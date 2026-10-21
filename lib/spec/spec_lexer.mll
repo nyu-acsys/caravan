@@ -52,9 +52,11 @@
         "requires", REQUIRES;
         "returning", RETURNING;
         "then", THEN;
+        "type", TYPE;
         "true", TRUE;
         "unfold", UNFOLD;
         "variant", VARIANT;
+        "view", VIEW;
         "with", WITH;
       ]
 
@@ -200,6 +202,10 @@ rule token = parse
       { COMMA }
   | ";"
       { SEMICOLON }
+  | "{"
+      { LEFTBRC }
+  | "}"
+      { RIGHTBRC }
   | "."
       { DOT }
   | ":"

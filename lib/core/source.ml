@@ -16,7 +16,7 @@ type t = {
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   env : Env.t;  (** The environment at the end of the file, for types in annotations. *)
   interface : interface option;
-  proof : S.predicate list;  (** The declarations of the proof. *)
+  proof : S.proof_decl list;  (** The declarations of the proof. *)
 }
 
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
@@ -96,7 +96,7 @@ let specialize_to_interface env (typed : Typedtree.structure) (interface : inter
       | _ -> ())
 
 (** The declarations of the proof in [file]. *)
-let load_proof file : (S.predicate list, Report.error) Result.t =
+let load_proof file : (S.proof_decl list, Report.error) Result.t =
   let lexbuf = lexbuf_of file in
   let lexeme_loc () =
     {

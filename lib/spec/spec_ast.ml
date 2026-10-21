@@ -110,8 +110,26 @@ type predicate = {
   pred_name : id;
   pred_params : (id * pty) list;
   pred_body : term option;  (** [None] for a declaration in an interface. *)
+  pred_persistent : bool;  (** [[@persistent]]: duplicable, as an invariant. *)
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
+
+(** A declaration of a proof. *)
+type proof_decl =
+  | Proof_predicate of predicate
+  | Proof_state of { state_name : id; state_fields : (id * pty) list }
+      (** The ghost state of a structure, [type state = { items : int list }]. *)
+  | Proof_invariant of {
+      inv_name : id;
+      inv_params : (id * pty) list;
+      inv_state : id * pty;
+      inv_body : term;
+    }
+      (** The persistent predicate [inv_name], defined by the heap in terms of the state,
+          [invariant is_stack (t : t) (s : state) = own t s.items]. *)
+  | Proof_view of { view_name : id; view_params : (id * pty) list; view_value : term }
+      (** The exclusive predicate [view_name]: a client's view of the state,
+          [view stack (t : t) = s.items], whose last parameter is the value. *)
 
 (** Where an atomic step linearizes the function that performs it: always, or if its
     result matches a pattern, as [returning [] -> commit]. *)

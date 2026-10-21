@@ -86,5 +86,5 @@ let () =
       "ensures exists x y. x * y = 4";
       "ensures r = Some [x; y] && l = [] && f [1] = x :: l";
       "ensures x = 1 +";
-      "ensures x { y";
+      "ensures x ` y";
     ]

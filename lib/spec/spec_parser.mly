@@ -56,7 +56,7 @@
 (* Contract tokens *)
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
-%token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING
+%token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 
 (* Keywords *)
 
@@ -98,7 +98,7 @@
 %start <Spec_ast.term> term_eof
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
-%start <Spec_ast.predicate list> proof
+%start <Spec_ast.proof_decl list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
 %%
@@ -123,13 +123,30 @@ predicate:
 ;
 
 predicate_decl:
-| PREDICATE n = lident ps = pred_param+ t = preceded(EQUAL, term)?
-    { { pred_name = n; pred_params = ps; pred_body = t } }
+| PREDICATE n = lident ps = pred_param+ a = ATTRIBUTE? t = preceded(EQUAL, term)?
+    { { pred_name = n; pred_params = ps; pred_body = t;
+        pred_persistent = (a = Some "persistent") } }
 ;
 
 (* The declarations of a proof file. *)
 proof:
-| ps = predicate_decl* EOF { ps }
+| ds = proof_decl* EOF { ds }
+;
+
+proof_decl:
+| p = predicate_decl { Proof_predicate p }
+| TYPE n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
+    { Proof_state { state_name = n; state_fields = fs } }
+| INVARIANT n = lident ps = pred_param+ EQUAL t = term
+    { let ps = List.rev ps in
+      Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
+                        inv_state = List.hd ps; inv_body = t } }
+| VIEW n = lident ps = pred_param+ EQUAL t = term
+    { Proof_view { view_name = n; view_params = ps; view_value = t } }
+;
+
+state_field:
+| x = lident COLON t = typ { (x, t) }
 ;
 
 pred_param:

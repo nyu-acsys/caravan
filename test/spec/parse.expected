@@ -28,5 +28,5 @@ ensures (exists x y. (infix ((* x) y) = 4))
 ensures ((&& (infix r = (Some ((:: x) ((:: y) []))))) ((&& (infix l = [])) (infix (f ((:: 1) [])) = ((:: x) l))))
 > ensures x = 1 +
 syntax error at 15
-> ensures x { y
-lexing error: Illegal character '{'
+> ensures x ` y
+lexing error: Illegal character '`'

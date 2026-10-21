@@ -133,6 +133,20 @@ type au = {
 }
 (** The atomic update of a function with an atomic contract. *)
 
+type shared = {
+  persistent : (string * Location.t) list;
+      (** The invariants, by their names, with their definitions. *)
+  views : (string * string) list;
+      (** The views, by their names, with their ghost fields, which hold a client's view
+          of the state, half in the view and half in the invariant. *)
+  anchors : (string * (string * R.Type.t) list) list;
+      (** The ghost fields of the views, by the field whose allocation allocates them: the
+          field of the structure's reference. *)
+}
+(** The shared structures of a program: invariants and views. *)
+
+let no_shared = { persistent = []; views = []; anchors = [] }
+
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Member.t) list ref;
@@ -160,6 +174,10 @@ type context = {
   linearizations : (int * Annotation.t) list;
       (** The annotations on atomic steps, by the offset of the end of the step they
           follow. *)
+  shared : shared;
+  mutable invariants : (string * R.Expr.t list) list;
+      (** The invariants that the function's precondition holds, opened around each of its
+          atomic steps, with their arguments. *)
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
@@ -225,22 +243,48 @@ let field_of_type ctx ~at (t : Types.type_expr) label =
       end
   | _ -> Ok None
 
-(** The OCaml type of the field [label] of values of type [t] that are references. *)
-let field_type ctx (t : Types.type_expr) label =
+(** The atomic that the field [label] of a value of the immutable record type [t] holds:
+    its type, if it is one. *)
+let atomic_in_record ctx (t : Types.type_expr) label =
   match Datatypes.desc ctx.types t with
-  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
-      Some elt
-  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
-      Some elt
   | Tconstr (p, [], _) ->
       begin match Datatypes.find ctx.types p with
-      | Some { heap = Some fields; _ } ->
-          Option.map
-            (List.find fields ~f:(fun f -> String.equal f.label label))
-            ~f:(fun f -> f.typ)
+      | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
+          List.find_map (List.zip_exn fields args) ~f:(fun (f, a) ->
+              match Datatypes.desc ctx.types a with
+              | Tconstr (q, [ _ ], _) when String.equal f label && Datatypes.is_atomic q
+                ->
+                  Some a
+              | _ -> None)
       | _ -> None
       end
   | _ -> None
+
+(** The OCaml type of the field [label] of values of type [t] that are references, or of
+    the contents of an atomic an immutable record holds. *)
+let field_type ctx (t : Types.type_expr) label =
+  match atomic_in_record ctx t label with
+  | Some atomic ->
+      begin match Datatypes.desc ctx.types atomic with
+      | Tconstr (_, [ elt ], _) -> Some elt
+      | _ -> None
+      end
+  | None -> (
+      match Datatypes.desc ctx.types t with
+      | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents"
+        ->
+          Some elt
+      | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+          Some elt
+      | Tconstr (p, [], _) ->
+          begin match Datatypes.find ctx.types p with
+          | Some { heap = Some fields; _ } ->
+              Option.map
+                (List.find fields ~f:(fun f -> String.equal f.label label))
+                ~f:(fun f -> f.typ)
+          | _ -> None
+          end
+      | _ -> None)
 
 (** The Raven field of the record field [label], and whether its record is a reference;
     [None] if it is unknown. *)
@@ -338,7 +382,11 @@ module S = Caravan_spec.Spec_ast
 
 (** What a name in a contract stands for: a Raven variable, or a value, such as the field
     of a matched value that a pattern names. *)
-type bound = Raven of string | Value of R.Expr.t
+type bound =
+  | Raven of string
+  | Value of R.Expr.t
+  | State of (string * R.Expr.t) list
+      (** The state of an invariant, by the values of its fields. *)
 
 type env = {
   ctx : context;  (** For the data types, and the fields of ref cells. *)
@@ -528,6 +576,12 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
   in
   Ok (List.filter_opt typed)
 
+(** The fields of the state [x], if [x] is one. *)
+let state_fields env x =
+  match List.Assoc.find env.vars x ~equal:String.equal with
+  | Some (State fields) -> Some fields
+  | _ -> None
+
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   let at = t.term_loc in
@@ -542,6 +596,8 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       begin match (List.Assoc.find env.vars x ~equal:String.equal, x) with
       | Some (Raven x), _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
       | Some (Value v), _ -> Ok v
+      | Some (State _), _ ->
+          error at (Printf.sprintf "The state %s is used by its fields, as %s.f" x x)
       | None, "max_int" -> Ok (R.Expr.int ~loc:l Prelude.max_int)
       | None, "min_int" -> Ok (R.Expr.int ~loc:l Prelude.min_int)
       | None, _ -> error at (Printf.sprintf "Unbound name %s" x)
@@ -599,6 +655,14 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       in
       spec_match env ~at ?scrutinee_type v cases
   | Tattr (_, t) | Tcast (t, _) -> formula env t
+  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
+    when Option.is_some (state_fields env x) ->
+      begin match
+        List.Assoc.find (Option.value_exn (state_fields env x)) label ~equal:String.equal
+      with
+      | Some v -> Ok v
+      | None -> error at (Printf.sprintf "The state %s has no field %s" x label)
+      end
   | Tfield (r, Qid { pid_str = label; _ }) ->
       let reference =
         match r.term_desc with
@@ -731,9 +795,17 @@ and location_of env (t : S.term) =
       | None -> error at (Printf.sprintf "The type of %s is not known here" x)
       | Some typ -> begin
           let* field = field_of_type env.ctx ~at typ label in
-          match field with
-          | Some field -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
-          | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
+          match (field, atomic_in_record env.ctx typ label) with
+          | Some field, _ -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+          | None, Some atomic -> begin
+              (* An atomic that an immutable record holds. *)
+              let atomic_ref = R.Expr.field ~loc:l r (name ~loc:l label) in
+              let* field = field_of_type env.ctx ~at atomic "" in
+              match field with
+              | Some field -> Ok (R.Expr.field ~loc:l atomic_ref (name ~loc:l field))
+              | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
+            end
+          | None, None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
         end
     end
   | Tvar (Qid { pid_str = x; _ }) -> begin
@@ -1028,6 +1100,41 @@ and owned_names (t : S.term) =
   | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
   | None, _ -> []
 
+(** The statements opening the invariants the function holds before the step at [at], or
+    with [fold] closing them after it, where a failure is reported. *)
+let use_invariants ctx ~(at : Location.t) ~fold =
+  let after = { at with loc_start = at.loc_end } in
+  List.map ctx.invariants ~f:(fun (inv, args) ->
+      if fold then begin
+        let definition =
+          Option.to_list
+            (Option.map (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
+               ~f:(fun def -> (def, "The invariant")))
+        in
+        ctx.origins :=
+          {
+            at = after;
+            code = Fold;
+            message = Printf.sprintf "The invariant %s may not hold after this step" inv;
+            related = definition;
+          }
+          :: !(ctx.origins);
+        R.Stmt.fold ~loc:(loc after) (name ~loc:(loc after) inv) args
+      end
+      else R.Stmt.unfold ~loc:(loc at) (name ~loc:(loc at) inv) args)
+
+(** [make], folding a predicate, preceded by setting the ghost field of a view to its new
+    value, the last argument: the view changes with the state. *)
+let with_views ctx make ~loc ~pred p args =
+  match List.Assoc.find ctx.shared.views pred ~equal:String.equal with
+  | Some field ->
+      let structure = List.hd_exn args and value = List.last_exn args in
+      R.Stmt.assign ~loc
+        [ R.Expr.field ~loc structure (name ~loc field) ]
+        (R.Stmt.expr_rhs value)
+      :: make ~loc ~pred p args
+  | None -> make ~loc ~pred p args
+
 (** The annotation saying how the atomic step at [at] linearizes the function, if one
     follows it, as [Atomic.get t (*@ commit *)]. *)
 let linearization ctx ~(at : Location.t) =
@@ -1054,11 +1161,14 @@ let commit_now (au : au) =
     as [how] says: always, never, if it is a [compare_and_set] that succeeds, or if it is
     a read whose value has a constructor. *)
 let linearize ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ]) access =
+  let around access =
+    use_invariants ctx ~at ~fold:false @ access @ use_invariants ctx ~at ~fold:true
+  in
   match ctx.au with
-  | None -> Ok access
+  | None -> Ok (around access)
   | Some au ->
       begin match au.state with
-      | Committed -> Ok access
+      | Committed -> Ok (around access)
       | Committing | On_cas | On_read _ | Partly | Unknown ->
           error at
             "Caravan cannot tell whether the function has linearized before this step"
@@ -1179,6 +1289,24 @@ let no_loop_before_linearizing ctx ~at =
   | Some _ ->
       unsupported at "A loop in a function with an atomic contract, before it linearizes,"
 
+(** The statements declaring arbitrary values for the ghost fields of the views that an
+    allocation of [fields] allocates, and these fields with their values: a view's value
+    is set when the structure's invariant is established. *)
+let view_allocation ctx ~loc:l (fields : string list) =
+  let views =
+    List.concat_map fields ~f:(fun field ->
+        Option.value
+          (List.Assoc.find ctx.shared.anchors field ~equal:String.equal)
+          ~default:[])
+  in
+  let allocated =
+    List.map views ~f:(fun (view, typ) ->
+        let x = Names.fresh ctx.names "view" in
+        ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x),
+          (name ~loc:l view, Some (R.Expr.var ~loc:l (name ~loc:l x))) ))
+  in
+  (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
+
 (** The statements evaluating [e], and the value of [e] after them; [tail] if the value is
     the function's result. *)
 let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
@@ -1230,12 +1358,14 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
                 Ok (fst (Option.value_exn field)))
           in
           let x = Names.fresh ctx.names "tmp" in
+          let views, view_args = view_allocation ctx ~loc:l fields in
           let init =
             R.Stmt.new_rhs
-              (List.map2_exn fields args ~f:(fun f v -> (name ~loc:l f, Some v)))
+              (List.map2_exn fields args ~f:(fun f v -> (name ~loc:l f, Some v))
+              @ view_args)
           in
           Ok
-            ( stmts @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
+            ( stmts @ views @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
               R.Expr.var ~loc:l (name ~loc:l x) )
       | Some ({ ctors = [ c ]; _ } as d) ->
           Ok (stmts, R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args)
@@ -1470,9 +1600,11 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
       let* field = ref_field ctx ~at v.exp_type in
       let* stmts, v = expr ctx v in
       let x = Names.fresh ctx.names "tmp" in
-      let init = R.Stmt.new_rhs [ (name ~loc:l field, Some v) ] in
+      let views, view_args = view_allocation ctx ~loc:l [ field ] in
+      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: view_args) in
       Ok
-        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
+        ( stmts @ views
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
           R.Expr.var ~loc:l (name ~loc:l x) )
   | Some "!", [ r ] ->
       let* field = contents r in
@@ -1540,9 +1672,11 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   match (op, values) with
   | ("make" | "make_contended"), [ v ] ->
       let x = Names.fresh ctx.names "tmp" in
-      let init = R.Stmt.new_rhs [ (name ~loc:l field, Some v) ] in
+      let views, view_args = view_allocation ctx ~loc:l [ field ] in
+      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: view_args) in
       Ok
-        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
+        ( stmts @ views
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
           R.Expr.var ~loc:l (name ~loc:l x) )
   | "get", [ a ] ->
       let* typ = typ ctx ~at e.exp_type in
@@ -2213,8 +2347,8 @@ and implicit_vars env (f : func) =
     do not call [f] itself: these are proven for the function's value, by induction, which
     a precondition bounding the function's own value, as for the code to not overflow,
     would make circular. *)
-let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f : func) :
-    (R.Callable.t, error) Result.t =
+let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs origins
+    (f : func) : (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
@@ -2230,6 +2364,8 @@ let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f
       facts = [];
       au = None;
       linearizations = [];
+      shared;
+      invariants = [];
     }
   in
   let l = loc f.loc in
@@ -2281,7 +2417,7 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
     when List.Assoc.mem ctx.preds p ~equal:String.equal ->
       let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
       let* args = all args ~f:(formula env) in
-      Ok [ make ~loc:l (name ~loc:l raven) args ]
+      Ok (make ~loc:l ~pred:p (name ~loc:l raven) args)
   | _, _, Tif (c, a, b) ->
       let* c = formula env c in
       let* a = uses ctx env ~at make a in
@@ -2335,8 +2471,8 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
     let* stmts = all terms ~f:(uses ctx env ~at make) in
     Ok (List.concat stmts)
   in
-  let fold ~loc p args = R.Stmt.fold ~loc p args in
-  let unfold ~loc p args = R.Stmt.unfold ~loc p args in
+  let fold ~loc ~pred:_ p args = [ R.Stmt.fold ~loc p args ] in
+  let unfold ~loc ~pred:_ p args = [ R.Stmt.unfold ~loc p args ] in
   let open_ ~at ~unfold:with_unfold =
     let l = loc at in
     let* decls =
@@ -2354,7 +2490,8 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
       | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
     in
     let* unfolds = if with_unfold then each pres ~at unfold (opened values) else Ok [] in
-    Ok (List.concat_map decls ~f:fst @ [ opening ] @ unfolds, values)
+    let invariants = if with_unfold then use_invariants ctx ~at ~fold:false else [] in
+    Ok (invariants @ List.concat_map decls ~f:fst @ [ opening ] @ unfolds, values)
   in
   let rec au =
     {
@@ -2396,11 +2533,14 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
                      (t.term_loc, "The atomic postcondition"));
              }
           :: !(ctx.origins);
-        let* folds = each posts ~at fold (opened ~value au.values) in
-        Ok (folds @ [ commit ])
+        let* folds = each posts ~at (with_views ctx fold) (opened ~value au.values) in
+        Ok (folds @ [ commit ] @ use_invariants ctx ~at ~fold:true)
     | Abort ->
         let* folds = each pres ~at fold (opened au.values) in
-        Ok (folds @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ])
+        Ok
+          (folds
+          @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ]
+          @ use_invariants ctx ~at ~fold:true)
     | Commit_call -> Ok [ commit ]
   in
   ctx.au <- Some au;
@@ -2410,11 +2550,28 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
        ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l "bindAU") []))
        (ident ~loc:l phi))
 
+(** The invariants that the conjunctions [terms] apply, with their arguments. *)
+let invariant_apps ctx env (terms : S.term list) =
+  let rec apps (t : S.term) =
+    let t = S.chain t in
+    match spine t [] with
+    | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+        apps a @ apps b
+    | { term_desc = Tvar (Qid { pid_str = p; _ }); _ }, args
+      when List.Assoc.mem ctx.shared.persistent p ~equal:String.equal ->
+        [ (p, args) ]
+    | _ -> []
+  in
+  all (List.concat_map terms ~f:apps) ~f:(fun (p, args) ->
+      let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+      let* args = all args ~f:(formula env) in
+      Ok (raven, args))
+
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations ~linearizations
-    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
-    (R.Callable.t, error) Result.t =
+let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
+    ~linearizations (functions : (string * string) list) origins ~proc_name ~pure
+    (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -2431,6 +2588,8 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations ~lineariz
       facts = [];
       au = None;
       linearizations;
+      shared;
+      invariants = [];
     }
   in
   let l = loc f.loc in
@@ -2460,6 +2619,9 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations ~lineariz
   in
   let pres = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
   let* requires = specs pres in
+  (* The invariants of the precondition are opened around each atomic step. *)
+  let* invariants = invariant_apps ctx env pres in
+  ctx.invariants <- invariants;
   let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
   let atomic_pres =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
@@ -2572,7 +2734,46 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations ~lineariz
     | Some (Committing | On_cas | On_read _ | Unknown) ->
         error f.loc "Caravan cannot tell whether this function linearizes on every path"
   in
-  let body = bind_au @ first @ stmts @ assignment @ last in
+  (* An invariant that the function establishes, as one creating a structure, is folded at
+     its end, after setting the views of its postcondition. *)
+  let* establish =
+    let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
+    let* established = invariant_apps ctx env posts in
+    let established =
+      List.filter established ~f:(fun (p, _) ->
+          not (List.exists invariants ~f:(fun (q, _) -> String.equal p q)))
+    in
+    if List.is_empty established then Ok []
+    else
+      let only_views ~loc ~pred p args =
+        if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then
+          [ R.Stmt.fold ~loc p args ]
+        else []
+      in
+      let* views = all posts ~f:(uses ctx env ~at:f.loc (with_views ctx only_views)) in
+      (* Reported at the end of the function. *)
+      let at = { f.loc with loc_start = f.loc.loc_end } in
+      List.iter established ~f:(fun (inv, _) ->
+          ctx.origins :=
+            {
+              at;
+              code = Fold;
+              message =
+                Printf.sprintf "The invariant %s may not hold when this function returns"
+                  inv;
+              related =
+                Option.to_list
+                  (Option.map
+                     (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
+                     ~f:(fun def -> (def, "The invariant")));
+            }
+            :: !(ctx.origins));
+      Ok
+        (List.concat views
+        @ List.map established ~f:(fun (inv, args) ->
+            R.Stmt.fold ~loc:(loc at) (name ~loc:(loc at) inv) args))
+  in
+  let body = bind_au @ first @ stmts @ assignment @ establish @ last in
   Ok
     (R.Callable.proc ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ implicit)
@@ -2724,9 +2925,59 @@ let pure_functions (funcs : func list) : func list =
   in
   close seeds
 
-(** The predicate [p], declared at [at], whose parameters have the OCaml types [types]. *)
-let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
-    (p : S.predicate) pred_body param_types : (R.Callable.t, error) Result.t =
+(** How a predicate is defined: by a body; as an invariant, by a body in terms of the
+    fields of its state; or as a view of an invariant's state. *)
+type definition =
+  | Body of S.term
+  | Invariant of { state : string; fields : (S.id * S.pty) list; body : S.term }
+  | View of { value : S.term }
+
+(** The ghost field holding the client's view [v] of a state. *)
+let view_field v = "view_" ^ v
+
+(** The field that allocating a value of type [t] allocates, if [t] is a reference: where
+    the ghost fields of the views of a structure of type [t] go. *)
+let anchor_field (types : Datatypes.t list) (t : Types.type_expr) =
+  match Datatypes.desc types t with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p ->
+      Some ("atomic_" ^ Datatypes.tag types elt)
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
+      Some ("ref_" ^ Datatypes.tag types elt ^ "_contents")
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find types p with
+      | Some { heap = Some (f :: _); _ } -> Some f.raven_field
+      | _ -> None
+      end
+  | _ -> None
+
+(** The parameters of [p], with the OCaml types [param_types], and the environment of the
+    predicate's body. *)
+let pred_params ctx ~at (p : S.predicate) param_types =
+  let l = loc at in
+  let* params =
+    all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
+        let* typ = typ ctx ~at t in
+        let raven = Names.fresh ctx.names id.S.pid_str in
+        Ok
+          (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
+  in
+  let env =
+    {
+      ctx;
+      var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
+      data = ctx.types;
+      funcs = ctx.spec_funcs;
+      vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
+    }
+  in
+  Ok (params, env)
+
+(** The predicate [p], declared at [at], whose parameters have the OCaml types
+    [param_types], defined as [def]; [views] are the views of the program, for an
+    invariant to hold its half of each. *)
+let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins ~at
+    ~views (p : S.predicate) (def : definition) param_types :
+    (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
@@ -2742,47 +2993,112 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
       facts = [];
       au = None;
       linearizations = [];
+      shared;
+      invariants = [];
     }
   in
   let l = loc at in
-  let* params =
-    all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
-        let* typ = typ ctx ~at t in
-        let raven = Names.fresh ctx.names id.S.pid_str in
-        Ok
-          (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
-  in
-  let env =
-    {
-      ctx;
-      var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
-      data = types;
-      funcs = spec_funcs;
-      vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
-    }
-  in
-  let* body = quantified env pred_body in
-  (* The trailing parameters without references, as the abstract value, are outputs:
-     determined by the others, which Raven checks, and found by Raven at calls. *)
-  let inputs, outputs =
-    let n =
-      List.length
-        (List.take_while (List.rev params) ~f:(fun (_, _, t, _) ->
-             not (Datatypes.has_refs types t)))
-    in
-    let n = if n = List.length params then 0 else n in
-    List.split_n params (List.length params - n)
-  in
+  let* params, env = pred_params ctx ~at p param_types in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
-  Ok
-    (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
-       (ident ~loc:l p.pred_name.pid_str)
-       (Some body))
+  let name = ident ~loc:l p.pred_name.pid_str in
+  match def with
+  | Body body ->
+      let* body = quantified env body in
+      (* The trailing parameters without references, as the abstract value, are outputs:
+         determined by the others, which Raven checks, and found by Raven at calls. *)
+      let inputs, outputs =
+        let n =
+          List.length
+            (List.take_while (List.rev params) ~f:(fun (_, _, t, _) ->
+                 not (Datatypes.has_refs types t)))
+        in
+        let n = if n = List.length params then 0 else n in
+        List.split_n params (List.length params - n)
+      in
+      Ok
+        (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
+           name (Some body))
+  | View _ ->
+      (* Half of the view's ghost field, on the structure, its first parameter. *)
+      let inputs, value = List.split_n params (List.length params - 1) in
+      let structure, _, _, _ = List.hd_exn params in
+      let* structure =
+        formula env (S.mk_term (Tvar (Qid (S.mk_id ~loc:at structure))) at)
+      in
+      let _, raven, _, _ = List.hd_exn value in
+      let field =
+        R.Expr.field ~loc:l structure
+          (R.Name.make ~loc:l (view_field p.pred_name.pid_str))
+      in
+      Ok
+        (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value)
+           name
+           (Some
+              (R.Expr.own ~loc:l
+                 [
+                   field;
+                   R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
+                   R.Expr.real ~loc:l 0.5;
+                 ])))
+  | Invariant { state; fields; body } ->
+      (* The state's fields are existentials, and its views hold the other halves of their
+         ghost fields. *)
+      let* fields =
+        all fields ~f:(fun (id, pty) ->
+            let* t = Source.ocaml_type ocaml_env ~at pty in
+            let* typ = typ ctx ~at t in
+            let raven = Names.fresh ctx.names (state ^ "_" ^ id.S.pid_str) in
+            Ok (id.pid_str, raven, typ))
+      in
+      let state_env =
+        bind env state
+          (State
+             (List.map fields ~f:(fun (f, raven, _) ->
+                  (f, R.Expr.var ~loc:l (R.Name.make ~loc:l raven)))))
+      in
+      let* body = quantified state_env body in
+      let* halves =
+        all views ~f:(fun ((v : S.predicate), value) ->
+            (* The view's parameters are the invariant's, but for its value. *)
+            let view_env =
+              List.fold
+                (List.zip_exn (List.drop_last_exn v.pred_params) params)
+                ~init:state_env
+                ~f:(fun env ((id, _), (_, raven, t, _)) ->
+                  {
+                    (bind env id.S.pid_str (Raven raven)) with
+                    var_types = (id.pid_str, t) :: env.var_types;
+                  })
+            in
+            let* value = formula view_env value in
+            let _, structure, _, _ = List.hd_exn params in
+            let field =
+              R.Expr.field ~loc:l
+                (R.Expr.var ~loc:l (R.Name.make ~loc:l structure))
+                (R.Name.make ~loc:l (view_field v.pred_name.pid_str))
+            in
+            Ok (R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ]))
+      in
+      let body =
+        List.fold halves ~init:body ~f:(fun a b -> R.Expr.binary ~loc:l And a b)
+      in
+      let body =
+        match fields with
+        | [] -> body
+        | _ ->
+            R.Expr.exists ~loc:l
+              (List.map fields ~f:(fun (_, raven, typ) ->
+                   R.Var.make ~loc:l (ident ~loc:l raven) typ))
+              body
+      in
+      Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A
     predicate declared in the interface without a definition is defined in the proof or an
-    annotation, with the same parameters. *)
+    annotation, with the same parameters; an invariant in the proof defines a persistent
+    predicate, and a view an exclusive one, whose value has the type of the declaration's
+    last parameter. *)
 let predicates (source : Source.t) =
   let of_annotations comments =
     all
@@ -2797,22 +3113,90 @@ let predicates (source : Source.t) =
         of_annotations i.interface_comments)
   in
   let* annotated = of_annotations source.comments in
-  let proof = List.map source.proof ~f:(fun p -> (p.pred_name.pid_loc, p)) in
-  let typed (at, (p : S.predicate)) =
+  let name (p : S.predicate) = p.pred_name.pid_str in
+  let declaration x = List.find declared ~f:(fun (_, p) -> String.equal (name p) x) in
+  let states =
+    List.filter_map source.proof ~f:(function
+      | Proof_state { state_name; state_fields } -> Some (state_name.pid_str, state_fields)
+      | _ -> None)
+  in
+  let* proof =
+    all source.proof ~f:(function
+      | S.Proof_predicate p ->
+          Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
+      | Proof_state _ -> Ok None
+      | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
+        ->
+          let* fields =
+            match state_type with
+            | PTtyapp (Qid t, []) when List.Assoc.mem states t.pid_str ~equal:String.equal
+              ->
+                Ok (List.Assoc.find_exn states t.pid_str ~equal:String.equal)
+            | _ ->
+                error state.pid_loc
+                  "The state of an invariant has a type declared in the proof, as type \
+                   state = { ... }"
+          in
+          Ok
+            (Some
+               ( inv_name.pid_loc,
+                 {
+                   S.pred_name = inv_name;
+                   pred_params = inv_params;
+                   pred_body = None;
+                   pred_persistent = true;
+                 },
+                 Some (Invariant { state = state.pid_str; fields; body = inv_body }) ))
+      | Proof_view { view_name; view_params; view_value } ->
+          begin match declaration view_name.pid_str with
+          | Some (_, d) when List.length d.pred_params = List.length view_params + 1 ->
+              let value = List.last_exn d.pred_params in
+              Ok
+                (Some
+                   ( view_name.pid_loc,
+                     {
+                       S.pred_name = view_name;
+                       pred_params = view_params @ [ value ];
+                       pred_body = None;
+                       pred_persistent = false;
+                     },
+                     Some (View { value = view_value }) ))
+          | Some (at, _) ->
+              error view_name.pid_loc
+                ~related:[ (at, "Its declaration") ]
+                "A view has the parameters of its declaration but the last, its value"
+          | None ->
+              error view_name.pid_loc
+                (Printf.sprintf
+                   "The view %s is not declared in the interface, which gives the type \
+                    of its value"
+                   view_name.pid_str)
+          end)
+  in
+  let proof = List.filter_opt proof in
+  let typed (at, (p : S.predicate), def) =
     let* types =
       all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type source.env ~at t)
     in
-    Ok (at, p, types)
+    Ok (at, p, def, types)
   in
-  let* declared = all declared ~f:typed in
-  let* defined = all (annotated @ proof) ~f:typed in
-  let with_body =
-    List.filter_map ~f:(fun (at, (p : S.predicate), types) ->
-        Option.map p.pred_body ~f:(fun body -> (at, p, body, types)))
+  let* declared =
+    all declared ~f:(fun (at, p) ->
+        typed (at, p, Option.map p.pred_body ~f:(fun b -> Body b)))
+  in
+  let* defined =
+    all
+      (List.map annotated ~f:(fun (at, p) ->
+           (at, p, Option.map p.pred_body ~f:(fun b -> Body b)))
+      @ proof)
+      ~f:typed
+  in
+  let with_def =
+    List.filter_map ~f:(fun (at, p, def, types) ->
+        Option.map def ~f:(fun def -> (at, p, def, types)))
   in
   (* Predicates defined in the interface are defined there. *)
-  let defined = with_body declared @ with_body defined in
-  let name (p : S.predicate) = p.pred_name.pid_str in
+  let defined = with_def declared @ with_def defined in
   let definitions x =
     List.filter defined ~f:(fun (_, p, _, _) -> String.equal (name p) x)
   in
@@ -2823,8 +3207,9 @@ let predicates (source : Source.t) =
           (Stdlib.Format.asprintf "%a" Printtyp.type_expr a)
           (Stdlib.Format.asprintf "%a" Printtyp.type_expr b))
   in
-  let declaration (at, (p : S.predicate), types) =
-    match (p.pred_body, definitions (name p)) with
+  let is_invariant = function Invariant _ -> true | Body _ | View _ -> false in
+  let declaration (at, (p : S.predicate), def, types) =
+    match (def, definitions (name p)) with
     | Some _, _ -> Ok ()
     | None, [] ->
         error at
@@ -2838,6 +3223,16 @@ let predicates (source : Source.t) =
              "The predicate %s is defined with other parameter types than it is declared \
               with"
              (name p))
+    | None, (def_at, _, d, _) :: _ when Bool.(p.pred_persistent <> is_invariant d) ->
+        error def_at
+          ~related:[ (at, "Its declaration") ]
+          (if p.pred_persistent then
+             Printf.sprintf
+               "The predicate %s is declared [@persistent], so it is defined as an \
+                invariant"
+               (name p)
+           else
+             Printf.sprintf "The invariant %s is declared without [@persistent]" (name p))
     | None, _ -> Ok ()
   in
   let definition (at, p, _, _) =
@@ -2910,30 +3305,78 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
   in
+  (* The views, with their values, and their ghost fields, on the structures. *)
+  let views =
+    List.filter_map predicates ~f:(fun (_, p, def, types) ->
+        match def with
+        | View { value } -> Some (p, value, types)
+        | Body _ | Invariant _ -> None)
+  in
+  let* view_fields =
+    all views ~f:(fun ((p : S.predicate), _, param_types) ->
+        let at = p.pred_name.pid_loc in
+        let structure = List.hd_exn param_types in
+        let* anchor =
+          match anchor_field types structure with
+          | Some anchor -> Ok anchor
+          | None ->
+              error at
+                "The structure of a view is a reference: an atomic, a ref or a record \
+                 with a mutable field"
+        in
+        let* typ = Datatypes.typ types ~at (List.last_exn param_types) in
+        Ok (anchor, (view_field p.pred_name.pid_str, typ)))
+  in
+  let shared =
+    {
+      persistent =
+        List.filter_map predicates ~f:(fun (at, p, def, _) ->
+            match def with
+            | Invariant _ -> Some (p.pred_name.pid_str, at)
+            | Body _ | View _ -> None);
+      views =
+        List.map views ~f:(fun (p, _, _) ->
+            (p.pred_name.pid_str, view_field p.pred_name.pid_str));
+      anchors =
+        List.map
+          (List.dedup_and_sort (List.map view_fields ~f:fst) ~compare:String.compare)
+          ~f:(fun anchor ->
+            ( anchor,
+              List.filter_map view_fields ~f:(fun (a, f) ->
+                  Option.some_if (String.equal a anchor) f) ));
+    }
+  in
   let* pred_members =
-    all predicates ~f:(fun (at, p, body, param_types) ->
-        predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at p body
-          param_types)
+    all predicates ~f:(fun (at, p, def, param_types) ->
+        predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
+          ~at
+          ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
+          p def param_types)
   in
   let* pure_funcs =
     all pure
       ~f:
-        (func types ~refs ~primitives ~ocaml_env ~preds
+        (func types ~refs ~primitives ~shared ~ocaml_env ~preds
            ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
            ~spec_funcs origins)
   in
   let* procs =
     all funcs ~f:(fun f ->
-        proc types ~refs ~primitives ~ocaml_env ~preds ~funcs:spec_funcs ~annotations
-          ~linearizations functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+        proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
+          ~annotations ~linearizations functions origins ~proc_name:(proc_name f)
+          ~pure:(is_pure f) f)
   in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
   let ref_fields = List.map !refs ~f:snd in
+  let ghost_fields =
+    List.map view_fields ~f:(fun (_, (field, typ)) ->
+        R.Member.field ~loc:start ~ghost:true (ident ~loc:start field) typ)
+  in
   Ok
     ( R.Program.make ~loc:start
-        (Prelude.members @ modules @ record_fields @ ref_fields
+        (Prelude.members @ modules @ record_fields @ ref_fields @ ghost_fields
        @ List.map !primitives ~f:snd
         @ List.map (pred_members @ pure_funcs @ procs) ~f:R.Member.callable),
       !origins )

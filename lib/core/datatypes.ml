@@ -150,7 +150,8 @@ let find (types : t list) (p : Path.t) =
   else if Path.same p Predef.path_option then Some option
   else List.find types ~f:(fun d -> declares d p)
 
-(** [t] with the abbreviations of [types] at its head expanded. *)
+(** [t] with the abbreviations of [types] at its head expanded, and without the quantifier
+    of a record label's type, which is not polymorphic here. *)
 let rec expand (types : t list) (t : Types.type_expr) =
   match Types.get_desc t with
   | Tconstr (p, [], _) ->
@@ -158,6 +159,7 @@ let rec expand (types : t list) (t : Types.type_expr) =
       | Some { alias = Some t; _ } -> expand types t
       | _ -> t
       end
+  | Tpoly (t, []) -> expand types t
   | _ -> t
 
 let desc types t = Types.get_desc (expand types t)
