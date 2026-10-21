@@ -91,6 +91,9 @@ type contract = {
 let empty_contract =
   { header = None; requires = []; ensures = []; variant = []; pure = false }
 
+type loop_spec = { invariants : term list; loop_variant : term list }
+(** The specification of a loop, written at the start of its body. *)
+
 let mk_loc (s, e) = { Location.loc_start = s; loc_end = e; loc_ghost = false }
 let mk_term t l = { term_desc = t; term_loc = l }
 

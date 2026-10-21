@@ -27,6 +27,13 @@ let lexeme_loc lexbuf =
     loc_ghost = false;
   }
 
+(** The specification of a loop that [annotation] states: its invariants and variants. *)
+let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =
+  let lexbuf = lexbuf annotation in
+  try Ok (Spec_parser.loop_spec Spec_lexer.token lexbuf) with
+  | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
+  | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+
 (** The contract that [annotation] states: an optional header [r = f x1 ... xn] followed
     by its clauses. The lexer and the parser report errors by raising. *)
 let contract (annotation : t) : (Spec_ast.contract, Report.error) Result.t =

@@ -48,7 +48,7 @@
 
 (* Contract tokens *)
 
-%token REQUIRES ENSURES VARIANT PURE
+%token REQUIRES ENSURES VARIANT PURE INVARIANT
 
 (* Keywords *)
 
@@ -88,6 +88,7 @@
 
 %start <Spec_ast.contract> contract
 %start <Spec_ast.term> term_eof
+%start <Spec_ast.loop_spec> loop_spec
 %%
 
 contract:
@@ -96,6 +97,18 @@ contract:
 
 term_eof:
 | t = term EOF { t }
+;
+
+loop_spec:
+| cs = loop_clause* EOF
+    { let invariants = List.filter_map (function `Invariant t -> Some t | `Variant _ -> None) cs in
+      let loop_variant = List.filter_map (function `Variant t -> Some t | `Invariant _ -> None) cs in
+      { invariants; loop_variant } }
+;
+
+loop_clause:
+| INVARIANT t = term { `Invariant t }
+| VARIANT t = term { `Variant t }
 ;
 
 clause:

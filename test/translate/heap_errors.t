@@ -8,8 +8,8 @@ has its own run.
   Type Error: A contract reads c.count through own, as in own c.count v.
   [1]
   $ caravan --shh heap_error_2.ml
-  [Error] File "heap_error_2.ml", line 3, columns 13-18:
+  [Error] File "heap_error_2.ml", line 3, columns 17-18:
   3 |     requires x < n *)
-                   ^^^^^
+                       ^
   Type Error: Unbound name n.
   [1]

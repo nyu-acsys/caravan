@@ -37,6 +37,7 @@
         "forall", FORALL;
         "if", IF;
         "in", IN;
+        "invariant", INVARIANT;
         "let", LET;
         "match", MATCH;
         "mod", OP3 "mod";
