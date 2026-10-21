@@ -1,0 +1,3 @@
+(library
+ (name caravan_config)
+ (package caravan))

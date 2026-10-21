@@ -1,0 +1,14 @@
+(executable
+ (name caravan)
+ (public_name caravan)
+ (libraries
+  base
+  cmdliner
+  fmt
+  fmt.cli
+  fmt.tty
+  logs
+  logs.cli
+  logs.fmt
+  raven.api
+  caravan_config))

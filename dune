@@ -1,0 +1,14 @@
+(env
+ (dev
+  (flags
+   (:standard -warn-error -A -w -39 -w -27 -w -32 -w -30)))
+ (debug
+  (flags
+   (:standard -warn-error -A -w -39 -w -27 -w -32 -w -30))
+  (ocamlopt_flags
+   (:standard -g -Oclassic -inline 0))))
+
+; Raven, for building against a checkout instead of an installed package: a symbolic
+; link vendor/raven to it. Only what Caravan uses is built.
+
+(vendored_dirs vendor)

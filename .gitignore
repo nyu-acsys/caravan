@@ -1,0 +1,12 @@
+_build/
+*~
+.directory
+.vscode
+.DS_Store
+log*.smt2
+front_end_output.log
+lowered_output.log
+CLAUDE.md
+AGENTS.md
+local/
+/vendor/
