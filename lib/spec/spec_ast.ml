@@ -106,7 +106,11 @@ let empty_contract =
 type loop_spec = { invariants : term list; loop_variant : term list }
 (** The specification of a loop, written at the start of its body. *)
 
-type predicate = { pred_name : id; pred_params : (id * pty) list; pred_body : term }
+type predicate = {
+  pred_name : id;
+  pred_params : (id * pty) list;
+  pred_body : term option;  (** [None] for a declaration in an interface. *)
+}
 (** A predicate, [predicate p (x : t) ... = body]. *)
 
 (** A ghost statement in code. *)

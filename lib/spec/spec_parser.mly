@@ -98,6 +98,7 @@
 %start <Spec_ast.term> term_eof
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
+%start <Spec_ast.predicate list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %%
 
@@ -117,8 +118,17 @@ loop_spec:
 ;
 
 predicate:
-| PREDICATE n = lident ps = pred_param+ EQUAL t = term EOF
+| p = predicate_decl EOF { p }
+;
+
+predicate_decl:
+| PREDICATE n = lident ps = pred_param+ t = preceded(EQUAL, term)?
     { { pred_name = n; pred_params = ps; pred_body = t } }
+;
+
+(* The declarations of a proof file. *)
+proof:
+| ps = predicate_decl* EOF { ps }
 ;
 
 pred_param:

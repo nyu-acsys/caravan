@@ -1,0 +1,2 @@
+(* The lock owns its atomic, which holds whether it is taken. *)
+predicate is_lock (l : t) (b : bool) = own l b

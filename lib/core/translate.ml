@@ -11,7 +11,7 @@ module R = Raven_api
 type error = Report.error
 
 let ( let* ) = Result.( >>= )
-let error loc message = Error (Report.error Type loc message)
+let error ?related loc message = Error (Report.error ?related Type loc message)
 let unsupported = Report.unsupported
 let loc (l : Location.t) = R.Loc.make l.loc_start l.loc_end
 let ident ~loc name = R.Ident.make ~loc name
@@ -79,9 +79,14 @@ module Names = struct
     List.Assoc.find names.bound (Ident.unique_name id) ~equal:String.equal
 end
 
-type origin = { at : Location.t; message : string }
-(** A check the translation generates, with what it checks, as the message to report when
-    it fails. *)
+type origin = {
+  at : Location.t;
+  code : R.Diagnostic.code;
+  message : string;
+  related : (Location.t * string) list;
+}
+(** A check the translation generates, with the code of its failure, and what it checks,
+    as the message and related locations to report when it fails. *)
 
 (** Whether a function with an atomic contract has linearized, as far as the translation
     knows: committed its atomic update, or not yet; or committed if the last
@@ -227,7 +232,7 @@ let field_of_label ctx ~at (label : Data_types.label_description) =
 
 (** The assertion [c] checking, at [at], what [message] says may fail. *)
 let check ctx ~(at : Location.t) message c =
-  ctx.origins := { at; message } :: !(ctx.origins);
+  ctx.origins := { at; code = Assertion; message; related = [] } :: !(ctx.origins);
   R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
 (** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
@@ -2107,11 +2112,12 @@ let atomic_update ctx env ~at ~self implicit ~pres ~posts =
     List.fold2_exn implicit values ~init:env ~f:(fun env (x, _, _, _) v ->
         bind env x (Value v))
   in
-  let uses make env preds =
+  (* At [step] if given, where a failure is reported, and otherwise in the contract. *)
+  let uses ?step make env preds =
     all preds ~f:(fun (p, args, at) ->
         let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
         let* args = all args ~f:(formula env) in
-        let l = loc at in
+        let l = loc (Option.value step ~default:at) in
         Ok (make ~loc:l (name ~loc:l raven) args))
   in
   let commit ~l = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ unit_value ~loc:l ]) in
@@ -2132,7 +2138,7 @@ let atomic_update ctx env ~at ~self implicit ~pres ~posts =
       | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
     in
     let* unfolds =
-      uses
+      uses ~step:at
         (fun ~loc p args -> R.Stmt.unfold ~loc p args)
         (opened values)
         (if unfold then pre_preds else [])
@@ -2141,12 +2147,34 @@ let atomic_update ctx env ~at ~self implicit ~pres ~posts =
   in
   let close ~at c values =
     let l = loc at in
-    let fold preds =
-      uses (fun ~loc p args -> R.Stmt.fold ~loc p args) (opened values) preds
+    let fold ?step preds =
+      uses ?step (fun ~loc p args -> R.Stmt.fold ~loc p args) (opened values) preds
     in
     match c with
     | Commit ->
-        let* folds = fold post_preds in
+        ctx.origins :=
+          {
+            at;
+            code = Fold;
+            message =
+              "The atomic postcondition may not hold after this step, which linearizes \
+               the function";
+            related =
+              List.map post_preds ~f:(fun (_, _, at) ->
+                  (at, "This part of the atomic postcondition may not hold"));
+          }
+          :: {
+               at;
+               code = Commit;
+               message =
+                 "The atomic postcondition may not hold after this step, which \
+                  linearizes the function";
+               related =
+                 List.map posts ~f:(fun (t : S.term) ->
+                     (t.term_loc, "The atomic postcondition"));
+             }
+          :: !(ctx.origins);
+        let* folds = fold ~step:at post_preds in
         Ok (folds @ [ commit ~l ])
     | Abort ->
         let* folds = fold pre_preds in
@@ -2341,10 +2369,30 @@ let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
   | [ a ] -> Result.map (Annotation.contract a) ~f:Option.some
   | _ :: a :: _ -> error a.loc "A function has at most one contract"
 
+(** The contracts of the values of [interface], by their names: an annotation after the
+    value's declaration. *)
+let interface_contracts (interface : Source.interface) =
+  let annotations = Annotation.of_comments interface.interface_comments in
+  let items = interface.signature in
+  let nexts =
+    List.map (List.drop items 1) ~f:(fun (i : Parsetree.signature_item) ->
+        Some i.psig_loc)
+    @ [ None ]
+  in
+  let* contracts =
+    all (List.zip_exn items nexts) ~f:(fun ((item : Parsetree.signature_item), next) ->
+        match item.psig_desc with
+        | Psig_value vd ->
+            let* contract = contract_after annotations ~item_loc:item.psig_loc ~next in
+            Ok (Option.map contract ~f:(fun c -> (vd.pval_name.txt, (c, item.psig_loc))))
+        | _ -> Ok None)
+  in
+  Ok (List.filter_opt contracts)
+
 (** The data types and functions of [structure], in order, with the contracts of the
-    functions in [annotations]. *)
-let items (structure : Typedtree.structure) (annotations : Annotation.t list) :
-    (Datatypes.t list * func list, error) Result.t =
+    functions in [annotations], or in [interface], by their names. *)
+let items ?(interface = []) (structure : Typedtree.structure)
+    (annotations : Annotation.t list) : (Datatypes.t list * func list, error) Result.t =
   let items = structure.str_items in
   let nexts =
     List.map (List.drop items 1) ~f:(fun (i : Typedtree.structure_item) -> Some i.str_loc)
@@ -2362,6 +2410,20 @@ let items (structure : Typedtree.structure) (annotations : Annotation.t list) :
               | Tpat_var (id, _, _), Texp_function (params, Tfunction_body body) ->
                   let* contract =
                     contract_after annotations ~item_loc:item.str_loc ~next
+                  in
+                  let* contract =
+                    match
+                      ( contract,
+                        List.Assoc.find interface (Ident.name id) ~equal:String.equal )
+                    with
+                    | Some _, Some (_, at) ->
+                        error vb.vb_loc
+                          ~related:[ (at, "Its contract in the interface") ]
+                          (Printf.sprintf
+                             "%s has a contract in its interface and another one here"
+                             (Ident.name id))
+                    | Some c, None | None, Some (c, _) -> Ok (Some c)
+                    | None, None -> Ok None
                   in
                   Ok
                     {
@@ -2421,7 +2483,7 @@ let pure_functions (funcs : func list) : func list =
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types [types]. *)
 let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
-    (p : S.predicate) param_types : (R.Callable.t, error) Result.t =
+    (p : S.predicate) pred_body param_types : (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
@@ -2455,7 +2517,7 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
       vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
     }
   in
-  let* body = quantified env p.pred_body in
+  let* body = quantified env pred_body in
   (* The trailing parameters without references, as the abstract value, are outputs:
      determined by the others, which Raven checks, and found by Raven at calls. *)
   let inputs, outputs =
@@ -2473,10 +2535,86 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
        (ident ~loc:l p.pred_name.pid_str)
        (Some body))
 
+(** The predicates of [source], declared in its interface, its proof or its annotations,
+    with where they are declared, their definitions, and their parameters' types. A
+    predicate declared in the interface without a definition is defined in the proof or an
+    annotation, with the same parameters. *)
+let predicates (source : Source.t) =
+  let of_annotations comments =
+    all
+      (List.filter (Annotation.of_comments comments) ~f:(fun a ->
+           Poly.equal (Annotation.kind a) Annotation.Predicate))
+      ~f:(fun a ->
+        let* p = Annotation.predicate a in
+        Ok (a.loc, p))
+  in
+  let* declared =
+    Option.value_map source.interface ~default:(Ok []) ~f:(fun i ->
+        of_annotations i.interface_comments)
+  in
+  let* annotated = of_annotations source.comments in
+  let proof = List.map source.proof ~f:(fun p -> (p.pred_name.pid_loc, p)) in
+  let typed (at, (p : S.predicate)) =
+    let* types =
+      all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type source.env ~at t)
+    in
+    Ok (at, p, types)
+  in
+  let* declared = all declared ~f:typed in
+  let* defined = all (annotated @ proof) ~f:typed in
+  let with_body =
+    List.filter_map ~f:(fun (at, (p : S.predicate), types) ->
+        Option.map p.pred_body ~f:(fun body -> (at, p, body, types)))
+  in
+  (* Predicates defined in the interface are defined there. *)
+  let defined = with_body declared @ with_body defined in
+  let name (p : S.predicate) = p.pred_name.pid_str in
+  let definitions x =
+    List.filter defined ~f:(fun (_, p, _, _) -> String.equal (name p) x)
+  in
+  let same_types a b =
+    List.length a = List.length b
+    && List.for_all2_exn a b ~f:(fun a b ->
+        String.equal
+          (Stdlib.Format.asprintf "%a" Printtyp.type_expr a)
+          (Stdlib.Format.asprintf "%a" Printtyp.type_expr b))
+  in
+  let declaration (at, (p : S.predicate), types) =
+    match (p.pred_body, definitions (name p)) with
+    | Some _, _ -> Ok ()
+    | None, [] ->
+        error at
+          (Printf.sprintf
+             "The predicate %s is not defined: define it in the proof or an annotation"
+             (name p))
+    | None, (def_at, _, _, def_types) :: _ when not (same_types types def_types) ->
+        error def_at
+          ~related:[ (at, "Its declaration") ]
+          (Printf.sprintf
+             "The predicate %s is defined with other parameter types than it is declared \
+              with"
+             (name p))
+    | None, _ -> Ok ()
+  in
+  let definition (at, p, _, _) =
+    match definitions (name p) with
+    | (first, _, _, _) :: _ :: _ when not (Poly.equal first at) ->
+        error at
+          ~related:[ (first, "Its first definition") ]
+          (Printf.sprintf "The predicate %s is defined twice" (name p))
+    | _ -> Ok ()
+  in
+  let* () = Result.all_unit (List.map declared ~f:declaration) in
+  let* () = Result.all_unit (List.map defined ~f:definition) in
+  Ok defined
+
 (** The Raven program of [source]. *)
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
-  let* types, funcs = items source.typed annotations in
+  let* interface =
+    Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
+  in
+  let* types, funcs = items ~interface source.typed annotations in
   (* Each data type's module, given the ones declared before it; a record type that is a
      reference has fields instead. *)
   let* modules =
@@ -2498,19 +2636,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let origins = ref [] in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
-  let* predicates =
-    all
-      (List.filter annotations ~f:(fun a ->
-           Poly.equal (Annotation.kind a) Annotation.Predicate))
-      ~f:(fun a ->
-        let* p = Annotation.predicate a in
-        let* param_types =
-          all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type ocaml_env ~at:a.loc t)
-        in
-        Ok (a, p, param_types))
-  in
+  let* predicates = predicates source in
   let preds =
-    List.map predicates ~f:(fun (_, p, types) ->
+    List.map predicates ~f:(fun (_, p, _, types) ->
         (p.pred_name.pid_str, (p.pred_name.pid_str, types)))
   in
   let spec_funcs =
@@ -2518,9 +2646,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
   in
   let* pred_members =
-    all predicates ~f:(fun ((a : Annotation.t), p, param_types) ->
-        predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at:a.loc
-          p param_types)
+    all predicates ~f:(fun (at, p, body, param_types) ->
+        predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at p body
+          param_types)
   in
   let* pure_funcs =
     all pure

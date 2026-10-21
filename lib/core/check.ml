@@ -11,12 +11,21 @@ let same_place (at : Location.t) (l : R.Loc.t) =
 
 (** [d], saying what failed if it is the failure of a check the translation generated. *)
 let explain (origins : Translate.origin list) (d : R.Diagnostic.t) : R.Diagnostic.t =
-  match d.code with
-  | Some Assertion -> (
-      match List.find origins ~f:(fun o -> same_place o.at d.loc) with
-      | Some o -> { d with message = o.message }
-      | None -> d)
-  | _ -> d
+  let origin =
+    List.find origins ~f:(fun o ->
+        same_place o.at d.loc && Option.exists d.code ~f:(Poly.equal o.code))
+  in
+  match origin with
+  | Some { message; related = []; _ } -> { d with message }
+  | Some { message; related; _ } ->
+      {
+        d with
+        message;
+        related =
+          List.map related ~f:(fun (at, related_message) ->
+              { R.Diagnostic.related_loc = Report.loc at; related_message });
+      }
+  | None -> d
 
 (** Verifies [file]; whether it verified. With [emit_rav], the Raven program is printed
     instead. *)

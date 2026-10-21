@@ -12,7 +12,7 @@ specifications written in comments, to [Raven](https://github.com/nyu-acsys/rave
 SMT-based verifier for concurrent separation logic, and reports what Raven finds in terms
 of the OCaml source.
 
-Caravan is at an early stage of development: so far, it verifies first-order functions on integers, booleans, tuples, lists, options and variant types.
+Caravan is at an early stage of development: so far, it verifies first-order functions on integers, booleans, tuples, lists, options, variant types, mutable records, references and atomics, with loops, predicates and logically atomic contracts. Specifications go in `(*@ ... *)` comments in the `.ml` or its `.mli`, and predicate definitions in the `.ml` or a `.proof` file next to it.
 
 ## Building
 
