@@ -1,0 +1,4 @@
+(library
+ (name caravan_core)
+ (package caravan)
+ (libraries base stdio logs fmt compiler-libs.common raven.api))

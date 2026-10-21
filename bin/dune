@@ -11,4 +11,5 @@
   logs.cli
   logs.fmt
   raven.api
-  caravan_config))
+  caravan_config
+  caravan_core))
