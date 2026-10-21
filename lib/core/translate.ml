@@ -505,7 +505,13 @@ module S = Caravan_spec.Spec_ast
     of a matched value that a pattern names. *)
 type bound = Raven of string | Value of R.Expr.t
 
-type env = { data : Datatypes.t list; vars : (string * bound) list }
+type env = {
+  data : Datatypes.t list;
+  funcs : (string * string) list;
+      (** The functions contracts can call, by their OCaml names, with their Raven ones.
+      *)
+  vars : (string * bound) list;
+}
 
 let bind env x b = { env with vars = (x, b) :: env.vars }
 
@@ -659,6 +665,11 @@ and application env (t : S.term) =
           | _ -> Ok (R.Expr.binary ~loc:l op a b))
       end
   | Tvar (Qid { pid_str = c; _ }), _ when is_constructor c -> constructor env t args
+  | Tvar (Qid { pid_str = f; _ }), _ :: _
+    when List.Assoc.mem env.funcs f ~equal:String.equal ->
+      let* args = all args ~f:(formula env) in
+      let func = List.Assoc.find_exn env.funcs f ~equal:String.equal in
+      Ok (R.Expr.call ~loc:l (name ~loc:l func) args)
   | Tvar q, args when Option.is_some (list_function q) ->
       let* args = all args ~f:(formula env) in
       let f = Option.value_exn (list_function q) in
@@ -850,33 +861,230 @@ let contract_names (f : func) (header : S.header option) n =
         let* args = all h.hd_args ~f:arg in
         Ok (result, args)
 
-(** The procedure of [f]. *)
-let proc types (functions : (string * string) list) origins (f : func) :
-    (R.Callable.t, error) Result.t =
+(** The parameters of [f]: their OCaml and Raven names, unless unit, their range, and
+    their declarations. *)
+let formals ctx (f : func) =
+  all f.params ~f:(fun (p : Typedtree.function_param) ->
+      match p.fp_kind with
+      | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
+        when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
+          let* typ = typ ctx ~at:pat_loc pat_type in
+          let x = Names.bind ctx.names id in
+          Ok
+            ( Some (Ident.name id, x),
+              range_spec ~loc:(loc pat_loc) pat_type x,
+              R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
+      | Tparam_pat
+          { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ } ->
+          let x = Names.fresh ctx.names "unit" in
+          let l = loc pat_loc in
+          Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
+      | _ -> unsupported p.fp_loc "This parameter")
+
+(** The pure expression [e] as a Raven expression, with the values of its let-bound
+    variables in [values]; [funcs] are the functions it may call, by their OCaml
+    identifiers' unique names, with their Raven names. *)
+let rec pure ctx ~funcs (values : (string * R.Expr.t) list) (e : Typedtree.expression) :
+    (R.Expr.t, error) Result.t =
+  let at = e.exp_loc in
+  let l = loc at in
+  let pure_in values = pure ctx ~funcs values in
+  let not_pure what =
+    unsupported at (what ^ " in a function that contracts use, which must be pure,")
+  in
+  match e.exp_desc with
+  | Texp_ident (Pident id, _, _) ->
+      begin match
+        ( List.Assoc.find values (Ident.unique_name id) ~equal:String.equal,
+          Names.find ctx.names id )
+      with
+      | Some v, _ -> Ok v
+      | None, Some x -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
+      | None, None -> not_pure "A function used as a value"
+      end
+  | Texp_ident (p, _, _) ->
+      begin match stdlib_name p with
+      | Some "max_int" -> Ok (R.Expr.int ~loc:l Prelude.max_int)
+      | Some "min_int" -> Ok (R.Expr.int ~loc:l Prelude.min_int)
+      | _ -> not_pure "This identifier"
+      end
+  | Texp_constant (Const_int n) -> Ok (R.Expr.int ~loc:l n)
+  | Texp_construct ({ txt = Lident (("true" | "false") as b); _ }, _, []) ->
+      Ok (R.Expr.bool ~loc:l (String.equal b "true"))
+  | Texp_construct ({ txt = Lident "()"; _ }, _, []) -> Ok (unit_value ~loc:l)
+  | Texp_construct (_, cstr, args) ->
+      begin match Datatypes.find_cstr ctx.types cstr with
+      | None -> not_pure "This constructor"
+      | Some (d, c) ->
+          let* args = all args ~f:(pure_in values) in
+          Ok (R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args)
+      end
+  | Texp_tuple components ->
+      let* components = all components ~f:(fun (_, c) -> pure_in values c) in
+      Ok (R.Expr.tuple ~loc:l components)
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) -> begin
+      let* args = plain_args ~at args in
+      let* args = all args ~f:(pure_in values) in
+      match (binop_of_path path, unop_of_path path, path, args) with
+      | Some Div, _, _, [ a; b ] -> Ok (prelude_call ~loc:l Prelude.div [ a; b ])
+      | Some Mod, _, _, [ a; b ] -> Ok (prelude_call ~loc:l Prelude.mod_ [ a; b ])
+      | Some op, _, _, [ a; b ] -> Ok (R.Expr.binary ~loc:l op a b)
+      | _, Some `Not, _, [ a ] -> Ok (R.Expr.not_ ~loc:l a)
+      | _, Some `Neg, _, [ a ] -> Ok (R.Expr.neg ~loc:l a)
+      | None, None, Pident id, _ ->
+          begin match
+            List.Assoc.find funcs (Ident.unique_name id) ~equal:String.equal
+          with
+          | Some f -> Ok (R.Expr.call ~loc:l (name ~loc:l f) args)
+          | None -> not_pure ("A call of " ^ Ident.name id)
+          end
+      | _ -> not_pure "This application"
+    end
+  | Texp_ifthenelse (c, a, Some b) ->
+      let* c = pure_in values c in
+      let* a = pure_in values a in
+      let* b = pure_in values b in
+      Ok (R.Expr.ite ~loc:l c a b)
+  | Texp_let
+      ( Nonrecursive,
+        [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; vb_expr; _ } ],
+        body ) ->
+      let* v = pure_in values vb_expr in
+      pure_in ((Ident.unique_name id, v) :: values) body
+  | Texp_match (scrutinee, cases, [], Total) -> begin
+      let* v = pure_in values scrutinee in
+      let* cases =
+        all cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+            match (Typedtree.split_pattern c.c_lhs, c.c_guard) with
+            | (Some p, None), None -> Ok (p, c.c_rhs)
+            | _ -> not_pure "A guard or an exception case")
+      in
+      let with_binds binds =
+        List.fold binds ~init:values ~f:(fun values (id, value, _) ->
+            (Ident.unique_name id, value) :: values)
+      in
+      match flat_cases ctx v cases with
+      | Some flat ->
+          let* cases =
+            all flat ~f:(fun (case, binds, _, rhs) ->
+                let* body = pure_in (with_binds binds) rhs in
+                Ok (case, body))
+          in
+          Ok (R.Expr.match_ ~loc:l v cases)
+      | None ->
+          (* OCaml found the cases exhaustive, so the last one needs no test. *)
+          let rec chain = function
+            | [] -> not_pure "An empty match"
+            | [ (p, rhs) ] ->
+                let* _, binds = pattern ctx p v in
+                pure_in (with_binds binds) rhs
+            | (p, rhs) :: rest -> begin
+                let* cond, binds = pattern ctx p v in
+                let* body = pure_in (with_binds binds) rhs in
+                match cond with
+                | None -> Ok body
+                | Some cond ->
+                    let* rest = chain rest in
+                    Ok (R.Expr.ite ~loc:l cond body rest)
+              end
+          in
+          chain cases
+    end
+  | Texp_match (_, _, _, Partial) -> not_pure "A match that may not be exhaustive"
+  | _ -> not_pure "This expression"
+
+(** The names that the contract term [t] uses free. *)
+let rec term_names (t : S.term) : string list =
+  let rec pat_names (p : S.pat) =
+    match p.pat_desc with
+    | Pwild | Pconst _ | Pconstr (_, None) -> []
+    | Pid id -> [ id.pid_str ]
+    | Ptuple ps -> List.concat_map ps ~f:pat_names
+    | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+  in
+  let without bound names =
+    List.filter names ~f:(fun x -> not (List.mem bound x ~equal:String.equal))
+  in
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar (Qdot _) -> []
+  | Tvar (Qid id) -> [ id.pid_str ]
+  | Tapply (a, b) | Tinfix (a, _, b) -> term_names a @ term_names b
+  | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
+  | Tquant (_, binders, body) ->
+      without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
+  | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
+  | Tmatch (t, cases) ->
+      term_names t
+      @ List.concat_map cases ~f:(fun (p, body) ->
+          without (pat_names p) (term_names body))
+  | Ttuple ts -> List.concat_map ts ~f:term_names
+  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
+
+(** The names that the contract of [f] uses for its result and parameters, with the Raven
+    names of the result, [result], and of the parameters, [formals]. *)
+let contract_env types ~spec_funcs (f : func) formals ~result =
+  let header = Option.bind f.contract ~f:(fun c -> c.header) in
+  let* result_name, arg_names = contract_names f header (List.length formals) in
+  let params =
+    List.map2_exn arg_names formals ~f:(fun contract_name (ocaml, _, _) ->
+        let raven = Option.value_map ocaml ~default:"" ~f:snd in
+        Option.map contract_name ~f:(fun n -> (n, raven)))
+    |> List.filter_map ~f:Fn.id
+  in
+  Ok
+    ( result_name,
+      {
+        data = types;
+        funcs = spec_funcs;
+        vars = List.map ((result_name, result) :: params) ~f:(fun (x, r) -> (x, Raven r));
+      } )
+
+(** The function that contracts call for [f], defined by its body; [funcs] are the
+    functions it may call, by their OCaml identifiers' unique names, and [spec_funcs] by
+    their OCaml names. Its postconditions are those of [f], under the preconditions that
+    do not call [f] itself: these are proven for the function's value, by induction, which
+    a precondition bounding the function's own value, as for the code to not overflow,
+    would make circular. *)
+let func types ~funcs ~spec_funcs origins (f : func) : (R.Callable.t, error) Result.t =
+  let ctx = { types; names = Names.create (); functions = []; origins } in
+  let l = loc f.loc in
+  let* formals = formals ctx f in
+  let result = Names.fresh ctx.names "result" in
+  let* _, env = contract_env types ~spec_funcs f formals ~result in
+  let calls_self (t : S.term) =
+    List.mem (term_names t) (Ident.name f.id) ~equal:String.equal
+  in
+  let clauses select = Option.value_map f.contract ~default:[] ~f:select in
+  let* requires =
+    all
+      (List.filter (clauses (fun c -> c.requires)) ~f:(fun t -> not (calls_self t)))
+      ~f:(formula env)
+  in
+  let* ensures = all (clauses (fun c -> c.ensures)) ~f:(formula env) in
+  let ensures =
+    List.map ensures ~f:(fun post ->
+        R.Spec.make
+          (List.fold_right requires ~init:post ~f:(fun pre post ->
+               R.Expr.binary ~loc:l Impl pre post)))
+  in
+  let* result_typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
+  let* body = pure ctx ~funcs [] f.body in
+  Ok
+    (R.Callable.func ~loc:l
+       ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
+       ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_typ ]
+       ~ensures (ident ~loc:l f.raven_name) (Some body))
+
+(** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
+    its function. [funcs] are the functions contracts can call, by their OCaml names. *)
+let proc types ~funcs (functions : (string * string) list) origins ~proc_name ~pure
+    (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx = { types; names; functions; origins } in
   let l = loc f.loc in
-  let* formals =
-    all f.params ~f:(fun (p : Typedtree.function_param) ->
-        match p.fp_kind with
-        | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
-          when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
-            let* typ = typ ctx ~at:pat_loc pat_type in
-            let x = Names.bind names id in
-            Ok
-              ( Some (Ident.name id, x),
-                range_spec ~loc:(loc pat_loc) pat_type x,
-                R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
-        | Tparam_pat
-            { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ }
-          ->
-            let x = Names.fresh names "unit" in
-            let l = loc pat_loc in
-            Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
-        | _ -> unsupported p.fp_loc "This parameter")
-  in
+  let* formals = formals ctx f in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
-  let* result_name, arg_names = contract_names f header (List.length formals) in
+  let* result_name, _ = contract_names f header (List.length formals) in
   let result = Names.fresh names result_name in
   let* returns =
     if is_unit f.body.exp_type then Ok []
@@ -884,19 +1092,7 @@ let proc types (functions : (string * string) list) origins (f : func) :
       let* typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
-  (* The names the contract uses: the parameters' and the result's. *)
-  let params =
-    List.map2_exn arg_names formals ~f:(fun contract_name (ocaml, _, var) ->
-        let raven = Option.value_map ocaml ~default:"" ~f:snd in
-        Option.map contract_name ~f:(fun n -> (n, raven)))
-    |> List.filter_map ~f:Fn.id
-  in
-  let env =
-    {
-      data = types;
-      vars = List.map ((result_name, result) :: params) ~f:(fun (x, r) -> (x, Raven r));
-    }
-  in
+  let* _, env = contract_env types ~spec_funcs:funcs f formals ~result in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula env f) ~f:(fun e -> R.Spec.make e))
   in
@@ -911,8 +1107,30 @@ let proc types (functions : (string * string) list) origins (f : func) :
   let* ensures =
     specs (Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures))
   in
+  let* () =
+    match Option.value_map f.contract ~default:[] ~f:(fun c -> c.variant) with
+    | [] -> Ok ()
+    | v :: _ -> unsupported v.term_loc "A variant"
+  in
+  (* The value of a pure function's function. *)
+  let defined =
+    if pure && not (List.is_empty returns) then
+      let args =
+        List.map formals ~f:(fun (ocaml, _, _) ->
+            match ocaml with
+            | Some (_, x) -> R.Expr.var ~loc:l (name ~loc:l x)
+            | None -> unit_value ~loc:l)
+      in
+      [
+        R.Spec.make
+          (R.Expr.binary ~loc:l Eq
+             (R.Expr.var ~loc:l (name ~loc:l result))
+             (R.Expr.call ~loc:l (name ~loc:l f.raven_name) args));
+      ]
+    else []
+  in
   let requires = in_range @ requires in
-  let ensures = Option.to_list result_in_range @ ensures in
+  let ensures = Option.to_list result_in_range @ defined @ ensures in
   let* stmts, v = expr ctx f.body in
   let body =
     if List.is_empty returns then stmts
@@ -927,7 +1145,7 @@ let proc types (functions : (string * string) list) origins (f : func) :
   Ok
     (R.Callable.proc ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
-       ~returns ~requires ~ensures (ident ~loc:l f.raven_name) (Some body))
+       ~returns ~requires ~ensures (ident ~loc:l proc_name) (Some body))
 
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
@@ -982,6 +1200,44 @@ let items (structure : Typedtree.structure) (annotations : Annotation.t list) :
   let* items = all (List.zip_exn items nexts) ~f:item in
   Ok (List.concat_map items ~f:fst, List.concat_map items ~f:snd)
 
+(** The identifiers that [e] refers to by a name of its own. *)
+let referenced (e : Typedtree.expression) : Ident.t list =
+  let found = ref [] in
+  let expr iterator (e : Typedtree.expression) =
+    begin match e.exp_desc with
+    | Texp_ident (Pident id, _, _) -> found := id :: !found
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.expr iterator e
+  in
+  let iterator = { Tast_iterator.default_iterator with expr } in
+  iterator.expr iterator e;
+  !found
+
+(** The functions of [funcs] that must be pure: those that contracts call or say are
+    [pure], and the functions these call. *)
+let pure_functions (funcs : func list) : func list =
+  let contract_names =
+    List.concat_map funcs ~f:(fun f ->
+        Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
+            List.concat_map (c.requires @ c.ensures @ c.variant) ~f:term_names))
+  in
+  let seeds =
+    List.filter funcs ~f:(fun f ->
+        List.mem contract_names (Ident.name f.id) ~equal:String.equal
+        || Option.exists f.contract ~f:(fun (c : S.contract) -> c.pure))
+  in
+  let is_in set (f : func) = List.exists set ~f:(fun g -> Ident.same g.id f.id) in
+  let rec close set =
+    let called = List.concat_map set ~f:(fun f -> referenced f.body) in
+    let added =
+      List.filter funcs ~f:(fun f ->
+          (not (is_in set f)) && List.exists called ~f:(fun id -> Ident.same id f.id))
+    in
+    if List.is_empty added then set else close (set @ added)
+  in
+  close seeds
+
 (** The Raven program of [source]. *)
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
@@ -992,12 +1248,28 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       (List.mapi types ~f:(fun i d -> (List.take types i, d)))
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
-  let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)) in
+  let pure = pure_functions funcs in
+  let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
+  (* A pure function's procedure is named apart from its function. *)
+  let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
+  let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, proc_name f)) in
   let origins = ref [] in
-  let* procs = all funcs ~f:(proc types functions origins) in
+  let spec_funcs = List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name)) in
+  let* pure_funcs =
+    all pure
+      ~f:
+        (func types
+           ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
+           ~spec_funcs origins)
+  in
+  let* procs =
+    all funcs ~f:(fun f ->
+        proc types ~funcs:spec_funcs functions origins ~proc_name:(proc_name f)
+          ~pure:(is_pure f) f)
+  in
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   Ok
     ( R.Program.make
         ~loc:(R.Loc.make file_start file_start)
-        (Prelude.members @ modules @ List.map procs ~f:R.Member.callable),
+        (Prelude.members @ modules @ List.map (pure_funcs @ procs) ~f:R.Member.callable),
       !origins )
