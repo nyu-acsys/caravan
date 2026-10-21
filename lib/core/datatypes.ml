@@ -1,6 +1,8 @@
 (** OCaml's variant types as Raven data types. Raven declares a data type's constructors
     and destructors in the scope of the type, so each type gets a module of its own, named
-    as the type, capitalized as Raven's type names are, with the type [T]. *)
+    as the type, capitalized as Raven's type names are, with the type [T]. OCaml's lists
+    and options are Raven's [List] and [Option], which Raven instantiates for their
+    element types. *)
 
 open Base
 module R = Raven_api
@@ -15,7 +17,36 @@ type ctor = {
   args : Types.type_expr list;
 }
 
-type t = { id : Ident.t; module_name : string; ctors : ctor list; at : Location.t }
+type t = {
+  id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
+  module_name : string;
+  ctors : ctor list;
+  at : Location.t;
+}
+
+let list =
+  {
+    id = None;
+    module_name = "List";
+    ctors =
+      [
+        { ocaml = "[]"; raven = "nil"; fields = []; args = [] };
+        { ocaml = "::"; raven = "::"; fields = [ "hd"; "tl" ]; args = [] };
+      ];
+    at = Location.none;
+  }
+
+let option =
+  {
+    id = None;
+    module_name = "Option";
+    ctors =
+      [
+        { ocaml = "None"; raven = "none"; fields = []; args = [] };
+        { ocaml = "Some"; raven = "some"; fields = [ "value" ]; args = [] };
+      ];
+    at = Location.none;
+  }
 
 (** The data type that [decl] declares, if it is a variant type. *)
 let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Result.t =
@@ -37,14 +68,25 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       in
       let* ctors = Result.all (List.map cds ~f:ctor) in
       Ok
-        { id = decl.typ_id; module_name = String.capitalize decl.typ_name.txt; ctors; at }
+        {
+          id = Some decl.typ_id;
+          module_name = String.capitalize decl.typ_name.txt;
+          ctors;
+          at;
+        }
   | Ttype_variant _ -> Report.unsupported at "A type with parameters"
   | _ -> Report.unsupported at "This type definition"
 
-let find (types : t list) (p : Path.t) =
-  match p with Pident id -> List.find types ~f:(fun d -> Ident.same d.id id) | _ -> None
+let declares (d : t) (p : Path.t) =
+  match (d.id, p) with Some id, Pident id' -> Ident.same id id' | _ -> false
 
-(** The data type and constructor of [cstr], a constructor of one of [types]. *)
+(** The data type of the type constructor [p]: one of [types], a list or an option. *)
+let find (types : t list) (p : Path.t) =
+  if Path.same p Predef.path_list then Some list
+  else if Path.same p Predef.path_option then Some option
+  else List.find types ~f:(fun d -> declares d p)
+
+(** The data type and constructor of [cstr]. *)
 let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
   match Types.get_desc cstr.cstr_res with
   | Tconstr (p, _, _) ->
@@ -55,9 +97,11 @@ let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
   | _ -> None
 
 (** The data type and constructor named [ocaml] in a contract: the latest such
-    constructor, as in OCaml. *)
+    constructor, as in OCaml, where those of lists and options come first. *)
 let find_ctor (types : t list) (ocaml : string) =
-  List.find_map (List.rev types) ~f:(fun d ->
+  List.find_map
+    (List.rev (list :: option :: types))
+    ~f:(fun d ->
       Option.map
         (List.find d.ctors ~f:(fun c -> String.equal c.ocaml ocaml))
         ~f:(fun c -> (d, c)))
@@ -74,10 +118,14 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
-  | Tconstr (p, [], _)
-    when Option.exists self ~f:(fun (d : t) -> Path.same p (Pident d.id)) ->
+  | Tconstr (p, [ elt ], _)
+    when Path.same p Predef.path_list || Path.same p Predef.path_option ->
+      let* elt = typ types ?self ~at elt in
+      let d = Option.value_exn (find types p) in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
+  | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
-  | Tconstr (p, [], _) when Option.is_some (find types p) ->
+  | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
   | Ttuple components ->

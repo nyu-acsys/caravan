@@ -516,8 +516,14 @@ let rec spec_type env ~at (t : S.pty) : (R.Type.t, error) Result.t =
   | PTtyapp (Qid { pid_str = "int"; _ }, []) -> Ok (R.Type.int ~loc:l)
   | PTtyapp (Qid { pid_str = "bool"; _ }, []) -> Ok (R.Type.bool ~loc:l)
   | PTtyapp (Qid { pid_str = "unit"; _ }, []) -> Ok (R.Type.tuple ~loc:l [])
+  | PTtyapp (Qid { pid_str = ("list" | "option") as n; _ }, [ elt ]) ->
+      let* elt = spec_type env ~at elt in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l (String.capitalize n)) [ elt ])
   | PTtyapp (Qid { pid_str = n; _ }, []) ->
-      begin match List.find env.data ~f:(fun d -> String.equal (Ident.name d.id) n) with
+      let declared (d : Datatypes.t) =
+        Option.exists d.id ~f:(fun id -> String.equal (Ident.name id) n)
+      in
+      begin match List.find env.data ~f:declared with
       | Some d ->
           Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
       | None -> error at (Printf.sprintf "Unbound type %s" n)
@@ -547,17 +553,25 @@ let spec_binop (op : string) : R.Expr.binop option =
   | "<->" -> Some Iff
   | _ -> None
 
+(** The functions of OCaml's standard library on lists that contracts can use, as Raven's
+    [List]'s. *)
+let list_function : S.qualid -> string option = function
+  | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "length"; _ }) -> Some "len"
+  | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "mem"; _ }) -> Some "in"
+  | _ -> None
+
 (** The head of the application [t] and its arguments. *)
 let rec spine (t : S.term) args =
   match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
 
-let is_constructor x = (not (String.is_empty x)) && Char.is_uppercase x.[0]
+let is_constructor x =
+  String.equal x "[]" || String.equal x "::"
+  || ((not (String.is_empty x)) && Char.is_uppercase x.[0])
 
 (** The arguments of a constructor of [arity], given as [args]: a tuple for several. *)
 let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
   match (arity, args) with
-  | 0, [] -> Ok []
-  | 1, [ a ] -> Ok [ a ]
+  | n, args when List.length args = n -> Ok args
   | n, [ a ] when n > 1 ->
       begin match tuple a with
       | Some components when List.length components = n -> Ok components
@@ -629,6 +643,10 @@ and application env (t : S.term) =
   | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.neg ~loc:l a)
+  | Tvar (Qid { pid_str = "@"; pid_fixity = Infix; _ }), [ a; b ] ->
+      let* a = formula env a in
+      let* b = formula env b in
+      Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] "++") [ a; b ])
   | Tvar (Qid { pid_str = op; pid_fixity = Infix; _ }), [ a; b ] ->
       begin match spec_binop op with
       | None -> unsupported at (Printf.sprintf "The operator %s" op)
@@ -641,6 +659,10 @@ and application env (t : S.term) =
           | _ -> Ok (R.Expr.binary ~loc:l op a b))
       end
   | Tvar (Qid { pid_str = c; _ }), _ when is_constructor c -> constructor env t args
+  | Tvar q, args when Option.is_some (list_function q) ->
+      let* args = all args ~f:(formula env) in
+      let f = Option.value_exn (list_function q) in
+      Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args)
   | _ -> unsupported at "A call of a function in a contract"
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)

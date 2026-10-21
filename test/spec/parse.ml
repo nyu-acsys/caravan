@@ -84,6 +84,7 @@ let () =
          | None -> match y with A -> true | B -> false|};
       "ensures let (a, b) = p in a + b = 3 && t.next = None pure";
       "ensures exists x y. x * y = 4";
+      "ensures r = Some [x; y] && l = [] && f [1] = x :: l";
       "ensures x = 1 +";
       "ensures x { y";
     ]

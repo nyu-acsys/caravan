@@ -10,8 +10,8 @@
 
 %{
   (* Gospel's grammar (uparser.mly of github.com/ocaml-gospel/gospel at ce26d16), for
-     Caravan's contracts: Gospel's terms, patterns and types, with match, and a
-     contract's header and clauses. *)
+     Caravan's contracts: Gospel's terms, patterns and types, with OCaml's match and list
+     literals in place of Gospel's indexing, and a contract's header and clauses. *)
 
   open Spec_ast
 
@@ -19,11 +19,6 @@
   let mk_term d l = { term_desc = d; term_loc = mk_loc l }
   let mk_pat p l = { pat_desc = p; pat_loc = mk_loc l }
 
-  let get_op l = mk_pid ~fixity:Mixfix "[_]" l
-  let set_op l = mk_pid ~fixity:Mixfix "[->]" l
-  let sub_op l = mk_pid ~fixity:Mixfix "[_.._]" l
-  let above_op l = mk_pid ~fixity:Mixfix "[_..]" l
-  let below_op l = mk_pid ~fixity:Mixfix "[.._]" l
 
   let add_clause c (keyword, t) =
     match keyword with
@@ -78,7 +73,6 @@
 %right COLON
 
 %right ARROW LRARROW
-%nonassoc RIGHTSQ
 %right DISJ BARBAR
 %right CONJ AMPAMP
 %nonassoc NOT
@@ -89,7 +83,6 @@
 %left OP4
 %left BACKQUOTE_LIDENT
 %nonassoc prec_prefix_op
-%nonassoc LEFTSQ
 %nonassoc OPPREF
 %nonassoc OLD
 
@@ -296,6 +289,12 @@ term_block_:
 | LEFTPAR RIGHTPAR                                  { Ttuple [] }
 | LEFTSQRIGHTSQ
     { Tvar (Qid (mk_pid "[]"  $loc)) }
+| LEFTSQ ts = semicolon_list1(term) RIGHTSQ
+    { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($3)))) $loc($3) in
+      let cons t l =
+        mk_term (mk_op_apply (mk_id ~fixity:Mixfix ~loc:t.term_loc "::") [ t; l ]) $loc
+      in
+      (List.fold_right cons ts nil).term_desc }
 ;
 
 term_sub_:
@@ -303,16 +302,6 @@ term_sub_:
     { t }
 | t = term_dot DOT q = lqualid_rich
     { Tfield (t, q) }
-| s = term_arg l = location(LEFTSQ) i = term RIGHTSQ
-    { mk_op_apply (get_op l) [s; i] }
-| m = term_arg l = location(LEFTSQ) k = term ARROW v = term RIGHTSQ
-    { mk_op_apply (set_op l) [m; k; v] }
-| s = term_arg l = location(LEFTSQ) i1 = term DOTDOT i2 = term RIGHTSQ
-    { mk_op_apply (sub_op l) [s; i1; i2] }
-| s = term_arg l = location(LEFTSQ) i = term DOTDOT RIGHTSQ
-    { mk_op_apply (above_op l) [s; i] }
-| s = term_arg l = location(LEFTSQ) DOTDOT i = term RIGHTSQ
-    { mk_op_apply (below_op l) [s; i] }
 | LEFTPAR l = comma_list2(term) RIGHTPAR                { Ttuple l }
 ;
 
