@@ -86,7 +86,10 @@ type origin = { at : Location.t; message : string }
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Type.t) list ref;
-      (** The fields of the ref cells used so far, by their names, with their types. *)
+      (** The fields of the ref cells and atomics used so far, by their names, with their
+          types. *)
+  primitives : (string * R.Member.t) list ref;
+      (** The atomic operations used so far, by their names (see {!Primitives}). *)
   names : Names.t;
   functions : (string * string) list;
       (** The top-level functions, by the unique name of their OCaml identifier. *)
@@ -114,11 +117,36 @@ let ref_field ctx ~at elt =
     ctx.refs := !(ctx.refs) @ [ (field, t) ];
   Ok field
 
-(** The Raven field named [label] of the values of type [t] that are references. *)
+(** The field of the atomics with contents of type [elt]. *)
+let atomic_field ctx ~at elt =
+  let field = "atomic_" ^ Datatypes.tag ctx.types elt in
+  let* t = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then
+    ctx.refs := !(ctx.refs) @ [ (field, t) ];
+  Ok field
+
+(** The procedure performing [op] on the atomics with contents of type [elt]. *)
+let primitive ctx ~at elt op =
+  let* field = atomic_field ctx ~at elt in
+  let name = Primitives.name ~field op in
+  let* typ = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.primitives) name ~equal:String.equal) then
+    ctx.primitives :=
+      !(ctx.primitives)
+      @ [
+          (name, Primitives.proc ~field ~typ ~exact:(Datatypes.immediate ctx.types elt) op);
+        ];
+  Ok name
+
+(** The Raven field named [label] of the values of type [t] that are references; an
+    atomic's contents have the empty label, as in [own a v]. *)
 let field_of_type ctx ~at (t : Types.type_expr) label =
   match Types.get_desc t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
       let* field = ref_field ctx ~at elt in
+      Ok (Some field)
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+      let* field = atomic_field ctx ~at elt in
       Ok (Some field)
   | Tconstr (p, [], _) ->
       begin match Datatypes.find ctx.types p with
@@ -135,6 +163,8 @@ let field_of_type ctx ~at (t : Types.type_expr) label =
 let field_type ctx (t : Types.type_expr) label =
   match Types.get_desc t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
+      Some elt
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
       Some elt
   | Tconstr (p, [], _) ->
       begin match Datatypes.find ctx.types p with
@@ -189,6 +219,14 @@ let stdlib_name (p : Path.t) =
   | Pdot (Pident m, x) when String.equal (Ident.name m) "Stdlib" -> Some x
   | _ -> None
 
+(** The name of [p] if it is a value of [Stdlib.Atomic]. *)
+let atomic_name (p : Path.t) =
+  match p with
+  | Pdot (Pdot (Pident m, "Atomic"), x) when String.equal (Ident.name m) "Stdlib" ->
+      Some x
+  | Pdot (Pident m, x) when String.equal (Ident.name m) "Stdlib__Atomic" -> Some x
+  | _ -> None
+
 (** The operators of the standard library that Raven has, by their paths. *)
 let binop_of_path (p : Path.t) : R.Expr.binop option =
   match stdlib_name p with
@@ -206,6 +244,18 @@ let binop_of_path (p : Path.t) : R.Expr.binop option =
   | Some "&&" -> Some And
   | Some "||" -> Some Or
   | _ -> None
+
+(** Whether [==] or [!=] on [a] and [b] is equality or its negation: on immediate values,
+    and with a constant constructor, which is immediate. Otherwise, physical equality
+    implies equality, but not conversely. *)
+let exact_physical types (a : Typedtree.expression) (b : Typedtree.expression) =
+  let constant (e : Typedtree.expression) =
+    match e.exp_desc with Texp_construct (_, _, []) -> true | _ -> false
+  in
+  Datatypes.immediate types a.exp_type || constant a || constant b
+
+let is_physical (p : Path.t) =
+  match stdlib_name p with Some ("==" | "!=") -> true | _ -> false
 
 let unop_of_path (p : Path.t) =
   match stdlib_name p with Some "not" -> Some `Not | Some "~-" -> Some `Neg | _ -> None
@@ -267,6 +317,20 @@ let list_function : S.qualid -> string option = function
 (** The head of the application [t] and its arguments. *)
 let rec spine (t : S.term) args =
   match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
+
+(** The variable, field and name of [own x.label v], with the empty label for [own x v].
+*)
+let owned_location (t : S.term) =
+  match spine t [] with
+  | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+      [ location; { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ] ) ->
+      begin match location.term_desc with
+      | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label) ->
+          Some (x, label.pid_str, v)
+      | Tvar (Qid { pid_str = x; _ }) -> Some (x, "", v)
+      | _ -> None
+      end
+  | _ -> None
 
 let is_constructor x =
   String.equal x "[]" || String.equal x "::"
@@ -348,28 +412,16 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
   in
   (* The types of the values of fields that [t] owns; and of names passed to predicates. *)
   let rec owned (t : S.term) =
-    match S.(t.term_desc) with
-    | Tapply
-        ( {
-            term_desc =
-              Tapply
-                ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
-                  {
-                    term_desc =
-                      Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label);
-                    _;
-                  } );
-            _;
-          },
-          { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ) ->
+    match (owned_location t, S.(t.term_desc)) with
+    | Some (x, label, v), _ ->
         Option.to_list
           (Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
              ~f:(fun typ ->
-               Option.map (field_type env.ctx typ label.pid_str) ~f:(fun t -> (v, t))))
-    | Tapply (a, b) | Tinfix (a, _, b) -> owned a @ owned b
-    | Tif (a, b, c) -> owned a @ owned b @ owned c
-    | Tattr (_, t) | Tcast (t, _) -> owned t
-    | _ -> []
+               Option.map (field_type env.ctx typ label) ~f:(fun t -> (v, t))))
+    | None, (Tapply (a, b) | Tinfix (a, _, b)) -> owned a @ owned b
+    | None, Tif (a, b, c) -> owned a @ owned b @ owned c
+    | None, (Tattr (_, t) | Tcast (t, _)) -> owned t
+    | None, _ -> []
   in
   (* The parameter types of the predicates that [t] passes names to. *)
   let rec passed (t : S.term) =
@@ -607,7 +659,19 @@ and location_of env (t : S.term) =
           | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
         end
     end
-  | _ -> unsupported at "This location, other than a field of a variable,"
+  | Tvar (Qid { pid_str = x; _ }) -> begin
+      let* r = formula env t in
+      let* field =
+        match List.Assoc.find env.var_types x ~equal:String.equal with
+        | None -> error at (Printf.sprintf "The type of %s is not known here" x)
+        | Some typ -> field_of_type env.ctx ~at typ ""
+      in
+      match field with
+      | Some field -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+      | None ->
+          error at (Printf.sprintf "%s is not an atomic, as owned without a field" x)
+    end
+  | _ -> unsupported at "This location, other than a field of a variable or an atomic,"
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)
 and constructor env (t : S.term) args =
@@ -880,25 +944,12 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
 (** The names that [t] owns the values of fields of variables as, as [k] for [i.contents]
     in [own i.contents k]: the variable, the field and the name. *)
 and owned_names (t : S.term) =
-  match t.term_desc with
-  | Tapply
-      ( {
-          term_desc =
-            Tapply
-              ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
-                {
-                  term_desc =
-                    Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label);
-                  _;
-                } );
-          _;
-        },
-        { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ) ->
-      [ (x, label.pid_str, v) ]
-  | Tapply (a, b) | Tinfix (a, _, b) -> owned_names a @ owned_names b
-  | Tif (a, b, c) -> owned_names a @ owned_names b @ owned_names c
-  | Tattr (_, t) | Tcast (t, _) -> owned_names t
-  | _ -> []
+  match (owned_location t, t.term_desc) with
+  | Some owned, _ -> [ owned ]
+  | None, (Tapply (a, b) | Tinfix (a, _, b)) -> owned_names a @ owned_names b
+  | None, Tif (a, b, c) -> owned_names a @ owned_names b @ owned_names c
+  | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
+  | None, _ -> []
 
 (** The statements evaluating [e], and the value of [e] after them. *)
 let rec expr (ctx : context) (e : Typedtree.expression) :
@@ -1165,6 +1216,8 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
         R.Expr.var ~loc:l (name ~loc:l x) )
   in
   match (stdlib_name path, args) with
+  | _ when Option.is_some (atomic_name path) ->
+      atomic ctx e (Option.value_exn (atomic_name path)) args
   | Some "ref", [ v ] ->
       let* field = ref_field ctx ~at v.exp_type in
       let* stmts, v = expr ctx v in
@@ -1196,6 +1249,72 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
           unit_value ~loc:l )
   | _ -> apply_operator ctx e path args
 
+(** The application of [Atomic.op] to [args], in [e]. *)
+and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) =
+  let at = e.exp_loc in
+  let l = loc at in
+  let element (t : Types.type_expr) =
+    match Types.get_desc t with
+    | Tconstr (_, [ elt ], _) -> Ok elt
+    | _ -> unsupported at "This atomic"
+  in
+  (* The result of [f] applied to the atomic and [args], in a variable. *)
+  let result f atomic args =
+    let* typ = typ ctx ~at e.exp_type in
+    let x = Names.fresh ctx.names "tmp" in
+    let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
+    Ok
+      ( R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)
+        @ assume_in_range ~loc:l e.exp_type x,
+        R.Expr.var ~loc:l (name ~loc:l x) )
+  in
+  let* elt =
+    match args with
+    | a :: _ when not (String.is_prefix op ~prefix:"make") -> element a.exp_type
+    | _ -> element e.exp_type
+  in
+  let* field = atomic_field ctx ~at elt in
+  let* stmts, values = operands ctx args in
+  let primitive op = primitive ctx ~at elt op in
+  match (op, values) with
+  | ("make" | "make_contended"), [ v ] ->
+      let x = Names.fresh ctx.names "tmp" in
+      let init = R.Stmt.new_rhs [ (name ~loc:l field, Some v) ] in
+      Ok
+        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
+          R.Expr.var ~loc:l (name ~loc:l x) )
+  | "get", [ a ] ->
+      let* typ = typ ctx ~at e.exp_type in
+      let x = Names.fresh ctx.names "tmp" in
+      let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (name ~loc:l field)) in
+      Ok
+        ( stmts
+          @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x)
+          @ assume_in_range ~loc:l e.exp_type x,
+          R.Expr.var ~loc:l (name ~loc:l x) )
+  | "set", [ a; v ] -> Ok (stmts @ [ write ~loc:l a field v ], unit_value ~loc:l)
+  | "exchange", [ a; v ] ->
+      let* f = primitive Exchange in
+      let* reading, r = result f a [ v ] in
+      Ok (stmts @ reading, r)
+  | "compare_and_set", [ a; old_val; new_val ] ->
+      let* f = primitive Compare_and_set in
+      let* reading, r = result f a [ old_val; new_val ] in
+      Ok (stmts @ reading, r)
+  | "fetch_and_add", [ a; n ] ->
+      let* f = primitive Fetch_and_add in
+      let* reading, r = result f a [ n ] in
+      Ok (stmts @ reading, r)
+  | (("incr" | "decr") as op), [ a ] ->
+      let* f = primitive Fetch_and_add in
+      let x = Names.fresh ctx.names "tmp" in
+      let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
+      let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
+      Ok
+        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x),
+          unit_value ~loc:l )
+  | _ -> unsupported at ("Atomic." ^ op)
+
 (** The application of the operator or function at [path] to [args], in [e]. *)
 and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
     (args : Typedtree.expression list) =
@@ -1221,6 +1340,22 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
               Ok [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
         in
         Ok (a_stmts @ stmts, v)
+  | Some ((Eq | Neq) as op), _, [ a; b ]
+    when is_physical path && not (exact_physical ctx.types a b) ->
+      let* b_stmts, b = expr ctx b in
+      let* a_stmts, a = expr ctx a in
+      let x = Names.fresh ctx.names "same" in
+      let same = R.Expr.var ~loc:l (name ~loc:l x) in
+      Ok
+        ( b_stmts @ a_stmts
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.bool ~loc:l) (ident ~loc:l x)
+          @ [
+              R.Stmt.havoc ~loc:l (name ~loc:l x);
+              R.Stmt.assume ~loc:l
+                (R.Spec.make
+                   (R.Expr.binary ~loc:l Impl same (R.Expr.binary ~loc:l Eq a b)));
+            ],
+          match op with Eq -> same | _ -> R.Expr.not_ ~loc:l same )
   | Some op, _, [ a; b ] ->
       let divisor = b.exp_loc in
       let* b_stmts, b = expr ctx b in
@@ -1540,6 +1675,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
           Ok (R.Expr.field ~loc:l (R.Expr.var ~loc:l (name ~loc:l x)) (name ~loc:l field))
       | None -> not_pure "This field"
     end
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
+    when is_physical path && not (exact_physical ctx.types a b) ->
+      not_pure "Physical equality on values that are not immediate"
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) -> begin
       let* args = plain_args ~at args in
       let* args = all args ~f:(pure_in values) in
@@ -1732,12 +1870,13 @@ and implicit_vars env (f : func) =
     do not call [f] itself: these are proven for the function's value, by induction, which
     a precondition bounding the function's own value, as for the code to not overflow,
     would make circular. *)
-let func types ~refs ~ocaml_env ~preds ~funcs ~spec_funcs origins (f : func) :
+let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f : func) :
     (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
       refs;
+      primitives;
       names = Names.create ();
       functions = [];
       origins;
@@ -1783,7 +1922,7 @@ let func types ~refs ~ocaml_env ~preds ~funcs ~spec_funcs origins (f : func) :
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~refs ~ocaml_env ~preds ~funcs ~annotations
+let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
     (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
     (R.Callable.t, error) Result.t =
   let names = Names.create () in
@@ -1791,6 +1930,7 @@ let proc types ~refs ~ocaml_env ~preds ~funcs ~annotations
     {
       types;
       refs;
+      primitives;
       names;
       functions;
       origins;
@@ -2001,12 +2141,13 @@ let pure_functions (funcs : func list) : func list =
   close seeds
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types [types]. *)
-let predicate types ~refs ~ocaml_env ~preds ~spec_funcs origins ~at (p : S.predicate)
-    param_types : (R.Callable.t, error) Result.t =
+let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
+    (p : S.predicate) param_types : (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
       refs;
+      primitives;
       names = Names.create ();
       functions = [];
       origins;
@@ -2055,6 +2196,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* record_fields = Datatypes.fields types in
   let refs = ref [] in
+  let primitives = ref [] in
   let pure = pure_functions funcs in
   let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
   (* A pure function's procedure is named apart from its function. *)
@@ -2084,20 +2226,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* pred_members =
     all predicates ~f:(fun ((a : Annotation.t), p, param_types) ->
-        predicate types ~refs ~ocaml_env ~preds ~spec_funcs origins ~at:a.loc p
-          param_types)
+        predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at:a.loc
+          p param_types)
   in
   let* pure_funcs =
     all pure
       ~f:
-        (func types ~refs ~ocaml_env ~preds
+        (func types ~refs ~primitives ~ocaml_env ~preds
            ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
            ~spec_funcs origins)
   in
   let* procs =
     all funcs ~f:(fun f ->
-        proc types ~refs ~ocaml_env ~preds ~funcs:spec_funcs ~annotations functions
-          origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+        proc types ~refs ~primitives ~ocaml_env ~preds ~funcs:spec_funcs ~annotations
+          functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
@@ -2108,5 +2250,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ record_fields @ ref_fields
+       @ List.map !primitives ~f:snd
         @ List.map (pred_members @ pure_funcs @ procs) ~f:R.Member.callable),
       !origins )

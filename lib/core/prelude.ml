@@ -1,6 +1,6 @@
 (** The Raven definitions every generated program includes: the range of OCaml's [int],
-    and its division, which rounds towards zero, in terms of Raven's, which is Euclidean.
-*)
+    its division, which rounds towards zero, in terms of Raven's, which is Euclidean, and
+    its wrap-around. *)
 
 module R = Raven_api
 
@@ -8,6 +8,7 @@ let loc = R.Loc.none
 let div = "ocaml_div"
 let mod_ = "ocaml_mod"
 let in_range = "ocaml_int"
+let wrap = "ocaml_wrap"
 
 (** The bounds of OCaml's 63-bit [int]. *)
 let min_int = Stdlib.min_int
@@ -34,6 +35,22 @@ let members : R.Member.t list =
          ~returns:[ R.Var.make ~loc (R.Ident.make ~loc "b") (R.Type.bool ~loc) ]
          (R.Ident.make ~loc in_range)
          (Some (R.Expr.binary ~loc And (bound Geq min_int) (bound Leq max_int))));
+    (* The value congruent to [x] modulo 2^63 in the range. *)
+    R.Member.callable
+      (R.Callable.func ~loc ~inline:true
+         ~formals:[ int_var "x" ]
+         ~returns:[ int_var "w" ]
+         (R.Ident.make ~loc wrap)
+         (Some
+            (let n i = R.Expr.int ~loc i in
+             let size =
+               R.Expr.binary ~loc Plus
+                 (R.Expr.binary ~loc Minus (n max_int) (n min_int))
+                 (n 1)
+             in
+             R.Expr.binary ~loc Plus
+               (R.Expr.binary ~loc Mod (R.Expr.binary ~loc Minus x (n min_int)) size)
+               (n min_int))));
     (* For a dividend that is not negative, Euclidean division truncates. *)
     R.Member.callable
       (func div "q"

@@ -142,6 +142,10 @@ let is_ref (p : Path.t) =
   | Pdot (Pident m, "ref") -> String.equal (Ident.name m) "Stdlib"
   | _ -> false
 
+(** Whether [p] is the path of [Stdlib.Atomic.t]. *)
+let is_atomic (p : Path.t) =
+  match Path.name p with "Stdlib.Atomic.t" | "Stdlib__Atomic.t" -> true | _ -> false
+
 (** The data type and constructor named [ocaml] in a contract: the latest such
     constructor, as in OCaml, where those of lists and options come first. *)
 let find_ctor (types : t list) (ocaml : string) =
@@ -169,7 +173,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let* elt = typ types ?self ~at elt in
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
-  | Tconstr (p, [ _ ], _) when is_ref p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [], _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
       Ok (R.Type.ref ~loc:l)
@@ -198,12 +202,33 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
   | Tconstr (p, [ elt ], _) when Path.same p Predef.path_option ->
       tag types elt ^ "Option"
   | Tconstr (p, [ elt ], _) when is_ref p -> tag types elt ^ "Ref"
+  | Tconstr (p, [ elt ], _) when is_atomic p -> tag types elt ^ "Atomic"
   | Tconstr (p, [], _) when Option.is_some (find types p) ->
       (Option.value_exn (find types p)).module_name
   | Ttuple components ->
       String.concat (List.map components ~f:(fun (_, t) -> tag types t)) ^ "Tuple"
   | Tpoly (t, []) -> tag types t
   | _ -> "Other"
+
+(** Whether the values of type [t] are immediate or references, so that physical equality
+    on them is equality: integers, booleans, unit, references, and variants whose
+    constructors are all constant. *)
+let rec immediate (types : t list) (t : Types.type_expr) =
+  match Types.get_desc t with
+  | Tconstr (p, [], _)
+    when Path.same p Predef.path_int || Path.same p Predef.path_bool
+         || Path.same p Predef.path_unit ->
+      true
+  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+  | Tconstr (p, [], _) ->
+      begin match find types p with
+      | Some { heap = Some _; _ } -> true
+      | Some { id = Some _; ctors; _ } ->
+          List.for_all ctors ~f:(fun c -> List.is_empty c.args)
+      | _ -> false
+      end
+  | Tpoly (t, []) -> immediate types t
+  | _ -> false
 
 (** The field of the record type of [label], and whether its record is a reference. *)
 let find_label (types : t list) (label : Data_types.label_description) =
