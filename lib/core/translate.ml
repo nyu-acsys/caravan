@@ -37,6 +37,19 @@ let is_unit (t : Types.type_expr) =
   | Tconstr (p, [], _) -> Path.same p Predef.path_unit
   | _ -> false
 
+let is_int (t : Types.type_expr) =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) -> Path.same p Predef.path_int
+  | _ -> false
+
+(** That the value of [x] is in the range of OCaml's [int], if its type is [int]. *)
+let range_spec ~loc:l (t : Types.type_expr) x =
+  Option.some_if (is_int t)
+    (R.Spec.make
+       (R.Expr.call ~loc:l
+          (R.Name.make ~loc:l Prelude.in_range)
+          [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+
 (** The names of a function's variables in Raven: OCaml's, made distinct where a name is
     bound twice. *)
 module Names = struct
@@ -64,35 +77,58 @@ module Names = struct
     List.Assoc.find names.bound (Ident.unique_name id) ~equal:String.equal
 end
 
+type origin = { at : Location.t; message : string }
+(** A check the translation generates, with what it checks, as the message to report when
+    it fails. *)
+
 type context = {
   names : Names.t;
   functions : (string * string) list;
       (** The top-level functions, by the unique name of their OCaml identifier. *)
+  origins : origin list ref;
 }
+
+(** The assertion [c] checking, at [at], what [message] says may fail. *)
+let check ctx ~(at : Location.t) message c =
+  ctx.origins := { at; message } :: !(ctx.origins);
+  R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
+
+(** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
+let no_overflow ctx ~at what v =
+  let l = loc at in
+  let bound op n = R.Expr.binary ~loc:l op v (R.Expr.int ~loc:l n) in
+  check ctx ~at
+    (Printf.sprintf "This %s may overflow" what)
+    (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
+
+let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
+
+(** The name of [p] if it is a value of the standard library's toplevel. *)
+let stdlib_name (p : Path.t) =
+  match p with
+  | Pdot (Pident m, x) when String.equal (Ident.name m) "Stdlib" -> Some x
+  | _ -> None
 
 (** The operators of the standard library that Raven has, by their paths. *)
 let binop_of_path (p : Path.t) : R.Expr.binop option =
-  match Path.name p with
-  | "Stdlib.+" -> Some Plus
-  | "Stdlib.-" -> Some Minus
-  | "Stdlib.*" -> Some Mult
-  | "Stdlib./" -> Some Div
-  | "Stdlib.mod" -> Some Mod
-  | "Stdlib.=" | "Stdlib.==" -> Some Eq
-  | "Stdlib.<>" | "Stdlib.!=" -> Some Neq
-  | "Stdlib.<" -> Some Lt
-  | "Stdlib.<=" -> Some Leq
-  | "Stdlib.>" -> Some Gt
-  | "Stdlib.>=" -> Some Geq
-  | "Stdlib.&&" -> Some And
-  | "Stdlib.||" -> Some Or
+  match stdlib_name p with
+  | Some "+" -> Some Plus
+  | Some "-" -> Some Minus
+  | Some "*" -> Some Mult
+  | Some "/" -> Some Div
+  | Some "mod" -> Some Mod
+  | Some ("=" | "==") -> Some Eq
+  | Some ("<>" | "!=") -> Some Neq
+  | Some "<" -> Some Lt
+  | Some "<=" -> Some Leq
+  | Some ">" -> Some Gt
+  | Some ">=" -> Some Geq
+  | Some "&&" -> Some And
+  | Some "||" -> Some Or
   | _ -> None
 
 let unop_of_path (p : Path.t) =
-  match Path.name p with
-  | "Stdlib.not" -> Some `Not
-  | "Stdlib.~-" -> Some `Neg
-  | _ -> None
+  match stdlib_name p with Some "not" -> Some `Not | Some "~-" -> Some `Neg | _ -> None
 
 let unit_value ~loc = R.Expr.tuple ~loc []
 
@@ -112,7 +148,11 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       match Names.find ctx.names id with
       | Some x -> Ok ([], R.Expr.var ~loc:l (name ~loc:l x))
       | None -> unsupported at "A function used as a value")
-  | Texp_ident _ -> unsupported at "This identifier"
+  | Texp_ident (p, _, _) -> (
+      match stdlib_name p with
+      | Some "max_int" -> Ok ([], R.Expr.int ~loc:l Prelude.max_int)
+      | Some "min_int" -> Ok ([], R.Expr.int ~loc:l Prelude.min_int)
+      | _ -> unsupported at "This identifier")
   | Texp_constant (Const_int n) -> Ok ([], R.Expr.int ~loc:l n)
   | Texp_constant _ -> unsupported at "This constant"
   | Texp_construct ({ txt = Lident "true"; _ }, _, []) -> Ok ([], R.Expr.bool ~loc:l true)
@@ -176,13 +216,35 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
         in
         Ok (a_stmts @ stmts, v)
   | Some op, _, [ a; b ] ->
+      let divisor = b.exp_loc in
       let* b_stmts, b = expr ctx b in
       let* a_stmts, a = expr ctx a in
-      Ok (b_stmts @ a_stmts, R.Expr.binary ~loc:l op a b)
-  | _, Some op, [ a ] ->
+      let stmts = b_stmts @ a_stmts in
+      let nonzero () =
+        check ctx ~at:divisor "This divisor may be zero"
+          (R.Expr.binary ~loc:(loc divisor) Neq b (R.Expr.int ~loc:(loc divisor) 0))
+      in
+      let checked what v = Ok (stmts @ [ no_overflow ctx ~at what v ], v) in
+      begin match op with
+      | Plus -> checked "addition" (R.Expr.binary ~loc:l op a b)
+      | Minus -> checked "subtraction" (R.Expr.binary ~loc:l op a b)
+      | Mult -> checked "multiplication" (R.Expr.binary ~loc:l op a b)
+      | Div ->
+          let v = prelude_call ~loc:l Prelude.div [ a; b ] in
+          let nonzero = nonzero () in
+          Ok (stmts @ [ nonzero; no_overflow ctx ~at "division" v ], v)
+      | Mod ->
+          let nonzero = nonzero () in
+          Ok (stmts @ [ nonzero ], prelude_call ~loc:l Prelude.mod_ [ a; b ])
+      | _ -> Ok (stmts, R.Expr.binary ~loc:l op a b)
+      end
+  | _, Some op, [ a ] -> (
       let* stmts, a = expr ctx a in
-      Ok
-        (stmts, match op with `Not -> R.Expr.not_ ~loc:l a | `Neg -> R.Expr.neg ~loc:l a)
+      match op with
+      | `Not -> Ok (stmts, R.Expr.not_ ~loc:l a)
+      | `Neg ->
+          let v = R.Expr.neg ~loc:l a in
+          Ok (stmts @ [ no_overflow ctx ~at "negation" v ], v))
   | None, None, _ -> (
       match path with
       | Pident id -> (
@@ -249,12 +311,18 @@ let rec formula (vars : (string * string) list) (f : Parsetree.expression) :
   let binop op a b =
     let* a = formula vars a in
     let* b = formula vars b in
-    Ok (R.Expr.binary ~loc:l op a b)
+    match op with
+    | R.Expr.Div -> Ok (prelude_call ~loc:l Prelude.div [ a; b ])
+    | Mod -> Ok (prelude_call ~loc:l Prelude.mod_ [ a; b ])
+    | _ -> Ok (R.Expr.binary ~loc:l op a b)
   in
   match f.pexp_desc with
-  | Pexp_ident { txt = Lident x; _ } ->
-      let x = Option.value (List.Assoc.find vars x ~equal:String.equal) ~default:x in
-      Ok (R.Expr.var ~loc:l (name ~loc:l x))
+  | Pexp_ident { txt = Lident x; _ } -> (
+      match (List.Assoc.find vars x ~equal:String.equal, x) with
+      | Some x, _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
+      | None, "max_int" -> Ok (R.Expr.int ~loc:l Prelude.max_int)
+      | None, "min_int" -> Ok (R.Expr.int ~loc:l Prelude.min_int)
+      | None, _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x)))
   | Pexp_constant { pconst_desc = Pconst_integer (n, None); _ } ->
       Ok (R.Expr.int ~loc:l (Int.of_string n))
   | Pexp_construct ({ txt = Lident "true"; _ }, None) -> Ok (R.Expr.bool ~loc:l true)
@@ -303,10 +371,10 @@ type func = {
 (** A top-level function [f] with its parameters [params] and [body], and its contract. *)
 
 (** The procedure of [f]. *)
-let proc (functions : (string * string) list) (f : func) : (R.Callable.t, error) Result.t
-    =
+let proc (functions : (string * string) list) origins (f : func) :
+    (R.Callable.t, error) Result.t =
   let names = Names.create () in
-  let ctx = { names; functions } in
+  let ctx = { names; functions; origins } in
   let l = loc f.loc in
   let* formals =
     all f.params ~f:(fun (p : Typedtree.function_param) ->
@@ -316,8 +384,15 @@ let proc (functions : (string * string) list) (f : func) : (R.Callable.t, error)
             let* typ = typ ~at:pat_loc pat_type in
             let x = Names.bind names id in
             Ok
-              ( (Ident.name id, x),
+              ( Some (Ident.name id, x),
+                range_spec ~loc:(loc pat_loc) pat_type x,
                 R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
+        | Tparam_pat
+            { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ }
+          ->
+            let x = Names.fresh names "unit" in
+            let l = loc pat_loc in
+            Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
         | _ -> unsupported p.fp_loc "This parameter")
   in
   let result_name =
@@ -331,9 +406,14 @@ let proc (functions : (string * string) list) (f : func) : (R.Callable.t, error)
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
   (* The names the contract uses: the parameters' and the result's. *)
-  let vars = (result_name, result) :: List.map formals ~f:fst in
+  let vars = (result_name, result) :: List.filter_map formals ~f:(fun (v, _, _) -> v) in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula vars f) ~f:(fun e -> R.Spec.make e))
+  in
+  (* Values of type [int] are in its range. *)
+  let in_range = List.filter_map formals ~f:(fun (_, range, _) -> range) in
+  let result_in_range =
+    if List.is_empty returns then None else range_spec ~loc:l f.body.exp_type result
   in
   let* requires =
     specs (Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires))
@@ -341,6 +421,8 @@ let proc (functions : (string * string) list) (f : func) : (R.Callable.t, error)
   let* ensures =
     specs (Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures))
   in
+  let requires = in_range @ requires in
+  let ensures = Option.to_list result_in_range @ ensures in
   let* stmts, v = expr ctx f.body in
   let body =
     if List.is_empty returns then stmts
@@ -353,8 +435,9 @@ let proc (functions : (string * string) list) (f : func) : (R.Callable.t, error)
         ]
   in
   Ok
-    (R.Callable.proc ~loc:l ~formals:(List.map formals ~f:snd) ~returns ~requires ~ensures
-       (ident ~loc:l f.raven_name) (Some body))
+    (R.Callable.proc ~loc:l
+       ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
+       ~returns ~requires ~ensures (ident ~loc:l f.raven_name) (Some body))
 
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
@@ -403,13 +486,15 @@ let functions (structure : Typedtree.structure) (annotations : Annotation.t list
   Ok (List.concat funcs)
 
 (** The Raven program of [source]. *)
-let program (source : Source.t) : (R.Program.t, error) Result.t =
+let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
   let* funcs = functions source.typed annotations in
   let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)) in
-  let* procs = all funcs ~f:(proc functions) in
+  let origins = ref [] in
+  let* procs = all funcs ~f:(proc functions origins) in
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   Ok
-    (R.Program.make
-       ~loc:(R.Loc.make file_start file_start)
-       (List.map procs ~f:R.Member.callable))
+    ( R.Program.make
+        ~loc:(R.Loc.make file_start file_start)
+        (Prelude.members @ List.map procs ~f:R.Member.callable),
+      !origins )

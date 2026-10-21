@@ -2,6 +2,7 @@
 
 let wrong x = x + 1
 (*@ r = wrong x
+    requires x < max_int
     ensures r = x *)
 
 let pred n = n - 1
