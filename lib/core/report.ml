@@ -50,3 +50,4 @@ let print_diagnostic (d : R.Diagnostic.t) =
   | Error -> Logs.err (fun m -> m "%s" (R.Diagnostic.to_string d))
 
 let print (e : error) = print_diagnostic (to_diagnostic e)
+let unsupported loc what = Error (error Unsupported loc (what ^ " is not supported yet"))

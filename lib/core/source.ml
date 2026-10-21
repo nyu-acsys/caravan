@@ -13,6 +13,8 @@ type t = {
 let load (file : string) : (t, Report.error) Result.t =
   try
     Compmisc.init_path ();
+    (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
+    let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
     let lexbuf = Lexing.from_string (Stdio.In_channel.read_all file) in
     Location.init lexbuf file;
