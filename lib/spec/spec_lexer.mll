@@ -37,6 +37,7 @@
         "forall", FORALL;
         "if", IF;
         "assert", ASSERT;
+        "atomic", ATOMIC;
         "fold", FOLD;
         "in", IN;
         "invariant", INVARIANT;
@@ -107,6 +108,17 @@
     let pos = lexbuf.lex_curr_p in
     lexbuf.lex_curr_p <-
       { pos with pos_lnum = pos.pos_lnum + 1; pos_bol = pos.pos_cnum }
+
+  (* The lines that the lexeme spans, as [atomic] and [requires] on two. *)
+  let newlines lexbuf =
+    let start = Lexing.lexeme_start lexbuf in
+    String.iteri
+      (fun i c ->
+        if c = '\n' then
+          let pos = lexbuf.lex_curr_p in
+          lexbuf.lex_curr_p <-
+            { pos with pos_lnum = pos.pos_lnum + 1; pos_bol = start + i + 1 })
+      (Lexing.lexeme lexbuf)
 }
 
 
@@ -160,6 +172,10 @@ rule token = parse
       { newline lexbuf; token lexbuf }
   | space+
       { token lexbuf }
+  | "atomic" (space | newline)+ "requires"
+      { newlines lexbuf; ATOMIC_REQUIRES }
+  | "atomic" (space | newline)+ "ensures"
+      { newlines lexbuf; ATOMIC_ENSURES }
   | int_literal as lit
       { INTEGER (lit, None) }
   | (int_literal as lit) (int_literal_modifier as modif)

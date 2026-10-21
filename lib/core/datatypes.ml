@@ -29,6 +29,7 @@ type t = {
   module_name : string;
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
+  alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
   at : Location.t;
 }
 
@@ -42,6 +43,7 @@ let list =
         { ocaml = "::"; raven = "::"; fields = [ "hd"; "tl" ]; args = [] };
       ];
     heap = None;
+    alias = None;
     at = Location.none;
   }
 
@@ -55,6 +57,7 @@ let option =
         { ocaml = "Some"; raven = "some"; fields = [ "value" ]; args = [] };
       ];
     heap = None;
+    alias = None;
     at = Location.none;
   }
 
@@ -83,6 +86,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           module_name = String.capitalize decl.typ_name.txt;
           ctors;
           heap = None;
+          alias = None;
           at;
         }
   | Ttype_record lds when List.is_empty decl.typ_params ->
@@ -113,8 +117,28 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
               };
             ] )
       in
-      Ok { id = Some decl.typ_id; module_name = String.capitalize name; ctors; heap; at }
-  | Ttype_variant _ | Ttype_record _ -> Report.unsupported at "A type with parameters"
+      Ok
+        {
+          id = Some decl.typ_id;
+          module_name = String.capitalize name;
+          ctors;
+          heap;
+          alias = None;
+          at;
+        }
+  | Ttype_abstract when List.is_empty decl.typ_params && Option.is_some decl.typ_manifest
+    ->
+      Ok
+        {
+          id = Some decl.typ_id;
+          module_name = String.capitalize decl.typ_name.txt;
+          ctors = [];
+          heap = None;
+          alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
+          at;
+        }
+  | Ttype_variant _ | Ttype_record _ | Ttype_abstract ->
+      Report.unsupported at "A type with parameters"
   | _ -> Report.unsupported at "This type definition"
 
 let declares (d : t) (p : Path.t) =
@@ -125,6 +149,18 @@ let find (types : t list) (p : Path.t) =
   if Path.same p Predef.path_list then Some list
   else if Path.same p Predef.path_option then Some option
   else List.find types ~f:(fun d -> declares d p)
+
+(** [t] with the abbreviations of [types] at its head expanded. *)
+let rec expand (types : t list) (t : Types.type_expr) =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) ->
+      begin match find types p with
+      | Some { alias = Some t; _ } -> expand types t
+      | _ -> t
+      end
+  | _ -> t
+
+let desc types t = Types.get_desc (expand types t)
 
 (** The data type and constructor of [cstr]. *)
 let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
@@ -164,7 +200,7 @@ let ctor_name ~loc:l (d : t) (c : ctor) =
 let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
     (R.Type.t, Report.error) Result.t =
   let l = loc at in
-  match Types.get_desc t with
+  match desc types t with
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
@@ -194,7 +230,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
 (** A name for the type [t], unique among those of [types], for the names of the fields of
     ref cells, as [IntList] for [int list]. *)
 let rec tag (types : t list) (t : Types.type_expr) : string =
-  match Types.get_desc t with
+  match desc types t with
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> "Int"
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> "Bool"
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> "Unit"
@@ -214,7 +250,7 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
     on them is equality: integers, booleans, unit, references, and variants whose
     constructors are all constant. *)
 let rec immediate (types : t list) (t : Types.type_expr) =
-  match Types.get_desc t with
+  match desc types t with
   | Tconstr (p, [], _)
     when Path.same p Predef.path_int || Path.same p Predef.path_bool
          || Path.same p Predef.path_unit ->
@@ -229,6 +265,26 @@ let rec immediate (types : t list) (t : Types.type_expr) =
       end
   | Tpoly (t, []) -> immediate types t
   | _ -> false
+
+(** Whether values of type [t] may contain references. *)
+let has_refs (types : t list) (t : Types.type_expr) =
+  let rec go seen t =
+    match desc types t with
+    | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+    | Tconstr (p, args, _) -> begin
+        List.exists args ~f:(go seen)
+        ||
+        match find types p with
+        | Some { heap = Some _; _ } -> true
+        | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same) ->
+            List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (id :: seen)))
+        | _ -> false
+      end
+    | Ttuple components -> List.exists components ~f:(fun (_, t) -> go seen t)
+    | Tpoly (t, []) -> go seen t
+    | _ -> false
+  in
+  go [] t
 
 (** The field of the record type of [label], and whether its record is a reference. *)
 let find_label (types : t list) (label : Data_types.label_description) =

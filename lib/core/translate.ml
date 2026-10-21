@@ -83,6 +83,35 @@ type origin = { at : Location.t; message : string }
 (** A check the translation generates, with what it checks, as the message to report when
     it fails. *)
 
+(** Whether a function with an atomic contract has linearized, as far as the translation
+    knows: committed its atomic update, or not yet; or committed if the last
+    [compare_and_set] succeeded. *)
+type au_state = Pending | Committed | Unknown | On_cas
+
+(** What a function with an atomic contract does at an atomic step on its abstract state.
+*)
+type au_close =
+  | Commit  (** The step linearizes the function. *)
+  | Abort  (** The step does not change the abstract state. *)
+  | Commit_call  (** The step is a call, which linearizes the function in its place. *)
+
+type au = {
+  mutable state : au_state;
+  mutable cas_results : (string * bool) list;
+      (** Variables bound to the result of a [compare_and_set], or its negation if
+          [false], by their unique names. *)
+  self : string;  (** The procedure's name. *)
+  open_ :
+    at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list, Report.error) Result.t;
+      (** Opens the atomic update for the step at [at]: the statements, unfolding the
+          atomic precondition's predicates if [unfold], and the values of the implicit
+          parameters. *)
+  close :
+    at:Location.t -> au_close -> R.Expr.t list -> (R.Stmt.t list, Report.error) Result.t;
+      (** Closes the atomic update opened with the values of the implicit parameters. *)
+}
+(** The atomic update of a function with an atomic contract. *)
+
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Type.t) list ref;
@@ -105,6 +134,8 @@ type context = {
   mutable facts : R.Spec.t list;
       (** Facts that hold throughout the function: its preconditions without [own], which
           only mention variables, all immutable. *)
+  mutable au : au option;
+      (** The atomic update, for a function with an atomic contract. *)
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
@@ -141,7 +172,7 @@ let primitive ctx ~at elt op =
 (** The Raven field named [label] of the values of type [t] that are references; an
     atomic's contents have the empty label, as in [own a v]. *)
 let field_of_type ctx ~at (t : Types.type_expr) label =
-  match Types.get_desc t with
+  match Datatypes.desc ctx.types t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
       let* field = ref_field ctx ~at elt in
       Ok (Some field)
@@ -161,7 +192,7 @@ let field_of_type ctx ~at (t : Types.type_expr) label =
 
 (** The OCaml type of the field [label] of values of type [t] that are references. *)
 let field_type ctx (t : Types.type_expr) label =
-  match Types.get_desc t with
+  match Datatypes.desc ctx.types t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
       Some elt
   | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
@@ -589,7 +620,7 @@ and application env (t : S.term) =
 *)
 and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_expr) list
     =
-  match (p.pat_desc, Types.get_desc t) with
+  match (p.pat_desc, Datatypes.desc env.data t) with
   | Pid id, _ -> [ (id.pid_str, t) ]
   | Pcast (p, _), _ -> pattern_types env p t
   | Ptuple ps, Ttuple ts when List.length ps = List.length ts ->
@@ -951,6 +982,63 @@ and owned_names (t : S.term) =
   | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
   | None, _ -> []
 
+(** The statements of [access], an atomic step, inside the atomic update of a function
+    with an atomic contract that has not linearized yet; [close] says how the step closes
+    it, [`Cas x] by committing if [x], the result of a [compare_and_set], holds. *)
+let linearize ctx ~at (close : [ `Close of au_close | `Cas of R.Expr.t ]) access =
+  match ctx.au with
+  | None -> Ok access
+  | Some au ->
+      begin match au.state with
+      | Committed -> Ok access
+      | Unknown | On_cas ->
+          error at
+            "Caravan cannot tell whether the function has linearized before this step"
+      | Pending ->
+          let* opening, values = au.open_ ~at ~unfold:true in
+          let* closing =
+            match close with
+            | `Close c ->
+                au.state <- (match c with Abort -> Pending | _ -> Committed);
+                au.close ~at c values
+            | `Cas x ->
+                let* commit = au.close ~at Commit values in
+                let* abort = au.close ~at Abort values in
+                au.state <- On_cas;
+                Ok [ R.Stmt.if_ ~loc:(loc at) x commit abort ]
+          in
+          Ok (opening @ access @ closing)
+      end
+
+(** The state of the atomic update after two branches. *)
+let join_au a b = if Poly.equal a b then a else Unknown
+
+let au_state ctx = Option.map ctx.au ~f:(fun au -> au.state)
+
+let set_au_state ctx = function
+  | Some state -> Option.iter ctx.au ~f:(fun au -> au.state <- state)
+  | None -> ()
+
+(** Whether [c] is the result of a [compare_and_set], [Some false] if its negation. *)
+let rec cas_polarity ctx (c : Typedtree.expression) =
+  match c.exp_desc with
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) ->
+      begin match (atomic_name path, unop_of_path path, args) with
+      | Some "compare_and_set", _, _ -> Some true
+      | _, Some `Not, [ (_, Arg a) ] -> Option.map (cas_polarity ctx a) ~f:not
+      | _ -> None
+      end
+  | Texp_ident (Pident id, _, _) ->
+      Option.bind ctx.au ~f:(fun au ->
+          List.Assoc.find au.cas_results (Ident.unique_name id) ~equal:String.equal)
+  | _ -> None
+
+let no_loop_before_linearizing ctx ~at =
+  match au_state ctx with
+  | None | Some Committed -> Ok ()
+  | Some _ ->
+      unsupported at "A loop in a function with an atomic contract, before it linearizes,"
+
 (** The statements evaluating [e], and the value of [e] after them. *)
 let rec expr (ctx : context) (e : Typedtree.expression) :
     (R.Stmt.t list * R.Expr.t, error) Result.t =
@@ -1071,14 +1159,23 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       apply ctx e path args
   | Texp_apply _ -> unsupported at "This application"
   | Texp_ifthenelse (c, e1, e2) ->
+      let polarity = cas_polarity ctx c in
       let* c_stmts, c = expr ctx c in
-      let* stmts = branch ctx e (fun target -> conditional ctx ~at c e1 e2 target) in
+      let* stmts =
+        branch ctx e (fun target -> conditional ctx ~at ?polarity c e1 e2 target)
+      in
       Ok (c_stmts @ fst stmts, snd stmts)
   | Texp_let (Nonrecursive, bindings, body) ->
       (* The bound expressions are evaluated before any of their variables is bound. *)
       let* evaluated =
         all bindings ~f:(fun (vb : Typedtree.value_binding) ->
+            let polarity = cas_polarity ctx vb.vb_expr in
             let* stmts, v = expr ctx vb.vb_expr in
+            begin match (ctx.au, polarity, vb.vb_pat.pat_desc) with
+            | Some au, Some p, Tpat_var (id, _, _) ->
+                au.cas_results <- (Ident.unique_name id, p) :: au.cas_results
+            | _ -> ()
+            end;
             Ok (vb, stmts, v))
       in
       let* defs =
@@ -1113,6 +1210,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       let* stmts2, v = expr ctx e2 in
       Ok (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
+      let* () = no_loop_before_linearizing ctx ~at in
       let* spec = loop_spec ctx ~after:cond.exp_loc body in
       let* c_stmts, c = expr ctx cond in
       let x = Names.fresh ctx.names "continue" in
@@ -1145,6 +1243,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
               ],
             unit_value ~loc:l )
   | Texp_for (id, _, lo, hi, direction, body) ->
+      let* () = no_loop_before_linearizing ctx ~at in
       let* spec = loop_spec ctx ~after:hi.exp_loc body in
       let* lo_stmts, lo = expr ctx lo in
       let* hi_stmts, hi = expr ctx hi in
@@ -1201,7 +1300,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
   let at = e.exp_loc in
   let l = loc at in
   let contents (r : Typedtree.expression) =
-    match Types.get_desc r.exp_type with
+    match Datatypes.desc ctx.types r.exp_type with
     | Tconstr (_, [ elt ], _) -> ref_field ctx ~at elt
     | _ -> unsupported at "This reference"
   in
@@ -1254,19 +1353,24 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   let at = e.exp_loc in
   let l = loc at in
   let element (t : Types.type_expr) =
-    match Types.get_desc t with
+    match Datatypes.desc ctx.types t with
     | Tconstr (_, [ elt ], _) -> Ok elt
     | _ -> unsupported at "This atomic"
   in
-  (* The result of [f] applied to the atomic and [args], in a variable. *)
-  let result f atomic args =
+  (* The result of [f] applied to the atomic and [args], in a variable, a step closing an
+     atomic update as [close] says. *)
+  let result ?close f atomic args =
     let* typ = typ ctx ~at e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
+    let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
-    Ok
-      ( R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)
-        @ assume_in_range ~loc:l e.exp_type x,
-        R.Expr.var ~loc:l (name ~loc:l x) )
+    let close = Option.value close ~default:(`Close Commit) in
+    let* step =
+      linearize ctx ~at
+        (match close with `Cas -> `Cas v | `Close c -> `Close c)
+        (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
+    in
+    Ok (step @ assume_in_range ~loc:l e.exp_type x, v)
   in
   let* elt =
     match args with
@@ -1287,19 +1391,23 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* typ = typ ctx ~at e.exp_type in
       let x = Names.fresh ctx.names "tmp" in
       let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (name ~loc:l field)) in
+      let* step =
+        linearize ctx ~at (`Close Abort)
+          (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+      in
       Ok
-        ( stmts
-          @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x)
-          @ assume_in_range ~loc:l e.exp_type x,
+        ( stmts @ step @ assume_in_range ~loc:l e.exp_type x,
           R.Expr.var ~loc:l (name ~loc:l x) )
-  | "set", [ a; v ] -> Ok (stmts @ [ write ~loc:l a field v ], unit_value ~loc:l)
+  | "set", [ a; v ] ->
+      let* step = linearize ctx ~at (`Close Commit) [ write ~loc:l a field v ] in
+      Ok (stmts @ step, unit_value ~loc:l)
   | "exchange", [ a; v ] ->
       let* f = primitive Exchange in
       let* reading, r = result f a [ v ] in
       Ok (stmts @ reading, r)
   | "compare_and_set", [ a; old_val; new_val ] ->
       let* f = primitive Compare_and_set in
-      let* reading, r = result f a [ old_val; new_val ] in
+      let* reading, r = result ~close:`Cas f a [ old_val; new_val ] in
       Ok (stmts @ reading, r)
   | "fetch_and_add", [ a; n ] ->
       let* f = primitive Fetch_and_add in
@@ -1310,9 +1418,11 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let x = Names.fresh ctx.names "tmp" in
       let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
-      Ok
-        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x),
-          unit_value ~loc:l )
+      let* step =
+        linearize ctx ~at (`Close Commit)
+          (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
+      in
+      Ok (stmts @ step, unit_value ~loc:l)
   | _ -> unsupported at ("Atomic." ^ op)
 
 (** The application of the operator or function at [path] to [args], in [e]. *)
@@ -1404,13 +1514,32 @@ and call ctx (e : Typedtree.expression) f args =
   let* stmts_args = all (List.rev args) ~f:(fun arg -> expr ctx arg) in
   let stmts = List.concat_map stmts_args ~f:fst in
   let args = List.rev_map stmts_args ~f:snd in
-  let callee = R.Expr.call ~loc:l (name ~loc:l f) args in
-  if is_unit e.exp_type then Ok (stmts @ [ R.Stmt.call ~loc:l callee ], unit_value ~loc:l)
+  (* A recursive call before the function linearizes is a retry, which linearizes it in
+     its place, with the atomic update's values of the implicit parameters. *)
+  let* opening, implicit, closing =
+    match ctx.au with
+    | Some au when String.equal au.self f ->
+        begin match au.state with
+        | Pending ->
+            let* opening, values = au.open_ ~at:e.exp_loc ~unfold:false in
+            let* closing = au.close ~at:e.exp_loc Commit_call values in
+            au.state <- Committed;
+            Ok (opening, values, closing)
+        | Committed -> Ok ([], [], [])
+        | Unknown | On_cas ->
+            error e.exp_loc
+              "Caravan cannot tell whether the function has linearized before this call"
+        end
+    | _ -> Ok ([], [], [])
+  in
+  let callee = R.Expr.call ~loc:l (name ~loc:l f) (args @ implicit) in
+  if is_unit e.exp_type then
+    Ok (stmts @ opening @ [ R.Stmt.call ~loc:l callee ] @ closing, unit_value ~loc:l)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
     let def = R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs callee) (ident ~loc:l x) in
-    Ok (stmts @ def, R.Expr.var ~loc:l (name ~loc:l x))
+    Ok (stmts @ opening @ def @ closing, R.Expr.var ~loc:l (name ~loc:l x))
 
 (** The statements evaluating [args], right to left as OCaml does, and their values. *)
 and operands ctx (args : Typedtree.expression list) =
@@ -1471,8 +1600,12 @@ and pattern ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 and match_cases ctx ~at v (cases : (Typedtree.pattern * Typedtree.expression) list) ~total
     target =
   let l = loc at in
+  (* Each case starts in the state of the atomic update before the match. *)
+  let start = au_state ctx in
+  let ends = ref [] in
   (* The body of a case, after defining the variables of its pattern. *)
   let case_body binds (rhs : Typedtree.expression) =
+    set_au_state ctx start;
     let* defs =
       all binds ~f:(fun (id, value, t) ->
           let* typ = typ ctx ~at t in
@@ -1485,43 +1618,49 @@ and match_cases ctx ~at v (cases : (Typedtree.pattern * Typedtree.expression) li
     let assignment =
       Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
     in
+    ends := au_state ctx :: !ends;
     Ok (List.concat defs @ stmts @ assignment)
   in
   let not_exhaustive () =
     [ check ctx ~at "This match may not be exhaustive" (R.Expr.bool ~loc:l false) ]
   in
-  match flat_cases ctx v cases with
-  | Some flat ->
-      let* raven_cases =
-        all flat ~f:(fun (case, binds, in_range, rhs) ->
-            let* body = case_body binds rhs in
-            Ok (case, in_range @ body))
-      in
-      let has_default =
-        List.exists flat ~f:(fun (case, _, _, _) ->
-            match case with R.Expr.Default -> true | Case _ -> false)
-      in
-      let default =
-        if total || has_default then [] else [ (R.Expr.Default, not_exhaustive ()) ]
-      in
-      Ok [ R.Stmt.match_ ~loc:l v (raven_cases @ default) ]
-  | None ->
-      let rec chain = function
-        | [] -> Ok (if total then [] else not_exhaustive ())
-        | [ (p, rhs) ] when total ->
-            let* _, binds = pattern ctx p v in
-            case_body binds rhs
-        | (p, rhs) :: rest -> begin
-            let* cond, binds = pattern ctx p v in
-            let* body = case_body binds rhs in
-            match cond with
-            | None -> Ok body
-            | Some cond ->
-                let* rest = chain rest in
-                Ok [ R.Stmt.if_ ~loc:l cond body rest ]
-          end
-      in
-      chain cases
+  let* stmts =
+    match flat_cases ctx v cases with
+    | Some flat ->
+        let* raven_cases =
+          all flat ~f:(fun (case, binds, in_range, rhs) ->
+              let* body = case_body binds rhs in
+              Ok (case, in_range @ body))
+        in
+        let has_default =
+          List.exists flat ~f:(fun (case, _, _, _) ->
+              match case with R.Expr.Default -> true | Case _ -> false)
+        in
+        let default =
+          if total || has_default then [] else [ (R.Expr.Default, not_exhaustive ()) ]
+        in
+        Ok [ R.Stmt.match_ ~loc:l v (raven_cases @ default) ]
+    | None ->
+        let rec chain = function
+          | [] -> Ok (if total then [] else not_exhaustive ())
+          | [ (p, rhs) ] when total ->
+              let* _, binds = pattern ctx p v in
+              case_body binds rhs
+          | (p, rhs) :: rest -> begin
+              let* cond, binds = pattern ctx p v in
+              let* body = case_body binds rhs in
+              match cond with
+              | None -> Ok body
+              | Some cond ->
+                  let* rest = chain rest in
+                  Ok [ R.Stmt.if_ ~loc:l cond body rest ]
+            end
+        in
+        chain cases
+  in
+  set_au_state ctx
+    (Option.first_some (List.reduce (List.filter_opt !ends) ~f:join_au) start);
+  Ok stmts
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
     constructors with variables or [_] as arguments, possibly followed by a variable or
@@ -1576,17 +1715,31 @@ and flat_cases ctx v cases =
   Option.map (flat [] cases) ~f:(List.map ~f:case)
 
 (** [if c then e1 else e2], with its value assigned to [target] if there is one. *)
-and conditional ctx ~at c (e1 : Typedtree.expression) (e2 : Typedtree.expression option)
-    target =
+and conditional ctx ~at ?polarity c (e1 : Typedtree.expression)
+    (e2 : Typedtree.expression option) target =
   let l = loc at in
-  let arm = function
-    | None -> Ok []
-    | Some e -> (
-        let* stmts, v = expr ctx e in
-        match target with Some t -> Ok (stmts @ [ assign t v ]) | None -> Ok stmts)
+  (* The state of the atomic update in each arm: if [c] is the result of the
+     [compare_and_set] that may have linearized the function, whether it did. *)
+  let start = au_state ctx in
+  let arm_state taken =
+    match (start, polarity) with
+    | Some On_cas, Some p -> Some (if Bool.equal p taken then Committed else Pending)
+    | _ -> start
   in
-  let* then_ = arm (Some e1) in
-  let* else_ = arm e2 in
+  let arm taken e =
+    set_au_state ctx (arm_state taken);
+    let* stmts =
+      match e with
+      | None -> Ok []
+      | Some e -> (
+          let* stmts, v = expr ctx e in
+          match target with Some t -> Ok (stmts @ [ assign t v ]) | None -> Ok stmts)
+    in
+    Ok (stmts, au_state ctx)
+  in
+  let* then_, then_state = arm true (Some e1) in
+  let* else_, else_state = arm false e2 in
+  set_au_state ctx (Option.map2 then_state else_state ~f:join_au);
   Ok [ R.Stmt.if_ ~loc:l c then_ else_ ]
 
 (** The statements [make target] computing the value of [e] into a new variable [target],
@@ -1652,7 +1805,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       ( { exp_desc = Texp_ident (path, _, _); _ },
         [ (Nolabel, Arg ({ exp_desc = Texp_ident (Pident r, _, _); _ } as cell)) ] )
     when Option.equal String.equal (stdlib_name path) (Some "!") ->
-      begin match (Names.find ctx.names r, Types.get_desc cell.exp_type) with
+      begin match (Names.find ctx.names r, Datatypes.desc ctx.types cell.exp_type) with
       | Some x, Tconstr (_, [ elt ], _) -> begin
           let* field = ref_field ctx ~at elt in
           match List.Assoc.find reads (x, field) ~equal:Poly.equal with
@@ -1855,7 +2008,9 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
     parameters, as [n] in [requires own c.count n], with their Raven names, OCaml types
     and declarations. A name owned as the value of a field has that field's type. *)
 and implicit_vars env (f : func) =
-  let requires = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
+  let requires =
+    Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires @ c.atomic_requires)
+  in
   let* free = free_typed env requires ~at:f.loc in
   Ok
     (List.map free ~f:(fun (x, raven, t, typ, l) ->
@@ -1885,6 +2040,7 @@ let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f
       env = ocaml_env;
       preds;
       facts = [];
+      au = None;
     }
   in
   let l = loc f.loc in
@@ -1920,6 +2076,90 @@ let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f
        ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_typ ]
        ~ensures (ident ~loc:l f.raven_name) (Some body))
 
+(** The predicates that the conjunction [t] applies, with their arguments, as [p x] in
+    [p x && b = false]. *)
+let rec predicate_apps ctx (t : S.term) =
+  let t = S.chain t in
+  let head, args = spine t [] in
+  match (head.term_desc, args) with
+  | Tvar (Qid { pid_str = "&&" | "/\\"; _ }), [ a; b ] ->
+      predicate_apps ctx a @ predicate_apps ctx b
+  | Tvar (Qid { pid_str = p; _ }), _ when List.Assoc.mem ctx.preds p ~equal:String.equal
+    ->
+      [ (p, args, t.term_loc) ]
+  | _ -> []
+
+(** The statements binding the atomic update of the function [self], whose atomic contract
+    has the preconditions [pres] and postconditions [posts], and whose implicit parameters
+    are [implicit]; sets [ctx.au]. An atomic step inside the update unfolds the predicates
+    of [pres], and folds those of [posts] if it commits, and those of [pres] otherwise. *)
+let atomic_update ctx env ~at ~self implicit ~pres ~posts =
+  let fun_loc = at in
+  let phi = Names.fresh ctx.names "phi" in
+  let au_call ~l f args =
+    R.Expr.call ~loc:l (name ~loc:l f) (R.Expr.var ~loc:l (name ~loc:l phi) :: args)
+  in
+  let pre_preds = List.concat_map pres ~f:(predicate_apps ctx) in
+  let post_preds = List.concat_map posts ~f:(predicate_apps ctx) in
+  (* The contract's environment, with the values of the implicit parameters in the
+     update. *)
+  let opened values =
+    List.fold2_exn implicit values ~init:env ~f:(fun env (x, _, _, _) v ->
+        bind env x (Value v))
+  in
+  let uses make env preds =
+    all preds ~f:(fun (p, args, at) ->
+        let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+        let* args = all args ~f:(formula env) in
+        let l = loc at in
+        Ok (make ~loc:l (name ~loc:l raven) args))
+  in
+  let commit ~l = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ unit_value ~loc:l ]) in
+  let open_ ~at ~unfold =
+    let l = loc at in
+    let* decls =
+      all implicit ~f:(fun (x, _, t, _) ->
+          let* typ = typ ctx ~at t in
+          let v = Names.fresh ctx.names x in
+          Ok
+            ( R.Stmt.local ~loc:l ~ghost:true ~const:false ~typ (ident ~loc:l v),
+              R.Expr.var ~loc:l (name ~loc:l v) ))
+    in
+    let values = List.map decls ~f:snd in
+    let opening =
+      match values with
+      | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
+      | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
+    in
+    let* unfolds =
+      uses
+        (fun ~loc p args -> R.Stmt.unfold ~loc p args)
+        (opened values)
+        (if unfold then pre_preds else [])
+    in
+    Ok (List.concat_map decls ~f:fst @ [ opening ] @ unfolds, values)
+  in
+  let close ~at c values =
+    let l = loc at in
+    let fold preds =
+      uses (fun ~loc p args -> R.Stmt.fold ~loc p args) (opened values) preds
+    in
+    match c with
+    | Commit ->
+        let* folds = fold post_preds in
+        Ok (folds @ [ commit ~l ])
+    | Abort ->
+        let* folds = fold pre_preds in
+        Ok (folds @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ])
+    | Commit_call -> Ok [ commit ~l ]
+  in
+  ctx.au <- Some { state = Pending; cas_results = []; self; open_; close };
+  let l = loc fun_loc in
+  Ok
+    (R.Stmt.local ~loc:l ~ghost:true ~const:true
+       ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l "bindAU") []))
+       (ident ~loc:l phi))
+
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
@@ -1939,6 +2179,7 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
       env = ocaml_env;
       preds;
       facts = [];
+      au = None;
     }
   in
   let l = loc f.loc in
@@ -1956,6 +2197,7 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   (* Ghost statements and invariants in the code can use the implicit parameters. *)
   List.iter implicit ~f:(fun (x, raven, t, _) ->
       ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
+  let implicit_decls = implicit in
   let implicit = List.map implicit ~f:(fun (_, _, _, var) -> var) in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula env f) ~f:(fun e -> R.Spec.make e))
@@ -1967,6 +2209,19 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   in
   let pres = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
   let* requires = specs pres in
+  let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
+  let* () =
+    if atomic && not (List.is_empty returns) then
+      unsupported f.loc "An atomic contract of a function with a result"
+    else Ok ()
+  in
+  let atomic_pres =
+    Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
+  in
+  let* atomic_requires =
+    all atomic_pres ~f:(fun t ->
+        Result.map (formula env t) ~f:(fun e -> R.Spec.make ~atomic:true e))
+  in
   (* Preconditions without [own] only mention immutable variables, so they hold
      throughout, as in loops. *)
   let* facts =
@@ -1977,11 +2232,12 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   ctx.facts <- facts;
   (* Names free in the postconditions are existentially quantified, as [j] in
      [ensures own c.count j]. *)
-  let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
-  let* free = free_typed env posts ~at:f.loc in
-  let* ensures =
+  let postconditions ?atomic posts =
+    let* free = free_typed env posts ~at:f.loc in
     match (free, posts) with
-    | [], _ | _, [] -> specs posts
+    | [], _ | _, [] ->
+        all posts ~f:(fun t ->
+            Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
     | _ ->
         let env =
           List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
@@ -1993,7 +2249,20 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
           List.map free ~f:(fun (_, raven, _, typ, l) ->
               R.Var.make ~loc:l (ident ~loc:l raven) typ)
         in
-        Ok [ R.Spec.make (R.Expr.exists ~loc:l vars conj) ]
+        Ok [ R.Spec.make ?atomic (R.Expr.exists ~loc:l vars conj) ]
+  in
+  let* ensures =
+    postconditions (Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures))
+  in
+  let atomic_posts =
+    Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
+  in
+  let* atomic_ensures = postconditions ~atomic:true atomic_posts in
+  let* bind_au =
+    if atomic then
+      atomic_update ctx env ~at:f.loc ~self:proc_name implicit_decls ~pres:atomic_pres
+        ~posts:atomic_posts
+    else Ok []
   in
   let* () =
     match Option.value_map f.contract ~default:[] ~f:(fun c -> c.variant) with
@@ -2017,8 +2286,8 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
       ]
     else []
   in
-  let requires = in_range @ requires in
-  let ensures = Option.to_list result_in_range @ defined @ ensures in
+  let requires = in_range @ requires @ atomic_requires in
+  let ensures = Option.to_list result_in_range @ defined @ ensures @ atomic_ensures in
   let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
   let* stmts, v = expr ctx f.body in
   let assignment =
@@ -2039,7 +2308,17 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
         (Option.value_map f.next ~default:{ f.loc.loc_end with pos_cnum = Int.max_value }
            ~f:(fun l -> l.loc_start))
   in
-  let body = first @ stmts @ assignment @ last in
+  let* () =
+    match au_state ctx with
+    | None | Some Committed -> Ok ()
+    | Some Pending ->
+        error f.loc
+          "This function may return before it linearizes: no step commits its atomic \
+           contract"
+    | Some (Unknown | On_cas) ->
+        error f.loc "Caravan cannot tell whether this function linearizes on every path"
+  in
+  let body = bind_au @ first @ stmts @ assignment @ last in
   Ok
     (R.Callable.proc ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ implicit)
@@ -2156,6 +2435,7 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
       env = ocaml_env;
       preds;
       facts = [];
+      au = None;
     }
   in
   let l = loc at in
@@ -2176,9 +2456,20 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
     }
   in
   let* body = quantified env p.pred_body in
+  (* The trailing parameters without references, as the abstract value, are outputs:
+     determined by the others, which Raven checks, and found by Raven at calls. *)
+  let inputs, outputs =
+    let n =
+      List.length
+        (List.take_while (List.rev params) ~f:(fun (_, _, t, _) ->
+             not (Datatypes.has_refs types t)))
+    in
+    let n = if n = List.length params then 0 else n in
+    List.split_n params (List.length params - n)
+  in
+  let vars = List.map ~f:(fun (_, _, _, v) -> v) in
   Ok
-    (R.Callable.func ~loc:l ~kind:Pred
-       ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
+    (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
        (ident ~loc:l p.pred_name.pid_str)
        (Some body))
 
@@ -2191,7 +2482,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* modules =
     all
       (List.filter_mapi types ~f:(fun i (d : Datatypes.t) ->
-           Option.some_if (Option.is_none d.heap) (List.take types i, d)))
+           Option.some_if
+             (Option.is_none d.heap && Option.is_none d.alias)
+             (List.take types i, d)))
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
   let* record_fields = Datatypes.fields types in

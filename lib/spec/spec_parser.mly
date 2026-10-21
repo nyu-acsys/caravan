@@ -24,12 +24,19 @@
     match keyword with
     | `Requires -> { c with requires = t :: c.requires }
     | `Ensures -> { c with ensures = t :: c.ensures }
+    | `Atomic_requires -> { c with atomic_requires = t :: c.atomic_requires }
+    | `Atomic_ensures -> { c with atomic_ensures = t :: c.atomic_ensures }
     | `Variant -> { c with variant = t :: c.variant }
     | `Pure -> { c with pure = true }
 
   let mk_contract header clauses =
-    let c = List.fold_left add_clause { empty_contract with header } clauses in
+    let atomic, header =
+      match header with Some (atomic, h) -> (atomic, Some h) | None -> (false, None)
+    in
+    let c = List.fold_left add_clause { empty_contract with header; atomic } clauses in
     { c with requires = List.rev c.requires; ensures = List.rev c.ensures;
+             atomic_requires = List.rev c.atomic_requires;
+             atomic_ensures = List.rev c.atomic_ensures;
              variant = List.rev c.variant }
 %}
 
@@ -48,7 +55,8 @@
 
 (* Contract tokens *)
 
-%token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT
+%token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
+%token ATOMIC_REQUIRES ATOMIC_ENSURES
 
 (* Keywords *)
 
@@ -135,6 +143,8 @@ loop_clause:
 clause:
 | REQUIRES t = term { `Requires, t }
 | ENSURES t = term { `Ensures, t }
+| ATOMIC_REQUIRES t = term { `Atomic_requires, t }
+| ATOMIC_ENSURES t = term { `Atomic_ensures, t }
 | VARIANT t = term { `Variant, t }
 | PURE { `Pure, mk_term Ttrue $loc }
 ;
@@ -147,12 +157,15 @@ header_app:
         nm, [arg1; arg2] }
 
 header:
-| ret=ret_name EQUAL app = header_app
+| ret=ret_name EQUAL atomic=boption(ATOMIC) app = header_app
   { let nm, args = app in
-    { hd_name = nm; hd_ret = ret; hd_args = args } }
+    atomic, { hd_name = nm; hd_ret = ret; hd_args = args } }
 | app = header_app
   { let nm, args = app in
-    { hd_name = nm; hd_ret = [ Lwild ]; hd_args = args } }
+    false, { hd_name = nm; hd_ret = [ Lwild ]; hd_args = args } }
+| ATOMIC app = header_app
+  { let nm, args = app in
+    true, { hd_name = nm; hd_ret = [ Lwild ]; hd_args = args } }
 ;
 
 fun_arg:

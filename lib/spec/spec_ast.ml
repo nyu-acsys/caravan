@@ -82,14 +82,26 @@ type header = { hd_name : id; hd_ret : labelled_arg list; hd_args : labelled_arg
 
 type contract = {
   header : header option;
+  atomic : bool;  (** A logically atomic contract: [atomic f x]. *)
   requires : term list;
   ensures : term list;
+  atomic_requires : term list;
+  atomic_ensures : term list;
   variant : term list;
   pure : bool;
 }
 
 let empty_contract =
-  { header = None; requires = []; ensures = []; variant = []; pure = false }
+  {
+    header = None;
+    atomic = false;
+    requires = [];
+    ensures = [];
+    atomic_requires = [];
+    atomic_ensures = [];
+    variant = [];
+    pure = false;
+  }
 
 type loop_spec = { invariants : term list; loop_variant : term list }
 (** The specification of a loop, written at the start of its body. *)
