@@ -10,6 +10,6 @@
   logs
   logs.cli
   logs.fmt
-  raven.api
+  raven-ivl.api
   caravan_config
   caravan_core))

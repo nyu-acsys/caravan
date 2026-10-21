@@ -3,7 +3,7 @@
 open Cmdliner
 
 let greeting =
-  Printf.sprintf "Caravan version %s (raven.api version %d)" Caravan_config.version
+  Printf.sprintf "Caravan version %s (raven-ivl.api version %d)" Caravan_config.version
     Raven_api.version
 
 (* As Raven's: a level's name as the header, none for the application's messages. *)

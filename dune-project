@@ -19,7 +19,7 @@
    (>= 5.5.0))
   (dune
    (>= 3.12))
-  (raven
+  (raven-ivl
    (>= 1.5.0))
   (ocamlformat
    (and

@@ -12,17 +12,17 @@ specifications written in comments, to [Raven](https://github.com/nyu-acsys/rave
 SMT-based verifier for concurrent separation logic, and reports what Raven finds in terms
 of the OCaml source.
 
-Caravan is at an early stage of development: it does not verify programs yet.
+Caravan is at an early stage of development: so far, it verifies first-order functions on integers and booleans.
 
 ## Building
 
-Caravan needs OCaml 5.5 and the library `raven.api` of Raven, which is not on opam yet.
+Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.
 Install it from Raven's `dev` branch:
 
 ```
 $ opam switch create caravan 5.5.0
 $ eval $(opam env)
-$ opam pin add raven git+https://github.com/nyu-acsys/raven.git#dev
+$ opam pin add raven-ivl git+https://github.com/nyu-acsys/raven.git#dev
 $ opam install . --deps-only --with-test
 $ dune build; dune runtest
 ```

@@ -116,8 +116,8 @@ jobs:
           EOF
           opam pin add -y z3 "$pin_dir"
 
-      # Raven is not on opam yet: its library raven.api comes from its dev branch.
-      - run: opam pin add -y --no-action raven git+https://github.com/nyu-acsys/raven.git#dev
+      # Raven is not on opam yet: its library raven-ivl.api comes from its dev branch.
+      - run: opam pin add -y --no-action raven-ivl git+https://github.com/nyu-acsys/raven.git#dev
 
       - run: opam install . --deps-only --with-test
 
