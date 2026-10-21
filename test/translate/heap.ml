@@ -40,3 +40,9 @@ type point = { x : int; y : int }
 let mirror p = { x = p.y; y = p.x }
 (*@ q = mirror p
     ensures q.x = p.y && q.y = p.x *)
+
+(* Owning an int field implies that its value is in int's range, without reading it. *)
+let check (c : counter) = ()
+(*@ check c
+    requires own c.count n
+    ensures own c.count n && min_int <= n <= max_int *)

@@ -27,8 +27,9 @@ let call f args = R.Expr.call ~loc (R.Name.make ~loc f) args
 let assign xs v = R.Stmt.assign ~loc (List.map xs ~f:var) (R.Stmt.expr_rhs v)
 
 (** The procedure performing [op] on [field], whose values have type [typ]; [exact] if
-    they are immediate. *)
-let proc ~field ~(typ : R.Type.t) ~exact op : R.Member.t =
+    they are immediate, [int] if they are OCaml's [int]s, which the values written are
+    then required to be. *)
+let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
   let x = var "x" and v = var "v" and q = var "q" in
   let content = R.Expr.field ~loc x (R.Name.make ~loc field) in
   let own value = R.Expr.own ~loc [ content; value; q ] in
@@ -104,7 +105,12 @@ let proc ~field ~(typ : R.Type.t) ~exact op : R.Member.t =
        ~formals:
          ((formal "x" (R.Type.ref ~loc) :: args) @ [ ghost "v" typ; ghost "q" real ])
        ~returns:[ ret ]
-       ~requires:[ R.Spec.make ~atomic:true (bin And (own v) pre) ]
+       ~requires:
+         ((if int then
+             let written = match op with Fetch_and_add -> "n" | _ -> "new_val" in
+             [ R.Spec.make (call Prelude.in_range [ var written ]) ]
+           else [])
+         @ [ R.Spec.make ~atomic:true (bin And (own v) pre) ])
        ~ensures:[ R.Spec.make ~atomic:true post ]
        (ident (name ~field op))
        (Some [ R.Stmt.atomic_block ~loc body ]))

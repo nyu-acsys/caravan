@@ -35,7 +35,8 @@ let members : R.Member.t list =
          ~returns:[ R.Var.make ~loc (R.Ident.make ~loc "b") (R.Type.bool ~loc) ]
          (R.Ident.make ~loc in_range)
          (Some (R.Expr.binary ~loc And (bound Geq min_int) (bound Leq max_int))));
-    (* The value congruent to [x] modulo 2^63 in the range. *)
+    (* The value congruent to [x] modulo 2^63 in the range, for [x] a sum of two values in
+       it. *)
     R.Member.callable
       (R.Callable.func ~loc ~inline:true
          ~formals:[ int_var "x" ]
@@ -48,9 +49,13 @@ let members : R.Member.t list =
                  (R.Expr.binary ~loc Minus (n max_int) (n min_int))
                  (n 1)
              in
-             R.Expr.binary ~loc Plus
-               (R.Expr.binary ~loc Mod (R.Expr.binary ~loc Minus x (n min_int)) size)
-               (n min_int))));
+             R.Expr.ite ~loc
+               (R.Expr.binary ~loc Gt x (n max_int))
+               (R.Expr.binary ~loc Minus x size)
+               (R.Expr.ite ~loc
+                  (R.Expr.binary ~loc Lt x (n min_int))
+                  (R.Expr.binary ~loc Plus x size)
+                  x))));
     (* For a dividend that is not negative, Euclidean division truncates. *)
     R.Member.callable
       (func div "q"

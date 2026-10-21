@@ -135,9 +135,9 @@ type au = {
 
 type context = {
   types : Datatypes.t list;
-  refs : (string * R.Type.t) list ref;
+  refs : (string * R.Member.t) list ref;
       (** The fields of the ref cells and atomics used so far, by their names, with their
-          types. *)
+          declarations. *)
   primitives : (string * R.Member.t) list ref;
       (** The atomic operations used so far, by their names (see {!Primitives}). *)
   names : Names.t;
@@ -164,20 +164,27 @@ type context = {
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
 
+(** Declares [field], with values of type [elt], unless it is already. *)
+let declare_field ctx ~at field elt =
+  let* t = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then begin
+    let file = { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname } in
+    let loc = R.Loc.make file file in
+    ctx.refs :=
+      !(ctx.refs) @ [ (field, Datatypes.field_member ctx.types ~loc field t elt) ]
+  end;
+  Ok ()
+
 (** The field of the ref cells with contents of type [elt]. *)
 let ref_field ctx ~at elt =
   let field = "ref_" ^ Datatypes.tag ctx.types elt ^ "_contents" in
-  let* t = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then
-    ctx.refs := !(ctx.refs) @ [ (field, t) ];
+  let* () = declare_field ctx ~at field elt in
   Ok field
 
 (** The field of the atomics with contents of type [elt]. *)
 let atomic_field ctx ~at elt =
   let field = "atomic_" ^ Datatypes.tag ctx.types elt in
-  let* t = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then
-    ctx.refs := !(ctx.refs) @ [ (field, t) ];
+  let* () = declare_field ctx ~at field elt in
   Ok field
 
 (** The procedure performing [op] on the atomics with contents of type [elt]. *)
@@ -189,7 +196,11 @@ let primitive ctx ~at elt op =
     ctx.primitives :=
       !(ctx.primitives)
       @ [
-          (name, Primitives.proc ~field ~typ ~exact:(Datatypes.immediate ctx.types elt) op);
+          ( name,
+            Primitives.proc ~field ~typ
+              ~exact:(Datatypes.immediate ctx.types elt)
+              ~int:(Datatypes.is_int ctx.types elt)
+              op );
         ];
   Ok name
 
@@ -560,10 +571,21 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       in
       let* body = formula env body in
       let vars = List.map bound ~f:(fun (_, _, v) -> v) in
+      (* A variable of type [int] ranges over its values. *)
+      let ranges =
+        List.filter_map bound ~f:(fun (x, t, _) ->
+            Option.map (range_spec ~loc:l t x) ~f:(fun _ ->
+                R.Expr.call ~loc:l
+                  (R.Name.make ~loc:l Prelude.in_range)
+                  [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+      in
+      let guard = List.reduce ranges ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
       Ok
-        (match q with
-        | Tforall -> R.Expr.forall ~loc:l vars body
-        | Texists -> R.Expr.exists ~loc:l vars body)
+        (match (q, guard) with
+        | Tforall, None -> R.Expr.forall ~loc:l vars body
+        | Tforall, Some g -> R.Expr.forall ~loc:l vars (R.Expr.binary ~loc:l Impl g body)
+        | Texists, None -> R.Expr.exists ~loc:l vars body
+        | Texists, Some g -> R.Expr.exists ~loc:l vars (R.Expr.binary ~loc:l And g body))
   | Ttuple ts ->
       let* ts = all ts ~f:(formula env) in
       Ok (R.Expr.tuple ~loc:l ts)
@@ -1229,9 +1251,7 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
           let x = Names.fresh ctx.names "tmp" in
           let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l v (name ~loc:l field)) in
           Ok
-            ( stmts
-              @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x)
-              @ assume_in_range ~loc:l e.exp_type x,
+            ( stmts @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x),
               R.Expr.var ~loc:l (name ~loc:l x) )
       | Some (field, false) -> Ok (stmts, R.Expr.field ~loc:l v (name ~loc:l field))
       | None -> unsupported at "This field"
@@ -1440,8 +1460,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
     let x = Names.fresh ctx.names "tmp" in
     let rhs = R.Stmt.expr_rhs (R.Expr.field ~loc:l r (name ~loc:l field)) in
     Ok
-      ( R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
-        @ assume_in_range ~loc:l typ_of x,
+      ( R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x),
         R.Expr.var ~loc:l (name ~loc:l x) )
   in
   match (stdlib_name path, args) with
@@ -1508,7 +1527,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
     let* how = how default in
     let* step = linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)) in
-    Ok (step @ assume_in_range ~loc:l e.exp_type x, v)
+    Ok (step, v)
   in
   let* elt =
     match args with
@@ -1533,9 +1552,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* step =
         linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
       in
-      Ok
-        ( stmts @ step @ assume_in_range ~loc:l e.exp_type x,
-          R.Expr.var ~loc:l (name ~loc:l x) )
+      Ok (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
   | "set", [ a; v ] ->
       let* how = how `Commit in
       let* step = linearize ctx ~at how [ write ~loc:l a field v ] in
@@ -2913,10 +2930,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
-  let ref_fields =
-    List.map !refs ~f:(fun (field, t) ->
-        R.Member.field ~loc:start (ident ~loc:start field) t)
-  in
+  let ref_fields = List.map !refs ~f:snd in
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ record_fields @ ref_fields

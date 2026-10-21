@@ -246,6 +246,21 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
   | Tpoly (t, []) -> tag types t
   | _ -> "Other"
 
+let is_int types t =
+  match desc types t with
+  | Tconstr (p, [], _) -> Path.same p Predef.path_int
+  | Tpoly (t, []) -> (
+      match desc types t with
+      | Tconstr (p, [], _) -> Path.same p Predef.path_int
+      | _ -> false)
+  | _ -> false
+
+(** The field [name] of type [typ], for values of the OCaml type [t]: an [int] field's
+    values are in [int]'s range, which owning the field then implies. *)
+let field_member types ~loc name typ (t : Types.type_expr) =
+  let where = Option.some_if (is_int types t) (R.Name.make ~loc Prelude.in_range) in
+  R.Member.field ~loc ?where (R.Ident.make ~loc name) typ
+
 (** Whether the values of type [t] are immediate or references, so that physical equality
     on them is equality: integers, booleans, unit, references, and variants whose
     constructors are all constant. *)
@@ -297,7 +312,7 @@ let fields (types : t list) : (R.Member.t list, Report.error) Result.t =
   let field (d : t) (f : field) =
     let* typ = typ types ~at:d.at f.typ in
     let l = loc d.at in
-    Ok (R.Member.field ~loc:l (R.Ident.make ~loc:l f.raven_field) typ)
+    Ok (field_member types ~loc:l f.raven_field typ f.typ)
   in
   Result.all
     (List.concat_map types ~f:(fun d ->
