@@ -27,7 +27,7 @@ let lexeme_loc lexbuf =
     loc_ghost = false;
   }
 
-type kind = Contract | Loop | Predicate | Ghost
+type kind = Contract | Loop | Predicate | Ghost | Linearization
 
 (** What [annotation] states, by its first word. *)
 let kind (annotation : t) =
@@ -35,6 +35,7 @@ let kind (annotation : t) =
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
   | ("fold" | "unfold" | "assert") :: _ -> Ghost
+  | ("commit" | "returning") :: _ -> Linearization
   | _ -> Contract
 
 (** Parses [annotation] with [entry]; the lexer and the parser report errors by raising.
@@ -47,6 +48,7 @@ let parse (annotation : t) entry =
 
 let predicate (annotation : t) = parse annotation Spec_parser.predicate
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
+let linearization (annotation : t) = parse annotation Spec_parser.linearization
 
 (** The specification of a loop that [annotation] states: its invariants and variants. *)
 let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =

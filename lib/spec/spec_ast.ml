@@ -113,6 +113,10 @@ type predicate = {
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
 
+(** Where an atomic step linearizes the function that performs it: always, or if its
+    result matches a pattern, as [returning [] -> commit]. *)
+type linearization = Commit | Returning of pat
+
 (** A ghost statement in code. *)
 type ghost_stmt = Fold of term | Unfold of term | Assert of term
 

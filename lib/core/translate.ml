@@ -89,31 +89,47 @@ type origin = {
     as the message and related locations to report when it fails. *)
 
 (** Whether a function with an atomic contract has linearized, as far as the translation
-    knows: committed its atomic update, or not yet; or committed if the last
-    [compare_and_set] succeeded. *)
-type au_state = Pending | Committed | Unknown | On_cas
+    knows. Raven needs the atomic update in the same state after both arms of a branch, so
+    a step whose effect depends on its result leaves the update open, and the arms of the
+    branch on that result close it. *)
+type au_state =
+  | Pending  (** Not linearized, the update closed. *)
+  | Committed
+  | Committing
+      (** Linearized, the update open until the function's result is known, at the end of
+          the arm whose value it is. *)
+  | On_cas  (** The update open, linearized if the last [compare_and_set] succeeded. *)
+  | On_read of string
+      (** The update open, linearized if the value of the last read has this constructor.
+      *)
+  | Partly  (** Linearized on some paths, the update closed. *)
+  | Unknown
 
-(** What a function with an atomic contract does at an atomic step on its abstract state.
-*)
+(** How the atomic update closes. *)
 type au_close =
-  | Commit  (** The step linearizes the function. *)
-  | Abort  (** The step does not change the abstract state. *)
-  | Commit_call  (** The step is a call, which linearizes the function in its place. *)
+  | Commit  (** The step linearized the function. *)
+  | Abort  (** The step did not change the abstract state. *)
+  | Commit_call  (** The step is a call, which linearized the function in its place. *)
 
 type au = {
   mutable state : au_state;
   mutable cas_results : (string * bool) list;
       (** Variables bound to the result of a [compare_and_set], or its negation if
           [false], by their unique names. *)
+  mutable read_results : string list;
+      (** Variables bound to the value of the last read, by their unique names. *)
+  mutable values : R.Expr.t list;
+      (** The values of the implicit parameters in the open update. *)
+  mutable step : Location.t;  (** The step that opened the update. *)
   self : string;  (** The procedure's name. *)
+  has_result : bool;
   open_ :
     at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list, Report.error) Result.t;
       (** Opens the atomic update for the step at [at]: the statements, unfolding the
           atomic precondition's predicates if [unfold], and the values of the implicit
           parameters. *)
-  close :
-    at:Location.t -> au_close -> R.Expr.t list -> (R.Stmt.t list, Report.error) Result.t;
-      (** Closes the atomic update opened with the values of the implicit parameters. *)
+  close : au_close -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+      (** Closes the open update, committing with the function's result [value]. *)
 }
 (** The atomic update of a function with an atomic contract. *)
 
@@ -141,6 +157,9 @@ type context = {
           only mention variables, all immutable. *)
   mutable au : au option;
       (** The atomic update, for a function with an atomic contract. *)
+  linearizations : (int * Annotation.t) list;
+      (** The annotations on atomic steps, by the offset of the end of the step they
+          follow. *)
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
@@ -987,42 +1006,108 @@ and owned_names (t : S.term) =
   | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
   | None, _ -> []
 
+(** The annotation saying how the atomic step at [at] linearizes the function, if one
+    follows it, as [Atomic.get t (*@ commit *)]. *)
+let linearization ctx ~(at : Location.t) =
+  match
+    List.find ctx.linearizations ~f:(fun (anchor, _) -> anchor = at.loc_end.pos_cnum)
+  with
+  | None -> Ok None
+  | Some (_, a) -> Result.map (Annotation.linearization a) ~f:Option.some
+
+(** The statements committing the open update [au] of a function that linearized: at once
+    if it has no result, and otherwise at the end of the arm whose value is its result. *)
+let commit_now (au : au) =
+  if au.has_result then begin
+    au.state <- Committing;
+    Ok []
+  end
+  else begin
+    au.state <- Committed;
+    au.close Commit ~value:(R.Expr.tuple ~loc:(loc au.step) [])
+  end
+
 (** The statements of [access], an atomic step, inside the atomic update of a function
-    with an atomic contract that has not linearized yet; [close] says how the step closes
-    it, [`Cas x] by committing if [x], the result of a [compare_and_set], holds. *)
-let linearize ctx ~at (close : [ `Close of au_close | `Cas of R.Expr.t ]) access =
+    with an atomic contract that has not linearized yet. The step linearizes the function
+    as [how] says: always, never, if it is a [compare_and_set] that succeeds, or if it is
+    a read whose value has a constructor. *)
+let linearize ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ]) access =
   match ctx.au with
   | None -> Ok access
   | Some au ->
       begin match au.state with
       | Committed -> Ok access
-      | Unknown | On_cas ->
+      | Committing | On_cas | On_read _ | Partly | Unknown ->
           error at
             "Caravan cannot tell whether the function has linearized before this step"
       | Pending ->
           let* opening, values = au.open_ ~at ~unfold:true in
+          au.values <- values;
+          au.step <- at;
+          au.read_results <- [];
           let* closing =
-            match close with
-            | `Close c ->
-                au.state <- (match c with Abort -> Pending | _ -> Committed);
-                au.close ~at c values
-            | `Cas x ->
-                let* commit = au.close ~at Commit values in
-                let* abort = au.close ~at Abort values in
+            match how with
+            | `Abort ->
+                au.state <- Pending;
+                au.close Abort ~value:(R.Expr.tuple ~loc:(loc at) [])
+            | `Commit -> commit_now au
+            | `Cas ->
                 au.state <- On_cas;
-                Ok [ R.Stmt.if_ ~loc:(loc at) x commit abort ]
+                Ok []
+            | `Returning c ->
+                au.state <- On_read c;
+                Ok []
           in
           Ok (opening @ access @ closing)
       end
 
+(** The statements at the start of an arm of a branch on the result of the step that left
+    the update open: committing if the step linearized the function there, as [commits]
+    says, and aborting otherwise. *)
+let enter_arm ctx ~(commits : bool option) =
+  match ctx.au with
+  | Some ({ state = On_cas | On_read _; _ } as au) ->
+      begin match commits with
+      | Some true -> commit_now au
+      | Some false ->
+          au.state <- Pending;
+          au.close Abort ~value:(R.Expr.tuple ~loc:(loc au.step) [])
+      | None ->
+          au.state <- Unknown;
+          Ok []
+      end
+  | _ -> Ok []
+
+(** The statements at the end of an arm whose value [v] is the function's result: the
+    commit, if the function linearized in the arm. *)
+let finish_arm ctx ~tail v =
+  match ctx.au with
+  | Some ({ state = Committing; _ } as au) when tail ->
+      au.state <- Committed;
+      au.close Commit ~value:v
+  | _ -> Ok []
+
 (** The state of the atomic update after two branches. *)
-let join_au a b = if Poly.equal a b then a else Unknown
+let join_au a b =
+  match (a, b) with
+  | _ when Poly.equal a b -> a
+  | (Pending | Committed | Partly), (Pending | Committed | Partly) -> Partly
+  | _ -> Unknown
 
 let au_state ctx = Option.map ctx.au ~f:(fun au -> au.state)
 
 let set_au_state ctx = function
   | Some state -> Option.iter ctx.au ~f:(fun au -> au.state <- state)
   | None -> ()
+
+(** The atomic update before a branch, for each arm to start from. *)
+let au_snapshot ctx = Option.map ctx.au ~f:(fun au -> (au.state, au.step, au.values))
+
+let restore_au ctx (state, step, values) =
+  Option.iter ctx.au ~f:(fun au ->
+      au.state <- state;
+      au.step <- step;
+      au.values <- values)
 
 (** Whether [c] is the result of a [compare_and_set], [Some false] if its negation. *)
 let rec cas_polarity ctx (c : Typedtree.expression) =
@@ -1038,14 +1123,43 @@ let rec cas_polarity ctx (c : Typedtree.expression) =
           List.Assoc.find au.cas_results (Ident.unique_name id) ~equal:String.equal)
   | _ -> None
 
+(** Whether [e] is the value of the last read. *)
+let is_read_value ctx (e : Typedtree.expression) =
+  match e.exp_desc with
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+      Option.equal String.equal (atomic_name path) (Some "get")
+  | Texp_ident (Pident id, _, _) ->
+      Option.exists ctx.au ~f:(fun au ->
+          List.mem au.read_results (Ident.unique_name id) ~equal:String.equal)
+  | _ -> false
+
+(** For each of [cases], of a match on the value of a read that linearizes the function if
+    the value has the constructor [c], whether the case's value has it; [None] if that is
+    not clear. *)
+let case_commits c (patterns : Typedtree.pattern list) =
+  let rec ctor (p : Typedtree.pattern) =
+    match p.pat_desc with
+    | Tpat_construct (_, cstr, _, _) -> Some cstr.cstr_name
+    | Tpat_alias (p, _, _, _, _) -> ctor p
+    | _ -> None
+  in
+  let _, commits =
+    List.fold_map patterns ~init:false ~f:(fun seen p ->
+        match ctor p with
+        | Some name -> (seen || String.equal name c, Some (String.equal name c))
+        | None -> (seen, if seen then Some false else None))
+  in
+  commits
+
 let no_loop_before_linearizing ctx ~at =
   match au_state ctx with
   | None | Some Committed -> Ok ()
   | Some _ ->
       unsupported at "A loop in a function with an atomic contract, before it linearizes,"
 
-(** The statements evaluating [e], and the value of [e] after them. *)
-let rec expr (ctx : context) (e : Typedtree.expression) :
+(** The statements evaluating [e], and the value of [e] after them; [tail] if the value is
+    the function's result. *)
+let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
     (R.Stmt.t list * R.Expr.t, error) Result.t =
   let at = e.exp_loc in
   let l = loc at in
@@ -1134,6 +1248,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       | _ -> unsupported at "This field"
     end
   | Texp_match (scrutinee, cases, [], partial) ->
+      let read = is_read_value ctx scrutinee in
       let* scrutinee_stmts, v = expr ctx scrutinee in
       (* The cases read the scrutinee repeatedly, so it is named unless it is a variable. *)
       let* naming, v =
@@ -1154,8 +1269,15 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
             | _ -> unsupported c.c_lhs.pat_loc "An exception case")
       in
       let total = match partial with Total -> true | Partial -> false in
+      (* A match on the value of a read that left the atomic update open closes it. *)
+      let commits =
+        match au_state ctx with
+        | Some (On_read c) when read -> Some (case_commits c (List.map cases ~f:fst))
+        | _ -> None
+      in
       let* stmts =
-        branch ctx e (fun target -> match_cases ctx ~at v cases ~total target)
+        branch ctx e (fun target ->
+            match_cases ?commits ~tail ctx ~at v cases ~total target)
       in
       Ok (scrutinee_stmts @ naming @ fst stmts, snd stmts)
   | Texp_match (_, _, _ :: _, _) -> unsupported at "An effect handler"
@@ -1167,7 +1289,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       let polarity = cas_polarity ctx c in
       let* c_stmts, c = expr ctx c in
       let* stmts =
-        branch ctx e (fun target -> conditional ctx ~at ?polarity c e1 e2 target)
+        branch ctx e (fun target -> conditional ctx ~at ?polarity ~tail c e1 e2 target)
       in
       Ok (c_stmts @ fst stmts, snd stmts)
   | Texp_let (Nonrecursive, bindings, body) ->
@@ -1175,10 +1297,13 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       let* evaluated =
         all bindings ~f:(fun (vb : Typedtree.value_binding) ->
             let polarity = cas_polarity ctx vb.vb_expr in
+            let read = is_read_value ctx vb.vb_expr in
             let* stmts, v = expr ctx vb.vb_expr in
             begin match (ctx.au, polarity, vb.vb_pat.pat_desc) with
             | Some au, Some p, Tpat_var (id, _, _) ->
                 au.cas_results <- (Ident.unique_name id, p) :: au.cas_results
+            | Some au, None, Tpat_var (id, _, _) when read ->
+                au.read_results <- Ident.unique_name id :: au.read_results
             | _ -> ()
             end;
             Ok (vb, stmts, v))
@@ -1202,7 +1327,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
       let* ghost =
         ghost ctx ~after:last.vb_expr.exp_loc.loc_end ~before:body.exp_loc.loc_start
       in
-      let* body_stmts, body = expr ctx body in
+      let* body_stmts, body = expr ~tail ctx body in
       Ok
         ( List.concat_map evaluated ~f:(fun (_, stmts, _) -> stmts)
           @ List.concat (List.concat defs)
@@ -1212,7 +1337,7 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
   | Texp_sequence (e1, e2) ->
       let* stmts1, _ = expr ctx e1 in
       let* ghost = ghost ctx ~after:e1.exp_loc.loc_end ~before:e2.exp_loc.loc_start in
-      let* stmts2, v = expr ctx e2 in
+      let* stmts2, v = expr ~tail ctx e2 in
       Ok (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
       let* () = no_loop_before_linearizing ctx ~at in
@@ -1362,19 +1487,27 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | Tconstr (_, [ elt ], _) -> Ok elt
     | _ -> unsupported at "This atomic"
   in
-  (* The result of [f] applied to the atomic and [args], in a variable, a step closing an
-     atomic update as [close] says. *)
-  let result ?close f atomic args =
+  (* How the step linearizes the function: as its annotation says, or by default. *)
+  let* annotation = linearization ctx ~at in
+  let how default =
+    match (annotation, default) with
+    | None, _ -> Ok default
+    | Some S.Commit, _ -> Ok `Commit
+    | Some (Returning { pat_desc = Pconstr (Qid c, _); _ }), `Abort ->
+        Ok (`Returning c.pid_str)
+    | Some (Returning p), `Abort ->
+        unsupported p.pat_loc "A pattern other than a constructor, after returning,"
+    | Some (Returning p), _ -> error p.pat_loc "Only a read can linearize by its value"
+  in
+  (* The result of [f] applied to the atomic and [args], in a variable, a step that
+     linearizes the function by default as [default] says. *)
+  let result ?(default = `Commit) f atomic args =
     let* typ = typ ctx ~at e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
-    let close = Option.value close ~default:(`Close Commit) in
-    let* step =
-      linearize ctx ~at
-        (match close with `Cas -> `Cas v | `Close c -> `Close c)
-        (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
-    in
+    let* how = how default in
+    let* step = linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)) in
     Ok (step @ assume_in_range ~loc:l e.exp_type x, v)
   in
   let* elt =
@@ -1396,15 +1529,16 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* typ = typ ctx ~at e.exp_type in
       let x = Names.fresh ctx.names "tmp" in
       let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (name ~loc:l field)) in
+      let* how = how `Abort in
       let* step =
-        linearize ctx ~at (`Close Abort)
-          (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+        linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
       in
       Ok
         ( stmts @ step @ assume_in_range ~loc:l e.exp_type x,
           R.Expr.var ~loc:l (name ~loc:l x) )
   | "set", [ a; v ] ->
-      let* step = linearize ctx ~at (`Close Commit) [ write ~loc:l a field v ] in
+      let* how = how `Commit in
+      let* step = linearize ctx ~at how [ write ~loc:l a field v ] in
       Ok (stmts @ step, unit_value ~loc:l)
   | "exchange", [ a; v ] ->
       let* f = primitive Exchange in
@@ -1412,7 +1546,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       Ok (stmts @ reading, r)
   | "compare_and_set", [ a; old_val; new_val ] ->
       let* f = primitive Compare_and_set in
-      let* reading, r = result ~close:`Cas f a [ old_val; new_val ] in
+      let* reading, r = result ~default:`Cas f a [ old_val; new_val ] in
       Ok (stmts @ reading, r)
   | "fetch_and_add", [ a; n ] ->
       let* f = primitive Fetch_and_add in
@@ -1423,8 +1557,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let x = Names.fresh ctx.names "tmp" in
       let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
+      let* how = how `Commit in
       let* step =
-        linearize ctx ~at (`Close Commit)
+        linearize ctx ~at how
           (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
       in
       Ok (stmts @ step, unit_value ~loc:l)
@@ -1521,30 +1656,42 @@ and call ctx (e : Typedtree.expression) f args =
   let args = List.rev_map stmts_args ~f:snd in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
      its place, with the atomic update's values of the implicit parameters. *)
-  let* opening, implicit, closing =
+  let* retry =
     match ctx.au with
     | Some au when String.equal au.self f ->
         begin match au.state with
         | Pending ->
             let* opening, values = au.open_ ~at:e.exp_loc ~unfold:false in
-            let* closing = au.close ~at:e.exp_loc Commit_call values in
+            au.values <- values;
+            au.step <- e.exp_loc;
             au.state <- Committed;
-            Ok (opening, values, closing)
-        | Committed -> Ok ([], [], [])
-        | Unknown | On_cas ->
+            Ok (Some (au, opening, values))
+        | Committed -> Ok None
+        | Committing | On_cas | On_read _ | Partly | Unknown ->
             error e.exp_loc
               "Caravan cannot tell whether the function has linearized before this call"
         end
-    | _ -> Ok ([], [], [])
+    | _ -> Ok None
+  in
+  let opening, implicit =
+    Option.value_map retry ~default:([], []) ~f:(fun (_, o, values) -> (o, values))
+  in
+  (* The retry commits with its result. *)
+  let closing value =
+    Option.value_map retry ~default:(Ok []) ~f:(fun (au, _, _) ->
+        au.close Commit_call ~value)
   in
   let callee = R.Expr.call ~loc:l (name ~loc:l f) (args @ implicit) in
   if is_unit e.exp_type then
+    let* closing = closing (unit_value ~loc:l) in
     Ok (stmts @ opening @ [ R.Stmt.call ~loc:l callee ] @ closing, unit_value ~loc:l)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
+    let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let def = R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs callee) (ident ~loc:l x) in
-    Ok (stmts @ opening @ def @ closing, R.Expr.var ~loc:l (name ~loc:l x))
+    let* closing = closing v in
+    Ok (stmts @ opening @ def @ closing, v)
 
 (** The statements evaluating [args], right to left as OCaml does, and their values. *)
 and operands ctx (args : Typedtree.expression list) =
@@ -1602,15 +1749,29 @@ and pattern ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 
 (** The cases of a match on the value [v], with the value of the matching one assigned to
     [target] if there is one; [total] if OCaml found them exhaustive. *)
-and match_cases ctx ~at v (cases : (Typedtree.pattern * Typedtree.expression) list) ~total
-    target =
+and match_cases ?commits ~tail ctx ~at v
+    (cases : (Typedtree.pattern * Typedtree.expression) list) ~total target =
   let l = loc at in
   (* Each case starts in the state of the atomic update before the match. *)
-  let start = au_state ctx in
+  let start = au_snapshot ctx in
   let ends = ref [] in
+  let commits =
+    match commits with
+    | Some commits -> commits
+    | None -> List.map cases ~f:(fun _ -> None)
+  in
+  (* Whether each case linearizes the function, if the scrutinee is the value of a read
+     that left the atomic update open, by the case's body. *)
+  let case_commits = List.zip_exn (List.map cases ~f:snd) commits in
   (* The body of a case, after defining the variables of its pattern. *)
   let case_body binds (rhs : Typedtree.expression) =
-    set_au_state ctx start;
+    Option.iter start ~f:(fun snapshot -> restore_au ctx snapshot);
+    let commits =
+      Option.join
+        (List.Assoc.find case_commits rhs ~equal:(fun a b ->
+             Poly.equal a.exp_loc b.exp_loc))
+    in
+    let* entry = enter_arm ctx ~commits in
     let* defs =
       all binds ~f:(fun (id, value, t) ->
           let* typ = typ ctx ~at t in
@@ -1619,12 +1780,13 @@ and match_cases ctx ~at v (cases : (Typedtree.pattern * Typedtree.expression) li
             (R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
             @ assume_in_range ~loc:l t x))
     in
-    let* stmts, value = expr ctx rhs in
+    let* stmts, value = expr ~tail ctx rhs in
+    let* finish = finish_arm ctx ~tail value in
     let assignment =
       Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
     in
     ends := au_state ctx :: !ends;
-    Ok (List.concat defs @ stmts @ assignment)
+    Ok (entry @ List.concat defs @ stmts @ finish @ assignment)
   in
   let not_exhaustive () =
     [ check ctx ~at "This match may not be exhaustive" (R.Expr.bool ~loc:l false) ]
@@ -1664,7 +1826,9 @@ and match_cases ctx ~at v (cases : (Typedtree.pattern * Typedtree.expression) li
         chain cases
   in
   set_au_state ctx
-    (Option.first_some (List.reduce (List.filter_opt !ends) ~f:join_au) start);
+    (Option.first_some
+       (List.reduce (List.filter_opt !ends) ~f:join_au)
+       (Option.map start ~f:(fun (state, _, _) -> state)));
   Ok stmts
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
@@ -1720,27 +1884,29 @@ and flat_cases ctx v cases =
   Option.map (flat [] cases) ~f:(List.map ~f:case)
 
 (** [if c then e1 else e2], with its value assigned to [target] if there is one. *)
-and conditional ctx ~at ?polarity c (e1 : Typedtree.expression)
+and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
     (e2 : Typedtree.expression option) target =
   let l = loc at in
-  (* The state of the atomic update in each arm: if [c] is the result of the
-     [compare_and_set] that may have linearized the function, whether it did. *)
-  let start = au_state ctx in
-  let arm_state taken =
-    match (start, polarity) with
-    | Some On_cas, Some p -> Some (if Bool.equal p taken then Committed else Pending)
-    | _ -> start
-  in
+  (* Each arm starts in the state of the atomic update before the branch; if [c] is the
+     result of the [compare_and_set] that left the update open, the arms close it. *)
+  let start = au_snapshot ctx in
   let arm taken e =
-    set_au_state ctx (arm_state taken);
+    Option.iter start ~f:(fun snapshot -> restore_au ctx snapshot);
+    let* entry =
+      enter_arm ctx ~commits:(Option.map polarity ~f:(fun p -> Bool.equal p taken))
+    in
     let* stmts =
       match e with
-      | None -> Ok []
-      | Some e -> (
-          let* stmts, v = expr ctx e in
-          match target with Some t -> Ok (stmts @ [ assign t v ]) | None -> Ok stmts)
+      | None -> finish_arm ctx ~tail (unit_value ~loc:l)
+      | Some e ->
+          let* stmts, v = expr ~tail ctx e in
+          let* finish = finish_arm ctx ~tail v in
+          let assignment =
+            Option.value_map target ~default:[] ~f:(fun t -> [ assign t v ])
+          in
+          Ok (stmts @ finish @ assignment)
     in
-    Ok (stmts, au_state ctx)
+    Ok (entry @ stmts, au_state ctx)
   in
   let* then_, then_state = arm true (Some e1) in
   let* else_, else_state = arm false e2 in
@@ -2046,6 +2212,7 @@ let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f
       preds;
       facts = [];
       au = None;
+      linearizations = [];
     }
   in
   let l = loc f.loc in
@@ -2081,47 +2248,79 @@ let func types ~refs ~primitives ~ocaml_env ~preds ~funcs ~spec_funcs origins (f
        ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_typ ]
        ~ensures (ident ~loc:l f.raven_name) (Some body))
 
-(** The predicates that the conjunction [t] applies, with their arguments, as [p x] in
-    [p x && b = false]. *)
-let rec predicate_apps ctx (t : S.term) =
+(** The statements folding, or unfolding with [make], the predicates that the formula [t]
+    applies, following its conditionals and matches, as
+    [match xs with [] -> stack t [] | _ :: xs' -> stack t xs']. *)
+let rec uses ctx env ~(at : Location.t) make (t : S.term) =
+  let l = loc at in
   let t = S.chain t in
   let head, args = spine t [] in
-  match (head.term_desc, args) with
-  | Tvar (Qid { pid_str = "&&" | "/\\"; _ }), [ a; b ] ->
-      predicate_apps ctx a @ predicate_apps ctx b
-  | Tvar (Qid { pid_str = p; _ }), _ when List.Assoc.mem ctx.preds p ~equal:String.equal
-    ->
-      [ (p, args, t.term_loc) ]
-  | _ -> []
+  match (head.term_desc, args, t.term_desc) with
+  | Tvar (Qid { pid_str = "&&" | "/\\"; _ }), [ a; b ], _ ->
+      let* a = uses ctx env ~at make a in
+      let* b = uses ctx env ~at make b in
+      Ok (a @ b)
+  | Tvar (Qid { pid_str = p; _ }), _, _
+    when List.Assoc.mem ctx.preds p ~equal:String.equal ->
+      let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+      let* args = all args ~f:(formula env) in
+      Ok [ make ~loc:l (name ~loc:l raven) args ]
+  | _, _, Tif (c, a, b) ->
+      let* c = formula env c in
+      let* a = uses ctx env ~at make a in
+      let* b = uses ctx env ~at make b in
+      Ok
+        (if List.is_empty a && List.is_empty b then []
+         else [ R.Stmt.ghost_block ~loc:l [ R.Stmt.if_ ~loc:l c a b ] ])
+  | _, _, Tmatch (scrutinee, cases) ->
+      let* v = formula env scrutinee in
+      let rec chain = function
+        | [] -> Ok []
+        | (p, body) :: rest -> begin
+            let* cond, binds = spec_pattern env p v in
+            let env =
+              List.fold binds ~init:env ~f:(fun env (x, v) -> bind env x (Value v))
+            in
+            let* body = uses ctx env ~at make body in
+            match (cond, rest) with
+            | None, _ | _, [] -> Ok body
+            | Some cond, _ ->
+                let* rest = chain rest in
+                Ok
+                  (if List.is_empty body && List.is_empty rest then []
+                   else [ R.Stmt.ghost_block ~loc:l [ R.Stmt.if_ ~loc:l cond body rest ] ])
+          end
+      in
+      chain cases
+  | _, _, (Tattr (_, t) | Tcast (t, _)) -> uses ctx env ~at make t
+  | _ -> Ok []
 
 (** The statements binding the atomic update of the function [self], whose atomic contract
     has the preconditions [pres] and postconditions [posts], and whose implicit parameters
-    are [implicit]; sets [ctx.au]. An atomic step inside the update unfolds the predicates
-    of [pres], and folds those of [posts] if it commits, and those of [pres] otherwise. *)
-let atomic_update ctx env ~at ~self implicit ~pres ~posts =
-  let fun_loc = at in
+    are [implicit]; [result] is the contract's name for the result, if there is one. Sets
+    [ctx.au]. A step inside the update unfolds the predicates of [pres], and folds those
+    of [posts] if it commits, and those of [pres] if it aborts. *)
+let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
   let phi = Names.fresh ctx.names "phi" in
   let au_call ~l f args =
     R.Expr.call ~loc:l (name ~loc:l f) (R.Expr.var ~loc:l (name ~loc:l phi) :: args)
   in
-  let pre_preds = List.concat_map pres ~f:(predicate_apps ctx) in
-  let post_preds = List.concat_map posts ~f:(predicate_apps ctx) in
   (* The contract's environment, with the values of the implicit parameters in the
-     update. *)
-  let opened values =
-    List.fold2_exn implicit values ~init:env ~f:(fun env (x, _, _, _) v ->
-        bind env x (Value v))
+     update, and the result's. *)
+  let opened ?value values =
+    let env =
+      List.fold2_exn implicit values ~init:env ~f:(fun env (x, _, _, _) v ->
+          bind env x (Value v))
+    in
+    match (result, value) with Some r, Some v -> bind env r (Value v) | _ -> env
   in
-  (* At [step] if given, where a failure is reported, and otherwise in the contract. *)
-  let uses ?step make env preds =
-    all preds ~f:(fun (p, args, at) ->
-        let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
-        let* args = all args ~f:(formula env) in
-        let l = loc (Option.value step ~default:at) in
-        Ok (make ~loc:l (name ~loc:l raven) args))
+  let each terms ~at make env =
+    let* stmts = all terms ~f:(uses ctx env ~at make) in
+    Ok (List.concat stmts)
   in
-  let commit ~l = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ unit_value ~loc:l ]) in
-  let open_ ~at ~unfold =
+  let fold ~loc p args = R.Stmt.fold ~loc p args in
+  let unfold ~loc p args = R.Stmt.unfold ~loc p args in
+  let open_ ~at ~unfold:with_unfold =
     let l = loc at in
     let* decls =
       all implicit ~f:(fun (x, _, t, _) ->
@@ -2137,52 +2336,58 @@ let atomic_update ctx env ~at ~self implicit ~pres ~posts =
       | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
       | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
     in
-    let* unfolds =
-      uses ~step:at
-        (fun ~loc p args -> R.Stmt.unfold ~loc p args)
-        (opened values)
-        (if unfold then pre_preds else [])
-    in
+    let* unfolds = if with_unfold then each pres ~at unfold (opened values) else Ok [] in
     Ok (List.concat_map decls ~f:fst @ [ opening ] @ unfolds, values)
   in
-  let close ~at c values =
+  let rec au =
+    {
+      state = Pending;
+      cas_results = [];
+      read_results = [];
+      values = [];
+      step = at;
+      self;
+      has_result = Option.is_some result;
+      open_;
+      close;
+    }
+  and close c ~value =
+    let at = au.step in
     let l = loc at in
-    let fold ?step preds =
-      uses ?step (fun ~loc p args -> R.Stmt.fold ~loc p args) (opened values) preds
-    in
+    let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
     match c with
     | Commit ->
+        let message =
+          "The atomic postcondition may not hold after this step, which linearizes the \
+           function"
+        in
         ctx.origins :=
           {
             at;
             code = Fold;
-            message =
-              "The atomic postcondition may not hold after this step, which linearizes \
-               the function";
+            message;
             related =
-              List.map post_preds ~f:(fun (_, _, at) ->
-                  (at, "This part of the atomic postcondition may not hold"));
+              List.map posts ~f:(fun (t : S.term) ->
+                  (t.term_loc, "This part of the atomic postcondition may not hold"));
           }
           :: {
                at;
                code = Commit;
-               message =
-                 "The atomic postcondition may not hold after this step, which \
-                  linearizes the function";
+               message;
                related =
                  List.map posts ~f:(fun (t : S.term) ->
                      (t.term_loc, "The atomic postcondition"));
              }
           :: !(ctx.origins);
-        let* folds = fold ~step:at post_preds in
-        Ok (folds @ [ commit ~l ])
+        let* folds = each posts ~at fold (opened ~value au.values) in
+        Ok (folds @ [ commit ])
     | Abort ->
-        let* folds = fold pre_preds in
+        let* folds = each pres ~at fold (opened au.values) in
         Ok (folds @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ])
-    | Commit_call -> Ok [ commit ~l ]
+    | Commit_call -> Ok [ commit ]
   in
-  ctx.au <- Some { state = Pending; cas_results = []; self; open_; close };
-  let l = loc fun_loc in
+  ctx.au <- Some au;
+  let l = loc at in
   Ok
     (R.Stmt.local ~loc:l ~ghost:true ~const:true
        ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l "bindAU") []))
@@ -2190,7 +2395,7 @@ let atomic_update ctx env ~at ~self implicit ~pres ~posts =
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
+let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations ~linearizations
     (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
     (R.Callable.t, error) Result.t =
   let names = Names.create () in
@@ -2208,6 +2413,7 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
       preds;
       facts = [];
       au = None;
+      linearizations;
     }
   in
   let l = loc f.loc in
@@ -2238,11 +2444,6 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   let pres = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
   let* requires = specs pres in
   let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
-  let* () =
-    if atomic && not (List.is_empty returns) then
-      unsupported f.loc "An atomic contract of a function with a result"
-    else Ok ()
-  in
   let atomic_pres =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
   in
@@ -2288,8 +2489,9 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   let* atomic_ensures = postconditions ~atomic:true atomic_posts in
   let* bind_au =
     if atomic then
-      atomic_update ctx env ~at:f.loc ~self:proc_name implicit_decls ~pres:atomic_pres
-        ~posts:atomic_posts
+      atomic_update ctx env ~at:f.loc ~self:proc_name
+        ~result:(Option.some_if (not (List.is_empty returns)) result_name)
+        implicit_decls ~pres:atomic_pres ~posts:atomic_posts
     else Ok []
   in
   let* () =
@@ -2317,7 +2519,9 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
   let requires = in_range @ requires @ atomic_requires in
   let ensures = Option.to_list result_in_range @ defined @ ensures @ atomic_ensures in
   let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
-  let* stmts, v = expr ctx f.body in
+  let* stmts, v = expr ~tail:true ctx f.body in
+  let* finish = finish_arm ctx ~tail:true v in
+  let stmts = stmts @ finish in
   let assignment =
     if List.is_empty returns then []
     else
@@ -2343,7 +2547,12 @@ let proc types ~refs ~primitives ~ocaml_env ~preds ~funcs ~annotations
         error f.loc
           "This function may return before it linearizes: no step commits its atomic \
            contract"
-    | Some (Unknown | On_cas) ->
+    | Some Partly ->
+        error f.loc
+          "This function may return before it linearizes, on some path: annotate the \
+           step that linearizes it there, as (*@ commit *) or (*@ returning [] -> commit \
+           *)"
+    | Some (Committing | On_cas | On_read _ | Unknown) ->
         error f.loc "Caravan cannot tell whether this function linearizes on every path"
   in
   let body = bind_au @ first @ stmts @ assignment @ last in
@@ -2457,6 +2666,23 @@ let referenced (e : Typedtree.expression) : Ident.t list =
   iterator.expr iterator e;
   !found
 
+(** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
+*)
+let atomic_steps (structure : Typedtree.structure) : int list =
+  let found = ref [] in
+  let expr iterator (e : Typedtree.expression) =
+    begin match e.exp_desc with
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _)
+      when Option.is_some (atomic_name path) ->
+        found := e.exp_loc.loc_end.pos_cnum :: !found
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.expr iterator e
+  in
+  let iterator = { Tast_iterator.default_iterator with expr } in
+  iterator.structure iterator structure;
+  !found
+
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
 let pure_functions (funcs : func list) : func list =
@@ -2498,6 +2724,7 @@ let predicate types ~refs ~primitives ~ocaml_env ~preds ~spec_funcs origins ~at
       preds;
       facts = [];
       au = None;
+      linearizations = [];
     }
   in
   let l = loc at in
@@ -2611,6 +2838,27 @@ let predicates (source : Source.t) =
 (** The Raven program of [source]. *)
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
+  (* Each annotation on an atomic step, by the end of the code it follows. *)
+  let linearizations =
+    List.filter_map annotations ~f:(fun a ->
+        if Poly.equal (Annotation.kind a) Annotation.Linearization then
+          let rec anchor i =
+            if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1) else i
+          in
+          Some (anchor a.loc.loc_start.pos_cnum, a)
+        else None)
+  in
+  (* Each follows an application of an [Atomic] operation. *)
+  let steps = atomic_steps source.typed in
+  let* () =
+    match
+      List.find linearizations ~f:(fun (anchor, _) ->
+          not (List.mem steps anchor ~equal:Int.equal))
+    with
+    | Some (_, a) ->
+        error a.loc "This annotation does not follow an atomic step, as Atomic.get t"
+    | None -> Ok ()
+  in
   let* interface =
     Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
   in
@@ -2660,8 +2908,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~ocaml_env ~preds ~funcs:spec_funcs ~annotations
-          functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+          ~linearizations functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
+
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
   let ref_fields =

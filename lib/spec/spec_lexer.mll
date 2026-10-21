@@ -38,6 +38,7 @@
         "if", IF;
         "assert", ASSERT;
         "atomic", ATOMIC;
+        "commit", COMMIT;
         "fold", FOLD;
         "in", IN;
         "invariant", INVARIANT;
@@ -49,6 +50,7 @@
         "predicate", PREDICATE;
         "pure", PURE;
         "requires", REQUIRES;
+        "returning", RETURNING;
         "then", THEN;
         "true", TRUE;
         "unfold", UNFOLD;

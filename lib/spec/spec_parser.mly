@@ -56,7 +56,7 @@
 (* Contract tokens *)
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
-%token ATOMIC_REQUIRES ATOMIC_ENSURES
+%token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING
 
 (* Keywords *)
 
@@ -100,6 +100,7 @@
 %start <Spec_ast.predicate> predicate
 %start <Spec_ast.predicate list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
+%start <Spec_ast.linearization> linearization
 %%
 
 contract:
@@ -133,6 +134,11 @@ proof:
 
 pred_param:
 | LEFTPAR x = lident COLON t = typ RIGHTPAR { (x, t) }
+;
+
+linearization:
+| COMMIT EOF { Commit }
+| RETURNING p = mpat ARROW COMMIT EOF { Returning p }
 ;
 
 ghost_stmts:

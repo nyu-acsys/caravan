@@ -11,6 +11,7 @@ type interface = {
 
 type t = {
   file : string;
+  text : string;
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   env : Env.t;  (** The environment at the end of the file, for types in annotations. *)
@@ -36,6 +37,64 @@ let load_interface file =
   let signature = Parse.interface lexbuf in
   { signature; interface_comments = Lexer.comments () }
 
+(** Links the type variables of [impl], the type of a value, to what they stand for in
+    [iface], the type its interface gives it, expanding abbreviations as needed. *)
+let rec specialize env (impl : Types.type_expr) (iface : Types.type_expr) =
+  let expanded t =
+    let t' = Ctype.expand_head env t in
+    Option.some_if (not (Types.eq_type t t')) t'
+  in
+  match (Types.get_desc impl, Types.get_desc iface) with
+  | Tpoly (impl, []), _ -> specialize env impl iface
+  | _, Tpoly (iface, []) -> specialize env impl iface
+  | Tvar _, _ -> if not (Types.eq_type impl iface) then Types.link_type impl iface
+  | Tarrow (_, a, r, _), Tarrow (_, a', r', _) ->
+      specialize env a a';
+      specialize env r r'
+  | Ttuple ts, Ttuple ts' when List.length ts = List.length ts' ->
+      List.iter2_exn ts ts' ~f:(fun (_, t) (_, t') -> specialize env t t')
+  | Tconstr (p, args, _), Tconstr (p', args', _)
+    when Path.same
+           (Env.normalize_type_path None env p)
+           (Env.normalize_type_path None env p')
+         && List.length args = List.length args' ->
+      List.iter2_exn args args' ~f:(specialize env)
+  | _ ->
+      begin match (expanded iface, expanded impl) with
+      | Some iface, _ -> specialize env impl iface
+      | None, Some impl -> specialize env impl iface
+      | None, None -> ()
+      end
+
+(** Specializes the values of [typed] to the types that [interface] gives them: the
+    translation is monomorphic, and an interface fixes the types of the values it
+    declares. *)
+let specialize_to_interface env (typed : Typedtree.structure) (interface : interface) =
+  let declared =
+    List.filter_map interface.signature ~f:(fun item ->
+        match item.psig_desc with
+        | Psig_value vd -> Some (vd.pval_name.txt, vd.pval_type)
+        | _ -> None)
+  in
+  List.iter typed.str_items ~f:(fun item ->
+      match item.str_desc with
+      | Tstr_value (_, bindings) ->
+          List.iter bindings ~f:(fun (vb : Typedtree.value_binding) ->
+              match vb.vb_pat.pat_desc with
+              | Tpat_var (id, _, _) ->
+                  begin match
+                    List.Assoc.find declared (Ident.name id) ~equal:String.equal
+                  with
+                  | Some ct ->
+                      let iface =
+                        (Typetexp.transl_simple_type env ~closed:false ct).ctyp_type
+                      in
+                      specialize env vb.vb_expr.exp_type iface
+                  | None -> ()
+                  end
+              | _ -> ())
+      | _ -> ())
+
 (** The declarations of the proof in [file]. *)
 let load_proof file : (S.predicate list, Report.error) Result.t =
   let lexbuf = lexbuf_of file in
@@ -60,7 +119,8 @@ let load (file : string) : (t, Report.error) Result.t =
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
-    let lexbuf = Lexing.from_string (Stdio.In_channel.read_all file) in
+    let text = Stdio.In_channel.read_all file in
+    let lexbuf = Lexing.from_string text in
     Location.init lexbuf file;
     Location.input_name := file;
     Lexer.init ();
@@ -71,8 +131,10 @@ let load (file : string) : (t, Report.error) Result.t =
          (Stdlib.Filename.remove_extension file));
     let typed, _, _, _, env = Typemod.type_structure env parsed in
     let interface = Option.map (sibling file ".mli") ~f:load_interface in
+    Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
-    Result.map proof ~f:(fun proof -> { file; typed; comments; env; interface; proof })
+    Result.map proof ~f:(fun proof ->
+        { file; text; typed; comments; env; interface; proof })
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error
