@@ -27,6 +27,27 @@ let lexeme_loc lexbuf =
     loc_ghost = false;
   }
 
+type kind = Contract | Loop | Predicate | Ghost
+
+(** What [annotation] states, by its first word. *)
+let kind (annotation : t) =
+  match String.split_on_chars (String.strip annotation.text) ~on:[ ' '; '\n'; '\t' ] with
+  | ("invariant" | "variant") :: _ -> Loop
+  | "predicate" :: _ -> Predicate
+  | ("fold" | "unfold" | "assert") :: _ -> Ghost
+  | _ -> Contract
+
+(** Parses [annotation] with [entry]; the lexer and the parser report errors by raising.
+*)
+let parse (annotation : t) entry =
+  let lexbuf = lexbuf annotation in
+  try Ok (entry Spec_lexer.token lexbuf) with
+  | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
+  | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+
+let predicate (annotation : t) = parse annotation Spec_parser.predicate
+let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
+
 (** The specification of a loop that [annotation] states: its invariants and variants. *)
 let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =
   let lexbuf = lexbuf annotation in

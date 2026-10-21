@@ -94,6 +94,12 @@ let empty_contract =
 type loop_spec = { invariants : term list; loop_variant : term list }
 (** The specification of a loop, written at the start of its body. *)
 
+type predicate = { pred_name : id; pred_params : (id * pty) list; pred_body : term }
+(** A predicate, [predicate p (x : t) ... = body]. *)
+
+(** A ghost statement in code. *)
+type ghost_stmt = Fold of term | Unfold of term | Assert of term
+
 let mk_loc (s, e) = { Location.loc_start = s; loc_end = e; loc_ghost = false }
 let mk_term t l = { term_desc = t; term_loc = l }
 

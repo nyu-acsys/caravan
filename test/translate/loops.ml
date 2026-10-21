@@ -27,7 +27,7 @@ type counter = { mutable count : int }
 
 let fill c n =
   for _ = 1 to n do
-    (*@ invariant own c.count k && 0 <= k <= 1000 *)
+    (*@ invariant own c.count j && 0 <= j <= 1000 *)
     if c.count < 1000 then c.count <- c.count + 1
   done
 (*@ fill c n

@@ -95,6 +95,10 @@ type context = {
   spec_funcs : (string * string) list;
       (** The functions contracts can call, by their OCaml names, with their Raven ones.
       *)
+  env : Env.t;  (** OCaml's, for the types in annotations. *)
+  preds : (string * (string * Types.type_expr list)) list;
+      (** The predicates, by their OCaml names, with their Raven names and parameter
+          types. *)
   mutable facts : R.Spec.t list;
       (** Facts that hold throughout the function: its preconditions without [own], which
           only mention variables, all immutable. *)
@@ -233,30 +237,6 @@ type env = {
 
 let bind env x b = { env with vars = (x, b) :: env.vars }
 
-(** The Raven type of the type [t] written in a contract at [at]. *)
-let rec spec_type env ~at (t : S.pty) : (R.Type.t, error) Result.t =
-  let l = loc at in
-  match t with
-  | PTtyapp (Qid { pid_str = "int"; _ }, []) -> Ok (R.Type.int ~loc:l)
-  | PTtyapp (Qid { pid_str = "bool"; _ }, []) -> Ok (R.Type.bool ~loc:l)
-  | PTtyapp (Qid { pid_str = "unit"; _ }, []) -> Ok (R.Type.tuple ~loc:l [])
-  | PTtyapp (Qid { pid_str = ("list" | "option") as n; _ }, [ elt ]) ->
-      let* elt = spec_type env ~at elt in
-      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l (String.capitalize n)) [ elt ])
-  | PTtyapp (Qid { pid_str = n; _ }, []) ->
-      let declared (d : Datatypes.t) =
-        Option.exists d.id ~f:(fun id -> String.equal (Ident.name id) n)
-      in
-      begin match List.find env.data ~f:declared with
-      | Some d ->
-          Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
-      | None -> error at (Printf.sprintf "Unbound type %s" n)
-      end
-  | PTtuple ts ->
-      let* ts = all ts ~f:(spec_type env ~at) in
-      Ok (R.Type.tuple ~loc:l ts)
-  | _ -> unsupported at "This type"
-
 (** The operators of contracts that Raven has. *)
 let spec_binop (op : string) : R.Expr.binop option =
   match op with
@@ -303,6 +283,133 @@ let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
       end
   | n, _ -> error at (Printf.sprintf "This constructor expects %d arguments" n)
 
+(** The names that the contract term [t] uses free. *)
+let rec term_names (t : S.term) : string list =
+  let rec pat_names (p : S.pat) =
+    match p.pat_desc with
+    | Pwild | Pconst _ | Pconstr (_, None) -> []
+    | Pid id -> [ id.pid_str ]
+    | Ptuple ps -> List.concat_map ps ~f:pat_names
+    | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+  in
+  let without bound names =
+    List.filter names ~f:(fun x -> not (List.mem bound x ~equal:String.equal))
+  in
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar (Qdot _) -> []
+  | Tvar (Qid id) -> [ id.pid_str ]
+  | Tapply (a, b) | Tinfix (a, _, b) -> term_names a @ term_names b
+  | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
+  | Tquant (_, binders, body) ->
+      without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
+  | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
+  | Tmatch (t, cases) ->
+      term_names t
+      @ List.concat_map cases ~f:(fun (p, body) ->
+          without (pat_names p) (term_names body))
+  | Ttuple ts -> List.concat_map ts ~f:term_names
+  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
+
+(** The location of the first occurrence of the name [x] in [terms]. *)
+let name_loc (terms : S.term list) x ~default =
+  let rec find (t : S.term) =
+    match t.term_desc with
+    | Tvar (Qid id) when String.equal id.pid_str x -> Some id.pid_loc
+    | Tapply (a, b) | Tinfix (a, _, b) -> Option.first_some (find a) (find b)
+    | Tif (a, b, c) -> List.find_map [ a; b; c ] ~f:find
+    | Tquant (_, _, t) | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> find t
+    | Tlet (_, a, b) -> Option.first_some (find a) (find b)
+    | Tmatch (t, cases) ->
+        Option.first_some (find t) (List.find_map cases ~f:(fun (_, b) -> find b))
+    | Ttuple ts -> List.find_map ts ~f:find
+    | _ -> None
+  in
+  Option.value (List.find_map terms ~f:find) ~default
+
+(** The names free in [terms] that [env] does not bind, with Raven names for them, and
+    their OCaml and Raven types: a name owned as the value of a field has that field's
+    type, as [n] in [own c.count n]. *)
+let free_typed ?(lenient = false) env (terms : S.term list) ~at =
+  let is_name x =
+    (not (String.is_empty x))
+    && (Char.is_lowercase x.[0] || Char.equal x.[0] '_')
+    && String.for_all x ~f:(fun c ->
+        Char.is_alphanum c || Char.equal c '_' || Char.equal c '\'')
+  in
+  let known x =
+    List.Assoc.mem env.vars x ~equal:String.equal
+    || List.Assoc.mem env.funcs x ~equal:String.equal
+    || List.mem [ "own"; "not"; "max_int"; "min_int"; "mod" ] x ~equal:String.equal
+  in
+  let free =
+    List.concat_map terms ~f:term_names
+    |> List.filter ~f:(fun x -> is_name x && not (known x))
+    |> List.dedup_and_sort ~compare:String.compare
+  in
+  (* The types of the values of fields that [t] owns; and of names passed to predicates. *)
+  let rec owned (t : S.term) =
+    match S.(t.term_desc) with
+    | Tapply
+        ( {
+            term_desc =
+              Tapply
+                ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+                  {
+                    term_desc =
+                      Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label);
+                    _;
+                  } );
+            _;
+          },
+          { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ) ->
+        Option.to_list
+          (Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
+             ~f:(fun typ ->
+               Option.map (field_type env.ctx typ label.pid_str) ~f:(fun t -> (v, t))))
+    | Tapply (a, b) | Tinfix (a, _, b) -> owned a @ owned b
+    | Tif (a, b, c) -> owned a @ owned b @ owned c
+    | Tattr (_, t) | Tcast (t, _) -> owned t
+    | _ -> []
+  in
+  (* The parameter types of the predicates that [t] passes names to. *)
+  let rec passed (t : S.term) =
+    let head, args = spine t [] in
+    let here =
+      match head.term_desc with
+      | Tvar (Qid { pid_str = p; _ }) ->
+          begin match List.Assoc.find env.ctx.preds p ~equal:String.equal with
+          | Some (_, types) when List.length types = List.length args ->
+              List.filter_map (List.zip_exn args types) ~f:(fun ((a : S.term), t) ->
+                  match a.term_desc with
+                  | Tvar (Qid { pid_str = v; _ }) -> Some (v, t)
+                  | _ -> None)
+          | _ -> []
+          end
+      | _ -> []
+    in
+    here
+    @
+    match t.term_desc with
+    | Tapply (a, b) | Tinfix (a, _, b) -> passed a @ passed b
+    | Tif (a, b, c) -> passed a @ passed b @ passed c
+    | Tattr (_, t) | Tcast (t, _) -> passed t
+    | _ -> []
+  in
+  let owned = List.concat_map terms ~f:owned @ List.concat_map terms ~f:passed in
+  let* typed =
+    all free ~f:(fun x ->
+        match List.Assoc.find owned x ~equal:String.equal with
+        | None when lenient -> Ok None
+        | None ->
+            error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x)
+        | Some t ->
+            let l = loc at in
+            let* typ = typ env.ctx ~at t in
+            let raven = Names.fresh env.ctx.names x in
+            Ok (Some (x, raven, t, typ, l)))
+  in
+  Ok (List.filter_opt typed)
+
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   let at = t.term_loc in
@@ -335,13 +442,17 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
             match ty with
             | None -> error id.pid_loc "A bound variable needs a type, as in x: int"
             | Some ty ->
-                let* ty = spec_type env ~at:id.pid_loc ty in
+                let* t = Source.ocaml_type env.ctx.env ~at:id.pid_loc ty in
+                let* ty = typ env.ctx ~at:id.pid_loc t in
                 let l = loc id.pid_loc in
-                Ok (id.pid_str, R.Var.make ~loc:l (ident ~loc:l id.pid_str) ty))
+                Ok (id.pid_str, t, R.Var.make ~loc:l (ident ~loc:l id.pid_str) ty))
       in
-      let env = List.fold bound ~init:env ~f:(fun env (x, _) -> bind env x (Raven x)) in
+      let env =
+        List.fold bound ~init:env ~f:(fun env (x, t, _) ->
+            { (bind env x (Raven x)) with var_types = (x, t) :: env.var_types })
+      in
       let* body = formula env body in
-      let vars = List.map bound ~f:snd in
+      let vars = List.map bound ~f:(fun (_, _, v) -> v) in
       Ok
         (match q with
         | Tforall -> R.Expr.forall ~loc:l vars body
@@ -351,7 +462,13 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       Ok (R.Expr.tuple ~loc:l ts)
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
-      spec_match env ~at v cases
+      let scrutinee_type =
+        match scrutinee.term_desc with
+        | Tvar (Qid { pid_str = x; _ }) ->
+            List.Assoc.find env.var_types x ~equal:String.equal
+        | _ -> None
+      in
+      spec_match env ~at ?scrutinee_type v cases
   | Tattr (_, t) | Tcast (t, _) -> formula env t
   | Tfield (r, Qid { pid_str = label; _ }) ->
       let reference =
@@ -415,6 +532,63 @@ and application env (t : S.term) =
       let f = Option.value_exn (list_function q) in
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args)
   | _ -> unsupported at "A call of a function in a contract"
+
+(** The OCaml types of the names that the pattern [p] binds, matching a value of type [t].
+*)
+and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_expr) list
+    =
+  match (p.pat_desc, Types.get_desc t) with
+  | Pid id, _ -> [ (id.pid_str, t) ]
+  | Pcast (p, _), _ -> pattern_types env p t
+  | Ptuple ps, Ttuple ts when List.length ps = List.length ts ->
+      List.concat_map (List.zip_exn ps ts) ~f:(fun (p, (_, t)) -> pattern_types env p t)
+  | Pconstr (Qid { pid_str = c; _ }, arg), Tconstr (path, args, _) -> begin
+      let arg_types =
+        match (c, args) with
+        | "::", [ elt ] when Path.same path Predef.path_list -> [ elt; t ]
+        | "Some", [ elt ] when Path.same path Predef.path_option -> [ elt ]
+        | _ ->
+            begin match Datatypes.find env.data path with
+            | Some d ->
+                Option.value_map
+                  (List.find d.ctors ~f:(fun ctor -> String.equal ctor.ocaml c))
+                  ~default:[]
+                  ~f:(fun ctor -> ctor.args)
+            | None -> []
+            end
+      in
+      let arg_patterns =
+        match (arg, arg_types) with
+        | None, _ | _, [] -> []
+        | Some p, [ _ ] -> [ p ]
+        | Some { pat_desc = Ptuple ps; _ }, _ -> ps
+        | Some _, _ -> []
+      in
+      if List.length arg_patterns <> List.length arg_types then []
+      else
+        List.concat_map (List.zip_exn arg_patterns arg_types) ~f:(fun (p, t) ->
+            pattern_types env p t)
+    end
+  | _ -> []
+
+(** The formula [t], with the names free in it that can be typed existentially quantified,
+    as [n] in [own x.next n && lseg n t]. *)
+and quantified env (t : S.term) =
+  let l = loc t.term_loc in
+  let* free = free_typed ~lenient:true env [ t ] ~at:t.term_loc in
+  let env =
+    List.fold free ~init:env ~f:(fun env (x, raven, ty, _, _) ->
+        { (bind env x (Raven raven)) with var_types = (x, ty) :: env.var_types })
+  in
+  let* body = formula env t in
+  match free with
+  | [] -> Ok body
+  | _ ->
+      let vars =
+        List.map free ~f:(fun (_, raven, _, typ, l) ->
+            R.Var.make ~loc:l (ident ~loc:l raven) typ)
+      in
+      Ok (R.Expr.exists ~loc:l vars body)
 
 (** The location [t], as in [own r.count n]: a field of a variable of known type. *)
 and location_of env (t : S.term) =
@@ -497,15 +671,22 @@ and spec_pattern env (p : S.pat) (v : R.Expr.t) =
 
 (** A match on the value [v] in a contract: a Raven match if the cases are flat, and
     otherwise conditional expressions, whose last case is not tested. *)
-and spec_match env ~at v (cases : (S.pat * S.term) list) =
+and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
   let l = loc at in
+  (* The environment of a case's body, with the types of its pattern's variables. *)
+  let typed env (p : S.pat) =
+    let types =
+      Option.value_map scrutinee_type ~default:[] ~f:(fun t -> pattern_types env p t)
+    in
+    { env with var_types = types @ env.var_types }
+  in
   let flat_arg (p : S.pat) =
     match p.pat_desc with Pwild -> Some None | Pid id -> Some (Some id) | _ -> None
   in
   let rec flat seen = function
     | [] -> Some []
     | [ ((p : S.pat), body) ] when Option.is_some (flat_arg p) ->
-        Some [ (`Any (Option.join (flat_arg p)), body) ]
+        Some [ (`Any (Option.join (flat_arg p)), (p, body)) ]
     | ((p : S.pat), body) :: rest ->
         begin match p.pat_desc with
         | Pconstr (Qid { pid_str = c_name; _ }, arg) -> begin
@@ -521,7 +702,7 @@ and spec_match env ~at v (cases : (S.pat * S.term) list) =
                    && not (List.mem seen c.raven ~equal:String.equal) ->
                 Option.map
                   (flat (c.raven :: seen) rest)
-                  ~f:(fun rest -> (`Ctor (c, args), body) :: rest)
+                  ~f:(fun rest -> (`Ctor (c, args), (p, body)) :: rest)
             | _ -> None
           end
         | _ -> None
@@ -530,14 +711,14 @@ and spec_match env ~at v (cases : (S.pat * S.term) list) =
   match flat [] cases with
   | Some flat ->
       let case = function
-        | `Any id, body ->
+        | `Any id, (p, body) ->
             let env =
               Option.value_map id ~default:env ~f:(fun id ->
                   bind env id.S.pid_str (Value v))
             in
-            let* body = formula env body in
+            let* body = quantified (typed env p) body in
             Ok (R.Expr.Default, body)
-        | `Ctor ((c : Datatypes.ctor), args), body ->
+        | `Ctor ((c : Datatypes.ctor), args), (p, body) ->
             let var = function
               | None -> ident ~loc:l "_"
               | Some (id : S.id) -> ident ~loc:(loc id.pid_loc) id.pid_str
@@ -547,25 +728,26 @@ and spec_match env ~at v (cases : (S.pat * S.term) list) =
                 | None -> env
                 | Some (id : S.id) -> bind env id.pid_str (Raven id.pid_str))
             in
-            let* body = formula env body in
+            let* body = quantified (typed env p) body in
             Ok (R.Expr.Case (ident ~loc:l c.raven, List.map args ~f:var), body)
       in
       let* cases = all flat ~f:case in
       Ok (R.Expr.match_ ~loc:l v cases)
   | None ->
-      let case_body binds body =
-        formula
-          (List.fold binds ~init:env ~f:(fun env (x, value) -> bind env x (Value value)))
+      let case_body p binds body =
+        quantified
+          (List.fold binds ~init:(typed env p) ~f:(fun env (x, value) ->
+               bind env x (Value value)))
           body
       in
       let rec chain = function
         | [] -> error at "A match needs at least one case"
         | [ (p, body) ] ->
             let* _, binds = spec_pattern env p v in
-            case_body binds body
+            case_body p binds body
         | (p, body) :: rest -> begin
             let* cond, binds = spec_pattern env p v in
-            let* body = case_body binds body in
+            let* body = case_body p binds body in
             match cond with
             | None -> Ok body
             | Some cond ->
@@ -575,103 +757,50 @@ and spec_match env ~at v (cases : (S.pat * S.term) list) =
       in
       chain cases
 
-(** The names that the contract term [t] uses free. *)
-let rec term_names (t : S.term) : string list =
-  let rec pat_names (p : S.pat) =
-    match p.pat_desc with
-    | Pwild | Pconst _ | Pconstr (_, None) -> []
-    | Pid id -> [ id.pid_str ]
-    | Ptuple ps -> List.concat_map ps ~f:pat_names
-    | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
-  in
-  let without bound names =
-    List.filter names ~f:(fun x -> not (List.mem bound x ~equal:String.equal))
-  in
-  match t.term_desc with
-  | Ttrue | Tfalse | Tconst _ | Tvar (Qdot _) -> []
-  | Tvar (Qid id) -> [ id.pid_str ]
-  | Tapply (a, b) | Tinfix (a, _, b) -> term_names a @ term_names b
-  | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
-  | Tquant (_, binders, body) ->
-      without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
-  | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
-  | Tmatch (t, cases) ->
-      term_names t
-      @ List.concat_map cases ~f:(fun (p, body) ->
-          without (pat_names p) (term_names body))
-  | Ttuple ts -> List.concat_map ts ~f:term_names
-  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
+(** The latest binding of each variable in scope. *)
+let scope ctx =
+  List.fold (List.rev ctx.names.scope) ~init:[] ~f:(fun acc (x, b) ->
+      (x, b) :: List.Assoc.remove acc x ~equal:String.equal)
 
-(** The location of the first occurrence of the name [x] in [terms]. *)
-let name_loc (terms : S.term list) x ~default =
-  let rec find (t : S.term) =
-    match t.term_desc with
-    | Tvar (Qid id) when String.equal id.pid_str x -> Some id.pid_loc
-    | Tapply (a, b) | Tinfix (a, _, b) -> Option.first_some (find a) (find b)
-    | Tif (a, b, c) -> List.find_map [ a; b; c ] ~f:find
-    | Tquant (_, _, t) | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> find t
-    | Tlet (_, a, b) -> Option.first_some (find a) (find b)
-    | Tmatch (t, cases) ->
-        Option.first_some (find t) (List.find_map cases ~f:(fun (_, b) -> find b))
-    | Ttuple ts -> List.find_map ts ~f:find
-    | _ -> None
-  in
-  Option.value (List.find_map terms ~f:find) ~default
+(** The environment of a contract term written in code, as an invariant, with the
+    variables in scope. *)
+let scope_env ctx =
+  let scope = scope ctx in
+  {
+    ctx;
+    var_types =
+      List.filter_map scope ~f:(fun (x, (_, t)) -> Option.map t ~f:(fun t -> (x, t)));
+    data = ctx.types;
+    funcs = ctx.spec_funcs;
+    vars = List.map scope ~f:(fun (x, (raven, _)) -> (x, Raven raven));
+  }
 
-(** The names free in [terms] that [env] does not bind, with Raven names for them, and
-    their OCaml and Raven types: a name owned as the value of a field has that field's
-    type, as [n] in [own c.count n]. *)
-let free_typed env (terms : S.term list) ~at =
-  let is_name x =
-    (not (String.is_empty x))
-    && (Char.is_lowercase x.[0] || Char.equal x.[0] '_')
-    && String.for_all x ~f:(fun c ->
-        Char.is_alphanum c || Char.equal c '_' || Char.equal c '\'')
+(** The ghost statements in the annotations between the positions [after] and [before], as
+    [e1; (*@ unfold p x *) e2]. *)
+let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
+  let between (a : Annotation.t) =
+    a.loc.loc_start.pos_cnum >= after.pos_cnum
+    && a.loc.loc_end.pos_cnum <= before.pos_cnum
+    && Poly.equal (Annotation.kind a) Annotation.Ghost
   in
-  let known x =
-    List.Assoc.mem env.vars x ~equal:String.equal
-    || List.Assoc.mem env.funcs x ~equal:String.equal
-    || List.mem [ "own"; "not"; "max_int"; "min_int"; "mod" ] x ~equal:String.equal
+  let* stmts = all (List.filter ctx.annotations ~f:between) ~f:Annotation.ghost_stmts in
+  let env = scope_env ctx in
+  let use (t : S.term) make =
+    let head, args = spine t [] in
+    match head.term_desc with
+    | Tvar (Qid { pid_str = p; _ }) when List.Assoc.mem ctx.preds p ~equal:String.equal ->
+        let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+        let* args = all args ~f:(formula env) in
+        let l = loc t.term_loc in
+        Ok (make ~loc:l (name ~loc:l raven) args)
+    | _ -> error t.term_loc "Expected a predicate applied to its arguments"
   in
-  let free =
-    List.concat_map terms ~f:term_names
-    |> List.filter ~f:(fun x -> is_name x && not (known x))
-    |> List.dedup_and_sort ~compare:String.compare
-  in
-  (* The types of the values of fields that [t] owns. *)
-  let rec owned (t : S.term) =
-    match S.(t.term_desc) with
-    | Tapply
-        ( {
-            term_desc =
-              Tapply
-                ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
-                  {
-                    term_desc =
-                      Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label);
-                    _;
-                  } );
-            _;
-          },
-          { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ) ->
-        Option.to_list
-          (Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
-             ~f:(fun typ ->
-               Option.map (field_type env.ctx typ label.pid_str) ~f:(fun t -> (v, t))))
-    | Tapply (a, b) | Tinfix (a, _, b) -> owned a @ owned b
-    | Tif (a, b, c) -> owned a @ owned b @ owned c
-    | Tattr (_, t) | Tcast (t, _) -> owned t
-    | _ -> []
-  in
-  let owned = List.concat_map terms ~f:owned in
-  all free ~f:(fun x ->
-      match List.Assoc.find owned x ~equal:String.equal with
-      | None -> error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x)
-      | Some t ->
-          let l = loc at in
-          let* typ = typ env.ctx ~at t in
-          let raven = Names.fresh env.ctx.names x in
-          Ok (x, raven, t, typ, l))
+  all (List.concat stmts) ~f:(function
+    | S.Fold t -> use t (fun ~loc p args -> R.Stmt.fold ~loc p args)
+    | Unfold t -> use t (fun ~loc p args -> R.Stmt.unfold ~loc p args)
+    | Assert t ->
+        let* c = formula env t in
+        Ok (R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make c)))
 
 (** The specification of the loop whose body is [body], in an annotation between [after]
     and the body, as [while c do (*@ invariant P *) ... done]. *)
@@ -680,7 +809,10 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     a.loc.loc_start.pos_cnum >= after.loc_end.pos_cnum
     && a.loc.loc_end.pos_cnum <= body.exp_loc.loc_start.pos_cnum
   in
-  match List.filter ctx.annotations ~f:between with
+  match
+    List.filter ctx.annotations ~f:(fun a ->
+        between a && Poly.equal (Annotation.kind a) Annotation.Loop)
+  with
   | [] -> Ok { S.invariants = []; loop_variant = [] }
   | [ a ] -> Annotation.loop_spec a
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
@@ -700,21 +832,8 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
     | [] -> Ok ()
     | v :: _ -> unsupported v.term_loc "A variant"
   in
-  (* The latest binding of each name. *)
-  let scope =
-    List.fold (List.rev ctx.names.scope) ~init:[] ~f:(fun acc (x, b) ->
-        (x, b) :: List.Assoc.remove acc x ~equal:String.equal)
-  in
-  let env =
-    {
-      ctx;
-      var_types =
-        List.filter_map scope ~f:(fun (x, (_, t)) -> Option.map t ~f:(fun t -> (x, t)));
-      data = ctx.types;
-      funcs = ctx.spec_funcs;
-      vars = List.map scope ~f:(fun (x, (raven, _)) -> (x, Raven raven));
-    }
-  in
+  let scope = scope ctx in
+  let env = scope_env ctx in
   let* free = free_typed env spec.invariants ~at in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
@@ -926,17 +1045,22 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
                          (ident ~loc:l x)
                       @ assume_in_range ~loc:l t x)))
       in
+      let last = List.last_exn bindings in
+      let* ghost =
+        ghost ctx ~after:last.vb_expr.exp_loc.loc_end ~before:body.exp_loc.loc_start
+      in
       let* body_stmts, body = expr ctx body in
       Ok
         ( List.concat_map evaluated ~f:(fun (_, stmts, _) -> stmts)
           @ List.concat (List.concat defs)
-          @ body_stmts,
+          @ ghost @ body_stmts,
           body )
   | Texp_let (Recursive, _, _) -> unsupported at "A local recursive function"
   | Texp_sequence (e1, e2) ->
       let* stmts1, _ = expr ctx e1 in
+      let* ghost = ghost ctx ~after:e1.exp_loc.loc_end ~before:e2.exp_loc.loc_start in
       let* stmts2, v = expr ctx e2 in
-      Ok (stmts1 @ stmts2, v)
+      Ok (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
       let* spec = loop_spec ctx ~after:cond.exp_loc body in
       let* c_stmts, c = expr ctx cond in
@@ -1494,6 +1618,7 @@ type func = {
   body : Typedtree.expression;
   loc : Location.t;
   contract : S.contract option;
+  next : Location.t option;  (** The location of the next structure item, if any. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract. *)
 
@@ -1586,7 +1711,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
     List.fold implicit ~init:env ~f:(fun env (x, raven, t, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
-  Ok (result_name, env, List.map implicit ~f:(fun (_, _, _, var) -> var))
+  Ok (result_name, env, implicit)
 
 (** The names free in the preconditions of [f] that [env] does not bind: implicit ghost
     parameters, as [n] in [requires own c.count n], with their Raven names, OCaml types
@@ -1607,7 +1732,7 @@ and implicit_vars env (f : func) =
     do not call [f] itself: these are proven for the function's value, by induction, which
     a precondition bounding the function's own value, as for the code to not overflow,
     would make circular. *)
-let func types ~refs ~funcs ~spec_funcs origins (f : func) :
+let func types ~refs ~ocaml_env ~preds ~funcs ~spec_funcs origins (f : func) :
     (R.Callable.t, error) Result.t =
   let ctx =
     {
@@ -1618,6 +1743,8 @@ let func types ~refs ~funcs ~spec_funcs origins (f : func) :
       origins;
       annotations = [];
       spec_funcs;
+      env = ocaml_env;
+      preds;
       facts = [];
     }
   in
@@ -1656,8 +1783,9 @@ let func types ~refs ~funcs ~spec_funcs origins (f : func) :
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~refs ~funcs ~annotations (functions : (string * string) list) origins
-    ~proc_name ~pure (f : func) : (R.Callable.t, error) Result.t =
+let proc types ~refs ~ocaml_env ~preds ~funcs ~annotations
+    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
+    (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -1668,6 +1796,8 @@ let proc types ~refs ~funcs ~annotations (functions : (string * string) list) or
       origins;
       annotations;
       spec_funcs = funcs;
+      env = ocaml_env;
+      preds;
       facts = [];
     }
   in
@@ -1683,6 +1813,10 @@ let proc types ~refs ~funcs ~annotations (functions : (string * string) list) or
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
   let* _, env, implicit = contract_env ctx ~spec_funcs:funcs f formals ~result in
+  (* Ghost statements and invariants in the code can use the implicit parameters. *)
+  List.iter implicit ~f:(fun (x, raven, t, _) ->
+      ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
+  let implicit = List.map implicit ~f:(fun (_, _, _, var) -> var) in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula env f) ~f:(fun e -> R.Spec.make e))
   in
@@ -1745,17 +1879,27 @@ let proc types ~refs ~funcs ~annotations (functions : (string * string) list) or
   in
   let requires = in_range @ requires in
   let ensures = Option.to_list result_in_range @ defined @ ensures in
+  let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
   let* stmts, v = expr ctx f.body in
-  let body =
-    if List.is_empty returns then stmts
+  let assignment =
+    if List.is_empty returns then []
     else
-      stmts
-      @ [
-          R.Stmt.assign ~loc:l
-            [ R.Expr.var ~loc:l (name ~loc:l result) ]
-            (R.Stmt.expr_rhs v);
-        ]
+      [
+        R.Stmt.assign ~loc:l
+          [ R.Expr.var ~loc:l (name ~loc:l result) ]
+          (R.Stmt.expr_rhs v);
+      ]
   in
+  (* The ghost statements after the body follow the result's assignment, and can use its
+     name. *)
+  ctx.names.scope <- (result_name, (result, Some f.body.exp_type)) :: ctx.names.scope;
+  let* last =
+    ghost ctx ~after:f.body.exp_loc.loc_end
+      ~before:
+        (Option.value_map f.next ~default:{ f.loc.loc_end with pos_cnum = Int.max_value }
+           ~f:(fun l -> l.loc_start))
+  in
+  let body = first @ stmts @ assignment @ last in
   Ok
     (R.Callable.proc ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ implicit)
@@ -1770,7 +1914,10 @@ let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
     && Option.for_all next ~f:(fun next ->
         a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
   in
-  match List.filter annotations ~f:after with
+  match
+    List.filter annotations ~f:(fun a ->
+        after a && Poly.equal (Annotation.kind a) Annotation.Contract)
+  with
   | [] -> Ok None
   | [ a ] -> Result.map (Annotation.contract a) ~f:Option.some
   | _ :: a :: _ -> error a.loc "A function has at most one contract"
@@ -1805,6 +1952,7 @@ let items (structure : Typedtree.structure) (annotations : Annotation.t list) :
                       body;
                       loc = vb.vb_loc;
                       contract;
+                      next;
                     }
               | _ -> unsupported vb.vb_loc "This definition")
         in
@@ -1852,6 +2000,47 @@ let pure_functions (funcs : func list) : func list =
   in
   close seeds
 
+(** The predicate [p], declared at [at], whose parameters have the OCaml types [types]. *)
+let predicate types ~refs ~ocaml_env ~preds ~spec_funcs origins ~at (p : S.predicate)
+    param_types : (R.Callable.t, error) Result.t =
+  let ctx =
+    {
+      types;
+      refs;
+      names = Names.create ();
+      functions = [];
+      origins;
+      annotations = [];
+      spec_funcs;
+      env = ocaml_env;
+      preds;
+      facts = [];
+    }
+  in
+  let l = loc at in
+  let* params =
+    all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
+        let* typ = typ ctx ~at t in
+        let raven = Names.fresh ctx.names id.S.pid_str in
+        Ok
+          (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
+  in
+  let env =
+    {
+      ctx;
+      var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
+      data = types;
+      funcs = spec_funcs;
+      vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
+    }
+  in
+  let* body = quantified env p.pred_body in
+  Ok
+    (R.Callable.func ~loc:l ~kind:Pred
+       ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
+       (ident ~loc:l p.pred_name.pid_str)
+       (Some body))
+
 (** The Raven program of [source]. *)
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
@@ -1872,18 +2061,43 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
   let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, proc_name f)) in
   let origins = ref [] in
-  let spec_funcs = List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name)) in
+  let ocaml_env = source.env in
+  (* The predicates' signatures first, for their bodies and the contracts to use. *)
+  let* predicates =
+    all
+      (List.filter annotations ~f:(fun a ->
+           Poly.equal (Annotation.kind a) Annotation.Predicate))
+      ~f:(fun a ->
+        let* p = Annotation.predicate a in
+        let* param_types =
+          all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type ocaml_env ~at:a.loc t)
+        in
+        Ok (a, p, param_types))
+  in
+  let preds =
+    List.map predicates ~f:(fun (_, p, types) ->
+        (p.pred_name.pid_str, (p.pred_name.pid_str, types)))
+  in
+  let spec_funcs =
+    List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
+    @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
+  in
+  let* pred_members =
+    all predicates ~f:(fun ((a : Annotation.t), p, param_types) ->
+        predicate types ~refs ~ocaml_env ~preds ~spec_funcs origins ~at:a.loc p
+          param_types)
+  in
   let* pure_funcs =
     all pure
       ~f:
-        (func types ~refs
+        (func types ~refs ~ocaml_env ~preds
            ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
            ~spec_funcs origins)
   in
   let* procs =
     all funcs ~f:(fun f ->
-        proc types ~refs ~funcs:spec_funcs ~annotations functions origins
-          ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+        proc types ~refs ~ocaml_env ~preds ~funcs:spec_funcs ~annotations functions
+          origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
@@ -1894,5 +2108,5 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ record_fields @ ref_fields
-        @ List.map (pure_funcs @ procs) ~f:R.Member.callable),
+        @ List.map (pred_members @ pure_funcs @ procs) ~f:R.Member.callable),
       !origins )

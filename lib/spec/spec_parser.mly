@@ -48,7 +48,7 @@
 
 (* Contract tokens *)
 
-%token REQUIRES ENSURES VARIANT PURE INVARIANT
+%token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT
 
 (* Keywords *)
 
@@ -89,6 +89,8 @@
 %start <Spec_ast.contract> contract
 %start <Spec_ast.term> term_eof
 %start <Spec_ast.loop_spec> loop_spec
+%start <Spec_ast.predicate> predicate
+%start <Spec_ast.ghost_stmt list> ghost_stmts
 %%
 
 contract:
@@ -104,6 +106,25 @@ loop_spec:
     { let invariants = List.filter_map (function `Invariant t -> Some t | `Variant _ -> None) cs in
       let loop_variant = List.filter_map (function `Variant t -> Some t | `Invariant _ -> None) cs in
       { invariants; loop_variant } }
+;
+
+predicate:
+| PREDICATE n = lident ps = pred_param+ EQUAL t = term EOF
+    { { pred_name = n; pred_params = ps; pred_body = t } }
+;
+
+pred_param:
+| LEFTPAR x = lident COLON t = typ RIGHTPAR { (x, t) }
+;
+
+ghost_stmts:
+| ss = ghost_stmt+ EOF { ss }
+;
+
+ghost_stmt:
+| FOLD t = term { Fold t }
+| UNFOLD t = term { Unfold t }
+| ASSERT t = term { Assert t }
 ;
 
 loop_clause:

@@ -36,6 +36,8 @@
         "false", FALSE;
         "forall", FORALL;
         "if", IF;
+        "assert", ASSERT;
+        "fold", FOLD;
         "in", IN;
         "invariant", INVARIANT;
         "let", LET;
@@ -43,10 +45,12 @@
         "mod", OP3 "mod";
         "not", NOT;
         "old", OLD;
+        "predicate", PREDICATE;
         "pure", PURE;
         "requires", REQUIRES;
         "then", THEN;
         "true", TRUE;
+        "unfold", UNFOLD;
         "variant", VARIANT;
         "with", WITH;
       ]
