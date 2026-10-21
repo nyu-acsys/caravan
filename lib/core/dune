@@ -1,4 +1,11 @@
 (library
  (name caravan_core)
  (package caravan)
- (libraries base stdio logs fmt compiler-libs.common raven-ivl.api))
+ (libraries
+  base
+  stdio
+  logs
+  fmt
+  compiler-libs.common
+  raven-ivl.api
+  caravan_spec))

@@ -1,4 +1,5 @@
 (lang dune 3.12)
+(using menhir 2.1)
 
 (generate_opam_files)
 
@@ -21,6 +22,10 @@
    (>= 3.12))
   (raven-ivl
    (>= 1.5.0))
+  (menhir
+   (and
+    :build
+    (>= 20220210)))
   (ocamlformat
    (and
     :with-dev-setup

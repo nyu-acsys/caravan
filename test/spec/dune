@@ -1,0 +1,3 @@
+(test
+ (name parse)
+ (libraries caravan_spec compiler-libs.common))

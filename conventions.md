@@ -2,7 +2,7 @@
 
 Here are some coding conventions that we should adhere to (in random order).
 
-* Reserve the use of exceptions for cases where program execution should be aborted. That is, `try ... with` blocks are confined to the very top-level error handling function in `bin/caravan.ml`, and to the places where the OCaml compiler's libraries report errors as exceptions, which are turned into Caravan's errors right there. Use `Option.t` and friends instead of exceptions in other cases. Learn about monads/applicatives if you want nice syntax.
+* Reserve the use of exceptions for cases where program execution should be aborted. That is, `try ... with` blocks are confined to the very top-level error handling function in `bin/caravan.ml`, and to the places where the OCaml compiler's libraries and the lexers and parsers that ocamllex and Menhir generate report errors as exceptions, which are turned into Caravan's errors right there. Use `Option.t` and friends instead of exceptions in other cases. Learn about monads/applicatives if you want nice syntax.
 
 * Do not write directly to standard output / standard error. Use the [Logs](https://erratique.ch/software/logs) module.
 

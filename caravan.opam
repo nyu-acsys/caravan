@@ -12,6 +12,7 @@ depends: [
   "ocaml" {>= "5.5.0"}
   "dune" {>= "3.12" & >= "3.12"}
   "raven-ivl" {>= "1.5.0"}
+  "menhir" {build & >= "20220210"}
   "ocamlformat" {with-dev-setup & >= "0.29.0"}
   "base" {>= "0.14"}
   "stdio" {>= "0.14"}

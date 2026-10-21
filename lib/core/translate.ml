@@ -10,7 +10,7 @@ module R = Raven_api
 type error = Report.error
 
 let ( let* ) = Result.( >>= )
-let error loc message = Error (Report.error Syntax loc message)
+let error loc message = Error (Report.error Type loc message)
 
 let unsupported loc what =
   Error (Report.error Unsupported loc (what ^ " is not supported yet"))
@@ -303,62 +303,111 @@ and branch ctx (e : Typedtree.expression) make =
 and assign (x, l) v =
   R.Stmt.assign ~loc:l [ R.Expr.var ~loc:l (name ~loc:l x) ] (R.Stmt.expr_rhs v)
 
-(** The formula [f] of a contract, with the names of [vars] for OCaml's. *)
-let rec formula (vars : (string * string) list) (f : Parsetree.expression) :
-    (R.Expr.t, error) Result.t =
-  let at = f.pexp_loc in
+module S = Caravan_spec.Spec_ast
+
+(** The Raven type of the type [t] written in a contract at [at]. *)
+let spec_type ~at (t : S.pty) : (R.Type.t, error) Result.t =
   let l = loc at in
-  let binop op a b =
-    let* a = formula vars a in
-    let* b = formula vars b in
-    match op with
-    | R.Expr.Div -> Ok (prelude_call ~loc:l Prelude.div [ a; b ])
-    | Mod -> Ok (prelude_call ~loc:l Prelude.mod_ [ a; b ])
-    | _ -> Ok (R.Expr.binary ~loc:l op a b)
-  in
-  match f.pexp_desc with
-  | Pexp_ident { txt = Lident x; _ } -> (
-      match (List.Assoc.find vars x ~equal:String.equal, x) with
+  match t with
+  | PTtyapp (Qid { pid_str = "int"; _ }, []) -> Ok (R.Type.int ~loc:l)
+  | PTtyapp (Qid { pid_str = "bool"; _ }, []) -> Ok (R.Type.bool ~loc:l)
+  | PTtyapp (Qid { pid_str = "unit"; _ }, []) -> Ok (R.Type.tuple ~loc:l [])
+  | _ -> unsupported at "This type"
+
+(** The operators of contracts that Raven has. *)
+let spec_binop (op : string) : R.Expr.binop option =
+  match op with
+  | "+" -> Some Plus
+  | "-" -> Some Minus
+  | "*" -> Some Mult
+  | "/" -> Some Div
+  | "mod" -> Some Mod
+  | "=" | "==" -> Some Eq
+  | "<>" | "!=" -> Some Neq
+  | "<" -> Some Lt
+  | "<=" -> Some Leq
+  | ">" -> Some Gt
+  | ">=" -> Some Geq
+  | "&&" | "/\\" -> Some And
+  | "||" | "\\/" -> Some Or
+  | "->" -> Some Impl
+  | "<->" -> Some Iff
+  | _ -> None
+
+(** The head of the application [t] and its arguments. *)
+let rec spine (t : S.term) args =
+  match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
+
+(** The formula [t] of a contract, with the Raven names of [vars] for the contract's. *)
+let rec formula (vars : (string * string) list) (t : S.term) : (R.Expr.t, error) Result.t
+    =
+  let at = t.term_loc in
+  let l = loc at in
+  match t.term_desc with
+  | Ttrue -> Ok (R.Expr.bool ~loc:l true)
+  | Tfalse -> Ok (R.Expr.bool ~loc:l false)
+  | Tconst (Pconst_integer (n, None)) -> Ok (R.Expr.int ~loc:l (Int.of_string n))
+  | Tconst _ -> unsupported at "This constant"
+  | Tvar (Qid { pid_str = x; _ }) ->
+      begin match (List.Assoc.find vars x ~equal:String.equal, x) with
       | Some x, _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
       | None, "max_int" -> Ok (R.Expr.int ~loc:l Prelude.max_int)
       | None, "min_int" -> Ok (R.Expr.int ~loc:l Prelude.min_int)
-      | None, _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x)))
-  | Pexp_constant { pconst_desc = Pconst_integer (n, None); _ } ->
-      Ok (R.Expr.int ~loc:l (Int.of_string n))
-  | Pexp_construct ({ txt = Lident "true"; _ }, None) -> Ok (R.Expr.bool ~loc:l true)
-  | Pexp_construct ({ txt = Lident "false"; _ }, None) -> Ok (R.Expr.bool ~loc:l false)
-  | Pexp_apply
-      ( { pexp_desc = Pexp_ident { txt = Lident op; _ }; _ },
-        [ (Nolabel, a); (Nolabel, b) ] ) -> (
-      let op : R.Expr.binop option =
-        match op with
-        | "+" -> Some Plus
-        | "-" -> Some Minus
-        | "*" -> Some Mult
-        | "/" -> Some Div
-        | "mod" -> Some Mod
-        | "=" | "==" -> Some Eq
-        | "<>" | "!=" -> Some Neq
-        | "<" -> Some Lt
-        | "<=" -> Some Leq
-        | ">" -> Some Gt
-        | ">=" -> Some Geq
-        | "&&" -> Some And
-        | "||" -> Some Or
-        | _ -> None
-      in
-      match op with Some op -> binop op a b | None -> unsupported at "This operator")
-  | Pexp_apply
-      ( { pexp_desc = Pexp_ident { txt = Lident (("not" | "~-" | "-") as op); _ }; _ },
-        [ (Nolabel, a) ] ) ->
-      let* a = formula vars a in
-      Ok (if String.equal op "not" then R.Expr.not_ ~loc:l a else R.Expr.neg ~loc:l a)
-  | Pexp_ifthenelse (c, a, Some b) ->
+      | None, _ -> error at (Printf.sprintf "Unbound name %s" x)
+      end
+  | Tvar (Qdot _) -> unsupported at "A qualified name"
+  | Tinfix _ -> formula vars (S.chain t)
+  | Tapply _ -> application vars t
+  | Tif (c, a, b) ->
       let* c = formula vars c in
       let* a = formula vars a in
       let* b = formula vars b in
       Ok (R.Expr.ite ~loc:l c a b)
-  | _ -> unsupported at "This formula"
+  | Tquant (q, binders, body) ->
+      let* bound =
+        all binders ~f:(fun (id, ty) ->
+            match ty with
+            | None -> error id.pid_loc "A bound variable needs a type, as in x: int"
+            | Some ty ->
+                let* ty = spec_type ~at:id.pid_loc ty in
+                let l = loc id.pid_loc in
+                Ok
+                  ( (id.pid_str, id.pid_str),
+                    R.Var.make ~loc:l (ident ~loc:l id.pid_str) ty ))
+      in
+      let* body = formula (List.map bound ~f:fst @ vars) body in
+      let vars = List.map bound ~f:snd in
+      Ok
+        (match q with
+        | Tforall -> R.Expr.forall ~loc:l vars body
+        | Texists -> R.Expr.exists ~loc:l vars body)
+  | Tattr (_, t) | Tcast (t, _) -> formula vars t
+  | Tlet _ | Tmatch _ | Ttuple _ | Told _ | Tfield _ -> unsupported at "This formula"
+
+(** The application [t] of an operator. *)
+and application vars (t : S.term) =
+  let at = t.term_loc in
+  let l = loc at in
+  let head, args = spine t [] in
+  match (head.term_desc, args) with
+  | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
+      let* a = formula vars a in
+      Ok (R.Expr.not_ ~loc:l a)
+  | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
+      let* a = formula vars a in
+      Ok (R.Expr.neg ~loc:l a)
+  | Tvar (Qid { pid_str = op; pid_fixity = Infix; _ }), [ a; b ] ->
+      begin match spec_binop op with
+      | None -> unsupported at (Printf.sprintf "The operator %s" op)
+      | Some op -> (
+          let* a = formula vars a in
+          let* b = formula vars b in
+          match op with
+          | Div -> Ok (prelude_call ~loc:l Prelude.div [ a; b ])
+          | Mod -> Ok (prelude_call ~loc:l Prelude.mod_ [ a; b ])
+          | _ -> Ok (R.Expr.binary ~loc:l op a b))
+      end
+  | _ -> unsupported at "A call of a function in a contract"
 
 type func = {
   id : Ident.t;
@@ -366,9 +415,44 @@ type func = {
   params : Typedtree.function_param list;
   body : Typedtree.expression;
   loc : Location.t;
-  contract : Annotation.contract option;
+  contract : S.contract option;
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract. *)
+
+(** The names that the contract of [f] gives its result and its [n] parameters, by its
+    [header] if it has one, and otherwise OCaml's. *)
+let contract_names (f : func) (header : S.header option) n =
+  let ocaml_names =
+    List.map f.params ~f:(fun p ->
+        match p.fp_kind with
+        | Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } -> Some (Ident.name id)
+        | _ -> None)
+  in
+  match header with
+  | None -> Ok ("result", ocaml_names)
+  | Some h ->
+      let* result =
+        match h.hd_ret with
+        | [ Lwild ] | [] -> Ok "result"
+        | [ Lvar id ] -> Ok id.pid_str
+        | _ -> unsupported h.hd_name.pid_loc "A contract naming several results"
+      in
+      let arg = function
+        | S.Lvar id -> Ok (Some id.pid_str)
+        | Lunit _ | Lwild -> Ok None
+        | Lghost (id, _) -> unsupported id.pid_loc "A ghost argument"
+      in
+      if not (String.equal h.hd_name.pid_str (Ident.name f.id)) then
+        error h.hd_name.pid_loc
+          (Printf.sprintf "This contract is for %s, not %s" h.hd_name.pid_str
+             (Ident.name f.id))
+      else if List.length h.hd_args <> n then
+        error h.hd_name.pid_loc
+          (Printf.sprintf "This contract names %d arguments, but %s has %d"
+             (List.length h.hd_args) (Ident.name f.id) n)
+      else
+        let* args = all h.hd_args ~f:arg in
+        Ok (result, args)
 
 (** The procedure of [f]. *)
 let proc (functions : (string * string) list) origins (f : func) :
@@ -395,9 +479,8 @@ let proc (functions : (string * string) list) origins (f : func) :
             Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
         | _ -> unsupported p.fp_loc "This parameter")
   in
-  let result_name =
-    Option.bind f.contract ~f:(fun c -> c.result) |> Option.value ~default:"result"
-  in
+  let header = Option.bind f.contract ~f:(fun c -> c.header) in
+  let* result_name, arg_names = contract_names f header (List.length formals) in
   let result = Names.fresh names result_name in
   let* returns =
     if is_unit f.body.exp_type then Ok []
@@ -406,7 +489,13 @@ let proc (functions : (string * string) list) origins (f : func) :
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
   (* The names the contract uses: the parameters' and the result's. *)
-  let vars = (result_name, result) :: List.filter_map formals ~f:(fun (v, _, _) -> v) in
+  let params =
+    List.map2_exn arg_names formals ~f:(fun contract_name (ocaml, _, var) ->
+        let raven = Option.value_map ocaml ~default:"" ~f:snd in
+        Option.map contract_name ~f:(fun n -> (n, raven)))
+    |> List.filter_map ~f:Fn.id
+  in
+  let vars = (result_name, result) :: params in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula vars f) ~f:(fun e -> R.Spec.make e))
   in
@@ -442,7 +531,7 @@ let proc (functions : (string * string) list) origins (f : func) :
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
 let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
-    ~(next : Location.t option) : (Annotation.contract option, error) Result.t =
+    ~(next : Location.t option) : (S.contract option, error) Result.t =
   let after (a : Annotation.t) =
     a.loc.loc_start.pos_cnum >= item_loc.loc_end.pos_cnum
     && Option.for_all next ~f:(fun next ->
