@@ -2,7 +2,12 @@
     and destructors in the scope of the type, so each type gets a module of its own, named
     as the type, capitalized as Raven's type names are, with the type [T]. OCaml's lists
     and options are Raven's [List] and [Option], which Raven instantiates for their
-    element types. *)
+    element types.
+
+    A record type with a mutable field is a reference instead, with a Raven field per
+    OCaml field, named after the type, as [counter_count]; so is a ref cell, with a field
+    per type of contents, as [ref_Int_contents]. A record type without a mutable field is
+    a data type with one constructor, named as the type. *)
 
 open Base
 module R = Raven_api
@@ -17,10 +22,13 @@ type ctor = {
   args : Types.type_expr list;
 }
 
+type field = { label : string; raven_field : string; typ : Types.type_expr }
+
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
   module_name : string;
   ctors : ctor list;
+  heap : field list option;  (** The fields of a record type with a mutable field. *)
   at : Location.t;
 }
 
@@ -33,6 +41,7 @@ let list =
         { ocaml = "[]"; raven = "nil"; fields = []; args = [] };
         { ocaml = "::"; raven = "::"; fields = [ "hd"; "tl" ]; args = [] };
       ];
+    heap = None;
     at = Location.none;
   }
 
@@ -45,6 +54,7 @@ let option =
         { ocaml = "None"; raven = "none"; fields = []; args = [] };
         { ocaml = "Some"; raven = "some"; fields = [ "value" ]; args = [] };
       ];
+    heap = None;
     at = Location.none;
   }
 
@@ -72,9 +82,39 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           id = Some decl.typ_id;
           module_name = String.capitalize decl.typ_name.txt;
           ctors;
+          heap = None;
           at;
         }
-  | Ttype_variant _ -> Report.unsupported at "A type with parameters"
+  | Ttype_record lds when List.is_empty decl.typ_params ->
+      let name = decl.typ_name.txt in
+      let labels =
+        List.map lds ~f:(fun (ld : Typedtree.label_declaration) -> ld.ld_name.txt)
+      in
+      let types =
+        List.map lds ~f:(fun (ld : Typedtree.label_declaration) -> ld.ld_type.ctyp_type)
+      in
+      let is_mutable (ld : Typedtree.label_declaration) =
+        match ld.ld_mutable with Mutable -> true | Immutable -> false
+      in
+      let heap, ctors =
+        if List.exists lds ~f:is_mutable then
+          ( Some
+              (List.map2_exn labels types ~f:(fun label typ ->
+                   { label; raven_field = name ^ "_" ^ label; typ })),
+            [] )
+        else
+          ( None,
+            [
+              {
+                ocaml = "";
+                raven = String.uncapitalize name;
+                fields = labels;
+                args = types;
+              };
+            ] )
+      in
+      Ok { id = Some decl.typ_id; module_name = String.capitalize name; ctors; heap; at }
+  | Ttype_variant _ | Ttype_record _ -> Report.unsupported at "A type with parameters"
   | _ -> Report.unsupported at "This type definition"
 
 let declares (d : t) (p : Path.t) =
@@ -95,6 +135,12 @@ let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
             (List.find d.ctors ~f:(fun c -> String.equal c.ocaml cstr.cstr_name))
             ~f:(fun c -> (d, c)))
   | _ -> None
+
+(** Whether [p] is the path of [Stdlib.ref]. *)
+let is_ref (p : Path.t) =
+  match p with
+  | Pdot (Pident m, "ref") -> String.equal (Ident.name m) "Stdlib"
+  | _ -> false
 
 (** The data type and constructor named [ocaml] in a contract: the latest such
     constructor, as in OCaml, where those of lists and options come first. *)
@@ -123,6 +169,10 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let* elt = typ types ?self ~at elt in
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
+  | Tconstr (p, [ _ ], _) when is_ref p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
+      Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
   | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
@@ -133,7 +183,44 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
         Result.all (List.map components ~f:(fun (_, t) -> typ types ?self ~at t))
       in
       Ok (R.Type.tuple ~loc:l components)
+  (* The type of a record label, which is not polymorphic here. *)
+  | Tpoly (t, []) -> typ types ?self ~at t
   | _ -> Report.unsupported at (Stdlib.Format.asprintf "The type %a" Printtyp.type_expr t)
+
+(** A name for the type [t], unique among those of [types], for the names of the fields of
+    ref cells, as [IntList] for [int list]. *)
+let rec tag (types : t list) (t : Types.type_expr) : string =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) when Path.same p Predef.path_int -> "Int"
+  | Tconstr (p, [], _) when Path.same p Predef.path_bool -> "Bool"
+  | Tconstr (p, [], _) when Path.same p Predef.path_unit -> "Unit"
+  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list -> tag types elt ^ "List"
+  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_option ->
+      tag types elt ^ "Option"
+  | Tconstr (p, [ elt ], _) when is_ref p -> tag types elt ^ "Ref"
+  | Tconstr (p, [], _) when Option.is_some (find types p) ->
+      (Option.value_exn (find types p)).module_name
+  | Ttuple components ->
+      String.concat (List.map components ~f:(fun (_, t) -> tag types t)) ^ "Tuple"
+  | Tpoly (t, []) -> tag types t
+  | _ -> "Other"
+
+(** The field of the record type of [label], and whether its record is a reference. *)
+let find_label (types : t list) (label : Data_types.label_description) =
+  match Types.get_desc label.lbl_res with
+  | Tconstr (p, _, _) -> Option.map (find types p) ~f:(fun d -> d)
+  | _ -> None
+
+(** The fields declaring the fields of the record types of [types] that are references. *)
+let fields (types : t list) : (R.Member.t list, Report.error) Result.t =
+  let field (d : t) (f : field) =
+    let* typ = typ types ~at:d.at f.typ in
+    let l = loc d.at in
+    Ok (R.Member.field ~loc:l (R.Ident.make ~loc:l f.raven_field) typ)
+  in
+  Result.all
+    (List.concat_map types ~f:(fun d ->
+         List.map (Option.value d.heap ~default:[]) ~f:(field d)))
 
 (** The module declaring [d], given the data types declared before it. *)
 let member (types : t list) (d : t) : (R.Member.t, Report.error) Result.t =

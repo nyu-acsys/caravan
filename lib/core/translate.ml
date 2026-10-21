@@ -78,6 +78,8 @@ type origin = { at : Location.t; message : string }
 
 type context = {
   types : Datatypes.t list;
+  refs : (string * R.Type.t) list ref;
+      (** The fields of the ref cells used so far, by their names, with their types. *)
   names : Names.t;
   functions : (string * string) list;
       (** The top-level functions, by the unique name of their OCaml identifier. *)
@@ -85,6 +87,64 @@ type context = {
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
+
+(** The field of the ref cells with contents of type [elt]. *)
+let ref_field ctx ~at elt =
+  let field = "ref_" ^ Datatypes.tag ctx.types elt ^ "_contents" in
+  let* t = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then
+    ctx.refs := !(ctx.refs) @ [ (field, t) ];
+  Ok field
+
+(** The Raven field named [label] of the values of type [t] that are references. *)
+let field_of_type ctx ~at (t : Types.type_expr) label =
+  match Types.get_desc t with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
+      let* field = ref_field ctx ~at elt in
+      Ok (Some field)
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find ctx.types p with
+      | Some { heap = Some fields; _ } ->
+          Ok
+            (Option.map
+               (List.find fields ~f:(fun f -> String.equal f.label label))
+               ~f:(fun f -> f.raven_field))
+      | _ -> Ok None
+      end
+  | _ -> Ok None
+
+(** The OCaml type of the field [label] of values of type [t] that are references. *)
+let field_type ctx (t : Types.type_expr) label =
+  match Types.get_desc t with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
+      Some elt
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find ctx.types p with
+      | Some { heap = Some fields; _ } ->
+          Option.map
+            (List.find fields ~f:(fun f -> String.equal f.label label))
+            ~f:(fun f -> f.typ)
+      | _ -> None
+      end
+  | _ -> None
+
+(** The Raven field of the record field [label], and whether its record is a reference;
+    [None] if it is unknown. *)
+let field_of_label ctx ~at (label : Data_types.label_description) =
+  match Types.get_desc label.lbl_res with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
+      let* field = ref_field ctx ~at elt in
+      Ok (Some (field, true))
+  | _ ->
+      begin match Datatypes.find_label ctx.types label with
+      | Some { heap = Some fields; _ } ->
+          let field =
+            List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
+          in
+          Ok (Some (field.raven_field, true))
+      | Some _ -> Ok (Some (label.lbl_name, false))
+      | None -> Ok None
+      end
 
 (** The assertion [c] checking, at [at], what [message] says may fail. *)
 let check ctx ~(at : Location.t) message c =
@@ -100,6 +160,10 @@ let no_overflow ctx ~at what v =
     (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
 
 let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
+
+(** The write of [v] to the field [field] of the reference [r]. *)
+let write ~loc:l r field v =
+  R.Stmt.assign ~loc:l [ R.Expr.field ~loc:l r (name ~loc:l field) ] (R.Stmt.expr_rhs v)
 
 (** The name of [p] if it is a value of the standard library's toplevel. *)
 let stdlib_name (p : Path.t) =
@@ -167,6 +231,64 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
   | Texp_tuple components ->
       let* stmts, components = operands ctx (List.map components ~f:snd) in
       Ok (stmts, R.Expr.tuple ~loc:l components)
+  | Texp_record { fields; extended_expression = None; _ } ->
+      let fields = Array.to_list fields in
+      let* values =
+        all fields ~f:(fun (label, def) ->
+            match (def : Typedtree.record_label_definition) with
+            | Overridden (_, e) -> Ok (label, e)
+            | Kept _ -> unsupported at "This record")
+      in
+      let* stmts, args = operands ctx (List.map values ~f:snd) in
+      let label, _ = List.hd_exn fields in
+      begin match Datatypes.find_label ctx.types label with
+      | Some { heap = Some _; _ } ->
+          let* typ = typ ctx ~at e.exp_type in
+          let* fields =
+            all values ~f:(fun (label, _) ->
+                let* field = field_of_label ctx ~at label in
+                Ok (fst (Option.value_exn field)))
+          in
+          let x = Names.fresh ctx.names "tmp" in
+          let init =
+            R.Stmt.new_rhs
+              (List.map2_exn fields args ~f:(fun f v -> (name ~loc:l f, Some v)))
+          in
+          Ok
+            ( stmts @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
+              R.Expr.var ~loc:l (name ~loc:l x) )
+      | Some ({ ctors = [ c ]; _ } as d) ->
+          Ok (stmts, R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args)
+      | _ -> unsupported at "This record"
+      end
+  | Texp_record _ -> unsupported at "A record copied with changes"
+  | Texp_field (record, _, label) -> begin
+      let* stmts, v = expr ctx record in
+      let* field = field_of_label ctx ~at label in
+      match field with
+      | Some (field, true) ->
+          let* typ = typ ctx ~at e.exp_type in
+          let x = Names.fresh ctx.names "tmp" in
+          let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l v (name ~loc:l field)) in
+          Ok
+            ( stmts
+              @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x)
+              @ assume_in_range ~loc:l e.exp_type x,
+              R.Expr.var ~loc:l (name ~loc:l x) )
+      | Some (field, false) -> Ok (stmts, R.Expr.field ~loc:l v (name ~loc:l field))
+      | None -> unsupported at "This field"
+    end
+  | Texp_setfield (record, _, label, value) -> begin
+      let* value_stmts, value = expr ctx value in
+      let* record_stmts, record = expr ctx record in
+      let* field = field_of_label ctx ~at label in
+      match field with
+      | Some (field, true) ->
+          Ok
+            ( value_stmts @ record_stmts @ [ write ~loc:l record field value ],
+              unit_value ~loc:l )
+      | _ -> unsupported at "This field"
+    end
   | Texp_match (scrutinee, cases, [], partial) ->
       let* scrutinee_stmts, v = expr ctx scrutinee in
       (* The cases read the scrutinee repeatedly, so it is named unless it is a variable. *)
@@ -225,6 +347,58 @@ let rec expr (ctx : context) (e : Typedtree.expression) :
 
 (** The application of the function at [path] to [args], in [e]. *)
 and apply ctx (e : Typedtree.expression) (path : Path.t)
+    (args : Typedtree.expression list) =
+  let at = e.exp_loc in
+  let l = loc at in
+  let contents (r : Typedtree.expression) =
+    match Types.get_desc r.exp_type with
+    | Tconstr (_, [ elt ], _) -> ref_field ctx ~at elt
+    | _ -> unsupported at "This reference"
+  in
+  (* The value of the field [field] of the reference [r], read into a variable. *)
+  let read r field typ_of =
+    let* typ = typ ctx ~at typ_of in
+    let x = Names.fresh ctx.names "tmp" in
+    let rhs = R.Stmt.expr_rhs (R.Expr.field ~loc:l r (name ~loc:l field)) in
+    Ok
+      ( R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
+        @ assume_in_range ~loc:l typ_of x,
+        R.Expr.var ~loc:l (name ~loc:l x) )
+  in
+  match (stdlib_name path, args) with
+  | Some "ref", [ v ] ->
+      let* field = ref_field ctx ~at v.exp_type in
+      let* stmts, v = expr ctx v in
+      let x = Names.fresh ctx.names "tmp" in
+      let init = R.Stmt.new_rhs [ (name ~loc:l field, Some v) ] in
+      Ok
+        ( stmts @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
+          R.Expr.var ~loc:l (name ~loc:l x) )
+  | Some "!", [ r ] ->
+      let* field = contents r in
+      let* stmts, r = expr ctx r in
+      let* reading, v = read r field e.exp_type in
+      Ok (stmts @ reading, v)
+  | Some ":=", [ r; v ] ->
+      let* field = contents r in
+      let* v_stmts, v = expr ctx v in
+      let* r_stmts, r = expr ctx r in
+      Ok (v_stmts @ r_stmts @ [ write ~loc:l r field v ], unit_value ~loc:l)
+  | Some (("incr" | "decr") as op), [ r ] ->
+      let* field = contents r in
+      let* stmts, r = expr ctx r in
+      let int_type = Predef.type_int in
+      let* reading, v = read r field int_type in
+      let binop : R.Expr.binop = if String.equal op "incr" then Plus else Minus in
+      let v' = R.Expr.binary ~loc:l binop v (R.Expr.int ~loc:l 1) in
+      let what = if String.equal op "incr" then "increment" else "decrement" in
+      Ok
+        ( stmts @ reading @ [ no_overflow ctx ~at what v'; write ~loc:l r field v' ],
+          unit_value ~loc:l )
+  | _ -> apply_operator ctx e path args
+
+(** The application of the operator or function at [path] to [args], in [e]. *)
+and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
     (args : Typedtree.expression list) =
   let at = e.exp_loc in
   let l = loc at in
@@ -506,6 +680,8 @@ module S = Caravan_spec.Spec_ast
 type bound = Raven of string | Value of R.Expr.t
 
 type env = {
+  ctx : context;  (** For the data types, and the fields of ref cells. *)
+  types : (string * Types.type_expr) list;  (** The OCaml types of variables, if known. *)
   data : Datatypes.t list;
   funcs : (string * string) list;
       (** The functions contracts can call, by their OCaml names, with their Raven ones.
@@ -635,7 +811,25 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       let* v = formula env scrutinee in
       spec_match env ~at v cases
   | Tattr (_, t) | Tcast (t, _) -> formula env t
-  | Tlet _ | Told _ | Tfield _ -> unsupported at "This formula"
+  | Tfield (r, Qid { pid_str = label; _ }) ->
+      let reference =
+        match r.term_desc with
+        | Tvar (Qid { pid_str = x; _ }) ->
+            Option.bind (List.Assoc.find env.types x ~equal:String.equal) ~f:(fun t ->
+                Option.map (field_type env.ctx t label) ~f:(fun _ -> x))
+        | _ -> None
+      in
+      begin match reference with
+      | Some x ->
+          error at
+            (Printf.sprintf "A contract reads %s.%s through own, as in own %s.%s v" x
+               label x label)
+      | None ->
+          let* r = formula env r in
+          Ok (R.Expr.field ~loc:l r (name ~loc:l label))
+      end
+  | Tfield (_, Qdot _) -> unsupported at "A qualified field"
+  | Tlet _ | Told _ -> unsupported at "This formula"
 
 (** The application [t] of an operator or a constructor. *)
 and application env (t : S.term) =
@@ -646,6 +840,10 @@ and application env (t : S.term) =
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.not_ ~loc:l a)
+  | Tvar (Qid { pid_str = "own"; _ }), [ location; v ] ->
+      let* location = location_of env location in
+      let* v = formula env v in
+      Ok (R.Expr.own ~loc:l [ location; v ])
   | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.neg ~loc:l a)
@@ -675,6 +873,25 @@ and application env (t : S.term) =
       let f = Option.value_exn (list_function q) in
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args)
   | _ -> unsupported at "A call of a function in a contract"
+
+(** The location [t], as in [own r.count n]: a field of a variable of known type. *)
+and location_of env (t : S.term) =
+  let at = t.term_loc in
+  let l = loc at in
+  match t.term_desc with
+  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
+    -> begin
+      let* r = formula env { t with term_desc = Tvar (Qid (S.mk_id ~loc:at x)) } in
+      match List.Assoc.find env.types x ~equal:String.equal with
+      | None -> error at (Printf.sprintf "The type of %s is not known here" x)
+      | Some typ -> begin
+          let* field = field_of_type env.ctx ~at typ label in
+          match field with
+          | Some field -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+          | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
+        end
+    end
+  | _ -> unsupported at "This location, other than a field of a variable,"
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)
 and constructor env (t : S.term) args =
@@ -1022,22 +1239,102 @@ let rec term_names (t : S.term) : string list =
 
 (** The names that the contract of [f] uses for its result and parameters, with the Raven
     names of the result, [result], and of the parameters, [formals]. *)
-let contract_env types ~spec_funcs (f : func) formals ~result =
+let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
   let* result_name, arg_names = contract_names f header (List.length formals) in
+  let param_types =
+    List.map f.params ~f:(fun p ->
+        match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
+  in
   let params =
-    List.map2_exn arg_names formals ~f:(fun contract_name (ocaml, _, _) ->
+    List.map2_exn (List.zip_exn arg_names param_types) formals
+      ~f:(fun (contract_name, t) (ocaml, _, _) ->
         let raven = Option.value_map ocaml ~default:"" ~f:snd in
-        Option.map contract_name ~f:(fun n -> (n, raven)))
+        Option.map contract_name ~f:(fun n -> (n, raven, t)))
     |> List.filter_map ~f:Fn.id
   in
-  Ok
-    ( result_name,
-      {
-        data = types;
-        funcs = spec_funcs;
-        vars = List.map ((result_name, result) :: params) ~f:(fun (x, r) -> (x, Raven r));
-      } )
+  let named = (result_name, result, Some f.body.exp_type) :: params in
+  let types =
+    List.filter_map named ~f:(fun (x, _, t) -> Option.map t ~f:(fun t -> (x, t)))
+  in
+  let env =
+    {
+      ctx;
+      types;
+      data = ctx.types;
+      funcs = spec_funcs;
+      vars = List.map named ~f:(fun (x, r, _) -> (x, Raven r));
+    }
+  in
+  let* implicit = implicit_vars env f in
+  let env =
+    List.fold implicit ~init:env ~f:(fun env (x, raven, t, _) ->
+        { (bind env x (Raven raven)) with types = (x, t) :: env.types })
+  in
+  Ok (result_name, env, List.map implicit ~f:(fun (_, _, _, var) -> var))
+
+(** The names free in the preconditions of [f] that [env] does not bind: implicit ghost
+    parameters, as [n] in [requires own c.count n], with their Raven names, OCaml types
+    and declarations. A name owned as the value of a field has that field's type. *)
+and implicit_vars env (f : func) =
+  let requires = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
+  let is_name x =
+    (not (String.is_empty x))
+    && (Char.is_lowercase x.[0] || Char.equal x.[0] '_')
+    && String.for_all x ~f:(fun c ->
+        Char.is_alphanum c || Char.equal c '_' || Char.equal c '\'')
+  in
+  let known x =
+    List.Assoc.mem env.vars x ~equal:String.equal
+    || List.Assoc.mem env.funcs x ~equal:String.equal
+    || List.mem [ "own"; "not"; "max_int"; "min_int"; "mod" ] x ~equal:String.equal
+  in
+  let free =
+    List.concat_map requires ~f:term_names
+    |> List.filter ~f:(fun x -> is_name x && not (known x))
+    |> List.dedup_and_sort ~compare:String.compare
+  in
+  (* The types of the values of fields that [t] owns. *)
+  let rec owned (t : S.term) =
+    match S.(t.term_desc) with
+    | Tapply
+        ( {
+            term_desc =
+              Tapply
+                ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+                  {
+                    term_desc =
+                      Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label);
+                    _;
+                  } );
+            _;
+          },
+          { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ) ->
+        Option.to_list
+          (Option.bind (List.Assoc.find env.types x ~equal:String.equal) ~f:(fun typ ->
+               Option.map (field_type env.ctx typ label.pid_str) ~f:(fun t -> (v, t))))
+    | Tapply (a, b) | Tinfix (a, _, b) -> owned a @ owned b
+    | Tif (a, b, c) -> owned a @ owned b @ owned c
+    | Tattr (_, t) | Tcast (t, _) -> owned t
+    | _ -> []
+  in
+  let owned = List.concat_map requires ~f:owned in
+  all free ~f:(fun x ->
+      match List.Assoc.find owned x ~equal:String.equal with
+      | None ->
+          error
+            (Option.value_map (List.hd requires) ~default:f.loc ~f:(fun t -> t.S.term_loc))
+            (Printf.sprintf "Unbound name %s" x)
+      | Some t ->
+          let at = f.loc in
+          let l = loc at in
+          let* typ = typ env.ctx ~at t in
+          let raven = Names.fresh env.ctx.names x in
+          Ok
+            ( x,
+              raven,
+              t,
+              R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ ))
 
 (** The function that contracts call for [f], defined by its body; [funcs] are the
     functions it may call, by their OCaml identifiers' unique names, and [spec_funcs] by
@@ -1045,12 +1342,18 @@ let contract_env types ~spec_funcs (f : func) formals ~result =
     do not call [f] itself: these are proven for the function's value, by induction, which
     a precondition bounding the function's own value, as for the code to not overflow,
     would make circular. *)
-let func types ~funcs ~spec_funcs origins (f : func) : (R.Callable.t, error) Result.t =
-  let ctx = { types; names = Names.create (); functions = []; origins } in
+let func types ~refs ~funcs ~spec_funcs origins (f : func) :
+    (R.Callable.t, error) Result.t =
+  let ctx = { types; refs; names = Names.create (); functions = []; origins } in
   let l = loc f.loc in
   let* formals = formals ctx f in
   let result = Names.fresh ctx.names "result" in
-  let* _, env = contract_env types ~spec_funcs f formals ~result in
+  let* _, env, implicit = contract_env ctx ~spec_funcs f formals ~result in
+  let* () =
+    match implicit with
+    | [] -> Ok ()
+    | _ -> unsupported f.loc "A pure function with ghost parameters"
+  in
   let calls_self (t : S.term) =
     List.mem (term_names t) (Ident.name f.id) ~equal:String.equal
   in
@@ -1077,10 +1380,10 @@ let func types ~funcs ~spec_funcs origins (f : func) : (R.Callable.t, error) Res
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~funcs (functions : (string * string) list) origins ~proc_name ~pure
+let proc types ~refs ~funcs (functions : (string * string) list) origins ~proc_name ~pure
     (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
-  let ctx = { types; names; functions; origins } in
+  let ctx = { types; refs; names; functions; origins } in
   let l = loc f.loc in
   let* formals = formals ctx f in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
@@ -1092,7 +1395,7 @@ let proc types ~funcs (functions : (string * string) list) origins ~proc_name ~p
       let* typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
-  let* _, env = contract_env types ~spec_funcs:funcs f formals ~result in
+  let* _, env, implicit = contract_env ctx ~spec_funcs:funcs f formals ~result in
   let specs fs =
     all fs ~f:(fun f -> Result.map (formula env f) ~f:(fun e -> R.Spec.make e))
   in
@@ -1144,7 +1447,7 @@ let proc types ~funcs (functions : (string * string) list) origins ~proc_name ~p
   in
   Ok
     (R.Callable.proc ~loc:l
-       ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
+       ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ implicit)
        ~returns ~requires ~ensures (ident ~loc:l proc_name) (Some body))
 
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
@@ -1242,12 +1545,16 @@ let pure_functions (funcs : func list) : func list =
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
   let* types, funcs = items source.typed annotations in
-  (* Each data type's module, given the ones declared before it. *)
+  (* Each data type's module, given the ones declared before it; a record type that is a
+     reference has fields instead. *)
   let* modules =
     all
-      (List.mapi types ~f:(fun i d -> (List.take types i, d)))
+      (List.filter_mapi types ~f:(fun i (d : Datatypes.t) ->
+           Option.some_if (Option.is_none d.heap) (List.take types i, d)))
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
+  let* record_fields = Datatypes.fields types in
+  let refs = ref [] in
   let pure = pure_functions funcs in
   let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
   (* A pure function's procedure is named apart from its function. *)
@@ -1258,18 +1565,23 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* pure_funcs =
     all pure
       ~f:
-        (func types
+        (func types ~refs
            ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
            ~spec_funcs origins)
   in
   let* procs =
     all funcs ~f:(fun f ->
-        proc types ~funcs:spec_funcs functions origins ~proc_name:(proc_name f)
+        proc types ~refs ~funcs:spec_funcs functions origins ~proc_name:(proc_name f)
           ~pure:(is_pure f) f)
   in
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
+  let start = R.Loc.make file_start file_start in
+  let ref_fields =
+    List.map !refs ~f:(fun (field, t) ->
+        R.Member.field ~loc:start (ident ~loc:start field) t)
+  in
   Ok
-    ( R.Program.make
-        ~loc:(R.Loc.make file_start file_start)
-        (Prelude.members @ modules @ List.map (pure_funcs @ procs) ~f:R.Member.callable),
+    ( R.Program.make ~loc:start
+        (Prelude.members @ modules @ record_fields @ ref_fields
+        @ List.map (pure_funcs @ procs) ~f:R.Member.callable),
       !origins )
