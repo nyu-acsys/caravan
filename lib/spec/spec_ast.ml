@@ -114,10 +114,14 @@ type predicate = {
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
 
+type state_field = { sf_name : id; sf_type : pty; sf_grows : bool }
+(** A field of the ghost state; [[@grows]] if it only grows: sequences by prefix, integers
+    by [<=]. *)
+
 (** A declaration of a proof. *)
 type proof_decl =
   | Proof_predicate of predicate
-  | Proof_state of { state_name : id; state_fields : (id * pty) list }
+  | Proof_state of { state_name : id; state_fields : state_field list }
       (** The ghost state of a structure, [type state = { items : int list }]. *)
   | Proof_invariant of {
       inv_name : id;
@@ -130,10 +134,17 @@ type proof_decl =
   | Proof_view of { view_name : id; view_params : (id * pty) list; view_value : term }
       (** The exclusive predicate [view_name]: a client's view of the state,
           [view stack (t : t) = s.items], whose last parameter is the value. *)
+  | Proof_action of {
+      action_name : id;
+      action_state : id;
+      action_update : (id * term) list;
+    }
+      (** A transition of the state, [action pop = { s with head = s.head + 1 }]: the
+          fields it changes, in terms of the state before. *)
 
 (** Where an atomic step linearizes the function that performs it: always, or if its
     result matches a pattern, as [returning [] -> commit]. *)
-type linearization = Commit | Returning of pat
+type linearization = Commit | Returning of pat | Performs of id
 
 (** A ghost statement in code. *)
 type ghost_stmt = Fold of term | Unfold of term | Assert of term

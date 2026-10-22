@@ -144,6 +144,19 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
 let declares (d : t) (p : Path.t) =
   match (d.id, p) with Some id, Pident id' -> Ident.same id id' | _ -> false
 
+(** The type ['a sequence] of specifications, declared as [id]: Raven's [Seq]. *)
+let sequence id =
+  {
+    id = Some id;
+    module_name = "Seq";
+    ctors = [];
+    heap = None;
+    alias = None;
+    at = Location.none;
+  }
+
+let is_sequence (d : t) = String.equal d.module_name "Seq" && List.is_empty d.ctors
+
 (** The data type of the type constructor [p]: one of [types], a list or an option. *)
 let find (types : t list) (p : Path.t) =
   if Path.same p Predef.path_list then Some list
@@ -212,6 +225,9 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
   | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
   | Tconstr (p, [], _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
       Ok (R.Type.ref ~loc:l)
@@ -241,6 +257,8 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
       tag types elt ^ "Option"
   | Tconstr (p, [ elt ], _) when is_ref p -> tag types elt ^ "Ref"
   | Tconstr (p, [ elt ], _) when is_atomic p -> tag types elt ^ "Atomic"
+  | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
+      tag types elt ^ "Seq"
   | Tconstr (p, [], _) when Option.is_some (find types p) ->
       (Option.value_exn (find types p)).module_name
   | Ttuple components ->

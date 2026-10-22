@@ -14,7 +14,10 @@ type t = {
   text : string;
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
-  env : Env.t;  (** The environment at the end of the file, for types in annotations. *)
+  env : Env.t;
+      (** The environment at the end of the file, for types in annotations, with the type
+          [sequence] of specifications. *)
+  sequence : Path.t;  (** The type ['a sequence] of specifications. *)
   interface : interface option;
   proof : S.proof_decl list;  (** The declarations of the proof. *)
 }
@@ -130,11 +133,17 @@ let load (file : string) : (t, Report.error) Result.t =
       (Unit_info.make ~check_modname:false ~source_file:file Impl
          (Stdlib.Filename.remove_extension file));
     let typed, _, _, _, env = Typemod.type_structure env parsed in
+    (* Specifications have sequences, which OCaml does not. *)
+    let _, _, _, _, env =
+      Typemod.type_structure env
+        (Parse.implementation (Lexing.from_string "type 'a sequence"))
+    in
+    let sequence, _ = Env.find_type_by_name (Lident "sequence") env in
     let interface = Option.map (sibling file ".mli") ~f:load_interface in
     Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.map proof ~f:(fun proof ->
-        { file; text; typed; comments; env; interface; proof })
+        { file; text; typed; comments; env; sequence; interface; proof })
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

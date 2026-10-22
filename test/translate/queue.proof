@@ -1,0 +1,22 @@
+(* The cells ever linked, their values, and the indices of the head's and the tail's
+   cells. Cells are never unlinked: popping moves the head. *)
+type state = {
+  cells : node Atomic.t sequence [@grows];
+  values : int sequence [@grows];
+  head : int [@grows];
+  tail : int;
+}
+
+invariant is_queue (q : t) (s : state) =
+  length s.cells = length s.values + 1
+  && 0 <= s.head && s.head < length s.cells
+  && 0 <= s.tail && s.tail < length s.cells
+  && own q.head s.cells.(s.head)
+  && own q.tail s.cells.(s.tail)
+  && (forall i : int. 0 <= i && i < length s.values ->
+        own s.cells.(i) (Next (s.values.(i), s.cells.(i + 1))))
+  && own s.cells.(length s.values) Nil
+
+view queue (q : t) = drop s.head s.values
+
+action pop = { s with head = s.head + 1 }

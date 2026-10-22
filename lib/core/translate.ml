@@ -10,6 +10,8 @@ module R = Raven_api
 
 type error = Report.error
 
+module S = Caravan_spec.Spec_ast
+
 let ( let* ) = Result.( >>= )
 let error ?related loc message = Error (Report.error ?related Type loc message)
 let unsupported = Report.unsupported
@@ -121,6 +123,8 @@ type au = {
   mutable values : R.Expr.t list;
       (** The values of the implicit parameters in the open update. *)
   mutable step : Location.t;  (** The step that opened the update. *)
+  mutable performing : string option;
+      (** The action that the step performs if it commits, as [(*@ performs pop *)]. *)
   self : string;  (** The procedure's name. *)
   has_result : bool;
   open_ :
@@ -133,19 +137,44 @@ type au = {
 }
 (** The atomic update of a function with an atomic contract. *)
 
+type structure = {
+  invariant : string;
+  state : string;
+  fields : (string * string * R.Type.t * Types.type_expr * bool) list;
+  chains : (string * string) list;
+  actions : (string * string * (string * S.term) list) list;
+  structure_type : Types.type_expr;
+  views : (S.predicate * S.term) list;  (** The views, with their values. *)
+  at : Location.t;  (** The invariant's definition. *)
+}
+(** A structure whose invariant has a ghost state: the invariant, its state variable, the
+    state's fields with their existentials, Raven and OCaml types and whether they grow,
+    the fields indexing ownership, with the existentials of their index maps, the actions,
+    and the type of the structure, the invariant's first parameter. *)
+
+let has_history st = List.exists st.fields ~f:(fun (_, _, _, _, grows) -> grows)
+
+(** The names of the members generated for [st]: functions, lemmas and fields, and
+    modules. *)
+let member_name st suffix = st.invariant ^ "_" ^ suffix
+
+let module_name st suffix = String.capitalize st.invariant ^ "_" ^ suffix
+
 type shared = {
   persistent : (string * Location.t) list;
       (** The invariants, by their names, with their definitions. *)
   views : (string * string) list;
       (** The views, by their names, with their ghost fields, which hold a client's view
           of the state, half in the view and half in the invariant. *)
-  anchors : (string * (string * R.Type.t) list) list;
-      (** The ghost fields of the views, by the field whose allocation allocates them: the
-          field of the structure's reference. *)
+  structures : structure list;
+  anchors : (string * (string * R.Type.t * R.Expr.t option) list) list;
+      (** The ghost fields of the views and histories, by the field whose allocation
+          allocates them, the field of the structure's reference, with their initial
+          values: arbitrary for views. *)
 }
 (** The shared structures of a program: invariants and views. *)
 
-let no_shared = { persistent = []; views = []; anchors = [] }
+let no_shared = { persistent = []; views = []; structures = []; anchors = [] }
 
 type context = {
   types : Datatypes.t list;
@@ -178,6 +207,11 @@ type context = {
   mutable invariants : (string * R.Expr.t list) list;
       (** The invariants that the function's precondition holds, opened around each of its
           atomic steps, with their arguments. *)
+  mutable opened : (string * R.Expr.t list) list;
+      (** The states of the open invariants, by the variables of their fields. *)
+  mutable snapshots : (string * R.Expr.t list list) list;
+      (** The snapshots of the states of the invariants taken on the current path, latest
+          first. *)
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
@@ -378,15 +412,13 @@ let plain_args ~at (args : (Asttypes.arg_label * Typedtree.apply_arg) list) =
     | Nolabel, Arg e -> Ok e
     | _ -> unsupported at "A labelled, optional or omitted argument")
 
-module S = Caravan_spec.Spec_ast
-
 (** What a name in a contract stands for: a Raven variable, or a value, such as the field
     of a matched value that a pattern names. *)
 type bound =
   | Raven of string
   | Value of R.Expr.t
-  | State of (string * R.Expr.t) list
-      (** The state of an invariant, by the values of its fields. *)
+  | State of (string * (R.Expr.t * Types.type_expr)) list
+      (** The state of an invariant, by the values and types of its fields. *)
 
 type env = {
   ctx : context;  (** For the data types, and the fields of ref cells. *)
@@ -517,7 +549,9 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
   let known x =
     List.Assoc.mem env.vars x ~equal:String.equal
     || List.Assoc.mem env.funcs x ~equal:String.equal
-    || List.mem [ "own"; "not"; "max_int"; "min_int"; "mod" ] x ~equal:String.equal
+    || List.mem
+         [ "own"; "not"; "max_int"; "min_int"; "mod"; "length"; "last"; "drop"; "take" ]
+         x ~equal:String.equal
   in
   let free =
     List.concat_map terms ~f:term_names
@@ -660,7 +694,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       begin match
         List.Assoc.find (Option.value_exn (state_fields env x)) label ~equal:String.equal
       with
-      | Some v -> Ok v
+      | Some (v, _) -> Ok v
       | None -> error at (Printf.sprintf "The state %s has no field %s" x label)
       end
   | Tfield (r, Qid { pid_str = label; _ }) ->
@@ -683,6 +717,62 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   | Tfield (_, Qdot _) -> unsupported at "A qualified field"
   | Tlet _ | Told _ -> unsupported at "This formula"
 
+(** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
+    as [[]] in [queue q []]. *)
+and expected_formula env (expected : Types.type_expr option) (t : S.term) =
+  let rec literal (t : S.term) =
+    match spine t [] with
+    | { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ }, [] -> Some []
+    | { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, [ h; rest ] ->
+        Option.map (literal rest) ~f:(fun rest -> h :: rest)
+    | _ -> None
+  in
+  let is_sequence ty =
+    match Datatypes.desc env.data ty with
+    | Tconstr (p, [ _ ], _) ->
+        Option.exists (Datatypes.find env.data p) ~f:Datatypes.is_sequence
+    | _ -> false
+  in
+  match (Option.map expected ~f:is_sequence, literal t) with
+  | Some true, Some elements ->
+      let* elements = all elements ~f:(formula env) in
+      Ok (R.Expr.seq ~loc:(loc t.term_loc) elements)
+  | _ -> formula env t
+
+(** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
+    concatenation. *)
+and term_type env (t : S.term) =
+  match (t.term_desc, spine t []) with
+  | Tvar (Qid { pid_str = x; _ }), _ ->
+      List.Assoc.find env.var_types x ~equal:String.equal
+  | _, ({ term_desc = Tvar (Qid { pid_str = "drop" | "take"; _ }); _ }, [ _; s ]) ->
+      term_type env s
+  | _, ({ term_desc = Tvar (Qid { pid_str = "++"; _ }); _ }, [ a; b ]) ->
+      Option.first_some (term_type env a) (term_type env b)
+  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = f; _ }), _
+    ->
+      Option.bind (state_fields env x) ~f:(fun fields ->
+          Option.map (List.Assoc.find fields f ~equal:String.equal) ~f:snd)
+  | _, ({ term_desc = Tvar (Qid { pid_str = "([])" | "last"; _ }); _ }, s :: _) ->
+      (* An entry of a sequence. *)
+      begin match Option.map (term_type env s) ~f:(Datatypes.desc env.data) with
+      | Some (Tconstr (_, [ elt ], _)) -> Some elt
+      | _ -> None
+      end
+  | _ -> None
+
+(** The OCaml type of the values that the location [t] holds, where it is known. *)
+and location_type env (t : S.term) =
+  match t.term_desc with
+  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
+    ->
+      Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
+          field_type env.ctx ty label)
+  | Tvar (Qid { pid_str = x; _ }) ->
+      Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
+          field_type env.ctx ty "")
+  | _ -> None
+
 (** The application [t] of an operator or a constructor. *)
 and application env (t : S.term) =
   let at = t.term_loc in
@@ -693,9 +783,18 @@ and application env (t : S.term) =
       let* a = formula env a in
       Ok (R.Expr.not_ ~loc:l a)
   | Tvar (Qid { pid_str = "own"; _ }), [ location; v ] ->
+      let expected = location_type env location in
       let* location = location_of env location in
-      let* v = formula env v in
+      let* v = expected_formula env expected v in
       Ok (R.Expr.own ~loc:l [ location; v ])
+  | Tvar (Qid { pid_str = "([])"; _ }), [ s; i ] ->
+      let* s = formula env s in
+      let* i = formula env i in
+      Ok (R.Expr.index ~loc:l s i)
+  | Tvar (Qid { pid_str = "++"; pid_fixity = Infix; _ }), [ a; b ] ->
+      let* a = formula env a in
+      let* b = formula env b in
+      Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l "++") [ a; b ])
   | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.neg ~loc:l a)
@@ -707,8 +806,11 @@ and application env (t : S.term) =
       begin match spec_binop op with
       | None -> unsupported at (Printf.sprintf "The operator %s" op)
       | Some op -> (
-          let* a = formula env a in
-          let* b = formula env b in
+          (* A literal compared with a sequence is one. *)
+          let a_type = term_type env a
+          and b_type = term_type env b in
+          let* a = expected_formula env b_type a in
+          let* b = expected_formula env a_type b in
           match op with
           | Div -> Ok (prelude_call ~loc:l Prelude.div [ a; b ])
           | Mod -> Ok (prelude_call ~loc:l Prelude.mod_ [ a; b ])
@@ -717,9 +819,39 @@ and application env (t : S.term) =
   | Tvar (Qid { pid_str = c; _ }), _ when is_constructor c -> constructor env t args
   | Tvar (Qid { pid_str = f; _ }), _ :: _
     when List.Assoc.mem env.funcs f ~equal:String.equal ->
-      let* args = all args ~f:(formula env) in
+      (* A predicate's arguments have its parameters' types. *)
+      let expected =
+        match List.Assoc.find env.ctx.preds f ~equal:String.equal with
+        | Some (_, types) when List.length types = List.length args ->
+            List.map types ~f:Option.some
+        | _ -> List.map args ~f:(fun _ -> None)
+      in
+      let* args =
+        all (List.zip_exn expected args) ~f:(fun (expected, a) ->
+            expected_formula env expected a)
+      in
       let func = List.Assoc.find_exn env.funcs f ~equal:String.equal in
       Ok (R.Expr.call ~loc:l (name ~loc:l func) args)
+  | Tvar (Qid { pid_str = ("length" | "last" | "drop" | "take") as f; _ }), args -> begin
+      let* args = all args ~f:(formula env) in
+      let length s =
+        R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "length") [ s ]
+      in
+      match (f, args) with
+      | "length", [ s ] -> Ok (length s)
+      | "last", [ s ] ->
+          Ok
+            (R.Expr.index ~loc:l s
+               (R.Expr.binary ~loc:l Minus (length s) (R.Expr.int ~loc:l 1)))
+      | "drop", [ n; s ] -> Ok (R.Expr.slice_from ~loc:l s n)
+      | "take", [ n; s ] -> Ok (R.Expr.slice_to ~loc:l s n)
+      | _ ->
+          error at
+            (Printf.sprintf "%s expects %s" f
+               (if String.equal f "drop" || String.equal f "take" then
+                  "a length and a sequence"
+                else "a sequence"))
+    end
   | Tvar q, args when Option.is_some (list_function q) ->
       let* args = all args ~f:(formula env) in
       let f = Option.value_exn (list_function q) in
@@ -820,7 +952,20 @@ and location_of env (t : S.term) =
       | None ->
           error at (Printf.sprintf "%s is not an atomic, as owned without a field" x)
     end
-  | _ -> unsupported at "This location, other than a field of a variable or an atomic,"
+  | _ -> begin
+      (* An atomic given by an expression, as [last s.cells]. *)
+      let* field =
+        match term_type env t with
+        | Some typ -> field_of_type env.ctx ~at typ ""
+        | None -> Ok None
+      in
+      match field with
+      | Some field ->
+          let* r = formula env t in
+          Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+      | None ->
+          unsupported at "This location, other than a field of a variable or an atomic,"
+    end
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)
 and constructor env (t : S.term) args =
@@ -1100,28 +1245,170 @@ and owned_names (t : S.term) =
   | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
   | None, _ -> []
 
+(** Where the ghost fields of a structure of type [t] go: on its reference, or, for an
+    immutable record, on its first atomic. The field whose allocation allocates them, and
+    the reference, given the structure. *)
+let anchor (types : Datatypes.t list) (t : Types.type_expr) :
+    (string * (loc:R.Loc.t -> R.Expr.t -> R.Expr.t)) option =
+  let itself ~loc:_ e = e in
+  match Datatypes.desc types t with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p ->
+      Some ("atomic_" ^ Datatypes.tag types elt, itself)
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
+      Some ("ref_" ^ Datatypes.tag types elt ^ "_contents", itself)
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find types p with
+      | Some { heap = Some (f :: _); _ } -> Some (f.raven_field, itself)
+      | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
+          List.find_map (List.zip_exn fields args) ~f:(fun (label, a) ->
+              match Datatypes.desc types a with
+              | Tconstr (q, [ elt ], _) when Datatypes.is_atomic q ->
+                  Some
+                    ( "atomic_" ^ Datatypes.tag types elt,
+                      fun ~loc e -> R.Expr.field ~loc e (name ~loc label) )
+              | _ -> None)
+      | _ -> None
+      end
+  | _ -> None
+
+(** The reference holding the ghost fields of the structure [e], the first argument of the
+    predicate [pred]. *)
+let anchored ctx ~loc ~pred (e : R.Expr.t) =
+  match List.Assoc.find ctx.preds pred ~equal:String.equal with
+  | Some (_, t :: _) ->
+      begin match anchor ctx.types t with Some (_, at) -> at ~loc e | None -> e
+      end
+  | _ -> e
+
+(** The state after the action [a] of [st] from the state [values], and whether each field
+    changes. *)
+let next_state ctx st values a =
+  match List.find st.actions ~f:(fun (name, _, _) -> String.equal name a) with
+  | None -> None
+  | Some (_, state, update) ->
+      let env =
+        bind (scope_env ctx) state
+          (State
+             (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
+      in
+      Some
+        (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v ->
+             match List.Assoc.find update f ~equal:String.equal with
+             | Some term ->
+                 begin match expected_formula env (Some t) term with
+                 | Ok e -> (e, true)
+                 | Error _ -> (v, false)
+                 end
+             | None -> (v, false)))
+
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
-let use_invariants ctx ~(at : Location.t) ~fold =
+let use_invariants ?performs ctx ~(at : Location.t) ~fold =
   let after = { at with loc_start = at.loc_end } in
-  List.map ctx.invariants ~f:(fun (inv, args) ->
-      if fold then begin
-        let definition =
-          Option.to_list
-            (Option.map (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
-               ~f:(fun def -> (def, "The invariant")))
-        in
-        ctx.origins :=
-          {
-            at = after;
-            code = Fold;
-            message = Printf.sprintf "The invariant %s may not hold after this step" inv;
-            related = definition;
-          }
-          :: !(ctx.origins);
-        R.Stmt.fold ~loc:(loc after) (name ~loc:(loc after) inv) args
-      end
-      else R.Stmt.unfold ~loc:(loc at) (name ~loc:(loc at) inv) args)
+  let l = loc at and la = loc after in
+  let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+  let structure inv =
+    List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+  in
+  let state_value st values =
+    R.Expr.call ~loc:l
+      (R.Name.make ~loc:l ~path:[ module_name st "state" ] "state")
+      values
+  in
+  let lemma f args = R.Stmt.call ~loc:l (R.Expr.call ~loc:l (name ~loc:l f) args) in
+  List.concat_map ctx.invariants ~f:(fun (inv, args) ->
+      match (fold, structure inv) with
+      | false, Some st ->
+          (* The state, bound to variables. *)
+          let locals =
+            List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
+                (raven, Names.fresh ctx.names raven, typ))
+          in
+          let values = List.map locals ~f:(fun (_, x, _) -> var x) in
+          ctx.opened <-
+            (inv, values) :: List.Assoc.remove ctx.opened inv ~equal:String.equal;
+          List.concat_map locals ~f:(fun (_, x, typ) ->
+              R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x))
+          @ [
+              R.Stmt.unfold ~loc:l
+                ~witnesses:(List.map locals ~f:(fun (e, x, _) -> (ident ~loc:l x, var e)))
+                (name ~loc:l inv) args;
+            ]
+      | false, None -> [ R.Stmt.unfold ~loc:l (name ~loc:l inv) args ]
+      | true, _ -> (
+          let definition =
+            Option.to_list
+              (Option.map (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
+                 ~f:(fun def -> (def, "The invariant")))
+          in
+          ctx.origins :=
+            {
+              at = after;
+              code = Fold;
+              message = Printf.sprintf "The invariant %s may not hold after this step" inv;
+              related = definition;
+            }
+            :: !(ctx.origins);
+          let fold ?(witnesses = []) () =
+            [ R.Stmt.fold ~loc:la ~witnesses (name ~loc:la inv) args ]
+          in
+          match (structure inv, List.Assoc.find ctx.opened inv ~equal:String.equal) with
+          | Some st, Some values when has_history st -> begin
+              let structure = List.hd_exn args in
+              match Option.bind performs ~f:(next_state ctx st values) with
+              | Some next ->
+                  (* The action's state, which the history learns, and the fields it
+                     changes, as witnesses. *)
+                  let changed =
+                    List.map2_exn st.fields next
+                      ~f:(fun (_, raven, _, _, _) (e, changes) -> (raven, e, changes))
+                  in
+                  let next = List.map next ~f:fst in
+                  ctx.snapshots <- List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
+                  [
+                    lemma (member_name st "learn")
+                      [ structure; state_value st values; state_value st next ];
+                  ]
+                  @ fold
+                      ~witnesses:
+                        (List.filter_map changed ~f:(fun (raven, e, changes) ->
+                             Option.some_if changes (ident ~loc:la raven, e)))
+                      ()
+              | None ->
+                  let snapshots =
+                    Option.value
+                      (List.Assoc.find ctx.snapshots inv ~equal:String.equal)
+                      ~default:[]
+                  in
+                  ctx.snapshots <-
+                    (inv, values :: snapshots)
+                    :: List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
+                  lemma (member_name st "snapshot") [ structure; state_value st values ]
+                  :: fold ()
+            end
+          | _ -> fold ()))
+
+(** The current states of the open invariants extend all their snapshots, which an action
+    may rely on. *)
+let order_snapshots ctx ~(at : Location.t) =
+  let l = loc at in
+  List.concat_map ctx.opened ~f:(fun (inv, values) ->
+      match
+        ( List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv),
+          List.Assoc.find ctx.snapshots inv ~equal:String.equal )
+      with
+      | Some st, Some (latest :: older) ->
+          let state values =
+            R.Expr.call ~loc:l
+              (R.Name.make ~loc:l ~path:[ module_name st "state" ] "state")
+              values
+          in
+          List.map older ~f:(fun o ->
+              R.Stmt.call ~loc:l
+                (R.Expr.call ~loc:l
+                   (name ~loc:l (member_name st "extends_trans"))
+                   [ state o; state latest; state values ]))
+      | _ -> [])
 
 (** [make], folding a predicate, preceded by setting the ghost field of a view to its new
     value, the last argument: the view changes with the state. *)
@@ -1130,10 +1417,52 @@ let with_views ctx make ~loc ~pred p args =
   | Some field ->
       let structure = List.hd_exn args and value = List.last_exn args in
       R.Stmt.assign ~loc
-        [ R.Expr.field ~loc structure (name ~loc field) ]
+        [ R.Expr.field ~loc (anchored ctx ~loc ~pred structure) (name ~loc field) ]
         (R.Stmt.expr_rhs value)
       :: make ~loc ~pred p args
   | None -> make ~loc ~pred p args
+
+(** The views of the open invariants, set to their values in the states after the action
+    [a], and folded: the views are functions of the state. *)
+let perform_views ctx ~(at : Location.t) a =
+  let l = loc at in
+  all ctx.opened ~f:(fun (inv, values) ->
+      let structure =
+        List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+      in
+      let args = List.Assoc.find ctx.invariants inv ~equal:String.equal in
+      match (structure, args) with
+      | Some st, Some args ->
+          begin match next_state ctx st values a with
+          | None -> Ok []
+          | Some next ->
+              let env =
+                bind (scope_env ctx) st.state
+                  (State
+                     (List.map2_exn st.fields next ~f:(fun (f, _, _, t, _) (e, _) ->
+                          (f, (e, t)))))
+              in
+              let* views =
+                all st.views ~f:(fun ((v : S.predicate), value) ->
+                    let pred = v.pred_name.pid_str in
+                    let inputs = List.take args (List.length v.pred_params - 1) in
+                    let env =
+                      List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
+                        ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
+                    in
+                    let* value = formula env value in
+                    let raven, _ =
+                      List.Assoc.find_exn ctx.preds pred ~equal:String.equal
+                    in
+                    Ok
+                      (with_views ctx
+                         (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
+                         ~loc:l ~pred (name ~loc:l raven) (inputs @ [ value ])))
+              in
+              Ok (List.concat views)
+          end
+      | _ -> Ok [])
+  |> Result.map ~f:List.concat
 
 (** The annotation saying how the atomic step at [at] linearizes the function, if one
     follows it, as [Atomic.get t (*@ commit *)]. *)
@@ -1233,13 +1562,21 @@ let set_au_state ctx = function
   | None -> ()
 
 (** The atomic update before a branch, for each arm to start from. *)
-let au_snapshot ctx = Option.map ctx.au ~f:(fun au -> (au.state, au.step, au.values))
+let au_snapshot ctx =
+  ( Option.map ctx.au ~f:(fun au -> (au.state, au.step, au.values, au.performing)),
+    ctx.opened,
+    ctx.snapshots )
 
-let restore_au ctx (state, step, values) =
-  Option.iter ctx.au ~f:(fun au ->
+let restore_au ctx (au_state, opened, snapshots) =
+  ctx.opened <- opened;
+  ctx.snapshots <- snapshots;
+  match (ctx.au, au_state) with
+  | Some au, Some (state, step, values, performing) ->
       au.state <- state;
       au.step <- step;
-      au.values <- values)
+      au.values <- values;
+      au.performing <- performing
+  | _ -> ()
 
 (** Whether [c] is the result of a [compare_and_set], [Some false] if its negation. *)
 let rec cas_polarity ctx (c : Typedtree.expression) =
@@ -1300,10 +1637,13 @@ let view_allocation ctx ~loc:l (fields : string list) =
           ~default:[])
   in
   let allocated =
-    List.map views ~f:(fun (view, typ) ->
-        let x = Names.fresh ctx.names "view" in
-        ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x),
-          (name ~loc:l view, Some (R.Expr.var ~loc:l (name ~loc:l x))) ))
+    List.map views ~f:(fun (view, typ, init) ->
+        match init with
+        | Some init -> ([], (name ~loc:l view, Some init))
+        | None ->
+            let x = Names.fresh ctx.names "view" in
+            ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x),
+              (name ~loc:l view, Some (R.Expr.var ~loc:l (name ~loc:l x))) ))
   in
   (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
 
@@ -1643,6 +1983,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   let how default =
     match (annotation, default) with
     | None, _ -> Ok default
+    | Some (S.Performs a), _ ->
+        Option.iter ctx.au ~f:(fun au -> au.performing <- Some a.pid_str);
+        Ok default
     | Some S.Commit, _ -> Ok `Commit
     | Some (Returning { pat_desc = Pconstr (Qid c, _); _ }), `Abort ->
         Ok (`Returning c.pid_str)
@@ -1916,7 +2259,7 @@ and match_cases ?commits ~tail ctx ~at v
   let case_commits = List.zip_exn (List.map cases ~f:snd) commits in
   (* The body of a case, after defining the variables of its pattern. *)
   let case_body binds (rhs : Typedtree.expression) =
-    Option.iter start ~f:(fun snapshot -> restore_au ctx snapshot);
+    restore_au ctx start;
     let commits =
       Option.join
         (List.Assoc.find case_commits rhs ~equal:(fun a b ->
@@ -1979,7 +2322,10 @@ and match_cases ?commits ~tail ctx ~at v
   set_au_state ctx
     (Option.first_some
        (List.reduce (List.filter_opt !ends) ~f:join_au)
-       (Option.map start ~f:(fun (state, _, _) -> state)));
+       (Option.map
+          (let au, _, _ = start in
+           au)
+          ~f:(fun (state, _, _, _) -> state)));
   Ok stmts
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
@@ -2042,7 +2388,7 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
      result of the [compare_and_set] that left the update open, the arms close it. *)
   let start = au_snapshot ctx in
   let arm taken e =
-    Option.iter start ~f:(fun snapshot -> restore_au ctx snapshot);
+    restore_au ctx start;
     let* entry =
       enter_arm ctx ~commits:(Option.map polarity ~f:(fun p -> Bool.equal p taken))
     in
@@ -2366,6 +2712,8 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       linearizations = [];
       shared;
       invariants = [];
+      opened = [];
+      snapshots = [];
     }
   in
   let l = loc f.loc in
@@ -2415,8 +2763,12 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
       Ok (a @ b)
   | Tvar (Qid { pid_str = p; _ }), _, _
     when List.Assoc.mem ctx.preds p ~equal:String.equal ->
-      let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
-      let* args = all args ~f:(formula env) in
+      let raven, types = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+      let* args =
+        if List.length types = List.length args then
+          all (List.zip_exn types args) ~f:(fun (t, a) -> expected_formula env (Some t) a)
+        else all args ~f:(formula env)
+      in
       Ok (make ~loc:l ~pred:p (name ~loc:l raven) args)
   | _, _, Tif (c, a, b) ->
       let* c = formula env c in
@@ -2500,6 +2852,7 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
       read_results = [];
       values = [];
       step = at;
+      performing = None;
       self;
       has_result = Option.is_some result;
       open_;
@@ -2533,8 +2886,26 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
                      (t.term_loc, "The atomic postcondition"));
              }
           :: !(ctx.origins);
-        let* folds = each posts ~at (with_views ctx fold) (opened ~value au.values) in
-        Ok (folds @ [ commit ] @ use_invariants ctx ~at ~fold:true)
+        let* folds =
+          match au.performing with
+          | Some a ->
+              (* The views follow from the action; the postcondition's other predicates
+                 are folded as usual. *)
+              let others ~loc ~pred p args =
+                if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then []
+                else fold ~loc ~pred p args
+              in
+              let* views = perform_views ctx ~at a in
+              let* others = each posts ~at others (opened ~value au.values) in
+              Ok (views @ others)
+          | None -> each posts ~at (with_views ctx fold) (opened ~value au.values)
+        in
+        let ordered =
+          if Option.is_some au.performing then order_snapshots ctx ~at else []
+        in
+        Ok
+          (ordered @ folds @ [ commit ]
+          @ use_invariants ?performs:au.performing ctx ~at ~fold:true)
     | Abort ->
         let* folds = each pres ~at fold (opened au.values) in
         Ok
@@ -2567,6 +2938,118 @@ let invariant_apps ctx env (terms : S.term list) =
       let* args = all args ~f:(formula env) in
       Ok (raven, args))
 
+(** The statements establishing the invariant [inv] with [args] at the end of [f], at
+    [at]: with the initial state of its structure, as [f]'s annotation
+    [(*@ initially { ... } *)] gives it, the history of that state and the index maps of
+    its fields owned by index. *)
+let establish_invariant ctx ~(f : func) ~at inv args =
+  let l = loc at in
+  match List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv) with
+  | None -> Ok [ R.Stmt.fold ~loc:l (name ~loc:l inv) args ]
+  | Some st -> begin
+      let window (a : Annotation.t) =
+        a.loc.loc_start.pos_cnum >= f.body.exp_loc.loc_end.pos_cnum
+        && Option.for_all f.next ~f:(fun next ->
+            a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
+        && Poly.equal (Annotation.kind a) Annotation.Initially
+      in
+      match List.filter ctx.annotations ~f:window with
+      | [] when (not (has_history st)) && List.is_empty st.chains ->
+          (* The witnesses are computed. *)
+          Ok [ R.Stmt.fold ~loc:l (name ~loc:l inv) args ]
+      | [] ->
+          error f.loc
+            (Printf.sprintf
+               "This function establishes %s, whose initial state it gives as (*@ \
+                initially { ... } *)"
+               inv)
+      | a :: _ ->
+          let* initial = Annotation.initially a in
+          let env = scope_env ctx in
+          let* values =
+            all st.fields ~f:(fun (field, raven, _, t, _) ->
+                match
+                  List.find initial ~f:(fun (x, _) -> String.equal x.S.pid_str field)
+                with
+                | Some (_, term) ->
+                    let* v = expected_formula env (Some t) term in
+                    Ok (raven, v, term)
+                | None ->
+                    error a.loc (Printf.sprintf "The initial state has no field %s" field))
+          in
+          (* The index map of a field owned by index, given as a list of entries. *)
+          let rec entries (t : S.term) =
+            match spine t [] with
+            | { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ }, [] -> Some []
+            | { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, [ h; rest ] ->
+                Option.map (entries rest) ~f:(fun rest -> h :: rest)
+            | _ -> None
+          in
+          let* indices =
+            all st.chains ~f:(fun (field, index) ->
+                let _, _, term =
+                  List.find_exn values ~f:(fun (raven, _, _) ->
+                      String.equal raven (st.state ^ "_" ^ field))
+                in
+                match entries term with
+                | Some es ->
+                    let* es = all es ~f:(formula env) in
+                    Ok
+                      ( ident ~loc:l index,
+                        R.Expr.map_literal ~loc:l
+                          (List.mapi es ~f:(fun i e -> (e, R.Expr.int ~loc:l i)))
+                          (R.Expr.int ~loc:l 0) )
+                | None ->
+                    unsupported term.term_loc
+                      "An initial value other than a list of entries, for a field owned \
+                       by index,")
+          in
+          let history =
+            if has_history st then
+              let qn m x = R.Name.make ~loc:l ~path:[ m ] x in
+              let full s =
+                R.Expr.call ~loc:l
+                  (qn (module_name st "history") "full")
+                  [ R.Expr.call ~loc:l (qn (module_name st "states") "set") [ s ] ]
+              in
+              let state =
+                R.Expr.call ~loc:l
+                  (qn (module_name st "state") "state")
+                  (List.map values ~f:(fun (_, v, _) -> v))
+              in
+              let location =
+                match anchor ctx.types st.structure_type with
+                | Some (_, at) ->
+                    R.Expr.field ~loc:l
+                      (at ~loc:l (List.hd_exn args))
+                      (name ~loc:l (member_name st "history"))
+                | None -> List.hd_exn args
+              in
+              [
+                R.Stmt.call ~loc:l
+                  (R.Expr.call ~loc:l (name ~loc:l "fpu")
+                     [
+                       location;
+                       full (R.Expr.set ~loc:l []);
+                       full
+                         (R.Expr.call ~loc:l
+                            (name ~loc:l (member_name st "states"))
+                            [ state ]);
+                     ]);
+              ]
+            else []
+          in
+          Ok
+            (history
+            @ [
+                R.Stmt.fold ~loc:l
+                  ~witnesses:
+                    (List.map values ~f:(fun (raven, v, _) -> (ident ~loc:l raven, v))
+                    @ indices)
+                  (name ~loc:l inv) args;
+              ])
+    end
+
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
@@ -2590,6 +3073,8 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       linearizations;
       shared;
       invariants = [];
+      opened = [];
+      snapshots = [];
     }
   in
   let l = loc f.loc in
@@ -2768,10 +3253,10 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
                      ~f:(fun def -> (def, "The invariant")));
             }
             :: !(ctx.origins));
-      Ok
-        (List.concat views
-        @ List.map established ~f:(fun (inv, args) ->
-            R.Stmt.fold ~loc:(loc at) (name ~loc:(loc at) inv) args))
+      let* folds =
+        all established ~f:(fun (inv, args) -> establish_invariant ctx ~f ~at inv args)
+      in
+      Ok (List.concat views @ List.concat folds)
   in
   let body = bind_au @ first @ stmts @ assignment @ establish @ last in
   Ok
@@ -2929,26 +3414,202 @@ let pure_functions (funcs : func list) : func list =
     fields of its state; or as a view of an invariant's state. *)
 type definition =
   | Body of S.term
-  | Invariant of { state : string; fields : (S.id * S.pty) list; body : S.term }
+  | Invariant of { state : string; fields : S.state_field list; body : S.term }
   | View of { value : S.term }
 
 (** The ghost field holding the client's view [v] of a state. *)
 let view_field v = "view_" ^ v
 
-(** The field that allocating a value of type [t] allocates, if [t] is a reference: where
-    the ghost fields of the views of a structure of type [t] go. *)
-let anchor_field (types : Datatypes.t list) (t : Types.type_expr) =
-  match Datatypes.desc types t with
-  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p ->
-      Some ("atomic_" ^ Datatypes.tag types elt)
-  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
-      Some ("ref_" ^ Datatypes.tag types elt ^ "_contents")
-  | Tconstr (p, [], _) ->
-      begin match Datatypes.find types p with
-      | Some { heap = Some (f :: _); _ } -> Some f.raven_field
+(** The conjuncts of [t]. *)
+let rec conjuncts (t : S.term) =
+  let t = S.chain t in
+  match spine t [] with
+  | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+      conjuncts a @ conjuncts b
+  | _ -> [ t ]
+
+(** [t], if it owns the entries of a field of the state [state] by index, as
+    [forall i. g -> own s.cells.(i) v]: the index, the guard, the field and the value. *)
+let chain_of ~state (t : S.term) =
+  match t.term_desc with
+  | Tquant (Tforall, [ (i, _) ], body) ->
+      begin match spine (S.chain body) [] with
+      | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ guard; owned ] ->
+          begin match spine owned [] with
+          | { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ }, [ location; value ] ->
+              begin match spine location [] with
+              | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
+                  [
+                    {
+                      term_desc =
+                        Tfield
+                          ( { term_desc = Tvar (Qid { pid_str = s; _ }); _ },
+                            Qid { pid_str = field; _ } );
+                      _;
+                    };
+                    { term_desc = Tvar (Qid { pid_str = j; _ }); _ };
+                  ] )
+                when String.equal s state && String.equal j i.S.pid_str ->
+                  Some (i, guard, field, value)
+              | _ -> None
+              end
+          | _ -> None
+          end
       | _ -> None
       end
   | _ -> None
+
+(** The members generated for the state of [st]: the state as a data type, its order, with
+    transitivity, the states it extends, their history as a resource algebra and its ghost
+    field, and lemmas taking snapshots of the history and growing it. *)
+let structure_members types (st : structure) ~at : (R.Member.t list, error) Result.t =
+  let l = loc at in
+  let n x = R.Name.make ~loc:l x in
+  let qn m x = R.Name.make ~loc:l ~path:[ m ] x in
+  let var x = R.Expr.var ~loc:l (n x) in
+  let call f args = R.Expr.call ~loc:l f args in
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  let state_module = module_name st "state" in
+  let state_type = R.Type.named ~loc:l (qn state_module "T") [] in
+  let decl x t = R.Var.make ~loc:l (ident ~loc:l x) t in
+  let length s = call (qn "Seq" "length") [ s ] in
+  let extends a b = call (n (member_name st "extends")) [ a; b ] in
+  let states s = call (n (member_name st "states")) [ s ] in
+  let set_module = module_name st "states"
+  and history_module = module_name st "history" in
+  let auth s = call (qn history_module "auth") [ call (qn set_module "set") [ s ] ] in
+  let history_field = member_name st "history" in
+  let* structure_typ = Datatypes.typ types ~at st.structure_type in
+  let* anchored =
+    match anchor types st.structure_type with
+    | Some (_, at) -> Ok (fun e -> R.Expr.field ~loc:l (at ~loc:l e) (n history_field))
+    | None ->
+        error at "The structure of a state is a reference: an atomic, a ref or a record"
+  in
+  let state_data =
+    R.Member.module_ ~loc:l (ident ~loc:l state_module)
+      [
+        R.Member.type_ ~loc:l (ident ~loc:l "T")
+          (Some
+             (R.Type.data ~loc:l
+                [
+                  R.Type.variant ~loc:l (ident ~loc:l "state")
+                    (List.map st.fields ~f:(fun (f, _, typ, _, _) ->
+                         (ident ~loc:l f, typ)));
+                ]));
+      ]
+  in
+  (* Sequences grow by prefix, integers by <=. *)
+  let order =
+    let a = var "a" and b = var "b" in
+    let field e f = R.Expr.field ~loc:l e (n f) in
+    let grows =
+      List.filter_map st.fields ~f:(fun (f, _, _, t, grows) ->
+          if not grows then None
+          else
+            match Datatypes.desc types t with
+            | Tconstr (p, [ _ ], _)
+              when Option.exists (Datatypes.find types p) ~f:Datatypes.is_sequence ->
+                Some
+                  (bin And
+                     (bin Leq (length (field a f)) (length (field b f)))
+                     (bin Eq (field a f)
+                        (R.Expr.slice_to ~loc:l (field b f) (length (field a f)))))
+            | _ -> Some (bin Leq (field a f) (field b f)))
+    in
+    Option.value (List.reduce grows ~f:(bin And)) ~default:(R.Expr.bool ~loc:l true)
+  in
+  let func name formals ret body =
+    R.Member.callable
+      (R.Callable.func ~loc:l ~formals
+         ~returns:[ decl "ret" ret ]
+         (ident ~loc:l name) (Some body))
+  in
+  let lemma ?auto name formals ~requires ~ensures body =
+    R.Member.callable
+      (R.Callable.proc ~loc:l ~kind:Lemma ?auto ~formals
+         ~requires:(List.map requires ~f:R.Spec.make)
+         ~ensures:(List.map ensures ~f:R.Spec.make)
+         (ident ~loc:l name) (Some body))
+  in
+  let fpu location a b = R.Stmt.call ~loc:l (call (n "fpu") [ location; a; b ]) in
+  let x = var "x" and s = var "s" and s1 = var "s1" and s2 = var "s2" in
+  let history = anchored x in
+  Ok
+    [
+      state_data;
+      func (member_name st "extends")
+        [ decl "a" state_type; decl "b" state_type ]
+        (R.Type.bool ~loc:l) order;
+      lemma ~auto:true
+        (member_name st "extends_trans")
+        [ decl "a" state_type; decl "b" state_type; decl "c" state_type ]
+        ~requires:[ bin And (extends (var "a") (var "b")) (extends (var "b") (var "c")) ]
+        ~ensures:[ extends (var "a") (var "c") ]
+        [];
+      func (member_name st "states")
+        [ decl "s" state_type ]
+        (R.Type.set ~loc:l state_type)
+        (R.Expr.set_compr ~loc:l (decl "e" state_type) (extends (var "e") s));
+      R.Member.instance ~loc:l
+        ~def:(R.Name.make ~loc:l ~path:[ "Library" ] "SetRA", [ state_type ])
+        (ident ~loc:l set_module)
+        (R.Name.make ~loc:l ~path:[ "Library" ] "SetRA");
+      R.Member.instance ~loc:l
+        ~def:
+          ( R.Name.make ~loc:l ~path:[ "Library" ] "Auth",
+            [ R.Type.named ~loc:l (n set_module) [] ] )
+        (ident ~loc:l history_module)
+        (R.Name.make ~loc:l ~path:[ "Library" ] "Auth");
+      R.Member.field ~loc:l ~ghost:true (ident ~loc:l history_field)
+        (R.Type.named ~loc:l (n history_module) []);
+      (* Takes note of the current state. *)
+      lemma (member_name st "snapshot")
+        [ decl "x" structure_typ; decl "s" state_type ]
+        ~requires:[ R.Expr.own ~loc:l [ history; auth (states s) ] ]
+        ~ensures:
+          [
+            R.Expr.own ~loc:l
+              [
+                history;
+                call
+                  (qn history_module "auth_frag")
+                  [
+                    call (qn set_module "set") [ states s ];
+                    call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
+                  ];
+              ];
+          ]
+        [
+          fpu history
+            (auth (states s))
+            (call
+               (qn history_module "auth_frag")
+               [
+                 call (qn set_module "set") [ states s ];
+                 call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
+               ]);
+        ];
+      (* Moves the history on to a state that extends the current one. *)
+      lemma (member_name st "learn")
+        [ decl "x" structure_typ; decl "s1" state_type; decl "s2" state_type ]
+        ~requires:
+          [ bin And (R.Expr.own ~loc:l [ history; auth (states s1) ]) (extends s1 s2) ]
+        ~ensures:
+          [
+            R.Expr.own ~loc:l
+              [
+                history;
+                call (qn history_module "full")
+                  [ call (qn set_module "set") [ states s2 ] ];
+              ];
+          ]
+        [
+          fpu history
+            (auth (states s1))
+            (call (qn history_module "full") [ call (qn set_module "set") [ states s2 ] ]);
+        ];
+    ]
 
 (** The parameters of [p], with the OCaml types [param_types], and the environment of the
     predicate's body. *)
@@ -2976,7 +3637,7 @@ let pred_params ctx ~at (p : S.predicate) param_types =
     [param_types], defined as [def]; [views] are the views of the program, for an
     invariant to hold its half of each. *)
 let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins ~at
-    ~views (p : S.predicate) (def : definition) param_types :
+    ~views ~structures (p : S.predicate) (def : definition) param_types :
     (R.Callable.t, error) Result.t =
   let ctx =
     {
@@ -2995,6 +3656,8 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
       linearizations = [];
       shared;
       invariants = [];
+      opened = [];
+      snapshots = [];
     }
   in
   let l = loc at in
@@ -3021,9 +3684,14 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
   | View _ ->
       (* Half of the view's ghost field, on the structure, its first parameter. *)
       let inputs, value = List.split_n params (List.length params - 1) in
-      let structure, _, _, _ = List.hd_exn params in
+      let structure, _, structure_type, _ = List.hd_exn params in
       let* structure =
         formula env (S.mk_term (Tvar (Qid (S.mk_id ~loc:at structure))) at)
+      in
+      let structure =
+        match anchor types structure_type with
+        | Some (_, at) -> at ~loc:l structure
+        | None -> structure
       in
       let _, raven, _, _ = List.hd_exn value in
       let field =
@@ -3040,23 +3708,108 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
                    R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
                    R.Expr.real ~loc:l 0.5;
                  ])))
-  | Invariant { state; fields; body } ->
-      (* The state's fields are existentials, and its views hold the other halves of their
-         ghost fields. *)
-      let* fields =
-        all fields ~f:(fun (id, pty) ->
-            let* t = Source.ocaml_type ocaml_env ~at pty in
-            let* typ = typ ctx ~at t in
-            let raven = Names.fresh ctx.names (state ^ "_" ^ id.S.pid_str) in
-            Ok (id.pid_str, raven, typ))
+  | Invariant { state; fields = _; body } ->
+      (* The state's fields are existentials, as are the index maps of the fields owned by
+         index; its views hold the other halves of their ghost fields, and its history
+         the authority over the states it extends. *)
+      let* st =
+        match
+          List.find structures ~f:(fun st ->
+              String.equal st.invariant p.pred_name.pid_str)
+        with
+        | Some st -> Ok st
+        | None -> error at "An invariant without a state"
       in
+      let var x = R.Expr.var ~loc:l (R.Name.make ~loc:l x) in
       let state_env =
         bind env state
-          (State
-             (List.map fields ~f:(fun (f, raven, _) ->
-                  (f, R.Expr.var ~loc:l (R.Name.make ~loc:l raven)))))
+          (State (List.map st.fields ~f:(fun (f, raven, _, t, _) -> (f, (var raven, t)))))
       in
-      let* body = quantified state_env body in
+      let length s =
+        R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "length") [ s ]
+      in
+      let bin op a b = R.Expr.binary ~loc:l op a b in
+      (* Ownership of a field's entries by index, as ownership by entry, with the entries'
+         positions in a map, which makes them distinct. *)
+      let chain (i, guard, field, value) =
+        let raven, otyp =
+          match List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field) with
+          | Some (_, raven, _, t, _) -> (raven, t)
+          | None -> (field, Predef.type_int)
+        in
+        let index = var (List.Assoc.find_exn st.chains field ~equal:String.equal) in
+        let entries = var raven in
+        let* elt, elt_typ =
+          match Datatypes.desc types otyp with
+          | Tconstr (_, [ elt ], _) ->
+              let* elt_typ = typ ctx ~at elt in
+              Ok (elt, elt_typ)
+          | _ -> error at "A sequence owned by index"
+        in
+        let j = Names.fresh ctx.names "i" and c = Names.fresh ctx.names "c" in
+        let wf =
+          R.Expr.forall ~loc:l
+            ~triggers:[ [ R.Expr.index ~loc:l entries (var j) ] ]
+            [ R.Var.make ~loc:l (ident ~loc:l j) (R.Type.int ~loc:l) ]
+            (bin Impl
+               (bin And
+                  (bin Leq (R.Expr.int ~loc:l 0) (var j))
+                  (bin Lt (var j) (length entries)))
+               (bin Eq
+                  (R.Expr.index ~loc:l index (R.Expr.index ~loc:l entries (var j)))
+                  (var j)))
+        in
+        let position = R.Expr.index ~loc:l index (var c) in
+        let entry_env =
+          {
+            (bind state_env i.S.pid_str (Value position)) with
+            var_types = (i.pid_str, Predef.type_int) :: state_env.var_types;
+          }
+        in
+        let* guard = formula entry_env guard in
+        let* contents =
+          match Datatypes.desc types elt with
+          | Tconstr (_, [ contents ], _) -> Ok (Some contents)
+          | _ -> Ok None
+        in
+        let* value = expected_formula entry_env contents value in
+        let* field = field_of_type ctx ~at elt "" in
+        let* field =
+          match field with
+          | Some f -> Ok f
+          | None -> error at "Entries owned by index are atomics"
+        in
+        let owned =
+          R.Expr.forall ~loc:l ~triggers:[ [ position ] ]
+            [ R.Var.make ~loc:l (ident ~loc:l c) elt_typ ]
+            (bin Impl
+               (bin And
+                  (bin And
+                     (bin And
+                        (bin Leq (R.Expr.int ~loc:l 0) position)
+                        (bin Lt position (length entries)))
+                     (bin Eq (R.Expr.index ~loc:l entries position) (var c)))
+                  guard)
+               (R.Expr.own ~loc:l
+                  [ R.Expr.field ~loc:l (var c) (R.Name.make ~loc:l field); value ]))
+        in
+        Ok (bin And wf owned)
+      in
+      let* body =
+        all (conjuncts body) ~f:(fun t ->
+            match chain_of ~state t with
+            | Some ((_, _, field, _) as owned)
+              when List.Assoc.mem st.chains field ~equal:String.equal ->
+                chain owned
+            | _ -> quantified state_env t)
+      in
+      let body = List.reduce_exn body ~f:(bin And) in
+      let _, structure, _, _ = List.hd_exn params in
+      let anchored e =
+        match anchor types st.structure_type with
+        | Some (_, at) -> at ~loc:l e
+        | None -> e
+      in
       let* halves =
         all views ~f:(fun ((v : S.predicate), value) ->
             (* The view's parameters are the invariant's, but for its value. *)
@@ -3071,25 +3824,65 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
                   })
             in
             let* value = formula view_env value in
-            let _, structure, _, _ = List.hd_exn params in
             let field =
               R.Expr.field ~loc:l
-                (R.Expr.var ~loc:l (R.Name.make ~loc:l structure))
+                (anchored (var structure))
                 (R.Name.make ~loc:l (view_field v.pred_name.pid_str))
             in
             Ok (R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ]))
       in
-      let body =
-        List.fold halves ~init:body ~f:(fun a b -> R.Expr.binary ~loc:l And a b)
+      let history =
+        if has_history st then
+          let qn m x = R.Name.make ~loc:l ~path:[ m ] x in
+          let state_value =
+            R.Expr.call ~loc:l
+              (qn (module_name st "state") "state")
+              (List.map st.fields ~f:(fun (_, raven, _, _, _) -> var raven))
+          in
+          [
+            R.Expr.own ~loc:l
+              [
+                R.Expr.field ~loc:l
+                  (anchored (var structure))
+                  (R.Name.make ~loc:l (member_name st "history"));
+                R.Expr.call ~loc:l
+                  (qn (module_name st "history") "auth")
+                  [
+                    R.Expr.call ~loc:l
+                      (qn (module_name st "states") "set")
+                      [
+                        R.Expr.call ~loc:l
+                          (R.Name.make ~loc:l (member_name st "states"))
+                          [ state_value ];
+                      ];
+                  ];
+              ];
+          ]
+        else []
+      in
+      let body = List.fold (halves @ history) ~init:body ~f:(bin And) in
+      let existentials =
+        List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
+            R.Var.make ~loc:l (ident ~loc:l raven) typ)
+        @ List.map st.chains ~f:(fun (field, raven) ->
+            let elt_typ =
+              match
+                List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
+              with
+              | Some (_, _, _, t, _) ->
+                  begin match Datatypes.desc types t with
+                  | Tconstr (_, [ elt ], _) -> Result.ok (typ ctx ~at elt)
+                  | _ -> None
+                  end
+              | None -> None
+            in
+            R.Var.make ~loc:l (ident ~loc:l raven)
+              (R.Type.map ~loc:l
+                 (Option.value elt_typ ~default:(R.Type.ref ~loc:l))
+                 (R.Type.int ~loc:l)))
       in
       let body =
-        match fields with
-        | [] -> body
-        | _ ->
-            R.Expr.exists ~loc:l
-              (List.map fields ~f:(fun (_, raven, typ) ->
-                   R.Var.make ~loc:l (ident ~loc:l raven) typ))
-              body
+        match existentials with [] -> body | _ -> R.Expr.exists ~loc:l existentials body
       in
       Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
 
@@ -3124,7 +3917,7 @@ let predicates (source : Source.t) =
     all source.proof ~f:(function
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
-      | Proof_state _ -> Ok None
+      | Proof_state _ | Proof_action _ -> Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
           let* fields =
@@ -3275,14 +4068,19 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
   in
   let* types, funcs = items ~interface source.typed annotations in
+  (* The data types, and the sequences of specifications, which have no module. *)
+  let data_types = types in
+  let types =
+    types @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
+  in
   (* Each data type's module, given the ones declared before it; a record type that is a
      reference has fields instead. *)
   let* modules =
     all
-      (List.filter_mapi types ~f:(fun i (d : Datatypes.t) ->
+      (List.filter_mapi data_types ~f:(fun i (d : Datatypes.t) ->
            Option.some_if
              (Option.is_none d.heap && Option.is_none d.alias)
-             (List.take types i, d)))
+             (List.take data_types i, d)))
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
   let* record_fields = Datatypes.fields types in
@@ -3317,7 +4115,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let at = p.pred_name.pid_loc in
         let structure = List.hd_exn param_types in
         let* anchor =
-          match anchor_field types structure with
+          match Option.map (anchor types structure) ~f:fst with
           | Some anchor -> Ok anchor
           | None ->
               error at
@@ -3325,8 +4123,71 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                  with a mutable field"
         in
         let* typ = Datatypes.typ types ~at (List.last_exn param_types) in
-        Ok (anchor, (view_field p.pred_name.pid_str, typ)))
+        Ok (anchor, (view_field p.pred_name.pid_str, typ, None)))
   in
+  (* The structures with a state, and their histories, allocated empty. *)
+  let actions =
+    List.filter_map source.proof ~f:(function
+      | Proof_action { action_name; action_state; action_update } ->
+          Some
+            ( action_name.pid_str,
+              action_state.pid_str,
+              List.map action_update ~f:(fun (f, t) -> (f.S.pid_str, t)) )
+      | _ -> None)
+  in
+  let* structures =
+    all
+      (List.filter_map predicates ~f:(fun (at, p, def, param_types) ->
+           match def with
+           | Invariant { state; fields; body } ->
+               Some (at, p, state, fields, body, param_types)
+           | Body _ | View _ -> None))
+      ~f:(fun (at, (p : S.predicate), state, fields, body, param_types) ->
+        let* fields =
+          all fields ~f:(fun (sf : S.state_field) ->
+              let* t = Source.ocaml_type ocaml_env ~at sf.sf_type in
+              let* typ = Datatypes.typ types ~at t in
+              Ok
+                (sf.sf_name.pid_str, state ^ "_" ^ sf.sf_name.pid_str, typ, t, sf.sf_grows))
+        in
+        let chains =
+          List.dedup_and_sort ~compare:String.compare
+            (List.filter_map (conjuncts body) ~f:(fun t ->
+                 Option.map (chain_of ~state t) ~f:(fun (_, _, field, _) -> field)))
+        in
+        Ok
+          {
+            invariant = p.pred_name.pid_str;
+            state;
+            fields;
+            chains = List.map chains ~f:(fun f -> (f, state ^ "_" ^ f ^ "_index"));
+            actions;
+            structure_type = List.hd_exn param_types;
+            views = List.map views ~f:(fun (p, value, _) -> (p, value));
+            at;
+          })
+  in
+  let* structure_member_lists =
+    all structures ~f:(fun st -> structure_members types st ~at:st.at)
+  in
+  let history_fields =
+    List.filter_map structures ~f:(fun st ->
+        Option.some_if (has_history st)
+          (let l = R.Loc.none in
+           let qn m x = R.Name.make ~loc:l ~path:[ m ] x in
+           ( Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst,
+             ( member_name st "history",
+               R.Type.named ~loc:l (R.Name.make ~loc:l (module_name st "history")) [],
+               Some
+                 (R.Expr.call ~loc:l
+                    (qn (module_name st "history") "full")
+                    [
+                      R.Expr.call ~loc:l
+                        (qn (module_name st "states") "set")
+                        [ R.Expr.set ~loc:l [] ];
+                    ]) ) )))
+  in
+  let view_fields = view_fields @ history_fields in
   let shared =
     {
       persistent =
@@ -3337,6 +4198,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       views =
         List.map views ~f:(fun (p, _, _) ->
             (p.pred_name.pid_str, view_field p.pred_name.pid_str));
+      structures;
       anchors =
         List.map
           (List.dedup_and_sort (List.map view_fields ~f:fst) ~compare:String.compare)
@@ -3351,7 +4213,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
           ~at
           ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
-          p def param_types)
+          ~structures p def param_types)
   in
   let* pure_funcs =
     all pure
@@ -3371,12 +4233,14 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let start = R.Loc.make file_start file_start in
   let ref_fields = List.map !refs ~f:snd in
   let ghost_fields =
-    List.map view_fields ~f:(fun (_, (field, typ)) ->
-        R.Member.field ~loc:start ~ghost:true (ident ~loc:start field) typ)
+    List.filter_map view_fields ~f:(fun (_, (field, typ, init)) ->
+        Option.some_if (Option.is_none init)
+          (R.Member.field ~loc:start ~ghost:true (ident ~loc:start field) typ))
   in
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ record_fields @ ref_fields @ ghost_fields
-       @ List.map !primitives ~f:snd
+        @ List.concat structure_member_lists
+        @ List.map !primitives ~f:snd
         @ List.map (pred_members @ pure_funcs @ procs) ~f:R.Member.callable),
       !origins )

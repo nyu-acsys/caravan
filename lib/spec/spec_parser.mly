@@ -57,6 +57,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
+%token ACTION INITIALLY PERFORMS
 
 (* Keywords *)
 
@@ -101,6 +102,7 @@
 %start <Spec_ast.proof_decl list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
+%start <(Spec_ast.id * Spec_ast.term) list> initially
 %%
 
 contract:
@@ -143,10 +145,13 @@ proof_decl:
                         inv_state = List.hd ps; inv_body = t } }
 | VIEW n = lident ps = pred_param+ EQUAL t = term
     { Proof_view { view_name = n; view_params = ps; view_value = t } }
+| ACTION n = lident EQUAL LEFTBRC s = lident WITH fs = semicolon_list1(field_value) RIGHTBRC
+    { Proof_action { action_name = n; action_state = s; action_update = fs } }
 ;
 
 state_field:
-| x = lident COLON t = typ { (x, t) }
+| x = lident COLON t = typ a = ATTRIBUTE?
+    { { sf_name = x; sf_type = t; sf_grows = (a = Some "grows") } }
 ;
 
 pred_param:
@@ -156,6 +161,15 @@ pred_param:
 linearization:
 | COMMIT EOF { Commit }
 | RETURNING p = mpat ARROW COMMIT EOF { Returning p }
+| PERFORMS a = lident EOF { Performs a }
+;
+
+initially:
+| INITIALLY LEFTBRC fs = semicolon_list1(field_value) RIGHTBRC EOF { fs }
+;
+
+field_value:
+| x = lident EQUAL t = term { (x, t) }
 ;
 
 ghost_stmts:
@@ -382,6 +396,8 @@ term_sub_:
     { t }
 | t = term_dot DOT q = lqualid_rich
     { Tfield (t, q) }
+| t = term_dot DOT LEFTPAR i = term RIGHTPAR
+    { mk_op_apply (mk_pid ~fixity:Mixfix "([])" $loc) [t; i] }
 | LEFTPAR l = comma_list2(term) RIGHTPAR                { Ttuple l }
 ;
 
