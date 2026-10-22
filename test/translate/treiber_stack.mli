@@ -8,6 +8,10 @@ val create : unit -> t
 (*@ t = create ()
     ensures stack t [] *)
 
+val of_list : int list -> t
+(*@ t = of_list xs
+    ensures stack t xs *)
+
 val is_empty : t -> bool
 (*@ b = atomic is_empty t
     atomic requires stack t xs

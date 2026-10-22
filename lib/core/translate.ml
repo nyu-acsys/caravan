@@ -4839,6 +4839,78 @@ let entry_of_args types (f : func) (names : string option list) (element : S.ter
       end
   | _ -> fun _ -> None
 
+(** [funcs], where a function without a contract that a wrapper calls with its own
+    parameters first, as [push t value Backoff.default] in [let push t value = ...], has
+    the wrapper's contract, and its other parameters are free; it continues the wrapper's
+    atomic update. *)
+let inherit_contracts (funcs : func list) =
+  let param_ids (f : func) =
+    Option.all
+      (List.map f.params ~f:(fun p ->
+           match p.fp_kind with
+           | Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } -> Some id
+           | _ -> None))
+  in
+  (* The wrapper of [f], with its contract. *)
+  let wrapper (f : func) =
+    List.find_map funcs ~f:(fun g ->
+        match (g.contract, g.body.exp_desc, param_ids g) with
+        | ( Some contract,
+            Texp_apply ({ exp_desc = Texp_ident (Pident callee, _, _); _ }, args),
+            Some params )
+          when Ident.same callee f.id && List.length params <= List.length f.params ->
+            let passed =
+              List.map
+                (List.take args (List.length params))
+                ~f:(fun (_, arg) ->
+                  match arg with
+                  | Typedtree.Arg { exp_desc = Texp_ident (Pident x, _, _); _ } -> Some x
+                  | _ -> None)
+            in
+            Option.some_if
+              (List.length passed = List.length params
+              && List.for_all2_exn passed params ~f:(fun x p ->
+                  Option.exists x ~f:(Ident.same p)))
+              (g, contract, List.length params)
+        | _ -> None)
+  in
+  List.map funcs ~f:(fun f ->
+      match (f.contract, wrapper f) with
+      | None, Some (g, (contract : S.contract), k) ->
+          let own_names =
+            List.map (List.drop f.params k) ~f:(fun p ->
+                match p.fp_kind with
+                | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_loc; _ } ->
+                    S.Lvar (S.mk_id ~loc:pat_loc (Ident.name id))
+                | _ -> S.Lwild)
+          in
+          let wrapper_names =
+            match contract.header with
+            | Some h ->
+                List.filter h.hd_args ~f:(function S.Lghost _ -> false | _ -> true)
+            | None ->
+                List.map (List.take f.params k) ~f:(fun p ->
+                    match p.fp_kind with
+                    | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_loc; _ } ->
+                        S.Lvar (S.mk_id ~loc:pat_loc (Ident.name id))
+                    | _ -> S.Lwild)
+          in
+          let header =
+            {
+              S.hd_name = S.mk_id ~loc:f.loc (Ident.name f.id);
+              hd_ret =
+                Option.value_map contract.header ~default:[ S.Lwild ] ~f:(fun h ->
+                    h.hd_ret);
+              hd_args = wrapper_names @ own_names;
+            }
+          in
+          {
+            f with
+            contract = Some { contract with header = Some header };
+            role = Some (Ident.name g.id);
+          }
+      | _ -> f)
+
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
 let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
@@ -4885,6 +4957,28 @@ let items ?(interface = []) (structure : Typedtree.structure)
     List.map (List.drop items 1) ~f:(fun (i : Typedtree.structure_item) -> Some i.str_loc)
     @ [ None ]
   in
+  (* A definition that a later one of the same name shadows is named apart, and the
+     interface's contract is the last one's. *)
+  let defined =
+    List.concat_map items ~f:(fun (i : Typedtree.structure_item) ->
+        match i.str_desc with
+        | Tstr_value (_, bindings) ->
+            List.filter_map bindings ~f:(fun (vb : Typedtree.value_binding) ->
+                match vb.vb_pat.pat_desc with Tpat_var (id, _, _) -> Some id | _ -> None)
+        | _ -> [])
+  in
+  let shadowed id =
+    let rec after = function
+      | [] -> []
+      | x :: rest -> if Ident.same x id then rest else after rest
+    in
+    List.exists (after defined) ~f:(fun x -> String.equal (Ident.name x) (Ident.name id))
+  in
+  let earlier id =
+    List.count
+      (List.take_while defined ~f:(fun x -> not (Ident.same x id)))
+      ~f:(fun x -> String.equal (Ident.name x) (Ident.name id))
+  in
   let item ((item : Typedtree.structure_item), next) =
     match item.str_desc with
     | Tstr_type (_, decls) ->
@@ -4901,7 +4995,9 @@ let items ?(interface = []) (structure : Typedtree.structure)
                   let* contract =
                     match
                       ( contract,
-                        List.Assoc.find interface (Ident.name id) ~equal:String.equal )
+                        if shadowed id then None
+                        else List.Assoc.find interface (Ident.name id) ~equal:String.equal
+                      )
                     with
                     | Some _, Some (_, at) ->
                         error vb.vb_loc
@@ -4915,7 +5011,10 @@ let items ?(interface = []) (structure : Typedtree.structure)
                   Ok
                     {
                       id;
-                      raven_name = Ident.name id;
+                      raven_name =
+                        (if shadowed id then
+                           Printf.sprintf "%s_%d" (Ident.name id) (earlier id + 1)
+                         else Ident.name id);
                       params;
                       body;
                       loc = vb.vb_loc;
@@ -6274,7 +6373,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* types, funcs = items ~interface source.typed annotations in
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
-  let funcs = funcs @ List.concat lifted in
+  let funcs = inherit_contracts (funcs @ List.concat lifted) in
   (* The abstract types of the libraries. *)
   let* library_types =
     all source.libraries ~f:(fun (lib : Source.library) ->
