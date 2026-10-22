@@ -1,0 +1,24 @@
+predicate held (b : box) = exists n : int. own b.value n
+
+lemma roundtrip (b : box)
+  requires (held b)
+  ensures (held b) =
+  let value = unfold held b {n} in
+  fold held b {n = value}
+
+
+predicate marked (b : box) =
+  exists n : int, marker : bool. own b.value n && marker
+
+lemma reordered (b : box)
+  requires (marked b)
+  ensures (marked b) =
+  let (flag, value) = unfold marked b {marker; n} in
+  assert flag;
+  fold marked b {n = value; marker = flag}
+
+lemma annotated (b : box)
+  requires (held b)
+  ensures (held b) =
+  let (value : int) = unfold held b {n} in
+  fold held b {n = value}

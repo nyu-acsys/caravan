@@ -1,0 +1,2 @@
+lemma first (n : int) ensures (false) = second n
+lemma second (n : int) ensures (false) = first n

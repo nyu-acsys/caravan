@@ -1,0 +1,21 @@
+type edge = Edge of int * int
+
+lemma set_union (a : int finset) (b : int finset) (x : int)
+  requires (Finset.mem x a)
+  ensures (Finset.mem x (Finset.union a b)) = ()
+
+lemma singleton_edge (x : int) (y : int)
+  ensures (Finset.mem (Edge (x, y)) (Finset.singleton (Edge (x, y)))) = ()
+
+lemma map_update (m : (int, int) map) (k : int) (v : int)
+  ensures (Map.get (Map.set m k v) k = v) = ()
+
+lemma constant_map (k : int) (v : int)
+  ensures (Map.get (Map.const v : (int, int) map) k = v) = ()
+
+lemma set_difference (s : int set) (x : int)
+  ensures (not (Set.mem x (Set.diff s (Set.singleton x)))) = ()
+
+lemma choose_member (s : int finset)
+  requires (s <> Finset.empty)
+  ensures (Finset.mem (Finset.choose s) s) = ()

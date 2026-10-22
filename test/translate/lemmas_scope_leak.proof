@@ -1,0 +1,3 @@
+lemma scope_leak =
+  let () = begin let hidden = 1 in () end in
+  hidden

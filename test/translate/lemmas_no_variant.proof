@@ -1,0 +1,1 @@
+lemma loop (n : int) = loop n

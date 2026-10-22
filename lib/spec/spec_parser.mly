@@ -18,6 +18,25 @@
   let mk_pid pid ?(fixity = Normal) l = mk_id pid ~fixity ~attrs:[] ~loc:(mk_loc l)
   let mk_term d l = { term_desc = d; term_loc = mk_loc l }
   let mk_pat p l = { pat_desc = p; pat_loc = mk_loc l }
+  let mk_proof d l = { proof_desc = d; proof_loc = mk_loc l }
+
+  let proof_value t = { proof_desc = Proof_value t; proof_loc = t.term_loc }
+
+  let rec term_of_proof e =
+    match e.proof_desc with
+    | Proof_value t -> t
+    | Proof_let (p, a, b) ->
+        { term_desc = Tlet (p, term_of_proof a, term_of_proof b); term_loc = e.proof_loc }
+    | Proof_if (c, a, b) ->
+        { term_desc = Tif (c, term_of_proof a, term_of_proof b); term_loc = e.proof_loc }
+    | Proof_match (t, cases) ->
+        { term_desc = Tmatch (t, List.map (fun (p, body) -> p, term_of_proof body) cases);
+          term_loc = e.proof_loc }
+    | Proof_seq _ | Proof_assert _ | Proof_fold _ | Proof_unfold _ ->
+        raise (Syntax_error (e.proof_loc,
+          "A proof operation cannot occur in a logical expression"))
+
+  let proof_term desc loc = proof_value (mk_term desc loc)
 
 
   let add_clause c (keyword, t) =
@@ -59,6 +78,7 @@
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS
+%token LEMMA RETURNS OF BEGIN END
 
 (* Keywords *)
 
@@ -77,6 +97,8 @@
 
 %nonassoc below_BAR
 %left BAR
+%nonassoc below_SEMICOLON
+%right SEMICOLON
 %nonassoc IN
 %nonassoc DOT ELSE
 %nonassoc prec_named
@@ -138,8 +160,26 @@ proof:
 
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
+| LEMMA n = lident ps = pred_param* rs = lemma_returns?
+    cs = lemma_clause* EQUAL body = proof_expr
+    { let requires, ensures, variant =
+        List.fold_left
+          (fun (requires, ensures, variant) -> function
+            | `Requires t -> (t :: requires, ensures, variant)
+            | `Ensures t -> (requires, t :: ensures, variant)
+            | `Variant t -> (requires, ensures, t :: variant))
+          ([], [], []) cs
+      in
+      Proof_lemma {
+        lemma_name = n; lemma_params = ps;
+        lemma_returns = (match rs with None -> [] | Some rs -> rs);
+        lemma_requires = List.rev requires; lemma_ensures = List.rev ensures;
+        lemma_variant = List.rev variant; lemma_body = body;
+      } }
 | TYPE n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
     { Proof_state { state_name = n; state_fields = fs } }
+| TYPE n = lident EQUAL cs = bar_list1(type_ctor)
+    { Proof_type { type_name = n; type_ctors = cs } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
@@ -155,6 +195,21 @@ proof_decl:
       Proof_action { action_name = n; action_params = ps; action_step = step;
                      action_consumes = consumes; action_state = s; action_update = fs;
                      action_linearizes = ls; action_helps = h } }
+;
+
+type_ctor:
+| c = uident args = preceded(OF, separated_nonempty_list(STAR, ty_arg))?
+    { (c, match args with None -> [] | Some args -> args) }
+;
+
+lemma_returns:
+| RETURNS rs = pred_param+ { rs }
+;
+
+lemma_clause:
+| REQUIRES LEFTPAR t = term RIGHTPAR { `Requires t }
+| ENSURES LEFTPAR t = term RIGHTPAR { `Ensures t }
+| VARIANT LEFTPAR t = term RIGHTPAR { `Variant t }
 ;
 
 helps:
@@ -211,9 +266,115 @@ ghost_stmts:
 ;
 
 ghost_stmt:
-| FOLD t = term { Fold t }
-| UNFOLD t = term { Unfold t }
+| FOLD t = term ws = ghost_witnesses?
+    { match ws with None -> Fold t | Some ws -> Fold_with (t, ws) }
+| UNFOLD t = term ws = ghost_witnesses?
+    { match ws with None -> Unfold t | Some ws -> Unfold_with (t, ws) }
 | ASSERT t = term { Assert t }
+| LEMMA t = term { Ghost_call t }
+;
+
+proof_expr:
+| e = proof_nonseq %prec below_SEMICOLON { e }
+| a = proof_nonseq SEMICOLON b = proof_expr { mk_proof (Proof_seq (a, b)) $loc }
+;
+
+proof_nonseq:
+| LET p = pat EQUAL value = proof_expr IN body = proof_expr
+    { mk_proof (Proof_let (p, value, body)) $loc }
+| IF c = proof_value_expr THEN yes = proof_nonseq ELSE no = proof_nonseq
+    { mk_proof (Proof_if (term_of_proof c, yes, no)) $loc }
+| MATCH t = proof_value_expr WITH ioption(BAR) cases = proof_cases
+    { mk_proof (Proof_match (term_of_proof t, cases)) $loc }
+| ASSERT t = proof_value_expr
+    { mk_proof (Proof_assert (term_of_proof t)) $loc }
+| FOLD t = proof_value_expr ws = fold_witnesses?
+    { mk_proof (Proof_fold (term_of_proof t,
+        match ws with None -> [] | Some ws -> ws)) $loc }
+| UNFOLD t = proof_value_expr names = unfold_names?
+    { mk_proof (Proof_unfold (term_of_proof t,
+        match names with None -> [] | Some names -> names)) $loc }
+| BEGIN e = proof_expr END { { e with proof_loc = mk_loc $loc } }
+| e = proof_value_expr { e }
+;
+
+proof_value_expr:
+| e = proof_app { e }
+| OLD e = proof_value_expr { proof_term (Told (term_of_proof e)) $loc }
+| op = prefix_op e = proof_value_expr %prec prec_prefix_op
+    { proof_term (mk_op_apply op [term_of_proof e]) $loc }
+| l = proof_value_expr o = infix_op_1 r = proof_value_expr
+    { proof_term (Tinfix (term_of_proof l, o, term_of_proof r)) $loc }
+| l = proof_value_expr o = infix_op_234 r = proof_value_expr
+    { proof_term (mk_op_apply o [term_of_proof l; term_of_proof r]) $loc }
+| l = proof_value_expr COLONCOLON r = proof_value_expr
+    { proof_term (mk_op_apply (mk_pid ~fixity:Mixfix "::" $loc)
+        [term_of_proof l; term_of_proof r]) $loc }
+| l = proof_value_expr o = BACKQUOTE_LIDENT r = proof_value_expr
+    { proof_term (mk_op_apply (mk_pid o $loc) [term_of_proof l; term_of_proof r]) $loc }
+| q = quant l = comma_list1(quant_vars) DOT t = proof_value_expr
+    { proof_term (Tquant (q, List.concat l, term_of_proof t)) $loc }
+| a = attr t = proof_value_expr %prec prec_named
+    { proof_term (Tattr (a, term_of_proof t)) $loc }
+;
+
+proof_app:
+| e = proof_postfix { e }
+| f = proof_app arg = proof_postfix
+    { proof_term (Tapply (term_of_proof f, term_of_proof arg)) $loc }
+;
+
+proof_postfix:
+| e = proof_value_atom { e }
+| f = proof_postfix DOT q = lqualid_rich
+    { proof_term (Tfield (term_of_proof f, q)) $loc }
+| f = proof_postfix DOT LEFTPAR i = proof_expr RIGHTPAR
+    { proof_term (mk_op_apply (mk_pid ~fixity:Mixfix "([])" $loc)
+        [term_of_proof f; term_of_proof i]) $loc }
+;
+
+proof_value_atom:
+| NOT { proof_term (Tvar (Qid (mk_pid "not" $loc))) $loc }
+| q = lqualid { proof_term (Tvar q) $loc }
+| q = uqualid %prec below_BAR { proof_term (Tvar q) $loc }
+| c = constant { proof_term (Tconst c) $loc }
+| TRUE { proof_term Ttrue $loc }
+| FALSE { proof_term Tfalse $loc }
+| LEFTPAR RIGHTPAR { proof_term (Ttuple []) $loc }
+| LEFTPAR e = proof_expr RIGHTPAR { { e with proof_loc = mk_loc $loc } }
+| LEFTPAR e = proof_value_expr COLON ty = typ RIGHTPAR
+    { proof_term (Tcast (term_of_proof e, ty)) $loc }
+| LEFTPAR first = proof_nonseq COMMA rest = comma_list1(proof_nonseq) RIGHTPAR
+    { proof_term (Ttuple (List.map term_of_proof (first :: rest))) $loc }
+| LEFTSQRIGHTSQ { proof_term (Tvar (Qid (mk_pid "[]" $loc))) $loc }
+| LEFTSQ ts = semicolon_list1(proof_nonseq) RIGHTSQ
+    { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($3)))) $loc($3) in
+      let cons e l =
+        let t = term_of_proof e in
+        mk_term (mk_op_apply (mk_id ~fixity:Mixfix ~loc:t.term_loc "::") [ t; l ]) $loc
+      in
+      proof_value (List.fold_right cons ts nil) }
+;
+
+proof_cases:
+| c = proof_case %prec below_BAR { [c] }
+| c = proof_case BAR cs = proof_cases { c :: cs }
+;
+
+proof_case:
+| p = mpat ARROW e = proof_expr { (p, e) }
+;
+
+fold_witnesses:
+| LEFTBRC ws = semicolon_list1(field_value) RIGHTBRC { ws }
+;
+
+unfold_names:
+| LEFTBRC names = semicolon_list1(lident) RIGHTBRC { names }
+;
+
+ghost_witnesses:
+| WITH LEFTBRC ws = semicolon_list1(field_value) RIGHTBRC { ws }
 ;
 
 loop_clause:
@@ -373,6 +534,7 @@ pat_arg:
 pat_arg_:
 | UNDERSCORE { Pwild }
 | v=lident { Pid v }
+| LEFTPAR RIGHTPAR { Ptuple [] }
 | LEFTPAR p=pat_ RIGHTPAR { p }
 
 pat:
@@ -381,7 +543,7 @@ pat:
 pat_:
 | p=pat_arg_ { p }
 | l=comma_list2(pat_arg) { Ptuple l }
-| p=pat_arg t=cast { Pcast (p, t) }
+| p=pat_arg COLON t=typ { Pcast (p, t) }
 
 quant_vars:
 | l = binder_var+ ty = cast? { List.map (fun id -> id, ty) l }

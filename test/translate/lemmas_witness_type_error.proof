@@ -1,0 +1,5 @@
+predicate held (b : box) = exists n : int. own b.value n
+
+lemma witness (b : box)
+  requires (held b) =
+  let (value : bool) = unfold held b {n} in ()

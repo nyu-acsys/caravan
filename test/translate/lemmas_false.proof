@@ -1,0 +1,1 @@
+lemma false_claim = assert (false)

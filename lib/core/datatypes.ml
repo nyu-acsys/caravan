@@ -23,6 +23,7 @@ type ctor = {
 }
 
 type field = { label : string; raven_field : string; typ : Types.type_expr }
+type collection_kind = Sequence | FinSet | Set | Map
 
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
@@ -30,6 +31,7 @@ type t = {
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
+  collection : collection_kind option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
@@ -47,6 +49,7 @@ let list =
       ];
     heap = None;
     alias = None;
+    collection = None;
     library = None;
     at = Location.none;
   }
@@ -62,6 +65,7 @@ let option =
       ];
     heap = None;
     alias = None;
+    collection = None;
     library = None;
     at = Location.none;
   }
@@ -92,6 +96,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors;
           heap = None;
           alias = None;
+          collection = None;
           library = None;
           at;
         }
@@ -130,6 +135,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors;
           heap;
           alias = None;
+          collection = None;
           library = None;
           at;
         }
@@ -142,6 +148,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors = [];
           heap = None;
           alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
+          collection = None;
           library = None;
           at;
         }
@@ -164,29 +171,42 @@ let library_type ~library ~library_id ~at name =
     ctors = [];
     heap = None;
     alias = None;
+    collection = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
   }
 
-(** The type ['a sequence] of specifications, declared as [id]: Raven's [Seq]. *)
-let sequence id =
+(** A specification-only collection, declared as [id]. *)
+let collection id kind =
+  let module_name =
+    match kind with Sequence -> "Seq" | FinSet -> "FinSet" | Set -> "Set" | Map -> "Map"
+  in
   {
     id = Some id;
-    module_name = "Seq";
+    module_name;
     ctors = [];
     heap = None;
     alias = None;
+    collection = Some kind;
     library = None;
     at = Location.none;
   }
 
-let is_sequence (d : t) = String.equal d.module_name "Seq" && List.is_empty d.ctors
+let sequence id = collection id Sequence
+let is_sequence (d : t) = match d.collection with Some Sequence -> true | _ -> false
 
 (** The data type of the type constructor [p]: one of [types], a list or an option. *)
 let find (types : t list) (p : Path.t) =
   if Path.same p Predef.path_list then Some list
   else if Path.same p Predef.path_option then Some option
   else List.find types ~f:(fun d -> declares d p)
+
+let collection_kind types p = Option.bind (find types p) ~f:(fun d -> d.collection)
+
+let is_collection types p kind =
+  match (kind, collection_kind types p) with
+  | Sequence, Some Sequence | FinSet, Some FinSet | Set, Some Set | Map, Some Map -> true
+  | _ -> false
 
 (** [t] with the abbreviations of [types] at its head expanded, and without the quantifier
     of a record label's type, which is not polymorphic here. *)
@@ -253,6 +273,16 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
       let* elt = typ types ?self ~at elt in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
+  | Tconstr (p, [ elt ], _) when is_collection types p FinSet ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.fin_set ~loc:l elt)
+  | Tconstr (p, [ elt ], _) when is_collection types p Set ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.set ~loc:l elt)
+  | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
+      let* key = typ types ?self ~at key in
+      let* value = typ types ?self ~at value in
+      Ok (R.Type.map ~loc:l key value)
   | Tconstr (p, [], _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
       Ok (R.Type.ref ~loc:l)
@@ -284,6 +314,10 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
   | Tconstr (p, [ elt ], _) when is_atomic p -> tag types elt ^ "Atomic"
   | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
       tag types elt ^ "Seq"
+  | Tconstr (p, [ elt ], _) when is_collection types p FinSet -> tag types elt ^ "FinSet"
+  | Tconstr (p, [ elt ], _) when is_collection types p Set -> tag types elt ^ "Set"
+  | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
+      tag types key ^ "To" ^ tag types value ^ "Map"
   | Tconstr (p, [], _) when Option.is_some (find types p) ->
       (Option.value_exn (find types p)).module_name
   | Ttuple components ->

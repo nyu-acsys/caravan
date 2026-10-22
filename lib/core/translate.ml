@@ -368,6 +368,12 @@ type position = {
 (** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
     index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
 
+type lemma_signature = {
+  lemma_raven : string;
+  lemma_inputs : Types.type_expr list;
+  lemma_outputs : Types.type_expr list;
+}
+
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Member.t) list ref;
@@ -404,6 +410,9 @@ type context = {
           or that it continues too, takes the first. *)
   origins : origin list ref;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
+  proof_lemmas : (string * lemma_signature) list;
+  predicate_bodies : (string * S.term) list;
+      (** Explicit predicate bodies, for the types of named unfold witnesses. *)
   spec_funcs : (string * string) list;
       (** The functions contracts can call, by their OCaml names, with their Raven ones.
       *)
@@ -689,6 +698,15 @@ let list_function : S.qualid -> string option = function
   | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "mem"; _ }) -> Some "in"
   | _ -> None
 
+(** Logical collections have no runtime module or OCaml representation. *)
+let collection_builtin env (q : S.qualid) =
+  match q with
+  | Qdot (Qid m, f)
+    when List.mem [ "Finset"; "Set"; "Map" ] m.pid_str ~equal:String.equal
+         && not (List.Assoc.mem env.funcs (qualid_key q) ~equal:String.equal) ->
+      Some (m.pid_str, f.pid_str)
+  | _ -> None
+
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
 *)
 let owned_location (t : S.term) =
@@ -718,15 +736,16 @@ let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
       end
   | n, _ -> error at (Printf.sprintf "This constructor expects %d arguments" n)
 
+(** The variables bound by a specification pattern. *)
+let rec pat_names (p : S.pat) =
+  match p.pat_desc with
+  | Pwild | Pconst _ | Pconstr (_, None) -> []
+  | Pid id -> [ id.pid_str ]
+  | Ptuple ps -> List.concat_map ps ~f:pat_names
+  | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+
 (** The names that the contract term [t] uses free. *)
 let rec term_names (t : S.term) : string list =
-  let rec pat_names (p : S.pat) =
-    match p.pat_desc with
-    | Pwild | Pconst _ | Pconstr (_, None) -> []
-    | Pid id -> [ id.pid_str ]
-    | Ptuple ps -> List.concat_map ps ~f:pat_names
-    | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
-  in
   let without bound names =
     List.filter names ~f:(fun x -> not (List.mem bound x ~equal:String.equal))
   in
@@ -863,6 +882,8 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       | None, "min_int" -> Ok (R.Expr.int ~loc:l Prelude.min_int)
       | None, _ -> error at (Printf.sprintf "Unbound name %s" x)
       end
+  | Tvar q when Option.is_some (collection_builtin env q) ->
+      collection_application env ~at (Option.value_exn (collection_builtin env q)) []
   | Tvar (Qdot _) -> unsupported at "A qualified name"
   | Tinfix _ -> formula env (S.chain t)
   | Tapply _ -> application env t
@@ -915,7 +936,12 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
         | _ -> None
       in
       spec_match env ~at ?scrutinee_type v cases
-  | Tattr (_, t) | Tcast (t, _) -> formula env t
+  | Tattr (_, t) -> formula env t
+  | Tcast (t, ty) ->
+      let* ty = Source.ocaml_type env.ctx.env ~at ty in
+      let* raven_type = typ env.ctx ~at ty in
+      let* value = expected_formula env (Some ty) t in
+      Ok (R.Expr.annotated value raven_type)
   | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
     when Option.is_some (state_fields env x) ->
       begin match
@@ -948,6 +974,26 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
 
 (** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
     as [[]] in [queue q []]. *)
+and collection_application env ~at (module_name, function_name) args =
+  let l = loc at in
+  let* args = all args ~f:(fun t -> formula env t) in
+  match (module_name, function_name, args) with
+  | ("Finset" | "Set"), "empty", [] -> Ok (R.Expr.set ~loc:l [])
+  | ("Finset" | "Set"), "singleton", [ x ] -> Ok (R.Expr.set ~loc:l [ x ])
+  | ("Finset" | "Set"), "mem", [ x; s ] -> Ok (R.Expr.binary ~loc:l In x s)
+  | ("Finset" | "Set"), "union", [ a; b ] -> Ok (R.Expr.binary ~loc:l Union a b)
+  | ("Finset" | "Set"), "inter", [ a; b ] -> Ok (R.Expr.binary ~loc:l Inter a b)
+  | ("Finset" | "Set"), "diff", [ a; b ] -> Ok (R.Expr.binary ~loc:l Diff a b)
+  | ("Finset" | "Set"), "subset", [ a; b ] -> Ok (R.Expr.binary ~loc:l Subseteq a b)
+  | "Finset", "choose", [ s ] -> Ok (R.Expr.call ~loc:l (name ~loc:l "choose") [ s ])
+  | "Map", "const", [ v ] -> Ok (R.Expr.map_literal ~loc:l [] v)
+  | "Map", "get", [ m; k ] -> Ok (R.Expr.index ~loc:l m k)
+  | "Map", "set", [ m; k; v ] -> Ok (R.Expr.update ~loc:l m k v)
+  | _ ->
+      error at
+        (Printf.sprintf "Unknown logical collection operation or wrong arity: %s.%s"
+           module_name function_name)
+
 and expected_formula env (expected : Types.type_expr option) (t : S.term) =
   let literal = list_literal in
   let is_sequence ty =
@@ -1002,6 +1048,8 @@ and application env (t : S.term) =
   let l = loc at in
   let head, args = spine t [] in
   match (head.term_desc, args) with
+  | Tvar q, args when Option.is_some (collection_builtin env q) ->
+      collection_application env ~at (Option.value_exn (collection_builtin env q)) args
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.not_ ~loc:l a)
@@ -1364,32 +1412,471 @@ let scope_env ctx =
     vars = List.map scope ~f:(fun (x, (raven, _)) -> (x, Raven raven));
   }
 
-(** The ghost statements in the annotations between the positions [after] and [before], as
-    [e1; (*@ unfold p x *) e2]. *)
+(** A call of a checked proof lemma, separate from logical function applications. *)
+let lemma_call env (t : S.term) =
+  let head, args = spine t [] in
+  match head.term_desc with
+  | Tvar (Qid id) ->
+      begin match List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal with
+      | None -> error id.pid_loc (Printf.sprintf "Unknown lemma %s" id.pid_str)
+      | Some signature ->
+          if List.length args <> List.length signature.lemma_inputs then
+            error t.term_loc
+              (Printf.sprintf "Lemma %s expects %d arguments" id.pid_str
+                 (List.length signature.lemma_inputs))
+          else
+            let* args =
+              all (List.zip_exn signature.lemma_inputs args) ~f:(fun (ty, arg) ->
+                  expected_formula env (Some ty) arg)
+            in
+            Ok
+              ( R.Expr.call ~loc:(loc t.term_loc)
+                  (name ~loc:(loc t.term_loc) signature.lemma_raven)
+                  args,
+                signature.lemma_outputs )
+      end
+  | _ -> error t.term_loc "Expected a lemma applied to its arguments"
+
+let predicate_use env ~unfold t witnesses make =
+  let head, args = spine t [] in
+  match head.term_desc with
+  | Tvar (Qid { pid_str = p; _ }) when List.Assoc.mem env.ctx.preds p ~equal:String.equal
+    ->
+      let raven, _ = List.Assoc.find_exn env.ctx.preds p ~equal:String.equal in
+      let* args = all args ~f:(formula env) in
+      let* witnesses =
+        all witnesses ~f:(fun (id, t) ->
+            if unfold then
+              match
+                (List.Assoc.find env.vars id.S.pid_str ~equal:String.equal, t.S.term_desc)
+              with
+              | Some (Raven target), Tvar (Qid existential) ->
+                  Ok
+                    ( ident ~loc:(loc id.pid_loc) target,
+                      R.Expr.var ~loc:(loc existential.pid_loc)
+                        (name ~loc:(loc existential.pid_loc) existential.pid_str) )
+              | None, _ ->
+                  error id.pid_loc (Printf.sprintf "Unbound proof variable %s" id.pid_str)
+              | _ -> error t.term_loc "An unfold binding names an existential variable"
+            else
+              let* value = formula env t in
+              Ok (ident ~loc:(loc id.pid_loc) id.pid_str, value))
+      in
+      let l = loc t.S.term_loc in
+      Ok (make ~loc:l ?witnesses:(Some witnesses) (name ~loc:l raven) args)
+  | _ -> error t.term_loc "Expected a predicate applied to its arguments"
+
+(** Ghost annotations invoke checked proof operations. *)
+let proof_statement env = function
+  | S.Fold t -> predicate_use env ~unfold:false t [] R.Stmt.fold
+  | Unfold t -> predicate_use env ~unfold:true t [] R.Stmt.unfold
+  | Fold_with (t, ws) -> predicate_use env ~unfold:false t ws R.Stmt.fold
+  | Unfold_with (t, ws) -> predicate_use env ~unfold:true t ws R.Stmt.unfold
+  | Assert t ->
+      let* value = formula env t in
+      Ok (R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make value))
+  | Ghost_call t ->
+      let* call, outputs = lemma_call env t in
+      if not (List.is_empty outputs) then
+        error t.term_loc "Bind all the results of this lemma"
+      else Ok (R.Stmt.call ~loc:(loc t.term_loc) call)
+
+type proof_target = { target_name : string; target_type : Types.type_expr }
+
+let proof_signature env (t : S.term) =
+  let head, _ = spine t [] in
+  match head.term_desc with
+  | Tvar (Qid id) when not (List.Assoc.mem env.vars id.pid_str ~equal:String.equal) ->
+      List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal
+  | _ -> None
+
+(** Type information for lexical bindings; annotations resolve logical operations whose
+    OCaml result type is not available. Raven checks every generated assignment. *)
+let rec proof_value_types env (t : S.term) =
+  match proof_signature env t with
+  | Some signature -> Ok (List.map signature.lemma_outputs ~f:Option.some)
+  | None ->
+      begin match t.term_desc with
+      | Ttuple ts ->
+          let* ts = all ts ~f:(proof_value_type env) in
+          Ok ts
+      | _ ->
+          let* ty = proof_value_type env t in
+          Ok [ ty ]
+      end
+
+and proof_value_type env (t : S.term) =
+  match t.term_desc with
+  | Tcast (_, ty) ->
+      let* ty = Source.ocaml_type env.ctx.env ~at:t.term_loc ty in
+      Ok (Some ty)
+  | Tconst (Pconst_integer _) -> Ok (Some Predef.type_int)
+  | Ttrue | Tfalse -> Ok (Some Predef.type_bool)
+  | Tapply ({ term_desc = Tvar (Qid { pid_str = "Some"; _ }); _ }, value) ->
+      let* ty = proof_value_type env value in
+      Ok (Option.map ty ~f:(fun ty -> Ctype.newconstr Predef.path_option [ ty ]))
+  | Ttuple ts ->
+      let* ts = all ts ~f:(proof_value_type env) in
+      Ok
+        (Option.map (Option.all ts) ~f:(fun ts ->
+             Btype.newgenty (Ttuple (List.map ts ~f:(fun ty -> (None, ty))))))
+  | _ -> Ok (term_type env t)
+
+let proof_pattern_parts (p : S.pat) = match p.pat_desc with Ptuple ps -> ps | _ -> [ p ]
+
+let proof_binding_types env pattern inferred =
+  let parts = proof_pattern_parts pattern in
+  let inferred =
+    match (parts, inferred) with
+    | [ _ ], Some [] -> Some [ Some Predef.type_unit ]
+    | [ _ ], Some (_ :: _ :: _ as ts) ->
+        Some
+          [
+            Option.map (Option.all ts) ~f:(fun ts ->
+                Btype.newgenty (Ttuple (List.map ts ~f:(fun ty -> (None, ty)))));
+          ]
+    | _ :: _ :: _, Some [ Some ty ] ->
+        begin match Datatypes.desc env.data ty with
+        | Ttuple ts -> Some (List.map ts ~f:(fun (_, ty) -> Some ty))
+        | _ -> inferred
+        end
+    | _ -> inferred
+  in
+  let* () =
+    match inferred with
+    | Some ts when List.length ts <> List.length parts ->
+        error pattern.S.pat_loc "The binding pattern does not match the proof results"
+    | _ -> Ok ()
+  in
+  let inferred = Option.value inferred ~default:(List.map parts ~f:(fun _ -> None)) in
+  let* bindings =
+    all (List.zip_exn parts inferred) ~f:(fun ((p : S.pat), inferred) ->
+        let* p, ty =
+          match p.pat_desc with
+          | Pcast (p, ty) ->
+              let* ty = Source.ocaml_type env.ctx.env ~at:p.pat_loc ty in
+              Ok (p, Some ty)
+          | _ -> Ok (p, inferred)
+        in
+        match (p.pat_desc, ty) with
+        | (Pid _ | Pwild), None ->
+            error p.pat_loc "Add a type annotation to this proof binding"
+        | Pid id, Some ty -> Ok (Some id, ty)
+        | Pwild, Some ty -> Ok (None, ty)
+        | _ ->
+            error p.pat_loc "A proof let binding needs a variable or tuple of variables")
+  in
+  let ids =
+    List.filter_map bindings ~f:(fun (id, _) -> Option.map id ~f:(fun id -> id.S.pid_str))
+  in
+  match List.find_a_dup ids ~compare:String.compare with
+  | Some x -> error pattern.pat_loc (Printf.sprintf "Duplicate proof variable %s" x)
+  | None -> Ok bindings
+
+let proof_typed_env env bindings =
+  List.fold bindings ~init:env ~f:(fun env (id, ty) ->
+      match id with
+      | None -> env
+      | Some id ->
+          {
+            (bind env id.S.pid_str (Raven id.pid_str)) with
+            var_types = (id.pid_str, ty) :: env.var_types;
+          })
+
+(** Existentials are named by their declaration in the predicate, including those nested
+    inside a match or another logical connective. *)
+let rec predicate_existentials (t : S.term) =
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
+  | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
+  | Tquant (Tforall, _, body)
+  | Tattr (_, body)
+  | Tcast (body, _)
+  | Told body
+  | Tfield (body, _) ->
+      predicate_existentials body
+  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
+      predicate_existentials a @ predicate_existentials b
+  | Tif (c, a, b) ->
+      predicate_existentials c @ predicate_existentials a @ predicate_existentials b
+  | Tmatch (scrutinee, cases) ->
+      predicate_existentials scrutinee
+      @ List.concat_map cases ~f:(fun (_, body) -> predicate_existentials body)
+  | Ttuple ts -> List.concat_map ts ~f:predicate_existentials
+
+let unfold_result_types env (t : S.term) witnesses =
+  let head, _ = spine t [] in
+  match head.term_desc with
+  | Tvar (Qid predicate)
+    when List.Assoc.mem env.ctx.preds predicate.pid_str ~equal:String.equal ->
+      begin match
+        List.Assoc.find env.ctx.predicate_bodies predicate.pid_str ~equal:String.equal
+      with
+      | None -> Ok None
+      | Some body ->
+          let bindings = predicate_existentials body in
+          let* types =
+            all witnesses ~f:(fun (witness : S.id) ->
+                match
+                  List.filter bindings ~f:(fun (id, _) ->
+                      String.equal id.S.pid_str witness.pid_str)
+                with
+                | [] ->
+                    error witness.pid_loc
+                      (Printf.sprintf "Predicate %s has no existential named %s"
+                         predicate.pid_str witness.pid_str)
+                | [ (_, Some ty) ] ->
+                    let* ty = Source.ocaml_type env.ctx.env ~at:witness.pid_loc ty in
+                    Ok (Some ty)
+                | [ (_, None) ] ->
+                    error witness.pid_loc "An existential variable needs a type"
+                | _ ->
+                    error witness.pid_loc
+                      (Printf.sprintf "Existential name %s is ambiguous in predicate %s"
+                         witness.pid_str predicate.pid_str))
+          in
+          Ok (Some types)
+      end
+  | _ -> error t.term_loc "Expected a predicate applied to its arguments"
+
+let rec proof_result_types env (body : S.proof_expr) =
+  match body.proof_desc with
+  | Proof_value t ->
+      let* ts = proof_value_types env t in
+      Ok (Some ts)
+  | Proof_assert _ | Proof_fold _ -> Ok (Some [])
+  | Proof_unfold (_, []) -> Ok (Some [])
+  | Proof_unfold (predicate, witnesses) -> unfold_result_types env predicate witnesses
+  | Proof_seq (_, body) -> proof_result_types env body
+  | Proof_if (_, yes, _) -> proof_result_types env yes
+  | Proof_match (_, []) -> error body.proof_loc "A match needs at least one case"
+  | Proof_match (scrutinee, (p, body) :: _) ->
+      let* scrutinee_type = proof_value_type env scrutinee in
+      let types = Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p) in
+      proof_result_types { env with var_types = types @ env.var_types } body
+  | Proof_let (pattern, rhs, body) ->
+      let* inferred = proof_result_types env rhs in
+      let* bindings = proof_binding_types env pattern inferred in
+      proof_result_types (proof_typed_env env bindings) body
+
+(** Lexical expressions assign only to fresh internal result variables. *)
+let rec proof_expression env targets (body : S.proof_expr) =
+  let l = loc body.proof_loc in
+  let target_expr target = R.Expr.var ~loc:l (name ~loc:l target.target_name) in
+  let unit_statement statement =
+    match targets with
+    | [] -> Ok [ statement ]
+    | [ target ] when is_unit target.target_type ->
+        Ok
+          [
+            statement;
+            R.Stmt.assign ~loc:l
+              [ target_expr target ]
+              (R.Stmt.expr_rhs (R.Expr.tuple ~loc:l []));
+          ]
+    | _ -> error body.proof_loc "This proof expression returns unit"
+  in
+  match body.proof_desc with
+  | Proof_value t ->
+      begin match proof_signature env t with
+      | Some _ ->
+          let* call, outputs = lemma_call env t in
+          if List.length outputs = List.length targets then
+            if List.is_empty targets then Ok [ R.Stmt.call ~loc:l call ]
+            else
+              Ok
+                [
+                  R.Stmt.assign ~loc:l
+                    (List.map targets ~f:target_expr)
+                    (R.Stmt.expr_rhs call);
+                ]
+          else
+            begin match targets with
+            | [ target ] ->
+                let* temporaries =
+                  all outputs ~f:(fun ty ->
+                      let raven = Names.fresh env.ctx.names "result" in
+                      let* raven_type = typ env.ctx ~at:t.term_loc ty in
+                      let target = { target_name = raven; target_type = ty } in
+                      Ok
+                        ( target,
+                          R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
+                            (ident ~loc:l raven) ))
+                in
+                let values =
+                  List.map temporaries ~f:(fun (target, _) -> target_expr target)
+                in
+                let call =
+                  if List.is_empty values then R.Stmt.call ~loc:l call
+                  else R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs call)
+                in
+                let result = R.Expr.tuple ~loc:l values in
+                Ok
+                  (List.concat_map temporaries ~f:snd
+                  @ [
+                      call;
+                      R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs result);
+                    ])
+            | _ ->
+                begin match outputs with
+                | [ ty ] when not (List.is_empty targets) ->
+                    let raven = Names.fresh env.ctx.names "result" in
+                    let* raven_type = typ env.ctx ~at:t.term_loc ty in
+                    let result = R.Expr.var ~loc:l (name ~loc:l raven) in
+                    let declaration =
+                      R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
+                    in
+                    let assignments =
+                      List.mapi targets ~f:(fun i target ->
+                          R.Stmt.assign ~loc:l
+                            [ target_expr target ]
+                            (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l result i)))
+                    in
+                    Ok
+                      (declaration
+                      @ [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs call) ]
+                      @ assignments)
+                | _ -> error t.term_loc "Bind all the results of this lemma"
+                end
+            end
+      | None ->
+          let values =
+            match (targets, t.term_desc) with
+            | [ _ ], _ -> [ t ]
+            | _, Ttuple ts -> ts
+            | _ -> [ t ]
+          in
+          if List.is_empty targets && not (List.is_empty values) then
+            let* _, _ = lemma_call env t in
+            error t.term_loc "This expression does not return unit"
+          else if List.length values <> List.length targets then
+            begin match values with
+            | [ value ] when not (List.is_empty targets) ->
+                let* value = formula env value in
+                Ok
+                  (List.mapi targets ~f:(fun i target ->
+                       R.Stmt.assign ~loc:l
+                         [ target_expr target ]
+                         (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l value i))))
+            | _ ->
+                error t.term_loc
+                  "This expression does not match the expected proof results"
+            end
+          else
+            all (List.zip_exn targets values) ~f:(fun (target, value) ->
+                let* value = expected_formula env (Some target.target_type) value in
+                Ok (R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs value)))
+      end
+  | Proof_assert t ->
+      let* value = formula env t in
+      unit_statement (R.Stmt.assert_ ~loc:l (R.Spec.make value))
+  | Proof_fold (t, witnesses) ->
+      let* statement = predicate_use env ~unfold:false t witnesses R.Stmt.fold in
+      unit_statement statement
+  | Proof_unfold (t, []) ->
+      let* statement = predicate_use env ~unfold:true t [] R.Stmt.unfold in
+      unit_statement statement
+  | Proof_unfold (t, witnesses) ->
+      let* _ = unfold_result_types env t witnesses in
+      if List.length targets <> List.length witnesses then
+        error body.proof_loc "Bind every named existential returned by unfold"
+      else
+        let env, witnesses =
+          List.fold (List.zip_exn targets witnesses) ~init:(env, [])
+            ~f:(fun (env, ws) (target, existential) ->
+              let id = S.mk_id ~loc:body.proof_loc target.target_name in
+              let value = S.mk_term (Tvar (Qid existential)) existential.pid_loc in
+              (bind env target.target_name (Raven target.target_name), (id, value) :: ws))
+        in
+        let* statement =
+          predicate_use env ~unfold:true t (List.rev witnesses) R.Stmt.unfold
+        in
+        Ok [ statement ]
+  | Proof_seq (first, rest) ->
+      let* first = proof_expression env [] first in
+      let* rest = proof_expression env targets rest in
+      Ok (first @ rest)
+  | Proof_if (condition, yes, no) ->
+      let* condition = expected_formula env (Some Predef.type_bool) condition in
+      let* yes = proof_expression env targets yes in
+      let* no = proof_expression env targets no in
+      Ok [ R.Stmt.if_ ~loc:l condition yes no ]
+  | Proof_let (pattern, rhs, rest) ->
+      let* inferred = proof_result_types env rhs in
+      let* bindings = proof_binding_types env pattern inferred in
+      let* declarations =
+        all bindings ~f:(fun (id, ty) ->
+            let id = Option.value id ~default:(S.mk_id ~loc:pattern.pat_loc "discard") in
+            let raven = Names.fresh env.ctx.names id.pid_str in
+            let* raven_type = typ env.ctx ~at:id.pid_loc ty in
+            Ok
+              ( id,
+                { target_name = raven; target_type = ty },
+                R.Stmt.local ~loc:(loc id.pid_loc) ~ghost:true ~typ:raven_type
+                  (ident ~loc:l raven) ))
+      in
+      let* rhs =
+        proof_expression env (List.map declarations ~f:(fun (_, target, _) -> target)) rhs
+      in
+      let env =
+        List.fold (List.zip_exn bindings declarations) ~init:env
+          ~f:(fun env ((id, ty), (_, target, _)) ->
+            match id with
+            | None -> env
+            | Some id ->
+                {
+                  (bind env id.pid_str (Raven target.target_name)) with
+                  var_types = (id.pid_str, ty) :: env.var_types;
+                })
+      in
+      let* rest = proof_expression env targets rest in
+      Ok (List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest)
+  | Proof_match (scrutinee, cases) ->
+      let* value = formula env scrutinee in
+      let* scrutinee_type = proof_value_type env scrutinee in
+      let rec chain = function
+        | [] ->
+            Ok
+              [
+                check env.ctx ~at:body.proof_loc "This match may not be exhaustive"
+                  (R.Expr.bool ~loc:l false);
+              ]
+        | (pattern, body) :: rest ->
+            let* () =
+              match List.find_a_dup (pat_names pattern) ~compare:String.compare with
+              | None -> Ok ()
+              | Some x ->
+                  error pattern.pat_loc (Printf.sprintf "Duplicate proof variable %s" x)
+            in
+            let* condition, bindings = spec_pattern env pattern value in
+            let types =
+              Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env pattern)
+            in
+            let branch_env =
+              List.fold bindings
+                ~init:{ env with var_types = types @ env.var_types }
+                ~f:(fun env (x, value) -> bind env x (Value value))
+            in
+            let* branch = proof_expression branch_env targets body in
+            begin match condition with
+            | None -> Ok branch
+            | Some condition ->
+                let* rest = chain rest in
+                Ok [ R.Stmt.if_ ~loc:l condition branch rest ]
+            end
+      in
+      chain cases
+
+(** Ghost annotations supplement the automatic path without declaring mutable state. *)
 let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
   let between (a : Annotation.t) =
     a.loc.loc_start.pos_cnum >= after.pos_cnum
     && a.loc.loc_end.pos_cnum <= before.pos_cnum
     && Poly.equal (Annotation.kind a) Annotation.Ghost
   in
-  let* stmts = all (List.filter ctx.annotations ~f:between) ~f:Annotation.ghost_stmts in
-  let env = scope_env ctx in
-  let use (t : S.term) make =
-    let head, args = spine t [] in
-    match head.term_desc with
-    | Tvar (Qid { pid_str = p; _ }) when List.Assoc.mem ctx.preds p ~equal:String.equal ->
-        let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
-        let* args = all args ~f:(formula env) in
-        let l = loc t.term_loc in
-        Ok (make ~loc:l (name ~loc:l raven) args)
-    | _ -> error t.term_loc "Expected a predicate applied to its arguments"
-  in
-  all (List.concat stmts) ~f:(function
-    | S.Fold t -> use t (fun ~loc p args -> R.Stmt.fold ~loc p args)
-    | Unfold t -> use t (fun ~loc p args -> R.Stmt.unfold ~loc p args)
-    | Assert t ->
-        let* c = formula env t in
-        Ok (R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make c)))
+  let* blocks = all (List.filter ctx.annotations ~f:between) ~f:Annotation.ghost_stmts in
+  let* stmts = all (List.concat blocks) ~f:(proof_statement (scope_env ctx)) in
+  Ok stmts
 
 (** The specification of the loop whose body is [body], in an annotation between [after]
     and the body, as [while c do (*@ invariant P *) ... done]. *)
@@ -4051,6 +4538,8 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       origins;
       annotations = [];
       spec_funcs;
+      proof_lemmas = [];
+      predicate_bodies = [];
       env = ocaml_env;
       preds;
       facts = [];
@@ -4512,7 +5001,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries
+    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries ~proof_lemmas
     (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
     (R.Callable.t, error) Result.t =
   let names = Names.create () in
@@ -4531,6 +5020,8 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       origins;
       annotations;
       spec_funcs = funcs;
+      proof_lemmas;
+      predicate_bodies = [];
       env = ocaml_env;
       preds;
       facts = [];
@@ -6231,6 +6722,8 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     origins;
     annotations = [];
     spec_funcs;
+    proof_lemmas = [];
+    predicate_bodies = [];
     env = ocaml_env;
     preds;
     facts = [];
@@ -6246,6 +6739,148 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     fields_of = [];
     libraries = [];
   }
+
+(** Recursive proof calls need checked well-founded descent, including mutual calls. *)
+let check_lemma_recursion declarations =
+  let rec calls bound (body : S.proof_expr) =
+    match body.proof_desc with
+    | Proof_value t ->
+        let head, _ = spine t [] in
+        begin match head.term_desc with
+        | Tvar (Qid id) when not (List.mem bound id.pid_str ~equal:String.equal) ->
+            [ id.pid_str ]
+        | _ -> []
+        end
+    | Proof_let (pattern, rhs, body) ->
+        calls bound rhs @ calls (pat_names pattern @ bound) body
+    | Proof_seq (rhs, body) -> calls bound rhs @ calls bound body
+    | Proof_if (_, yes, no) -> calls bound yes @ calls bound no
+    | Proof_match (_, cases) ->
+        List.concat_map cases ~f:(fun (pattern, body) ->
+            calls (pat_names pattern @ bound) body)
+    | Proof_fold _ | Proof_unfold _ | Proof_assert _ -> []
+  in
+  let graph =
+    List.filter_map declarations ~f:(function
+      | S.Proof_lemma { lemma_name; lemma_params; lemma_body; _ } ->
+          Some
+            ( lemma_name.pid_str,
+              calls (List.map lemma_params ~f:(fun (id, _) -> id.S.pid_str)) lemma_body )
+      | _ -> None)
+  in
+  let cyclic start =
+    let rec visit seen = function
+      | [] -> false
+      | x :: pending when String.equal x start -> true
+      | x :: pending when List.mem seen x ~equal:String.equal -> visit seen pending
+      | x :: pending ->
+          let next =
+            Option.value (List.Assoc.find graph x ~equal:String.equal) ~default:[]
+          in
+          visit (x :: seen) (next @ pending)
+    in
+    visit [] (Option.value (List.Assoc.find graph start ~equal:String.equal) ~default:[])
+  in
+  Result.all_unit
+    (List.map declarations ~f:(function
+      | S.Proof_lemma { lemma_name; lemma_variant = []; _ } when cyclic lemma_name.pid_str
+        ->
+          error lemma_name.pid_loc "A recursive lemma needs a variant"
+      | _ -> Ok ()))
+
+(** Checked proof declarations share logical types, but introduce no runtime code. *)
+let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+    ~proof_lemmas ~predicate_bodies origins declaration =
+  match declaration with
+  | S.Proof_lemma
+      {
+        lemma_name;
+        lemma_params;
+        lemma_returns;
+        lemma_requires;
+        lemma_ensures;
+        lemma_variant;
+        lemma_body;
+      } ->
+      let ctx =
+        {
+          (spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+             origins)
+          with
+          proof_lemmas;
+          predicate_bodies;
+        }
+      in
+      let l = loc lemma_name.pid_loc in
+      let signature =
+        List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
+      in
+      let declare (id, _) ty =
+        let* raven_type = typ ctx ~at:id.S.pid_loc ty in
+        let raven = Names.fresh ctx.names id.pid_str in
+        Ok
+          ( id.pid_str,
+            raven,
+            ty,
+            R.Var.make ~loc:(loc id.pid_loc) ~ghost:true (ident ~loc:l raven) raven_type
+          )
+      in
+      let* inputs =
+        all (List.zip_exn lemma_params signature.lemma_inputs) ~f:(fun (parameter, ty) ->
+            declare parameter ty)
+      in
+      let* outputs =
+        all (List.zip_exn lemma_returns signature.lemma_outputs)
+          ~f:(fun (parameter, ty) -> declare parameter ty)
+      in
+      let parameters = inputs @ outputs in
+      let* () =
+        match
+          List.find_a_dup
+            (List.map parameters ~f:(fun (x, _, _, _) -> x))
+            ~compare:String.compare
+        with
+        | None -> Ok ()
+        | Some x ->
+            error lemma_name.pid_loc (Printf.sprintf "Duplicate proof variable %s" x)
+      in
+      let env =
+        {
+          ctx;
+          data = types;
+          funcs = spec_funcs;
+          var_types = List.map parameters ~f:(fun (x, _, ty, _) -> (x, ty));
+          vars = List.map parameters ~f:(fun (x, raven, _, _) -> (x, Raven raven));
+        }
+      in
+      let specs terms =
+        all terms ~f:(fun t ->
+            let* value = formula env t in
+            Ok (R.Spec.make value))
+      in
+      let* requires = specs lemma_requires in
+      let* ensures = specs lemma_ensures in
+      let* decreases = all lemma_variant ~f:(formula env) in
+      let body_env =
+        {
+          env with
+          vars = List.map inputs ~f:(fun (x, raven, _, _) -> (x, Raven raven));
+          var_types = List.map inputs ~f:(fun (x, _, ty, _) -> (x, ty));
+        }
+      in
+      let targets =
+        List.map outputs ~f:(fun (_, raven, ty, _) ->
+            { target_name = raven; target_type = ty })
+      in
+      let* body = proof_expression body_env targets lemma_body in
+      Ok
+        (R.Callable.proc ~loc:l ~kind:Lemma
+           ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
+           ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
+           ~requires ~ensures ~decreases
+           (ident ~loc:l signature.lemma_raven)
+           (Some body))
+  | _ -> error Location.none "Expected a lemma declaration"
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]; [views] are the views of the program, for an
@@ -6586,7 +7221,7 @@ let predicates (source : Source.t) =
     all source.proof ~f:(function
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
-      | Proof_state _ | Proof_action _ -> Ok None
+      | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _ -> Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
           let* fields =
@@ -6759,11 +7394,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                            parameters")
             | _ -> Ok []))
   in
-  let types = List.concat (List.concat library_types) @ types in
+  let types = List.concat (List.concat library_types) @ types @ source.proof_types in
   (* The data types, and the sequences of specifications, which have no module. *)
   let data_types = types in
   let types =
-    types @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
+    types @ source.logical_types
+    @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
   (* Each data type's module, given the ones declared before it; a record type that is a
      reference has fields instead. *)
@@ -6773,7 +7409,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
            Option.some_if
              (Option.is_none d.heap && Option.is_none d.alias)
              (List.take data_types i, d)))
-      ~f:(fun (before, d) -> Datatypes.member before d)
+      ~f:(fun (before, d) -> Datatypes.member (before @ source.logical_types) d)
   in
   let* record_fields = Datatypes.fields types in
   let refs = ref [] in
@@ -6846,6 +7482,36 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let spec_funcs =
     List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
+  in
+  let lemma_declarations =
+    List.filter source.proof ~f:(function S.Proof_lemma _ -> true | _ -> false)
+  in
+  let* () = check_lemma_recursion lemma_declarations in
+  let* proof_lemmas =
+    all lemma_declarations ~f:(function
+      | S.Proof_lemma { lemma_name; lemma_params; lemma_returns; _ } ->
+          let types_of ps =
+            all ps ~f:(fun (id, ty) -> Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
+          in
+          let* lemma_inputs = types_of lemma_params in
+          let* lemma_outputs = types_of lemma_returns in
+          if
+            List.Assoc.mem spec_funcs lemma_name.pid_str ~equal:String.equal
+            || List.exists funcs ~f:(fun f ->
+                String.equal f.raven_name lemma_name.pid_str)
+          then
+            error lemma_name.pid_loc
+              (Printf.sprintf "Name %s is already declared" lemma_name.pid_str)
+          else
+            Ok
+              ( lemma_name.pid_str,
+                { lemma_raven = lemma_name.pid_str; lemma_inputs; lemma_outputs } )
+      | _ -> error Location.none "Expected a lemma declaration")
+  in
+  let* () =
+    match List.find_a_dup (List.map proof_lemmas ~f:fst) ~compare:String.compare with
+    | None -> Ok ()
+    | Some x -> error Location.none (Printf.sprintf "Duplicate lemma %s" x)
   in
   (* The views, with their values, and their ghost fields, on the structures. *)
   let views =
@@ -7230,6 +7896,18 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
           ~structures p def param_types)
   in
+  let predicate_bodies =
+    List.filter_map predicates ~f:(fun (_, p, definition, _) ->
+        match definition with
+        | Body body -> Some (p.S.pred_name.pid_str, body)
+        | Invariant _ | View _ -> None)
+  in
+  let* lemma_members =
+    all lemma_declarations
+      ~f:
+        (proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+           ~proof_lemmas ~predicate_bodies origins)
+  in
   let* pure_funcs =
     all pure
       ~f:
@@ -7241,6 +7919,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
           ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
+          ~proof_lemmas
           ~libraries:
             (List.map source.libraries ~f:(fun (lib : Source.library) ->
                  (lib.library_id, lib.library_name)))
@@ -7263,7 +7942,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         @ List.concat_map pending_member_lists ~f:List.concat
         @ List.concat action_check_lists
         @ List.map !primitives ~f:snd
-        @ List.map (pred_members @ pure_funcs) ~f:R.Member.callable
+        @ List.map (pred_members @ pure_funcs @ lemma_members) ~f:R.Member.callable
         @ List.map2_exn funcs procs ~f:(fun f p ->
             (* A trusted function's procedure is assumed. *)
             if f.trusted then R.Member.free (R.Member.callable p) else R.Member.callable p)

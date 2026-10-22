@@ -1,0 +1,53 @@
+lemma append_assoc (a : int list) (b : int list) (c : int list)
+  ensures ((a @ b) @ c = a @ (b @ c))
+  variant (a) =
+  if a = [] then
+    assert ((a @ b) @ c = a @ (b @ c))
+  else
+    let (tail : int list) = drop_head a in
+    let () = append_assoc tail b c in
+    assert ((a @ b) @ c = a @ (b @ c))
+
+lemma duplicate (n : int) returns (left : int) (right : int)
+  ensures (left = n)
+  ensures (right = n) =
+  (n, n)
+
+lemma use_duplicate (n : int) =
+  let (left, right) = duplicate n in
+  let left = match Some left with
+    | Some value -> value
+    | None -> n
+  in
+  let right = if n = 0 then begin right end else begin n end in
+  assert (left = right)
+
+lemma call_ends (n : int) = use_duplicate n
+
+lemma shadow (shadow : int) returns (result : int)
+  ensures (result = shadow) =
+  shadow
+
+lemma local_shadow (n : int) returns (result : int)
+  ensures (result = n) =
+  let (local_shadow : int) = n in
+  local_shadow
+
+lemma tuple_value (n : int) returns (result : int * int)
+  ensures (result = (n, n)) =
+  let pair = duplicate n in
+  pair
+
+lemma use_tuple_value (n : int) =
+  let (pair : int * int) = tuple_value n in
+  assert (pair = (n, n))
+
+lemma unit_value (n : int) =
+  let result = use_duplicate n in
+  assert (result = ())
+
+lemma destructure_tuple (n : int) =
+  let pair = tuple_value n in
+  let (left, right) = pair in
+  let (first, second) = tuple_value n in
+  assert (left = right && first = second)

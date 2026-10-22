@@ -4,6 +4,8 @@
 open Base
 module S = Caravan_spec.Spec_ast
 
+let ( let* ) = Result.( >>= )
+
 type interface = {
   signature : Parsetree.signature;
   interface_comments : (string * Location.t) list;
@@ -20,8 +22,11 @@ type t = {
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   env : Env.t;
       (** The environment at the end of the file, for types in annotations, with the type
-          [sequence] of specifications. *)
+          [sequence], [finset], [set], and [map] of specifications. *)
   sequence : Path.t;  (** The type ['a sequence] of specifications. *)
+  logical_types : Datatypes.t list;
+      (** The collection types of specifications, identified by their declarations. *)
+  proof_types : Datatypes.t list;  (** Algebraic types declared by the proof. *)
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be
           helped, each on a key. *)
@@ -122,6 +127,143 @@ let load_proof file : (S.proof_decl list, Report.error) Result.t =
   | Caravan_spec.Spec_parser.Error ->
       Error (Report.error Syntax (lexeme_loc ()) "Syntax error")
 
+let rec longident : S.qualid -> Longident.t = function
+  | Qid id -> Lident id.pid_str
+  | Qdot (q, id) ->
+      Ldot
+        ( { txt = longident q; loc = S.qualid_loc q },
+          { txt = id.pid_str; loc = id.pid_loc } )
+
+let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
+  match t with
+  | PTtyvar id -> Ast_helper.Typ.var ~loc:id.pid_loc id.pid_str
+  | PTtyapp (q, args) ->
+      let loc = S.qualid_loc q in
+      Ast_helper.Typ.constr ~loc
+        { txt = longident q; loc }
+        (List.map args ~f:(core_type ~at))
+  | PTtuple ts ->
+      Ast_helper.Typ.tuple ~loc:at (List.map ts ~f:(fun t -> (None, core_type ~at t)))
+  | PTarrow (a, b) ->
+      Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at a) (core_type ~at b)
+
+let find_type_by_name env name =
+  try Some (Env.find_type_by_name (Lident name) env) with Stdlib.Not_found -> None
+
+let find_constructor_by_name env name =
+  try Some (Env.find_constructor_by_name (Lident name) env)
+  with Stdlib.Not_found -> None
+
+let interface_type_declarations = function
+  | None -> []
+  | Some (interface : interface) ->
+      List.concat_map interface.signature ~f:(fun item ->
+          match item.psig_desc with
+          | Psig_type (_, declarations) | Psig_typesubst declarations -> declarations
+          | _ -> [])
+
+let interface_constructors = function
+  | None -> []
+  | Some (interface : interface) ->
+      List.concat_map interface.signature ~f:(fun item ->
+          match item.psig_desc with
+          | Psig_type (_, declarations) | Psig_typesubst declarations ->
+              List.concat_map declarations ~f:(fun declaration ->
+                  match declaration.ptype_kind with
+                  | Ptype_variant constructors ->
+                      List.map constructors ~f:(fun c -> c.pcd_name.txt)
+                  | _ -> [])
+          | Psig_typext extension ->
+              List.map extension.ptyext_constructors ~f:(fun c -> c.pext_name.txt)
+          | _ -> [])
+
+let proof_type_collision env interface proof =
+  let declared =
+    List.map (interface_type_declarations interface) ~f:(fun d -> d.ptype_name.txt)
+  in
+  let rec find seen = function
+    | [] -> None
+    | S.Proof_type { type_name; _ } :: rest ->
+        if
+          List.mem seen type_name.pid_str ~equal:String.equal
+          || List.mem declared type_name.pid_str ~equal:String.equal
+          || Option.is_some (find_type_by_name env type_name.pid_str)
+        then Some type_name
+        else find (type_name.pid_str :: seen) rest
+    | _ :: rest -> find seen rest
+  in
+  find [] proof
+
+let proof_constructor_collision env interface proof =
+  let declared = interface_constructors interface in
+  let constructors =
+    List.concat_map proof ~f:(function
+      | S.Proof_type { type_ctors; _ } -> List.map type_ctors ~f:fst
+      | _ -> [])
+  in
+  let rec find seen = function
+    | [] -> None
+    | (name : S.id) :: rest ->
+        if
+          List.mem seen name.pid_str ~equal:String.equal
+          || List.mem declared name.pid_str ~equal:String.equal
+          || Option.is_some (find_constructor_by_name env name.pid_str)
+        then Some name
+        else find (name.pid_str :: seen) rest
+  in
+  find [] constructors
+
+(** Type-checks the algebraic types of [proof] in [env], after the implementation, and
+    returns their descriptors and the environment for the rest of the proof. *)
+let elaborate_proof_types (env : Env.t) (interface : interface option)
+    (proof : S.proof_decl list) : (Env.t * Datatypes.t list, Report.error) Result.t =
+  let* () =
+    match proof_type_collision env interface proof with
+    | None -> Ok ()
+    | Some name ->
+        Error
+          (Report.error Type name.pid_loc
+             (Printf.sprintf "The proof type %s is already declared" name.pid_str))
+  in
+  let* () =
+    match proof_constructor_collision env interface proof with
+    | None -> Ok ()
+    | Some name ->
+        Error
+          (Report.error Type name.pid_loc
+             (Printf.sprintf "The proof constructor %s is already declared" name.pid_str))
+  in
+  let declarations =
+    List.filter_map proof ~f:(function
+      | Proof_type { type_name; type_ctors } ->
+          let constructor ((name : S.id), (args : S.pty list)) =
+            Ast_helper.Type.constructor ~loc:name.pid_loc
+              ~args:(Pcstr_tuple (List.map args ~f:(core_type ~at:name.pid_loc)))
+              { txt = name.pid_str; loc = name.pid_loc }
+          in
+          Some
+            (Ast_helper.Type.mk ~loc:type_name.pid_loc
+               ~kind:(Ptype_variant (List.map type_ctors ~f:constructor))
+               { txt = type_name.pid_str; loc = type_name.pid_loc })
+      | _ -> None)
+  in
+  let* env, reversed =
+    List.fold_result declarations ~init:(env, [])
+      ~f:(fun (env, descriptors) declaration ->
+        let typed, _, _, _, env =
+          Typemod.type_structure env [ Ast_helper.Str.type_ Recursive [ declaration ] ]
+        in
+        let typed_declarations =
+          List.concat_map typed.str_items ~f:(fun item ->
+              match item.str_desc with Tstr_type (_, ds) -> ds | _ -> [])
+        in
+        let* added =
+          Result.all (List.map typed_declarations ~f:Datatypes.of_declaration)
+        in
+        Ok (env, List.rev_append added descriptors))
+  in
+  Ok (env, List.rev reversed)
+
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
 let library_files ~include_dirs file =
@@ -190,22 +332,50 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     in
     let sequence, _ = Env.find_type_by_name (Lident "sequence") env in
     let pending, _ = Env.find_type_by_name (Lident "pending") env in
+    let env, logical_types =
+      List.fold
+        [
+          ("finset", Datatypes.FinSet, "type 'a finset");
+          ("set", Datatypes.Set, "type 'a set");
+          ("map", Datatypes.Map, "type ('k, 'v) map");
+        ]
+        ~init:(env, [])
+        ~f:(fun (env, types) (name, kind, declaration) ->
+          match find_type_by_name env name with
+          | Some _ -> (env, types)
+          | None ->
+              let _, _, _, _, env =
+                Typemod.type_structure env
+                  (Parse.implementation (Lexing.from_string declaration))
+              in
+              let types =
+                match find_type_by_name env name with
+                | Some (Pident id, _) -> Datatypes.collection id kind :: types
+                | _ -> types
+              in
+              (env, types))
+    in
+    let logical_types = List.rev logical_types in
     let interface = Option.map (sibling file ".mli") ~f:load_interface in
     Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
-    Result.map proof ~f:(fun proof ->
-        {
-          file;
-          text;
-          typed;
-          comments;
-          env;
-          sequence;
-          pending;
-          interface;
-          proof;
-          libraries;
-        })
+    Result.bind proof ~f:(fun proof ->
+        Result.map (elaborate_proof_types env interface proof)
+          ~f:(fun (env, proof_types) ->
+            {
+              file;
+              text;
+              typed;
+              comments;
+              env;
+              sequence;
+              logical_types;
+              proof_types;
+              pending;
+              interface;
+              proof;
+              libraries;
+            }))
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error
@@ -216,23 +386,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     compiler's type checker reports errors by raising. *)
 let ocaml_type (env : Env.t) ~(at : Location.t) (t : S.pty) :
     (Types.type_expr, Report.error) Result.t =
-  let rec longident : S.qualid -> Longident.t = function
-    | Qid id -> Lident id.pid_str
-    | Qdot (q, id) ->
-        Ldot ({ txt = longident q; loc = at }, { txt = id.pid_str; loc = at })
-  in
-  let rec core_type (t : S.pty) : Parsetree.core_type =
-    match t with
-    | PTtyvar id -> Ast_helper.Typ.var ~loc:at id.pid_str
-    | PTtyapp (q, args) ->
-        Ast_helper.Typ.constr ~loc:at
-          { txt = longident q; loc = at }
-          (List.map args ~f:core_type)
-    | PTtuple ts ->
-        Ast_helper.Typ.tuple ~loc:at (List.map ts ~f:(fun t -> (None, core_type t)))
-    | PTarrow (a, b) -> Ast_helper.Typ.arrow ~loc:at Nolabel (core_type a) (core_type b)
-  in
-  try Ok (Typetexp.transl_simple_type env ~closed:true (core_type t)).ctyp_type
+  try Ok (Typetexp.transl_simple_type env ~closed:true (core_type ~at t)).ctyp_type
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

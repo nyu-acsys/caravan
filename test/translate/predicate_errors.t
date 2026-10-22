@@ -8,8 +8,8 @@ its own run.
   Type Error: Expected a predicate applied to its arguments.
   [1]
   $ caravan --shh predicate_error_2.ml
-  [Error] File "predicate_error_2.ml", line 3, columns 0-62:
+  [Error] File "predicate_error_2.ml", line 3, columns 39-42:
   3 | (*@ predicate valid (c : counter) (n : nat) = own c.count n *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                             ^^^
   Type Error: Unbound type constructor nat.
   [1]

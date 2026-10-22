@@ -14,6 +14,33 @@ of the OCaml source.
 
 Caravan is at an early stage of development: so far, it verifies first-order functions on integers, booleans, tuples, lists, options, variant types, mutable records, references and atomics, with loops, predicates and logically atomic contracts. Specifications go in `(*@ ... *)` comments in the `.ml` or its `.mli`, and predicate definitions in the `.ml` or a `.proof` file next to it.
 
+Proof files also support checked lemmas and monomorphic logical variant types.
+A lemma has typed parameters and an expression body after `=`. Optional
+`returns`, `requires`, and `ensures` clauses state its contract explicitly.
+Recursive lemmas require a `variant`, which can be a list for structural
+induction. Bindings in the body are immutable and lexical:
+`let (value : int) = expression in body`.
+Write each clause with its full expression in parentheses, for example
+`requires (p x)`, `ensures (result = x)`, and `variant (xs)`.
+The final expression supplies the result, or a tuple for multiple `returns`
+parameters; a lemma without results ends in a unit expression such as `()`.
+Bodies can call other lemmas, use `if` and `match`, and check `assert` expressions.
+All lemma bodies are verified.
+
+An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
+program code. In a proof body, `unfold p x {n}` names an existential to bind
+with `let value = ... in`, and `fold p x {n = value}` supplies its
+witness. Unfold bindings infer their types from the named existential declarations;
+explicit type annotations remain optional. Use `fold p x` when no explicit witness
+is needed.
+
+Specification types include `'a finset`, `'a set`, and `('k, 'v) map` when those
+names are not already declared by the program. `Finset` and `Set` provide
+`empty`, `singleton`, `mem`, `union`, `inter`, `diff`, and `subset`; `Finset`
+also provides `choose`, whose set must be nonempty. Maps use `Map.const`,
+`Map.get`, and `Map.set`. A constant map may need an explicit type annotation,
+such as `(Map.const 0 : (int, int) map)`.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.

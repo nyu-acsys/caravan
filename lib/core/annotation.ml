@@ -34,7 +34,7 @@ let kind (annotation : t) =
   match String.split_on_chars (String.strip annotation.text) ~on:[ ' '; '\n'; '\t' ] with
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
-  | ("fold" | "unfold" | "assert") :: _ -> Ghost
+  | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
   | ("commit" | "returning" | "performs") :: _ -> Linearization
   | "initially" :: _ -> Initially
   | [ "trusted" ] -> Trusted

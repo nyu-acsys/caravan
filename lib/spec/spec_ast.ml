@@ -21,6 +21,8 @@ type id = {
   pid_loc : Location.t;
 }
 
+exception Syntax_error of Location.t * string
+
 let mk_id ?(fixity = Normal) ?(attrs = []) ~loc str =
   { pid_str = str; pid_fixity = fixity; pid_attrs = attrs; pid_loc = loc }
 
@@ -127,9 +129,40 @@ type state_field = {
 (** A field of the ghost state; [[@grows]] if it only grows: sequences by prefix, integers
     by [<=]. *)
 
+(** A ghost statement in code. *)
+type ghost_stmt =
+  | Fold of term
+  | Unfold of term
+  | Assert of term
+  | Fold_with of term * (id * term) list
+  | Unfold_with of term * (id * term) list
+  | Ghost_call of term
+
+type proof_expr = { proof_desc : proof_desc; proof_loc : Location.t }
+
+and proof_desc =
+  | Proof_value of term
+  | Proof_let of pat * proof_expr * proof_expr
+  | Proof_seq of proof_expr * proof_expr
+  | Proof_if of term * proof_expr * proof_expr
+  | Proof_match of term * (pat * proof_expr) list
+  | Proof_assert of term
+  | Proof_fold of term * (id * term) list
+  | Proof_unfold of term * id list
+
 (** A declaration of a proof. *)
 type proof_decl =
   | Proof_predicate of predicate
+  | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
+  | Proof_lemma of {
+      lemma_name : id;
+      lemma_params : (id * pty) list;
+      lemma_returns : (id * pty) list;
+      lemma_requires : term list;
+      lemma_ensures : term list;
+      lemma_variant : term list;
+      lemma_body : proof_expr;
+    }
   | Proof_state of { state_name : id; state_fields : state_field list }
       (** The ghost state of a structure, [type state = { items : int list }]. *)
   | Proof_invariant of {
@@ -174,9 +207,6 @@ type outcome =
 (** Where an atomic step linearizes the function that performs it: always, or if its
     result matches a pattern, as [returning [] -> commit]. *)
 type linearization = Commit | Returning of pat * outcome | Performs of id
-
-(** A ghost statement in code. *)
-type ghost_stmt = Fold of term | Unfold of term | Assert of term
 
 let mk_loc (s, e) = { Location.loc_start = s; loc_end = e; loc_ghost = false }
 let mk_term t l = { term_desc = t; term_loc = l }

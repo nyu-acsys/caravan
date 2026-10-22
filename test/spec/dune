@@ -1,3 +1,7 @@
 (test
  (name parse)
  (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name lemma)
+ (libraries caravan_spec compiler-libs.common))

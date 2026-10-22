@@ -15,7 +15,7 @@
   open Lexing
   open Spec_parser
 
-  exception Error of Location.t * string
+  exception Error = Spec_ast.Syntax_error
 
   let error lexbuf message =
     let loc =
@@ -39,27 +39,32 @@
         "action", ACTION;
         "consumes", CONSUMES;
         "continues", CONTINUES;
+        "end", END;
         "helps", HELPS;
         "on", ON;
         "wait", WAIT;
         "linearizes", LINEARIZES;
         "assert", ASSERT;
         "atomic", ATOMIC;
+        "begin", BEGIN;
         "commit", COMMIT;
         "fold", FOLD;
         "in", IN;
         "initially", INITIALLY;
         "invariant", INVARIANT;
         "let", LET;
+        "lemma", LEMMA;
         "match", MATCH;
         "mod", OP3 "mod";
         "not", NOT;
+        "of", OF;
         "old", OLD;
         "performs", PERFORMS;
         "predicate", PREDICATE;
         "pure", PURE;
         "requires", REQUIRES;
         "returning", RETURNING;
+        "returns", RETURNS;
         "then", THEN;
         "type", TYPE;
         "true", TRUE;

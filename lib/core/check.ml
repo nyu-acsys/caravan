@@ -27,17 +27,22 @@ let explain (origins : Translate.origin list) (d : R.Diagnostic.t) : R.Diagnosti
       }
   | None -> d
 
-(** [d], an error of Raven on the generated program, reported as the bug in Caravan it is
-    if it is not about the user's code: a type or syntax error, or one outside the user's
-    files. *)
-let blame (d : R.Diagnostic.t) : R.Diagnostic.t =
+(** Type errors in explicit proof files belong to the user; errors in generated syntax,
+    runtime types, or constructs outside the user's files belong to Caravan. *)
+let blame ~explicit_proof_files (d : R.Diagnostic.t) : R.Diagnostic.t =
   let user_file =
     let file = (R.Loc.start d.loc).pos_fname in
     List.exists [ ".ml"; ".mli"; ".proof" ] ~f:(fun suffix ->
         String.is_suffix file ~suffix)
   in
+  let explicit_proof =
+    List.mem explicit_proof_files (R.Loc.start d.loc).pos_fname ~equal:String.equal
+  in
   let generated =
-    match d.kind with Type | Syntax | Internal -> true | _ -> not user_file
+    match d.kind with
+    | Type when explicit_proof -> false
+    | Type | Syntax | Internal -> true
+    | _ -> not user_file
   in
   match d.severity with
   | Error when generated ->
@@ -69,7 +74,13 @@ let file ~(include_dirs : string list) ~(emit_rav : bool) ~(smt_timeout : int)
           true
       | Ok (program, origins) ->
           let result = R.verify ~options:{ R.default_options with smt_timeout } program in
+          let explicit_proof_files =
+            List.filter_map source.proof ~f:(function
+              | Caravan_spec.Spec_ast.Proof_lemma { lemma_name; _ } ->
+                  Some lemma_name.pid_loc.loc_start.pos_fname
+              | _ -> None)
+          in
           List.iter result.diagnostics ~f:(fun d ->
-              Report.print_diagnostic (blame (explain origins d)));
+              Report.print_diagnostic (blame ~explicit_proof_files (explain origins d)));
           if result.verified then Logs.app (fun m -> m "Verification successful.");
           result.verified)
