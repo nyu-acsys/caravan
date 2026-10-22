@@ -16,6 +16,33 @@ module S = Caravan_spec.Spec_ast
 let rec spine (t : S.term) args =
   match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
 
+(** The conjuncts of [t]. *)
+let rec conjuncts (t : S.term) =
+  let t = S.chain t in
+  match spine t [] with
+  | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+      conjuncts a @ conjuncts b
+  | _ -> [ t ]
+
+(** The conjuncts of [terms] that make a variable a field of a value, [x = g.f] or
+    [g.f = x]: the variable, the field and the value's name. *)
+let field_equations (terms : S.term list) =
+  List.filter_map (List.concat_map terms ~f:conjuncts) ~f:(fun t ->
+      match spine t [] with
+      | { term_desc = Tvar (Qid { pid_str = "="; _ }); _ }, [ a; b ] ->
+          begin match (a.term_desc, b.term_desc) with
+          | ( Tvar (Qid { pid_str = x; _ }),
+              Tfield
+                ({ term_desc = Tvar (Qid { pid_str = g; _ }); _ }, Qid { pid_str = f; _ })
+            )
+          | ( Tfield
+                ({ term_desc = Tvar (Qid { pid_str = g; _ }); _ }, Qid { pid_str = f; _ }),
+              Tvar (Qid { pid_str = x; _ }) ) ->
+              Some (x, f, g)
+          | _ -> None
+          end
+      | _ -> None)
+
 (** The elements of the list literal [t], if it is one. *)
 let rec list_literal (t : S.term) =
   match spine t [] with
@@ -362,6 +389,13 @@ type context = {
       (** The lifted local functions, by their procedures' names, with the number of
           parameters of the function they continue, which they take first, and its name.
       *)
+  ghost_args : (string * (int * string) option list) list;
+      (** The ghost parameters of procedures, by their names: for each, the position of a
+          parameter that a precondition makes a field of it, with the field, as [tail] in
+          [requires tail = q.tail], by which calls find the ghost argument. *)
+  mutable fields_of : (string * (string * R.Expr.t)) list;
+      (** The variables known to be fields of values, by their Raven names: the field and
+          the value, as [tail] of [q] after [let push { tail; _ } value]. *)
   mutable formals : R.Expr.t list;
       (** The procedure's parameters, of which a lifted local function that continues it,
           or that it continues too, takes the first. *)
@@ -877,8 +911,10 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       let reference =
         match r.term_desc with
         | Tvar (Qid { pid_str = x; _ }) ->
+            (* An atomic that an immutable record holds is a value, read by Atomic.get. *)
             Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun t ->
-                Option.map (field_type env.ctx t label) ~f:(fun _ -> x))
+                if Option.is_some (atomic_in_record env.ctx t label) then None
+                else Option.map (field_type env.ctx t label) ~f:(fun _ -> x))
         | _ -> None
       in
       begin match reference with
@@ -3065,7 +3101,8 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
 
 (** The call of the top-level function [f] with [args], in [e]: a statement, whose result
     is kept in a variable unless it is unit. *)
-and call ctx (e : Typedtree.expression) f args =
+and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression list) =
+  let args = ocaml_args in
   let l = loc e.exp_loc in
   let* stmts_args = all (List.rev args) ~f:(fun arg -> expr ctx arg) in
   let stmts = List.concat_map stmts_args ~f:fst in
@@ -3078,7 +3115,36 @@ and call ctx (e : Typedtree.expression) f args =
     if List.length ctx.formals >= prefix then Ok (List.take ctx.formals prefix)
     else error e.exp_loc "This call needs the parameters of the function it continues"
   in
-  let args = prefix @ args in
+  (* A ghost argument is the value of which the argument a precondition relates it to is a
+     field, as [q] for [tail] in [fix_tail tail new_tail] after [push { tail; _ }]. *)
+  let* ghosts =
+    all
+      (Option.value (List.Assoc.find ctx.ghost_args f ~equal:String.equal) ~default:[])
+      ~f:(fun equation ->
+        let known =
+          Option.bind equation ~f:(fun (i, field) ->
+              match List.nth ocaml_args (i - List.length prefix) with
+              | Some { exp_desc = Texp_ident (Pident id, _, _); _ } ->
+                  Option.bind (Names.find ctx.names id) ~f:(fun x ->
+                      List.find_map ctx.fields_of ~f:(fun (y, (g, value)) ->
+                          Option.some_if (String.equal x y && String.equal g field) value))
+              | _ -> None)
+        in
+        match (known, equation) with
+        | Some value, _ -> Ok value
+        | None, None ->
+            error e.exp_loc
+              "Caravan cannot tell the ghost argument of this call: give the callee a \
+               precondition that makes a parameter a field of it, as tail = q.tail"
+        | None, Some (_, field) ->
+            error e.exp_loc
+              (Printf.sprintf
+                 "Caravan cannot tell the ghost argument of this call: the argument is \
+                  not a variable known to be the field %s of a value, as one a record \
+                  pattern binds"
+                 field))
+  in
+  let args = prefix @ args @ ghosts in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
      its place, with the atomic update's values of the implicit parameters, as does a call
      of a function that continues the update. *)
@@ -3639,6 +3705,16 @@ type func = {
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
     a local function lifted to the top level. *)
 
+(** The ghost parameters that the contract of [f] gives it, as [q] in
+    [fix_tail [q : t] tail new_tail]. *)
+let ghost_params (f : func) =
+  match Option.bind f.contract ~f:(fun c -> c.header) with
+  | Some h ->
+      List.filter_map h.hd_args ~f:(function
+        | S.Lghost (id, t) -> Some (id, t)
+        | _ -> None)
+  | None -> []
+
 (** The names that the contract of [f] gives its result and its [n] parameters, by its
     [header] if it has one, and otherwise OCaml's. *)
 let contract_names (f : func) (header : S.header option) n =
@@ -3659,8 +3735,14 @@ let contract_names (f : func) (header : S.header option) n =
       in
       let arg = function
         | S.Lvar id -> Ok (Some id.pid_str)
-        | Lunit _ | Lwild -> Ok None
-        | Lghost (id, _) -> unsupported id.pid_loc "A ghost argument"
+        | Lunit _ | Lwild | Lghost _ -> Ok None
+      in
+      (* Ghost parameters are not the function's. *)
+      let h =
+        {
+          h with
+          hd_args = List.filter h.hd_args ~f:(function S.Lghost _ -> false | _ -> true);
+        }
       in
       if not (String.equal h.hd_name.pid_str (Ident.name f.id)) then
         error h.hd_name.pid_loc
@@ -3718,17 +3800,33 @@ let pattern_params ctx (f : func) formals =
         | ( Tparam_pat ({ pat_desc = Tpat_record _ | Tpat_tuple _; pat_loc; _ } as pat),
             Some (_, x) ) ->
             let l = loc pat_loc in
-            let* cond, binds = pattern ctx pat (R.Expr.var ~loc:l (name ~loc:l x)) in
+            let value = R.Expr.var ~loc:l (name ~loc:l x) in
+            let* cond, binds = pattern ctx pat value in
             begin match cond with
             | Some _ -> unsupported pat_loc "A refutable pattern as a parameter"
             | None ->
-                all binds ~f:(fun (id, value, t) ->
-                    let* typ = typ ctx ~at:pat_loc t in
-                    let y = Names.bind ~typ:t ctx.names id in
-                    Ok
-                      (R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
-                         (ident ~loc:l y)
-                      @ assume_in_range ~loc:l t y))
+                let* stmts =
+                  all binds ~f:(fun (id, value, t) ->
+                      let* typ = typ ctx ~at:pat_loc t in
+                      let y = Names.bind ~typ:t ctx.names id in
+                      Ok
+                        (R.Stmt.local ~loc:l ~const:true ~typ
+                           ~init:(R.Stmt.expr_rhs value) (ident ~loc:l y)
+                        @ assume_in_range ~loc:l t y))
+                in
+                (* The variables of a record's fields are its fields. *)
+                begin match pat.pat_desc with
+                | Tpat_record (fields, _) ->
+                    List.iter fields ~f:(fun (_, label, p) ->
+                        match p.pat_desc with
+                        | Tpat_var (id, _, _) ->
+                            Option.iter (Names.find ctx.names id) ~f:(fun y ->
+                                ctx.fields_of <-
+                                  (y, (label.lbl_name, value)) :: ctx.fields_of)
+                        | _ -> ())
+                | _ -> ()
+                end;
+                Ok stmts
             end
         | _ -> Ok [])
   in
@@ -3763,13 +3861,23 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
       vars = List.map named ~f:(fun (x, r, _) -> (x, Raven r));
     }
   in
+  (* Ghost parameters, as [q] in [fix_tail [q : t] tail new_tail]. *)
+  let* ghosts =
+    all (ghost_params f) ~f:(fun (id, pty) ->
+        let* t = Source.ocaml_type ctx.env ~at:id.pid_loc pty in
+        Ok (id.pid_str, Names.fresh ctx.names id.pid_str, t))
+  in
+  let env =
+    List.fold ghosts ~init:env ~f:(fun env (x, raven, t) ->
+        { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+  in
   let env = pattern_definitions env f in
   let* implicit = implicit_vars env f in
   let env =
     List.fold implicit ~init:env ~f:(fun env (x, raven, t, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
-  Ok (result_name, env, implicit)
+  Ok (result_name, env, implicit, ghosts)
 
 (** [env] with the names that preconditions of [f] define by a constructor's arguments, as
     [c] in [requires node = Next (v, c)]: the value's fields. *)
@@ -3865,12 +3973,19 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       snapshots = [];
       positions = [];
       formals = [];
+      ghost_args = [];
+      fields_of = [];
     }
   in
   let l = loc f.loc in
   let* formals = formals ctx f in
   let result = Names.fresh ctx.names "result" in
-  let* _, env, implicit = contract_env ctx ~spec_funcs f formals ~result in
+  let* _, env, implicit, ghosts = contract_env ctx ~spec_funcs f formals ~result in
+  let* () =
+    match ghosts with
+    | [] -> Ok ()
+    | _ -> unsupported f.loc "A pure function with ghost parameters"
+  in
   let* () =
     match implicit with
     | [] -> Ok ()
@@ -4303,8 +4418,9 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~linearizations ~lifted ~pasts ~past_returns (functions : (string * string) list)
-    origins ~proc_name ~pure (f : func) : (R.Callable.t, error) Result.t =
+    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
+    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
+    (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -4316,6 +4432,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       lifted;
       pasts;
       past_returns;
+      ghost_args;
       origins;
       annotations;
       spec_funcs = funcs;
@@ -4330,6 +4447,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       snapshots = [];
       positions = [];
       formals = [];
+      fields_of = [];
     }
   in
   let l = loc f.loc in
@@ -4362,7 +4480,28 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       let* typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
-  let* _, env, implicit = contract_env ctx ~spec_funcs:funcs f formals ~result in
+  let* _, env, implicit, ghosts = contract_env ctx ~spec_funcs:funcs f formals ~result in
+  let* ghost_formals =
+    all ghosts ~f:(fun (_, raven, t) ->
+        let* typ = typ ctx ~at:f.loc t in
+        Ok (R.Var.make ~loc:l ~ghost:true (ident ~loc:l raven) typ))
+  in
+  (* A parameter that a precondition makes a field of a ghost parameter is one. *)
+  List.iter
+    (field_equations (Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires)))
+    ~f:(fun (x, field, g) ->
+      let position =
+        List.findi arg_names ~f:(fun _ n -> Option.equal String.equal n (Some x))
+      in
+      match (List.find ghosts ~f:(fun (n, _, _) -> String.equal n g), position) with
+      | Some (_, ghost, _), Some (i, _) ->
+          begin match List.nth formals i with
+          | Some (Some (_, raven), _, _) ->
+              ctx.fields_of <-
+                (raven, (field, R.Expr.var ~loc:l (name ~loc:l ghost))) :: ctx.fields_of
+          | _ -> ()
+          end
+      | _ -> ());
   (* Ghost statements and invariants in the code can use the implicit parameters. *)
   List.iter implicit ~f:(fun (x, raven, t, _) ->
       ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
@@ -4602,7 +4741,9 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let body = bind_au @ bound @ first @ stmts @ assignment @ establish @ last in
   Ok
     (R.Callable.proc ~loc:l
-       ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ past_formals @ implicit)
+       ~formals:
+         (List.map formals ~f:(fun (_, _, v) -> v)
+         @ ghost_formals @ past_formals @ implicit)
        ~returns:(returns @ past_returns) ~requires ~ensures (ident ~loc:l proc_name)
        (Some body))
 
@@ -4949,14 +5090,6 @@ type definition =
 
 (** The ghost field holding the client's view [v] of a state. *)
 let view_field v = "view_" ^ v
-
-(** The conjuncts of [t]. *)
-let rec conjuncts (t : S.term) =
-  let t = S.chain t in
-  match spine t [] with
-  | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
-      conjuncts a @ conjuncts b
-  | _ -> [ t ]
 
 (** [t], if it owns the entries of a field of the state [state] by index, as
     [forall i. g -> own s.cells.(i) v]: the index, the guard, the field and the value. *)
@@ -5505,6 +5638,8 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     snapshots = [];
     positions = [];
     formals = [];
+    ghost_args = [];
+    fields_of = [];
   }
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
@@ -6289,6 +6424,29 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 ~f:(fun p -> (p.inv, p.field, entry_of_args types f names p.element)) ) ))
   in
   let pasts, past_returns = List.unzip pasts in
+  (* For each ghost parameter, a parameter that a precondition makes a field of it. *)
+  let* ghost_args =
+    all funcs ~f:(fun f ->
+        let* _, names =
+          contract_names f
+            (Option.bind f.contract ~f:(fun c -> c.header))
+            (List.length f.params)
+        in
+        let equations =
+          field_equations
+            (Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires))
+        in
+        Ok
+          ( proc_name f,
+            List.map (ghost_params f) ~f:(fun (g, _) ->
+                List.find_map equations ~f:(fun (x, field, h) ->
+                    if not (String.equal h g.S.pid_str) then None
+                    else
+                      Option.map
+                        (List.findi names ~f:(fun _ n ->
+                             Option.equal String.equal n (Some x)))
+                        ~f:(fun (i, _) -> (i, field)))) ))
+  in
   let* pending_member_lists =
     all structures ~f:(fun st ->
         all st.pendings ~f:(fun p ->
@@ -6320,8 +6478,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~linearizations ~lifted ~pasts ~past_returns functions origins
-          ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+          ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args functions
+          origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
