@@ -358,9 +358,13 @@ type context = {
       (** The facts about earlier states that procedures ensure, by their names, each
           witnessed by two ghost results: the invariant, the field, and the entry, given
           the arguments, if it is known. *)
-  lifted : (string * (Ident.t list * string option)) list;
-      (** The lifted local functions, by their procedures' names, with the parameters of
-          the function they continue, which their calls pass first, and its name. *)
+  lifted : (string * (int * string option)) list;
+      (** The lifted local functions, by their procedures' names, with the number of
+          parameters of the function they continue, which they take first, and its name.
+      *)
+  mutable formals : R.Expr.t list;
+      (** The procedure's parameters, of which a lifted local function that continues it,
+          or that it continues too, takes the first. *)
   origins : origin list ref;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   spec_funcs : (string * string) list;
@@ -3068,14 +3072,11 @@ and call ctx (e : Typedtree.expression) f args =
   let args = List.rev_map stmts_args ~f:snd in
   (* A lifted local function takes the parameters of the function it continues first. *)
   let prefix, role =
-    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:([], None)
+    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:(0, None)
   in
   let* prefix =
-    all prefix ~f:(fun id ->
-        match Names.find ctx.names id with
-        | Some x -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
-        | None ->
-            error e.exp_loc (Printf.sprintf "%s is not in scope here" (Ident.name id)))
+    if List.length ctx.formals >= prefix then Ok (List.take ctx.formals prefix)
+    else error e.exp_loc "This call needs the parameters of the function it continues"
   in
   let args = prefix @ args in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
@@ -3239,6 +3240,18 @@ and pattern ctx (p : Typedtree.pattern) (v : R.Expr.t) =
   | Tpat_tuple ps ->
       let values = List.mapi ps ~f:(fun i _ -> R.Expr.tuple_get ~loc:l v i) in
       let* conds, binds = components (List.map ps ~f:snd) values in
+      Ok (conjoin conds, binds)
+  | Tpat_record (fields, _) ->
+      (* The fields of an immutable record. *)
+      let* parts =
+        all fields ~f:(fun (_, label, p) ->
+            let* field = field_of_label ctx ~at label in
+            match field with
+            | Some (field, false) -> Ok (p, R.Expr.field ~loc:l v (name ~loc:l field))
+            | Some (_, true) -> unsupported at "A pattern on a mutable field"
+            | None -> unsupported at "This field")
+      in
+      let* conds, binds = components (List.map parts ~f:fst) (List.map parts ~f:snd) in
       Ok (conjoin conds, binds)
   | Tpat_construct (_, { cstr_name = ("true" | "false") as b; _ }, [], _) ->
       Ok
@@ -3618,8 +3631,9 @@ type func = {
   contract : S.contract option;
   next : Location.t option;  (** The location of the next structure item, if any. *)
   prefix : Ident.t list;
-      (** The parameters of the function that a lifted local function continues, which its
-          parameters start with. *)
+      (** The variables of the parameters of the function that a lifted local function
+          continues, which its parameters start with. *)
+  prefix_count : int;  (** The number of those parameters. *)
   role : string option;  (** The function whose atomic update it continues. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
@@ -3661,9 +3675,13 @@ let contract_names (f : func) (header : S.header option) n =
         Ok (result, args)
 
 (** The parameters of [f]: their OCaml and Raven names, unless unit, their range, and
-    their declarations. *)
-let formals ctx (f : func) =
-  all f.params ~f:(fun (p : Typedtree.function_param) ->
+    their declarations. A parameter that is a pattern, as [{ tail; _ }], is named as
+    [names], those of the contract, name it, and binds its variables at the start of the
+    body, by [pattern_params]. *)
+let formals ?(names = []) ctx (f : func) =
+  all
+    (List.mapi f.params ~f:(fun i p -> (i, p)))
+    ~f:(fun (i, (p : Typedtree.function_param)) ->
       match p.fp_kind with
       | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
@@ -3678,7 +3696,43 @@ let formals ctx (f : func) =
           let x = Names.fresh ctx.names "unit" in
           let l = loc pat_loc in
           Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
+      | Tparam_pat { pat_desc = Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
+        when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
+          let* typ = typ ctx ~at:pat_loc pat_type in
+          let contract_name = Option.join (List.nth names i) in
+          let x = Names.fresh ctx.names (Option.value contract_name ~default:"arg") in
+          let l = loc pat_loc in
+          Ok
+            ( Some (Option.value contract_name ~default:"", x),
+              None,
+              R.Var.make ~loc:l (ident ~loc:l x) typ )
       | _ -> unsupported p.fp_loc "This parameter")
+
+(** The statements binding the variables of the parameters of [f] that are patterns to the
+    parts of their values, [formals]. *)
+let pattern_params ctx (f : func) formals =
+  let* bindings =
+    all (List.zip_exn f.params formals)
+      ~f:(fun ((p : Typedtree.function_param), (ocaml, _, _)) ->
+        match (p.fp_kind, ocaml) with
+        | ( Tparam_pat ({ pat_desc = Tpat_record _ | Tpat_tuple _; pat_loc; _ } as pat),
+            Some (_, x) ) ->
+            let l = loc pat_loc in
+            let* cond, binds = pattern ctx pat (R.Expr.var ~loc:l (name ~loc:l x)) in
+            begin match cond with
+            | Some _ -> unsupported pat_loc "A refutable pattern as a parameter"
+            | None ->
+                all binds ~f:(fun (id, value, t) ->
+                    let* typ = typ ctx ~at:pat_loc t in
+                    let y = Names.bind ~typ:t ctx.names id in
+                    Ok
+                      (R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
+                         (ident ~loc:l y)
+                      @ assume_in_range ~loc:l t y))
+            end
+        | _ -> Ok [])
+  in
+  Ok (List.concat (List.concat bindings))
 
 (** The names that the contract of [f] uses for its result and parameters, with the Raven
     names of the result, [result], and of the parameters, [formals]. *)
@@ -3810,6 +3864,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       opened = [];
       snapshots = [];
       positions = [];
+      formals = [];
     }
   in
   let l = loc f.loc in
@@ -4274,6 +4329,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       opened = [];
       snapshots = [];
       positions = [];
+      formals = [];
     }
   in
   let l = loc f.loc in
@@ -4290,9 +4346,15 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
         (past_pres, past_posts, { f with contract = Some { c with requires; ensures } })
     | None -> ([], [], f)
   in
-  let* formals = formals ctx f in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
-  let* result_name, _ = contract_names f header (List.length formals) in
+  let* result_name, arg_names = contract_names f header (List.length f.params) in
+  let* formals = formals ~names:arg_names ctx f in
+  let* bound = pattern_params ctx f formals in
+  ctx.formals <-
+    List.map formals ~f:(fun (ocaml, _, _) ->
+        match ocaml with
+        | Some (_, x) -> R.Expr.var ~loc:l (name ~loc:l x)
+        | None -> unit_value ~loc:l);
   let result = Names.fresh names result_name in
   let* returns =
     if is_unit f.body.exp_type then Ok []
@@ -4537,7 +4599,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       in
       Ok (List.concat views @ List.concat folds)
   in
-  let body = bind_au @ first @ stmts @ assignment @ establish @ last in
+  let body = bind_au @ bound @ first @ stmts @ assignment @ establish @ last in
   Ok
     (R.Callable.proc ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ past_formals @ implicit)
@@ -4682,6 +4744,7 @@ let items ?(interface = []) (structure : Typedtree.structure)
                       contract;
                       next;
                       prefix = [];
+                      prefix_count = 0;
                       role = None;
                     }
               | _ -> unsupported vb.vb_loc "This definition")
@@ -4821,13 +4884,7 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
               }
         | _ -> contract
       in
-      let prefix_params =
-        List.filter outer.params ~f:(fun p ->
-            match p.fp_kind with
-            | Tparam_pat { pat_desc = Tpat_var (x, _, _); _ } ->
-                List.mem prefix x ~equal:Ident.same
-            | _ -> false)
-      in
+      let prefix_params = if Option.is_some continues then outer.params else [] in
       Ok
         {
           id;
@@ -4838,6 +4895,7 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
           contract;
           next = Some rest.exp_loc;
           prefix;
+          prefix_count = List.length prefix_params;
           role = Option.map continues ~f:(fun g -> g.pid_str);
         })
 
@@ -5446,6 +5504,7 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     opened = [];
     snapshots = [];
     positions = [];
+    formals = [];
   }
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
@@ -5967,7 +6026,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.filter_map funcs ~f:(fun f ->
         Option.some_if
           ((not (List.is_empty f.prefix)) || Option.is_some f.role)
-          (proc_name f, (f.prefix, f.role)))
+          (proc_name f, (f.prefix_count, f.role)))
   in
   let origins = ref [] in
   let ocaml_env = source.env in
