@@ -4570,11 +4570,11 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
          ~returns:[ decl "ret" ret ]
          (ident ~loc:l name) (Some body))
   in
-  let lemma ?auto name formals ~requires ~ensures body =
+  let lemma ?auto ?triggers name formals ~requires ~ensures body =
     R.Member.callable
       (R.Callable.proc ~loc:l ~kind:Lemma ?auto ~formals
          ~requires:(List.map requires ~f:R.Spec.make)
-         ~ensures:(List.map ensures ~f:R.Spec.make)
+         ~ensures:(List.map ensures ~f:(R.Spec.make ?triggers))
          (ident ~loc:l name) (Some body))
   in
   let fpu location a b = R.Stmt.call ~loc:l (call (n "fpu") [ location; a; b ]) in
@@ -4586,7 +4586,9 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
        func (member_name st "extends")
          [ decl "a" state_type; decl "b" state_type ]
          (R.Type.bool ~loc:l) order;
+       (* Triggered by two steps of the order, as Z3 would choose, but fixed. *)
        lemma ~auto:true
+         ~triggers:[ [ extends (var "a") (var "b"); extends (var "b") (var "c") ] ]
          (member_name st "extends_trans")
          [ decl "a" state_type; decl "b" state_type; decl "c" state_type ]
          ~requires:[ bin And (extends (var "a") (var "b")) (extends (var "b") (var "c")) ]
