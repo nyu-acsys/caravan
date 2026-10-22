@@ -9,6 +9,10 @@ type interface = {
   interface_comments : (string * Location.t) list;
 }
 
+type library = { library_name : string; library_id : Ident.t; library : interface }
+(** A library that the file uses, which an interface [m.mli] without an implementation
+    next to it declares: the module [M], trusted. *)
+
 type t = {
   file : string;
   text : string;
@@ -23,6 +27,7 @@ type t = {
           helped, each on a key. *)
   interface : interface option;
   proof : S.proof_decl list;  (** The declarations of the proof. *)
+  libraries : library list;
 }
 
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
@@ -125,6 +130,38 @@ let load (file : string) : (t, Report.error) Result.t =
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
+    (* The libraries, as modules of the interfaces next to the file without
+       implementations. *)
+    let dir = Stdlib.Filename.dirname file in
+    let own = Stdlib.Filename.(remove_extension (basename file)) in
+    let library_files =
+      List.filter
+        (List.sort (Array.to_list (Stdlib.Sys.readdir dir)) ~compare:String.compare)
+        ~f:(fun f ->
+          let base = Stdlib.Filename.remove_extension f in
+          Stdlib.Filename.check_suffix f ".mli"
+          && (not (String.equal base own))
+          && not (Stdlib.Sys.file_exists (Stdlib.Filename.concat dir (base ^ ".ml"))))
+    in
+    let env, libraries =
+      List.fold library_files ~init:(env, []) ~f:(fun (env, libraries) f ->
+          let library = load_interface (Stdlib.Filename.concat dir f) in
+          let library_name = String.capitalize (Stdlib.Filename.remove_extension f) in
+          let declaration =
+            Ast_helper.Sig.module_
+              (Ast_helper.Md.mk
+                 (Location.mknoloc (Some library_name))
+                 (Ast_helper.Mty.signature library.signature))
+          in
+          let typed = Typemod.type_interface env [ declaration ] in
+          let library_id =
+            match typed.sig_items with
+            | [ { sig_desc = Tsig_module { md_id = Some id; _ }; _ } ] -> id
+            | _ -> Ident.create_local library_name
+          in
+          (typed.sig_final_env, { library_name; library_id; library } :: libraries))
+    in
+    let libraries = List.rev libraries in
     let text = Stdio.In_channel.read_all file in
     let lexbuf = Lexing.from_string text in
     Location.init lexbuf file;
@@ -147,7 +184,18 @@ let load (file : string) : (t, Report.error) Result.t =
     Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.map proof ~f:(fun proof ->
-        { file; text; typed; comments; env; sequence; pending; interface; proof })
+        {
+          file;
+          text;
+          typed;
+          comments;
+          env;
+          sequence;
+          pending;
+          interface;
+          proof;
+          libraries;
+        })
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

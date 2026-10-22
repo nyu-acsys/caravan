@@ -30,6 +30,9 @@ type t = {
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
+  library : Path.t option;
+      (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
+          module with no definition of it. *)
   at : Location.t;
 }
 
@@ -44,6 +47,7 @@ let list =
       ];
     heap = None;
     alias = None;
+    library = None;
     at = Location.none;
   }
 
@@ -58,6 +62,7 @@ let option =
       ];
     heap = None;
     alias = None;
+    library = None;
     at = Location.none;
   }
 
@@ -87,6 +92,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors;
           heap = None;
           alias = None;
+          library = None;
           at;
         }
   | Ttype_record lds when List.is_empty decl.typ_params ->
@@ -124,6 +130,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors;
           heap;
           alias = None;
+          library = None;
           at;
         }
   | Ttype_abstract when List.is_empty decl.typ_params && Option.is_some decl.typ_manifest
@@ -135,6 +142,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors = [];
           heap = None;
           alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
+          library = None;
           at;
         }
   | Ttype_variant _ | Ttype_record _ | Ttype_abstract ->
@@ -142,7 +150,23 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
   | _ -> Report.unsupported at "This type definition"
 
 let declares (d : t) (p : Path.t) =
-  match (d.id, p) with Some id, Pident id' -> Ident.same id id' | _ -> false
+  match (d.id, d.library, p) with
+  | Some id, _, Pident id' -> Ident.same id id'
+  | _, Some q, _ -> Path.same p q
+  | _ -> false
+
+(** The abstract type [name] of the library [library], the module with the identifier
+    [library_id], declared at [at]. *)
+let library_type ~library ~library_id ~at name =
+  {
+    id = None;
+    module_name = library ^ "_" ^ name;
+    ctors = [];
+    heap = None;
+    alias = None;
+    library = Some (Path.Pdot (Pident library_id, name));
+    at;
+  }
 
 (** The type ['a sequence] of specifications, declared as [id]: Raven's [Seq]. *)
 let sequence id =
@@ -152,6 +176,7 @@ let sequence id =
     ctors = [];
     heap = None;
     alias = None;
+    library = None;
     at = Location.none;
   }
 
@@ -351,10 +376,11 @@ let member (types : t list) (d : t) : (R.Member.t, Report.error) Result.t =
     Ok (R.Type.variant ~loc:l (R.Ident.make ~loc:l c.raven) args)
   in
   let* variants = Result.all (List.map d.ctors ~f:variant) in
-  Ok
-    (R.Member.module_ ~loc:l
-       (R.Ident.make ~loc:l d.module_name)
-       [
-         R.Member.type_ ~loc:l (R.Ident.make ~loc:l "T")
-           (Some (R.Type.data ~loc:l variants));
-       ])
+  let t =
+    match d.library with
+    | Some _ -> R.Member.free (R.Member.type_ ~loc:l (R.Ident.make ~loc:l "T") None)
+    | None ->
+        R.Member.type_ ~loc:l (R.Ident.make ~loc:l "T")
+          (Some (R.Type.data ~loc:l variants))
+  in
+  Ok (R.Member.module_ ~loc:l (R.Ident.make ~loc:l d.module_name) [ t ])

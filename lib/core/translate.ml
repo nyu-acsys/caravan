@@ -396,6 +396,8 @@ type context = {
   mutable fields_of : (string * (string * R.Expr.t)) list;
       (** The variables known to be fields of values, by their Raven names: the field and
           the value, as [tail] of [q] after [let push { tail; _ } value]. *)
+  libraries : (Ident.t * string) list;
+      (** The modules of the libraries, with their names: trusted Raven modules. *)
   mutable formals : R.Expr.t list;
       (** The procedure's parameters, of which a lifted local function that continues it,
           or that it continues too, takes the first. *)
@@ -2593,6 +2595,16 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
       match Names.find ctx.names id with
       | Some x -> Ok ([], R.Expr.var ~loc:l (name ~loc:l x))
       | None -> unsupported at "A function used as a value")
+  | Texp_ident (Pdot (Pident m, x), _, _)
+    when List.Assoc.mem ctx.libraries m ~equal:Ident.same ->
+      (* A value of a library, which its module gives by a function. *)
+      Ok
+        ( [],
+          R.Expr.call ~loc:l
+            (R.Name.make ~loc:l
+               ~path:[ List.Assoc.find_exn ctx.libraries m ~equal:Ident.same ]
+               x)
+            [] )
   | Texp_ident (p, _, _) -> (
       match stdlib_name p with
       | Some "max_int" -> Ok ([], R.Expr.int ~loc:l Prelude.max_int)
@@ -3096,6 +3108,11 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
           with
           | Some f -> call ctx e f args
           | None -> unsupported at "A call of a local function")
+      | Pdot (Pident m, x) when List.Assoc.mem ctx.libraries m ~equal:Ident.same ->
+          (* A function of a library, trusted. *)
+          call ctx e
+            (List.Assoc.find_exn ctx.libraries m ~equal:Ident.same ^ "." ^ x)
+            args
       | _ -> unsupported at ("A call of " ^ Path.name path))
   | _ -> unsupported at "This application"
 
@@ -3202,9 +3219,13 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
               "This call needs a fact about an earlier state, of which no snapshot was \
                taken")
   in
-  let callee =
-    R.Expr.call ~loc:l (name ~loc:l f) (args @ List.concat witnesses @ implicit)
+  (* A library's procedure is qualified by its module, as [Backoff.once]. *)
+  let callee_name =
+    match String.lsplit2 f ~on:'.' with
+    | Some (m, x) -> R.Name.make ~loc:l ~path:[ m ] x
+    | None -> name ~loc:l f
   in
+  let callee = R.Expr.call ~loc:l callee_name (args @ List.concat witnesses @ implicit) in
   (* The ghost results witnessing facts about the state after the call: the caller's own,
      if the callee continues its update with the same ones. *)
   let ghost_facts =
@@ -3975,6 +3996,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       formals = [];
       ghost_args = [];
       fields_of = [];
+      libraries = [];
     }
   in
   let l = loc f.loc in
@@ -4418,7 +4440,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
+    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries
     (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
     (R.Callable.t, error) Result.t =
   let names = Names.create () in
@@ -4433,6 +4455,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       pasts;
       past_returns;
       ghost_args;
+      libraries;
       origins;
       annotations;
       spec_funcs = funcs;
@@ -5640,6 +5663,7 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     formals = [];
     ghost_args = [];
     fields_of = [];
+    libraries = [];
   }
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
@@ -6134,6 +6158,26 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* types, funcs = items ~interface source.typed annotations in
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
   let funcs = funcs @ List.concat lifted in
+  (* The abstract types of the libraries. *)
+  let* library_types =
+    all source.libraries ~f:(fun (lib : Source.library) ->
+        all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
+            match item.psig_desc with
+            | Psig_type (_, decls) ->
+                all decls ~f:(fun (decl : Parsetree.type_declaration) ->
+                    match (decl.ptype_kind, decl.ptype_manifest, decl.ptype_params) with
+                    | Ptype_abstract, None, [] ->
+                        Ok
+                          (Datatypes.library_type ~library:lib.library_name
+                             ~library_id:lib.library_id ~at:decl.ptype_loc
+                             decl.ptype_name.txt)
+                    | _ ->
+                        unsupported decl.ptype_loc
+                          "A type of a library other than an abstract one without \
+                           parameters")
+            | _ -> Ok []))
+  in
+  let types = List.concat (List.concat library_types) @ types in
   (* The data types, and the sequences of specifications, which have no module. *)
   let data_types = types in
   let types =
@@ -6150,6 +6194,57 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
   let* record_fields = Datatypes.fields types in
+  (* Each library's module: its values, trusted, as functions without arguments, and its
+     functions as procedures. *)
+  let* library_modules =
+    all source.libraries ~f:(fun (lib : Source.library) ->
+        let* members =
+          all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
+              match item.psig_desc with
+              | Psig_value vd ->
+                  let at = vd.pval_loc in
+                  let l = loc at in
+                  let x = vd.pval_name.txt in
+                  let value =
+                    Env.find_value (Pdot (Pident lib.library_id, x)) source.env
+                  in
+                  let rec arrows (t : Types.type_expr) =
+                    match Types.get_desc t with
+                    | Tarrow (Nolabel, a, r, _) ->
+                        let args, result = arrows r in
+                        (a :: args, result)
+                    | Tpoly (t, []) -> arrows t
+                    | _ -> ([], t)
+                  in
+                  let args, result = arrows value.val_type in
+                  let* result_typ = Datatypes.typ types ~at result in
+                  let returns =
+                    if is_unit result then []
+                    else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
+                  in
+                  let* formals =
+                    all
+                      (List.mapi args ~f:(fun i a -> (i, a)))
+                      ~f:(fun (i, a) ->
+                        let* typ = Datatypes.typ types ~at a in
+                        Ok (R.Var.make ~loc:l (ident ~loc:l (Printf.sprintf "x%d" i)) typ))
+                  in
+                  Ok
+                    [
+                      R.Member.free
+                        (R.Member.callable
+                           (match args with
+                           | [] -> R.Callable.func ~loc:l ~returns (ident ~loc:l x) None
+                           | _ ->
+                               R.Callable.proc ~loc:l ~formals ~returns (ident ~loc:l x)
+                                 None));
+                    ]
+              | Psig_type _ | Psig_attribute _ -> Ok []
+              | _ -> unsupported item.psig_loc "This item of a library's interface")
+        in
+        let l = loc Location.none in
+        Ok (R.Member.module_ ~loc:l (ident ~loc:l lib.library_name) (List.concat members)))
+  in
   let refs = ref [] in
   let primitives = ref [] in
   let pure = pure_functions funcs in
@@ -6478,8 +6573,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args functions
-          origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+          ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
+          ~libraries:
+            (List.map source.libraries ~f:(fun (lib : Source.library) ->
+                 (lib.library_id, lib.library_name)))
+          functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
@@ -6492,7 +6590,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   Ok
     ( R.Program.make ~loc:start
-        (Prelude.members @ modules @ record_fields @ ref_fields @ ghost_fields
+        (Prelude.members @ modules @ library_modules @ record_fields @ ref_fields
+       @ ghost_fields
         @ List.concat structure_member_lists
         @ List.concat_map pending_member_lists ~f:List.concat
         @ List.map !primitives ~f:snd
