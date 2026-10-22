@@ -27,7 +27,7 @@ let lexeme_loc lexbuf =
     loc_ghost = false;
   }
 
-type kind = Contract | Loop | Predicate | Ghost | Linearization | Initially
+type kind = Contract | Loop | Predicate | Ghost | Linearization | Initially | Trusted
 
 (** What [annotation] states, by its first word. *)
 let kind (annotation : t) =
@@ -37,6 +37,7 @@ let kind (annotation : t) =
   | ("fold" | "unfold" | "assert") :: _ -> Ghost
   | ("commit" | "returning" | "performs") :: _ -> Linearization
   | "initially" :: _ -> Initially
+  | [ "trusted" ] -> Trusted
   | _ -> Contract
 
 (** Parses [annotation] with [entry]; the lexer and the parser report errors by raising.

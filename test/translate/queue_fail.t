@@ -3,10 +3,10 @@
   10 |       if Atomic.compare_and_set q.head old_head old_head then Some value else pop_opt q
                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: This step may not perform the action pop.
-  [Error] File "queue_fail.ml", line 16, columns 49-49:
+  [Error] File "queue_fail.ml", line 16, columns 5-49:
   16 |   if Atomic.compare_and_set q.tail old_tail fresh then () else ()
-                                                        ^
-  Verification Error: The invariant is_queue may not hold after this step.
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Verification Error: This step may change the state of is_queue in a way that no action allows; if it performs one, say so, as (*@ performs a *).
   File "queue_fail.proof", line 12, columns 10-18:
   12 | invariant is_queue (q : t) (s : state) =
                  ^^^^^^^^
