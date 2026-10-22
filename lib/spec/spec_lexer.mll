@@ -38,6 +38,7 @@
         "if", IF;
         "action", ACTION;
         "consumes", CONSUMES;
+        "continues", CONTINUES;
         "linearizes", LINEARIZES;
         "assert", ASSERT;
         "atomic", ATOMIC;

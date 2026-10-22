@@ -89,6 +89,9 @@ type contract = {
   atomic_ensures : term list;
   variant : term list;
   pure : bool;
+  continues : id option;
+      (** The function whose atomic update a local function continues, [continues push]:
+          it takes that function's parameters first, and has its contract too. *)
 }
 
 let empty_contract =
@@ -101,6 +104,7 @@ let empty_contract =
     atomic_ensures = [];
     variant = [];
     pure = false;
+    continues = None;
   }
 
 type loop_spec = { invariants : term list; loop_variant : term list }

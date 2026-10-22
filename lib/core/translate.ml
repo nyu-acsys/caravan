@@ -12,6 +12,18 @@ type error = Report.error
 
 module S = Caravan_spec.Spec_ast
 
+(** The head of the application [t] and its arguments. *)
+let rec spine (t : S.term) args =
+  match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
+
+(** The elements of the list literal [t], if it is one. *)
+let rec list_literal (t : S.term) =
+  match spine t [] with
+  | { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ }, [] -> Some []
+  | { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, [ h; rest ] ->
+      Option.map (list_literal rest) ~f:(fun rest -> h :: rest)
+  | _ -> None
+
 let ( let* ) = Result.( >>= )
 let error ?related loc message = Error (Report.error ?related Type loc message)
 let unsupported = Report.unsupported
@@ -142,6 +154,11 @@ type au = {
       (** The action that the step performs if it commits, as [(*@ performs pop *)] or by
           its step, with the condition, if any, under which the step is the action's. *)
   self : string;  (** The procedure's name. *)
+  role : string;
+      (** The function that the update is of: [self], or the one it continues. *)
+  ghost_results : R.Expr.t list;
+      (** The ghost results witnessing facts about earlier states, which the update
+          commits with. *)
   has_result : bool;
   open_ :
     at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list, Report.error) Result.t;
@@ -199,6 +216,65 @@ let member_name st suffix = st.invariant ^ "_" ^ suffix
 
 let module_name st suffix = String.capitalize st.invariant ^ "_" ^ suffix
 
+type past = { inv : string; field : string; element : S.term }
+(** A fact about an earlier state of a structure, [past (mem e s.f)]: [e] was in the field
+    [f], owned by index, of a state of the invariant [inv], which a snapshot of its
+    history and a position in [f] witness. *)
+
+(** [t] as a fact about an earlier state, if it is one, of the structures [structures]. *)
+let past_of structures (t : S.term) =
+  match spine (S.chain t) [] with
+  | { term_desc = Tvar (Qid { pid_str = "past"; _ }); _ }, [ fact ] ->
+      begin match spine (S.chain fact) [] with
+      | ( { term_desc = Tvar (Qid { pid_str = "mem"; _ }); _ },
+          [
+            element;
+            {
+              term_desc =
+                Tfield
+                  ( { term_desc = Tvar (Qid { pid_str = s; _ }); _ },
+                    Qid { pid_str = f; _ } );
+              _;
+            };
+          ] ) ->
+          Option.bind
+            (List.find structures ~f:(fun st -> String.equal st.state s))
+            ~f:(fun st ->
+              Option.some_if
+                (List.Assoc.mem st.chains f ~equal:String.equal)
+                { inv = st.invariant; field = f; element })
+      | _ -> None
+      end
+  | _ -> None
+
+(** The state of the growing fields [values] of [st], as the history holds it. *)
+let state_of ~loc:l st values =
+  R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ module_name st "state" ] "state") values
+
+(** That the snapshot [snapshot] of [st]'s history, on the structure [structure], has the
+    value [e] at the position [k] of its field [field]. *)
+let past_fact ~loc:l st ~structure ~field ~snapshot ~k e =
+  let qn m x = R.Name.make ~loc:l ~path:[ m ] x in
+  let entries = R.Expr.field ~loc:l snapshot (R.Name.make ~loc:l field) in
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  List.reduce_exn ~f:(bin And)
+    [
+      R.Expr.own ~loc:l
+        [
+          structure;
+          R.Expr.call ~loc:l
+            (qn (module_name st "history") "frag")
+            [
+              R.Expr.call ~loc:l
+                (qn (module_name st "states") "set")
+                [ R.Expr.set ~loc:l [ snapshot ] ];
+            ];
+        ];
+      bin Leq (R.Expr.int ~loc:l 0) k;
+      bin Lt k (R.Expr.call ~loc:l (qn "Seq" "length") [ entries ]);
+      bin Eq (R.Expr.index ~loc:l entries k) e;
+    ]
+
 type shared = {
   persistent : (string * Location.t) list;
       (** The invariants, by their names, with their definitions. *)
@@ -219,6 +295,16 @@ type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
 (** The state of an open invariant: the variables of its fields and of the index maps of
     the fields owned by index. *)
 
+type position = {
+  pos_inv : string;
+  pos_field : string;
+  pos_element : R.Expr.t;
+  pos_snapshot : R.Expr.t;
+  pos_k : R.Expr.t;
+}
+(** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
+    index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
+
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Member.t) list ref;
@@ -229,6 +315,17 @@ type context = {
   names : Names.t;
   functions : (string * string) list;
       (** The top-level functions, by the unique name of their OCaml identifier. *)
+  pasts : (string * (string * string * int) list) list;
+      (** The facts about earlier states that procedures require, by their names: the
+          invariant, the field, and the position of the parameter that was in it. *)
+  past_returns :
+    (string * (string * string * (R.Expr.t list -> R.Expr.t option)) list) list;
+      (** The facts about earlier states that procedures ensure, by their names, each
+          witnessed by two ghost results: the invariant, the field, and the entry, given
+          the arguments, if it is known. *)
+  lifted : (string * (Ident.t list * string option)) list;
+      (** The lifted local functions, by their procedures' names, with the parameters of
+          the function they continue, which their calls pass first, and its name. *)
   origins : origin list ref;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   spec_funcs : (string * string) list;
@@ -251,9 +348,11 @@ type context = {
       (** The invariants that the function's precondition holds, opened around each of its
           atomic steps, with their arguments. *)
   mutable opened : (string * opened) list;  (** The states of the open invariants. *)
-  mutable snapshots : (string * R.Expr.t list list) list;
+  mutable snapshots : (string * opened list) list;
       (** The snapshots of the states of the invariants taken on the current path, latest
           first. *)
+  mutable positions : position list;
+      (** The positions of entries in snapshots known on the current path. *)
 }
 
 let typ ctx ~at t = Datatypes.typ ctx.types ~at t
@@ -501,10 +600,6 @@ let list_function : S.qualid -> string option = function
   | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "length"; _ }) -> Some "len"
   | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "mem"; _ }) -> Some "in"
   | _ -> None
-
-(** The head of the application [t] and its arguments. *)
-let rec spine (t : S.term) args =
-  match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
 
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
 *)
@@ -762,13 +857,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
 (** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
     as [[]] in [queue q []]. *)
 and expected_formula env (expected : Types.type_expr option) (t : S.term) =
-  let rec literal (t : S.term) =
-    match spine t [] with
-    | { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ }, [] -> Some []
-    | { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, [ h; rest ] ->
-        Option.map (literal rest) ~f:(fun rest -> h :: rest)
-    | _ -> None
-  in
+  let literal = list_literal in
   let is_sequence ty =
     match Datatypes.desc env.data ty with
     | Tconstr (p, [ _ ], _) ->
@@ -834,8 +923,16 @@ and application env (t : S.term) =
       let* i = formula env i in
       Ok (R.Expr.index ~loc:l s i)
   | Tvar (Qid { pid_str = "++"; pid_fixity = Infix; _ }), [ a; b ] ->
-      let* a = formula env a in
-      let* b = formula env b in
+      (* Concatenating sequences, as list literals are here. *)
+      let operand (t : S.term) =
+        match list_literal t with
+        | Some elements ->
+            let* elements = all elements ~f:(formula env) in
+            Ok (R.Expr.seq ~loc:(loc t.term_loc) elements)
+        | None -> formula env t
+      in
+      let* a = operand a in
+      let* b = operand b in
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l "++") [ a; b ])
   | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
       let* a = formula env a in
@@ -1339,9 +1436,9 @@ let action_env ctx st inv_params args values bindings =
   List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e))
 
 (** The state after [p] of [st] from [opened], whose invariant has the parameters
-    [inv_params] and the arguments [args]: each field's value, whether it changes, and the
+    [inv_params] and the arguments [args]: each field's value, whether it changes, the
     index map of each field owned by index that it changes, as a list that it appends an
-    entry to. *)
+    entry to, and the entries appended, with their fields and positions. *)
 let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
   let env = action_env ctx st inv_params args opened.values p.bindings in
   let next =
@@ -1375,22 +1472,30 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
         | _ -> None
         end
   in
-  let indices =
+  let appended =
     List.filter_map st.chains ~f:(fun (field, index) ->
         let i, _ =
           List.findi_exn st.fields ~f:(fun _ (f, _, _, _, _) -> String.equal f field)
         in
         Option.map (appended field) ~f:(fun e ->
             let l = R.Loc.none in
-            ( index,
-              R.Expr.update ~loc:l
-                (List.Assoc.find_exn opened.indices field ~equal:String.equal)
-                e
-                (R.Expr.call ~loc:l
-                   (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
-                   [ List.nth_exn opened.values i ]) )))
+            ( field,
+              index,
+              e,
+              R.Expr.call ~loc:l
+                (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
+                [ List.nth_exn opened.values i ] )))
   in
-  (next, indices)
+  let indices =
+    List.map appended ~f:(fun (field, index, e, position) ->
+        ( index,
+          R.Expr.update ~loc:R.Loc.none
+            (List.Assoc.find_exn opened.indices field ~equal:String.equal)
+            e position ))
+  in
+  ( next,
+    indices,
+    List.map appended ~f:(fun (field, _, e, position) -> (field, e, position)) )
 
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
@@ -1427,6 +1532,24 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
               } )
             :: List.Assoc.remove ctx.opened inv ~equal:String.equal;
           let all_locals = locals @ List.map index_locals ~f:snd in
+          (* The entries of earlier snapshots are still at their positions. *)
+          let current =
+            state_of ~loc:l st (grown st (List.map locals ~f:(fun (_, x, _) -> var x)))
+          in
+          let kept =
+            if has_history st then
+              List.concat_map
+                (List.filter ctx.positions ~f:(fun p -> String.equal p.pos_inv inv))
+                ~f:(fun p ->
+                  [
+                    lemma (member_name st "observe")
+                      [ List.hd_exn args; p.pos_snapshot; current ];
+                    lemma
+                      (member_name st ("kept_" ^ p.pos_field))
+                      [ p.pos_snapshot; current; p.pos_k ];
+                  ])
+            else []
+          in
           List.concat_map all_locals ~f:(fun (_, x, typ) ->
               R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x))
           @ [
@@ -1435,6 +1558,7 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
                   (List.map all_locals ~f:(fun (e, x, _) -> (ident ~loc:l x, var e)))
                 (name ~loc:l inv) args;
             ]
+          @ kept
       | false, None -> [ R.Stmt.unfold ~loc:l (name ~loc:l inv) args ]
       | true, _ -> (
           let definition =
@@ -1453,16 +1577,17 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
           let fold ?(witnesses = []) () =
             [ R.Stmt.fold ~loc:la ~witnesses (name ~loc:la inv) args ]
           in
-          let snapshot st values =
+          let snapshot st (state : opened) =
             let snapshots =
               Option.value
                 (List.Assoc.find ctx.snapshots inv ~equal:String.equal)
                 ~default:[]
             in
             ctx.snapshots <-
-              (inv, grown st values :: snapshots)
+              (inv, state :: snapshots)
               :: List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
-            lemma (member_name st "snapshot") [ List.hd_exn args; state_value st values ]
+            lemma (member_name st "snapshot")
+              [ List.hd_exn args; state_value st state.values ]
           in
           match (structure inv, List.Assoc.find ctx.opened inv ~equal:String.equal) with
           | Some st, Some opened ->
@@ -1470,7 +1595,7 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
               | Some p ->
                   (* The action's state, which the history learns if a growing field
                      changes, and the fields it changes, as witnesses. *)
-                  let next, indices =
+                  let next, indices, appended =
                     next_state ctx st ~inv_params:st.params args opened p
                   in
                   let values = List.map next ~f:fst in
@@ -1496,12 +1621,163 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
                       ]
                     else []
                   in
-                  if has_history st then learn @ (snapshot st values :: fold ~witnesses ())
+                  (* The state after the action, with its index maps. *)
+                  let state =
+                    {
+                      values;
+                      indices =
+                        List.map opened.indices ~f:(fun (field, e) ->
+                            let index =
+                              List.Assoc.find_exn st.chains field ~equal:String.equal
+                            in
+                            ( field,
+                              Option.value
+                                (List.Assoc.find indices index ~equal:String.equal)
+                                ~default:e ));
+                    }
+                  in
+                  let after = state_of ~loc:l st (grown st values) in
+                  ctx.positions <-
+                    List.map appended ~f:(fun (field, e, k) ->
+                        {
+                          pos_inv = inv;
+                          pos_field = field;
+                          pos_element = e;
+                          pos_snapshot = after;
+                          pos_k = k;
+                        })
+                    @ ctx.positions;
+                  if has_history st then learn @ (snapshot st state :: fold ~witnesses ())
                   else fold ~witnesses ()
-              | None when has_history st -> snapshot st opened.values :: fold ()
+              | None when has_history st -> snapshot st opened :: fold ()
               | None -> fold ()
               end
           | _ -> fold ()))
+
+(** The known position of [e] in [field] of a snapshot of [inv]'s history, if any. *)
+let known_position ctx inv field e =
+  List.find ctx.positions ~f:(fun p ->
+      String.equal p.pos_inv inv
+      && String.equal p.pos_field field
+      && R.Expr.alpha_equal p.pos_element e)
+
+type position_join = {
+  mutable merged : (position * R.Expr.t * R.Expr.t) list;
+      (** The facts that arms learned, one for each entry, with the variables of their
+          snapshots and positions. *)
+  mutable decls : R.Stmt.t list;  (** Their declarations, before the branch. *)
+  mutable learned : position list list;  (** The facts each arm learned. *)
+}
+(** The position facts of a branch's arms, joined after it. *)
+
+(** Whether [p] and [q] are about the same entry. *)
+let same_entry p q =
+  String.equal p.pos_inv q.pos_inv
+  && String.equal p.pos_field q.pos_field
+  && R.Expr.alpha_equal p.pos_element q.pos_element
+
+let new_join () = { merged = []; decls = []; learned = [] }
+
+(** The statements at the end of an arm, which started with the facts [start], assigning
+    the facts it learned to the variables of [join]. *)
+let end_arm ctx join ~(start : position list) =
+  let l = R.Loc.none in
+  let learned =
+    List.filter ctx.positions ~f:(fun p -> not (List.mem start p ~equal:phys_equal))
+  in
+  join.learned <- learned :: join.learned;
+  List.concat_map learned ~f:(fun p ->
+      let _, snapshot, k =
+        match List.find join.merged ~f:(fun (q, _, _) -> same_entry p q) with
+        | Some vars -> vars
+        | None ->
+            let st =
+              List.find_exn ctx.shared.structures ~f:(fun st ->
+                  String.equal st.invariant p.pos_inv)
+            in
+            let x = Names.fresh ctx.names "snapshot"
+            and y = Names.fresh ctx.names "position" in
+            join.decls <-
+              join.decls
+              @ R.Stmt.local ~loc:l ~ghost:true
+                  ~typ:
+                    (R.Type.named ~loc:l
+                       (R.Name.make ~loc:l ~path:[ module_name st "state" ] "T")
+                       [])
+                  (ident ~loc:l x)
+              @ R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.int ~loc:l) (ident ~loc:l y);
+            let vars =
+              (p, R.Expr.var ~loc:l (name ~loc:l x), R.Expr.var ~loc:l (name ~loc:l y))
+            in
+            join.merged <- vars :: join.merged;
+            vars
+      in
+      [
+        R.Stmt.assign ~loc:l [ snapshot ] (R.Stmt.expr_rhs p.pos_snapshot);
+        R.Stmt.assign ~loc:l [ k ] (R.Stmt.expr_rhs p.pos_k);
+      ])
+
+(** The facts after a branch whose arms started with [start] and ended with [ends]: those
+    that every arm kept, and those that every arm learned, in [join]'s variables. *)
+let join_positions join ~(start : position list) (ends : position list list) =
+  let kept =
+    List.filter start ~f:(fun p ->
+        List.for_all ends ~f:(fun e -> List.mem e p ~equal:phys_equal))
+  in
+  let learned =
+    List.filter_map join.merged ~f:(fun (p, snapshot, k) ->
+        Option.some_if
+          (List.for_all join.learned ~f:(List.exists ~f:(same_entry p)))
+          { p with pos_snapshot = snapshot; pos_k = k })
+  in
+  learned @ kept
+
+(** The statements taking snapshots of the states of the open invariants with a history,
+    which become the latest. *)
+let take_snapshots ctx ~(at : Location.t) =
+  let l = loc at in
+  List.concat_map ctx.invariants ~f:(fun (inv, args) ->
+      match
+        ( List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv),
+          List.Assoc.find ctx.opened inv ~equal:String.equal )
+      with
+      | Some st, Some opened when has_history st ->
+          let snapshots =
+            Option.value
+              (List.Assoc.find ctx.snapshots inv ~equal:String.equal)
+              ~default:[]
+          in
+          ctx.snapshots <-
+            (inv, opened :: snapshots)
+            :: List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
+          [
+            R.Stmt.call ~loc:l
+              (R.Expr.call ~loc:l
+                 (name ~loc:l (member_name st "snapshot"))
+                 [ List.hd_exn args; state_of ~loc:l st (grown st opened.values) ]);
+          ]
+      | _ -> [])
+
+(** The snapshots taken on all of the paths [arms] ended with: those before the paths
+    split. *)
+let common_snapshots (arms : (string * opened list) list list) =
+  (* The snapshots that [a] and [b], latest first, share. *)
+  let shared a b =
+    let rec go acc = function
+      | x :: xs, y :: ys when phys_equal x y -> go (x :: acc) (xs, ys)
+      | _ -> acc
+    in
+    go [] (List.rev a, List.rev b)
+  in
+  match arms with
+  | [] -> []
+  | first :: rest ->
+      List.map first ~f:(fun (inv, snapshots) ->
+          ( inv,
+            List.fold rest ~init:snapshots ~f:(fun common arm ->
+                shared common
+                  (Option.value (List.Assoc.find arm inv ~equal:String.equal) ~default:[]))
+          ))
 
 (** [make], folding a predicate, preceded by setting the ghost field of a view to its new
     value, the last argument: the view changes with the state. *)
@@ -1526,7 +1802,7 @@ let perform_views ctx ~(at : Location.t) (p : performing) =
       let args = List.Assoc.find ctx.invariants inv ~equal:String.equal in
       match (structure, args) with
       | Some st, Some args ->
-          let next, _ = next_state ctx st ~inv_params:st.params args opened p in
+          let next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
           let env =
             bind (scope_env ctx) st.state
               (State
@@ -1706,7 +1982,8 @@ let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of str
     | [], _ | _, None -> opening @ access @ use_invariants ctx ~at ~fold:true
     | performings, Some (_, _, _, _, result) ->
         (* If the step succeeds, it performs the action whose step it is, or changes
-           nothing. *)
+           nothing. The state before it is the latest snapshot after it on every path. *)
+        let snapshot = take_snapshots ctx ~at in
         let snapshots = ctx.snapshots in
         let close ?performs () =
           ctx.snapshots <- snapshots;
@@ -1719,7 +1996,7 @@ let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of str
         in
         let failed = close () in
         ctx.snapshots <- snapshots;
-        opening @ access
+        opening @ access @ snapshot
         @ [ R.Stmt.if_ ~loc:l result [ R.Stmt.ghost_block ~loc:l performed ] failed ]
   in
   match ctx.au with
@@ -1747,7 +2024,7 @@ let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of str
                    function. *)
                 let linearizing =
                   List.filter (performings ()) ~f:(fun (p, _) ->
-                      List.mem p.performed.linearizes au.self ~equal:String.equal)
+                      List.mem p.performed.linearizes au.role ~equal:String.equal)
                 in
                 begin match (linearizing, au.performing) with
                 | _, Some _ | [], None -> Ok []
@@ -1808,11 +2085,12 @@ let set_au_state ctx = function
 let au_snapshot ctx =
   ( Option.map ctx.au ~f:(fun au -> (au.state, au.step, au.values, au.performing)),
     ctx.opened,
-    ctx.snapshots )
+    (ctx.snapshots, ctx.positions) )
 
-let restore_au ctx (au_state, opened, snapshots) =
+let restore_au ctx (au_state, opened, (snapshots, positions)) =
   ctx.opened <- opened;
   ctx.snapshots <- snapshots;
+  ctx.positions <- positions;
   match (ctx.au, au_state) with
   | Some au, Some (state, step, values, performing) ->
       au.state <- state;
@@ -2025,6 +2303,10 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
         branch ctx e (fun target -> conditional ctx ~at ?polarity ~tail c e1 e2 target)
       in
       Ok (c_stmts @ fst stmts, snd stmts)
+  | Texp_let (_, [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; _ } ], rest)
+    when List.Assoc.mem ctx.functions (Ident.unique_name id) ~equal:String.equal ->
+      (* A local function, lifted to the top level. *)
+      expr ~tail ctx rest
   | Texp_let (Nonrecursive, bindings, body) ->
       (* The bound expressions are evaluated before any of their variables is bound. *)
       let* evaluated =
@@ -2321,7 +2603,11 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
   | Some ((And | Or) as op), _, [ a; b ] ->
       (* The right operand is evaluated only if the left one does not decide. *)
       let* a_stmts, a = expr ctx a in
+      let before = ctx.snapshots and before_positions = ctx.positions in
       let* b_stmts, b = expr ctx b in
+      (* The snapshots that the right operand takes are on one path only. *)
+      ctx.snapshots <- common_snapshots [ before; ctx.snapshots ];
+      ctx.positions <- before_positions;
       if List.is_empty b_stmts then Ok (a_stmts, R.Expr.binary ~loc:l op a b)
       else
         let then_, else_ =
@@ -2401,11 +2687,26 @@ and call ctx (e : Typedtree.expression) f args =
   let* stmts_args = all (List.rev args) ~f:(fun arg -> expr ctx arg) in
   let stmts = List.concat_map stmts_args ~f:fst in
   let args = List.rev_map stmts_args ~f:snd in
+  (* A lifted local function takes the parameters of the function it continues first. *)
+  let prefix, role =
+    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:([], None)
+  in
+  let* prefix =
+    all prefix ~f:(fun id ->
+        match Names.find ctx.names id with
+        | Some x -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
+        | None ->
+            error e.exp_loc (Printf.sprintf "%s is not in scope here" (Ident.name id)))
+  in
+  let args = prefix @ args in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
-     its place, with the atomic update's values of the implicit parameters. *)
+     its place, with the atomic update's values of the implicit parameters, as does a call
+     of a function that continues the update. *)
   let* retry =
     match ctx.au with
-    | Some au when String.equal au.self f ->
+    | Some au
+      when String.equal au.self f
+           || Option.exists role ~f:(fun r -> String.equal r au.role) ->
         begin match au.state with
         | Pending ->
             let* opening, values = au.open_ ~at:e.exp_loc ~unfold:false in
@@ -2428,15 +2729,106 @@ and call ctx (e : Typedtree.expression) f args =
     Option.value_map retry ~default:(Ok []) ~f:(fun (au, _, _) ->
         au.close Commit_call ~value)
   in
-  let callee = R.Expr.call ~loc:l (name ~loc:l f) (args @ implicit) in
+  (* The latest snapshot witnesses the facts about earlier states that the callee
+     requires, with the arguments' positions in it. *)
+  let* witnesses =
+    all
+      (Option.value (List.Assoc.find ctx.pasts f ~equal:String.equal) ~default:[])
+      ~f:(fun (inv, field, i) ->
+        let structure =
+          List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+        in
+        match (structure, List.Assoc.find ctx.snapshots inv ~equal:String.equal) with
+        | _ when Option.is_some (known_position ctx inv field (List.nth_exn args i)) ->
+            let p =
+              Option.value_exn (known_position ctx inv field (List.nth_exn args i))
+            in
+            Ok [ p.pos_snapshot; p.pos_k ]
+        | Some st, Some (latest :: _) ->
+            let index = List.Assoc.find_exn latest.indices field ~equal:String.equal in
+            Ok
+              [
+                state_of ~loc:l st (grown st latest.values);
+                R.Expr.index ~loc:l index (List.nth_exn args i);
+              ]
+        | _ ->
+            error e.exp_loc
+              "This call needs a fact about an earlier state, of which no snapshot was \
+               taken")
+  in
+  let callee =
+    R.Expr.call ~loc:l (name ~loc:l f) (args @ List.concat witnesses @ implicit)
+  in
+  (* The ghost results witnessing facts about the state after the call: the caller's own,
+     if the callee continues its update with the same ones. *)
+  let ghost_facts =
+    Option.value (List.Assoc.find ctx.past_returns f ~equal:String.equal) ~default:[]
+  in
+  let ghost_count = 2 * List.length ghost_facts in
+  let ghost_decls, ghosts =
+    match retry with
+    | Some (au, _, _) when ghost_count > 0 && List.length au.ghost_results = ghost_count
+      ->
+        ([], au.ghost_results)
+    | _ ->
+        let fresh =
+          List.concat_map ghost_facts ~f:(fun (inv, _, _) ->
+              let st =
+                List.find_exn ctx.shared.structures ~f:(fun st ->
+                    String.equal st.invariant inv)
+              in
+              [
+                ( Names.fresh ctx.names "snapshot",
+                  R.Type.named ~loc:l
+                    (R.Name.make ~loc:l ~path:[ module_name st "state" ] "T")
+                    [] );
+                (Names.fresh ctx.names "position", R.Type.int ~loc:l);
+              ])
+        in
+        ( List.concat_map fresh ~f:(fun (x, typ) ->
+              R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x)),
+          List.map fresh ~f:(fun (x, _) -> R.Expr.var ~loc:l (name ~loc:l x)) )
+  in
+  (* The ghost results witness the positions of the entries the callee ensures. *)
+  let rec witnessed facts ghosts =
+    match (facts, ghosts) with
+    | (inv, field, entry) :: facts, snapshot :: k :: ghosts ->
+        let rest = witnessed facts ghosts in
+        begin match entry args with
+        | Some e ->
+            {
+              pos_inv = inv;
+              pos_field = field;
+              pos_element = e;
+              pos_snapshot = snapshot;
+              pos_k = k;
+            }
+            :: rest
+        | None -> rest
+        end
+    | _ -> []
+  in
+  ctx.positions <- witnessed ghost_facts ghosts @ ctx.positions;
   if is_unit e.exp_type then
     let* closing = closing (unit_value ~loc:l) in
-    Ok (stmts @ opening @ [ R.Stmt.call ~loc:l callee ] @ closing, unit_value ~loc:l)
+    let call =
+      match ghosts with
+      | [] -> [ R.Stmt.call ~loc:l callee ]
+      | _ -> ghost_decls @ [ R.Stmt.assign ~loc:l ghosts (R.Stmt.expr_rhs callee) ]
+    in
+    Ok (stmts @ opening @ call @ closing, unit_value ~loc:l)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
-    let def = R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs callee) (ident ~loc:l x) in
+    let def =
+      match ghosts with
+      | [] -> R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs callee) (ident ~loc:l x)
+      | _ ->
+          R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+          @ ghost_decls
+          @ [ R.Stmt.assign ~loc:l (v :: ghosts) (R.Stmt.expr_rhs callee) ]
+    in
     let* closing = closing v in
     Ok (stmts @ opening @ def @ closing, v)
 
@@ -2502,6 +2894,10 @@ and match_cases ?commits ~tail ctx ~at v
   (* Each case starts in the state of the atomic update before the match. *)
   let start = au_snapshot ctx in
   let ends = ref [] in
+  let snapshot_ends = ref [] in
+  let start_positions = ctx.positions in
+  let join = new_join () in
+  let position_ends = ref [] in
   let commits =
     match commits with
     | Some commits -> commits
@@ -2533,7 +2929,10 @@ and match_cases ?commits ~tail ctx ~at v
       Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
     in
     ends := au_state ctx :: !ends;
-    Ok (entry @ List.concat defs @ stmts @ finish @ assignment)
+    snapshot_ends := ctx.snapshots :: !snapshot_ends;
+    position_ends := ctx.positions :: !position_ends;
+    let assigned = end_arm ctx join ~start:start_positions in
+    Ok (entry @ List.concat defs @ stmts @ finish @ assignment @ assigned)
   in
   let not_exhaustive () =
     [ check ctx ~at "This match may not be exhaustive" (R.Expr.bool ~loc:l false) ]
@@ -2579,7 +2978,9 @@ and match_cases ?commits ~tail ctx ~at v
           (let au, _, _ = start in
            au)
           ~f:(fun (state, _, _, _) -> state)));
-  Ok stmts
+  ctx.snapshots <- common_snapshots !snapshot_ends;
+  ctx.positions <- join_positions join ~start:start_positions !position_ends;
+  Ok (join.decls @ stmts)
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
     constructors with variables or [_] as arguments, possibly followed by a variable or
@@ -2640,6 +3041,8 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
   (* Each arm starts in the state of the atomic update before the branch; if [c] is the
      result of the [compare_and_set] that left the update open, the arms close it. *)
   let start = au_snapshot ctx in
+  let start_positions = ctx.positions in
+  let join = new_join () in
   let arm taken e =
     restore_au ctx start;
     let* entry =
@@ -2656,12 +3059,16 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
           in
           Ok (stmts @ finish @ assignment)
     in
-    Ok (entry @ stmts, au_state ctx)
+    let assigned = end_arm ctx join ~start:start_positions in
+    Ok (entry @ stmts @ assigned, (au_state ctx, ctx.snapshots, ctx.positions))
   in
-  let* then_, then_state = arm true (Some e1) in
-  let* else_, else_state = arm false e2 in
+  let* then_, (then_state, then_snapshots, then_positions) = arm true (Some e1) in
+  let* else_, (else_state, else_snapshots, else_positions) = arm false e2 in
   set_au_state ctx (Option.map2 then_state else_state ~f:join_au);
-  Ok [ R.Stmt.if_ ~loc:l c then_ else_ ]
+  ctx.snapshots <- common_snapshots [ then_snapshots; else_snapshots ];
+  ctx.positions <-
+    join_positions join ~start:start_positions [ then_positions; else_positions ];
+  Ok (join.decls @ [ R.Stmt.if_ ~loc:l c then_ else_ ])
 
 (** The statements [make target] computing the value of [e] into a new variable [target],
     and that variable; no variable if [e] is of type unit. *)
@@ -2831,8 +3238,13 @@ type func = {
   loc : Location.t;
   contract : S.contract option;
   next : Location.t option;  (** The location of the next structure item, if any. *)
+  prefix : Ident.t list;
+      (** The parameters of the function that a lifted local function continues, which its
+          parameters start with. *)
+  role : string option;  (** The function whose atomic update it continues. *)
 }
-(** A top-level function [f] with its parameters [params] and [body], and its contract. *)
+(** A top-level function [f] with its parameters [params] and [body], and its contract, or
+    a local function lifted to the top level. *)
 
 (** The names that the contract of [f] gives its result and its [n] parameters, by its
     [header] if it has one, and otherwise OCaml's. *)
@@ -2918,12 +3330,60 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
       vars = List.map named ~f:(fun (x, r, _) -> (x, Raven r));
     }
   in
+  let env = pattern_definitions env f in
   let* implicit = implicit_vars env f in
   let env =
     List.fold implicit ~init:env ~f:(fun env (x, raven, t, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
   Ok (result_name, env, implicit)
+
+(** [env] with the names that preconditions of [f] define by a constructor's arguments, as
+    [c] in [requires node = Next (v, c)]: the value's fields. *)
+and pattern_definitions env (f : func) =
+  let l = R.Loc.none in
+  let requires = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
+  let rec conjuncts (t : S.term) =
+    match spine (S.chain t) [] with
+    | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+        conjuncts a @ conjuncts b
+    | _ -> [ S.chain t ]
+  in
+  let define env (t : S.term) =
+    match spine t [] with
+    | ( { term_desc = Tvar (Qid { pid_str = "="; _ }); _ },
+        [ ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ } as value); rhs ] )
+      when List.Assoc.mem env.vars x ~equal:String.equal ->
+        begin match spine rhs [] with
+        | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args
+          when Char.is_uppercase c.[0] -> begin
+            let args =
+              match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args
+            in
+            match (Datatypes.find_ctor env.data c, formula env value) with
+            | Some (_, ctor), Ok v when List.length ctor.fields = List.length args ->
+                List.fold
+                  (List.zip_exn args (List.zip_exn ctor.fields ctor.args))
+                  ~init:env
+                  ~f:(fun env ((a : S.term), (field, typ)) ->
+                    match a.term_desc with
+                    | Tvar (Qid { pid_str = y; _ })
+                      when Char.is_lowercase y.[0]
+                           && not (List.Assoc.mem env.vars y ~equal:String.equal) ->
+                        {
+                          (bind env y
+                             (Value (R.Expr.field ~loc:l v (R.Name.make ~loc:l field))))
+                          with
+                          var_types = (y, typ) :: env.var_types;
+                        }
+                    | _ -> env)
+            | _ -> env
+          end
+        | _ -> env
+        end
+    | _ -> env
+  in
+  List.fold (List.concat_map requires ~f:conjuncts) ~init:env ~f:define
 
 (** The names free in the preconditions of [f] that [env] does not bind: implicit ghost
     parameters, as [n] in [requires own c.count n], with their Raven names, OCaml types
@@ -2955,6 +3415,9 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       primitives;
       names = Names.create ();
       functions = [];
+      lifted = [];
+      pasts = [];
+      past_returns = [];
       origins;
       annotations = [];
       spec_funcs;
@@ -2967,6 +3430,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       invariants = [];
       opened = [];
       snapshots = [];
+      positions = [];
     }
   in
   let l = loc f.loc in
@@ -3058,7 +3522,7 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
     are [implicit]; [result] is the contract's name for the result, if there is one. Sets
     [ctx.au]. A step inside the update unfolds the predicates of [pres], and folds those
     of [posts] if it commits, and those of [pres] if it aborts. *)
-let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
+let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_results =
   let phi = Names.fresh ctx.names "phi" in
   let au_call ~l f args =
     R.Expr.call ~loc:l (name ~loc:l f) (R.Expr.var ~loc:l (name ~loc:l phi) :: args)
@@ -3107,6 +3571,9 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
       step = at;
       performing = None;
       self;
+      role;
+      ghost_results =
+        List.concat_map past_results ~f:(fun (_, _, _, (snapshot, k)) -> [ snapshot; k ]);
       has_result = Option.is_some result;
       open_;
       close;
@@ -3114,7 +3581,47 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
   and close c ~value =
     let at = au.step in
     let l = loc at in
+    let value =
+      match au.ghost_results with
+      | [] -> value
+      | ghosts -> R.Expr.tuple ~loc:l ((if au.has_result then [ value ] else []) @ ghosts)
+    in
     let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
+    (* The facts that the function ensures about the state after the action. *)
+    let established performs =
+      all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
+          match
+            ( performs,
+              List.Assoc.find ctx.opened p.inv ~equal:String.equal,
+              List.Assoc.find ctx.invariants p.inv ~equal:String.equal )
+          with
+          | Some performed, Some opened, Some args ->
+              let next, indices, _ =
+                next_state ctx st ~inv_params:st.params args opened performed
+              in
+              let index =
+                match
+                  List.Assoc.find indices
+                    (List.Assoc.find_exn st.chains p.field ~equal:String.equal)
+                    ~equal:String.equal
+                with
+                | Some index -> index
+                | None -> List.Assoc.find_exn opened.indices p.field ~equal:String.equal
+              in
+              let* e = formula env p.element in
+              Ok
+                [
+                  R.Stmt.assign ~loc:l [ snapshot ]
+                    (R.Stmt.expr_rhs
+                       (state_of ~loc:l st (grown st (List.map next ~f:fst))));
+                  R.Stmt.assign ~loc:l [ k ]
+                    (R.Stmt.expr_rhs (R.Expr.index ~loc:l index e));
+                ]
+          | _ ->
+              error at
+                "This step linearizes the function, which ensures a fact about the state \
+                 after it, but performs no action")
+    in
     match c with
     | Commit ->
         let message =
@@ -3166,7 +3673,10 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
               ]
           | _ -> []
         in
-        Ok (checked @ folds @ [ commit ] @ use_invariants ?performs ctx ~at ~fold:true)
+        let* established = established performs in
+        Ok
+          (checked @ folds @ List.concat established @ [ commit ]
+          @ use_invariants ?performs ctx ~at ~fold:true)
     | Abort ->
         let* folds = each pres ~at fold (opened au.values) in
         Ok
@@ -3314,8 +3824,8 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~linearizations (functions : (string * string) list) origins ~proc_name ~pure
-    (f : func) : (R.Callable.t, error) Result.t =
+    ~linearizations ~lifted ~pasts ~past_returns (functions : (string * string) list)
+    origins ~proc_name ~pure (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -3324,6 +3834,9 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       primitives;
       names;
       functions;
+      lifted;
+      pasts;
+      past_returns;
       origins;
       annotations;
       spec_funcs = funcs;
@@ -3336,9 +3849,23 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       invariants = [];
       opened = [];
       snapshots = [];
+      positions = [];
     }
   in
   let l = loc f.loc in
+  (* Facts about earlier states are ghost parameters and results. *)
+  let split terms =
+    List.partition_map terms ~f:(fun t ->
+        match past_of shared.structures t with Some p -> First p | None -> Second t)
+  in
+  let past_pres, past_posts, f =
+    match f.contract with
+    | Some c ->
+        let past_pres, requires = split c.requires in
+        let past_posts, ensures = split c.ensures in
+        (past_pres, past_posts, { f with contract = Some { c with requires; ensures } })
+    | None -> ([], [], f)
+  in
   let* formals = formals ctx f in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
   let* result_name, _ = contract_names f header (List.length formals) in
@@ -3368,6 +3895,63 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   (* The invariants of the precondition are opened around each atomic step. *)
   let* invariants = invariant_apps ctx env pres in
   ctx.invariants <- invariants;
+  (* A snapshot and a position witnessing each fact about an earlier state. *)
+  let witnesses (p : past) =
+    let* st =
+      match
+        List.find shared.structures ~f:(fun st -> String.equal st.invariant p.inv)
+      with
+      | Some st -> Ok st
+      | None -> error p.element.term_loc "A fact about an earlier state without a state"
+    in
+    let* structure =
+      match List.Assoc.find invariants p.inv ~equal:String.equal with
+      | Some (x :: _) ->
+          let anchored =
+            match anchor types st.structure_type with
+            | Some (_, at) -> at ~loc:l x
+            | None -> x
+          in
+          Ok (R.Expr.field ~loc:l anchored (name ~loc:l (member_name st "history")))
+      | _ ->
+          error p.element.term_loc
+            (Printf.sprintf
+               "A fact about an earlier state of %s, which the precondition does not hold"
+               p.inv)
+    in
+    let snapshot = Names.fresh names "snapshot" and k = Names.fresh names "position" in
+    let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+    let* e = formula env p.element in
+    let decl x typ = R.Var.make ~loc:l ~ghost:true (ident ~loc:l x) typ in
+    Ok
+      ( ( p,
+          st,
+          e,
+          [
+            decl snapshot
+              (R.Type.named ~loc:l
+                 (R.Name.make ~loc:l ~path:[ module_name st "state" ] "T")
+                 []);
+            decl k (R.Type.int ~loc:l);
+          ],
+          (var snapshot, var k) ),
+        R.Spec.make
+          (past_fact ~loc:l st ~structure ~field:p.field ~snapshot:(var snapshot)
+             ~k:(var k) e) )
+  in
+  let* past_params = all past_pres ~f:witnesses in
+  let* past_results = all past_posts ~f:witnesses in
+  let past_formals = List.concat_map past_params ~f:(fun ((_, _, _, d, _), _) -> d) in
+  let past_returns = List.concat_map past_results ~f:(fun ((_, _, _, d, _), _) -> d) in
+  ctx.positions <-
+    List.map past_params ~f:(fun ((p, _, e, _, (snapshot, k)), _) ->
+        {
+          pos_inv = p.inv;
+          pos_field = p.field;
+          pos_element = e;
+          pos_snapshot = snapshot;
+          pos_k = k;
+        });
   let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
   let atomic_pres =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
@@ -3415,8 +3999,11 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* bind_au =
     if atomic then
       atomic_update ctx env ~at:f.loc ~self:proc_name
+        ~role:(Option.value f.role ~default:(Ident.name f.id))
         ~result:(Option.some_if (not (List.is_empty returns)) result_name)
         implicit_decls ~pres:atomic_pres ~posts:atomic_posts
+        ~past_results:
+          (List.map past_results ~f:(fun ((p, st, _, d, w), _) -> (p, st, d, w)))
     else Ok []
   in
   let* () =
@@ -3441,8 +4028,11 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       ]
     else []
   in
-  let requires = in_range @ requires @ atomic_requires in
-  let ensures = Option.to_list result_in_range @ defined @ ensures @ atomic_ensures in
+  let requires = in_range @ requires @ List.map past_params ~f:snd @ atomic_requires in
+  let ensures =
+    Option.to_list result_in_range
+    @ defined @ ensures @ List.map past_results ~f:snd @ atomic_ensures
+  in
   let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
   let* stmts, v = expr ~tail:true ctx f.body in
   let* finish = finish_arm ctx ~tail:true v in
@@ -3522,8 +4112,64 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let body = bind_au @ first @ stmts @ assignment @ establish @ last in
   Ok
     (R.Callable.proc ~loc:l
-       ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ implicit)
-       ~returns ~requires ~ensures (ident ~loc:l proc_name) (Some body))
+       ~formals:(List.map formals ~f:(fun (_, _, v) -> v) @ past_formals @ implicit)
+       ~returns:(returns @ past_returns) ~requires ~ensures (ident ~loc:l proc_name)
+       (Some body))
+
+(** The entry [element] of a fact that [f] ensures about an earlier state, given the
+    arguments of a call: a parameter, which [names] names, or the argument of a
+    constructor that a precondition matches a parameter with, as [c] in
+    [requires node = Next (v, c)]. *)
+let entry_of_args types (f : func) (names : string option list) (element : S.term) =
+  let l = R.Loc.none in
+  let param x =
+    Option.map
+      (List.findi names ~f:(fun _ n -> Option.equal String.equal n (Some x)))
+      ~f:fst
+  in
+  let requires = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
+  let rec conjuncts (t : S.term) =
+    match spine (S.chain t) [] with
+    | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+        conjuncts a @ conjuncts b
+    | _ -> [ S.chain t ]
+  in
+  (* The parameter and destructor of [y], if a precondition matches a parameter with a
+     constructor of which [y] is an argument. *)
+  let defined y =
+    List.find_map (List.concat_map requires ~f:conjuncts) ~f:(fun t ->
+        match spine t [] with
+        | ( { term_desc = Tvar (Qid { pid_str = "="; _ }); _ },
+            [ { term_desc = Tvar (Qid { pid_str = x; _ }); _ }; rhs ] ) ->
+            begin match (param x, spine rhs []) with
+            | Some i, ({ term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args) -> begin
+                let args =
+                  match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args
+                in
+                match Datatypes.find_ctor types c with
+                | Some (_, ctor) when List.length ctor.fields = List.length args ->
+                    List.find_map (List.zip_exn args ctor.fields) ~f:(fun (a, field) ->
+                        match a.S.term_desc with
+                        | Tvar (Qid { pid_str = z; _ }) when String.equal z y ->
+                            Some (i, field)
+                        | _ -> None)
+                | _ -> None
+              end
+            | _ -> None
+            end
+        | _ -> None)
+  in
+  match element.term_desc with
+  | Tvar (Qid { pid_str = y; _ }) ->
+      begin match (param y, defined y) with
+      | Some i, _ -> fun args -> List.nth args i
+      | None, Some (i, field) ->
+          fun args ->
+            Option.map (List.nth args i) ~f:(fun a ->
+                R.Expr.field ~loc:l a (R.Name.make ~loc:l field))
+      | None, None -> fun _ -> None
+      end
+  | _ -> fun _ -> None
 
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
@@ -3607,6 +4253,8 @@ let items ?(interface = []) (structure : Typedtree.structure)
                       loc = vb.vb_loc;
                       contract;
                       next;
+                      prefix = [];
+                      role = None;
                     }
               | _ -> unsupported vb.vb_loc "This definition")
         in
@@ -3629,6 +4277,141 @@ let referenced (e : Typedtree.expression) : Ident.t list =
   let iterator = { Tast_iterator.default_iterator with expr } in
   iterator.expr iterator e;
   !found
+
+(** An iterator collecting the identifiers that patterns bind, and what it found. *)
+let binders () =
+  let found = ref [] in
+  let pat : type k. Tast_iterator.iterator -> k Typedtree.general_pattern -> unit =
+   fun iterator p ->
+    begin match p.pat_desc with
+    | Tpat_var (id, _, _) | Tpat_alias (_, id, _, _, _) -> found := id :: !found
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.pat iterator p
+  in
+  ({ Tast_iterator.default_iterator with pat }, found)
+
+(** The identifiers that the patterns of [e] bind, its functions' parameters included. *)
+let bound_in (e : Typedtree.expression) : Ident.t list =
+  let iterator, found = binders () in
+  iterator.expr iterator e;
+  !found
+
+(** The identifiers that the parameters [params] bind, in order. *)
+let params_bound (params : Typedtree.function_param list) : Ident.t list =
+  let iterator, found = binders () in
+  List.iter params ~f:(fun p ->
+      match p.fp_kind with
+      | Tparam_pat pat -> iterator.pat iterator pat
+      | Tparam_optional_default (pat, _) -> iterator.pat iterator pat);
+  List.rev !found
+
+(** The local functions of the top-level function [outer], lifted to the top level, with
+    their contracts in [annotations]: one after the function's definition, before the
+    expression it is local to. A function that [continues] [outer] takes [outer]'s
+    parameters first and has its contract too; another may not use [outer]'s variables. *)
+let local_functions (outer : func) (annotations : Annotation.t list) =
+  let found = ref [] in
+  let expr iterator (e : Typedtree.expression) =
+    begin match e.exp_desc with
+    | Texp_let (_, [ vb ], rest) ->
+        begin match (vb.vb_pat.pat_desc, vb.vb_expr.exp_desc) with
+        | Tpat_var (id, _, _), Texp_function (params, Tfunction_body body) ->
+            found := (vb, id, params, body, rest) :: !found
+        | _ -> ()
+        end
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.expr iterator e
+  in
+  let iterator = { Tast_iterator.default_iterator with expr } in
+  iterator.expr iterator outer.body;
+  let outer_params = params_bound outer.params in
+  let outer_bound = outer_params @ bound_in outer.body in
+  all (List.rev !found)
+    ~f:(fun
+        ((vb : Typedtree.value_binding), id, params, body, (rest : Typedtree.expression))
+      ->
+      let* contract =
+        contract_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc)
+      in
+      let continues = Option.bind contract ~f:(fun c -> c.continues) in
+      let* () =
+        match continues with
+        | Some g when not (String.equal g.pid_str (Ident.name outer.id)) ->
+            error g.pid_loc
+              (Printf.sprintf "A local function of %s continues %s only"
+                 (Ident.name outer.id) (Ident.name outer.id))
+        | _ -> Ok ()
+      in
+      let prefix = if Option.is_some continues then outer_params else [] in
+      let own = (id :: params_bound params) @ bound_in body in
+      let captured =
+        List.filter (referenced body) ~f:(fun x ->
+            List.mem outer_bound x ~equal:Ident.same
+            && (not (List.mem own x ~equal:Ident.same))
+            && not (List.mem prefix x ~equal:Ident.same))
+      in
+      let* () =
+        match captured with
+        | x :: _ ->
+            unsupported vb.vb_loc
+              (Printf.sprintf "A local function using the variable %s of its context,"
+                 (Ident.name x))
+        | [] -> Ok ()
+      in
+      (* The contract of the function continued, with its parameters first. *)
+      let contract =
+        match (contract, continues, outer.contract) with
+        | Some c, Some _, Some oc ->
+            let names (f_params : Typedtree.function_param list) (h : S.header option) =
+              match h with
+              | Some h -> h.hd_args
+              | None ->
+                  List.map f_params ~f:(fun p ->
+                      match p.fp_kind with
+                      | Tparam_pat { pat_desc = Tpat_var (x, _, _); pat_loc; _ } ->
+                          S.Lvar (S.mk_id ~loc:pat_loc (Ident.name x))
+                      | _ -> S.Lwild)
+            in
+            let header =
+              {
+                S.hd_name = S.mk_id ~loc:vb.vb_loc (Ident.name id);
+                hd_ret =
+                  Option.value_map c.header ~default:[ S.Lwild ] ~f:(fun h -> h.hd_ret);
+                hd_args = names outer.params oc.header @ names params c.header;
+              }
+            in
+            Some
+              {
+                c with
+                header = Some header;
+                atomic = oc.atomic;
+                requires = oc.requires @ c.requires;
+                atomic_requires = oc.atomic_requires;
+                atomic_ensures = oc.atomic_ensures;
+              }
+        | _ -> contract
+      in
+      let prefix_params =
+        List.filter outer.params ~f:(fun p ->
+            match p.fp_kind with
+            | Tparam_pat { pat_desc = Tpat_var (x, _, _); _ } ->
+                List.mem prefix x ~equal:Ident.same
+            | _ -> false)
+      in
+      Ok
+        {
+          id;
+          raven_name = Ident.name id;
+          params = prefix_params @ params;
+          body;
+          loc = vb.vb_loc;
+          contract;
+          next = Some rest.exp_loc;
+          prefix;
+          role = Option.map continues ~f:(fun g -> g.pid_str);
+        })
 
 (** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
 *)
@@ -3798,80 +4581,119 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
   let x = var "x" and s = var "s" and s1 = var "s1" and s2 = var "s2" in
   let history = anchored x in
   Ok
-    [
-      state_data;
-      func (member_name st "extends")
-        [ decl "a" state_type; decl "b" state_type ]
-        (R.Type.bool ~loc:l) order;
-      lemma ~auto:true
-        (member_name st "extends_trans")
-        [ decl "a" state_type; decl "b" state_type; decl "c" state_type ]
-        ~requires:[ bin And (extends (var "a") (var "b")) (extends (var "b") (var "c")) ]
-        ~ensures:[ extends (var "a") (var "c") ]
-        [];
-      func (member_name st "states")
-        [ decl "s" state_type ]
-        (R.Type.set ~loc:l state_type)
-        (R.Expr.set_compr ~loc:l (decl "e" state_type) (extends (var "e") s));
-      R.Member.instance ~loc:l
-        ~def:(R.Name.make ~loc:l ~path:[ "Library" ] "SetRA", [ state_type ])
-        (ident ~loc:l set_module)
-        (R.Name.make ~loc:l ~path:[ "Library" ] "SetRA");
-      R.Member.instance ~loc:l
-        ~def:
-          ( R.Name.make ~loc:l ~path:[ "Library" ] "Auth",
-            [ R.Type.named ~loc:l (n set_module) [] ] )
-        (ident ~loc:l history_module)
-        (R.Name.make ~loc:l ~path:[ "Library" ] "Auth");
-      R.Member.field ~loc:l ~ghost:true (ident ~loc:l history_field)
-        (R.Type.named ~loc:l (n history_module) []);
-      (* Takes note of the current state. *)
-      lemma (member_name st "snapshot")
-        [ decl "x" structure_typ; decl "s" state_type ]
-        ~requires:[ R.Expr.own ~loc:l [ history; auth (states s) ] ]
-        ~ensures:
-          [
-            R.Expr.own ~loc:l
-              [
-                history;
-                call
-                  (qn history_module "auth_frag")
-                  [
-                    call (qn set_module "set") [ states s ];
-                    call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
-                  ];
-              ];
-          ]
-        [
-          fpu history
-            (auth (states s))
-            (call
-               (qn history_module "auth_frag")
+    ([
+       state_data;
+       func (member_name st "extends")
+         [ decl "a" state_type; decl "b" state_type ]
+         (R.Type.bool ~loc:l) order;
+       lemma ~auto:true
+         (member_name st "extends_trans")
+         [ decl "a" state_type; decl "b" state_type; decl "c" state_type ]
+         ~requires:[ bin And (extends (var "a") (var "b")) (extends (var "b") (var "c")) ]
+         ~ensures:[ extends (var "a") (var "c") ]
+         [];
+       func (member_name st "states")
+         [ decl "s" state_type ]
+         (R.Type.set ~loc:l state_type)
+         (R.Expr.set_compr ~loc:l (decl "e" state_type) (extends (var "e") s));
+       R.Member.instance ~loc:l
+         ~def:(R.Name.make ~loc:l ~path:[ "Library" ] "SetRA", [ state_type ])
+         (ident ~loc:l set_module)
+         (R.Name.make ~loc:l ~path:[ "Library" ] "SetRA");
+       R.Member.instance ~loc:l
+         ~def:
+           ( R.Name.make ~loc:l ~path:[ "Library" ] "Auth",
+             [ R.Type.named ~loc:l (n set_module) [] ] )
+         (ident ~loc:l history_module)
+         (R.Name.make ~loc:l ~path:[ "Library" ] "Auth");
+       R.Member.field ~loc:l ~ghost:true (ident ~loc:l history_field)
+         (R.Type.named ~loc:l (n history_module) []);
+       (* Takes note of the current state. *)
+       lemma (member_name st "snapshot")
+         [ decl "x" structure_typ; decl "s" state_type ]
+         ~requires:[ R.Expr.own ~loc:l [ history; auth (states s) ] ]
+         ~ensures:
+           [
+             R.Expr.own ~loc:l
                [
-                 call (qn set_module "set") [ states s ];
-                 call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
-               ]);
-        ];
-      (* Moves the history on to a state that extends the current one. *)
-      lemma (member_name st "learn")
-        [ decl "x" structure_typ; decl "s1" state_type; decl "s2" state_type ]
-        ~requires:
-          [ bin And (R.Expr.own ~loc:l [ history; auth (states s1) ]) (extends s1 s2) ]
-        ~ensures:
-          [
-            R.Expr.own ~loc:l
-              [
-                history;
-                call (qn history_module "full")
-                  [ call (qn set_module "set") [ states s2 ] ];
-              ];
-          ]
-        [
-          fpu history
-            (auth (states s1))
-            (call (qn history_module "full") [ call (qn set_module "set") [ states s2 ] ]);
-        ];
-    ]
+                 history;
+                 call
+                   (qn history_module "auth_frag")
+                   [
+                     call (qn set_module "set") [ states s ];
+                     call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
+                   ];
+               ];
+           ]
+         [
+           fpu history
+             (auth (states s))
+             (call
+                (qn history_module "auth_frag")
+                [
+                  call (qn set_module "set") [ states s ];
+                  call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
+                ]);
+         ];
+       (* Moves the history on to a state that extends the current one. *)
+       lemma (member_name st "learn")
+         [ decl "x" structure_typ; decl "s1" state_type; decl "s2" state_type ]
+         ~requires:
+           [ bin And (R.Expr.own ~loc:l [ history; auth (states s1) ]) (extends s1 s2) ]
+         ~ensures:
+           [
+             R.Expr.own ~loc:l
+               [
+                 history;
+                 call (qn history_module "full")
+                   [ call (qn set_module "set") [ states s2 ] ];
+               ];
+           ]
+         [
+           fpu history
+             (auth (states s1))
+             (call (qn history_module "full")
+                [ call (qn set_module "set") [ states s2 ] ]);
+         ];
+       (* A snapshot precedes the current state. *)
+       (let t = var "t" in
+        let both =
+          R.Expr.own ~loc:l
+            [
+              history;
+              call
+                (qn history_module "auth_frag")
+                [
+                  call (qn set_module "set") [ states t ];
+                  call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
+                ];
+            ]
+        in
+        lemma (member_name st "observe")
+          [ decl "x" structure_typ; decl "s" state_type; decl "t" state_type ]
+          ~requires:[ both ]
+          ~ensures:[ both; extends s t ]
+          []);
+     ]
+    @ List.map st.chains ~f:(fun (field, _) ->
+        (* A later state keeps the entries of an earlier one at their positions. *)
+        let t = var "t" and k = var "k" in
+        let entries e = R.Expr.field ~loc:l e (n field) in
+        let within e =
+          bin And (bin Leq (R.Expr.int ~loc:l 0) k) (bin Lt k (length (entries e)))
+        in
+        lemma
+          (member_name st ("kept_" ^ field))
+          [ decl "s" state_type; decl "t" state_type; decl "k" (R.Type.int ~loc:l) ]
+          ~requires:[ bin And (extends s t) (within s) ]
+          ~ensures:
+            [
+              bin And (within t)
+                (bin Eq
+                   (R.Expr.index ~loc:l (entries t) k)
+                   (R.Expr.index ~loc:l (entries s) k));
+            ]
+          []))
 
 (** The parameters of [p], with the OCaml types [param_types], and the environment of the
     predicate's body. *)
@@ -3908,6 +4730,9 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
       primitives;
       names = Names.create ();
       functions = [];
+      lifted = [];
+      pasts = [];
+      past_returns = [];
       origins;
       annotations = [];
       spec_funcs;
@@ -3920,6 +4745,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
       invariants = [];
       opened = [];
       snapshots = [];
+      positions = [];
     }
   in
   let l = loc at in
@@ -4332,6 +5158,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
   in
   let* types, funcs = items ~interface source.typed annotations in
+  let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
+  let funcs = funcs @ List.concat lifted in
   (* The data types, and the sequences of specifications, which have no module. *)
   let data_types = types in
   let types =
@@ -4355,6 +5183,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* A pure function's procedure is named apart from its function. *)
   let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
   let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, proc_name f)) in
+  let lifted =
+    List.filter_map funcs ~f:(fun f ->
+        Option.some_if
+          ((not (List.is_empty f.prefix)) || Option.is_some f.role)
+          (proc_name f, (f.prefix, f.role)))
+  in
   let origins = ref [] in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
@@ -4491,6 +5325,42 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                   Option.some_if (String.equal a anchor) f) ));
     }
   in
+  (* The facts about earlier states in contracts, by the parameter they are about. *)
+  let* pasts =
+    all funcs ~f:(fun f ->
+        let clauses select =
+          Option.value_map f.contract ~default:[] ~f:select
+          |> List.filter_map ~f:(past_of structures)
+        in
+        let* _, names =
+          contract_names f
+            (Option.bind f.contract ~f:(fun c -> c.header))
+            (List.length f.params)
+        in
+        let* required =
+          all
+            (clauses (fun c -> c.requires))
+            ~f:(fun p ->
+              let position =
+                match p.element.term_desc with
+                | Tvar (Qid { pid_str = x; _ }) ->
+                    List.findi names ~f:(fun _ n -> Option.equal String.equal n (Some x))
+                | _ -> None
+              in
+              match position with
+              | Some (i, _) -> Ok (p.inv, p.field, i)
+              | None ->
+                  unsupported p.element.term_loc
+                    "A fact about an earlier state other than of a parameter,")
+        in
+        Ok
+          ( (proc_name f, required),
+            ( proc_name f,
+              List.map
+                (clauses (fun c -> c.ensures))
+                ~f:(fun p -> (p.inv, p.field, entry_of_args types f names p.element)) ) ))
+  in
+  let pasts, past_returns = List.unzip pasts in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
         predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
@@ -4508,8 +5378,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~linearizations functions origins ~proc_name:(proc_name f)
-          ~pure:(is_pure f) f)
+          ~annotations ~linearizations ~lifted ~pasts ~past_returns functions origins
+          ~proc_name:(proc_name f) ~pure:(is_pure f) f)
   in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in

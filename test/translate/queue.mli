@@ -10,6 +10,12 @@ val create : unit -> t
 (*@ q = create ()
     ensures is_queue q && queue q [] *)
 
+val push : t -> int -> unit
+(*@ atomic push q v
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures queue q (xs ++ [ v ]) *)
+
 val pop_opt : t -> int option
 (*@ r = atomic pop_opt q
     requires is_queue q

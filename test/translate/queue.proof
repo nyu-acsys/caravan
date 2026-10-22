@@ -23,5 +23,10 @@ view queue (q : t) = drop s.head s.values
 action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1)
   ~> { s with head = s.head + 1 } linearizes pop_opt
 
+(* Linking a new cell, which the step gives the queue, after the last. *)
+action link v c = compare_and_set s.cells.(length s.values) Nil (Next (v, c))
+  consumes own c Nil
+  ~> { s with cells = s.cells ++ [ c ]; values = s.values ++ [ v ] } linearizes push
+
 (* Moving the tail on, to a cell linked before. *)
 action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }

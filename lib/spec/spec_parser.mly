@@ -28,6 +28,7 @@
     | `Atomic_ensures -> { c with atomic_ensures = t :: c.atomic_ensures }
     | `Variant -> { c with variant = t :: c.variant }
     | `Pure -> { c with pure = true }
+    | `Continues f -> { c with continues = Some f }
 
   let mk_contract header clauses =
     let atomic, header =
@@ -57,7 +58,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES
 
 (* Keywords *)
 
@@ -209,6 +210,7 @@ clause:
 | ATOMIC_ENSURES t = term { `Atomic_ensures, t }
 | VARIANT t = term { `Variant, t }
 | PURE { `Pure, mk_term Ttrue $loc }
+| CONTINUES f = lident { `Continues f, mk_term Ttrue $loc }
 ;
 
 header_app:
