@@ -27,9 +27,9 @@ let explain (origins : Translate.origin list) (d : R.Diagnostic.t) : R.Diagnosti
       }
   | None -> d
 
-(** Verifies [file]; whether it verified. With [emit_rav], the Raven program is printed
-    instead. *)
-let file ~(emit_rav : bool) (file : string) : bool =
+(** Verifies [file], giving the solver [smt_timeout] milliseconds a query; whether it
+    verified. With [emit_rav], the Raven program is printed instead. *)
+let file ~(emit_rav : bool) ~(smt_timeout : int) (file : string) : bool =
   match Source.load file with
   | Error error ->
       Report.print error;
@@ -43,7 +43,7 @@ let file ~(emit_rav : bool) (file : string) : bool =
           Logs.app (fun m -> m "%s" (R.Program.to_string program));
           true
       | Ok (program, origins) ->
-          let result = R.verify program in
+          let result = R.verify ~options:{ R.default_options with smt_timeout } program in
           List.iter result.diagnostics ~f:(fun d ->
               Report.print_diagnostic (explain origins d));
           if result.verified then Logs.app (fun m -> m "Verification successful.");

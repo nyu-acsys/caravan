@@ -1,10 +1,12 @@
-(* The cells ever linked, their values, and the indices of the head's and the tail's
-   cells. Cells are never unlinked: popping moves the head. *)
+(* The cells ever linked, their values, the indices of the head's and the tail's cells,
+   and the is_empty calls waiting for a cell to be linked. Cells are never unlinked:
+   popping moves the head. *)
 type state = {
   cells : node Atomic.t sequence [@grows];
   values : int sequence [@grows];
   head : int [@grows];
   tail : int;
+  waiting : node Atomic.t pending [@helps is_empty];
 }
 
 invariant is_queue (q : t) (s : state) =
@@ -27,6 +29,7 @@ action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1)
 action link v c = compare_and_set s.cells.(length s.values) Nil (Next (v, c))
   consumes own c Nil
   ~> { s with cells = s.cells ++ [ c ]; values = s.values ++ [ v ] } linearizes push
+  helps s.waiting on s.cells.(length s.values) with false
 
 (* Moving the tail on, to a cell linked before. *)
 action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }

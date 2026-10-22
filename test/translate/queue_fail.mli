@@ -12,6 +12,12 @@ val pop_opt : t -> int option
     atomic ensures if length xs = 0 then r = None && queue q xs
       else r = Some xs.(0) && queue q (drop 1 xs) *)
 
+val is_empty : t -> bool
+(*@ b = atomic is_empty q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures queue q xs && b = (length xs = 0) *)
+
 val swing_tail : t -> unit
 (*@ swing_tail q
     requires is_queue q *)

@@ -35,19 +35,26 @@ let emit_rav =
   let doc = "Print the Raven program generated for the files instead of verifying it." in
   Arg.(value & flag & info [ "emit-rav" ] ~doc)
 
+let smt_timeout =
+  let doc = "The time the solver may take on a query, in milliseconds." in
+  Arg.(
+    value
+    & opt int Raven_api.default_options.smt_timeout
+    & info [ "smt-timeout" ] ~docv:"MS" ~doc)
+
 let files =
   let doc = "The OCaml files to verify." in
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
 
-let main () no_greeting emit_rav files =
+let main () no_greeting emit_rav smt_timeout files =
   if not no_greeting then Logs.app (fun m -> m "%s" greeting);
   (* Every file is checked, also after one that fails. *)
-  let results = List.map (Caravan_core.Check.file ~emit_rav) files in
+  let results = List.map (Caravan_core.Check.file ~emit_rav ~smt_timeout) files in
   let verified = List.for_all Fun.id results in
   if verified then 0 else 1
 
 let cmd =
   let info = Cmd.info "caravan" ~version:Caravan_config.version in
-  Cmd.v info Term.(const main $ setup $ no_greeting $ emit_rav $ files)
+  Cmd.v info Term.(const main $ setup $ no_greeting $ emit_rav $ smt_timeout $ files)
 
 let () = Stdlib.exit (Cmd.eval' cmd)

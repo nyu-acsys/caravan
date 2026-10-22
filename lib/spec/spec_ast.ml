@@ -118,7 +118,12 @@ type predicate = {
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
 
-type state_field = { sf_name : id; sf_type : pty; sf_grows : bool }
+type state_field = {
+  sf_name : id;
+  sf_type : pty;
+  sf_grows : bool;
+  sf_helps : string option;
+}
 (** A field of the ghost state; [[@grows]] if it only grows: sequences by prefix, integers
     by [<=]. *)
 
@@ -146,6 +151,9 @@ type proof_decl =
       action_state : id;
       action_update : (id * term) list;
       action_linearizes : id list;
+      action_helps : (term * term * term) option;
+          (** The calls it helps: those waiting in a pending field on a key, with the
+              result, [helps s.waiting on last s.cells with false]. *)
     }
       (** A transition of the state, as
           [action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1) ~> {
@@ -154,9 +162,18 @@ type proof_decl =
           the state, the fields it changes, in terms of the state before, and the
           functions it linearizes. Without a step, only [(*@ performs a *)] names it. *)
 
+(** What an atomic step does to the update of the function that performs it, if its result
+    matches a pattern: linearize it, with the function's result or a given one, leave it
+    to be helped, as [wait in s.waiting on c], or either, by a condition. *)
+type outcome =
+  | Commits
+  | Commits_with of term
+  | Waits of term * term  (** The pending field and the key it waits on. *)
+  | Chooses of term * outcome * outcome
+
 (** Where an atomic step linearizes the function that performs it: always, or if its
     result matches a pattern, as [returning [] -> commit]. *)
-type linearization = Commit | Returning of pat | Performs of id
+type linearization = Commit | Returning of pat * outcome | Performs of id
 
 (** A ghost statement in code. *)
 type ghost_stmt = Fold of term | Unfold of term | Assert of term

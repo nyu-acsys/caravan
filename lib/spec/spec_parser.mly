@@ -58,7 +58,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS
 
 (* Keywords *)
 
@@ -149,11 +149,16 @@ proof_decl:
 | ACTION n = lident ps = lident* EQUAL step = action_step?
     LEFTBRC s = lident WITH fs = semicolon_list1(field_value) RIGHTBRC
     ls = loption(preceded(LINEARIZES, separated_nonempty_list(COMMA, lident)))
+    h = preceded(HELPS, helps)?
     { let step, consumes =
         match step with Some (st, c) -> (Some st, c) | None -> (None, None) in
       Proof_action { action_name = n; action_params = ps; action_step = step;
                      action_consumes = consumes; action_state = s; action_update = fs;
-                     action_linearizes = ls } }
+                     action_linearizes = ls; action_helps = h } }
+;
+
+helps:
+| f = term ON k = term WITH v = term { (f, k, v) }
 ;
 
 action_step:
@@ -167,16 +172,29 @@ step_arg:
 
 state_field:
 | x = lident COLON t = typ a = ATTRIBUTE?
-    { { sf_name = x; sf_type = t; sf_grows = (a = Some "grows") } }
+    { let helps =
+        match a with
+        | Some a when String.length a > 6 && String.sub a 0 6 = "helps " ->
+            Some (String.sub a 6 (String.length a - 6))
+        | _ -> None
+      in
+      { sf_name = x; sf_type = t; sf_grows = (a = Some "grows"); sf_helps = helps } }
 ;
 
 pred_param:
 | LEFTPAR x = lident COLON t = typ RIGHTPAR { (x, t) }
 ;
 
+outcome:
+| COMMIT { Commits }
+| COMMIT t = term_arg { Commits_with t }
+| WAIT IN f = term ON k = term { Waits (f, k) }
+| IF c = term THEN a = outcome ELSE b = outcome { Chooses (c, a, b) }
+;
+
 linearization:
 | COMMIT EOF { Commit }
-| RETURNING p = mpat ARROW COMMIT EOF { Returning p }
+| RETURNING p = mpat ARROW o = outcome EOF { Returning (p, o) }
 | PERFORMS a = lident EOF { Performs a }
 ;
 

@@ -39,6 +39,9 @@
         "action", ACTION;
         "consumes", CONSUMES;
         "continues", CONTINUES;
+        "helps", HELPS;
+        "on", ON;
+        "wait", WAIT;
         "linearizes", LINEARIZES;
         "assert", ASSERT;
         "atomic", ATOMIC;

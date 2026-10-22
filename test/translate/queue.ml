@@ -54,3 +54,16 @@ let swing_tail q =
   match Atomic.get old_tail with
   | Nil -> ()
   | Next (_, next) -> if Atomic.compare_and_set q.tail old_tail next then () else ()
+
+(* If the head's cell is the last at the first read, the call waits for it to be linked,
+   which commits the call with false; it commits with true if the cell is still the last
+   at the second read. *)
+let is_empty q =
+  Atomic.get
+    (Atomic.get
+       q.head
+       (*@ returning c ->
+          if c <> s.cells.(length s.values) then commit false
+          else wait in s.waiting on c *))
+  (*@ returning Nil -> commit true *)
+  == Nil

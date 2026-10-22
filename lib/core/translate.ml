@@ -102,6 +102,35 @@ type origin = {
 (** A check the translation generates, with the code of its failure, and what it checks,
     as the message and related locations to report when it fails. *)
 
+type action = {
+  action : string;
+  params : string list;
+  step : (string * S.term option list) option;
+      (** The operation performing it, with its arguments: the location, then the others,
+          [None] for any. *)
+  state : string;
+  update : (string * S.term) list;  (** The fields it changes. *)
+  linearizes : string list;
+  helps : (string * S.term * S.term) option;
+      (** The pending field whose calls it helps, the key and the result. *)
+}
+(** An action of a structure (see {!S.Proof_action}). *)
+
+type performing = { performed : action; bindings : (string * R.Expr.t) list }
+(** An action that a step performs, with the values of its parameters. *)
+
+type pending = {
+  pending_field : string;
+  pending_on : string;  (** The existential of the keys of the registrations. *)
+  key_type : Types.type_expr;
+  helped : string;  (** The function whose calls wait. *)
+  helping : string * S.term * S.term;
+      (** The key whose calls the action that helps commits, and the result, in terms of
+          the state before the action, named as the action names it. *)
+}
+(** A field of calls of [helped] waiting to be helped, each registered on a key: a finite
+    set of registrations, ghost cells holding the calls' updates. *)
+
 (** Whether a function with an atomic contract has linearized, as far as the translation
     knows. Raven needs the atomic update in the same state after both arms of a branch, so
     a step whose effect depends on its result leaves the update open, and the arms of the
@@ -117,28 +146,23 @@ type au_state =
       (** The update open, linearized if the value of the last read has this constructor.
       *)
   | Partly  (** Linearized on some paths, the update closed. *)
+  | Registered of registered
+      (** Linearized, or left to be helped if [registered] says so: given away in a
+          registration on a pending field, whose result a later step collects. *)
   | Unknown
+
+and registered = {
+  registration : R.Expr.t;  (** The ghost cell of the registration. *)
+  registered : R.Expr.t;  (** Whether the call registered rather than linearized. *)
+  pending_inv : string;
+  pending : pending;
+}
 
 (** How the atomic update closes. *)
 type au_close =
   | Commit  (** The step linearized the function. *)
   | Abort  (** The step did not change the abstract state. *)
   | Commit_call  (** The step is a call, which linearized the function in its place. *)
-
-type action = {
-  action : string;
-  params : string list;
-  step : (string * S.term option list) option;
-      (** The operation performing it, with its arguments: the location, then the others,
-          [None] for any. *)
-  state : string;
-  update : (string * S.term) list;  (** The fields it changes. *)
-  linearizes : string list;
-}
-(** An action of a structure (see {!S.Proof_action}). *)
-
-type performing = { performed : action; bindings : (string * R.Expr.t) list }
-(** An action that a step performs, with the values of its parameters. *)
 
 type au = {
   mutable state : au_state;
@@ -167,6 +191,10 @@ type au = {
           parameters. *)
   close : au_close -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
       (** Closes the open update, committing with the function's result [value]. *)
+  token : R.Expr.t;  (** The update's token. *)
+  commit_only : at:Location.t -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+      (** Opens the update and commits it with [value] at once, at the step at [at], the
+          invariants left as they are. *)
 }
 (** The atomic update of a function with an atomic contract. *)
 
@@ -176,6 +204,10 @@ type structure = {
   fields : (string * string * R.Type.t * Types.type_expr * bool) list;
   chains : (string * string) list;
   actions : action list;
+  pendings : pending list;
+  held : (S.term * string * S.term) list;
+      (** The atomics that the invariant owns holding an entry of a field owned by index,
+          [own q.head s.cells.(s.head)]: the atomic, the field and the position. *)
   params : (string * Types.type_expr) list;
       (** The invariant's parameters but the state, with their types. *)
   structure_type : Types.type_expr;
@@ -215,6 +247,9 @@ let grown st values =
 let member_name st suffix = st.invariant ^ "_" ^ suffix
 
 let module_name st suffix = String.capitalize st.invariant ^ "_" ^ suffix
+
+(** The names of the members generated for the pending field [p] of [st]. *)
+let pending_name st (p : pending) suffix = member_name st (p.pending_field ^ "_" ^ suffix)
 
 type past = { inv : string; field : string; element : S.term }
 (** A fact about an earlier state of a structure, [past (mem e s.f)]: [e] was in the field
@@ -1497,6 +1532,22 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
     indices,
     List.map appended ~f:(fun (field, _, e, position) -> (field, e, position)) )
 
+(** The views of [st], whose invariant has the arguments [args], in the state [values]:
+    each view, its inputs and its value. *)
+let views_after ctx st args values =
+  let env =
+    bind (scope_env ctx) st.state
+      (State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) e -> (f, (e, t)))))
+  in
+  all st.views ~f:(fun ((v : S.predicate), value) ->
+      let inputs = List.take args (List.length v.pred_params - 1) in
+      let env =
+        List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
+          ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
+      in
+      let* value = formula env value in
+      Ok (v.pred_name.pid_str, inputs, value))
+
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
 let use_invariants ?performs ctx ~(at : Location.t) ~fold =
@@ -1523,6 +1574,14 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
           let index_locals =
             List.map st.chains ~f:(fun (field, raven) ->
                 (field, local (raven, chain_index_type ctx.types st field)))
+            @ List.map st.pendings ~f:(fun p ->
+                let key =
+                  Option.value
+                    (Result.ok (Datatypes.typ ctx.types ~at p.key_type))
+                    ~default:(R.Type.ref ~loc:l)
+                in
+                ( p.pending_field,
+                  local (p.pending_on, R.Type.map ~loc:l (R.Type.ref ~loc:l) key) ))
           in
           ctx.opened <-
             ( inv,
@@ -1627,12 +1686,12 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
                       values;
                       indices =
                         List.map opened.indices ~f:(fun (field, e) ->
-                            let index =
-                              List.Assoc.find_exn st.chains field ~equal:String.equal
-                            in
                             ( field,
                               Option.value
-                                (List.Assoc.find indices index ~equal:String.equal)
+                                (Option.bind
+                                   (List.Assoc.find st.chains field ~equal:String.equal)
+                                   ~f:(fun index ->
+                                     List.Assoc.find indices index ~equal:String.equal))
                                 ~default:e ));
                     }
                   in
@@ -1647,7 +1706,45 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
                           pos_k = k;
                         })
                     @ ctx.positions;
-                  if has_history st then learn @ (snapshot st state :: fold ~witnesses ())
+                  (* The calls the action helps, committed in the state after it. *)
+                  let helping =
+                    match p.performed.helps with
+                    | Some (field, key, _) -> begin
+                        let env =
+                          action_env ctx st st.params args opened.values p.bindings
+                        in
+                        match
+                          ( List.find st.pendings ~f:(fun q ->
+                                String.equal q.pending_field field),
+                            formula env key,
+                            views_after ctx st args values,
+                            List.findi st.fields ~f:(fun _ (f, _, _, _, _) ->
+                                String.equal f field) )
+                        with
+                        | Some pending, Ok c, Ok views, Some (i, _) ->
+                            let on =
+                              List.Assoc.find_exn opened.indices field ~equal:String.equal
+                            in
+                            let hc = R.Expr.var ~loc:la (name ~loc:la "hc") in
+                            let helped =
+                              R.Expr.set_compr ~loc:la
+                                (R.Var.make ~loc:la (ident ~loc:la "hc")
+                                   (R.Type.ref ~loc:la))
+                                (R.Expr.binary ~loc:la Neq (R.Expr.index ~loc:la on hc) c)
+                            in
+                            [
+                              lemma
+                                (pending_name st pending "help")
+                                (args @ [ c ]
+                                @ List.map views ~f:(fun (_, _, value) -> value)
+                                @ [ List.nth_exn opened.values i; on; helped ]);
+                            ]
+                        | _ -> []
+                      end
+                    | None -> []
+                  in
+                  if has_history st then
+                    helping @ learn @ (snapshot st state :: fold ~witnesses ())
                   else fold ~witnesses ()
               | None when has_history st -> snapshot st opened :: fold ()
               | None -> fold ()
@@ -1803,28 +1900,13 @@ let perform_views ctx ~(at : Location.t) (p : performing) =
       match (structure, args) with
       | Some st, Some args ->
           let next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
-          let env =
-            bind (scope_env ctx) st.state
-              (State
-                 (List.map2_exn st.fields next ~f:(fun (f, _, _, t, _) (e, _) ->
-                      (f, (e, t)))))
-          in
-          let* views =
-            all st.views ~f:(fun ((v : S.predicate), value) ->
-                let pred = v.pred_name.pid_str in
-                let inputs = List.take args (List.length v.pred_params - 1) in
-                let env =
-                  List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
-                    ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
-                in
-                let* value = formula env value in
-                let raven, _ = List.Assoc.find_exn ctx.preds pred ~equal:String.equal in
-                Ok
-                  (with_views ctx
-                     (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
-                     ~loc:l ~pred (name ~loc:l raven) (inputs @ [ value ])))
-          in
-          Ok (List.concat views)
+          let* views = views_after ctx st args (List.map next ~f:fst) in
+          Ok
+            (List.concat_map views ~f:(fun (pred, inputs, value) ->
+                 let raven, _ = List.Assoc.find_exn ctx.preds pred ~equal:String.equal in
+                 with_views ctx
+                   (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
+                   ~loc:l ~pred (name ~loc:l raven) (inputs @ [ value ])))
       | _ -> Ok [])
   |> Result.map ~f:List.concat
 
@@ -1840,6 +1922,33 @@ let atomic_of env (t : S.term) =
       let* r = formula env r in
       Ok (R.Expr.field ~loc:l r (name ~loc:l label))
   | _ -> formula env t
+
+(** The positions of [value], read from the atomic [atomic] at a step, in the latest
+    snapshots: those of entries of fields owned by index that the invariants own the
+    atomic holding. *)
+let record_read ctx ~atomic value =
+  List.iter ctx.opened ~f:(fun (inv, opened) ->
+      match
+        ( List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv),
+          List.Assoc.find ctx.invariants inv ~equal:String.equal,
+          List.Assoc.find ctx.snapshots inv ~equal:String.equal )
+      with
+      | Some st, Some args, Some (latest :: _) when has_history st ->
+          let env = action_env ctx st st.params args opened.values [] in
+          List.iter st.held ~f:(fun (location, field, position) ->
+              match (atomic_of env location, formula env position) with
+              | Ok held, Ok k when R.Expr.alpha_equal held atomic ->
+                  ctx.positions <-
+                    {
+                      pos_inv = inv;
+                      pos_field = field;
+                      pos_element = value;
+                      pos_snapshot = state_of ~loc:R.Loc.none st (grown st latest.values);
+                      pos_k = k;
+                    }
+                    :: ctx.positions
+              | _ -> ())
+      | _ -> ())
 
 (** The values of the parameters [params] of an action in [pattern], an argument of its
     step that the step's argument [actual] matches: a parameter itself, a position in a
@@ -1941,12 +2050,22 @@ let named_action ctx a =
   List.find_map ctx.shared.structures ~f:(fun st ->
       List.find st.actions ~f:(fun act -> String.equal act.action a))
 
-(** The annotation saying how the atomic step at [at] linearizes the function, if one
-    follows it, as [Atomic.get t (*@ commit *)]. *)
-let linearization ctx ~(at : Location.t) =
-  match
-    List.find ctx.linearizations ~f:(fun (anchor, _) -> anchor = at.loc_end.pos_cnum)
-  with
+(** The offset of the end of the step [e], where an annotation on it starts: that of its
+    last argument, since a parenthesized step's location includes the parentheses, which
+    may enclose the annotation, as in [Atomic.get (Atomic.get t (*@ ... *))]. *)
+let step_end (e : Typedtree.expression) =
+  match e.exp_desc with
+  | Texp_apply (_, args) ->
+      List.fold args ~init:e.exp_loc.loc_start.pos_cnum ~f:(fun last (_, arg) ->
+          match arg with
+          | Typedtree.Arg a -> Int.max last a.exp_loc.loc_end.pos_cnum
+          | Omitted _ -> last)
+  | _ -> e.exp_loc.loc_end.pos_cnum
+
+(** The annotation saying how the atomic step [e] linearizes the function, if one follows
+    it, as [Atomic.get t (*@ commit *)]. *)
+let linearization ctx (e : Typedtree.expression) =
+  match List.find ctx.linearizations ~f:(fun (anchor, _) -> anchor = step_end e) with
   | None -> Ok None
   | Some (_, a) -> Result.map (Annotation.linearization a) ~f:Option.some
 
@@ -1962,11 +2081,244 @@ let commit_now (au : au) =
     au.close Commit ~value:(R.Expr.tuple ~loc:(loc au.step) [])
   end
 
+(** The open structure with a pending field among the invariants of the function, with its
+    invariant's arguments and open state. *)
+let open_pending_structure ctx =
+  List.find_map ctx.opened ~f:(fun (inv, opened) ->
+      match
+        ( List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv),
+          List.Assoc.find ctx.invariants inv ~equal:String.equal )
+      with
+      | Some st, Some args when not (List.is_empty st.pendings) -> Some (st, args, opened)
+      | _ -> None)
+
+(** The environment of a decision at a step whose result [value] matches [p], in the state
+    [opened] of [st]. *)
+let decision_env ctx st (opened : opened) (p : S.pat) value =
+  let env =
+    bind (scope_env ctx) st.state
+      (State
+         (List.map2_exn st.fields opened.values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
+  in
+  match p.pat_desc with
+  | Pid x -> Ok (bind env x.pid_str (Value value))
+  | Pwild -> Ok env
+  | _ -> unsupported p.pat_loc "A pattern other than a variable, before a choice,"
+
+(** The statements of the step at [at] of the function with the update [au], whose result
+    [value] matches [p]: the invariants are open, and [outcome] linearizes the function or
+    leaves it to be helped, registered on a pending field. *)
+let decide ctx (au : au) ~(at : Location.t) ~value (p : S.pat) (outcome : S.outcome) =
+  let l = loc at in
+  let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+  let* st, args, opened =
+    match open_pending_structure ctx with
+    | Some found -> Ok found
+    | None -> error at "A step that may wait without a structure with pending calls"
+  in
+  let* env = decision_env ctx st opened p value in
+  let snapshots = ctx.snapshots in
+  let hc = Names.fresh ctx.names "registration" in
+  let registered = Names.fresh ctx.names "registered" in
+  let waiting = Names.fresh ctx.names "waiting" in
+  (* The pending field the call may wait in. *)
+  let rec waits (o : S.outcome) =
+    match o with
+    | Waits (field, _) -> Some field
+    | Chooses (_, a, b) -> Option.first_some (waits a) (waits b)
+    | Commits | Commits_with _ -> None
+  in
+  let* pending =
+    match Option.map (waits outcome) ~f:(fun (field : S.term) -> field.term_desc) with
+    | Some (Tfield (_, Qid f)) ->
+        begin match
+          List.find st.pendings ~f:(fun q -> String.equal q.pending_field f.pid_str)
+        with
+        | Some q -> Ok q
+        | None -> error at (Printf.sprintf "%s is not a field of pending calls" f.pid_str)
+        end
+    | Some _ -> error at "A field of pending calls of the state, as s.waiting, to wait in"
+    | None -> error at "A choice that never waits"
+  in
+  let i, _ =
+    List.findi_exn st.fields ~f:(fun _ (f, _, _, _, _) ->
+        String.equal f pending.pending_field)
+  in
+  let registrations = List.nth_exn opened.values i in
+  (* Each way records the registrations it ends with, and whether it registered. *)
+  let ends registrations waited =
+    [
+      R.Stmt.assign ~loc:l [ var waiting ] (R.Stmt.expr_rhs registrations);
+      R.Stmt.assign ~loc:l
+        [ var registered ]
+        (R.Stmt.expr_rhs (R.Expr.bool ~loc:l waited));
+    ]
+  in
+  let rec arm (o : S.outcome) =
+    match o with
+    | Commits_with t ->
+        let* v = formula env t in
+        let* commit = au.commit_only ~at ~value:v in
+        let fold = use_invariants ctx ~at ~fold:true in
+        ctx.snapshots <- snapshots;
+        Ok (commit @ fold @ ends registrations false)
+    | Commits -> unsupported at "Linearizing with the function's result, before a choice,"
+    | Waits (_, key) ->
+        let* key = formula env key in
+        let on =
+          List.Assoc.find_exn opened.indices pending.pending_field ~equal:String.equal
+        in
+        let added =
+          R.Expr.call ~loc:l (name ~loc:l "++")
+            [ registrations; R.Expr.set ~loc:l [ var hc ] ]
+        in
+        let next = List.mapi opened.values ~f:(fun j v -> if j = i then added else v) in
+        let field f = name ~loc:l (pending_name st pending f) in
+        let lemma f es = R.Stmt.call ~loc:l (R.Expr.call ~loc:l (name ~loc:l f) es) in
+        let state values = state_of ~loc:l st (grown st values) in
+        let inv = st.invariant in
+        let after = { at with loc_start = at.loc_end } in
+        ctx.origins :=
+          {
+            at = after;
+            code = Fold;
+            message = Printf.sprintf "The invariant %s may not hold after this step" inv;
+            related = [];
+          }
+          :: !(ctx.origins);
+        let _, raven_field, _, _, _ = List.nth_exn st.fields i in
+        Ok
+          ([
+             R.Stmt.assign ~loc:l
+               [ var hc ]
+               (R.Stmt.new_rhs
+                  [
+                    (field "watched", Some key);
+                    (field "linked", Some (R.Expr.bool ~loc:l false));
+                    (field "token", Some au.token);
+                    (field "retired", Some (R.Expr.bool ~loc:l false));
+                  ]);
+             R.Stmt.fold ~loc:l
+               ~witnesses:
+                 [
+                   (ident ~loc:l "tok", au.token);
+                   (ident ~loc:l "l", R.Expr.bool ~loc:l false);
+                   (ident ~loc:l "r", R.Expr.bool ~loc:l false);
+                 ]
+               (name ~loc:l (pending_name st pending "registration"))
+               (var hc :: args);
+             lemma (member_name st "learn")
+               [ List.hd_exn args; state opened.values; state next ];
+             lemma (member_name st "snapshot") [ List.hd_exn args; state next ];
+             R.Stmt.fold ~loc:(loc after)
+               ~witnesses:
+                 [
+                   (ident ~loc:l raven_field, added);
+                   (ident ~loc:l pending.pending_on, R.Expr.update ~loc:l on (var hc) key);
+                 ]
+               (name ~loc:l inv) args;
+           ]
+          @ ends added true)
+    | Chooses (c, a, b) ->
+        let* c = formula env c in
+        let* a = arm a in
+        let* b = arm b in
+        Ok [ R.Stmt.if_ ~loc:l c a b ]
+  in
+  let* stmts = arm outcome in
+  let j = i in
+  (* The latest snapshot, on either path: the state with the registrations each ended
+     with. *)
+  let merged =
+    {
+      opened with
+      values = List.mapi opened.values ~f:(fun k v -> if k = j then var waiting else v);
+    }
+  in
+  ctx.snapshots <-
+    ( st.invariant,
+      merged
+      :: Option.value
+           (List.Assoc.find snapshots st.invariant ~equal:String.equal)
+           ~default:[] )
+    :: List.Assoc.remove snapshots st.invariant ~equal:String.equal;
+  au.state <-
+    Registered
+      {
+        registration = var hc;
+        registered = var registered;
+        pending_inv = st.invariant;
+        pending;
+      };
+  au.step <- at;
+  let local x typ = R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x) in
+  let _, _, waiting_typ, _, _ = List.nth_exn st.fields j in
+  Ok
+    (local hc (R.Type.ref ~loc:l)
+    @ local registered (R.Type.bool ~loc:l)
+    @ local waiting waiting_typ
+    @ [ R.Stmt.ghost_block ~loc:l stmts ])
+
+(** The statements of the step at [at] that collects the result of the function with the
+    update [au], left to be helped as [r] says, if its result [value] matches [p]:
+    committing with [result] if nobody helped it, and retiring the registration. *)
+let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat) result =
+  let l = loc at in
+  let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+  let* st, args, _ =
+    match open_pending_structure ctx with
+    | Some found -> Ok found
+    | None ->
+        error at "A step that collects a result without a structure with pending calls"
+  in
+  let env = scope_env ctx in
+  let* matches, _ = spec_pattern env p value in
+  let* result = formula env result in
+  let* commit = au.commit_only ~at ~value:result in
+  let linked = Names.fresh ctx.names "linked" in
+  let registration = name ~loc:l (pending_name st r.pending "registration") in
+  let retired = name ~loc:l (pending_name st r.pending "retired") in
+  au.state <- Committed;
+  au.step <- at;
+  Ok
+    [
+      R.Stmt.ghost_block ~loc:l
+        [
+          R.Stmt.if_ ~loc:l r.registered
+            (R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.bool ~loc:l)
+               (ident ~loc:l linked)
+            @ [
+                R.Stmt.unfold ~loc:l
+                  ~witnesses:[ (ident ~loc:l linked, var "l") ]
+                  registration (r.registration :: args);
+              ]
+            @ (match matches with
+              | Some c -> [ R.Stmt.if_ ~loc:l c commit [] ]
+              | None -> commit)
+            @ [
+                R.Stmt.assign ~loc:l
+                  [ R.Expr.field ~loc:l r.registration retired ]
+                  (R.Stmt.expr_rhs (R.Expr.bool ~loc:l true));
+                R.Stmt.fold ~loc:l
+                  ~witnesses:
+                    [
+                      (ident ~loc:l "tok", au.token);
+                      (ident ~loc:l "l", var linked);
+                      (ident ~loc:l "r", R.Expr.bool ~loc:l true);
+                    ]
+                  registration (r.registration :: args);
+              ])
+            [];
+        ];
+    ]
+
 (** The statements of [access], an atomic step, inside the atomic update of a function
     with an atomic contract that has not linearized yet. The step linearizes the function
     as [how] says: always, never, if it is a [compare_and_set] that succeeds, or if it is
     a read whose value has a constructor. *)
-let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ])
+let linearize ?step ?value ctx ~at
+    (how :
+      [ `Commit | `Abort | `Cas | `Returning of string | `Decide of S.pat * S.outcome ])
     access =
   let l = loc at in
   (* The actions that the step may perform, once the invariants are open. *)
@@ -1999,11 +2351,33 @@ let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of str
         opening @ access @ snapshot
         @ [ R.Stmt.if_ ~loc:l result [ R.Stmt.ghost_block ~loc:l performed ] failed ]
   in
-  match ctx.au with
-  | None -> Ok (around access)
-  | Some au ->
+  match (ctx.au, how, value) with
+  | None, `Decide _, _ ->
+      error at "A choice of how to linearize outside an atomic function"
+  | Some au, `Decide (p, o), Some value ->
+      begin match (au.state, o) with
+      | Pending, _ ->
+          (* The invariants open, the update not: the step decides. *)
+          let opening = use_invariants ctx ~at ~fold:false in
+          let* decision = decide ctx au ~at ~value p o in
+          Ok (opening @ access @ decision)
+      | Registered r, Commits_with result ->
+          let opening = use_invariants ctx ~at ~fold:false in
+          let* collected = collect ctx au r ~at ~value p result in
+          Ok (opening @ access @ collected @ use_invariants ctx ~at ~fold:true)
+      | _ ->
+          error at
+            "Caravan cannot tell whether the function has linearized before this step"
+      end
+  | Some _, `Decide _, None -> error at "Only a read can linearize by its value"
+  | None, _, _ -> Ok (around access)
+  | Some au, ((`Commit | `Abort | `Cas | `Returning _) as how), _ ->
       begin match au.state with
       | Committed -> Ok (around access)
+      | Registered _ ->
+          error at
+            "This function waits to be helped: the next step collects its result, as (*@ \
+             returning Nil -> commit true *)"
       | Committing | On_cas | On_read _ | Partly | Unknown ->
           error at
             "Caravan cannot tell whether the function has linearized before this step"
@@ -2504,7 +2878,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | _ -> unsupported at "This atomic"
   in
   (* How the step linearizes the function: as its annotation says, or by default. *)
-  let* annotation = linearization ctx ~at in
+  let* annotation = linearization ctx e in
   let how default =
     match (annotation, default) with
     | None, _ -> Ok default
@@ -2517,11 +2891,13 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
         | None -> error a.pid_loc (Printf.sprintf "There is no action %s" a.pid_str)
         end
     | Some S.Commit, _ -> Ok `Commit
-    | Some (Returning { pat_desc = Pconstr (Qid c, _); _ }), `Abort ->
+    | Some (Returning ({ pat_desc = Pconstr (Qid c, _); _ }, Commits)), `Abort ->
         Ok (`Returning c.pid_str)
-    | Some (Returning p), `Abort ->
+    | Some (Returning (p, Commits)), `Abort ->
         unsupported p.pat_loc "A pattern other than a constructor, after returning,"
-    | Some (Returning p), _ -> error p.pat_loc "Only a read can linearize by its value"
+    | Some (Returning (p, o)), `Abort -> Ok (`Decide (p, o))
+    | Some (Returning (p, _)), _ ->
+        error p.pat_loc "Only a read can linearize by its value"
   in
   (* The result of [f] applied to the atomic and [args], in a variable, a step that
      linearizes the function by default as [default] says. *)
@@ -2559,9 +2935,12 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let x = Names.fresh ctx.names "tmp" in
       let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (name ~loc:l field)) in
       let* how = how `Abort in
+      let value = R.Expr.var ~loc:l (name ~loc:l x) in
       let* step =
-        linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+        linearize ~value ctx ~at how
+          (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
       in
+      record_read ctx ~atomic:a value;
       Ok (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
   | "set", [ a; v ] ->
       let* how = how `Commit in
@@ -2715,7 +3094,7 @@ and call ctx (e : Typedtree.expression) f args =
             au.state <- Committed;
             Ok (Some (au, opening, values))
         | Committed -> Ok None
-        | Committing | On_cas | On_read _ | Partly | Unknown ->
+        | Committing | On_cas | On_read _ | Partly | Registered _ | Unknown ->
             error e.exp_loc
               "Caravan cannot tell whether the function has linearized before this call"
         end
@@ -3577,7 +3956,41 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
       has_result = Option.is_some result;
       open_;
       close;
+      token = R.Expr.var ~loc:(loc at) (name ~loc:(loc at) phi);
+      commit_only;
     }
+  and commit_only ~at ~value =
+    let l = loc at in
+    let* decls =
+      all implicit ~f:(fun (x, _, t, _) ->
+          let* typ = typ ctx ~at t in
+          let v = Names.fresh ctx.names x in
+          Ok
+            ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l v),
+              R.Expr.var ~loc:l (name ~loc:l v) ))
+    in
+    let values = List.map decls ~f:snd in
+    let opening =
+      match values with
+      | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
+      | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
+    in
+    let* unfolds = each pres ~at unfold (opened values) in
+    let* folds = each posts ~at (with_views ctx fold) (opened ~value values) in
+    ctx.origins :=
+      {
+        at;
+        code = Commit;
+        message =
+          "The atomic postcondition may not hold after this step, which linearizes the \
+           function";
+        related =
+          List.map posts ~f:(fun (t : S.term) -> (t.term_loc, "The atomic postcondition"));
+      }
+      :: !(ctx.origins);
+    Ok
+      (List.concat_map decls ~f:fst @ [ opening ] @ unfolds @ folds
+      @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ])
   and close c ~value =
     let at = au.step in
     let l = loc at in
@@ -3745,6 +4158,11 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                 | Some (_, term) ->
                     let* v = expected_formula env (Some t) term in
                     Ok (raven, v, term)
+                | None
+                  when List.exists st.pendings ~f:(fun p ->
+                           String.equal p.pending_field field) ->
+                    (* No calls wait yet. *)
+                    Ok (raven, R.Expr.set ~loc:l [], S.mk_term Ttrue a.loc)
                 | None ->
                     error a.loc (Printf.sprintf "The initial state has no field %s" field))
           in
@@ -3774,6 +4192,12 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                     unsupported term.term_loc
                       "An initial value other than a list of entries, for a field owned \
                        by index,")
+          in
+          (* The keys of no registrations. *)
+          let ons =
+            List.map st.pendings ~f:(fun p ->
+                ( ident ~loc:l p.pending_on,
+                  R.Expr.map_literal ~loc:l [] (R.Expr.null ~loc:l) ))
           in
           let history =
             if has_history st then
@@ -3816,7 +4240,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                 R.Stmt.fold ~loc:l
                   ~witnesses:
                     (List.map values ~f:(fun (raven, v, _) -> (ident ~loc:l raven, v))
-                    @ indices)
+                    @ indices @ ons)
                   (name ~loc:l inv) args;
               ])
     end
@@ -4067,6 +4491,10 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
           "This function may return before it linearizes, on some path: annotate the \
            step that linearizes it there, as (*@ commit *) or (*@ returning [] -> commit \
            *)"
+    | Some (Registered _) ->
+        error f.loc
+          "This function may return waiting to be helped: a step after it waits collects \
+           its result, as (*@ returning Nil -> commit true *)"
     | Some (Committing | On_cas | On_read _ | Unknown) ->
         error f.loc "Caravan cannot tell whether this function linearizes on every path"
   in
@@ -4421,7 +4849,7 @@ let atomic_steps (structure : Typedtree.structure) : int list =
     begin match e.exp_desc with
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _)
       when Option.is_some (atomic_name path) ->
-        found := e.exp_loc.loc_end.pos_cnum :: !found
+        found := step_end e :: !found
     | _ -> ()
     end;
     Tast_iterator.default_iterator.expr iterator e
@@ -4544,7 +4972,7 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
                 ]));
       ]
   in
-  (* Sequences grow by prefix, integers by <=. *)
+  (* Sequences grow by prefix, pending calls by inclusion, integers by <=. *)
   let order =
     let a = var "a" and b = var "b" in
     let field e f = R.Expr.field ~loc:l e (n f) in
@@ -4560,6 +4988,9 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
                      (bin Leq (length (field a f)) (length (field b f)))
                      (bin Eq (field a f)
                         (R.Expr.slice_to ~loc:l (field b f) (length (field a f)))))
+            | _ when List.exists st.pendings ~f:(fun p -> String.equal p.pending_field f)
+              ->
+                Some (bin Subseteq (field a f) (field b f))
             | _ -> Some (bin Leq (field a f) (field b f)))
     in
     Option.value (List.reduce grows ~f:(bin And)) ~default:(R.Expr.bool ~loc:l true)
@@ -4697,6 +5128,278 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
             ]
           []))
 
+(** The views that bind the implicit parameters of the function [f] in its atomic
+    precondition, as [queue q xs]: the parameter, the view and its ghost field. *)
+let view_bindings ctx (f : func) =
+  let atomic_requires =
+    Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
+  in
+  List.filter_map (List.concat_map atomic_requires ~f:conjuncts) ~f:(fun t ->
+      match spine t [] with
+      | { term_desc = Tvar (Qid { pid_str = v; _ }); _ }, args ->
+          begin match
+            (List.Assoc.find ctx.shared.views v ~equal:String.equal, List.last args)
+          with
+          | Some field, Some { term_desc = Tvar (Qid { pid_str = x; _ }); _ } ->
+              Some (x, v, field)
+          | _ -> None
+          end
+      | _ -> None)
+
+(** [t] without the applications of predicates in its conjunctions. *)
+let rec without_predicates ctx (t : S.term) : S.term =
+  match spine (S.chain t) [] with
+  | ({ term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ } as op), [ a; b ] ->
+      let a = without_predicates ctx a and b = without_predicates ctx b in
+      S.mk_term (Tapply (S.mk_term (Tapply (op, a)) t.term_loc, b)) t.term_loc
+  | { term_desc = Tvar (Qid { pid_str = p; _ }); _ }, _
+    when List.Assoc.mem ctx.preds p ~equal:String.equal || String.equal p "own" ->
+      S.mk_term Ttrue t.term_loc
+  | _ -> t
+
+(** The members of the pending field [p] of [st], whose calls of [helped], the procedure
+    [helped_proc], wait: the ghost fields of a registration, the predicate holding its
+    call's update until the call retires, committed with the result once helped, and the
+    lemma helping the registrations waiting on a key. *)
+let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_proc =
+  let at = st.at in
+  let l = loc at in
+  let n x = R.Name.make ~loc:l x in
+  let var x = R.Expr.var ~loc:l (n x) in
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  let field e f = R.Expr.field ~loc:l e (n (pending_name st p f)) in
+  let half e f v = R.Expr.own ~loc:l [ field e f; v; R.Expr.real ~loc:l 0.5 ] in
+  let decl ?(ghost = false) x t = R.Var.make ~loc:l ~ghost (ident ~loc:l x) t in
+  let* key_typ = typ ctx ~at p.key_type in
+  let token_typ = R.Type.atomic_token ~loc:l (n helped_proc) in
+  let bool_typ = R.Type.bool ~loc:l and ref_typ = R.Type.ref ~loc:l in
+  let* params =
+    all st.params ~f:(fun (x, t) ->
+        let* typ = typ ctx ~at t in
+        Ok (x, t, decl x typ))
+  in
+  let args = List.map params ~f:(fun (x, _, _) -> var x) in
+  let* () =
+    if List.length helped.params = List.length params then Ok ()
+    else
+      unsupported helped.loc
+        "Helping a function whose parameters are not those of the structure's invariant"
+  in
+  let* result_name, arg_names =
+    contract_names helped
+      (Option.bind helped.contract ~f:(fun c -> c.header))
+      (List.length helped.params)
+  in
+  let env =
+    {
+      ctx;
+      var_types = List.map params ~f:(fun (x, t, _) -> (x, t));
+      data = ctx.types;
+      funcs = ctx.spec_funcs;
+      vars = List.map params ~f:(fun (x, _, _) -> (x, Raven x));
+    }
+  in
+  let _, _, result = p.helping in
+  let* result = formula env result in
+  let registration = pending_name st p "registration" in
+  let registered hc = R.Expr.call ~loc:l (n registration) (hc :: args) in
+  let fields =
+    [
+      ("watched", key_typ);
+      ("linked", bool_typ);
+      ("token", token_typ);
+      ("retired", bool_typ);
+    ]
+  in
+  let ghost_fields =
+    List.map fields ~f:(fun (f, t) ->
+        R.Member.field ~loc:l ~ghost:true (ident ~loc:l (pending_name st p f)) t)
+  in
+  (* The registration of a call: its update until it retires, committed once helped. *)
+  let hc = var "hc" in
+  let registration_pred =
+    R.Callable.func ~loc:l ~kind:Pred
+      ~formals:(decl "hc" ref_typ :: List.map params ~f:(fun (_, _, d) -> d))
+      (ident ~loc:l registration)
+      (Some
+         (R.Expr.exists ~loc:l
+            [ decl "tok" token_typ; decl "l" bool_typ; decl "r" bool_typ ]
+            (List.reduce_exn ~f:(bin And)
+               [
+                 half hc "token" (var "tok");
+                 half hc "linked" (var "l");
+                 half hc "retired" (var "r");
+                 R.Expr.ite ~loc:l (var "r") (R.Expr.bool ~loc:l true)
+                   (R.Expr.ite ~loc:l (var "l")
+                      (R.Expr.au_commit ~loc:l (n helped_proc)
+                         ((var "tok" :: args) @ [ result ]))
+                      (R.Expr.au ~loc:l (n helped_proc) (var "tok" :: args)));
+               ])))
+  in
+  (* The values of the structure's views, which the helped function's implicit
+     parameters are bound to by its atomic precondition. *)
+  let bindings = view_bindings ctx helped in
+  let* () =
+    if List.length bindings <= 1 then Ok ()
+    else unsupported helped.loc "Helping a function with several implicit parameters"
+  in
+  let* view_values =
+    all st.views ~f:(fun ((v : S.predicate), _) ->
+        let v = v.pred_name.pid_str in
+        let* t =
+          match List.Assoc.find ctx.preds v ~equal:String.equal with
+          | Some (_, types) when not (List.is_empty types) -> Ok (List.last_exn types)
+          | _ -> error at (Printf.sprintf "The view %s has no value" v)
+        in
+        let* typ = typ ctx ~at t in
+        let view_field = List.Assoc.find_exn ctx.shared.views v ~equal:String.equal in
+        Ok ("view_" ^ v, v, view_field, t, typ))
+  in
+  let anchored e =
+    match anchor ctx.types st.structure_type with
+    | Some (_, at) -> at ~loc:l e
+    | None -> e
+  in
+  let structure = List.hd_exn args in
+  let view_owned =
+    List.map view_values ~f:(fun (x, _, view_field, _, _) ->
+        R.Expr.own ~loc:l
+          [
+            R.Expr.field ~loc:l (anchored structure) (n view_field);
+            var x;
+            R.Expr.real ~loc:l 0.5;
+          ])
+  in
+  (* The helped function's atomic postcondition, for the result, without its predicates. *)
+  let post_env =
+    List.fold view_values
+      ~init:
+        (List.fold2_exn arg_names params ~init:env ~f:(fun env name (x, t, _) ->
+             match name with
+             | Some name ->
+                 { (bind env name (Raven x)) with var_types = (name, t) :: env.var_types }
+             | None -> env))
+      ~f:(fun env (x, v, _, t, _) ->
+        match List.find bindings ~f:(fun (_, w, _) -> String.equal v w) with
+        | Some (implicit, _, _) ->
+            {
+              (bind env implicit (Raven x)) with
+              var_types = (implicit, t) :: env.var_types;
+            }
+        | None -> env)
+  in
+  let post_env = bind post_env result_name (Value result) in
+  let* posts =
+    all
+      (Option.value_map helped.contract ~default:[] ~f:(fun c -> c.atomic_ensures))
+      ~f:(fun t -> formula post_env (without_predicates ctx t))
+  in
+  let c = var "c" and regs = var "regs" and on = var "on" and ls = var "ls" in
+  let each body =
+    R.Expr.forall ~loc:l [ decl "hc" ref_typ ] (bin Impl (bin In hc regs) body)
+  in
+  let waits_on_c = bin Eq (R.Expr.index ~loc:l on hc) c in
+  let help = pending_name st p "help" in
+  let call f es = R.Stmt.call ~loc:l (R.Expr.call ~loc:l (n f) es) in
+  let local ?init x t = R.Stmt.local ~loc:l ~ghost:true ?init ~typ:t (ident ~loc:l x) in
+  (* Opening a helped call's update, with the values of its implicit parameters, and
+     committing it with the result. *)
+  let bound =
+    List.filter view_values ~f:(fun (_, v, _, _, _) ->
+        List.exists bindings ~f:(fun (_, w, _) -> String.equal v w))
+  in
+  let opened_values = List.map bound ~f:(fun (x, _, _, _, _) -> var (x ^ "_1")) in
+  let view_uses use =
+    List.map bound ~f:(fun (x, v, _, _, _) ->
+        let raven, _ = List.Assoc.find_exn ctx.preds v ~equal:String.equal in
+        use ~loc:l (n raven) (args @ [ var (x ^ "_1") ]))
+  in
+  let commit =
+    List.concat_map bound ~f:(fun (x, _, _, _, typ) -> local (x ^ "_1") typ)
+    @ [
+        (match opened_values with
+        | [] -> call "openAU" (var "tok" :: args)
+        | _ ->
+            R.Stmt.assign ~loc:l opened_values
+              (R.Stmt.expr_rhs (R.Expr.call ~loc:l (n "openAU") (var "tok" :: args))));
+      ]
+    @ view_uses (fun ~loc p args -> R.Stmt.unfold ~loc p args)
+    @ view_uses (fun ~loc p args -> R.Stmt.fold ~loc p args)
+    @ [ call "commitAU" ((var "tok" :: args) @ [ result ]) ]
+  in
+  let body =
+    [
+      R.Stmt.if_ ~loc:l
+        (bin Neq regs (R.Expr.set ~loc:l []))
+        (local "hc" ref_typ
+           ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (n "choose") [ regs ]))
+        @ [
+            call help
+              (args @ [ c ]
+              @ List.map view_values ~f:(fun (x, _, _, _, _) -> var x)
+              @ [ R.Expr.call ~loc:l (n "--") [ regs; R.Expr.set ~loc:l [ hc ] ]; on; ls ]
+              );
+            R.Stmt.if_ ~loc:l waits_on_c
+              (local "tok" token_typ @ local "r" bool_typ
+              @ [
+                  R.Stmt.unfold ~loc:l
+                    ~witnesses:
+                      [ (ident ~loc:l "tok", var "tok"); (ident ~loc:l "r", var "r") ]
+                    (n registration) (hc :: args);
+                  R.Stmt.if_ ~loc:l (R.Expr.not_ ~loc:l (var "r")) commit [];
+                  R.Stmt.assign ~loc:l
+                    [ field hc "linked" ]
+                    (R.Stmt.expr_rhs (R.Expr.bool ~loc:l true));
+                  R.Stmt.fold ~loc:l
+                    ~witnesses:
+                      [
+                        (ident ~loc:l "tok", var "tok");
+                        (ident ~loc:l "l", R.Expr.bool ~loc:l true);
+                        (ident ~loc:l "r", var "r");
+                      ]
+                    (n registration) (hc :: args);
+                ])
+              [];
+          ])
+        [];
+    ]
+  in
+  let help_lemma =
+    R.Callable.proc ~loc:l ~kind:Lemma
+      ~formals:
+        (List.map params ~f:(fun (_, _, d) -> d)
+        @ [ decl "c" key_typ ]
+        @ List.map view_values ~f:(fun (x, _, _, _, typ) -> decl x typ)
+        @ [
+            decl "regs" (R.Type.fin_set ~loc:l ref_typ);
+            decl "on" (R.Type.map ~loc:l ref_typ key_typ);
+            decl "ls" (R.Type.map ~loc:l ref_typ bool_typ);
+          ])
+      ~requires:
+        (List.map (posts @ view_owned) ~f:R.Spec.make
+        @ [
+            R.Spec.make
+              (each
+                 (List.reduce_exn ~f:(bin And)
+                    [
+                      half hc "linked" (R.Expr.index ~loc:l ls hc);
+                      registered hc;
+                      bin Impl waits_on_c (R.Expr.not_ ~loc:l (R.Expr.index ~loc:l ls hc));
+                    ]));
+          ])
+      ~ensures:
+        (List.map view_owned ~f:R.Spec.make
+        @ [
+            R.Spec.make
+              (each
+                 (bin And
+                    (half hc "linked" (bin Or (R.Expr.index ~loc:l ls hc) waits_on_c))
+                    (registered hc)));
+          ])
+      ~decreases:[ regs ] (ident ~loc:l help) (Some body)
+  in
+  Ok (ghost_fields @ [ R.Member.callable registration_pred; R.Member.callable help_lemma ])
+
 (** The parameters of [p], with the OCaml types [param_types], and the environment of the
     predicate's body. *)
 let pred_params ctx ~at (p : S.predicate) param_types =
@@ -4719,6 +5422,32 @@ let pred_params ctx ~at (p : S.predicate) param_types =
   in
   Ok (params, env)
 
+(** The context translating the specifications of declarations, outside functions. *)
+let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins =
+  {
+    types;
+    refs;
+    primitives;
+    names = Names.create ();
+    functions = [];
+    lifted = [];
+    pasts = [];
+    past_returns = [];
+    origins;
+    annotations = [];
+    spec_funcs;
+    env = ocaml_env;
+    preds;
+    facts = [];
+    au = None;
+    linearizations = [];
+    shared;
+    invariants = [];
+    opened = [];
+    snapshots = [];
+    positions = [];
+  }
+
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]; [views] are the views of the program, for an
     invariant to hold its half of each. *)
@@ -4726,29 +5455,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
     ~views ~structures (p : S.predicate) (def : definition) param_types :
     (R.Callable.t, error) Result.t =
   let ctx =
-    {
-      types;
-      refs;
-      primitives;
-      names = Names.create ();
-      functions = [];
-      lifted = [];
-      pasts = [];
-      past_returns = [];
-      origins;
-      annotations = [];
-      spec_funcs;
-      env = ocaml_env;
-      preds;
-      facts = [];
-      au = None;
-      linearizations = [];
-      shared;
-      invariants = [];
-      opened = [];
-      snapshots = [];
-      positions = [];
-    }
+    spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
   in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
@@ -4895,7 +5602,70 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
                 chain owned
             | _ -> quantified state_env t)
       in
-      let body = List.reduce_exn body ~f:(bin And) in
+      (* The registered calls, each waiting on a key, helped once the key is not the one
+         that the helping action helps any more, and their registrations. *)
+      let* waiting =
+        all st.pendings ~f:(fun p ->
+            let registrations = var (st.state ^ "_" ^ p.pending_field) in
+            let on = var p.pending_on in
+            let hc = R.Expr.var ~loc:l (R.Name.make ~loc:l "hc") in
+            let key = R.Expr.index ~loc:l on hc in
+            let helping_state, helping_key, _ = p.helping in
+            let* helped_key =
+              formula
+                (bind state_env helping_state
+                   (Option.value_exn
+                      (List.Assoc.find state_env.vars state ~equal:String.equal)))
+                helping_key
+            in
+            let pending_field f =
+              R.Expr.field ~loc:l hc (R.Name.make ~loc:l (pending_name st p f))
+            in
+            let half f v =
+              R.Expr.own ~loc:l [ pending_field f; v; R.Expr.real ~loc:l 0.5 ]
+            in
+            (* A key that is an entry of a field owned by index is at its position. *)
+            let membership =
+              List.filter_map st.chains ~f:(fun (field, _) ->
+                  match
+                    List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
+                  with
+                  | Some (_, entries, _, t, _) ->
+                      begin match Datatypes.desc types t with
+                      | Tconstr (_, [ elt ], _)
+                        when String.equal (Datatypes.tag types elt)
+                               (Datatypes.tag types p.key_type) ->
+                          let index =
+                            R.Expr.index ~loc:l
+                              (var
+                                 (List.Assoc.find_exn st.chains field ~equal:String.equal))
+                              key
+                          in
+                          Some
+                            (List.reduce_exn ~f:(bin And)
+                               [
+                                 bin Leq (R.Expr.int ~loc:l 0) index;
+                                 bin Lt index (length (var entries));
+                                 bin Eq (R.Expr.index ~loc:l (var entries) index) key;
+                               ])
+                      | _ -> None
+                      end
+                  | None -> None)
+            in
+            let registered =
+              R.Expr.call ~loc:l
+                (R.Name.make ~loc:l (pending_name st p "registration"))
+                (hc :: List.map params ~f:(fun (_, raven, _, _) -> var raven))
+            in
+            Ok
+              (R.Expr.forall ~loc:l
+                 [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+                 (bin Impl (bin In hc registrations)
+                    (List.reduce_exn ~f:(bin And)
+                       ((half "watched" key :: membership)
+                       @ [ half "linked" (bin Neq key helped_key); registered ])))))
+      in
+      let body = List.reduce_exn (body @ waiting) ~f:(bin And) in
       let _, structure, _, _ = List.hd_exn params in
       let anchored e =
         match anchor types st.structure_type with
@@ -4953,9 +5723,17 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
         else []
       in
       let body = List.fold (halves @ history) ~init:body ~f:(bin And) in
+      let* ons =
+        all st.pendings ~f:(fun p ->
+            let* key = typ ctx ~at p.key_type in
+            Ok
+              (R.Var.make ~loc:l (ident ~loc:l p.pending_on)
+                 (R.Type.map ~loc:l (R.Type.ref ~loc:l) key)))
+      in
       let existentials =
         List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
             R.Var.make ~loc:l (ident ~loc:l raven) typ)
+        @ ons
         @ List.map st.chains ~f:(fun (field, raven) ->
             let elt_typ =
               match
@@ -5237,8 +6015,15 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             action_state;
             action_update;
             action_linearizes;
+            action_helps;
           } ->
           let id (x : S.id) = x.pid_str in
+          let helps =
+            Option.bind action_helps ~f:(fun (field, key, result) ->
+                match field.term_desc with
+                | Tfield (_, Qid f) -> Some (f.pid_str, key, result)
+                | _ -> None)
+          in
           Some
             {
               action = action_name.pid_str;
@@ -5247,6 +6032,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               state = action_state.pid_str;
               update = List.map action_update ~f:(fun (f, t) -> (f.S.pid_str, t));
               linearizes = List.map action_linearizes ~f:id;
+              helps;
             }
       | _ -> None)
   in
@@ -5257,13 +6043,70 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
            | Invariant { state; fields; body } ->
                Some (at, p, state, fields, body, param_types)
            | Body _ | View _ -> None))
-      ~f:(fun (at, (p : S.predicate), state, fields, body, param_types) ->
+      ~f:(fun (at, (p : S.predicate), state, state_fields, body, param_types) ->
+        (* The key type of a field of pending calls. *)
+        let pending_key t =
+          match Datatypes.desc types t with
+          | Tconstr (path, [ key ], _) when Path.same path source.pending -> Some key
+          | _ -> None
+        in
         let* fields =
-          all fields ~f:(fun (sf : S.state_field) ->
+          all state_fields ~f:(fun (sf : S.state_field) ->
               let* t = Source.ocaml_type ocaml_env ~at sf.sf_type in
-              let* typ = Datatypes.typ types ~at t in
+              let raven = state ^ "_" ^ sf.sf_name.pid_str in
+              match pending_key t with
+              | Some _ ->
+                  (* The registrations, which only grow. *)
+                  Ok
+                    ( sf.sf_name.pid_str,
+                      raven,
+                      R.Type.fin_set ~loc:(loc at) (R.Type.ref ~loc:(loc at)),
+                      t,
+                      true )
+              | None ->
+                  let* typ = Datatypes.typ types ~at t in
+                  Ok (sf.sf_name.pid_str, raven, typ, t, sf.sf_grows))
+        in
+        let* pendings =
+          all
+            (List.filter_map state_fields ~f:(fun (sf : S.state_field) ->
+                 match Source.ocaml_type ocaml_env ~at sf.sf_type with
+                 | Ok t -> Option.map (pending_key t) ~f:(fun key -> (sf, key))
+                 | Error _ -> None))
+            ~f:(fun ((sf : S.state_field), key) ->
+              let field = sf.sf_name.pid_str in
+              let* helped =
+                match sf.sf_helps with
+                | Some f -> Ok f
+                | None ->
+                    error sf.sf_name.pid_loc
+                      "A field of pending calls names the function whose calls wait, as \
+                       [@helps is_empty]"
+              in
+              let* helping =
+                match
+                  List.filter_map actions ~f:(fun a ->
+                      match a.helps with
+                      | Some (f, k, v) when String.equal f field -> Some (a.state, k, v)
+                      | _ -> None)
+                with
+                | [ helping ] -> Ok helping
+                | [] ->
+                    error sf.sf_name.pid_loc
+                      "No action helps the calls of this field: give one as [helps s.f \
+                       on key with result]"
+                | _ :: _ :: _ ->
+                    unsupported sf.sf_name.pid_loc
+                      "Helping the calls of a field by several actions"
+              in
               Ok
-                (sf.sf_name.pid_str, state ^ "_" ^ sf.sf_name.pid_str, typ, t, sf.sf_grows))
+                {
+                  pending_field = field;
+                  pending_on = state ^ "_" ^ field ^ "_on";
+                  key_type = key;
+                  helped;
+                  helping;
+                })
         in
         let chains =
           List.dedup_and_sort ~compare:String.compare
@@ -5277,6 +6120,30 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             fields;
             chains = List.map chains ~f:(fun f -> (f, state ^ "_" ^ f ^ "_index"));
             actions;
+            pendings;
+            held =
+              List.filter_map (conjuncts body) ~f:(fun t ->
+                  match spine t [] with
+                  | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+                      [ location; value ] ) ->
+                      begin match spine value [] with
+                      | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
+                          [
+                            {
+                              term_desc =
+                                Tfield
+                                  ( { term_desc = Tvar (Qid { pid_str = x; _ }); _ },
+                                    Qid { pid_str = f; _ } );
+                              _;
+                            };
+                            position;
+                          ] )
+                        when String.equal x state && List.mem chains f ~equal:String.equal
+                        ->
+                          Some (location, f, position)
+                      | _ -> None
+                      end
+                  | _ -> None);
             params =
               List.zip_exn
                 (List.map p.pred_params ~f:(fun (x, _) -> x.S.pid_str))
@@ -5363,6 +6230,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 ~f:(fun p -> (p.inv, p.field, entry_of_args types f names p.element)) ) ))
   in
   let pasts, past_returns = List.unzip pasts in
+  let* pending_member_lists =
+    all structures ~f:(fun st ->
+        all st.pendings ~f:(fun p ->
+            match
+              List.find funcs ~f:(fun f -> String.equal (Ident.name f.id) p.helped)
+            with
+            | Some helped ->
+                pending_members
+                  (spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds
+                     ~spec_funcs origins)
+                  st p helped ~helped_proc:(proc_name helped)
+            | None ->
+                error st.at (Printf.sprintf "There is no function %s to help" p.helped)))
+  in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
         predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
@@ -5396,6 +6277,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ record_fields @ ref_fields @ ghost_fields
         @ List.concat structure_member_lists
+        @ List.concat_map pending_member_lists ~f:List.concat
         @ List.map !primitives ~f:snd
         @ List.map (pred_members @ pure_funcs @ procs) ~f:R.Member.callable),
       !origins )

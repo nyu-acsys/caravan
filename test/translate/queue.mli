@@ -16,6 +16,12 @@ val push : t -> int -> unit
     atomic requires queue q xs
     atomic ensures queue q (xs ++ [ v ]) *)
 
+val is_empty : t -> bool
+(*@ b = atomic is_empty q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures queue q xs && b = (length xs = 0) *)
+
 val pop_opt : t -> int option
 (*@ r = atomic pop_opt q
     requires is_queue q

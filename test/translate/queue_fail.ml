@@ -14,3 +14,14 @@ let swing_tail q =
   let old_tail = Atomic.get q.tail in
   let fresh = Atomic.make Nil in
   if Atomic.compare_and_set q.tail old_tail fresh then () else ()
+
+(* The first read commits with false even if the head's cell is the last, which makes
+   the queue empty. *)
+let is_empty q =
+  Atomic.get
+    (Atomic.get
+       q.head
+       (*@ returning c ->
+          if c = c then commit false else wait in s.waiting on c *))
+  (*@ returning Nil -> commit true *)
+  == Nil
