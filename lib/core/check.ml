@@ -50,10 +50,12 @@ let blame (d : R.Diagnostic.t) : R.Diagnostic.t =
       }
   | _ -> d
 
-(** Verifies [file], giving the solver [smt_timeout] milliseconds a query; whether it
-    verified. With [emit_rav], the Raven program is printed instead. *)
-let file ~(emit_rav : bool) ~(smt_timeout : int) (file : string) : bool =
-  match Source.load file with
+(** Verifies [file], with the libraries in [include_dirs], giving the solver [smt_timeout]
+    milliseconds a query; whether it verified. With [emit_rav], the Raven program is
+    printed instead. *)
+let file ~(include_dirs : string list) ~(emit_rav : bool) ~(smt_timeout : int)
+    (file : string) : bool =
+  match Source.load ~include_dirs file with
   | Error error ->
       Report.print error;
       false

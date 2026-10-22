@@ -122,31 +122,41 @@ let load_proof file : (S.proof_decl list, Report.error) Result.t =
   | Caravan_spec.Spec_parser.Error ->
       Error (Report.error Syntax (lexeme_loc ()) "Syntax error")
 
-(** Parses and type-checks [file], in the environment of the standard library. The front
-    end reports errors by raising; they are returned here. *)
-let load (file : string) : (t, Report.error) Result.t =
+(** The interfaces without an implementation next to them in [file]'s directory, then in
+    [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
+let library_files ~include_dirs file =
+  let own = Stdlib.Filename.(remove_extension (basename file)) in
+  let in_dir dir =
+    List.filter_map
+      (List.sort (Array.to_list (Stdlib.Sys.readdir dir)) ~compare:String.compare)
+      ~f:(fun f ->
+        let base = Stdlib.Filename.remove_extension f in
+        Option.some_if
+          (Stdlib.Filename.check_suffix f ".mli"
+          && (not (String.equal base own))
+          && not (Stdlib.Sys.file_exists (Stdlib.Filename.concat dir (base ^ ".ml"))))
+          (Stdlib.Filename.concat dir f))
+  in
+  List.concat_map (Stdlib.Filename.dirname file :: include_dirs) ~f:in_dir
+  |> List.stable_dedup ~compare:(fun f g ->
+      String.compare Stdlib.Filename.(basename f) Stdlib.Filename.(basename g))
+
+(** Parses and type-checks [file], in the environment of the standard library and the
+    libraries in its directory and [include_dirs]. The front end reports errors by
+    raising; they are returned here. *)
+let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
   try
     Compmisc.init_path ();
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
-    (* The libraries, as modules of the interfaces next to the file without
-       implementations. *)
-    let dir = Stdlib.Filename.dirname file in
-    let own = Stdlib.Filename.(remove_extension (basename file)) in
-    let library_files =
-      List.filter
-        (List.sort (Array.to_list (Stdlib.Sys.readdir dir)) ~compare:String.compare)
-        ~f:(fun f ->
-          let base = Stdlib.Filename.remove_extension f in
-          Stdlib.Filename.check_suffix f ".mli"
-          && (not (String.equal base own))
-          && not (Stdlib.Sys.file_exists (Stdlib.Filename.concat dir (base ^ ".ml"))))
-    in
     let env, libraries =
-      List.fold library_files ~init:(env, []) ~f:(fun (env, libraries) f ->
-          let library = load_interface (Stdlib.Filename.concat dir f) in
-          let library_name = String.capitalize (Stdlib.Filename.remove_extension f) in
+      List.fold (library_files ~include_dirs file) ~init:(env, [])
+        ~f:(fun (env, libraries) f ->
+          let library = load_interface f in
+          let library_name =
+            String.capitalize Stdlib.Filename.(remove_extension (basename f))
+          in
           let declaration =
             Ast_helper.Sig.module_
               (Ast_helper.Md.mk
