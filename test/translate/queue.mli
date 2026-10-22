@@ -1,4 +1,5 @@
-(** The Michael-Scott queue, of integers, after Saturn's: its creation and pop. *)
+(** The Michael-Scott queue, of integers, after Saturn's: its creation, pop, and moving
+    its tail on. *)
 
 type t
 
@@ -15,3 +16,7 @@ val pop_opt : t -> int option
     atomic requires queue q xs
     atomic ensures if length xs = 0 then r = None && queue q xs
       else r = Some xs.(0) && queue q (drop 1 xs) *)
+
+val swing_tail : t -> unit
+(*@ swing_tail q
+    requires is_queue q *)

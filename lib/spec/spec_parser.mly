@@ -57,7 +57,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO
 
 (* Keywords *)
 
@@ -145,8 +145,23 @@ proof_decl:
                         inv_state = List.hd ps; inv_body = t } }
 | VIEW n = lident ps = pred_param+ EQUAL t = term
     { Proof_view { view_name = n; view_params = ps; view_value = t } }
-| ACTION n = lident EQUAL LEFTBRC s = lident WITH fs = semicolon_list1(field_value) RIGHTBRC
-    { Proof_action { action_name = n; action_state = s; action_update = fs } }
+| ACTION n = lident ps = lident* EQUAL step = action_step?
+    LEFTBRC s = lident WITH fs = semicolon_list1(field_value) RIGHTBRC
+    ls = loption(preceded(LINEARIZES, separated_nonempty_list(COMMA, lident)))
+    { let step, consumes =
+        match step with Some (st, c) -> (Some st, c) | None -> (None, None) in
+      Proof_action { action_name = n; action_params = ps; action_step = step;
+                     action_consumes = consumes; action_state = s; action_update = fs;
+                     action_linearizes = ls } }
+;
+
+action_step:
+| op = lident args = step_arg* c = preceded(CONSUMES, term)? LEADSTO { ((op, args), c) }
+;
+
+step_arg:
+| UNDERSCORE { None }
+| t = term_arg { Some t }
 ;
 
 state_field:

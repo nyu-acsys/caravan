@@ -136,11 +136,19 @@ type proof_decl =
           [view stack (t : t) = s.items], whose last parameter is the value. *)
   | Proof_action of {
       action_name : id;
+      action_params : id list;
+      action_step : (id * term option list) option;
+      action_consumes : term option;
       action_state : id;
       action_update : (id * term) list;
+      action_linearizes : id list;
     }
-      (** A transition of the state, [action pop = { s with head = s.head + 1 }]: the
-          fields it changes, in terms of the state before. *)
+      (** A transition of the state, as
+          [action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1) ~> {
+           s with head = s.head + 1 } linearizes pop_opt]: its parameters, the step that
+          performs it, an operation with its arguments, [_] for any, what the step gives
+          the state, the fields it changes, in terms of the state before, and the
+          functions it linearizes. Without a step, only [(*@ performs a *)] names it. *)
 
 (** Where an atomic step linearizes the function that performs it: always, or if its
     result matches a pattern, as [returning [] -> commit]. *)

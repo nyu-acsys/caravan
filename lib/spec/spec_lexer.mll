@@ -37,6 +37,8 @@
         "forall", FORALL;
         "if", IF;
         "action", ACTION;
+        "consumes", CONSUMES;
+        "linearizes", LINEARIZES;
         "assert", ASSERT;
         "atomic", ATOMIC;
         "commit", COMMIT;
@@ -221,6 +223,8 @@ rule token = parse
       { RIGHTPAR }
   | "->"
       { ARROW }
+  | "~>"
+      { LEADSTO }
   | "<->"
       { LRARROW }
   | "&&"

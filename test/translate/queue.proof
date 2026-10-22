@@ -19,4 +19,9 @@ invariant is_queue (q : t) (s : state) =
 
 view queue (q : t) = drop s.head s.values
 
-action pop = { s with head = s.head + 1 }
+(* Popping moves the head on, by a compare_and_set from its cell to the next. *)
+action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1)
+  ~> { s with head = s.head + 1 } linearizes pop_opt
+
+(* Moving the tail on, to a cell linked before. *)
+action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }

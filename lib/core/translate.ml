@@ -113,6 +113,21 @@ type au_close =
   | Abort  (** The step did not change the abstract state. *)
   | Commit_call  (** The step is a call, which linearized the function in its place. *)
 
+type action = {
+  action : string;
+  params : string list;
+  step : (string * S.term option list) option;
+      (** The operation performing it, with its arguments: the location, then the others,
+          [None] for any. *)
+  state : string;
+  update : (string * S.term) list;  (** The fields it changes. *)
+  linearizes : string list;
+}
+(** An action of a structure (see {!S.Proof_action}). *)
+
+type performing = { performed : action; bindings : (string * R.Expr.t) list }
+(** An action that a step performs, with the values of its parameters. *)
+
 type au = {
   mutable state : au_state;
   mutable cas_results : (string * bool) list;
@@ -123,8 +138,9 @@ type au = {
   mutable values : R.Expr.t list;
       (** The values of the implicit parameters in the open update. *)
   mutable step : Location.t;  (** The step that opened the update. *)
-  mutable performing : string option;
-      (** The action that the step performs if it commits, as [(*@ performs pop *)]. *)
+  mutable performing : (performing * R.Expr.t option) option;
+      (** The action that the step performs if it commits, as [(*@ performs pop *)] or by
+          its step, with the condition, if any, under which the step is the action's. *)
   self : string;  (** The procedure's name. *)
   has_result : bool;
   open_ :
@@ -142,7 +158,9 @@ type structure = {
   state : string;
   fields : (string * string * R.Type.t * Types.type_expr * bool) list;
   chains : (string * string) list;
-  actions : (string * string * (string * S.term) list) list;
+  actions : action list;
+  params : (string * Types.type_expr) list;
+      (** The invariant's parameters but the state, with their types. *)
   structure_type : Types.type_expr;
   views : (S.predicate * S.term) list;  (** The views, with their values. *)
   at : Location.t;  (** The invariant's definition. *)
@@ -153,6 +171,27 @@ type structure = {
     and the type of the structure, the invariant's first parameter. *)
 
 let has_history st = List.exists st.fields ~f:(fun (_, _, _, _, grows) -> grows)
+
+(** The type of the index map of [field] of [st], owned by index: from its entries to
+    their positions. *)
+let chain_index_type types st field =
+  let l = R.Loc.none in
+  let elt =
+    match List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field) with
+    | Some (_, _, _, t, _) ->
+        begin match Datatypes.desc types t with
+        | Tconstr (_, [ elt ], _) -> Result.ok (Datatypes.typ types ~at:Location.none elt)
+        | _ -> None
+        end
+    | None -> None
+  in
+  R.Type.map ~loc:l (Option.value elt ~default:(R.Type.ref ~loc:l)) (R.Type.int ~loc:l)
+
+(** The values of the fields of [st] that grow, among [values], those of all its fields:
+    the history's state. *)
+let grown st values =
+  List.filter_map (List.zip_exn st.fields values) ~f:(fun ((_, _, _, _, grows), v) ->
+      Option.some_if grows v)
 
 (** The names of the members generated for [st]: functions, lemmas and fields, and
     modules. *)
@@ -175,6 +214,10 @@ type shared = {
 (** The shared structures of a program: invariants and views. *)
 
 let no_shared = { persistent = []; views = []; structures = []; anchors = [] }
+
+type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
+(** The state of an open invariant: the variables of its fields and of the index maps of
+    the fields owned by index. *)
 
 type context = {
   types : Datatypes.t list;
@@ -207,8 +250,7 @@ type context = {
   mutable invariants : (string * R.Expr.t list) list;
       (** The invariants that the function's precondition holds, opened around each of its
           atomic steps, with their arguments. *)
-  mutable opened : (string * R.Expr.t list) list;
-      (** The states of the open invariants, by the variables of their fields. *)
+  mutable opened : (string * opened) list;  (** The states of the open invariants. *)
   mutable snapshots : (string * R.Expr.t list list) list;
       (** The snapshots of the states of the invariants taken on the current path, latest
           first. *)
@@ -1280,26 +1322,75 @@ let anchored ctx ~loc ~pred (e : R.Expr.t) =
       end
   | _ -> e
 
-(** The state after the action [a] of [st] from the state [values], and whether each field
-    changes. *)
-let next_state ctx st values a =
-  match List.find st.actions ~f:(fun (name, _, _) -> String.equal name a) with
-  | None -> None
-  | Some (_, state, update) ->
-      let env =
-        bind (scope_env ctx) state
-          (State
-             (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
-      in
-      Some
-        (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v ->
-             match List.Assoc.find update f ~equal:String.equal with
-             | Some term ->
-                 begin match expected_formula env (Some t) term with
-                 | Ok e -> (e, true)
-                 | Error _ -> (v, false)
-                 end
-             | None -> (v, false)))
+(** The environment of an action's terms: the state [values] of [st], its parameters with
+    their [bindings] and the invariant's parameters, with the values [args]. *)
+let action_env ctx st inv_params args values bindings =
+  let env =
+    bind (scope_env ctx) st.state
+      (State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
+  in
+  let env =
+    List.fold
+      (List.zip_exn inv_params (List.take args (List.length inv_params)))
+      ~init:env
+      ~f:(fun env ((x, t), e) ->
+        { (bind env x (Value e)) with var_types = (x, t) :: env.var_types })
+  in
+  List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e))
+
+(** The state after [p] of [st] from [opened], whose invariant has the parameters
+    [inv_params] and the arguments [args]: each field's value, whether it changes, and the
+    index map of each field owned by index that it changes, as a list that it appends an
+    entry to. *)
+let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
+  let env = action_env ctx st inv_params args opened.values p.bindings in
+  let next =
+    List.map2_exn st.fields opened.values ~f:(fun (f, _, _, t, _) v ->
+        match List.Assoc.find p.performed.update f ~equal:String.equal with
+        | Some term ->
+            begin match expected_formula env (Some t) term with
+            | Ok e -> (e, true)
+            | Error _ -> (v, false)
+            end
+        | None -> (v, false))
+  in
+  (* An entry appended to a field owned by index, at the field's length. *)
+  let appended field =
+    match List.Assoc.find p.performed.update field ~equal:String.equal with
+    | None -> None
+    | Some term ->
+        begin match spine (S.chain term) [] with
+        | ( { term_desc = Tvar (Qid { pid_str = "++"; _ }); _ },
+            [
+              { term_desc = Tfield (_, Qid { pid_str = f; _ }); _ };
+              ({ term_desc = Tapply _; _ } as added);
+            ] )
+          when String.equal f field ->
+            begin match spine added [] with
+            | ( { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ },
+                [ e; { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ } ] ) ->
+                Result.ok (formula env e)
+            | _ -> None
+            end
+        | _ -> None
+        end
+  in
+  let indices =
+    List.filter_map st.chains ~f:(fun (field, index) ->
+        let i, _ =
+          List.findi_exn st.fields ~f:(fun _ (f, _, _, _, _) -> String.equal f field)
+        in
+        Option.map (appended field) ~f:(fun e ->
+            let l = R.Loc.none in
+            ( index,
+              R.Expr.update ~loc:l
+                (List.Assoc.find_exn opened.indices field ~equal:String.equal)
+                e
+                (R.Expr.call ~loc:l
+                   (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
+                   [ List.nth_exn opened.values i ]) )))
+  in
+  (next, indices)
 
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
@@ -1313,25 +1404,35 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
   let state_value st values =
     R.Expr.call ~loc:l
       (R.Name.make ~loc:l ~path:[ module_name st "state" ] "state")
-      values
+      (grown st values)
   in
   let lemma f args = R.Stmt.call ~loc:l (R.Expr.call ~loc:l (name ~loc:l f) args) in
   List.concat_map ctx.invariants ~f:(fun (inv, args) ->
       match (fold, structure inv) with
       | false, Some st ->
-          (* The state, bound to variables. *)
+          (* The state, and the index maps, bound to variables. *)
+          let local (raven, typ) = (raven, Names.fresh ctx.names raven, typ) in
           let locals =
-            List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
-                (raven, Names.fresh ctx.names raven, typ))
+            List.map st.fields ~f:(fun (_, raven, typ, _, _) -> local (raven, typ))
           in
-          let values = List.map locals ~f:(fun (_, x, _) -> var x) in
+          let index_locals =
+            List.map st.chains ~f:(fun (field, raven) ->
+                (field, local (raven, chain_index_type ctx.types st field)))
+          in
           ctx.opened <-
-            (inv, values) :: List.Assoc.remove ctx.opened inv ~equal:String.equal;
-          List.concat_map locals ~f:(fun (_, x, typ) ->
+            ( inv,
+              {
+                values = List.map locals ~f:(fun (_, x, _) -> var x);
+                indices = List.map index_locals ~f:(fun (f, (_, x, _)) -> (f, var x));
+              } )
+            :: List.Assoc.remove ctx.opened inv ~equal:String.equal;
+          let all_locals = locals @ List.map index_locals ~f:snd in
+          List.concat_map all_locals ~f:(fun (_, x, typ) ->
               R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x))
           @ [
               R.Stmt.unfold ~loc:l
-                ~witnesses:(List.map locals ~f:(fun (e, x, _) -> (ident ~loc:l x, var e)))
+                ~witnesses:
+                  (List.map all_locals ~f:(fun (e, x, _) -> (ident ~loc:l x, var e)))
                 (name ~loc:l inv) args;
             ]
       | false, None -> [ R.Stmt.unfold ~loc:l (name ~loc:l inv) args ]
@@ -1352,63 +1453,55 @@ let use_invariants ?performs ctx ~(at : Location.t) ~fold =
           let fold ?(witnesses = []) () =
             [ R.Stmt.fold ~loc:la ~witnesses (name ~loc:la inv) args ]
           in
-          match (structure inv, List.Assoc.find ctx.opened inv ~equal:String.equal) with
-          | Some st, Some values when has_history st -> begin
-              let structure = List.hd_exn args in
-              match Option.bind performs ~f:(next_state ctx st values) with
-              | Some next ->
-                  (* The action's state, which the history learns, and the fields it
-                     changes, as witnesses. *)
-                  let changed =
-                    List.map2_exn st.fields next
-                      ~f:(fun (_, raven, _, _, _) (e, changes) -> (raven, e, changes))
-                  in
-                  let next = List.map next ~f:fst in
-                  ctx.snapshots <- List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
-                  [
-                    lemma (member_name st "learn")
-                      [ structure; state_value st values; state_value st next ];
-                  ]
-                  @ fold
-                      ~witnesses:
-                        (List.filter_map changed ~f:(fun (raven, e, changes) ->
-                             Option.some_if changes (ident ~loc:la raven, e)))
-                      ()
-              | None ->
-                  let snapshots =
-                    Option.value
-                      (List.Assoc.find ctx.snapshots inv ~equal:String.equal)
-                      ~default:[]
-                  in
-                  ctx.snapshots <-
-                    (inv, values :: snapshots)
-                    :: List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
-                  lemma (member_name st "snapshot") [ structure; state_value st values ]
-                  :: fold ()
-            end
-          | _ -> fold ()))
-
-(** The current states of the open invariants extend all their snapshots, which an action
-    may rely on. *)
-let order_snapshots ctx ~(at : Location.t) =
-  let l = loc at in
-  List.concat_map ctx.opened ~f:(fun (inv, values) ->
-      match
-        ( List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv),
-          List.Assoc.find ctx.snapshots inv ~equal:String.equal )
-      with
-      | Some st, Some (latest :: older) ->
-          let state values =
-            R.Expr.call ~loc:l
-              (R.Name.make ~loc:l ~path:[ module_name st "state" ] "state")
-              values
+          let snapshot st values =
+            let snapshots =
+              Option.value
+                (List.Assoc.find ctx.snapshots inv ~equal:String.equal)
+                ~default:[]
+            in
+            ctx.snapshots <-
+              (inv, grown st values :: snapshots)
+              :: List.Assoc.remove ctx.snapshots inv ~equal:String.equal;
+            lemma (member_name st "snapshot") [ List.hd_exn args; state_value st values ]
           in
-          List.map older ~f:(fun o ->
-              R.Stmt.call ~loc:l
-                (R.Expr.call ~loc:l
-                   (name ~loc:l (member_name st "extends_trans"))
-                   [ state o; state latest; state values ]))
-      | _ -> [])
+          match (structure inv, List.Assoc.find ctx.opened inv ~equal:String.equal) with
+          | Some st, Some opened ->
+              begin match performs with
+              | Some p ->
+                  (* The action's state, which the history learns if a growing field
+                     changes, and the fields it changes, as witnesses. *)
+                  let next, indices =
+                    next_state ctx st ~inv_params:st.params args opened p
+                  in
+                  let values = List.map next ~f:fst in
+                  let grows =
+                    List.exists2_exn st.fields next
+                      ~f:(fun (_, _, _, _, grows) (_, changes) -> grows && changes)
+                  in
+                  let witnesses =
+                    List.filter_map (List.zip_exn st.fields next)
+                      ~f:(fun ((_, raven, _, _, _), (e, changes)) ->
+                        Option.some_if changes (ident ~loc:la raven, e))
+                    @ List.map indices ~f:(fun (index, e) -> (ident ~loc:la index, e))
+                  in
+                  let learn =
+                    if grows then
+                      [
+                        lemma (member_name st "learn")
+                          [
+                            List.hd_exn args;
+                            state_value st opened.values;
+                            state_value st values;
+                          ];
+                      ]
+                    else []
+                  in
+                  if has_history st then learn @ (snapshot st values :: fold ~witnesses ())
+                  else fold ~witnesses ()
+              | None when has_history st -> snapshot st opened.values :: fold ()
+              | None -> fold ()
+              end
+          | _ -> fold ()))
 
 (** [make], folding a predicate, preceded by setting the ghost field of a view to its new
     value, the last argument: the view changes with the state. *)
@@ -1422,47 +1515,155 @@ let with_views ctx make ~loc ~pred p args =
       :: make ~loc ~pred p args
   | None -> make ~loc ~pred p args
 
-(** The views of the open invariants, set to their values in the states after the action
-    [a], and folded: the views are functions of the state. *)
-let perform_views ctx ~(at : Location.t) a =
+(** The views of the open invariants, set to their values in the states after [p], and
+    folded: the views are functions of the state. *)
+let perform_views ctx ~(at : Location.t) (p : performing) =
   let l = loc at in
-  all ctx.opened ~f:(fun (inv, values) ->
+  all ctx.opened ~f:(fun (inv, opened) ->
       let structure =
         List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
       in
       let args = List.Assoc.find ctx.invariants inv ~equal:String.equal in
       match (structure, args) with
       | Some st, Some args ->
-          begin match next_state ctx st values a with
-          | None -> Ok []
-          | Some next ->
-              let env =
-                bind (scope_env ctx) st.state
-                  (State
-                     (List.map2_exn st.fields next ~f:(fun (f, _, _, t, _) (e, _) ->
-                          (f, (e, t)))))
-              in
-              let* views =
-                all st.views ~f:(fun ((v : S.predicate), value) ->
-                    let pred = v.pred_name.pid_str in
-                    let inputs = List.take args (List.length v.pred_params - 1) in
-                    let env =
-                      List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
-                        ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
-                    in
-                    let* value = formula env value in
-                    let raven, _ =
-                      List.Assoc.find_exn ctx.preds pred ~equal:String.equal
-                    in
-                    Ok
-                      (with_views ctx
-                         (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
-                         ~loc:l ~pred (name ~loc:l raven) (inputs @ [ value ])))
-              in
-              Ok (List.concat views)
-          end
+          let next, _ = next_state ctx st ~inv_params:st.params args opened p in
+          let env =
+            bind (scope_env ctx) st.state
+              (State
+                 (List.map2_exn st.fields next ~f:(fun (f, _, _, t, _) (e, _) ->
+                      (f, (e, t)))))
+          in
+          let* views =
+            all st.views ~f:(fun ((v : S.predicate), value) ->
+                let pred = v.pred_name.pid_str in
+                let inputs = List.take args (List.length v.pred_params - 1) in
+                let env =
+                  List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
+                    ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
+                in
+                let* value = formula env value in
+                let raven, _ = List.Assoc.find_exn ctx.preds pred ~equal:String.equal in
+                Ok
+                  (with_views ctx
+                     (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
+                     ~loc:l ~pred (name ~loc:l raven) (inputs @ [ value ])))
+          in
+          Ok (List.concat views)
       | _ -> Ok [])
   |> Result.map ~f:List.concat
+
+(** The atomic that [t] denotes as the location of a step: one that an immutable record
+    holds, as [q.head], or [t]'s value. *)
+let atomic_of env (t : S.term) =
+  let l = loc t.term_loc in
+  match t.term_desc with
+  | Tfield
+      (({ term_desc = Tvar (Qid { pid_str = x; _ }); _ } as r), Qid { pid_str = label; _ })
+    when Option.exists (List.Assoc.find env.var_types x ~equal:String.equal)
+           ~f:(fun typ -> Option.is_some (atomic_in_record env.ctx typ label)) ->
+      let* r = formula env r in
+      Ok (R.Expr.field ~loc:l r (name ~loc:l label))
+  | _ -> formula env t
+
+(** The values of the parameters [params] of an action in [pattern], an argument of its
+    step that the step's argument [actual] matches: a parameter itself, a position in a
+    field owned by index, [s.cells.(k)], by the field's index map in [opened], or the
+    arguments of a constructor. *)
+let rec bind_params env st (opened : opened) params (pattern : S.term) actual =
+  let l = R.Loc.none in
+  let pattern = S.chain pattern in
+  match spine pattern [] with
+  | { term_desc = Tvar (Qid { pid_str = x; _ }); _ }, []
+    when List.mem params x ~equal:String.equal ->
+      [ (x, actual) ]
+  | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
+      [
+        {
+          term_desc = Tfield ({ term_desc = Tvar (Qid { pid_str = s; _ }); _ }, Qid f);
+          _;
+        };
+        { term_desc = Tvar (Qid { pid_str = k; _ }); _ };
+      ] )
+    when String.equal s st.state && List.mem params k ~equal:String.equal ->
+      begin match List.Assoc.find opened.indices f.pid_str ~equal:String.equal with
+      | Some index -> [ (k, R.Expr.index ~loc:l index actual) ]
+      | None -> []
+      end
+  | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args when Char.is_uppercase c.[0] ->
+    begin
+      let args = match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args in
+      match Datatypes.find_ctor env.data c with
+      | Some (_, ctor) when List.length ctor.fields = List.length args ->
+          List.concat
+            (List.map2_exn args ctor.fields ~f:(fun a f ->
+                 bind_params env st opened params a
+                   (R.Expr.field ~loc:l actual (R.Name.make ~loc:l f))))
+      | _ -> []
+    end
+  | _ -> []
+
+(** The actions that the step [op], at [location] with the arguments [args], may perform
+    on the open invariants: those whose step is the same operation, at a location of the
+    same type as [field] if known, with their parameters bound and the condition under
+    which the step is theirs. *)
+let step_performings ctx ~at ~op ~field ~location args =
+  let l = loc at in
+  List.concat_map ctx.opened ~f:(fun (inv, opened) ->
+      let structure =
+        List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+      in
+      match (structure, List.Assoc.find ctx.invariants inv ~equal:String.equal) with
+      | Some st, Some inv_args ->
+          List.filter_map st.actions ~f:(fun a ->
+              match a.step with
+              | Some (o, Some loc_pattern :: patterns)
+                when String.equal o op && List.length patterns = List.length args ->
+                  let env bindings =
+                    action_env ctx st st.params inv_args opened.values bindings
+                  in
+                  let bindings =
+                    List.concat
+                      (List.map2_exn patterns args ~f:(fun p actual ->
+                           match p with
+                           | Some p -> bind_params (env []) st opened a.params p actual
+                           | None -> []))
+                  in
+                  let env = env bindings in
+                  let same_field =
+                    match term_type env loc_pattern with
+                    | Some t ->
+                        begin match field_of_type ctx ~at t "" with
+                        | Ok (Some f) -> String.equal f field
+                        | _ -> true
+                        end
+                    | None -> true
+                  in
+                  let condition =
+                    let* location_pattern = atomic_of env loc_pattern in
+                    let* equalities =
+                      all (List.zip_exn patterns args) ~f:(fun (p, actual) ->
+                          match p with
+                          | Some p ->
+                              let* p = formula env p in
+                              Ok (Some (R.Expr.binary ~loc:l Eq p actual))
+                          | None -> Ok None)
+                    in
+                    Ok
+                      (List.fold (List.filter_opt equalities)
+                         ~init:(R.Expr.binary ~loc:l Eq location_pattern location)
+                         ~f:(R.Expr.binary ~loc:l And))
+                  in
+                  begin match (same_field, condition) with
+                  | true, Ok condition -> Some ({ performed = a; bindings }, condition)
+                  | _ -> None
+                  end
+              | _ -> None)
+      | _ -> [])
+
+(** The action named [a] of a structure, for [(*@ performs a *)]. *)
+let named_action ctx a =
+  List.find_map ctx.shared.structures ~f:(fun st ->
+      List.find st.actions ~f:(fun act -> String.equal act.action a))
 
 (** The annotation saying how the atomic step at [at] linearizes the function, if one
     follows it, as [Atomic.get t (*@ commit *)]. *)
@@ -1489,9 +1690,37 @@ let commit_now (au : au) =
     with an atomic contract that has not linearized yet. The step linearizes the function
     as [how] says: always, never, if it is a [compare_and_set] that succeeds, or if it is
     a read whose value has a constructor. *)
-let linearize ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ]) access =
+let linearize ?step ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ])
+    access =
+  let l = loc at in
+  (* The actions that the step may perform, once the invariants are open. *)
+  let performings () =
+    match step with
+    | Some (op, field, location, args, _) ->
+        step_performings ctx ~at ~op ~field ~location args
+    | None -> []
+  in
   let around access =
-    use_invariants ctx ~at ~fold:false @ access @ use_invariants ctx ~at ~fold:true
+    let opening = use_invariants ctx ~at ~fold:false in
+    match (performings (), step) with
+    | [], _ | _, None -> opening @ access @ use_invariants ctx ~at ~fold:true
+    | performings, Some (_, _, _, _, result) ->
+        (* If the step succeeds, it performs the action whose step it is, or changes
+           nothing. *)
+        let snapshots = ctx.snapshots in
+        let close ?performs () =
+          ctx.snapshots <- snapshots;
+          use_invariants ?performs ctx ~at ~fold:true
+        in
+        let unchanged = close () in
+        let performed =
+          List.fold_right performings ~init:unchanged ~f:(fun (p, condition) rest ->
+              [ R.Stmt.if_ ~loc:l condition (close ~performs:p ()) rest ])
+        in
+        let failed = close () in
+        ctx.snapshots <- snapshots;
+        opening @ access
+        @ [ R.Stmt.if_ ~loc:l result [ R.Stmt.ghost_block ~loc:l performed ] failed ]
   in
   match ctx.au with
   | None -> Ok (around access)
@@ -1514,7 +1743,21 @@ let linearize ctx ~at (how : [ `Commit | `Abort | `Cas | `Returning of string ])
             | `Commit -> commit_now au
             | `Cas ->
                 au.state <- On_cas;
-                Ok []
+                (* The action that the step performs if it succeeds, which linearizes the
+                   function. *)
+                let linearizing =
+                  List.filter (performings ()) ~f:(fun (p, _) ->
+                      List.mem p.performed.linearizes au.self ~equal:String.equal)
+                in
+                begin match (linearizing, au.performing) with
+                | _, Some _ | [], None -> Ok []
+                | [ (p, condition) ], None ->
+                    au.performing <- Some (p, Some condition);
+                    Ok []
+                | _ :: _ :: _, None ->
+                    error at
+                      "This step may perform several actions that linearize the function"
+                end
             | `Returning c ->
                 au.state <- On_read c;
                 Ok []
@@ -1984,8 +2227,13 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     match (annotation, default) with
     | None, _ -> Ok default
     | Some (S.Performs a), _ ->
-        Option.iter ctx.au ~f:(fun au -> au.performing <- Some a.pid_str);
-        Ok default
+        begin match named_action ctx a.pid_str with
+        | Some performed ->
+            Option.iter ctx.au ~f:(fun au ->
+                au.performing <- Some ({ performed; bindings = [] }, None));
+            Ok default
+        | None -> error a.pid_loc (Printf.sprintf "There is no action %s" a.pid_str)
+        end
     | Some S.Commit, _ -> Ok `Commit
     | Some (Returning { pat_desc = Pconstr (Qid c, _); _ }), `Abort ->
         Ok (`Returning c.pid_str)
@@ -1995,13 +2243,16 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   in
   (* The result of [f] applied to the atomic and [args], in a variable, a step that
      linearizes the function by default as [default] says. *)
-  let result ?(default = `Commit) f atomic args =
+  let result ?(default = `Commit) ?op f atomic args =
     let* typ = typ ctx ~at e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
     let* how = how default in
-    let* step = linearize ctx ~at how (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)) in
+    let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
+    let* step =
+      linearize ?step ctx ~at how (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
+    in
     Ok (step, v)
   in
   let* elt =
@@ -2040,7 +2291,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       Ok (stmts @ reading, r)
   | "compare_and_set", [ a; old_val; new_val ] ->
       let* f = primitive Compare_and_set in
-      let* reading, r = result ~default:`Cas f a [ old_val; new_val ] in
+      let* reading, r =
+        result ~default:`Cas ~op:("compare_and_set", field) f a [ old_val; new_val ]
+      in
       Ok (stmts @ reading, r)
   | "fetch_and_add", [ a; n ] ->
       let* f = primitive Fetch_and_add in
@@ -2888,7 +3141,7 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
           :: !(ctx.origins);
         let* folds =
           match au.performing with
-          | Some a ->
+          | Some (a, _) ->
               (* The views follow from the action; the postcondition's other predicates
                  are folded as usual. *)
               let others ~loc ~pred p args =
@@ -2900,12 +3153,20 @@ let atomic_update ctx env ~at ~self ~result implicit ~pres ~posts =
               Ok (views @ others)
           | None -> each posts ~at (with_views ctx fold) (opened ~value au.values)
         in
-        let ordered =
-          if Option.is_some au.performing then order_snapshots ctx ~at else []
+        (* The step is the action's, if its step says when. *)
+        let performs = Option.map au.performing ~f:fst in
+        let checked =
+          match au.performing with
+          | Some (p, Some condition) ->
+              [
+                check ctx ~at
+                  (Printf.sprintf "This step may not perform the action %s"
+                     p.performed.action)
+                  condition;
+              ]
+          | _ -> []
         in
-        Ok
-          (ordered @ folds @ [ commit ]
-          @ use_invariants ?performs:au.performing ctx ~at ~fold:true)
+        Ok (checked @ folds @ [ commit ] @ use_invariants ?performs ctx ~at ~fold:true)
     | Abort ->
         let* folds = each pres ~at fold (opened au.values) in
         Ok
@@ -3015,7 +3276,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
               let state =
                 R.Expr.call ~loc:l
                   (qn (module_name st "state") "state")
-                  (List.map values ~f:(fun (_, v, _) -> v))
+                  (grown st (List.map values ~f:(fun (_, v, _) -> v)))
               in
               let location =
                 match anchor ctx.types st.structure_type with
@@ -3459,9 +3720,10 @@ let chain_of ~state (t : S.term) =
       end
   | _ -> None
 
-(** The members generated for the state of [st]: the state as a data type, its order, with
-    transitivity, the states it extends, their history as a resource algebra and its ghost
-    field, and lemmas taking snapshots of the history and growing it. *)
+(** The members generated for the state of [st]: the state of its growing fields as a data
+    type, its order, with transitivity, the states it extends, their history as a resource
+    algebra and its ghost field, and lemmas taking snapshots of the history and growing
+    it. *)
 let structure_members types (st : structure) ~at : (R.Member.t list, error) Result.t =
   let l = loc at in
   let n x = R.Name.make ~loc:l x in
@@ -3494,8 +3756,8 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
              (R.Type.data ~loc:l
                 [
                   R.Type.variant ~loc:l (ident ~loc:l "state")
-                    (List.map st.fields ~f:(fun (f, _, typ, _, _) ->
-                         (ident ~loc:l f, typ)));
+                    (List.filter_map st.fields ~f:(fun (f, _, typ, _, grows) ->
+                         Option.some_if grows (ident ~loc:l f, typ)));
                 ]));
       ]
   in
@@ -3780,7 +4042,9 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
           | None -> error at "Entries owned by index are atomics"
         in
         let owned =
-          R.Expr.forall ~loc:l ~triggers:[ [ position ] ]
+          (* No trigger: one on the index map loops with the positions' trigger, through
+             the next entry that an entry's value names. *)
+          R.Expr.forall ~loc:l
             [ R.Var.make ~loc:l (ident ~loc:l c) elt_typ ]
             (bin Impl
                (bin And
@@ -3837,7 +4101,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs orig
           let state_value =
             R.Expr.call ~loc:l
               (qn (module_name st "state") "state")
-              (List.map st.fields ~f:(fun (_, raven, _, _, _) -> var raven))
+              (grown st (List.map st.fields ~f:(fun (_, raven, _, _, _) -> var raven)))
           in
           [
             R.Expr.own ~loc:l
@@ -4128,11 +4392,26 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* The structures with a state, and their histories, allocated empty. *)
   let actions =
     List.filter_map source.proof ~f:(function
-      | Proof_action { action_name; action_state; action_update } ->
+      | Proof_action
+          {
+            action_name;
+            action_params;
+            action_step;
+            action_consumes = _;
+            action_state;
+            action_update;
+            action_linearizes;
+          } ->
+          let id (x : S.id) = x.pid_str in
           Some
-            ( action_name.pid_str,
-              action_state.pid_str,
-              List.map action_update ~f:(fun (f, t) -> (f.S.pid_str, t)) )
+            {
+              action = action_name.pid_str;
+              params = List.map action_params ~f:id;
+              step = Option.map action_step ~f:(fun (op, args) -> (op.pid_str, args));
+              state = action_state.pid_str;
+              update = List.map action_update ~f:(fun (f, t) -> (f.S.pid_str, t));
+              linearizes = List.map action_linearizes ~f:id;
+            }
       | _ -> None)
   in
   let* structures =
@@ -4162,6 +4441,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             fields;
             chains = List.map chains ~f:(fun f -> (f, state ^ "_" ^ f ^ "_index"));
             actions;
+            params =
+              List.zip_exn
+                (List.map p.pred_params ~f:(fun (x, _) -> x.S.pid_str))
+                (List.take param_types (List.length p.pred_params));
             structure_type = List.hd_exn param_types;
             views = List.map views ~f:(fun (p, value, _) -> (p, value));
             at;

@@ -1,4 +1,5 @@
-(* Saturn's Michael-Scott queue, of integers: creation and pop, without backoff. *)
+(* Saturn's Michael-Scott queue, of integers: creation and pop, without backoff, and
+   moving the tail on by a cell. *)
 
 type node = Nil | Next of int * node Atomic.t
 type t = { head : node Atomic.t Atomic.t; tail : node Atomic.t Atomic.t }
@@ -15,5 +16,10 @@ let rec pop_opt q =
   match Atomic.get old_head (*@ returning Nil -> commit *) with
   | Nil -> None
   | Next (value, next) ->
-      if Atomic.compare_and_set q.head old_head next (*@ performs pop *) then Some value
-      else pop_opt q
+      if Atomic.compare_and_set q.head old_head next then Some value else pop_opt q
+
+let swing_tail q =
+  let old_tail = Atomic.get q.tail in
+  match Atomic.get old_tail with
+  | Nil -> ()
+  | Next (_, next) -> if Atomic.compare_and_set q.tail old_tail next then () else ()
