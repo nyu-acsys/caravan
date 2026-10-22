@@ -25,7 +25,8 @@ Write each clause with its full expression in parentheses, for example
 The final expression supplies the result, or a tuple for multiple `returns`
 parameters; a lemma without results ends in a unit expression such as `()`.
 Bodies can call other lemmas, use `if` and `match`, and check `assert` expressions.
-All lemma bodies are verified.
+As in OCaml, `assert false` can finish an unreachable branch of any result type;
+the assertion must still be proved. All lemma bodies are verified.
 
 An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
 program code. In a proof body, `unfold p x {n}` names an existential to bind

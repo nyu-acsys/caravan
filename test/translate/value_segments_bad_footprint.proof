@@ -1,0 +1,24 @@
+type edge = Edge of node Atomic.t * int * node Atomic.t
+
+predicate segment (first : node Atomic.t) (limit : node Atomic.t)
+    (items : int list) (cells : node Atomic.t finset) (edges : edge finset) =
+  not (Finset.mem limit cells)
+  && (match items with
+      | [] -> first = limit && cells = Finset.empty && edges = Finset.empty
+      | value :: tail ->
+          exists next : node Atomic.t, tail_cells : node Atomic.t finset,
+            tail_edges : edge finset.
+          first <> limit && not (Finset.mem first tail_cells)
+          && cells = Finset.union (Finset.singleton first) tail_cells
+          && edges = Finset.union (Finset.singleton (Edge (first, value, next))) tail_edges
+          && own first (Next (value, next))
+          && segment next limit tail tail_cells tail_edges)
+
+lemma bad_footprint (first : node Atomic.t) (limit : node Atomic.t) (value : int)
+  requires (first <> limit && own first (Next (value, limit)))
+  ensures (segment first limit [value] Finset.empty
+    (Finset.singleton (Edge (first, value, limit)))) =
+  fold segment limit limit [] Finset.empty Finset.empty;
+  fold segment first limit [value] Finset.empty
+    (Finset.singleton (Edge (first, value, limit)))
+    {next = limit; tail_cells = Finset.empty; tail_edges = Finset.empty}

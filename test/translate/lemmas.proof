@@ -51,3 +51,16 @@ lemma destructure_tuple (n : int) =
   let (left, right) = pair in
   let (first, second) = tuple_value n in
   assert (left = right && first = second)
+
+lemma unreachable_result (n : int) returns (result : int)
+  ensures (result = n) =
+  let value = if false then assert false else n in
+  let result = match Some value with
+    | None -> assert false
+    | Some x -> x
+  in
+  result
+
+lemma unreachable_tuple (n : int) returns (left : int) (right : int)
+  ensures (left = n && right = n) =
+  if false then assert false else (n, n)

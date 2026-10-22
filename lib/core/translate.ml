@@ -1644,16 +1644,31 @@ let rec proof_result_types env (body : S.proof_expr) =
   | Proof_value t ->
       let* ts = proof_value_types env t in
       Ok (Some ts)
+  | Proof_assert { term_desc = Tfalse; _ } -> Ok None
   | Proof_assert _ | Proof_fold _ -> Ok (Some [])
   | Proof_unfold (_, []) -> Ok (Some [])
   | Proof_unfold (predicate, witnesses) -> unfold_result_types env predicate witnesses
   | Proof_seq (_, body) -> proof_result_types env body
-  | Proof_if (_, yes, _) -> proof_result_types env yes
+  | Proof_if (_, yes, no) ->
+      let* types = proof_result_types env yes in
+      begin match types with Some _ -> Ok types | None -> proof_result_types env no
+      end
   | Proof_match (_, []) -> error body.proof_loc "A match needs at least one case"
-  | Proof_match (scrutinee, (p, body) :: _) ->
+  | Proof_match (scrutinee, cases) ->
       let* scrutinee_type = proof_value_type env scrutinee in
-      let types = Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p) in
-      proof_result_types { env with var_types = types @ env.var_types } body
+      let rec infer = function
+        | [] -> Ok None
+        | (p, body) :: rest ->
+            let types =
+              Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p)
+            in
+            let* types =
+              proof_result_types { env with var_types = types @ env.var_types } body
+            in
+            begin match types with Some _ -> Ok types | None -> infer rest
+            end
+      in
+      infer cases
   | Proof_let (pattern, rhs, body) ->
       let* inferred = proof_result_types env rhs in
       let* bindings = proof_binding_types env pattern inferred in
@@ -1769,7 +1784,11 @@ let rec proof_expression env targets (body : S.proof_expr) =
       end
   | Proof_assert t ->
       let* value = formula env t in
-      unit_statement (R.Stmt.assert_ ~loc:l (R.Spec.make value))
+      let statement = R.Stmt.assert_ ~loc:l (R.Spec.make value) in
+      begin match t.term_desc with
+      | Tfalse -> Ok [ statement ]
+      | _ -> unit_statement statement
+      end
   | Proof_fold (t, witnesses) ->
       let* statement = predicate_use env ~unfold:false t witnesses R.Stmt.fold in
       unit_statement statement

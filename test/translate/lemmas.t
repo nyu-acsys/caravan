@@ -4,6 +4,23 @@ and be applied from an OCaml ghost annotation.
   $ caravan --shh lemmas.ml
   Verification successful.
 
+Unreachable branches can use assert false at any result type; its assertion is
+still checked, and other assertions return unit.
+
+  $ caravan --shh lemmas_false_result.ml
+  [Error] File "lemmas_false_result.proof", line 1, columns 51-56:
+  1 | lemma false_result returns (result : int) = assert false
+                                                         ^^^^^
+  Verification Error: This assertion may be violated.
+  [1]
+
+  $ caravan --shh lemmas_assert_unit.ml
+  [Error] File "lemmas_assert_unit.proof", line 1, columns 44-55:
+  1 | lemma not_a_result returns (result : int) = assert true
+                                                  ^^^^^^^^^^^
+  Type Error: This proof expression returns unit.
+  [1]
+
 Existential witnesses can be named while unfolding and supplied while folding an
 owned predicate.
 
