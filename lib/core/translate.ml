@@ -385,10 +385,10 @@ type context = {
       (** The facts about earlier states that procedures ensure, by their names, each
           witnessed by two ghost results: the invariant, the field, and the entry, given
           the arguments, if it is known. *)
-  lifted : (string * (int * string option)) list;
+  lifted : (string * (int * Ident.t list * string option)) list;
       (** The lifted local functions, by their procedures' names, with the number of
-          parameters of the function they continue, which they take first, and its name.
-      *)
+          parameters of the function they continue, which they take first, the variables
+          of their context they use, which they take next, and the function's name. *)
   ghost_args : (string * (int * string) option list) list;
       (** The ghost parameters of procedures, by their names: for each, the position of a
           parameter that a precondition makes a field of it, with the field, as [tail] in
@@ -3139,13 +3139,21 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
   let stmts = List.concat_map stmts_args ~f:fst in
   let args = List.rev_map stmts_args ~f:snd in
   (* A lifted local function takes the parameters of the function it continues first. *)
-  let prefix, role =
-    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:(0, None)
+  let prefix, captured, role =
+    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:(0, [], None)
   in
   let* prefix =
     if List.length ctx.formals >= prefix then Ok (List.take ctx.formals prefix)
     else error e.exp_loc "This call needs the parameters of the function it continues"
   in
+  let* captured =
+    all captured ~f:(fun x ->
+        match Names.find ctx.names x with
+        | Some y -> Ok (R.Expr.var ~loc:l (name ~loc:l y))
+        | None ->
+            error e.exp_loc (Printf.sprintf "%s is not in scope here" (Ident.name x)))
+  in
+  let prefix = prefix @ captured in
   (* A ghost argument is the value of which the argument a precondition relates it to is a
      field, as [q] for [tail] in [fix_tail tail new_tail] after [push { tail; _ }]. *)
   let* ghosts =
@@ -3735,6 +3743,9 @@ type func = {
       (** The variables of the parameters of the function that a lifted local function
           continues, which its parameters start with. *)
   prefix_count : int;  (** The number of those parameters. *)
+  captured : Ident.t list;
+      (** The variables of its context that a lifted local function uses, which it takes
+          next. *)
   role : string option;  (** The function whose atomic update it continues. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
@@ -4911,6 +4922,104 @@ let inherit_contracts (funcs : func list) =
           }
       | _ -> f)
 
+(** The parameters and body of the function [e]: as written, or, for
+    [function p1 -> e1 | ...], with its last parameter and a match on it. *)
+let function_parts (e : Typedtree.expression) =
+  match e.exp_desc with
+  | Texp_function (params, Tfunction_body body) -> Some (params, body)
+  | Texp_function (params, Tfunction_cases { cases; partial; param; loc; _ }) -> begin
+      (* The type of the last parameter, and the result's, after the others. *)
+      let rec after n (t : Types.type_expr) =
+        match Types.get_desc t with
+        | Tarrow (_, a, r, _) -> if n = 0 then Some (a, r) else after (n - 1) r
+        | Tpoly (t, []) -> after n t
+        | _ -> None
+      in
+      match after (List.length params) e.exp_type with
+      | None -> None
+      | Some (param_type, result_type) ->
+          let name = Ident.name param in
+          let uid = Shape.Uid.internal_not_actually_unique in
+          let pattern : Typedtree.pattern =
+            {
+              pat_desc = Tpat_var (param, Location.mkloc name loc, uid);
+              pat_loc = loc;
+              pat_extra = [];
+              pat_type = param_type;
+              pat_env = e.exp_env;
+              pat_attributes = [];
+            }
+          in
+          let fp : Typedtree.function_param =
+            {
+              fp_arg_label = Nolabel;
+              fp_param = param;
+              fp_partial = Total;
+              fp_kind = Tparam_pat pattern;
+              fp_newtypes = [];
+              fp_loc = loc;
+            }
+          in
+          let scrutinee : Typedtree.expression =
+            {
+              e with
+              exp_desc =
+                Texp_ident
+                  ( Pident param,
+                    Location.mkloc (Longident.Lident name) loc,
+                    {
+                      val_type = param_type;
+                      val_kind = Val_reg;
+                      val_loc = loc;
+                      val_attributes = [];
+                      val_uid = uid;
+                    } );
+              exp_loc = loc;
+              exp_extra = [];
+              exp_type = param_type;
+            }
+          in
+          let cases =
+            List.map cases ~f:(fun (c : Typedtree.value Typedtree.case) ->
+                { c with c_lhs = Typedtree.as_computation_pattern c.c_lhs })
+          in
+          let body =
+            {
+              e with
+              exp_desc = Texp_match (scrutinee, cases, [], partial);
+              exp_loc = loc;
+              exp_extra = [];
+              exp_type = result_type;
+            }
+          in
+          Some (params @ [ fp ], body)
+    end
+  | _ -> None
+
+(** [structure] with the applications by [@@] and [|>] written out, as [f x] for [f @@ x]
+    and [x |> f]. *)
+let without_application_operators (structure : Typedtree.structure) =
+  let expr (mapper : Tast_mapper.mapper) (e : Typedtree.expression) =
+    let e = Tast_mapper.default.expr mapper e in
+    let apply (f : Typedtree.expression) x =
+      match f.exp_desc with
+      | Texp_apply (g, args) -> Typedtree.Texp_apply (g, args @ [ (Nolabel, Arg x) ])
+      | _ -> Texp_apply (f, [ (Nolabel, Arg x) ])
+    in
+    match e.exp_desc with
+    | Texp_apply
+        ({ exp_desc = Texp_ident (p, _, _); _ }, [ (Nolabel, Arg a); (Nolabel, Arg b) ])
+      ->
+        begin match stdlib_name p with
+        | Some "@@" -> { e with exp_desc = apply a b }
+        | Some "|>" -> { e with exp_desc = apply b a }
+        | _ -> e
+        end
+    | _ -> e
+  in
+  let mapper = { Tast_mapper.default with expr } in
+  mapper.structure mapper structure
+
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
 let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
@@ -4987,8 +5096,8 @@ let items ?(interface = []) (structure : Typedtree.structure)
     | Tstr_value (_, bindings) ->
         let* funcs =
           all bindings ~f:(fun (vb : Typedtree.value_binding) ->
-              match (vb.vb_pat.pat_desc, vb.vb_expr.exp_desc) with
-              | Tpat_var (id, _, _), Texp_function (params, Tfunction_body body) ->
+              match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
+              | Tpat_var (id, _, _), Some (params, body) ->
                   let* contract =
                     contract_after annotations ~item_loc:item.str_loc ~next
                   in
@@ -5022,6 +5131,7 @@ let items ?(interface = []) (structure : Typedtree.structure)
                       next;
                       prefix = [];
                       prefix_count = 0;
+                      captured = [];
                       role = None;
                     }
               | _ -> unsupported vb.vb_loc "This definition")
@@ -5052,18 +5162,23 @@ let binders () =
   let pat : type k. Tast_iterator.iterator -> k Typedtree.general_pattern -> unit =
    fun iterator p ->
     begin match p.pat_desc with
-    | Tpat_var (id, _, _) | Tpat_alias (_, id, _, _, _) -> found := id :: !found
+    | Tpat_var (id, _, _) | Tpat_alias (_, id, _, _, _) ->
+        found := (id, p.pat_type, p.pat_loc) :: !found
     | _ -> ()
     end;
     Tast_iterator.default_iterator.pat iterator p
   in
   ({ Tast_iterator.default_iterator with pat }, found)
 
-(** The identifiers that the patterns of [e] bind, its functions' parameters included. *)
-let bound_in (e : Typedtree.expression) : Ident.t list =
+(** The identifiers that the patterns of [e] bind, with their types and locations. *)
+let typed_bound_in (e : Typedtree.expression) =
   let iterator, found = binders () in
   iterator.expr iterator e;
   !found
+
+(** The identifiers that the patterns of [e] bind, its functions' parameters included. *)
+let bound_in (e : Typedtree.expression) : Ident.t list =
+  List.map (typed_bound_in e) ~f:(fun (id, _, _) -> id)
 
 (** The identifiers that the parameters [params] bind, in order. *)
 let params_bound (params : Typedtree.function_param list) : Ident.t list =
@@ -5072,7 +5187,7 @@ let params_bound (params : Typedtree.function_param list) : Ident.t list =
       match p.fp_kind with
       | Tparam_pat pat -> iterator.pat iterator pat
       | Tparam_optional_default (pat, _) -> iterator.pat iterator pat);
-  List.rev !found
+  List.rev_map !found ~f:(fun (id, _, _) -> id)
 
 (** The local functions of the top-level function [outer], lifted to the top level, with
     their contracts in [annotations]: one after the function's definition, before the
@@ -5083,8 +5198,8 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
   let expr iterator (e : Typedtree.expression) =
     begin match e.exp_desc with
     | Texp_let (_, [ vb ], rest) ->
-        begin match (vb.vb_pat.pat_desc, vb.vb_expr.exp_desc) with
-        | Tpat_var (id, _, _), Texp_function (params, Tfunction_body body) ->
+        begin match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
+        | Tpat_var (id, _, _), Some (params, body) ->
             found := (vb, id, params, body, rest) :: !found
         | _ -> ()
         end
@@ -5120,13 +5235,48 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
             && (not (List.mem own x ~equal:Ident.same))
             && not (List.mem prefix x ~equal:Ident.same))
       in
-      let* () =
-        match captured with
-        | x :: _ ->
-            unsupported vb.vb_loc
-              (Printf.sprintf "A local function using the variable %s of its context,"
-                 (Ident.name x))
-        | [] -> Ok ()
+      (* The variables of its context that the function uses are parameters of it. *)
+      let captured = List.dedup_and_sort captured ~compare:Ident.compare in
+      let typed =
+        let iterator, found = binders () in
+        List.iter outer.params ~f:(fun p ->
+            match p.fp_kind with
+            | Tparam_pat pat -> iterator.pat iterator pat
+            | Tparam_optional_default (pat, _) -> iterator.pat iterator pat);
+        !found @ typed_bound_in outer.body
+      in
+      let* captured_params =
+        all captured ~f:(fun x ->
+            match List.find typed ~f:(fun (y, _, _) -> Ident.same x y) with
+            | Some (_, t, at) ->
+                let uid = Shape.Uid.internal_not_actually_unique in
+                let pattern : Typedtree.pattern =
+                  {
+                    pat_desc = Tpat_var (x, Location.mkloc (Ident.name x) at, uid);
+                    pat_loc = at;
+                    pat_extra = [];
+                    pat_type = t;
+                    pat_env = body.exp_env;
+                    pat_attributes = [];
+                  }
+                in
+                Ok
+                  {
+                    Typedtree.fp_arg_label = Nolabel;
+                    fp_param = x;
+                    fp_partial = Total;
+                    fp_kind = Tparam_pat pattern;
+                    fp_newtypes = [];
+                    fp_loc = at;
+                  }
+            | None ->
+                error vb.vb_loc
+                  (Printf.sprintf
+                     "The type of %s, which this local function uses, is unknown"
+                     (Ident.name x)))
+      in
+      let captured_names =
+        List.map captured ~f:(fun x -> S.Lvar (S.mk_id ~loc:vb.vb_loc (Ident.name x)))
       in
       (* The contract of the function continued, with its parameters first. *)
       let contract =
@@ -5147,7 +5297,8 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
                 S.hd_name = S.mk_id ~loc:vb.vb_loc (Ident.name id);
                 hd_ret =
                   Option.value_map c.header ~default:[ S.Lwild ] ~f:(fun h -> h.hd_ret);
-                hd_args = names outer.params oc.header @ names params c.header;
+                hd_args =
+                  names outer.params oc.header @ captured_names @ names params c.header;
               }
             in
             Some
@@ -5159,6 +5310,13 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
                 atomic_requires = oc.atomic_requires;
                 atomic_ensures = oc.atomic_ensures;
               }
+        | Some c, None, _ ->
+            (* Its own contract, which names the variables it uses as they are named. *)
+            Some
+              (match c.header with
+              | Some h ->
+                  { c with header = Some { h with hd_args = captured_names @ h.hd_args } }
+              | None -> c)
         | _ -> contract
       in
       let prefix_params = if Option.is_some continues then outer.params else [] in
@@ -5166,13 +5324,14 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
         {
           id;
           raven_name = Ident.name id;
-          params = prefix_params @ params;
+          params = prefix_params @ captured_params @ params;
           body;
           loc = vb.vb_loc;
           contract;
           next = Some rest.exp_loc;
           prefix;
           prefix_count = List.length prefix_params;
+          captured;
           role = Option.map continues ~f:(fun g -> g.pid_str);
         })
 
@@ -6358,7 +6517,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         else None)
   in
   (* Each follows an application of an [Atomic] operation. *)
-  let steps = atomic_steps source.typed in
+  let typed = without_application_operators source.typed in
+  let steps = atomic_steps typed in
   let* () =
     match
       List.find linearizations ~f:(fun (anchor, _) ->
@@ -6371,7 +6531,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* interface =
     Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
   in
-  let* types, funcs = items ~interface source.typed annotations in
+  let* types, funcs = items ~interface typed annotations in
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
   let funcs = inherit_contracts (funcs @ List.concat lifted) in
   (* The abstract types of the libraries. *)
@@ -6420,8 +6580,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let lifted =
     List.filter_map funcs ~f:(fun f ->
         Option.some_if
-          ((not (List.is_empty f.prefix)) || Option.is_some f.role)
-          (proc_name f, (f.prefix_count, f.role)))
+          ((not (List.is_empty f.prefix))
+          || (not (List.is_empty f.captured))
+          || Option.is_some f.role)
+          (proc_name f, (f.prefix_count, f.captured, f.role)))
   in
   let origins = ref [] in
   let ocaml_env = source.env in
