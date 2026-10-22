@@ -336,6 +336,7 @@ let has_refs (types : t list) (t : Types.type_expr) =
         ||
         match find types p with
         | Some { heap = Some _; _ } -> true
+        | Some { library = Some _; _ } -> true
         | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same) ->
             List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (id :: seen)))
         | _ -> false

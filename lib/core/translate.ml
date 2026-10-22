@@ -669,6 +669,18 @@ let spec_binop (op : string) : R.Expr.binop option =
   | "<->" -> Some Iff
   | _ -> None
 
+(** The name of [q] in contracts: [x], or [M.x] for a name of a library's module. *)
+let qualid_key : S.qualid -> string = function
+  | Qid x -> x.pid_str
+  | Qdot (Qid m, x) -> m.pid_str ^ "." ^ x.pid_str
+  | Qdot (_, x) -> x.pid_str
+
+(** The Raven name of the name [x] of a contract, qualified as a library's, [M.x]. *)
+let qualified_name ~loc x =
+  match String.lsplit2 x ~on:'.' with
+  | Some (m, y) -> R.Name.make ~loc ~path:[ m ] y
+  | None -> R.Name.make ~loc x
+
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)
 let list_function : S.qualid -> string option = function
@@ -788,8 +800,10 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     let head, args = spine t [] in
     let here =
       match head.term_desc with
-      | Tvar (Qid { pid_str = p; _ }) ->
-          begin match List.Assoc.find env.ctx.preds p ~equal:String.equal with
+      | Tvar q ->
+          begin match
+            List.Assoc.find env.ctx.preds (qualid_key q) ~equal:String.equal
+          with
           | Some (_, types) when List.length types = List.length args ->
               List.filter_map (List.zip_exn args types) ~f:(fun ((a : S.term), t) ->
                   match a.term_desc with
@@ -1033,8 +1047,8 @@ and application env (t : S.term) =
           | _ -> Ok (R.Expr.binary ~loc:l op a b))
       end
   | Tvar (Qid { pid_str = c; _ }), _ when is_constructor c -> constructor env t args
-  | Tvar (Qid { pid_str = f; _ }), _ :: _
-    when List.Assoc.mem env.funcs f ~equal:String.equal ->
+  | Tvar q, _ :: _ when List.Assoc.mem env.funcs (qualid_key q) ~equal:String.equal ->
+      let f = qualid_key q in
       (* A predicate's arguments have its parameters' types. *)
       let expected =
         match List.Assoc.find env.ctx.preds f ~equal:String.equal with
@@ -1047,7 +1061,7 @@ and application env (t : S.term) =
             expected_formula env expected a)
       in
       let func = List.Assoc.find_exn env.funcs f ~equal:String.equal in
-      Ok (R.Expr.call ~loc:l (name ~loc:l func) args)
+      Ok (R.Expr.call ~loc:l (qualified_name ~loc:l func) args)
   | Tvar (Qid { pid_str = ("length" | "last" | "drop" | "take") as f; _ }), args -> begin
       let* args = all args ~f:(formula env) in
       let length s =
@@ -5636,6 +5650,109 @@ let pred_params ctx ~at (p : S.predicate) param_types =
   in
   Ok (params, env)
 
+(** The declaration of the value [name] of a library, of a function type with the
+    parameter types [args] and the result type [result], or of the type [result]: a
+    procedure with [contract] if it has one, or a function without arguments. Names free
+    in the preconditions are implicit ghost parameters, those free in the postconditions
+    are existentially quantified. *)
+let library_function ctx ~(at : Location.t) ~name ~args ~result
+    (contract : S.contract option) =
+  let l = loc at in
+  let x = ident ~loc:l name in
+  let* result_typ = typ ctx ~at result in
+  match (args, contract) with
+  | [], None ->
+      Ok
+        (R.Callable.func ~loc:l
+           ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
+           x None)
+  | [], Some _ -> unsupported at "A contract of a library's value other than a function"
+  | _, Some { atomic = true; _ } ->
+      unsupported at "An atomic contract of a library's function"
+  | _ ->
+      let header = Option.bind contract ~f:(fun c -> c.header) in
+      let* result_name, names =
+        match header with
+        | None -> Ok ("result", List.map args ~f:(fun _ -> None))
+        | Some h ->
+            let* result =
+              match h.hd_ret with
+              | [ Lvar id ] -> Ok id.pid_str
+              | [ Lwild ] | [] -> Ok "result"
+              | _ -> unsupported h.hd_name.pid_loc "A contract naming several results"
+            in
+            let* names =
+              all h.hd_args ~f:(function
+                | S.Lvar id -> Ok (Some id.pid_str)
+                | Lunit _ | Lwild -> Ok None
+                | Lghost (id, _) ->
+                    unsupported id.pid_loc "A ghost parameter of a library's function")
+            in
+            if List.length names = List.length args then Ok (result, names)
+            else
+              error h.hd_name.pid_loc
+                (Printf.sprintf "This contract names %d arguments, but %s has %d"
+                   (List.length names) name (List.length args))
+      in
+      let* params =
+        all (List.zip_exn names args) ~f:(fun (n, t) ->
+            let raven = Names.fresh ctx.names (Option.value n ~default:"x") in
+            let* typ = typ ctx ~at t in
+            Ok (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
+      in
+      let returns =
+        if is_unit result then [] else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
+      in
+      let named =
+        (result_name, "r", result)
+        :: List.filter_map params ~f:(fun (n, raven, t, _) ->
+            Option.map n ~f:(fun n -> (n, raven, t)))
+      in
+      let env =
+        {
+          ctx;
+          var_types = List.map named ~f:(fun (n, _, t) -> (n, t));
+          data = ctx.types;
+          funcs = ctx.spec_funcs;
+          vars = List.map named ~f:(fun (n, raven, _) -> (n, Raven raven));
+        }
+      in
+      let requires = Option.value_map contract ~default:[] ~f:(fun c -> c.requires) in
+      let ensures = Option.value_map contract ~default:[] ~f:(fun c -> c.ensures) in
+      let* implicit = free_typed env requires ~at in
+      let env =
+        List.fold implicit ~init:env ~f:(fun env (n, raven, t, _, _) ->
+            { (bind env n (Raven raven)) with var_types = (n, t) :: env.var_types })
+      in
+      let* requires = all requires ~f:(formula env) in
+      let* existentials = free_typed env ensures ~at in
+      let post_env =
+        List.fold existentials ~init:env ~f:(fun env (n, raven, t, _, _) ->
+            { (bind env n (Raven raven)) with var_types = (n, t) :: env.var_types })
+      in
+      let* ensures = all ensures ~f:(formula post_env) in
+      let ensures =
+        match (existentials, ensures) with
+        | [], _ | _, [] -> ensures
+        | _ ->
+            [
+              R.Expr.exists ~loc:l
+                (List.map existentials ~f:(fun (_, raven, _, typ, _) ->
+                     R.Var.make ~loc:l (ident ~loc:l raven) typ))
+                (List.reduce_exn ensures ~f:(fun a b -> R.Expr.binary ~loc:l And a b));
+            ]
+      in
+      Ok
+        (R.Callable.proc ~loc:l
+           ~formals:
+             (List.map params ~f:(fun (_, _, _, v) -> v)
+             @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
+                 R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ))
+           ~returns
+           ~requires:(List.map requires ~f:R.Spec.make)
+           ~ensures:(List.map ensures ~f:R.Spec.make)
+           x None)
+
 (** The context translating the specifications of declarations, outside functions. *)
 let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins =
   {
@@ -6194,57 +6311,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~f:(fun (before, d) -> Datatypes.member before d)
   in
   let* record_fields = Datatypes.fields types in
-  (* Each library's module: its values, trusted, as functions without arguments, and its
-     functions as procedures. *)
-  let* library_modules =
-    all source.libraries ~f:(fun (lib : Source.library) ->
-        let* members =
-          all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
-              match item.psig_desc with
-              | Psig_value vd ->
-                  let at = vd.pval_loc in
-                  let l = loc at in
-                  let x = vd.pval_name.txt in
-                  let value =
-                    Env.find_value (Pdot (Pident lib.library_id, x)) source.env
-                  in
-                  let rec arrows (t : Types.type_expr) =
-                    match Types.get_desc t with
-                    | Tarrow (Nolabel, a, r, _) ->
-                        let args, result = arrows r in
-                        (a :: args, result)
-                    | Tpoly (t, []) -> arrows t
-                    | _ -> ([], t)
-                  in
-                  let args, result = arrows value.val_type in
-                  let* result_typ = Datatypes.typ types ~at result in
-                  let returns =
-                    if is_unit result then []
-                    else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
-                  in
-                  let* formals =
-                    all
-                      (List.mapi args ~f:(fun i a -> (i, a)))
-                      ~f:(fun (i, a) ->
-                        let* typ = Datatypes.typ types ~at a in
-                        Ok (R.Var.make ~loc:l (ident ~loc:l (Printf.sprintf "x%d" i)) typ))
-                  in
-                  Ok
-                    [
-                      R.Member.free
-                        (R.Member.callable
-                           (match args with
-                           | [] -> R.Callable.func ~loc:l ~returns (ident ~loc:l x) None
-                           | _ ->
-                               R.Callable.proc ~loc:l ~formals ~returns (ident ~loc:l x)
-                                 None));
-                    ]
-              | Psig_type _ | Psig_attribute _ -> Ok []
-              | _ -> unsupported item.psig_loc "This item of a library's interface")
-        in
-        let l = loc Location.none in
-        Ok (R.Member.module_ ~loc:l (ident ~loc:l lib.library_name) (List.concat members)))
-  in
   let refs = ref [] in
   let primitives = ref [] in
   let pure = pure_functions funcs in
@@ -6262,9 +6328,53 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
   let* predicates = predicates source in
+  (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
+     whose parameters' types are the library's own where it declares them. *)
+  let* library_preds =
+    all source.libraries ~f:(fun (lib : Source.library) ->
+        let declared =
+          List.concat_map lib.library.signature
+            ~f:(fun (item : Parsetree.signature_item) ->
+              match item.psig_desc with
+              | Psig_type (_, decls) ->
+                  List.map decls ~f:(fun (d : Parsetree.type_declaration) ->
+                      d.ptype_name.txt)
+              | _ -> [])
+        in
+        let rec qualify (t : S.pty) : S.pty =
+          match t with
+          | PTtyapp (Qid x, args) when List.mem declared x.pid_str ~equal:String.equal ->
+              PTtyapp
+                ( Qdot (Qid (S.mk_id ~loc:x.pid_loc lib.library_name), x),
+                  List.map args ~f:qualify )
+          | PTtyapp (q, args) -> PTtyapp (q, List.map args ~f:qualify)
+          | PTtuple ts -> PTtuple (List.map ts ~f:qualify)
+          | PTarrow (a, b) -> PTarrow (qualify a, qualify b)
+          | PTtyvar _ -> t
+        in
+        all
+          (List.filter (Annotation.of_comments lib.library.interface_comments)
+             ~f:(fun a -> Poly.equal (Annotation.kind a) Annotation.Predicate))
+          ~f:(fun a ->
+            let* p = Annotation.predicate a in
+            let* () =
+              match p.pred_body with
+              | Some _ -> unsupported a.loc "A predicate of a library with a definition"
+              | None -> Ok ()
+            in
+            let* types =
+              all p.pred_params ~f:(fun (_, t) ->
+                  Source.ocaml_type source.env ~at:a.loc (qualify t))
+            in
+            Ok (lib, p, types)))
+  in
+  let library_preds = List.concat library_preds in
   let preds =
     List.map predicates ~f:(fun (_, p, _, types) ->
         (p.pred_name.pid_str, (p.pred_name.pid_str, types)))
+    @ List.map library_preds ~f:(fun ((lib : Source.library), p, types) ->
+        let key = lib.library_name ^ "." ^ p.pred_name.pid_str in
+        (key, (key, types)))
   in
   let spec_funcs =
     List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
@@ -6541,6 +6651,87 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                         (List.findi names ~f:(fun _ n ->
                              Option.equal String.equal n (Some x)))
                         ~f:(fun (i, _) -> (i, field)))) ))
+  in
+  (* Each library's module, trusted: its abstract predicates, and its values, as functions
+     without arguments, and functions, as procedures with their contracts. *)
+  let* library_modules =
+    all source.libraries ~f:(fun (lib : Source.library) ->
+        let l = loc Location.none in
+        let own_preds =
+          List.filter_map library_preds ~f:(fun ((lib' : Source.library), p, types) ->
+              Option.some_if
+                (String.equal lib'.library_name lib.library_name)
+                ( p.pred_name.pid_str,
+                  (lib.library_name ^ "." ^ p.pred_name.pid_str, types) ))
+        in
+        (* In the library's contracts, its predicates go by their own names. *)
+        let ctx =
+          spec_context types ~refs ~primitives ~shared ~ocaml_env
+            ~preds:(own_preds @ preds)
+            ~spec_funcs:
+              (List.map own_preds ~f:(fun (p, (raven, _)) -> (p, raven)) @ spec_funcs)
+            origins
+        in
+        let* pred_members =
+          all
+            (List.filter library_preds ~f:(fun ((lib' : Source.library), _, _) ->
+                 String.equal lib'.library_name lib.library_name))
+            ~f:(fun (_, (p : S.predicate), param_types) ->
+              let* params =
+                all (List.zip_exn p.pred_params param_types) ~f:(fun ((x, _), t) ->
+                    let* typ = Datatypes.typ types ~at:x.S.pid_loc t in
+                    Ok (t, R.Var.make ~loc:l (ident ~loc:l x.pid_str) typ))
+              in
+              (* The trailing parameters without references are outputs, as for the
+                 program's predicates; a library's abstract type may have references. *)
+              let outputs =
+                let n =
+                  List.length
+                    (List.take_while (List.rev params) ~f:(fun (t, _) ->
+                         not (Datatypes.has_refs types t)))
+                in
+                if n = List.length params then 0 else n
+              in
+              let inputs, outputs = List.split_n params (List.length params - outputs) in
+              Ok
+                (R.Member.free
+                   (R.Member.callable
+                      (R.Callable.func ~loc:l ~kind:Pred ~formals:(List.map inputs ~f:snd)
+                         ~returns:(List.map outputs ~f:snd)
+                         (ident ~loc:l p.pred_name.pid_str)
+                         None))))
+        in
+        let* contracts = interface_contracts lib.library in
+        let* value_members =
+          all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
+              match item.psig_desc with
+              | Psig_value vd ->
+                  let at = vd.pval_loc in
+                  let x = vd.pval_name.txt in
+                  let value =
+                    Env.find_value (Pdot (Pident lib.library_id, x)) source.env
+                  in
+                  let rec arrows (t : Types.type_expr) =
+                    match Types.get_desc t with
+                    | Tarrow (Nolabel, a, r, _) ->
+                        let args, result = arrows r in
+                        (a :: args, result)
+                    | Tpoly (t, []) -> arrows t
+                    | _ -> ([], t)
+                  in
+                  let args, result = arrows value.val_type in
+                  let contract =
+                    Option.map (List.Assoc.find contracts x ~equal:String.equal) ~f:fst
+                  in
+                  let* member = library_function ctx ~at ~name:x ~args ~result contract in
+                  Ok [ R.Member.free (R.Member.callable member) ]
+              | Psig_type _ | Psig_attribute _ -> Ok []
+              | _ -> unsupported item.psig_loc "This item of a library's interface")
+        in
+        Ok
+          (R.Member.module_ ~loc:l
+             (ident ~loc:l lib.library_name)
+             (pred_members @ List.concat value_members)))
   in
   let* pending_member_lists =
     all structures ~f:(fun st ->
