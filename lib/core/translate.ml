@@ -2210,10 +2210,21 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
           in
           match (structure inv, List.Assoc.find ctx.opened inv ~equal:String.equal) with
           | Some st, Some opened ->
+              let witnesses (state : opened) =
+                List.map2_exn st.fields state.values ~f:(fun (_, raven, _, _, _) value ->
+                    (ident ~loc:la raven, value))
+                @ List.map st.chains ~f:(fun (field, raven) ->
+                    ( ident ~loc:la raven,
+                      List.Assoc.find_exn state.indices field ~equal:String.equal ))
+                @ List.map st.pendings ~f:(fun p ->
+                    ( ident ~loc:la p.pending_on,
+                      List.Assoc.find_exn state.indices p.pending_field
+                        ~equal:String.equal ))
+              in
               begin match performs with
               | Some p ->
                   (* The action's state, which the history learns if a growing field
-                     changes, and the fields it changes, as witnesses. *)
+                     changes, supplies the fold witnesses. *)
                   let next, indices, appended =
                     next_state ctx st ~inv_params:st.params args opened p
                   in
@@ -2221,12 +2232,6 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                   let grows =
                     List.exists2_exn st.fields next
                       ~f:(fun (_, _, _, _, grows) (_, changes) -> grows && changes)
-                  in
-                  let witnesses =
-                    List.filter_map (List.zip_exn st.fields next)
-                      ~f:(fun ((_, raven, _, _, _), (e, changes)) ->
-                        Option.some_if changes (ident ~loc:la raven, e))
-                    @ List.map indices ~f:(fun (index, e) -> (ident ~loc:la index, e))
                   in
                   let learn =
                     if grows then
@@ -2255,6 +2260,7 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                                 ~default:e ));
                     }
                   in
+                  let witnesses = witnesses state in
                   let after = state_of ~loc:l st (grown st values) in
                   ctx.positions <-
                     List.map appended ~f:(fun (field, e, k) ->
@@ -2306,8 +2312,11 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                   if has_history st then
                     helping @ learn @ (snapshot st state :: fold ~witnesses ())
                   else fold ~witnesses ()
-              | None when has_history st -> snapshot st opened :: fold ()
-              | None -> fold ()
+              | None when has_history st ->
+                  snapshot st opened :: fold ~witnesses:(witnesses opened) ()
+              | None ->
+                  (* The heap determines the state without a history. *)
+                  fold ()
               end
           | _ -> fold ()))
 

@@ -1,0 +1,3 @@
+(test
+ (name diagnostics)
+ (libraries caravan_core compiler-libs.common raven-ivl.api))

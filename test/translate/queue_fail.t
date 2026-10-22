@@ -1,4 +1,9 @@
-  $ caravan --shh --smt-timeout=30000 queue_fail.ml
+The intentionally invalid obligations can time out instead of yielding a
+counterexample, so normalize only the timeout explanation when checking diagnostics.
+
+  $ caravan --shh --smt-timeout=30000 queue_fail.ml > queue_fail.out 2>&1
+  [1]
+  $ sed 's/\. The solver timed out (see --smt-timeout)//' queue_fail.out
   [Error] File "queue_fail.ml", line 10, columns 9-56:
   10 |       if Atomic.compare_and_set q.head old_head old_head then Some value else pop_opt q
                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -27,4 +32,3 @@
   19 |     atomic ensures queue q xs && b = (length xs = 0) *)
                                         ^^^^^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
-  [1]

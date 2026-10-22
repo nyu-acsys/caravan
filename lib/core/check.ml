@@ -11,16 +11,20 @@ let same_place (at : Location.t) (l : R.Loc.t) =
 
 (** [d], saying what failed if it is the failure of a check the translation generated. *)
 let explain (origins : Translate.origin list) (d : R.Diagnostic.t) : R.Diagnostic.t =
+  let explain_message message =
+    let timeout = ". The solver timed out (see --smt-timeout)" in
+    if String.is_suffix d.message ~suffix:timeout then message ^ timeout else message
+  in
   let origin =
     List.find origins ~f:(fun o ->
         same_place o.at d.loc && Option.exists d.code ~f:(Poly.equal o.code))
   in
   match origin with
-  | Some { message; related = []; _ } -> { d with message }
+  | Some { message; related = []; _ } -> { d with message = explain_message message }
   | Some { message; related; _ } ->
       {
         d with
-        message;
+        message = explain_message message;
         related =
           List.map related ~f:(fun (at, related_message) ->
               { R.Diagnostic.related_loc = Report.loc at; related_message });

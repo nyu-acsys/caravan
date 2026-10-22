@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Generated invariant folds supply explicit witnesses for known state transitions and histories.
+- Source-level verification errors retain solver timeout explanations.
 - Proof files support checked lemmas, logical variant types, and sets and maps.
 - First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
 - Contracts support named arguments, quantifiers, chained comparisons, and pattern matching.
