@@ -1,6 +1,5 @@
 (** The atomic read-modify-write operations of [Atomic], as Raven procedures on the field
-    of the atomics with contents of one type: logically atomic, and physically atomic by
-    an [atomic] block.
+    of the atomics with contents of one type, declared physically atomic.
 
     [compare_and_set] compares physically. On values that are not immediate, physical
     equality implies equality but not conversely, so on these it may fail even if the
@@ -91,17 +90,8 @@ let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
               (R.Stmt.expr_rhs (call Prelude.wrap [ bin Plus (var "r") (var "n") ]));
           ] )
   in
-  let ret_name = match op with Compare_and_set -> "b" | _ -> "r" in
-  let body =
-    R.Stmt.local ~loc ~ghost:true ~const:true
-      ~init:(R.Stmt.expr_rhs (call "bindAU" []))
-      (ident "phi")
-    @ [ assign [ "v"; "q" ] (call "openAU" [ var "phi" ]) ]
-    @ update
-    @ [ R.Stmt.call ~loc (call "commitAU" [ var "phi"; var ret_name ]) ]
-  in
   R.Member.callable
-    (R.Callable.proc ~loc
+    (R.Callable.proc ~loc ~atomic:true
        ~formals:
          ((formal "x" (R.Type.ref ~loc) :: args) @ [ ghost "v" typ; ghost "q" real ])
        ~returns:[ ret ]
@@ -110,7 +100,7 @@ let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
              let written = match op with Fetch_and_add -> "n" | _ -> "new_val" in
              [ R.Spec.make (call Prelude.in_range [ var written ]) ]
            else [])
-         @ [ R.Spec.make ~atomic:true (bin And (own v) pre) ])
-       ~ensures:[ R.Spec.make ~atomic:true post ]
+         @ [ R.Spec.make (bin And (own v) pre) ])
+       ~ensures:[ R.Spec.make post ]
        (ident (name ~field op))
-       (Some [ R.Stmt.atomic_block ~loc body ]))
+       (Some update))

@@ -201,8 +201,13 @@ in ordinary ghost fields and passed to checked lemmas, allowing a helper to open
 and commit a registered operation. Raven checks the resource and atomicity rules;
 Caravan preserves the procedure-specific token types before translation.
 AU facades currently name procedures in the same implementation without explicit
-ghost parameters. Ghost argument/result transport at runtime calls and specialized
-CAS proofs remain subsequent extensions.
+ghost parameters. Ghost argument/result transport at runtime calls remains a
+subsequent extension.
+
+Read-modify-write primitives use Raven's `atomic proc` declarations with ordinary
+contracts. Each call executes as one physical step, so an access scope can expose
+a segment with a checked lemma before a generic CAS and reassemble it afterward,
+without a separate abort-restoration proof at that primitive call.
 
 ## Building
 
