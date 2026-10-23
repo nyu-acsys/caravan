@@ -1,0 +1,1 @@
+invariant zero (cell : int Atomic.t) = own cell 0

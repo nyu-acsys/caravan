@@ -128,6 +128,8 @@
 
 %start <Spec_ast.contract> contract
 %start <Spec_ast.term> term_eof
+%start <Spec_ast.proof_expr> proof_expr_eof
+%start <Spec_ast.id * Spec_ast.proof_expr> access
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
 %start <Spec_ast.proof_decl list> proof
@@ -142,6 +144,20 @@ contract:
 
 term_eof:
 | t = term EOF { t }
+;
+
+proof_expr_eof:
+| e = proof_expr EOF { e }
+;
+
+access:
+| f = lqualid LEFTPAR FUN reader = lident ARROW body = proof_expr RIGHTPAR EOF
+    { begin match f with
+      | Qdot (Qid ghost, access)
+        when ghost.pid_str = "Ghost" && access.pid_str = "access" -> ()
+      | _ -> raise (Syntax_error (mk_loc $loc(f), "Expected Ghost.access"))
+      end;
+      (reader, body) }
 ;
 
 loop_spec:

@@ -32,6 +32,9 @@ type kind =
   | Loop
   | Predicate
   | Ghost
+  | Access
+  | Proof
+  | Manual
   | Linearization
   | Initially
   | Initializes
@@ -39,10 +42,17 @@ type kind =
 
 (** What [annotation] states, by its first word. *)
 let kind (annotation : t) =
-  match String.split_on_chars (String.strip annotation.text) ~on:[ ' '; '\n'; '\t' ] with
+  match
+    String.split_on_chars
+      (String.strip annotation.text)
+      ~on:[ ' '; '\n'; '\t'; '\r'; '(' ]
+  with
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
   | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
+  | "Ghost.access" :: _ -> Access
+  | "proof" :: _ -> Proof
+  | [ "manual" ] -> Manual
   | ("commit" | "returning" | "performs") :: _ -> Linearization
   | "initially" :: _ -> Initially
   | "initializes" :: _ -> Initializes
@@ -56,17 +66,18 @@ let parse (annotation : t) entry =
   try Ok (entry Spec_lexer.token lexbuf) with
   | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
   | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+  | Spec_ast.Syntax_error (loc, message) -> Error (Report.error Syntax loc message)
 
 let predicate (annotation : t) = parse annotation Spec_parser.predicate
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
 let linearization (annotation : t) = parse annotation Spec_parser.linearization
 let initially (annotation : t) = parse annotation Spec_parser.initially
+let access (annotation : t) = parse annotation Spec_parser.access
 
-let initializes (annotation : t) =
-  let keyword = "initializes" in
+let without_keyword (annotation : t) keyword =
   let stripped = String.lstrip annotation.text in
   match String.chop_prefix stripped ~prefix:keyword with
-  | None -> parse annotation Spec_parser.term_eof
+  | None -> annotation
   | Some body ->
       let leading = String.length annotation.text - String.length stripped in
       let text =
@@ -74,7 +85,13 @@ let initializes (annotation : t) =
         ^ String.make (String.length keyword) ' '
         ^ body
       in
-      parse { annotation with text } Spec_parser.term_eof
+      { annotation with text }
+
+let initializes (annotation : t) =
+  parse (without_keyword annotation "initializes") Spec_parser.term_eof
+
+let proof (annotation : t) =
+  parse (without_keyword annotation "proof") Spec_parser.proof_expr_eof
 
 (** The specification of a loop that [annotation] states: its invariants and variants. *)
 let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =

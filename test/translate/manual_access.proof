@@ -1,0 +1,26 @@
+invariant live (cell : int Atomic.t) = exists value : int. own cell value
+invariant indirect (outer : int Atomic.t Atomic.t) (inner : int Atomic.t) = own outer inner
+
+predicate segment (first : node Atomic.t) (limit : node Atomic.t) (items : int list) =
+  match items with
+  | [] -> first = limit
+  | value :: tail ->
+    exists next : node Atomic.t.
+      first <> limit && own first (Next (value, next)) && segment next limit tail
+
+invariant chain (first : node Atomic.t) (limit : node Atomic.t) =
+  exists value : int, tail : int list.
+    segment first limit (value :: tail) && own limit End
+
+lemma expose_head (first : node Atomic.t) (limit : node Atomic.t)
+    (value : int) (tail : int list) returns (next : node Atomic.t)
+  requires (segment first limit (value :: tail))
+  ensures (first <> limit && own first (Next (value, next)) && segment next limit tail) =
+  let next = unfold segment first limit (value :: tail) {next} in
+  next
+
+lemma restore_head (first : node Atomic.t) (limit : node Atomic.t)
+    (value : int) (tail : int list) (next : node Atomic.t)
+  requires (first <> limit && own first (Next (value, next)) && segment next limit tail)
+  ensures (segment first limit (value :: tail)) =
+  fold segment first limit (value :: tail) {next = next}

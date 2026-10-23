@@ -114,6 +114,54 @@ storage operations are erased from the OCaml program. Field reads and
 allocations are proof operations; pure logical definitions cannot perform them.
 `Ghost` and `Permission` are reserved module names.
 
+Direct invariants use the same declaration syntax as state-based invariants:
+
+```ocaml
+invariant live (cell : int Atomic.t) =
+  exists value : int. own cell value
+```
+
+When the final parameter names a ghost state record declared in the proof, Caravan
+elaborates the existing state-based form with its generated support. Otherwise,
+all parameters are invariant inputs and the body is emitted directly, without
+state, history, or action synthesis.
+
+A `(*@ manual *)` annotation after a function selects a checked manual proof.
+The function keeps its OCaml implementation and contract; its proof supplies
+invariant opening and closing. Local functions inherit the enclosing manual
+mode. A `(*@ proof ... *)` block uses the same expression language as checked
+lemmas, including lexical bindings and fold/unfold witnesses. Block-local names
+do not escape into the runtime program.
+
+An access annotation attaches a proof closure to one `Atomic` operation:
+
+```ocaml
+let read (cell : int Atomic.t) = Atomic.get cell
+(*@ Ghost.access (fun step ->
+  let state = unfold live cell {value} in
+  let observed = step () in
+  fold live cell {value = state};
+  observed)
+*)
+(*@ manual *)
+(*@ result = read cell requires live cell ensures live cell *)
+```
+
+The operation and result names are freely chosen lexical bindings. Ghost values
+bound before the operation remain in scope afterward. The closure must contain
+one unconditional `let` binding of the supplied operation applied to `()`, and
+end with that binding's unchanged result. Preparation and restoration use
+checked ghost expressions. The operation cannot escape, be duplicated, or run
+conditionally. Nested accesses have their own annotations; original arguments
+are evaluated before their access proof in OCaml order.
+
+Manual and automatic proofs share runtime translation, primitive implementations,
+and ghost-expression lowering. Raven checks permissions, invariant closure,
+atomicity, and contracts; Caravan checks the annotation shape that preserves the
+runtime operation. Manual mode supplies its own invariant proof steps and rejects
+automatic `commit`, `returning`, and `performs` annotations. Explicit AU operations
+and manual proofs of atomic contracts are a subsequent extension.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.

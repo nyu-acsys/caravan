@@ -434,6 +434,8 @@ type context = {
           only mention variables, all immutable. *)
   mutable au : au option;
       (** The atomic update, for a function with an atomic contract. *)
+  manual : bool;
+  access_proofs : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
   linearizations : (int * Annotation.t) list;
       (** The annotations on atomic steps, by the offset of the end of the step they
@@ -1667,6 +1669,8 @@ let scope_env ctx =
 let lemma_call env (t : S.term) =
   let head, args = spine t [] in
   match head.term_desc with
+  | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+      error id.pid_loc "A local proof value cannot be called as a lemma"
   | Tvar (Qid id) ->
       begin match List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal with
       | None -> error id.pid_loc (Printf.sprintf "Unknown lemma %s" id.pid_str)
@@ -2214,35 +2218,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
       let* no = proof_expression env targets no in
       Ok [ R.Stmt.if_ ~loc:l condition yes no ]
   | Proof_let (pattern, rhs, rest) ->
-      let* inferred = proof_result_types env rhs in
-      let* bindings = proof_binding_types env pattern inferred in
-      let* declarations =
-        all bindings ~f:(fun (id, ty) ->
-            let id = Option.value id ~default:(S.mk_id ~loc:pattern.pat_loc "discard") in
-            let raven = Names.fresh env.ctx.names id.pid_str in
-            let* raven_type = typ env.ctx ~at:id.pid_loc ty in
-            Ok
-              ( id,
-                { target_name = raven; target_type = ty },
-                R.Stmt.local ~loc:(loc id.pid_loc) ~ghost:true ~typ:raven_type
-                  (ident ~loc:l raven) ))
-      in
-      let* rhs =
-        proof_expression env (List.map declarations ~f:(fun (_, target, _) -> target)) rhs
-      in
-      let env =
-        List.fold (List.zip_exn bindings declarations) ~init:env
-          ~f:(fun env ((id, ty), (_, target, _)) ->
-            match id with
-            | None -> env
-            | Some id ->
-                {
-                  (bind env id.pid_str (Raven target.target_name)) with
-                  var_types = (id.pid_str, ty) :: env.var_types;
-                })
-      in
-      let* rest = proof_expression env targets rest in
-      Ok (List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest)
+      proof_binding env pattern rhs (fun env -> proof_expression env targets rest)
   | Proof_match (scrutinee, cases) ->
       let* value = formula env scrutinee in
       let* scrutinee_type = proof_value_type env scrutinee in
@@ -2279,16 +2255,174 @@ let rec proof_expression env targets (body : S.proof_expr) =
       in
       chain cases
 
-(** Ghost annotations supplement the automatic path without declaring mutable state. *)
+and proof_binding ?(ghost_rhs = false) env pattern rhs continuation =
+  let l = loc rhs.S.proof_loc in
+  let* inferred = proof_result_types env rhs in
+  let* bindings = proof_binding_types env pattern inferred in
+  let* declarations =
+    all bindings ~f:(fun (id, ty) ->
+        let id = Option.value id ~default:(S.mk_id ~loc:pattern.pat_loc "discard") in
+        let raven = Names.fresh env.ctx.names id.pid_str in
+        let* raven_type = typ env.ctx ~at:id.pid_loc ty in
+        Ok
+          ( id,
+            { target_name = raven; target_type = ty },
+            R.Stmt.local ~loc:(loc id.pid_loc) ~ghost:true ~typ:raven_type
+              (ident ~loc:l raven) ))
+  in
+  let* rhs_statements =
+    proof_expression env (List.map declarations ~f:(fun (_, target, _) -> target)) rhs
+  in
+  let env =
+    List.fold (List.zip_exn bindings declarations) ~init:env
+      ~f:(fun env ((id, ty), (_, target, _)) ->
+        match id with
+        | None -> env
+        | Some id ->
+            {
+              (bind env id.pid_str (Raven target.target_name)) with
+              var_types = (id.pid_str, ty) :: env.var_types;
+            })
+  in
+  let* rest = continuation env in
+  let rhs =
+    if ghost_rhs then [ R.Stmt.ghost_block ~loc:(loc rhs.proof_loc) rhs_statements ]
+    else rhs_statements
+  in
+  Ok (List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest)
+
+(** Ghost annotations share the checked lemma expression language. *)
 let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
   let between (a : Annotation.t) =
     a.loc.loc_start.pos_cnum >= after.pos_cnum
     && a.loc.loc_end.pos_cnum <= before.pos_cnum
-    && Poly.equal (Annotation.kind a) Annotation.Ghost
+    && List.mem
+         [ Annotation.Ghost; Annotation.Proof ]
+         (Annotation.kind a) ~equal:Poly.equal
   in
-  let* blocks = all (List.filter ctx.annotations ~f:between) ~f:Annotation.ghost_stmts in
-  let* stmts = all (List.concat blocks) ~f:(proof_statement (scope_env ctx)) in
-  Ok stmts
+  let* blocks =
+    all (List.filter ctx.annotations ~f:between) ~f:(fun annotation ->
+        match Annotation.kind annotation with
+        | Annotation.Proof ->
+            let* body = Annotation.proof annotation in
+            let* statements = proof_expression (scope_env ctx) [] body in
+            Ok [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
+        | _ ->
+            let* statements = Annotation.ghost_stmts annotation in
+            all statements ~f:(proof_statement (scope_env ctx)))
+  in
+  Ok (List.concat blocks)
+
+(** Free names in proof expressions, respecting lexical bindings. *)
+let rec proof_names (body : S.proof_expr) =
+  match body.proof_desc with
+  | Proof_value t | Proof_assert t | Proof_unfold (t, _) -> term_names t
+  | Proof_fold (t, witnesses) ->
+      term_names t @ List.concat_map witnesses ~f:(fun (_, t) -> term_names t)
+  | Proof_seq (a, b) -> proof_names a @ proof_names b
+  | Proof_let (pattern, rhs, rest) ->
+      proof_names rhs
+      @ List.filter (proof_names rest) ~f:(fun name ->
+          not (List.mem (pat_names pattern) name ~equal:String.equal))
+  | Proof_if (t, a, b) -> term_names t @ proof_names a @ proof_names b
+  | Proof_match (t, cases) ->
+      term_names t
+      @ List.concat_map cases ~f:(fun (p, body) ->
+          List.filter (proof_names body) ~f:(fun name ->
+              not (List.mem (pat_names p) name ~equal:String.equal)))
+
+(** The closure is a proof context around the original, unchanged runtime access. *)
+let access_proof ctx annotation ~result_type ~result statements =
+  let* operation, body = Annotation.access annotation in
+  let uses_operation body =
+    List.mem (proof_names body) operation.pid_str ~equal:String.equal
+  in
+  let reject_operation visible body =
+    if visible && uses_operation body then
+      error body.S.proof_loc "Bind the attached operation once in an unconditional let"
+    else Ok ()
+  in
+  let ghost_statements env body =
+    let* statements = proof_expression env [] body in
+    Ok [ R.Stmt.ghost_block ~loc:(loc body.S.proof_loc) statements ]
+  in
+  let rec after env ~operation_visible ~result_name ~result_visible body =
+    let* () = reject_operation operation_visible body in
+    match body.S.proof_desc with
+    | Proof_value { term_desc = Tvar (Qid id); _ }
+      when result_visible && String.equal id.pid_str result_name ->
+        Ok []
+    | Proof_seq (first, rest) ->
+        let* first = ghost_statements env first in
+        let* rest = after env ~operation_visible ~result_name ~result_visible rest in
+        Ok (first @ rest)
+    | Proof_let (pattern, rhs, rest) ->
+        proof_binding ~ghost_rhs:true env pattern rhs (fun env ->
+            after env
+              ~operation_visible:
+                (operation_visible
+                && not
+                     (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal)
+                )
+              ~result_name
+              ~result_visible:
+                (result_visible
+                && not (List.mem (pat_names pattern) result_name ~equal:String.equal))
+              rest)
+    | _ ->
+        error body.proof_loc
+          "An access proof must return the unchanged result of the attached operation"
+  in
+  let is_operation visible body =
+    match body.S.proof_desc with
+    | Proof_value t when visible ->
+        begin match spine t [] with
+        | { term_desc = Tvar (Qid id); _ }, [ { term_desc = Ttuple []; _ } ] ->
+            String.equal id.pid_str operation.pid_str
+        | _ -> false
+        end
+    | _ -> false
+  in
+  let rec before env visible body =
+    match body.S.proof_desc with
+    | Proof_let (pattern, rhs, rest) when is_operation visible rhs ->
+        let* bindings = proof_binding_types env pattern (Some [ Some result_type ]) in
+        begin match bindings with
+        | [ (Some id, ty) ] when Ctype.is_equal ctx.env false [ ty ] [ result_type ] ->
+            let env =
+              {
+                (bind env id.pid_str (Value result)) with
+                var_types = (id.pid_str, ty) :: env.var_types;
+              }
+            in
+            let* rest =
+              after env
+                ~operation_visible:(not (String.equal id.pid_str operation.pid_str))
+                ~result_name:id.pid_str ~result_visible:true rest
+            in
+            Ok (statements @ rest)
+        | _ ->
+            error pattern.pat_loc
+              "Bind the attached operation's result to a variable of its original type"
+        end
+    | Proof_let (pattern, rhs, rest) ->
+        let* () = reject_operation visible rhs in
+        proof_binding ~ghost_rhs:true env pattern rhs (fun env ->
+            before env
+              (visible
+              && not (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal)
+              )
+              rest)
+    | Proof_seq (first, rest) ->
+        let* () = reject_operation visible first in
+        let* first = ghost_statements env first in
+        let* rest = before env visible rest in
+        Ok (first @ rest)
+    | _ ->
+        error body.proof_loc
+          "An access proof needs one unconditional let binding of the attached operation"
+  in
+  before (scope_env ctx) true body
 
 (** The specification of the loop whose body is [body], in an annotation between [after]
     and the body, as [while c do (*@ invariant P *) ... done]. *)
@@ -3071,6 +3205,9 @@ let step_end (e : Typedtree.expression) =
 let linearization ctx (e : Typedtree.expression) =
   match List.find ctx.linearizations ~f:(fun (anchor, _) -> anchor = step_end e) with
   | None -> Ok None
+  | Some (_, a) when ctx.manual ->
+      error a.loc
+        "Automatic linearization annotations cannot be used in a manual function proof"
   | Some (_, a) -> Result.map (Annotation.linearization a) ~f:Option.some
 
 (** The statements committing the open update [au] of a function that linearized: at once
@@ -3320,105 +3457,122 @@ let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat)
     with an atomic contract that has not linearized yet. The step linearizes the function
     as [how] says: always, never, if it is a [compare_and_set] that succeeds, or if it is
     a read whose value has a constructor. *)
-let linearize ?step ?value ctx ~at
+let linearize ?step ?value ?access_type ctx ~at
     (how :
       [ `Commit | `Abort | `Cas | `Returning of string | `Decide of S.pat * S.outcome ])
     access =
-  let l = loc at in
-  (* The actions that the step may perform, once the invariants are open. *)
-  let performings () =
-    match step with
-    | Some (op, field, location, args, _) ->
-        step_performings ctx ~at ~op ~field ~location args
-    | None -> []
+  let annotation =
+    List.Assoc.find ctx.access_proofs
+      (at.Location.loc_start.pos_cnum, at.loc_end.pos_cnum)
+      ~equal:Poly.equal
   in
-  let around access =
-    let opening = use_invariants ctx ~at ~fold:false in
-    match (performings (), step) with
-    | [], _ | _, None -> opening @ access @ use_invariants ctx ~at ~fold:true
-    | performings, Some (_, _, _, _, result) ->
-        (* If the step succeeds, it performs the action whose step it is, or changes
+  if ctx.manual then
+    match (annotation, value, access_type) with
+    | None, _, _ -> Ok access
+    | Some annotation, Some result, Some result_type ->
+        access_proof ctx annotation ~result ~result_type access
+    | Some annotation, _, _ ->
+        error annotation.loc "This operation does not support an access proof"
+  else if Option.is_some annotation then
+    error (Option.value_exn annotation).loc
+      "Ghost.access requires a manual function proof"
+  else
+    let l = loc at in
+    (* The actions that the step may perform, once the invariants are open. *)
+    let performings () =
+      match step with
+      | Some (op, field, location, args, _) ->
+          step_performings ctx ~at ~op ~field ~location args
+      | None -> []
+    in
+    let around access =
+      let opening = use_invariants ctx ~at ~fold:false in
+      match (performings (), step) with
+      | [], _ | _, None -> opening @ access @ use_invariants ctx ~at ~fold:true
+      | performings, Some (_, _, _, _, result) ->
+          (* If the step succeeds, it performs the action whose step it is, or changes
            nothing. The state before it is the latest snapshot after it on every path. *)
-        let snapshot = take_snapshots ctx ~at in
-        let snapshots = ctx.snapshots in
-        let close ?performs ?no_action () =
-          ctx.snapshots <- snapshots;
-          use_invariants ?performs ?no_action ctx ~at ~fold:true
-        in
-        let unchanged = close ~no_action:true () in
-        let performed =
-          List.fold_right performings ~init:unchanged ~f:(fun (p, condition) rest ->
-              [ R.Stmt.if_ ~loc:l condition (close ~performs:p ()) rest ])
-        in
-        let failed = close () in
-        ctx.snapshots <- snapshots;
-        opening @ access @ snapshot
-        @ [ R.Stmt.if_ ~loc:l result [ R.Stmt.ghost_block ~loc:l performed ] failed ]
-  in
-  match (ctx.au, how, value) with
-  | None, `Decide _, _ ->
-      error at "A choice of how to linearize outside an atomic function"
-  | Some au, `Decide (p, o), Some value ->
-      begin match (au.state, o) with
-      | Pending, _ ->
-          (* The invariants open, the update not: the step decides. *)
-          let opening = use_invariants ctx ~at ~fold:false in
-          let* decision = decide ctx au ~at ~value p o in
-          Ok (opening @ access @ decision)
-      | Registered r, Commits_with result ->
-          let opening = use_invariants ctx ~at ~fold:false in
-          let* collected = collect ctx au r ~at ~value p result in
-          Ok (opening @ access @ collected @ use_invariants ctx ~at ~fold:true)
-      | _ ->
-          error at
-            "Caravan cannot tell whether the function has linearized before this step"
-      end
-  | Some _, `Decide _, None -> error at "Only a read can linearize by its value"
-  | None, _, _ -> Ok (around access)
-  | Some au, ((`Commit | `Abort | `Cas | `Returning _) as how), _ ->
-      begin match au.state with
-      | Committed -> Ok (around access)
-      | Registered _ ->
-          error at
-            "This function waits to be helped: the next step collects its result, as (*@ \
-             returning Nil -> commit true *)"
-      | Committing | On_cas | On_read _ | Partly | Unknown ->
-          error at
-            "Caravan cannot tell whether the function has linearized before this step"
-      | Pending ->
-          let* opening, values = au.open_ ~at ~unfold:true in
-          au.values <- values;
-          au.step <- at;
-          au.read_results <- [];
-          let* closing =
-            match how with
-            | `Abort ->
-                au.state <- Pending;
-                au.close Abort ~value:(R.Expr.tuple ~loc:(loc at) [])
-            | `Commit -> commit_now au
-            | `Cas ->
-                au.state <- On_cas;
-                (* The action that the step performs if it succeeds, which linearizes the
-                   function. *)
-                let linearizing =
-                  List.filter (performings ()) ~f:(fun (p, _) ->
-                      List.mem p.performed.linearizes au.role ~equal:String.equal)
-                in
-                begin match (linearizing, au.performing) with
-                | _, Some _ | [], None -> Ok []
-                | [ (p, condition) ], None ->
-                    au.performing <- Some (p, Some condition);
-                    Ok []
-                | _ :: _ :: _, None ->
-                    error at
-                      "This step may perform several actions that linearize the function"
-                end
-            | `Returning c ->
-                au.state <- On_read c;
-                Ok []
+          let snapshot = take_snapshots ctx ~at in
+          let snapshots = ctx.snapshots in
+          let close ?performs ?no_action () =
+            ctx.snapshots <- snapshots;
+            use_invariants ?performs ?no_action ctx ~at ~fold:true
           in
-          Ok (opening @ access @ closing)
-      end
+          let unchanged = close ~no_action:true () in
+          let performed =
+            List.fold_right performings ~init:unchanged ~f:(fun (p, condition) rest ->
+                [ R.Stmt.if_ ~loc:l condition (close ~performs:p ()) rest ])
+          in
+          let failed = close () in
+          ctx.snapshots <- snapshots;
+          opening @ access @ snapshot
+          @ [ R.Stmt.if_ ~loc:l result [ R.Stmt.ghost_block ~loc:l performed ] failed ]
+    in
+    match (ctx.au, how, value) with
+    | None, `Decide _, _ ->
+        error at "A choice of how to linearize outside an atomic function"
+    | Some au, `Decide (p, o), Some value ->
+        begin match (au.state, o) with
+        | Pending, _ ->
+            (* The invariants open, the update not: the step decides. *)
+            let opening = use_invariants ctx ~at ~fold:false in
+            let* decision = decide ctx au ~at ~value p o in
+            Ok (opening @ access @ decision)
+        | Registered r, Commits_with result ->
+            let opening = use_invariants ctx ~at ~fold:false in
+            let* collected = collect ctx au r ~at ~value p result in
+            Ok (opening @ access @ collected @ use_invariants ctx ~at ~fold:true)
+        | _ ->
+            error at
+              "Caravan cannot tell whether the function has linearized before this step"
+        end
+    | Some _, `Decide _, None -> error at "Only a read can linearize by its value"
+    | None, _, _ -> Ok (around access)
+    | Some au, ((`Commit | `Abort | `Cas | `Returning _) as how), _ ->
+        begin match au.state with
+        | Committed -> Ok (around access)
+        | Registered _ ->
+            error at
+              "This function waits to be helped: the next step collects its result, as \
+               (*@ returning Nil -> commit true *)"
+        | Committing | On_cas | On_read _ | Partly | Unknown ->
+            error at
+              "Caravan cannot tell whether the function has linearized before this step"
+        | Pending ->
+            let* opening, values = au.open_ ~at ~unfold:true in
+            au.values <- values;
+            au.step <- at;
+            au.read_results <- [];
+            let* closing =
+              match how with
+              | `Abort ->
+                  au.state <- Pending;
+                  au.close Abort ~value:(R.Expr.tuple ~loc:(loc at) [])
+              | `Commit -> commit_now au
+              | `Cas ->
+                  au.state <- On_cas;
+                  (* The action that the step performs if it succeeds, which linearizes the
+                   function. *)
+                  let linearizing =
+                    List.filter (performings ()) ~f:(fun (p, _) ->
+                        List.mem p.performed.linearizes au.role ~equal:String.equal)
+                  in
+                  begin match (linearizing, au.performing) with
+                  | _, Some _ | [], None -> Ok []
+                  | [ (p, condition) ], None ->
+                      au.performing <- Some (p, Some condition);
+                      Ok []
+                  | _ :: _ :: _, None ->
+                      error at
+                        "This step may perform several actions that linearize the \
+                         function"
+                  end
+              | `Returning c ->
+                  au.state <- On_read c;
+                  Ok []
+            in
+            Ok (opening @ access @ closing)
+        end
 
 (** The statements at the start of an arm of a branch on the result of the step that left
     the update open: committing if the step linearized the function there, as [commits]
@@ -3936,7 +4090,8 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     let* how = how default in
     let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
     let* step =
-      linearize ?step ctx ~at how (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
+      linearize ?step ~value:v ~access_type:e.exp_type ctx ~at how
+        (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
     in
     Ok (step, v)
   in
@@ -3965,14 +4120,17 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* how = how `Abort in
       let value = R.Expr.var ~loc:l (name ~loc:l x) in
       let* step =
-        linearize ~value ctx ~at how
+        linearize ~value ~access_type:e.exp_type ctx ~at how
           (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
       in
       record_read ctx ~atomic:a value;
       Ok (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
   | "set", [ a; v ] ->
       let* how = how `Commit in
-      let* step = linearize ctx ~at how [ write ~loc:l a field v ] in
+      let* step =
+        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
+          [ write ~loc:l a field v ]
+      in
       Ok (stmts @ step, unit_value ~loc:l)
   | "exchange", [ a; v ] ->
       let* f = primitive Exchange in
@@ -3995,7 +4153,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
       let* how = how `Commit in
       let* step =
-        linearize ctx ~at how
+        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
           (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
       in
       Ok (stmts @ step, unit_value ~loc:l)
@@ -4708,6 +4866,7 @@ type func = {
   captured : Ident.t list;
       (** The variables of its context that a lifted local function uses, which it takes
           next. *)
+  manual : bool;
   trusted : bool;
       (** Whether the function is trusted, as [(*@ trusted *)] after it says: its contract
           assumed, its body not translated. *)
@@ -4981,6 +5140,8 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
       preds;
       facts = [];
       au = None;
+      manual = false;
+      access_proofs = [];
       initializations = [];
       linearizations = [];
       shared;
@@ -5439,9 +5600,10 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~initializations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries
-    ~proof_lemmas ~proof_support (functions : (string * string) list) origins ~proc_name
-    ~pure (f : func) : (R.Callable.t, error) Result.t =
+    ~access_proofs ~initializations ~linearizations ~lifted ~pasts ~past_returns
+    ~ghost_args ~libraries ~proof_lemmas ~proof_support ~predicate_bodies
+    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
+    (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -5460,11 +5622,13 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       spec_funcs = funcs;
       proof_lemmas;
       proof_support;
-      predicate_bodies = [];
+      predicate_bodies;
       env = ocaml_env;
       preds;
       facts = [];
       au = None;
+      manual = f.manual;
+      access_proofs;
       initializations;
       linearizations;
       shared;
@@ -5545,7 +5709,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* requires = specs pres in
   (* The invariants of the precondition are opened around each atomic step. *)
   let* invariants = invariant_apps ctx env pres in
-  ctx.invariants <- invariants;
+  ctx.invariants <- (if f.manual then [] else invariants);
   (* A snapshot and a position witnessing each fact about an earlier state. *)
   let witnesses (p : past) =
     let* st =
@@ -5604,6 +5768,14 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
           pos_k = k;
         });
   let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
+  let* () =
+    if f.manual && atomic then
+      error f.loc
+        "Manual proofs of atomic contracts require explicit AU support, which is not \
+         available yet"
+    else if f.manual && f.trusted then error f.loc "A manual proof cannot also be trusted"
+    else Ok ()
+  in
   let atomic_pres =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
   in
@@ -5742,41 +5914,46 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     (* An invariant that the function establishes, as one creating a structure, is folded at
      its end, after setting the views of its postcondition. *)
     let* establish =
-      let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
-      let* established = invariant_apps ctx env posts in
-      let established =
-        List.filter established ~f:(fun (p, _) ->
-            not (List.exists invariants ~f:(fun (q, _) -> String.equal p q)))
-      in
-      if List.is_empty established then Ok []
+      if f.manual then Ok []
       else
-        let only_views ~loc ~pred p args =
-          if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then
-            [ R.Stmt.fold ~loc p args ]
-          else []
+        let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
+        let* established = invariant_apps ctx env posts in
+        let established =
+          List.filter established ~f:(fun (p, _) ->
+              not (List.exists invariants ~f:(fun (q, _) -> String.equal p q)))
         in
-        let* views = all posts ~f:(uses ctx env ~at:f.loc (with_views ctx only_views)) in
-        (* Reported at the end of the function. *)
-        let at = { f.loc with loc_start = f.loc.loc_end } in
-        List.iter established ~f:(fun (inv, _) ->
-            ctx.origins :=
-              {
-                at;
-                code = Fold;
-                message =
-                  Printf.sprintf
-                    "The invariant %s may not hold when this function returns" inv;
-                related =
-                  Option.to_list
-                    (Option.map
-                       (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
-                       ~f:(fun def -> (def, "The invariant")));
-              }
-              :: !(ctx.origins));
-        let* folds =
-          all established ~f:(fun (inv, args) -> establish_invariant ctx ~f ~at inv args)
-        in
-        Ok (List.concat views @ List.concat folds)
+        if List.is_empty established then Ok []
+        else
+          let only_views ~loc ~pred p args =
+            if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then
+              [ R.Stmt.fold ~loc p args ]
+            else []
+          in
+          let* views =
+            all posts ~f:(uses ctx env ~at:f.loc (with_views ctx only_views))
+          in
+          (* Reported at the end of the function. *)
+          let at = { f.loc with loc_start = f.loc.loc_end } in
+          List.iter established ~f:(fun (inv, _) ->
+              ctx.origins :=
+                {
+                  at;
+                  code = Fold;
+                  message =
+                    Printf.sprintf
+                      "The invariant %s may not hold when this function returns" inv;
+                  related =
+                    Option.to_list
+                      (Option.map
+                         (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
+                         ~f:(fun def -> (def, "The invariant")));
+                }
+                :: !(ctx.origins));
+          let* folds =
+            all established ~f:(fun (inv, args) ->
+                establish_invariant ctx ~f ~at inv args)
+          in
+          Ok (List.concat views @ List.concat folds)
     in
     let body = bind_au @ bound @ first @ stmts @ assignment @ establish @ last in
     Ok
@@ -6025,14 +6202,17 @@ let contract_after (annotations : Annotation.t list) ~(item_loc : Location.t)
   | [ a ] -> Result.map (Annotation.contract a) ~f:Option.some
   | _ :: a :: _ -> error a.loc "A function has at most one contract"
 
-(** Whether [(*@ trusted *)] annotates the item at [item_loc], ending before [next]. *)
-let trusted_after (annotations : Annotation.t list) ~(item_loc : Location.t)
+(** Function proof markers follow their declaration, before the next item. *)
+let marked_after (annotations : Annotation.t list) kind ~(item_loc : Location.t)
     ~(next : Location.t option) =
   List.exists annotations ~f:(fun a ->
       a.loc.loc_start.pos_cnum >= item_loc.loc_end.pos_cnum
       && Option.for_all next ~f:(fun next ->
           a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
-      && Poly.equal (Annotation.kind a) Annotation.Trusted)
+      && Poly.equal (Annotation.kind a) kind)
+
+let trusted_after annotations = marked_after annotations Annotation.Trusted
+let manual_after annotations = marked_after annotations Annotation.Manual
 
 (** The contracts of the values of [interface], by their names: an annotation after the
     value's declaration. *)
@@ -6130,6 +6310,7 @@ let items ?(interface = []) (structure : Typedtree.structure)
                       prefix_count = 0;
                       captured = [];
                       role = None;
+                      manual = manual_after annotations ~item_loc:item.str_loc ~next;
                       trusted = trusted_after annotations ~item_loc:item.str_loc ~next;
                     }
               | _ -> unsupported vb.vb_loc "This definition")
@@ -6330,6 +6511,9 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
           prefix;
           prefix_count = List.length prefix_params;
           captured;
+          manual =
+            outer.manual
+            || manual_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
           trusted =
             trusted_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
           role = Option.map continues ~f:(fun g -> g.pid_str);
@@ -6352,42 +6536,33 @@ let atomic_steps (structure : Typedtree.structure) : int list =
   iterator.structure iterator structure;
   !found
 
-(** Resolves allocation annotations to one source expression, including nested calls. *)
-let initialization_annotations (source : Source.t) typed annotations =
-  let initializations =
+(** Resolves annotations to one source expression, including nested calls. *)
+let attached_annotations (source : Source.t) typed annotations ~kind ~is_target
+    ~description =
+  let attached =
     List.filter_map annotations ~f:(fun a ->
-        if Poly.equal (Annotation.kind a) Annotation.Initializes then
+        if Poly.equal (Annotation.kind a) kind then
           let rec anchor i =
             if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1) else i
           in
           Some (anchor a.loc.loc_start.pos_cnum, a)
         else None)
   in
-  let allocations = ref [] in
-  let allocation_expr iterator (e : Typedtree.expression) =
-    let fresh =
-      match e.exp_desc with
-      | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
-          Option.exists (stdlib_name path) ~f:(String.equal "ref")
-          || Option.exists (atomic_name path) ~f:(fun op ->
-              List.mem [ "make"; "make_contended" ] op ~equal:String.equal)
-      | Texp_record { fields; extended_expression = None; _ } ->
-          Array.exists fields ~f:(fun (label, _) ->
-              Poly.equal label.Data_types.lbl_mut Mutable)
-      | _ -> false
-    in
+  let expressions = ref [] in
+  let collect_expression iterator (e : Typedtree.expression) =
+    let eligible = is_target e in
     begin match e.exp_desc with
-    | Texp_apply _ | Texp_record _ -> allocations := (e, fresh) :: !allocations
+    | Texp_apply _ | Texp_record _ -> expressions := (e, eligible) :: !expressions
     | _ -> ()
     end;
     Tast_iterator.default_iterator.expr iterator e
   in
-  let iterator = { Tast_iterator.default_iterator with expr = allocation_expr } in
+  let iterator = { Tast_iterator.default_iterator with expr = collect_expression } in
   iterator.structure iterator typed;
-  let* initializations =
-    all initializations ~f:(fun (anchor, annotation) ->
+  let* attached =
+    all attached ~f:(fun (anchor, annotation) ->
         let candidates =
-          List.filter !allocations ~f:(fun (e, _) ->
+          List.filter !expressions ~f:(fun (e, _) ->
               (anchor = step_end e
               &&
               match e.exp_desc with
@@ -6405,22 +6580,47 @@ let initialization_annotations (source : Source.t) typed annotations =
               | 0 -> Int.compare b.exp_loc.loc_end.pos_cnum a.exp_loc.loc_end.pos_cnum
               | order -> order)
         with
-        | None | Some (_, false) ->
-            error annotation.loc "This annotation must follow a fresh allocation"
-        | Some (allocation, true) ->
+        | None | Some (_, false) -> error annotation.loc description
+        | Some (expression, true) ->
             Ok
-              ( ( allocation.exp_loc.loc_start.pos_cnum,
-                  allocation.exp_loc.loc_end.pos_cnum ),
+              ( ( expression.exp_loc.loc_start.pos_cnum,
+                  expression.exp_loc.loc_end.pos_cnum ),
                 annotation ))
   in
   let* () =
-    match List.find_a_dup (List.map initializations ~f:fst) ~compare:Poly.compare with
+    match List.find_a_dup (List.map attached ~f:fst) ~compare:Poly.compare with
     | None -> Ok ()
     | Some start ->
-        let annotation = List.Assoc.find_exn initializations start ~equal:Poly.equal in
-        error annotation.loc "An allocation has more than one initializer annotation"
+        let annotation = List.Assoc.find_exn attached start ~equal:Poly.equal in
+        error annotation.loc "This expression has more than one annotation of this kind"
   in
-  Ok initializations
+  Ok attached
+
+let initialization_annotations source typed annotations =
+  let is_target (e : Typedtree.expression) =
+    match e.exp_desc with
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+        Option.exists (stdlib_name path) ~f:(String.equal "ref")
+        || Option.exists (atomic_name path) ~f:(fun op ->
+            List.mem [ "make"; "make_contended" ] op ~equal:String.equal)
+    | Texp_record { fields; extended_expression = None; _ } ->
+        Array.exists fields ~f:(fun (label, _) ->
+            Poly.equal label.Data_types.lbl_mut Mutable)
+    | _ -> false
+  in
+  attached_annotations source typed annotations ~kind:Annotation.Initializes ~is_target
+    ~description:"This annotation must follow a fresh allocation"
+
+let access_annotations source typed annotations =
+  let is_target (e : Typedtree.expression) =
+    match e.exp_desc with
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+        Option.exists (atomic_name path) ~f:(fun op ->
+            not (String.is_prefix op ~prefix:"make"))
+    | _ -> false
+  in
+  attached_annotations source typed annotations ~kind:Annotation.Access ~is_target
+    ~description:"Ghost.access must follow an Atomic access"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
@@ -6446,10 +6646,11 @@ let pure_functions (funcs : func list) : func list =
   in
   close seeds
 
-(** How a predicate is defined: by a body; as an invariant, by a body in terms of the
-    fields of its state; or as a view of an invariant's state. *)
+(** How a predicate is defined: by a body; as a direct invariant; as an invariant in terms
+    of its state's fields; or as a view of an invariant's state. *)
 type definition =
   | Body of S.term
+  | Direct_invariant of S.term
   | Invariant of { state : string; fields : S.state_field list; body : S.term }
   | View of { value : S.term }
 
@@ -7243,6 +7444,8 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     preds;
     facts = [];
     au = None;
+    manual = false;
+    access_proofs = [];
     initializations = [];
     linearizations = [];
     shared;
@@ -7415,6 +7618,9 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
   let name = ident ~loc:l p.pred_name.pid_str in
   match def with
+  | Direct_invariant body ->
+      let* body = quantified env body in
+      Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
   | Body body ->
       let* body = quantified env body in
       (* The trailing parameters without references, as the abstract value, are outputs:
@@ -7745,26 +7951,24 @@ let predicates (source : Source.t) =
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
-          let* fields =
+          let params, definition =
             match state_type with
             | PTtyapp (Qid t, []) when List.Assoc.mem states t.pid_str ~equal:String.equal
               ->
-                Ok (List.Assoc.find_exn states t.pid_str ~equal:String.equal)
-            | _ ->
-                error state.pid_loc
-                  "The state of an invariant has a type declared in the proof, as type \
-                   state = { ... }"
+                let fields = List.Assoc.find_exn states t.pid_str ~equal:String.equal in
+                (inv_params, Invariant { state = state.pid_str; fields; body = inv_body })
+            | _ -> (inv_params @ [ (state, state_type) ], Direct_invariant inv_body)
           in
           Ok
             (Some
                ( inv_name.pid_loc,
                  {
                    S.pred_name = inv_name;
-                   pred_params = inv_params;
+                   pred_params = params;
                    pred_body = None;
                    pred_persistent = true;
                  },
-                 Some (Invariant { state = state.pid_str; fields; body = inv_body }) ))
+                 Some definition ))
       | Proof_view { view_name; view_params; view_value } ->
           begin match declaration view_name.pid_str with
           | Some (_, d) when List.length d.pred_params = List.length view_params + 1 ->
@@ -7825,7 +8029,10 @@ let predicates (source : Source.t) =
           (Stdlib.Format.asprintf "%a" Printtyp.type_expr a)
           (Stdlib.Format.asprintf "%a" Printtyp.type_expr b))
   in
-  let is_invariant = function Invariant _ -> true | Body _ | View _ -> false in
+  let is_invariant = function
+    | Direct_invariant _ | Invariant _ -> true
+    | Body _ | View _ -> false
+  in
   let declaration (at, (p : S.predicate), def, types) =
     match (def, definitions (name p)) with
     | Some _, _ -> Ok ()
@@ -7955,6 +8162,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let typed = without_application_operators source.typed in
   let steps = atomic_steps typed in
   let* initializations = initialization_annotations source typed annotations in
+  let* access_proofs = access_annotations source typed annotations in
   let* () =
     match
       List.find linearizations ~f:(fun (anchor, _) ->
@@ -7970,6 +8178,25 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* types, funcs = items ~interface typed annotations in
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
   let funcs = inherit_contracts (funcs @ List.concat lifted) in
+  let* () =
+    Result.all_unit
+      (List.map access_proofs ~f:(fun ((start, finish), annotation) ->
+           let owners =
+             List.filter funcs ~f:(fun f ->
+                 start >= f.body.exp_loc.loc_start.pos_cnum
+                 && finish <= f.body.exp_loc.loc_end.pos_cnum)
+           in
+           match
+             List.min_elt owners ~compare:(fun a b ->
+                 Int.compare
+                   (a.body.exp_loc.loc_end.pos_cnum - a.body.exp_loc.loc_start.pos_cnum)
+                   (b.body.exp_loc.loc_end.pos_cnum - b.body.exp_loc.loc_start.pos_cnum))
+           with
+           | Some f when f.manual && not f.trusted -> Ok ()
+           | Some f when f.trusted ->
+               error annotation.loc "Ghost.access cannot be used in a trusted function"
+           | _ -> error annotation.loc "Ghost.access requires a manual function proof"))
+  in
   (* The abstract types of the libraries. *)
   let* library_types =
     all source.libraries ~f:(fun (lib : Source.library) ->
@@ -8188,7 +8415,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.filter_map predicates ~f:(fun (_, p, def, types) ->
         match def with
         | View { value } -> Some (p, value, types)
-        | Body _ | Invariant _ -> None)
+        | Body _ | Direct_invariant _ | Invariant _ -> None)
   in
   let* view_fields =
     all views ~f:(fun ((p : S.predicate), _, param_types) ->
@@ -8245,7 +8472,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
            match def with
            | Invariant { state; fields; body } ->
                Some (at, p, state, fields, body, param_types)
-           | Body _ | View _ -> None))
+           | Body _ | Direct_invariant _ | View _ -> None))
       ~f:(fun (at, (p : S.predicate), state, state_fields, body, param_types) ->
         (* The key type of a field of pending calls. *)
         let pending_key t =
@@ -8382,7 +8609,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       persistent =
         List.filter_map predicates ~f:(fun (at, p, def, _) ->
             match def with
-            | Invariant _ -> Some (p.pred_name.pid_str, at)
+            | Direct_invariant _ | Invariant _ -> Some (p.pred_name.pid_str, at)
             | Body _ | View _ -> None);
       views =
         List.map views ~f:(fun (p, _, _) ->
@@ -8569,7 +8796,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let predicate_bodies =
     List.filter_map predicates ~f:(fun (_, p, definition, _) ->
         match definition with
-        | Body body -> Some (p.S.pred_name.pid_str, body)
+        | Body body | Direct_invariant body -> Some (p.S.pred_name.pid_str, body)
         | Invariant _ | View _ -> None)
   in
   let* lemma_members =
@@ -8613,8 +8840,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~initializations ~linearizations ~lifted ~pasts ~past_returns
-          ~ghost_args ~proof_lemmas ~proof_support
+          ~annotations ~access_proofs ~initializations ~linearizations ~lifted ~pasts
+          ~past_returns ~ghost_args ~proof_lemmas ~proof_support ~predicate_bodies
           ~libraries:
             (List.map source.libraries ~f:(fun (lib : Source.library) ->
                  (lib.library_id, lib.library_name)))

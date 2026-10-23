@@ -7,10 +7,10 @@ Proofs that do not fit their interface; each file has its own run.
   Type Error: The view stack is not declared in the interface, which gives the type of its value.
   [1]
   $ caravan --shh proof_error_2.ml
-  [Error] File "proof_error_2.proof", line 1, columns 28-29:
+  [Error] File "proof_error_2.proof", line 1, columns 32-37:
   1 | invariant is_stack (t : t) (s : state) = own t s.items
-                                  ^
-  Type Error: The state of an invariant has a type declared in the proof, as type state = { ... }.
+                                      ^^^^^
+  Type Error: Unbound type constructor state.
   [1]
   $ caravan --shh proof_error_3.ml
   [Error] File "proof_error_3.proof", line 1, columns 10-18:

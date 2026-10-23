@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 - Proof files support resource algebra instances, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.
 - Generated invariant folds supply explicit witnesses for known state transitions and histories.
 - Source-level verification errors retain solver timeout explanations.
-- Proof files support checked lemmas, logical variant types, and sets and maps.
+- Proof files support checked lemmas, general invariants, logical variant types, and sets and maps.
 - First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
 - Contracts support named arguments, quantifiers, chained comparisons, and pattern matching.
 - Variants, tuples, lists, options, records, and type abbreviations are supported.
@@ -24,7 +24,7 @@ All notable changes to this project will be documented in this file.
 - Logically atomic contracts generate linearization proofs, including branches that return results.
 - Read linearization points can be selected with `commit` and conditional `returning` annotations.
 - Contracts can reside in `.mli` interfaces, with predicate definitions in companion `.proof` files.
-- Predicates support `fold`, `unfold`, and `assert` annotations in program code.
+- Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses.
 - Shared structures support persistent invariants and exclusive views of their ghost state.
 - Growing ghost-state fields support histories, snapshots, and facts about past states.
 - Specifications support sequences and ownership of their entries by index.
