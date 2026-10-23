@@ -83,10 +83,8 @@ A type mismatch in an explicit proof is reported as a user type error.
   [Error] File "lemmas_type_error.proof", line 1, columns 30-34:
   1 | lemma wrong = let (n : int) = true in ()
                                     ^^^^
-  Type Error: Expected an expression of type
-    Int
-  but found an expression of type
-    Bool.
+  Type Error: This expression should not be a boolean literal, the expected type is
+  int.
   [1]
 
 A binding inside a nested block does not escape its lexical scope.

@@ -1,0 +1,15 @@
+lemma inferred_finset_diff (items : int finset) (value : int)
+  ensures (not (Finset.mem value (Finset.diff items (Finset.singleton value)))) =
+  let remaining = Finset.diff items (Finset.singleton value) in
+  assert (not (Finset.mem value remaining))
+
+lemma inferred_set_union (left : int set) (right : int set) (value : int)
+  requires (Set.mem value left)
+  ensures (Set.mem value (Set.union left right)) =
+  let combined = Set.union left right in
+  assert (Set.mem value combined)
+
+lemma inferred_map_set (mapping : (int, int) map) (key : int) (value : int)
+  ensures (Map.get (Map.set mapping key value) key = value) =
+  let updated = Map.set mapping key value in
+  assert (Map.get updated key = value)

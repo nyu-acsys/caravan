@@ -129,7 +129,8 @@
 %start <Spec_ast.contract> contract
 %start <Spec_ast.term> term_eof
 %start <Spec_ast.proof_expr> proof_expr_eof
-%start <Spec_ast.id * Spec_ast.proof_expr> scope
+%start <Spec_ast.access_scope> scope
+%start <Spec_ast.return_adapter> return_adapter
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
 %start <Spec_ast.proof_decl list> proof
@@ -151,20 +152,37 @@ proof_expr_eof:
 ;
 
 scope:
-| f = lqualid LEFTPAR FUN reader = lident ARROW body = proof_expr RIGHTPAR EOF
-    { begin match f with
-      | Qdot (Qid ghost, scope)
+| f = lqualid LEFTPAR FUN operation = lident state = pat_arg?
+    ARROW body = proof_expr RIGHTPAR EOF
+    { begin match f, state with
+      | Qdot (Qid ghost, scope), None
         when ghost.pid_str = "Ghost" && scope.pid_str = "scope" -> ()
-      | _ -> raise (Syntax_error (mk_loc $loc(f), "Expected Ghost.scope"))
+      | Qdot (Qdot (Qid ghost, state), scope), Some _
+        when ghost.pid_str = "Ghost" && state.pid_str = "State"
+          && scope.pid_str = "scope" -> ()
+      | _ -> raise (Syntax_error (mk_loc $loc(f),
+          "Expected Ghost.scope with one binder or Ghost.State.scope with two binders"))
       end;
-      (reader, body) }
+      { scope_operation = operation; scope_state = state; scope_body = body } }
+;
+
+return_adapter:
+| ghost = uident DOT RETURNS LEFTPAR FUN result = pat_arg state = pat_arg
+    ARROW body = proof_expr RIGHTPAR EOF
+    { if ghost.pid_str <> "Ghost" then
+        raise (Syntax_error (ghost.pid_loc, "Expected Ghost.returns"));
+      { returns_result = result; returns_state = state; returns_body = body } }
 ;
 
 loop_spec:
 | cs = loop_clause* EOF
-    { let invariants = List.filter_map (function `Invariant t -> Some t | `Variant _ -> None) cs in
-      let loop_variant = List.filter_map (function `Variant t -> Some t | `Invariant _ -> None) cs in
-      { invariants; loop_variant } }
+    { let invariants = List.filter_map (function
+        | `Invariant t -> Some t | `State_invariant _ | `Variant _ -> None) cs in
+      let state_invariants = List.filter_map (function
+        | `State_invariant invariant -> Some invariant | `Invariant _ | `Variant _ -> None) cs in
+      let loop_variant = List.filter_map (function
+        | `Variant t -> Some t | `Invariant _ | `State_invariant _ -> None) cs in
+      { invariants; state_invariants; loop_variant } }
 ;
 
 predicate:
@@ -438,6 +456,8 @@ ghost_witnesses:
 
 loop_clause:
 | INVARIANT t = term { `Invariant t }
+| INVARIANT LEFTPAR FUN state = pat_arg ARROW t = term RIGHTPAR
+    { `State_invariant (state, t) }
 | VARIANT t = term { `Variant t }
 ;
 

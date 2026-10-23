@@ -110,7 +110,11 @@ let empty_contract =
     continues = None;
   }
 
-type loop_spec = { invariants : term list; loop_variant : term list }
+type loop_spec = {
+  invariants : term list;
+  state_invariants : (pat * term) list;
+  loop_variant : term list;
+}
 (** The specification of a loop, written at the start of its body. *)
 
 type predicate = {
@@ -150,6 +154,18 @@ and proof_desc =
   | Proof_assert of term
   | Proof_fold of term * (id * term) list
   | Proof_unfold of term * id list
+
+type access_scope = {
+  scope_operation : id;
+  scope_state : pat option;
+  scope_body : proof_expr;
+}
+
+type return_adapter = {
+  returns_result : pat;
+  returns_state : pat;
+  returns_body : proof_expr;
+}
 
 type resource_kind = Resource_set of pty | Resource_auth of id
 

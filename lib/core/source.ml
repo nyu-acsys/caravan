@@ -827,35 +827,32 @@ let ghost_type env ~at =
 (** Compiler-only operations used to type-check logical expressions. *)
 let logical_check_signature =
   "module Caravan__logical_check : sig\n\
-   type nonrec 'a s = 'a set\n\
-   type nonrec 'a f = 'a finset\n\
-   type nonrec ('k,'v) m = ('k,'v) map\n\
    val quantify : ('a -> bool) -> bool\n\
    val implies : bool -> bool -> bool\n\
    module Set : sig\n\
-   val empty : 'a s\n\
-   val singleton : 'a -> 'a s\n\
-   val mem : 'a -> 'a s -> bool\n\
-   val union : 'a s -> 'a s -> 'a s\n\
-   val inter : 'a s -> 'a s -> 'a s\n\
-   val diff : 'a s -> 'a s -> 'a s\n\
-   val subset : 'a s -> 'a s -> bool\n\
-   val of_predicate : ('a -> bool) -> 'a s\n\
+   val empty : 'a set\n\
+   val singleton : 'a -> 'a set\n\
+   val mem : 'a -> 'a set -> bool\n\
+   val union : 'a set -> 'a set -> 'a set\n\
+   val inter : 'a set -> 'a set -> 'a set\n\
+   val diff : 'a set -> 'a set -> 'a set\n\
+   val subset : 'a set -> 'a set -> bool\n\
+   val of_predicate : ('a -> bool) -> 'a set\n\
    end\n\
    module Finset : sig\n\
-   val empty : 'a f\n\
-   val singleton : 'a -> 'a f\n\
-   val mem : 'a -> 'a f -> bool\n\
-   val union : 'a f -> 'a f -> 'a f\n\
-   val inter : 'a f -> 'a f -> 'a f\n\
-   val diff : 'a f -> 'a f -> 'a f\n\
-   val subset : 'a f -> 'a f -> bool\n\
-   val choose : 'a f -> 'a\n\
+   val empty : 'a finset\n\
+   val singleton : 'a -> 'a finset\n\
+   val mem : 'a -> 'a finset -> bool\n\
+   val union : 'a finset -> 'a finset -> 'a finset\n\
+   val inter : 'a finset -> 'a finset -> 'a finset\n\
+   val diff : 'a finset -> 'a finset -> 'a finset\n\
+   val subset : 'a finset -> 'a finset -> bool\n\
+   val choose : 'a finset -> 'a\n\
    end\n\
    module Map : sig\n\
-   val const : 'v -> ('k,'v) m\n\
-   val get : ('k,'v) m -> 'k -> 'v\n\
-   val set : ('k,'v) m -> 'k -> 'v -> ('k,'v) m\n\
+   val const : 'v -> ('k,'v) map\n\
+   val get : ('k,'v) map -> 'k -> 'v\n\
+   val set : ('k,'v) map -> 'k -> 'v -> ('k,'v) map\n\
    end\n\
    end"
 
@@ -1004,8 +1001,8 @@ let rec logical_expression ~functions (term : S.term) =
       Ok (Ast_helper.Exp.field ~loc value { txt = longident field; loc })
   | Tattr (_, value) | Told value -> exp value
 
-(** Checks OCaml types before Raven erases reference element types. *)
-let check_logical_expression env ~functions ~variables ~expected (term : S.term) =
+(** Types logical expressions before Raven erases reference element types. *)
+let type_logical_expression env ~functions ~variables ?expected (term : S.term) =
   try
     let* expression = logical_expression ~functions term in
     let env =
@@ -1027,23 +1024,29 @@ let check_logical_expression env ~functions ~variables ~expected (term : S.term)
     let env =
       List.fold_right variables ~init:env ~f:(fun (name, typ) env -> add env name typ)
     in
-    let name = "caravan$logical$expected" in
-    let expected =
-      let argument =
-        match Types.get_desc expected with
-        | Tpoly _ -> expected
-        | _ -> Btype.newgenty (Tpoly (expected, []))
-      in
-      Ctype.newty (Tarrow (Nolabel, argument, Predef.type_unit, Types.commu_ok))
+    let env, expression =
+      match expected with
+      | None -> (env, expression)
+      | Some expected ->
+          let name = "caravan$logical$expected" in
+          let argument =
+            match Types.get_desc expected with
+            | Tpoly _ -> expected
+            | _ -> Btype.newgenty (Tpoly (expected, []))
+          in
+          let expected =
+            Ctype.newty (Tarrow (Nolabel, argument, Predef.type_unit, Types.commu_ok))
+          in
+          let env = add env name expected in
+          let application =
+            Ast_helper.Exp.apply ~loc:term.term_loc
+              (Ast_helper.Exp.ident ~loc:term.term_loc
+                 { txt = Lident name; loc = term.term_loc })
+              [ (Nolabel, expression) ]
+          in
+          (env, application)
     in
-    let env = add env name expected in
-    let application =
-      Ast_helper.Exp.apply ~loc:term.term_loc
-        (Ast_helper.Exp.ident ~loc:term.term_loc
-           { txt = Lident name; loc = term.term_loc })
-        [ (Nolabel, expression) ]
-    in
-    let typed = Typecore.type_expression env application in
+    let typed = Typecore.type_expression env expression in
     let partial_match = ref None in
     let default = Tast_iterator.default_iterator in
     let iterator =
@@ -1061,12 +1064,20 @@ let check_logical_expression env ~functions ~variables ~expected (term : S.term)
     in
     iterator.expr iterator typed;
     match !partial_match with
-    | None -> Ok ()
+    | None -> Ok typed.exp_type
     | Some at -> Error (Report.error Type at "A logical match must be exhaustive")
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error
     | None -> Error (Report.error Type term.term_loc (Stdlib.Printexc.to_string exn)))
+
+let infer_logical_expression env ~functions ~variables term :
+    (Types.type_expr, Report.error) Result.t =
+  type_logical_expression env ~functions ~variables term
+
+let check_logical_expression env ~functions ~variables ~expected term =
+  Result.map (type_logical_expression env ~functions ~variables ~expected term)
+    ~f:(fun _ -> ())
 
 let check_logical_function env ~functions = function
   | S.Proof_function { function_params; function_result; function_body; function_name } ->

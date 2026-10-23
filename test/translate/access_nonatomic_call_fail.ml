@@ -1,5 +1,4 @@
-let increment (value : int) = value + 1
-let read (cell : int Atomic.t) = increment 0
+let read (cell : int Atomic.t) = Sys.opaque_identity 0
 (*@ Ghost.scope (fun read -> let result = read () in result) *)
 (*@ result = read cell
     requires own cell 0

@@ -374,11 +374,18 @@ type lemma_signature = {
   lemma_outputs : Types.type_expr list;
 }
 
+type procedure_signature = {
+  procedure_inputs : (string * Types.type_expr) list;
+  procedure_outputs : (string * Types.type_expr) list;
+  procedure_result : Types.type_expr;
+}
+
 type atomic_signature = {
   au_source : Source.proof_au;
   au_procedure : string;
   au_inputs : Types.type_expr list;
   au_result : Types.type_expr;
+  au_ghost_outputs : Types.type_expr list;
   au_implicit : Types.type_expr list;
 }
 
@@ -418,6 +425,10 @@ type context = {
       (** The ghost parameters of procedures, by their names: for each, the position of a
           parameter that a precondition makes a field of it, with the field, as [tail] in
           [requires tail = q.tail], by which calls find the ghost argument. *)
+  procedure_signatures : (string * procedure_signature) list;
+  mutable ghost_returns : (string * string * Types.type_expr) list;
+  mutable proof_state : (R.Expr.t * Types.type_expr) option;
+  mutable return_covered : bool;
   mutable fields_of : (string * (string * R.Expr.t)) list;
       (** The variables known to be fields of values, by their Raven names: the field and
           the value, as [tail] of [q] after [let push { tail; _ } value]. *)
@@ -447,6 +458,7 @@ type context = {
   current_procedure : string option;
   manual : bool;
   access_proofs : ((int * int) * Annotation.t) list;
+  return_proofs : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
   linearizations : (int * Annotation.t) list;
       (** The annotations on atomic steps, by the offset of the end of the step they
@@ -745,10 +757,17 @@ let atomic_inputs signature method_ =
   | "bind" -> Some ([ Predef.type_unit ], [ token ])
   | "access" -> Some (token :: signature.au_inputs, signature.au_implicit)
   | "abort" -> Some (token :: signature.au_inputs, [])
-  | "commit" -> Some ((token :: signature.au_inputs) @ [ signature.au_result ], [])
+  | "commit" ->
+      Some
+        ( (token :: signature.au_inputs)
+          @ (signature.au_result :: signature.au_ghost_outputs),
+          [] )
   | "pending" -> Some (token :: signature.au_inputs, [ Predef.type_bool ])
   | "committed" ->
-      Some ((token :: signature.au_inputs) @ [ signature.au_result ], [ Predef.type_bool ])
+      Some
+        ( (token :: signature.au_inputs)
+          @ (signature.au_result :: signature.au_ghost_outputs),
+          [ Predef.type_bool ] )
   | _ -> None
 
 (** Raven takes the concrete inputs and outputs as tuples, including empty ones. *)
@@ -759,7 +778,9 @@ let atomic_arguments ~loc:l signature method_ values =
       let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
       let inputs = R.Expr.tuple ~loc:l inputs in
       if List.mem [ "commit"; "committed" ] method_ ~equal:String.equal then
-        let outputs = if is_unit signature.au_result then [] else outputs in
+        let outputs =
+          if is_unit signature.au_result then List.drop outputs 1 else outputs
+        in
         [ token; inputs; R.Expr.tuple ~loc:l outputs ]
       else [ token; inputs ]
 
@@ -1123,7 +1144,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
           Ok (R.Expr.field ~loc:l r (name ~loc:l label))
       end
   | Tfield (_, Qdot _) -> unsupported at "A qualified field"
-  | Tlet (pattern, value, body) when env.logical_definition ->
+  | Tlet (pattern, value, body) ->
       let* translated = formula env value in
       let* condition, bindings = spec_pattern env pattern translated in
       let* () =
@@ -1138,7 +1159,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       formula
         (List.fold bindings ~init:env ~f:(fun env (id, v) -> bind env id (Value v)))
         body
-  | Tlet _ | Told _ -> unsupported at "This formula"
+  | Told _ -> unsupported at "This formula"
 
 (** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
     as [[]] in [queue q []]. *)
@@ -1214,9 +1235,11 @@ and term_type env (t : S.term) =
                  Option.bind (Datatypes.find env.data p) ~f:(fun d ->
                      match d.ctors with
                      | [ c ] ->
-                         List.Assoc.find
-                           (List.zip_exn c.fields c.args)
-                           f ~equal:String.equal
+                         Option.map
+                           (List.Assoc.find
+                              (List.zip_exn c.fields c.args)
+                              f ~equal:String.equal)
+                           ~f:(Datatypes.expand env.data)
                      | _ -> None)
              | _ -> None))
   | _, ({ term_desc = Tvar (Qid { pid_str = "([])" | "last"; _ }); _ }, s :: _) ->
@@ -1981,12 +2004,20 @@ and proof_value_type env (t : S.term) =
       | Tapply ({ term_desc = Tvar (Qid { pid_str = "Some"; _ }); _ }, value) ->
           let* ty = proof_value_type env value in
           Ok (Option.map ty ~f:(fun ty -> Ctype.newconstr Predef.path_option [ ty ]))
+      | Ttuple [] -> Ok (Some Predef.type_unit)
       | Ttuple ts ->
           let* ts = all ts ~f:(proof_value_type env) in
           Ok
             (Option.map (Option.all ts) ~f:(fun ts ->
                  Btype.newgenty (Ttuple (List.map ts ~f:(fun ty -> (None, ty))))))
-      | _ -> Ok (term_type env t))
+      | _ -> (
+          match term_type env t with
+          | Some ty -> Ok (Some ty)
+          | None ->
+              Result.map
+                (Source.infer_logical_expression env.ctx.env
+                   ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+                ~f:Option.some))
 
 let proof_pattern_parts (p : S.pat) = match p.pat_desc with Ptuple ps -> ps | _ -> [ p ]
 
@@ -2048,6 +2079,58 @@ let proof_typed_env env bindings =
             (bind env id.S.pid_str (Raven id.pid_str)) with
             var_types = (id.pid_str, ty) :: env.var_types;
           })
+
+let proof_state ctx ~at =
+  Option.value ctx.proof_state ~default:(unit_value ~loc:(loc at), Predef.type_unit)
+
+let rec proof_pattern env (pattern : S.pat) ty value =
+  match pattern.pat_desc with
+  | Pwild -> Ok env
+  | Pid id ->
+      Ok
+        {
+          (bind env id.pid_str (Value value)) with
+          var_types = (id.pid_str, ty) :: env.var_types;
+        }
+  | Pcast (pattern, annotation) ->
+      let* expected = Source.ocaml_type env.ctx.env ~at:pattern.pat_loc annotation in
+      if Ctype.is_equal env.ctx.env false [ expected ] [ ty ] then
+        proof_pattern env pattern ty value
+      else error pattern.pat_loc "The proof pattern has a different type from its input"
+  | Ptuple [] when Ctype.is_equal env.ctx.env false [ ty ] [ Predef.type_unit ] -> Ok env
+  | Ptuple patterns ->
+      begin match Datatypes.desc env.data ty with
+      | Ttuple types when List.length patterns = List.length types ->
+          List.foldi patterns ~init:(Ok env) ~f:(fun i env pattern ->
+              let* env = env in
+              let _, ty = List.nth_exn types i in
+              proof_pattern env pattern ty
+                (R.Expr.tuple_get ~loc:(loc pattern.pat_loc) value i))
+      | _ -> error pattern.pat_loc "The proof pattern does not match its input type"
+      end
+  | Pconstr _ | Pconst _ ->
+      error pattern.pat_loc "A proof parameter needs an irrefutable pattern"
+
+let bind_proof_pattern env pattern ty value =
+  match List.find_a_dup (pat_names pattern) ~compare:String.compare with
+  | Some x -> error pattern.S.pat_loc (Printf.sprintf "Duplicate proof variable %s" x)
+  | None -> proof_pattern env pattern ty value
+
+let packed_type = function
+  | [] -> Predef.type_unit
+  | [ ty ] -> ty
+  | types -> Btype.newgenty (Ttuple (List.map types ~f:(fun ty -> (None, ty))))
+
+let packed_value ~loc:l = function
+  | [] -> unit_value ~loc:l
+  | [ value ] -> value
+  | values -> R.Expr.tuple ~loc:l values
+
+let unpacked_value ~loc:l types value =
+  match types with
+  | [] -> []
+  | [ _ ] -> [ value ]
+  | types -> List.mapi types ~f:(fun i _ -> R.Expr.tuple_get ~loc:l value i)
 
 (** Existentials are named by their declaration in the predicate, including those nested
     inside a match or another logical connective. *)
@@ -2132,9 +2215,12 @@ let rec proof_result_types env (body : S.proof_expr) =
             let types =
               Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p)
             in
-            let* types =
-              proof_result_types { env with var_types = types @ env.var_types } body
+            let branch_env =
+              List.fold types
+                ~init:{ env with var_types = types @ env.var_types }
+                ~f:(fun env (x, _) -> bind env x (Raven x))
             in
+            let* types = proof_result_types branch_env body in
             begin match types with Some _ -> Ok types | None -> infer rest
             end
       in
@@ -2207,7 +2293,17 @@ let rec proof_expression env targets (body : S.proof_expr) =
       end
   | Proof_value t ->
       begin match proof_signature env t with
-      | Some _ ->
+      | Some signature ->
+          let* () =
+            if
+              Ctype.is_equal env.ctx.env false
+                [ packed_type signature.lemma_outputs ]
+                [ packed_type (List.map targets ~f:(fun t -> t.target_type)) ]
+            then Ok ()
+            else
+              error t.term_loc
+                "The proof expression has a different result type from its binding"
+          in
           let* call, outputs = proof_call env t in
           if List.length outputs = List.length targets then
             if List.is_empty targets then Ok [ R.Stmt.call ~loc:l call ]
@@ -2280,6 +2376,12 @@ let rec proof_expression env targets (body : S.proof_expr) =
           else if List.length values <> List.length targets then
             begin match values with
             | [ value ] when not (List.is_empty targets) ->
+                let* () =
+                  Source.check_logical_expression env.ctx.env
+                    ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                    ~expected:(packed_type (List.map targets ~f:(fun t -> t.target_type)))
+                    value
+                in
                 let* value = formula env value in
                 Ok
                   (List.mapi targets ~f:(fun i target ->
@@ -2292,6 +2394,11 @@ let rec proof_expression env targets (body : S.proof_expr) =
             end
           else
             all (List.zip_exn targets values) ~f:(fun (target, value) ->
+                let* () =
+                  Source.check_logical_expression env.ctx.env
+                    ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                    ~expected:target.target_type value
+                in
                 let* value = expected_formula env (Some target.target_type) value in
                 Ok (R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs value)))
       end
@@ -2447,9 +2554,11 @@ let rec proof_names (body : S.proof_expr) =
           List.filter (proof_names body) ~f:(fun name ->
               not (List.mem (pat_names p) name ~equal:String.equal)))
 
-(** The closure is a proof context around the original, unchanged runtime access. *)
-let access_proof ctx annotation ~result_type ~result statements =
-  let* operation, body = Annotation.scope annotation in
+(** A checked wrapper invokes the original operation once. *)
+let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
+    =
+  let* scope = Annotation.scope annotation in
+  let operation = scope.scope_operation and body = scope.scope_body in
   let uses_operation body =
     List.mem (proof_names body) operation.pid_str ~equal:String.equal
   in
@@ -2462,12 +2571,41 @@ let access_proof ctx annotation ~result_type ~result statements =
     let* statements = proof_expression env [] body in
     Ok [ R.Stmt.ghost_block ~loc:(loc body.S.proof_loc) statements ]
   in
+  let finish_state env (state : S.term) =
+    let* ty = proof_value_type env state in
+    match ty with
+    | None -> error state.term_loc "Add a type annotation to the output proof state"
+    | Some ty ->
+        let* () =
+          Source.check_logical_expression env.ctx.env
+            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
+            state
+        in
+        let* value = expected_formula env (Some ty) state in
+        let raven = Names.fresh ctx.names "proof_state" in
+        let* raven_type = typ ctx ~at:state.term_loc ty in
+        let l = loc state.term_loc in
+        let result = R.Expr.var ~loc:l (name ~loc:l raven) in
+        ctx.proof_state <- Some (result, ty);
+        Ok
+          (R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
+          @ [
+              R.Stmt.ghost_block ~loc:l
+                [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs value) ];
+            ])
+  in
   let rec after env ~operation_visible ~result_name ~result_visible body =
     let* () = reject_operation operation_visible body in
+    let unchanged (t : S.term) =
+      match t.term_desc with
+      | Tvar (Qid id) -> result_visible && String.equal id.pid_str result_name
+      | _ -> false
+    in
     match body.S.proof_desc with
-    | Proof_value { term_desc = Tvar (Qid id); _ }
-      when result_visible && String.equal id.pid_str result_name ->
-        Ok []
+    | Proof_value t when Option.is_none scope.scope_state && unchanged t -> Ok []
+    | Proof_value { term_desc = Ttuple [ runtime; state ]; _ }
+      when Option.is_some scope.scope_state && unchanged runtime ->
+        finish_state env state
     | Proof_seq (first, rest) ->
         let* first = ghost_statements env first in
         let* rest = after env ~operation_visible ~result_name ~result_visible rest in
@@ -2487,39 +2625,70 @@ let access_proof ctx annotation ~result_type ~result statements =
               rest)
     | _ ->
         error body.proof_loc
-          "An access proof must return the unchanged result of the attached operation"
+          (if Option.is_some scope.scope_state then
+             "A stateful scope must return (unchanged operation result, output state)"
+           else
+             "An access proof must return the unchanged result of the attached operation")
   in
-  let is_operation visible body =
+  let operation_argument visible body =
     match body.S.proof_desc with
     | Proof_value t when visible ->
         begin match spine t [] with
-        | { term_desc = Tvar (Qid id); _ }, [ { term_desc = Ttuple []; _ } ] ->
-            String.equal id.pid_str operation.pid_str
-        | _ -> false
+        | { term_desc = Tvar (Qid id); _ }, [ argument ]
+          when String.equal id.pid_str operation.pid_str ->
+            Some argument
+        | _ -> None
         end
-    | _ -> false
+    | _ -> None
+  in
+  let rec runtime_binding (p : S.pat) =
+    match p.pat_desc with
+    | Pid id -> Some id
+    | Pcast (p, _) -> runtime_binding p
+    | _ -> None
+  in
+  let rec operation_result (p : S.pat) =
+    if List.is_empty output_types then runtime_binding p
+    else
+      match p.pat_desc with
+      | Ptuple [ runtime; _ ] -> runtime_binding runtime
+      | Pcast (p, _) -> operation_result p
+      | _ -> None
   in
   let rec before env visible body =
     match body.S.proof_desc with
-    | Proof_let (pattern, rhs, rest) when is_operation visible rhs ->
-        let* bindings = proof_binding_types env pattern (Some [ Some result_type ]) in
-        begin match bindings with
-        | [ (Some id, ty) ] when Ctype.is_equal ctx.env false [ ty ] [ result_type ] ->
-            let env =
-              {
-                (bind env id.pid_str (Value result)) with
-                var_types = (id.pid_str, ty) :: env.var_types;
-              }
-            in
+    | Proof_let (pattern, rhs, rest) when Option.is_some (operation_argument visible rhs)
+      ->
+        let argument = Option.value_exn (operation_argument visible rhs) in
+        let* () =
+          Source.check_logical_expression env.ctx.env
+            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+            ~expected:(packed_type input_types) argument
+        in
+        let* argument = expected_formula env (Some (packed_type input_types)) argument in
+        let arguments = unpacked_value ~loc:(loc rhs.proof_loc) input_types argument in
+        let* statements, result, outputs = run arguments in
+        let result_value, result_ty =
+          if List.is_empty output_types then (result, result_type)
+          else
+            ( R.Expr.tuple ~loc:(loc rhs.proof_loc)
+                [ result; packed_value ~loc:(loc rhs.proof_loc) outputs ],
+              packed_type [ result_type; packed_type output_types ] )
+        in
+        let* env = bind_proof_pattern env pattern result_ty result_value in
+        begin match operation_result pattern with
+        | None ->
+            error pattern.pat_loc
+              "Bind the operation's runtime result to a variable of its original type"
+        | Some id ->
             let* rest =
               after env
-                ~operation_visible:(not (String.equal id.pid_str operation.pid_str))
+                ~operation_visible:
+                  (not
+                     (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal))
                 ~result_name:id.pid_str ~result_visible:true rest
             in
             Ok (statements @ rest)
-        | _ ->
-            error pattern.pat_loc
-              "Bind the attached operation's result to a variable of its original type"
         end
     | Proof_let (pattern, rhs, rest) ->
         let* () = reject_operation visible rhs in
@@ -2538,7 +2707,36 @@ let access_proof ctx annotation ~result_type ~result statements =
         error body.proof_loc
           "An access proof needs one unconditional let binding of the attached operation"
   in
-  before (scope_env ctx) true body
+  let* env =
+    match scope.scope_state with
+    | None -> Ok (scope_env ctx)
+    | Some pattern ->
+        let value, ty = proof_state ctx ~at:pattern.pat_loc in
+        bind_proof_pattern (scope_env ctx) pattern ty value
+  in
+  let visible =
+    not
+      (Option.exists scope.scope_state ~f:(fun p ->
+           List.mem (pat_names p) operation.pid_str ~equal:String.equal))
+  in
+  before env visible body
+
+let return_proof ctx annotation ~result_type ~result =
+  let* adapter = Annotation.returns annotation in
+  if List.is_empty ctx.ghost_returns then
+    error annotation.Annotation.loc "Ghost.returns requires declared ghost results"
+  else
+    let* env =
+      bind_proof_pattern (scope_env ctx) adapter.returns_result result_type result
+    in
+    let value, ty = proof_state ctx ~at:adapter.returns_state.pat_loc in
+    let* env = bind_proof_pattern env adapter.returns_state ty value in
+    let targets =
+      List.map ctx.ghost_returns ~f:(fun (_, raven, ty) ->
+          { target_name = raven; target_type = ty })
+    in
+    let* statements = proof_expression env targets adapter.returns_body in
+    Ok [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
 
 (** The specification of the loop whose body is [body], in an annotation between [after]
     and the body, as [while c do (*@ invariant P *) ... done]. *)
@@ -2551,7 +2749,7 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     List.filter ctx.annotations ~f:(fun a ->
         between a && Poly.equal (Annotation.kind a) Annotation.Loop)
   with
-  | [] -> Ok { S.invariants = []; loop_variant = [] }
+  | [] -> Ok { S.invariants = []; state_invariants = []; loop_variant = [] }
   | [ a ] -> Annotation.loop_spec a
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
 
@@ -2572,16 +2770,36 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
   in
   let scope = scope ctx in
   let env = scope_env ctx in
-  let* free = free_typed env spec.invariants ~at in
+  let* env, state_invariants =
+    List.fold spec.state_invariants
+      ~init:(Ok (env, []))
+      ~f:(fun acc (pattern, body) ->
+        let* env, terms = acc in
+        let value, ty = proof_state ctx ~at:pattern.S.pat_loc in
+        let* _ = bind_proof_pattern env pattern ty value in
+        let source = Names.fresh ctx.names "caravan$loop_state" in
+        let id = S.mk_id ~loc:pattern.pat_loc source in
+        let variable = S.mk_term (Tvar (Qid id)) pattern.pat_loc in
+        let term = S.mk_term (Tlet (pattern, variable, body)) body.term_loc in
+        let env =
+          {
+            (bind env source (Value value)) with
+            var_types = (source, ty) :: env.var_types;
+          }
+        in
+        Ok (env, terms @ [ term ]))
+  in
+  let terms = spec.invariants @ state_invariants in
+  let* free = free_typed env terms ~at in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
-  let* invariants = all spec.invariants ~f:(formula env) in
+  let* invariants = all terms ~f:(formula env) in
   (* The values that the invariants own, by the Raven names of their references and
      fields. *)
   let* reads =
-    all (List.concat_map spec.invariants ~f:owned_names) ~f:(fun (x, label, v) ->
+    all (List.concat_map terms ~f:owned_names) ~f:(fun (x, label, v) ->
         match
           ( List.Assoc.find env.vars x ~equal:String.equal,
             List.Assoc.find env.var_types x ~equal:String.equal,
@@ -3586,7 +3804,7 @@ let linearize ?step ?value ?access_type ctx ~at
     match (annotation, value, access_type) with
     | None, _, _ -> Ok access
     | Some annotation, Some result, Some result_type ->
-        access_proof ctx annotation ~result ~result_type access
+        access_proof ctx annotation ~result_type (fun _ -> Ok (access, result, []))
     | Some annotation, _, _ ->
         error annotation.loc "This operation does not support an access proof"
   else if Option.is_some annotation then
@@ -3828,7 +4046,53 @@ let allocation_initializers ctx (e : Typedtree.expression) =
 
 (** The statements evaluating [e], and the value of [e] after them; [tail] if the value is
     the function's result. *)
-let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
+let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
+    (ctx : context) (e : Typedtree.expression) :
+    (R.Stmt.t list * R.Expr.t, error) Result.t =
+  let incoming = ctx.proof_state and covered = ctx.return_covered in
+  let incoming_names = ctx.names.scope in
+  let key = (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) in
+  let adapter = List.Assoc.find ctx.return_proofs key ~equal:Poly.equal in
+  let* () =
+    match adapter with
+    | Some a when not tail ->
+        error a.loc "Ghost.returns must follow a normal tail expression"
+    | Some a when covered ->
+        error a.loc "This return path has more than one Ghost.returns annotation"
+    | _ -> Ok ()
+  in
+  ctx.return_covered <- covered || Option.is_some adapter;
+  let tail_container =
+    match e.exp_desc with
+    | Texp_let _ | Texp_sequence _ | Texp_match _ -> true
+    | Texp_ifthenelse (_, _, Some _) -> true
+    | _ -> false
+  in
+  let* () =
+    if
+      tail && (not ctx.return_covered) && (not tail_container)
+      && not (List.is_empty ctx.ghost_returns)
+    then error e.exp_loc "A normal return with ghost results needs Ghost.returns"
+    else Ok ()
+  in
+  let* statements, value = expr_body ~tail ~keep_scope ctx e in
+  let* finish =
+    match adapter with
+    | None -> Ok []
+    | Some a -> return_proof ctx a ~result_type:e.exp_type ~result:value
+  in
+  let* stateful =
+    match List.Assoc.find ctx.access_proofs key ~equal:Poly.equal with
+    | None -> Ok false
+    | Some a ->
+        Result.map (Annotation.scope a) ~f:(fun scope -> Option.is_some scope.scope_state)
+  in
+  if not (continue_state && stateful) then ctx.proof_state <- incoming;
+  if not keep_scope then ctx.names.scope <- incoming_names;
+  ctx.return_covered <- covered;
+  Ok (statements @ finish, value)
+
+and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
     (R.Stmt.t list * R.Expr.t, error) Result.t =
   let at = e.exp_loc in
   let l = loc at in
@@ -3975,14 +4239,16 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
   | Texp_let (_, [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; _ } ], rest)
     when List.Assoc.mem ctx.functions (Ident.unique_name id) ~equal:String.equal ->
       (* A local function, lifted to the top level. *)
-      expr ~tail ctx rest
+      expr ~tail ~keep_scope ctx rest
   | Texp_let (Nonrecursive, bindings, body) ->
       (* The bound expressions are evaluated before any of their variables is bound. *)
       let* evaluated =
         all bindings ~f:(fun (vb : Typedtree.value_binding) ->
             let polarity = cas_polarity ctx vb.vb_expr in
             let read = is_read_value ctx vb.vb_expr in
-            let* stmts, v = expr ctx vb.vb_expr in
+            let* stmts, v =
+              expr ~continue_state:(List.length bindings = 1) ctx vb.vb_expr
+            in
             begin match (ctx.au, polarity, vb.vb_pat.pat_desc) with
             | Some au, Some p, Tpat_var (id, _, _) ->
                 au.cas_results <- (Ident.unique_name id, p) :: au.cas_results
@@ -4011,7 +4277,7 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
       let* ghost =
         ghost ctx ~after:last.vb_expr.exp_loc.loc_end ~before:body.exp_loc.loc_start
       in
-      let* body_stmts, body = expr ~tail ctx body in
+      let* body_stmts, body = expr ~tail ~keep_scope ctx body in
       Ok
         ( List.concat_map evaluated ~f:(fun (_, stmts, _) -> stmts)
           @ List.concat (List.concat defs)
@@ -4019,9 +4285,9 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
           body )
   | Texp_let (Recursive, _, _) -> unsupported at "A local recursive function"
   | Texp_sequence (e1, e2) ->
-      let* stmts1, _ = expr ctx e1 in
+      let* stmts1, _ = expr ~continue_state:true ctx e1 in
       let* ghost = ghost ctx ~after:e1.exp_loc.loc_end ~before:e2.exp_loc.loc_start in
-      let* stmts2, v = expr ~tail ctx e2 in
+      let* stmts2, v = expr ~tail ~keep_scope ctx e2 in
       Ok (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
       let* () = no_loop_before_linearizing ctx ~at in
@@ -4368,11 +4634,43 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
 (** The call of the top-level function [f] with [args], in [e]: a statement, whose result
     is kept in a variable unless it is unit. *)
 and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression list) =
-  let args = ocaml_args in
+  let* arguments, args = operands ctx ocaml_args in
+  let signature = List.Assoc.find ctx.procedure_signatures f ~equal:String.equal in
+  let inputs = Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_inputs) in
+  let outputs =
+    Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_outputs)
+  in
+  let run explicit =
+    call_prepared ctx e f ocaml_args args ~explicit ~signature_outputs:outputs
+  in
+  let annotation =
+    List.Assoc.find ctx.access_proofs
+      (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
+      ~equal:Poly.equal
+  in
+  match annotation with
+  | None ->
+      let* statements, value, _ = run None in
+      Ok (arguments @ statements, value)
+  | Some annotation ->
+      let result = ref None in
+      let* statements =
+        access_proof ctx annotation ~result_type:e.exp_type
+          ~input_types:(List.map inputs ~f:snd) ~output_types:(List.map outputs ~f:snd)
+          (fun values ->
+            let* statements, value, outputs = run (Some values) in
+            result := Some value;
+            Ok (statements, value, outputs))
+      in
+      begin match !result with
+      | Some value -> Ok (arguments @ statements, value)
+      | None -> error annotation.loc "The scope did not invoke its attached call"
+      end
+
+and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
+    ~signature_outputs =
   let l = loc e.exp_loc in
-  let* stmts_args = all (List.rev args) ~f:(fun arg -> expr ctx arg) in
-  let stmts = List.concat_map stmts_args ~f:fst in
-  let args = List.rev_map stmts_args ~f:snd in
+  let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
   let prefix, captured, role =
     Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:(0, [], None)
@@ -4392,31 +4690,38 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
   (* A ghost argument is the value of which the argument a precondition relates it to is a
      field, as [q] for [tail] in [fix_tail tail new_tail] after [push { tail; _ }]. *)
   let* ghosts =
-    all
-      (Option.value (List.Assoc.find ctx.ghost_args f ~equal:String.equal) ~default:[])
-      ~f:(fun equation ->
-        let known =
-          Option.bind equation ~f:(fun (i, field) ->
-              match List.nth ocaml_args (i - List.length prefix) with
-              | Some { exp_desc = Texp_ident (Pident id, _, _); _ } ->
-                  Option.bind (Names.find ctx.names id) ~f:(fun x ->
-                      List.find_map ctx.fields_of ~f:(fun (y, (g, value)) ->
-                          Option.some_if (String.equal x y && String.equal g field) value))
-              | _ -> None)
-        in
-        match (known, equation) with
-        | Some value, _ -> Ok value
-        | None, None ->
-            error e.exp_loc
-              "Caravan cannot tell the ghost argument of this call: give the callee a \
-               precondition that makes a parameter a field of it, as tail = q.tail"
-        | None, Some (_, field) ->
-            error e.exp_loc
-              (Printf.sprintf
-                 "Caravan cannot tell the ghost argument of this call: the argument is \
-                  not a variable known to be the field %s of a value, as one a record \
-                  pattern binds"
-                 field))
+    match explicit with
+    | Some values -> Ok values
+    | None ->
+        all
+          (Option.value
+             (List.Assoc.find ctx.ghost_args f ~equal:String.equal)
+             ~default:[])
+          ~f:(fun equation ->
+            let known =
+              Option.bind equation ~f:(fun (i, field) ->
+                  match List.nth ocaml_args (i - List.length prefix) with
+                  | Some { exp_desc = Texp_ident (Pident id, _, _); _ } ->
+                      Option.bind (Names.find ctx.names id) ~f:(fun x ->
+                          List.find_map ctx.fields_of ~f:(fun (y, (g, value)) ->
+                              Option.some_if
+                                (String.equal x y && String.equal g field)
+                                value))
+                  | _ -> None)
+            in
+            match (known, equation) with
+            | Some value, _ -> Ok value
+            | None, None ->
+                error e.exp_loc
+                  "Caravan cannot tell the ghost argument of this call: give the callee \
+                   a precondition that makes a parameter a field of it, as tail = q.tail"
+            | None, Some (_, field) ->
+                error e.exp_loc
+                  (Printf.sprintf
+                     "Caravan cannot tell the ghost argument of this call: the argument \
+                      is not a variable known to be the field %s of a value, as one a \
+                      record pattern binds"
+                     field))
   in
   let args = prefix @ args @ ghosts in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
@@ -4533,6 +4838,17 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
     | _ -> []
   in
   ctx.positions <- witnessed ghost_facts ghosts @ ctx.positions;
+  let* public =
+    all signature_outputs ~f:(fun (_, ty) ->
+        let raven = Names.fresh ctx.names "ghost_result" in
+        let* raven_type = typ ctx ~at:e.exp_loc ty in
+        Ok
+          ( R.Expr.var ~loc:l (name ~loc:l raven),
+            R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven) ))
+  in
+  let public_values = List.map public ~f:fst in
+  let ghost_decls = List.concat_map public ~f:snd @ ghost_decls in
+  let ghosts = public_values @ ghosts in
   if is_unit e.exp_type then
     let* closing = closing (unit_value ~loc:l) in
     let call =
@@ -4540,7 +4856,7 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
       | [] -> [ R.Stmt.call ~loc:l callee ]
       | _ -> ghost_decls @ [ R.Stmt.assign ~loc:l ghosts (R.Stmt.expr_rhs callee) ]
     in
-    Ok (stmts @ opening @ call @ closing, unit_value ~loc:l)
+    Ok (stmts @ opening @ call @ closing, unit_value ~loc:l, public_values)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
@@ -4554,7 +4870,7 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
           @ [ R.Stmt.assign ~loc:l (v :: ghosts) (R.Stmt.expr_rhs callee) ]
     in
     let* closing = closing v in
-    Ok (stmts @ opening @ def @ closing, v)
+    Ok (stmts @ opening @ def @ closing, v, public_values)
 
 (** The statements evaluating [args], right to left as OCaml does, and their values. *)
 and operands ctx (args : Typedtree.expression list) =
@@ -4627,6 +4943,7 @@ and pattern ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 and match_cases ?commits ~tail ctx ~at v
     (cases : (Typedtree.pattern * Typedtree.expression) list) ~total target =
   let l = loc at in
+  let enclosing_names = ctx.names.scope in
   (* Each case starts in the state of the atomic update before the match. *)
   let start = au_snapshot ctx in
   let ends = ref [] in
@@ -4643,7 +4960,8 @@ and match_cases ?commits ~tail ctx ~at v
      that left the atomic update open, by the case's body. *)
   let case_commits = List.zip_exn (List.map cases ~f:snd) commits in
   (* The body of a case, after defining the variables of its pattern. *)
-  let case_body binds (rhs : Typedtree.expression) =
+  let case_body ?(names = enclosing_names) binds (rhs : Typedtree.expression) =
+    ctx.names.scope <- names;
     restore_au ctx start;
     let commits =
       Option.join
@@ -4677,12 +4995,12 @@ and match_cases ?commits ~tail ctx ~at v
     match flat_cases ctx v cases with
     | Some flat ->
         let* raven_cases =
-          all flat ~f:(fun (case, binds, in_range, rhs) ->
-              let* body = case_body binds rhs in
+          all flat ~f:(fun (case, binds, in_range, rhs, names) ->
+              let* body = case_body ~names binds rhs in
               Ok (case, in_range @ body))
         in
         let has_default =
-          List.exists flat ~f:(fun (case, _, _, _) ->
+          List.exists flat ~f:(fun (case, _, _, _, _) ->
               match case with R.Expr.Default -> true | Case _ -> false)
         in
         let default =
@@ -4722,6 +5040,7 @@ and match_cases ?commits ~tail ctx ~at v
     constructors with variables or [_] as arguments, possibly followed by a variable or
     [_] matching anything else. *)
 and flat_cases ctx v cases =
+  let enclosing_names = ctx.names.scope in
   let flat_arg (p : Typedtree.pattern) =
     match p.pat_desc with
     | Tpat_any -> Some None
@@ -4748,12 +5067,14 @@ and flat_cases ctx v cases =
         | _ -> None
         end
   in
-  let case = function
+  let case item =
+    ctx.names.scope <- enclosing_names;
+    match item with
     | `Any (id, (p : Typedtree.pattern)), rhs ->
         let binds =
           Option.value_map id ~default:[] ~f:(fun id -> [ (id, v, p.pat_type) ])
         in
-        (R.Expr.Default, binds, [], rhs)
+        (R.Expr.Default, binds, [], rhs, ctx.names.scope)
     | `Ctor ((c : Datatypes.ctor), args, (p : Typedtree.pattern)), rhs ->
         let l = loc p.pat_loc in
         let var = function
@@ -4766,9 +5087,12 @@ and flat_cases ctx v cases =
         ( R.Expr.Case (ident ~loc:l c.raven, List.map vars ~f:fst),
           [],
           List.concat_map vars ~f:snd,
-          rhs )
+          rhs,
+          ctx.names.scope )
   in
-  Option.map (flat [] cases) ~f:(List.map ~f:case)
+  let result = Option.map (flat [] cases) ~f:(List.map ~f:case) in
+  ctx.names.scope <- enclosing_names;
+  result
 
 (** [if c then e1 else e2], with its value assigned to [target] if there is one. *)
 and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
@@ -4939,7 +5263,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       match flat_cases ctx v cases with
       | Some flat ->
           let* cases =
-            all flat ~f:(fun (case, binds, _, rhs) ->
+            all flat ~f:(fun (case, binds, _, rhs, _) ->
                 let* body = pure_in (with_binds binds) rhs in
                 Ok (case, body))
           in
@@ -5000,6 +5324,15 @@ let ghost_params (f : func) =
         | _ -> None)
   | None -> []
 
+(** The ghost results declared after the concrete result of [f]. *)
+let ghost_results (f : func) =
+  match Option.bind f.contract ~f:(fun c -> c.header) with
+  | Some h ->
+      List.filter_map h.hd_ret ~f:(function
+        | S.Lghost (id, t) -> Some (id, t)
+        | _ -> None)
+  | None -> []
+
 (** The names that the contract of [f] gives its result and its [n] parameters, by its
     [header] if it has one, and otherwise OCaml's. *)
 let contract_names (f : func) (header : S.header option) n =
@@ -5012,8 +5345,11 @@ let contract_names (f : func) (header : S.header option) n =
   match header with
   | None -> Ok ("result", ocaml_names)
   | Some h ->
+      let concrete_results =
+        List.filter h.hd_ret ~f:(function S.Lghost _ -> false | _ -> true)
+      in
       let* result =
-        match h.hd_ret with
+        match concrete_results with
         | [ Lwild ] | [] -> Ok "result"
         | [ Lvar id ] -> Ok id.pid_str
         | _ -> unsupported h.hd_name.pid_loc "A contract naming several results"
@@ -5144,17 +5480,73 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
       logical_definition = false;
       data = ctx.types;
       funcs = spec_funcs;
-      vars = List.map named ~f:(fun (x, r, _) -> (x, Raven r));
+      vars =
+        ( result_name,
+          if is_unit f.body.exp_type then Value (unit_value ~loc:(loc f.loc))
+          else Raven result )
+        :: List.map params ~f:(fun (x, r, _) -> (x, Raven r));
     }
   in
   (* Ghost parameters, as [q] in [fix_tail [q : t] tail new_tail]. *)
+  let declared_inputs = ghost_params f in
   let* ghosts =
-    all (ghost_params f) ~f:(fun (id, pty) ->
+    all
+      (List.mapi declared_inputs ~f:(fun i input -> (i, input)))
+      ~f:(fun (i, (id, pty)) ->
+        let* () =
+          if
+            List.Assoc.mem env.vars id.pid_str ~equal:String.equal
+            || List.exists (List.take declared_inputs i) ~f:(fun (earlier, _) ->
+                String.equal earlier.pid_str id.pid_str)
+          then
+            error id.pid_loc
+              (Printf.sprintf "The ghost parameter %s repeats another contract name"
+                 id.pid_str)
+          else Ok ()
+        in
         let* t = Source.ocaml_type ctx.env ~at:id.pid_loc pty in
         Ok (id.pid_str, Names.fresh ctx.names id.pid_str, t))
   in
   let env =
     List.fold ghosts ~init:env ~f:(fun env (x, raven, t) ->
+        { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+  in
+  let declared_outputs = ghost_results f in
+  let* output_ghosts =
+    all
+      (List.mapi declared_outputs ~f:(fun i output -> (i, output)))
+      ~f:(fun (i, (id, pty)) ->
+        let* () =
+          if
+            List.Assoc.mem env.vars id.pid_str ~equal:String.equal
+            || List.exists (List.take declared_outputs i) ~f:(fun (earlier, _) ->
+                String.equal earlier.pid_str id.pid_str)
+          then
+            error id.pid_loc
+              (Printf.sprintf "The ghost result %s repeats another contract name"
+                 id.pid_str)
+          else Ok ()
+        in
+        let* t = Source.ocaml_type ctx.env ~at:id.pid_loc pty in
+        Ok (id.pid_str, Names.fresh ctx.names id.pid_str, t))
+  in
+  let* () =
+    let preconditions =
+      Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires @ c.atomic_requires)
+    in
+    Result.all_unit
+      (List.map preconditions ~f:(fun t ->
+           match
+             List.find output_ghosts ~f:(fun (x, _, _) ->
+                 List.mem (term_names t) x ~equal:String.equal)
+           with
+           | Some (x, _, _) ->
+               error t.term_loc
+                 (Printf.sprintf "The ghost result %s is unavailable in a precondition" x)
+           | None -> Ok ()))
+  in
+  let env =
+    List.fold output_ghosts ~init:env ~f:(fun env (x, raven, t) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
   let env = pattern_definitions env f in
@@ -5258,6 +5650,11 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
       current_procedure = None;
       manual = false;
       access_proofs = [];
+      return_proofs = [];
+      procedure_signatures = [];
+      ghost_returns = [];
+      proof_state = None;
+      return_covered = false;
       initializations = [];
       linearizations = [];
       shared;
@@ -5716,10 +6113,10 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~access_proofs ~initializations ~linearizations ~lifted ~pasts ~past_returns
-    ~ghost_args ~libraries ~proof_lemmas ~proof_support ~predicate_bodies
-    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
-    (R.Callable.t, error) Result.t =
+    ~access_proofs ~return_proofs ~initializations ~linearizations ~lifted ~pasts
+    ~past_returns ~ghost_args ~procedure_signatures ~libraries ~proof_lemmas
+    ~proof_support ~predicate_bodies (functions : (string * string) list) origins
+    ~proc_name ~pure (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -5732,6 +6129,10 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       pasts;
       past_returns;
       ghost_args;
+      procedure_signatures;
+      ghost_returns = [];
+      proof_state = None;
+      return_covered = false;
       libraries;
       origins;
       annotations;
@@ -5746,6 +6147,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       current_procedure = Some proc_name;
       manual = f.manual;
       access_proofs;
+      return_proofs;
       initializations;
       linearizations;
       shared;
@@ -5775,6 +6177,16 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* result_name, arg_names = contract_names f header (List.length f.params) in
   let* formals = formals ~names:arg_names ctx f in
   let* bound = pattern_params ctx f formals in
+  List.iter
+    (List.zip_exn (List.zip_exn f.params arg_names) formals)
+    ~f:(fun ((parameter, source), (formal, _, _)) ->
+      match (parameter.Typedtree.fp_kind, source, formal) with
+      | ( Tparam_pat { pat_desc = Tpat_record _ | Tpat_tuple _; pat_type; _ },
+          Some source,
+          Some (_, raven) )
+        when not (List.Assoc.mem ctx.names.scope source ~equal:String.equal) ->
+          ctx.names.scope <- (source, (raven, Some pat_type)) :: ctx.names.scope
+      | _ -> ());
   ctx.formals <-
     List.map formals ~f:(fun (ocaml, _, _) ->
         match ocaml with
@@ -5788,6 +6200,21 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
   let* _, env, implicit, ghosts = contract_env ctx ~spec_funcs:funcs f formals ~result in
+  let* ghost_returns =
+    all (ghost_results f) ~f:(fun (id, _) ->
+        match
+          ( List.Assoc.find env.vars id.pid_str ~equal:String.equal,
+            List.Assoc.find env.var_types id.pid_str ~equal:String.equal )
+        with
+        | Some (Raven raven), Some t -> Ok (id.pid_str, raven, t)
+        | _ -> error id.pid_loc "Cannot resolve this ghost result")
+  in
+  ctx.ghost_returns <- ghost_returns;
+  let* ghost_return_vars =
+    all ghost_returns ~f:(fun (_, raven, t) ->
+        let* typ = typ ctx ~at:f.loc t in
+        Ok (R.Var.make ~loc:l ~ghost:true (ident ~loc:l raven) typ))
+  in
   let* ghost_formals =
     all ghosts ~f:(fun (_, raven, t) ->
         let* typ = typ ctx ~at:f.loc t in
@@ -5809,7 +6236,9 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
           | _ -> ()
           end
       | _ -> ());
-  (* Ghost statements and invariants in the code can use the implicit parameters. *)
+  (* Ghost statements and invariants in the code can use ghost parameters. *)
+  List.iter ghosts ~f:(fun (x, raven, t) ->
+      ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
   List.iter implicit ~f:(fun (x, raven, t, _) ->
       ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
   let implicit_decls = implicit in
@@ -5978,12 +6407,13 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       (Printf.sprintf "%s is trusted: its contract is assumed, not verified"
          (Ident.name f.id));
     Ok
-      (R.Callable.proc ~loc:l ~formals:all_formals ~returns:(returns @ past_returns)
+      (R.Callable.proc ~loc:l ~formals:all_formals
+         ~returns:(returns @ ghost_return_vars @ past_returns)
          ~requires ~ensures (ident ~loc:l proc_name) None)
   end
   else
     let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
-    let* stmts, v = expr ~tail:true ctx f.body in
+    let* stmts, v = expr ~tail:true ~keep_scope:true ctx f.body in
     let* finish = finish_arm ctx ~tail:true v in
     let stmts = stmts @ finish in
     let assignment =
@@ -6070,7 +6500,8 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     in
     let body = bind_au @ bound @ first @ stmts @ assignment @ establish @ last in
     Ok
-      (R.Callable.proc ~loc:l ~formals:all_formals ~returns:(returns @ past_returns)
+      (R.Callable.proc ~loc:l ~formals:all_formals
+         ~returns:(returns @ ghost_return_vars @ past_returns)
          ~requires ~ensures (ident ~loc:l proc_name) (Some body))
 
 (** The entry [element] of a fact that [f] ensures about an earlier state, given the
@@ -6650,13 +7081,20 @@ let atomic_steps (structure : Typedtree.structure) : int list =
   !found
 
 (** Resolves annotations to one source expression, including nested calls. *)
-let attached_annotations (source : Source.t) typed annotations ~kind ~is_target
-    ~description =
+let attached_annotations ?(all_expressions = false) ?(innermost = false)
+    (source : Source.t) typed annotations ~kind ~is_target ~description =
   let attached =
     List.filter_map annotations ~f:(fun a ->
         if Poly.equal (Annotation.kind a) kind then
           let rec anchor i =
-            if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1) else i
+            if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1)
+            else
+              match
+                List.find source.comments ~f:(fun (_, at) ->
+                    at.Location.loc_end.pos_cnum = i)
+              with
+              | Some (_, at) -> anchor at.loc_start.pos_cnum
+              | None -> i
           in
           Some (anchor a.loc.loc_start.pos_cnum, a)
         else None)
@@ -6664,10 +7102,14 @@ let attached_annotations (source : Source.t) typed annotations ~kind ~is_target
   let expressions = ref [] in
   let collect_expression iterator (e : Typedtree.expression) =
     let eligible = is_target e in
-    begin match e.exp_desc with
-    | Texp_apply _ | Texp_record _ -> expressions := (e, eligible) :: !expressions
-    | _ -> ()
-    end;
+    if all_expressions then
+      begin if eligible then expressions := (e, true) :: !expressions
+      end
+    else
+      begin match e.exp_desc with
+      | Texp_apply _ | Texp_record _ -> expressions := (e, eligible) :: !expressions
+      | _ -> ()
+      end;
     Tast_iterator.default_iterator.expr iterator e
   in
   let iterator = { Tast_iterator.default_iterator with expr = collect_expression } in
@@ -6691,7 +7133,7 @@ let attached_annotations (source : Source.t) typed annotations ~kind ~is_target
                 Int.compare a.exp_loc.loc_start.pos_cnum b.exp_loc.loc_start.pos_cnum
               with
               | 0 -> Int.compare b.exp_loc.loc_end.pos_cnum a.exp_loc.loc_end.pos_cnum
-              | order -> order)
+              | order -> if innermost then -order else order)
         with
         | None | Some (_, false) -> error annotation.loc description
         | Some (expression, true) ->
@@ -6724,16 +7166,23 @@ let initialization_annotations source typed annotations =
   attached_annotations source typed annotations ~kind:Annotation.Initializes ~is_target
     ~description:"This annotation must follow a fresh allocation"
 
-let access_annotations source typed annotations =
+let access_annotations source typed annotations ~functions =
   let is_target (e : Typedtree.expression) =
     match e.exp_desc with
-    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
         Option.exists (atomic_name path) ~f:(fun op ->
             not (String.is_prefix op ~prefix:"make"))
+        ||
+        match path with
+        | Pident id -> List.exists functions ~f:(fun f -> Ident.same f.id id)
+        | Pdot (Pident m, _) ->
+            List.exists source.Source.libraries ~f:(fun lib ->
+                Ident.same lib.library_id m)
+        | _ -> false)
     | _ -> false
   in
   attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
-    ~description:"Ghost.scope must follow an Atomic access"
+    ~description:"Ghost.scope must follow an Atomic access or a checked procedure call"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
@@ -7560,6 +8009,11 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     current_procedure = None;
     manual = false;
     access_proofs = [];
+    return_proofs = [];
+    procedure_signatures = [];
+    ghost_returns = [];
+    proof_state = None;
+    return_covered = false;
     initializations = [];
     linearizations = [];
     shared;
@@ -8276,7 +8730,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let typed = without_application_operators source.typed in
   let steps = atomic_steps typed in
   let* initializations = initialization_annotations source typed annotations in
-  let* access_proofs = access_annotations source typed annotations in
   let* () =
     match
       List.find linearizations ~f:(fun (anchor, _) ->
@@ -8292,9 +8745,84 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* types, funcs = items ~interface typed annotations in
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
   let funcs = inherit_contracts (funcs @ List.concat lifted) in
+  let* access_proofs = access_annotations source typed annotations ~functions:funcs in
+  let state_targets = ref [] in
+  let remember (e : Typedtree.expression) =
+    state_targets :=
+      (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) :: !state_targets
+  in
+  let rec lexical_tail (e : Typedtree.expression) =
+    remember e;
+    match e.exp_desc with
+    | Texp_let (_, _, body) | Texp_sequence (_, body) -> lexical_tail body
+    | Texp_ifthenelse (_, yes, no) ->
+        lexical_tail yes;
+        Option.iter no ~f:lexical_tail
+    | Texp_match (_, cases, _, _) ->
+        List.iter cases ~f:(fun c -> lexical_tail c.Typedtree.c_rhs)
+    | _ -> ()
+  in
+  let visit iterator (e : Typedtree.expression) =
+    begin match e.exp_desc with
+    | Texp_let (Nonrecursive, [ binding ], body) ->
+        remember binding.vb_expr;
+        lexical_tail body
+    | Texp_let (_, _, body) -> lexical_tail body
+    | Texp_sequence (left, right) ->
+        remember left;
+        lexical_tail right
+    | Texp_ifthenelse (_, yes, no) ->
+        lexical_tail yes;
+        Option.iter no ~f:lexical_tail
+    | Texp_match (_, cases, _, _) ->
+        List.iter cases ~f:(fun c -> lexical_tail c.Typedtree.c_rhs)
+    | Texp_while (_, body) | Texp_for (_, _, _, _, _, body) -> lexical_tail body
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.expr iterator e
+  in
+  let iterator = { Tast_iterator.default_iterator with expr = visit } in
+  List.iter funcs ~f:(fun f ->
+      lexical_tail f.body;
+      iterator.expr iterator f.body);
   let* () =
     Result.all_unit
-      (List.map access_proofs ~f:(fun ((start, finish), annotation) ->
+      (List.map access_proofs ~f:(fun (key, a) ->
+           let* scope = Annotation.scope a in
+           if
+             Option.is_some scope.scope_state
+             && not (List.mem !state_targets key ~equal:Poly.equal)
+           then
+             error a.loc
+               "A stateful scope needs a direct let binding, sequence continuation, or \
+                lexical tail"
+           else Ok ()))
+  in
+  let tails = ref [] in
+  let rec collect_tail (e : Typedtree.expression) =
+    tails := (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) :: !tails;
+    match e.exp_desc with
+    | Texp_let (_, _, body) | Texp_sequence (_, body) -> collect_tail body
+    | Texp_ifthenelse (_, yes, no) ->
+        collect_tail yes;
+        Option.iter no ~f:collect_tail
+    | Texp_match (_, cases, _, _) ->
+        List.iter cases ~f:(fun c -> collect_tail c.Typedtree.c_rhs)
+    | _ -> ()
+  in
+  List.iter funcs ~f:(fun f -> collect_tail f.body);
+  let* return_proofs =
+    attached_annotations ~all_expressions:true ~innermost:true source typed annotations
+      ~kind:Annotation.Returns
+      ~is_target:(fun e ->
+        List.mem !tails
+          (e.Typedtree.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
+          ~equal:Poly.equal)
+      ~description:"Ghost.returns must follow a normal tail expression"
+  in
+  let* () =
+    Result.all_unit
+      (List.map (access_proofs @ return_proofs) ~f:(fun ((start, finish), annotation) ->
            let owners =
              List.filter funcs ~f:(fun f ->
                  start >= f.body.exp_loc.loc_start.pos_cnum
@@ -8335,6 +8863,28 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let pure = pure_functions funcs in
   let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
   let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
+  let* procedure_signatures =
+    all funcs ~f:(fun f ->
+        let outputs = ghost_results f in
+        let* () =
+          match outputs with
+          | (id, _) :: _ when is_pure f ->
+              unsupported id.pid_loc "Ghost results of a pure function"
+          | (id, _) :: _ when not f.manual ->
+              unsupported id.pid_loc "Ghost results require a manual function proof"
+          | _ -> Ok ()
+        in
+        let declared xs =
+          all xs ~f:(fun (id, pty) ->
+              let* t = Source.ocaml_type source.env ~at:id.S.pid_loc pty in
+              Ok (id.pid_str, t))
+        in
+        let* procedure_inputs = declared (ghost_params f) in
+        let* procedure_outputs = declared outputs in
+        Ok
+          ( proc_name f,
+            { procedure_inputs; procedure_outputs; procedure_result = f.body.exp_type } ))
+  in
   let* atomic_operations =
     all source.proof_aus ~f:(fun (au : Source.proof_au) ->
         match
@@ -8344,8 +8894,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             error au.au_at "An AU facade must name a procedure in this implementation"
         | Some f when not (Option.exists f.contract ~f:(fun c -> c.atomic)) ->
             error au.au_at "An AU facade requires a logically atomic contract"
-        | Some f when not (List.is_empty (ghost_params f)) ->
-            unsupported au.au_at "An AU facade for a procedure with ghost parameters"
         | Some f -> Ok (au, f))
   in
   let token_types =
@@ -8524,9 +9072,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let* _, _, implicit, _ =
           contract_env ctx ~spec_funcs f formals ~result:"result"
         in
+        let signature =
+          List.Assoc.find_exn procedure_signatures (proc_name f) ~equal:String.equal
+        in
         let au_inputs =
           List.filter_map f.params ~f:(fun p ->
               match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
+          @ List.map signature.procedure_inputs ~f:snd
         in
         Ok
           {
@@ -8534,6 +9086,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             au_procedure = proc_name f;
             au_inputs;
             au_result = f.body.exp_type;
+            au_ghost_outputs = List.map signature.procedure_outputs ~f:snd;
             au_implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
           })
   in
@@ -9009,8 +9562,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~access_proofs ~initializations ~linearizations ~lifted ~pasts
-          ~past_returns ~ghost_args ~proof_lemmas ~proof_support ~predicate_bodies
+          ~annotations ~access_proofs ~return_proofs ~initializations ~linearizations
+          ~lifted ~pasts ~past_returns ~ghost_args ~procedure_signatures ~proof_lemmas
+          ~proof_support ~predicate_bodies
           ~libraries:
             (List.map source.libraries ~f:(fun (lib : Source.library) ->
                  (lib.library_id, lib.library_name)))

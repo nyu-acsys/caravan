@@ -34,7 +34,7 @@ All notable changes to this project will be documented in this file.
 - Trusted library interfaces support abstract types, values, predicates, and function contracts.
 - Functions marked `trusted` assume their contracts and emit a warning.
 - Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
-- Saturn's Treiber stack and Michael-Scott queue are included as case studies.
+- Saturn's Treiber stack and Michael-Scott queue are included as case studies, with a separate List/segment queue proof covering the full empty-check helping protocol.
 - `--emit-rav` prints the generated Raven program without verifying it.
 - `--smt-timeout` controls the solver timeout for each query.
 - `-I` adds directories to the library interface search path.

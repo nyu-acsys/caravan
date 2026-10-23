@@ -1,0 +1,3 @@
+module Read = Ghost.AU (struct let operation = read_known end)
+module Store = Ghost.AU (struct let operation = store_known end)
+module ReadState = Ghost.AU (struct let operation = read_via_state end)

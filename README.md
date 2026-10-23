@@ -133,7 +133,8 @@ mode. A `(*@ proof ... *)` block uses the same expression language as checked
 lemmas, including lexical bindings and fold/unfold witnesses. Block-local names
 do not escape into the runtime program.
 
-An access annotation attaches a proof closure to one `Atomic` operation:
+An access annotation attaches a proof closure to one `Atomic` operation or
+runtime call:
 
 ```ocaml
 let read (cell : int Atomic.t) = Atomic.get cell
@@ -149,11 +150,75 @@ let read (cell : int Atomic.t) = Atomic.get cell
 
 The operation and result names are freely chosen lexical bindings. Ghost values
 bound before the operation remain in scope afterward. The closure must contain
-one unconditional `let` binding of the supplied operation applied to `()`, and
+one unconditional `let` binding of the supplied operation applied to its ghost
+input bundle (`()` for an `Atomic` operation), and
 end with that binding's unchanged result. Preparation and restoration use
 checked ghost expressions. The operation cannot escape, be duplicated, or run
 conditionally. Nested accesses have their own annotations; original arguments
 are evaluated before their access proof in OCaml order.
+
+`Ghost.State.scope` carries a ghost value between access annotations in the
+same lexical sequence. Its first scope receives `()`; each later scope receives
+the previous scope's output, which may have a different type:
+
+```ocaml
+let first = Atomic.get cell
+  (*@ Ghost.State.scope (fun step () ->
+    let result = step () in
+    (result, result)) *)
+in
+Atomic.get cell
+(*@ Ghost.State.scope (fun step (known : int) ->
+  let result = step () in
+  assert (result = known);
+  (result, known)) *)
+```
+
+The pair returned by a state scope contains the unchanged runtime result and
+the next ghost value. State scopes attach to a direct right-hand side, the left
+side of a sequence, or a tail expression. The state binder may be `()`, a
+variable, a tuple, `_`, or a typed pattern. Branches, matches, loop bodies, and
+nested right-hand sides inherit the enclosing state; changes inside those
+regions do not escape. Thus branches may produce different ghost value types,
+and a loop does not carry ghost state between iterations. A loop invariant can
+refer to its inherited state with `invariant (fun saved -> proposition)`.
+Ordinary `Ghost.scope` annotations and unannotated expressions preserve the
+current ghost state.
+
+Calls with ghost parameters use an access scope around the runtime call. The
+scope's operation accepts one ghost input bundle: `()` for none, the value for
+one, or a tuple for several. The runtime callee and its ordinary arguments are
+evaluated once. A callee with ghost results supplies them through
+`Ghost.returns` on a normal tail expression:
+
+```ocaml
+let read_known (cell : int Atomic.t) = Atomic.get cell
+(*@ Ghost.scope (fun step ->
+  let result = step () in
+  result) *)
+(*@ Ghost.returns (fun result () -> result) *)
+(*@ manual *)
+(*@ result, [seen : int] = read_known [expected : int] cell
+    requires own cell expected
+    ensures own cell expected && result = seen && seen = expected *)
+
+let use_known cell = read_known cell
+(*@ Ghost.scope (fun invoke ->
+  let (result, seen) = invoke 7 in
+  result) *)
+(*@ manual *)
+(*@ result = use_known cell
+    requires own cell 7
+    ensures own cell 7 && result = 7 *)
+```
+
+The return adapter receives the runtime result and the current lexical state;
+its proof expression supplies the declared ghost results. Every runtime return
+path must provide one adapter when the contract declares ghost results. With no
+ghost results, invoking the call yields the ordinary runtime result. With one
+or more ghost results, it yields `(runtime_result, ghost_results)`, where
+multiple ghost results form a tuple. A stateful call scope can pass its current
+state as the ghost input and return a new state after the call.
 
 Manual and automatic proofs share runtime translation, primitive implementations,
 and ghost-expression lowering. Raven checks permissions, invariant closure,
@@ -174,7 +239,12 @@ implicit parameters, with inferred types. Multiple implicit parameters form a tu
 in name order. `Read.abort token cell` restores the
 precondition; `Read.commit token cell result` establishes the atomic postcondition.
 Each operation takes the procedure's concrete arguments in their declared order,
-including unit arguments. A unit result is passed as `()`.
+including unit arguments, followed by its declared ghost inputs. `commit` and
+`committed` then take the runtime result followed by each declared ghost result.
+For example, an operation with one ghost input and output uses
+`Read.access token cell expected` and
+`Read.commit token cell expected result seen`. A unit runtime result is still
+passed as `()`, separately from any unit-valued ghost result.
 
 For example, with `contents cell value` defined as `own cell value`:
 
@@ -200,14 +270,21 @@ corresponding AU resources in predicates and lemma contracts. Tokens can be stor
 in ordinary ghost fields and passed to checked lemmas, allowing a helper to open
 and commit a registered operation. Raven checks the resource and atomicity rules;
 Caravan preserves the procedure-specific token types before translation.
-AU facades currently name procedures in the same implementation without explicit
-ghost parameters. Ghost argument/result transport at runtime calls remains a
-subsequent extension.
+AU facades name procedures in the same implementation.
 
 Read-modify-write primitives use Raven's `atomic proc` declarations with ordinary
 contracts. Each call executes as one physical step, so an access scope can expose
 a segment with a checked lemma before a generic CAS and reassemble it afterward,
 without a separate abort-restoration proof at that primitive call.
+
+The [List/segment Michael–Scott queue](test/saturn/michael_scott_queue_lseg/)
+combines these features in a complete manual proof. Its FIFO contracts cover
+`create`, `push`, `pop_opt`, and `is_empty`, including the empty-check helping
+protocol; `swing_tail` and the recursive enqueue/tail helpers are also checked.
+The proof uses algebraic lists, heap segments, and monotone fact snapshots.
+It retains explicit witnesses and resource updates as a reference for future
+automation. The original sequence/history queue remains a separate case study in
+[test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
 
 ## Building
 
