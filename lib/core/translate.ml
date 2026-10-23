@@ -2333,7 +2333,7 @@ let rec proof_names (body : S.proof_expr) =
 
 (** The closure is a proof context around the original, unchanged runtime access. *)
 let access_proof ctx annotation ~result_type ~result statements =
-  let* operation, body = Annotation.access annotation in
+  let* operation, body = Annotation.scope annotation in
   let uses_operation body =
     List.mem (proof_names body) operation.pid_str ~equal:String.equal
   in
@@ -3474,8 +3474,7 @@ let linearize ?step ?value ?access_type ctx ~at
     | Some annotation, _, _ ->
         error annotation.loc "This operation does not support an access proof"
   else if Option.is_some annotation then
-    error (Option.value_exn annotation).loc
-      "Ghost.access requires a manual function proof"
+    error (Option.value_exn annotation).loc "Ghost.scope requires a manual function proof"
   else
     let l = loc at in
     (* The actions that the step may perform, once the invariants are open. *)
@@ -6619,8 +6618,8 @@ let access_annotations source typed annotations =
             not (String.is_prefix op ~prefix:"make"))
     | _ -> false
   in
-  attached_annotations source typed annotations ~kind:Annotation.Access ~is_target
-    ~description:"Ghost.access must follow an Atomic access"
+  attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
+    ~description:"Ghost.scope must follow an Atomic access"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
@@ -8194,8 +8193,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
            with
            | Some f when f.manual && not f.trusted -> Ok ()
            | Some f when f.trusted ->
-               error annotation.loc "Ghost.access cannot be used in a trusted function"
-           | _ -> error annotation.loc "Ghost.access requires a manual function proof"))
+               error annotation.loc "Ghost.scope cannot be used in a trusted function"
+           | _ -> error annotation.loc "Ghost.scope requires a manual function proof"))
   in
   (* The abstract types of the libraries. *)
   let* library_types =

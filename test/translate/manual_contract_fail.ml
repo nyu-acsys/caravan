@@ -1,5 +1,5 @@
 let false_claim (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun read ->
+(*@ Ghost.scope (fun read ->
     unfold zero cell;
     let result = read () in
     fold zero cell;

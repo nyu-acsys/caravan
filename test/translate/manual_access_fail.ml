@@ -1,5 +1,5 @@
 let unclosed (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun read ->
+(*@ Ghost.scope (fun read ->
     unfold zero cell;
     let result = read () in
     result)

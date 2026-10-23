@@ -1,5 +1,5 @@
 let wrong_restoration (cell : int Atomic.t) = Atomic.set cell 1
-(*@ Ghost.access (fun write ->
+(*@ Ghost.scope (fun write ->
     unfold zero cell;
     let result = write () in
     fold zero cell;

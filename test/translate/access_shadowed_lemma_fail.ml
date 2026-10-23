@@ -1,5 +1,5 @@
 let read (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun step ->
+(*@ Ghost.scope (fun step ->
     let helper = 0 in
     helper ();
     let result = step () in

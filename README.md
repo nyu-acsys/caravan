@@ -137,7 +137,7 @@ An access annotation attaches a proof closure to one `Atomic` operation:
 
 ```ocaml
 let read (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun step ->
+(*@ Ghost.scope (fun step ->
   let state = unfold live cell {value} in
   let observed = step () in
   fold live cell {value = state};

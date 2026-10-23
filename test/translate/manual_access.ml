@@ -11,7 +11,7 @@ let create () =
 (*@ result = create () ensures live result *)
 
 let read (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun step ->
+(*@ Ghost.scope (fun step ->
     let state = unfold live cell {value} in
     let observed = step () in
     fold live cell {value = state};
@@ -24,13 +24,13 @@ let nested (outer : int Atomic.t Atomic.t) (inner : int Atomic.t) =
   Atomic.get
     (Atomic.get
        outer
-       (*@ Ghost.access (fun load ->
+       (*@ Ghost.scope (fun load ->
         unfold indirect outer inner;
         let reference = load () in
         fold indirect outer inner;
         reference)
       *))
-(*@ Ghost.access (fun fetch ->
+(*@ Ghost.scope (fun fetch ->
       let value = unfold live inner {value} in
       let result = fetch () in
       fold live inner {value = value};
@@ -42,7 +42,7 @@ let nested (outer : int Atomic.t Atomic.t) (inner : int Atomic.t) =
     ensures indirect outer inner && live inner *)
 
 let store (cell : int Atomic.t) value = Atomic.set cell value
-(*@ Ghost.access (fun write ->
+(*@ Ghost.scope (fun write ->
     let previous = unfold live cell {value} in
     let stored = write () in
     fold live cell {value = value};
@@ -52,7 +52,7 @@ let store (cell : int Atomic.t) value = Atomic.set cell value
 (*@ store cell value requires live cell ensures live cell *)
 
 let exchange (cell : int Atomic.t) value = Atomic.exchange cell value
-(*@ Ghost.access (fun swap ->
+(*@ Ghost.scope (fun swap ->
     let previous = unfold live cell {value} in
     let original = swap () in
     assert (original = previous);
@@ -76,7 +76,7 @@ let create_chain () =
     ensures match result with (first, limit) -> chain first limit *)
 
 let read_chain (first : node Atomic.t) (limit : node Atomic.t) = Atomic.get first
-(*@ Ghost.access (fun inspect ->
+(*@ Ghost.scope (fun inspect ->
     let (value, tail) = unfold chain first limit {value; tail} in
     let next = expose_head first limit value tail in
     let observed = inspect () in
@@ -89,7 +89,7 @@ let read_chain (first : node Atomic.t) (limit : node Atomic.t) = Atomic.get firs
 (*@ result = read_chain first limit requires chain first limit ensures chain first limit *)
 
 let same_name (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun observed ->
+(*@ Ghost.scope (fun observed ->
   let observed = observed () in
   observed)
 *)
@@ -97,7 +97,7 @@ let same_name (cell : int Atomic.t) = Atomic.get cell
 (*@ result = same_name cell requires own cell 0 ensures own cell 0 && result = 0 *)
 
 let shadow_operation (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun step ->
+(*@ Ghost.scope (fun step ->
   let observed = step () in
   let step = 1 in
   assert (step = 1);

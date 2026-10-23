@@ -1,9 +1,9 @@
 Access proofs preserve the operation, its result, and its source attachment.
 
   $ caravan --shh access_changed_result_fail.ml
-  [Error] File "access_changed_result_fail.ml", line 2, columns 54-64:
-  2 | (*@ Ghost.access (fun read -> let result = read () in result + 1) *)
-                                                            ^^^^^^^^^^
+  [Error] File "access_changed_result_fail.ml", line 2, columns 53-63:
+  2 | (*@ Ghost.scope (fun read -> let result = read () in result + 1) *)
+                                                           ^^^^^^^^^^
   Type Error: An access proof must return the unchanged result of the attached operation.
   [1]
 
@@ -22,9 +22,9 @@ Access proofs preserve the operation, its result, and its source attachment.
   [1]
 
   $ caravan --shh access_missing_read_fail.ml
-  [Error] File "access_missing_read_fail.ml", line 2, columns 30-31:
-  2 | (*@ Ghost.access (fun read -> 0) *)
-                                    ^
+  [Error] File "access_missing_read_fail.ml", line 2, columns 29-30:
+  2 | (*@ Ghost.scope (fun read -> 0) *)
+                                   ^
   Type Error: An access proof needs one unconditional let binding of the attached operation.
   [1]
 
@@ -43,24 +43,24 @@ Access proofs preserve the operation, its result, and its source attachment.
   [1]
 
   $ caravan --shh access_nonatomic_call_fail.ml
-  [Error] File "access_nonatomic_call_fail.ml", line 3, columns 0-64:
-  3 | (*@ Ghost.access (fun read -> let result = read () in result) *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.access must follow an Atomic access.
+  [Error] File "access_nonatomic_call_fail.ml", line 3, columns 0-63:
+  3 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: Ghost.scope must follow an Atomic access.
   [1]
 
   $ caravan --shh access_existing_value_fail.ml
-  [Error] File "access_existing_value_fail.ml", line 4, columns 0-64:
-  4 | (*@ Ghost.access (fun read -> let result = read () in result) *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.access must follow an Atomic access.
+  [Error] File "access_existing_value_fail.ml", line 4, columns 0-63:
+  4 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: Ghost.scope must follow an Atomic access.
   [1]
 
   $ caravan --shh access_automatic_fail.ml
-  [Error] File "access_automatic_fail.ml", line 2, columns 0-64:
-  2 | (*@ Ghost.access (fun read -> let result = read () in result) *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.access requires a manual function proof.
+  [Error] File "access_automatic_fail.ml", line 2, columns 0-63:
+  2 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: Ghost.scope requires a manual function proof.
   [1]
 
   $ caravan --shh access_manual_commit_fail.ml
@@ -71,10 +71,10 @@ Access proofs preserve the operation, its result, and its source attachment.
   [1]
 
   $ caravan --shh access_manual_trusted_fail.ml
-  [Error] File "access_manual_trusted_fail.ml", line 2, columns 0-64:
-  2 | (*@ Ghost.access (fun read -> let result = read () in result) *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.access cannot be used in a trusted function.
+  [Error] File "access_manual_trusted_fail.ml", line 2, columns 0-63:
+  2 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: Ghost.scope cannot be used in a trusted function.
   [1]
 
   $ caravan --shh access_shadowed_lemma_fail.ml

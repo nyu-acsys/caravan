@@ -1,5 +1,5 @@
 let read (cell : int Atomic.t) = Atomic.get cell
-(*@ Ghost.access (fun read ->
+(*@ Ghost.scope (fun read ->
         let escaped = read in
         let result = read () in
         result) *)

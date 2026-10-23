@@ -32,7 +32,7 @@ type kind =
   | Loop
   | Predicate
   | Ghost
-  | Access
+  | Scope
   | Proof
   | Manual
   | Linearization
@@ -50,7 +50,7 @@ let kind (annotation : t) =
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
   | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
-  | "Ghost.access" :: _ -> Access
+  | "Ghost.scope" :: _ -> Scope
   | "proof" :: _ -> Proof
   | [ "manual" ] -> Manual
   | ("commit" | "returning" | "performs") :: _ -> Linearization
@@ -72,7 +72,7 @@ let predicate (annotation : t) = parse annotation Spec_parser.predicate
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
 let linearization (annotation : t) = parse annotation Spec_parser.linearization
 let initially (annotation : t) = parse annotation Spec_parser.initially
-let access (annotation : t) = parse annotation Spec_parser.access
+let scope (annotation : t) = parse annotation Spec_parser.scope
 
 let without_keyword (annotation : t) keyword =
   let stripped = String.lstrip annotation.text in
