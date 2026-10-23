@@ -1,0 +1,7 @@
+module Facts = SetRA (struct type t = int end)
+module Facts_auth = Auth (Facts)
+
+let facts : (node Atomic.t, Facts_auth.t) Ghost.field = Ghost.field ()
+
+lemma plain_resource (cell : node Atomic.t)
+  requires (own (Ghost.at facts cell) 0) = ()

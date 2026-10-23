@@ -1,0 +1,28 @@
+type fact = Published of node Atomic.t
+
+module Fact_set = SetRA (struct type t = fact end)
+module Fact_auth = Auth (Fact_set)
+
+let facts : (node Atomic.t, Fact_auth.t) Ghost.field = Ghost.field ()
+
+lemma invent_snapshot (cell : node Atomic.t) (known : fact set) (f : fact)
+  requires (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set known)))
+  requires (not (Set.mem f known))
+  ensures (own (Ghost.at facts cell)
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f)))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set known))
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f)))
+
+lemma forget_possible_snapshot (cell : node Atomic.t) (f : fact)
+  requires (own (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set (Set.singleton f))))
+  ensures (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set Set.empty))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set (Set.singleton f)))
+    (Fact_auth.auth (Fact_set.set Set.empty))
+
+lemma update_without_ownership (cell : node Atomic.t) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set Set.empty))
+    (Fact_auth.auth (Fact_set.set Set.empty))

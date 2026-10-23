@@ -49,6 +49,7 @@
         "begin", BEGIN;
         "commit", COMMIT;
         "fold", FOLD;
+        "fun", FUN;
         "in", IN;
         "initially", INITIALLY;
         "invariant", INVARIANT;
@@ -56,6 +57,7 @@
         "lemma", LEMMA;
         "match", MATCH;
         "mod", OP3 "mod";
+        "module", MODULE;
         "not", NOT;
         "of", OF;
         "old", OLD;
@@ -65,6 +67,7 @@
         "requires", REQUIRES;
         "returning", RETURNING;
         "returns", RETURNS;
+        "struct", STRUCT;
         "then", THEN;
         "type", TYPE;
         "true", TRUE;
@@ -184,6 +187,8 @@ let op_char_34   = op_char_3 | op_char_4
 let op_char_pref = ['!' '?']
 
 rule token = parse
+  | "Set.of_predicate"
+      { SET_OF_PREDICATE }
   | "[@" space* ([^ ' ' '\n' ']']+ (' '+ [^ ' ' '\n' ']']+)* as lbl) space* ']'
       { ATTRIBUTE lbl }
   | newline

@@ -151,4 +151,61 @@ let () =
       assert (List.length args = 3);
       assert (empty.pid_str = "Empty")
   | _ -> failwith "unexpected logical type or state declarations"
-  end
+  end;
+  begin match
+    parse_proof
+      {|type fact = Seen of int
+        module Facts = SetRA (struct type t = fact end)
+        module Authority = Auth (Facts)
+        let facts : (node Atomic.t, Authority.t) Ghost.field = Ghost.field ()
+        let facts_of (x : int) : fact set =
+          Set.of_predicate (fun (f : fact) -> f = Seen x)
+        lemma use (x : int) =
+          let known = Set.of_predicate (fun (f : fact) -> f = Seen x) in
+          assert Set.mem (Seen x) known|}
+  with
+  | [
+   Proof_type _;
+   Proof_resource { resource_name = facts; resource_kind = Resource_set _ };
+   Proof_resource { resource_name = authority; resource_kind = Resource_auth argument };
+   Proof_field { field_name; field_type = PTtyapp (_, [ _; _ ]) };
+   Proof_function fn;
+   Proof_lemma use;
+  ] ->
+      assert (facts.pid_str = "Facts");
+      assert (authority.pid_str = "Authority");
+      assert (argument.pid_str = "Facts");
+      assert (field_name.pid_str = "facts");
+      assert (fn.function_name.pid_str = "facts_of");
+      assert (List.length fn.function_params = 1);
+      begin match fn.function_body.term_desc with
+      | Tcomprehension ((f, _), _) -> assert (f.pid_str = "f")
+      | _ -> failwith "function comprehension was not parsed"
+      end;
+      begin match use.lemma_body.proof_desc with
+      | Proof_let
+          (_, { proof_desc = Proof_value { term_desc = Tcomprehension _; _ }; _ }, _) ->
+          ()
+      | _ -> failwith "proof comprehension was not parsed"
+      end
+  | _ -> failwith "unexpected resource declarations"
+  end;
+  let rejected source =
+    let lexbuf = Lexing.from_string source in
+    match Spec_parser.proof Spec_lexer.token lexbuf with
+    | _ -> failwith ("accepted malformed resource syntax: " ^ source)
+    | exception Spec_parser.Error -> ()
+    | exception Spec_ast.Syntax_error _ -> ()
+  in
+  List.iter rejected
+    [
+      "module Facts = Unknown (struct type t = int end)";
+      "module Facts = SetRA (struct type element = int end)";
+      "module Authority = Unknown (Facts)";
+      "let facts : (int, Authority.t) Ghost.field = Other.field ()";
+      "let facts : int = Ghost.field ()";
+      "let facts_of x : int set = Set.empty";
+      "let facts_of (x : int) = Set.empty";
+      "let facts_of (x : int) : int set = Set.of_predicate (fun f -> f = x)";
+      "lemma arbitrary_lambda = fun (x : int) -> x";
+    ]

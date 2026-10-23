@@ -176,6 +176,10 @@ let library_type ~library ~library_id ~at name =
     at;
   }
 
+(** A nominal proof resource, represented by the instantiated Raven module's type. *)
+let resource_type ~name ~module_id ~at =
+  { (library_type ~library:name ~library_id:module_id ~at "t") with module_name = name }
+
 (** A specification-only collection, declared as [id]. *)
 let collection id kind =
   let module_name =

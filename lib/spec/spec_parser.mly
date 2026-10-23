@@ -78,7 +78,7 @@
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS
-%token LEMMA RETURNS OF BEGIN END
+%token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE
 
 (* Keywords *)
 
@@ -160,6 +160,29 @@ proof:
 
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
+| MODULE n = uident EQUAL f = uident LEFTPAR STRUCT TYPE t = lident
+    EQUAL ty = typ END RIGHTPAR
+    { if f.pid_str <> "SetRA" then
+        raise (Syntax_error (f.pid_loc, "Unsupported resource functor: " ^ f.pid_str));
+      if t.pid_str <> "t" then
+        raise (Syntax_error (t.pid_loc, "A SetRA argument must define type t"));
+      Proof_resource { resource_name = n; resource_kind = Resource_set ty } }
+| MODULE n = uident EQUAL f = uident LEFTPAR a = uident RIGHTPAR
+    { if f.pid_str <> "Auth" then
+        raise (Syntax_error (f.pid_loc, "Unsupported resource functor: " ^ f.pid_str));
+      Proof_resource { resource_name = n; resource_kind = Resource_auth a } }
+| LET n = lident COLON ty = typ EQUAL init = lqualid LEFTPAR RIGHTPAR
+    { begin match ty, init with
+      | PTtyapp (Qdot (Qid m, field), [_; _]), Qdot (Qid im, make)
+        when m.pid_str = "Ghost" && field.pid_str = "field"
+          && im.pid_str = "Ghost" && make.pid_str = "field" -> ()
+      | _ -> raise (Syntax_error (n.pid_loc,
+          "A ghost field declaration requires (owner, resource) Ghost.field = Ghost.field ()"))
+      end;
+      Proof_field { field_name = n; field_type = ty } }
+| LET n = lident ps = pred_param+ COLON ty = typ EQUAL body = term
+    { Proof_function { function_name = n; function_params = ps;
+        function_result = ty; function_body = body } }
 | LEMMA n = lident ps = pred_param* rs = lemma_returns?
     cs = lemma_clause* EQUAL body = proof_expr
     { let requires, ensures, variant =
@@ -334,6 +357,7 @@ proof_postfix:
 ;
 
 proof_value_atom:
+| c = comprehension { proof_value c }
 | NOT { proof_term (Tvar (Qid (mk_pid "not" $loc))) $loc }
 | q = lqualid { proof_term (Tvar q) $loc }
 | q = uqualid %prec below_BAR { proof_term (Tvar q) $loc }
@@ -561,6 +585,7 @@ term_dot: t = mk_term(term_dot_) { t }
 ;
 
 term_arg_:
+| c = comprehension        { c.term_desc }
 | q = qualid                { Tvar q }
 | c = constant              { Tconst c }
 | TRUE                      { Ttrue }
@@ -573,6 +598,11 @@ term_dot_:
 | q = lqualid               { Tvar q }
 | o = oppref ; a = term_dot { mk_op_apply o [a] }
 | t = term_sub_             { t }
+;
+
+comprehension:
+| SET_OF_PREDICATE LEFTPAR FUN b = pred_param ARROW body = term RIGHTPAR
+    { mk_term (Tcomprehension (b, body)) $loc }
 ;
 
 term_block_:

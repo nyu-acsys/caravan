@@ -37,6 +37,7 @@ let rec term t =
       let q = match q with Tforall -> "forall" | Texists -> "exists" in
       let b (id, ty) = id.pid_str ^ match ty with Some _ -> ":ty" | None -> "" in
       "(" ^ q ^ " " ^ String.concat " " (List.map b bs) ^ ". " ^ term t ^ ")"
+  | Tcomprehension ((id, _), body) -> "(set " ^ id.pid_str ^ ":ty. " ^ term body ^ ")"
   | Tattr (a, t) -> "(attr " ^ a ^ " " ^ term t ^ ")"
   | Tlet (p, a, b) -> "(let " ^ pat p ^ " " ^ term a ^ " " ^ term b ^ ")"
   | Tmatch (t, cases) ->

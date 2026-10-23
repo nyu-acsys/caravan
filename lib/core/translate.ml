@@ -374,6 +374,14 @@ type lemma_signature = {
   lemma_outputs : Types.type_expr list;
 }
 
+type proof_support = {
+  resources : Source.proof_resource list;
+  ghost_fields : Source.proof_field list;
+  logical_functions : (string * lemma_signature) list;
+}
+
+let empty_proof_support = { resources = []; ghost_fields = []; logical_functions = [] }
+
 type context = {
   types : Datatypes.t list;
   refs : (string * R.Member.t) list ref;
@@ -411,6 +419,7 @@ type context = {
   origins : origin list ref;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   proof_lemmas : (string * lemma_signature) list;
+  proof_support : proof_support;
   predicate_bodies : (string * S.term) list;
       (** Explicit predicate bodies, for the types of named unfold witnesses. *)
   spec_funcs : (string * string) list;
@@ -655,6 +664,7 @@ type env = {
       (** The functions contracts can call, by their OCaml names, with their Raven ones.
       *)
   vars : (string * bound) list;
+  logical_definition : bool;
 }
 
 let bind env x b = { env with vars = (x, b) :: env.vars }
@@ -707,6 +717,54 @@ let collection_builtin env (q : S.qualid) =
       Some (m.pid_str, f.pid_str)
   | _ -> None
 
+let resource_operation env = function
+  | S.Qdot (Qid m, f) ->
+      Option.bind
+        (List.find env.ctx.proof_support.resources ~f:(fun r ->
+             String.equal r.Source.resource_name m.pid_str))
+        ~f:(fun resource ->
+          List.find_map resource.resource_operations ~f:(fun (op, inputs, result) ->
+              Option.some_if (String.equal op f.pid_str)
+                {
+                  lemma_raven = m.pid_str ^ "." ^ op;
+                  lemma_inputs = inputs;
+                  lemma_outputs = [ result ];
+                }))
+  | _ -> None
+
+let logical_signature env q =
+  match q with
+  | S.Qid id when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
+  | _ ->
+      begin match resource_operation env q with
+      | Some _ as signature -> signature
+      | None ->
+          List.Assoc.find env.ctx.proof_support.logical_functions (qualid_key q)
+            ~equal:String.equal
+      end
+
+let ghost_projection env t =
+  match spine t [] with
+  | ( { S.term_desc = Tvar (Qdot (Qid m, op)); _ },
+      [ { term_desc = Tvar (Qid field); _ }; owner ] )
+    when String.equal m.pid_str "Ghost" && String.equal op.pid_str "at" ->
+      Option.bind
+        (List.find env.ctx.proof_support.ghost_fields ~f:(fun f ->
+             String.equal f.Source.field_name field.pid_str))
+        ~f:(fun descriptor ->
+          Option.some_if
+            (not (List.Assoc.mem env.vars field.pid_str ~equal:String.equal))
+            (descriptor, owner))
+  | _ -> None
+
+let ghost_field_name (field : Source.proof_field) = "proof$" ^ field.field_name
+
+let is_ghost_fpu t =
+  match spine t [] with
+  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, _ ->
+      String.equal m.pid_str "Ghost" && String.equal op.pid_str "fpu"
+  | _ -> false
+
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
 *)
 let owned_location (t : S.term) =
@@ -756,6 +814,7 @@ let rec term_names (t : S.term) : string list =
   | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
   | Tquant (_, binders, body) ->
       without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
+  | Tcomprehension ((id, _), body) -> without [ id.pid_str ] (term_names body)
   | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
   | Tmatch (t, cases) ->
       term_names t
@@ -771,7 +830,13 @@ let name_loc (terms : S.term list) x ~default =
     | Tvar (Qid id) when String.equal id.pid_str x -> Some id.pid_loc
     | Tapply (a, b) | Tinfix (a, _, b) -> Option.first_some (find a) (find b)
     | Tif (a, b, c) -> List.find_map [ a; b; c ] ~f:find
-    | Tquant (_, _, t) | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> find t
+    | Tquant (_, _, t)
+    | Tcomprehension (_, t)
+    | Tattr (_, t)
+    | Tcast (t, _)
+    | Told t
+    | Tfield (t, _) ->
+        find t
     | Tlet (_, a, b) -> Option.first_some (find a) (find b)
     | Tmatch (t, cases) ->
         Option.first_some (find t) (List.find_map cases ~f:(fun (_, b) -> find b))
@@ -793,6 +858,8 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
   let known x =
     List.Assoc.mem env.vars x ~equal:String.equal
     || List.Assoc.mem env.funcs x ~equal:String.equal
+    || List.exists env.ctx.proof_support.ghost_fields ~f:(fun f ->
+        String.equal f.Source.field_name x)
     || List.mem
          [ "own"; "not"; "max_int"; "min_int"; "mod"; "length"; "last"; "drop"; "take" ]
          x ~equal:String.equal
@@ -884,6 +951,8 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       end
   | Tvar q when Option.is_some (collection_builtin env q) ->
       collection_application env ~at (Option.value_exn (collection_builtin env q)) []
+  | Tvar q when Option.is_some (resource_operation env q) ->
+      logical_application env ~at (Option.value_exn (resource_operation env q)) []
   | Tvar (Qdot _) -> unsupported at "A qualified name"
   | Tinfix _ -> formula env (S.chain t)
   | Tapply _ -> application env t
@@ -901,17 +970,21 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
                 let* t = Source.ocaml_type env.ctx.env ~at:id.pid_loc ty in
                 let* ty = typ env.ctx ~at:id.pid_loc t in
                 let l = loc id.pid_loc in
-                Ok (id.pid_str, t, R.Var.make ~loc:l (ident ~loc:l id.pid_str) ty))
+                let raven =
+                  if env.logical_definition then Names.fresh env.ctx.names id.pid_str
+                  else id.pid_str
+                in
+                Ok (id.pid_str, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty))
       in
       let env =
-        List.fold bound ~init:env ~f:(fun env (x, t, _) ->
-            { (bind env x (Raven x)) with var_types = (x, t) :: env.var_types })
+        List.fold bound ~init:env ~f:(fun env (x, raven, t, _) ->
+            { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
       in
       let* body = formula env body in
-      let vars = List.map bound ~f:(fun (_, _, v) -> v) in
+      let vars = List.map bound ~f:(fun (_, _, _, v) -> v) in
       (* A variable of type [int] ranges over its values. *)
       let ranges =
-        List.filter_map bound ~f:(fun (x, t, _) ->
+        List.filter_map bound ~f:(fun (_, x, t, _) ->
             Option.map (range_spec ~loc:l t x) ~f:(fun _ ->
                 R.Expr.call ~loc:l
                   (R.Name.make ~loc:l Prelude.in_range)
@@ -924,6 +997,30 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
         | Tforall, Some g -> R.Expr.forall ~loc:l vars (R.Expr.binary ~loc:l Impl g body)
         | Texists, None -> R.Expr.exists ~loc:l vars body
         | Texists, Some g -> R.Expr.exists ~loc:l vars (R.Expr.binary ~loc:l And g body))
+  | Tcomprehension ((id, ty), body) ->
+      let* ty = Source.ocaml_type env.ctx.env ~at:id.pid_loc ty in
+      let* raven_type = typ env.ctx ~at:id.pid_loc ty in
+      let raven = Names.fresh env.ctx.names id.pid_str in
+      let env =
+        {
+          (bind env id.pid_str (Raven raven)) with
+          var_types = (id.pid_str, ty) :: env.var_types;
+          logical_definition = true;
+        }
+      in
+      let* body = formula env body in
+      let body =
+        match range_spec ~loc:l ty raven with
+        | None -> body
+        | Some _ ->
+            R.Expr.binary ~loc:l And
+              (R.Expr.call ~loc:l
+                 (name ~loc:l Prelude.in_range)
+                 [ R.Expr.var ~loc:l (name ~loc:l raven) ])
+              body
+      in
+      Ok
+        (R.Expr.set_compr ~loc:l (R.Var.make ~loc:l (ident ~loc:l raven) raven_type) body)
   | Ttuple ts ->
       let* ts = all ts ~f:(formula env) in
       Ok (R.Expr.tuple ~loc:l ts)
@@ -970,6 +1067,21 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
           Ok (R.Expr.field ~loc:l r (name ~loc:l label))
       end
   | Tfield (_, Qdot _) -> unsupported at "A qualified field"
+  | Tlet (pattern, value, body) when env.logical_definition ->
+      let* translated = formula env value in
+      let* condition, bindings = spec_pattern env pattern translated in
+      let* () =
+        match condition with
+        | None -> Ok ()
+        | Some _ -> error pattern.pat_loc "A logical let needs an irrefutable pattern"
+      in
+      let types =
+        Option.value_map (term_type env value) ~default:[] ~f:(pattern_types env pattern)
+      in
+      let env = { env with var_types = types @ env.var_types } in
+      formula
+        (List.fold bindings ~init:env ~f:(fun env (id, v) -> bind env id (Value v)))
+        body
   | Tlet _ | Told _ -> unsupported at "This formula"
 
 (** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
@@ -1012,16 +1124,41 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
     concatenation. *)
 and term_type env (t : S.term) =
   match (t.term_desc, spine t []) with
+  | Tcast (_, ty), _ -> Result.ok (Source.ocaml_type env.ctx.env ~at:t.term_loc ty)
+  | Tconst (Pconst_integer _), _ -> Some Predef.type_int
+  | (Ttrue | Tfalse), _ -> Some Predef.type_bool
+  | Tcomprehension ((_, ty), _), _ ->
+      Result.ok
+        (Source.ocaml_type env.ctx.env ~at:t.term_loc
+           (S.PTtyapp (Qid (S.mk_id ~loc:t.term_loc "set"), [ ty ])))
+  | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
+      List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
   | Tvar (Qid { pid_str = x; _ }), _ ->
       List.Assoc.find env.var_types x ~equal:String.equal
   | _, ({ term_desc = Tvar (Qid { pid_str = "drop" | "take"; _ }); _ }, [ _; s ]) ->
       term_type env s
   | _, ({ term_desc = Tvar (Qid { pid_str = "++"; _ }); _ }, [ a; b ]) ->
       Option.first_some (term_type env a) (term_type env b)
-  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = f; _ }), _
-    ->
-      Option.bind (state_fields env x) ~f:(fun fields ->
-          Option.map (List.Assoc.find fields f ~equal:String.equal) ~f:snd)
+  | Tfield (base, Qid { pid_str = f; _ }), _ ->
+      let state =
+        match base.term_desc with
+        | Tvar (Qid id) ->
+            Option.bind (state_fields env id.pid_str) ~f:(fun fields ->
+                Option.map (List.Assoc.find fields f ~equal:String.equal) ~f:snd)
+        | _ -> None
+      in
+      Option.first_some state
+        (Option.bind (term_type env base) ~f:(fun ty ->
+             match Datatypes.desc env.data ty with
+             | Tconstr (p, [], _) ->
+                 Option.bind (Datatypes.find env.data p) ~f:(fun d ->
+                     match d.ctors with
+                     | [ c ] ->
+                         List.Assoc.find
+                           (List.zip_exn c.fields c.args)
+                           f ~equal:String.equal
+                     | _ -> None)
+             | _ -> None))
   | _, ({ term_desc = Tvar (Qid { pid_str = "([])" | "last"; _ }); _ }, s :: _) ->
       (* An entry of a sequence. *)
       begin match Option.map (term_type env s) ~f:(Datatypes.desc env.data) with
@@ -1032,15 +1169,19 @@ and term_type env (t : S.term) =
 
 (** The OCaml type of the values that the location [t] holds, where it is known. *)
 and location_type env (t : S.term) =
-  match t.term_desc with
-  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
-    ->
-      Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
-          field_type env.ctx ty label)
-  | Tvar (Qid { pid_str = x; _ }) ->
-      Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
-          field_type env.ctx ty "")
-  | _ -> None
+  match ghost_projection env t with
+  | Some (field, _) -> Some field.field_value
+  | None -> (
+      match t.term_desc with
+      | Tfield
+          ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
+        ->
+          Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
+              field_type env.ctx ty label)
+      | Tvar (Qid { pid_str = x; _ }) ->
+          Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
+              field_type env.ctx ty "")
+      | _ -> None)
 
 (** The application [t] of an operator or a constructor. *)
 and application env (t : S.term) =
@@ -1048,6 +1189,10 @@ and application env (t : S.term) =
   let l = loc at in
   let head, args = spine t [] in
   match (head.term_desc, args) with
+  | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+      error head.term_loc "A local proof value cannot be called as a logical function"
+  | Tvar q, args when Option.is_some (logical_signature env q) ->
+      logical_application env ~at (Option.value_exn (logical_signature env q)) args
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
       collection_application env ~at (Option.value_exn (collection_builtin env q)) args
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
@@ -1137,6 +1282,36 @@ and application env (t : S.term) =
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args)
   | _ -> unsupported at "A call of a function in a contract"
 
+and logical_application env ~at signature args =
+  let l = loc at in
+  if List.length args <> List.length signature.lemma_inputs then
+    error at
+      (Printf.sprintf "%s expects %d arguments" signature.lemma_raven
+         (List.length signature.lemma_inputs))
+  else
+    let* args =
+      all (List.zip_exn signature.lemma_inputs args) ~f:(fun (ty, value) ->
+          let* () =
+            Source.check_logical_expression env.ctx.env
+              ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
+              value
+          in
+          let* () =
+            match term_type env value with
+            | Some actual when not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
+                error value.term_loc
+                  (Stdlib.Format.asprintf "Expected logical type %a but found %a"
+                     Printtyp.type_expr ty Printtyp.type_expr actual)
+            | _ -> Ok ()
+          in
+          let* value = expected_formula env (Some ty) value in
+          let* raven_type = typ env.ctx ~at ty in
+          Ok (R.Expr.annotated value raven_type))
+    in
+    let n = qualified_name ~loc:l signature.lemma_raven in
+    if String.is_suffix signature.lemma_raven ~suffix:".id" then Ok (R.Expr.var ~loc:l n)
+    else Ok (R.Expr.call ~loc:l n args)
+
 (** The OCaml types of the names that the pattern [p] binds, matching a value of type [t].
 *)
 and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_expr) list
@@ -1198,53 +1373,73 @@ and quantified env (t : S.term) =
 and location_of env (t : S.term) =
   let at = t.term_loc in
   let l = loc at in
-  match t.term_desc with
-  | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
-    -> begin
-      let* r = formula env { t with term_desc = Tvar (Qid (S.mk_id ~loc:at x)) } in
-      match List.Assoc.find env.var_types x ~equal:String.equal with
-      | None -> error at (Printf.sprintf "The type of %s is not known here" x)
-      | Some typ -> begin
-          let* field = field_of_type env.ctx ~at typ label in
-          match (field, atomic_in_record env.ctx typ label) with
-          | Some field, _ -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
-          | None, Some atomic -> begin
-              (* An atomic that an immutable record holds. *)
-              let atomic_ref = R.Expr.field ~loc:l r (name ~loc:l label) in
-              let* field = field_of_type env.ctx ~at atomic "" in
-              match field with
-              | Some field -> Ok (R.Expr.field ~loc:l atomic_ref (name ~loc:l field))
-              | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
+  match ghost_projection env t with
+  | Some (field, owner) ->
+      let* () =
+        match term_type env owner with
+        | None -> Ok ()
+        | Some actual
+          when Ctype.is_equal env.ctx.env false [ field.field_owner ] [ actual ] ->
+            Ok ()
+        | Some _ -> error owner.term_loc "This ghost field has a different owner type"
+      in
+      let* () =
+        Source.check_logical_expression env.ctx.env ~functions:(List.map env.funcs ~f:fst)
+          ~variables:env.var_types ~expected:field.field_owner owner
+      in
+      let* owner = formula env owner in
+      Ok (R.Expr.field ~loc:l owner (name ~loc:l (ghost_field_name field)))
+  | None -> (
+      match t.term_desc with
+      | Tfield
+          ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
+        -> begin
+          let* r = formula env { t with term_desc = Tvar (Qid (S.mk_id ~loc:at x)) } in
+          match List.Assoc.find env.var_types x ~equal:String.equal with
+          | None -> error at (Printf.sprintf "The type of %s is not known here" x)
+          | Some typ -> begin
+              let* field = field_of_type env.ctx ~at typ label in
+              match (field, atomic_in_record env.ctx typ label) with
+              | Some field, _ -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+              | None, Some atomic -> begin
+                  (* An atomic that an immutable record holds. *)
+                  let atomic_ref = R.Expr.field ~loc:l r (name ~loc:l label) in
+                  let* field = field_of_type env.ctx ~at atomic "" in
+                  match field with
+                  | Some field -> Ok (R.Expr.field ~loc:l atomic_ref (name ~loc:l field))
+                  | None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
+                end
+              | None, None ->
+                  error at (Printf.sprintf "%s has no mutable field %s" x label)
             end
-          | None, None -> error at (Printf.sprintf "%s has no mutable field %s" x label)
         end
-    end
-  | Tvar (Qid { pid_str = x; _ }) -> begin
-      let* r = formula env t in
-      let* field =
-        match List.Assoc.find env.var_types x ~equal:String.equal with
-        | None -> error at (Printf.sprintf "The type of %s is not known here" x)
-        | Some typ -> field_of_type env.ctx ~at typ ""
-      in
-      match field with
-      | Some field -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
-      | None ->
-          error at (Printf.sprintf "%s is not an atomic, as owned without a field" x)
-    end
-  | _ -> begin
-      (* An atomic given by an expression, as [last s.cells]. *)
-      let* field =
-        match term_type env t with
-        | Some typ -> field_of_type env.ctx ~at typ ""
-        | None -> Ok None
-      in
-      match field with
-      | Some field ->
+      | Tvar (Qid { pid_str = x; _ }) -> begin
           let* r = formula env t in
-          Ok (R.Expr.field ~loc:l r (name ~loc:l field))
-      | None ->
-          unsupported at "This location, other than a field of a variable or an atomic,"
-    end
+          let* field =
+            match List.Assoc.find env.var_types x ~equal:String.equal with
+            | None -> error at (Printf.sprintf "The type of %s is not known here" x)
+            | Some typ -> field_of_type env.ctx ~at typ ""
+          in
+          match field with
+          | Some field -> Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+          | None ->
+              error at (Printf.sprintf "%s is not an atomic, as owned without a field" x)
+        end
+      | _ -> begin
+          (* An atomic given by an expression, as [last s.cells]. *)
+          let* field =
+            match term_type env t with
+            | Some typ -> field_of_type env.ctx ~at typ ""
+            | None -> Ok None
+          in
+          match field with
+          | Some field ->
+              let* r = formula env t in
+              Ok (R.Expr.field ~loc:l r (name ~loc:l field))
+          | None ->
+              unsupported at
+                "This location, other than a field of a variable or an atomic,"
+        end)
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)
 and constructor env (t : S.term) args =
@@ -1356,17 +1551,31 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
             let* body = quantified (typed env p) body in
             Ok (R.Expr.Default, body)
         | `Ctor ((c : Datatypes.ctor), args), (p, body) ->
-            let var = function
-              | None -> ident ~loc:l "_"
-              | Some (id : S.id) -> ident ~loc:(loc id.pid_loc) id.pid_str
-            in
-            let env =
-              List.fold args ~init:env ~f:(fun env -> function
-                | None -> env
-                | Some (id : S.id) -> bind env id.pid_str (Raven id.pid_str))
-            in
-            let* body = quantified (typed env p) body in
-            Ok (R.Expr.Case (ident ~loc:l c.raven, List.map args ~f:var), body)
+            if env.logical_definition then begin
+              let* _, bindings = spec_pattern env p v in
+              let env =
+                List.fold bindings ~init:env ~f:(fun env (x, value) ->
+                    bind env x (Value value))
+              in
+              let* body = quantified (typed env p) body in
+              Ok
+                ( R.Expr.Case
+                    (ident ~loc:l c.raven, List.map args ~f:(fun _ -> ident ~loc:l "_")),
+                  body )
+            end
+            else begin
+              let var = function
+                | None -> ident ~loc:l "_"
+                | Some (id : S.id) -> ident ~loc:(loc id.pid_loc) id.pid_str
+              in
+              let env =
+                List.fold args ~init:env ~f:(fun env -> function
+                  | None -> env
+                  | Some (id : S.id) -> bind env id.pid_str (Raven id.pid_str))
+              in
+              let* body = quantified (typed env p) body in
+              Ok (R.Expr.Case (ident ~loc:l c.raven, List.map args ~f:var), body)
+            end
       in
       let* cases = all flat ~f:case in
       Ok (R.Expr.match_ ~loc:l v cases)
@@ -1407,6 +1616,7 @@ let scope_env ctx =
     ctx;
     var_types =
       List.filter_map scope ~f:(fun (x, (_, t)) -> Option.map t ~f:(fun t -> (x, t)));
+    logical_definition = false;
     data = ctx.types;
     funcs = ctx.spec_funcs;
     vars = List.map scope ~f:(fun (x, (raven, _)) -> (x, Raven raven));
@@ -1489,6 +1699,35 @@ let proof_signature env (t : S.term) =
   | Tvar (Qid id) when not (List.Assoc.mem env.vars id.pid_str ~equal:String.equal) ->
       List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal
   | _ -> None
+
+let ghost_fpu env t =
+  let _, args = spine t [] in
+  match args with
+  | [ location; before; after ] ->
+      begin match ghost_projection env location with
+      | None -> error location.term_loc "Ghost.fpu needs a declared ghost field location"
+      | Some (field, _) ->
+          let* location = location_of env location in
+          let value t =
+            let* () =
+              match term_type env t with
+              | Some actual
+                when not
+                       (Ctype.is_equal env.ctx.env false [ field.field_value ] [ actual ])
+                ->
+                  error t.S.term_loc "This update uses a different resource type"
+              | _ -> Ok ()
+            in
+            expected_formula env (Some field.field_value) t
+          in
+          let* before = value before in
+          let* after = value after in
+          let l = loc t.S.term_loc in
+          Ok
+            (R.Stmt.call ~loc:l
+               (R.Expr.call ~loc:l (name ~loc:l "fpu") [ location; before; after ]))
+      end
+  | _ -> error t.term_loc "Ghost.fpu expects a location and two resources"
 
 (** Type information for lexical bindings; annotations resolve logical operations whose
     OCaml result type is not available. Raven checks every generated assignment. *)
@@ -1590,6 +1829,7 @@ let rec predicate_existentials (t : S.term) =
   | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
   | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
   | Tquant (Tforall, _, body)
+  | Tcomprehension (_, body)
   | Tattr (_, body)
   | Tcast (body, _)
   | Told body
@@ -1641,6 +1881,7 @@ let unfold_result_types env (t : S.term) witnesses =
 
 let rec proof_result_types env (body : S.proof_expr) =
   match body.proof_desc with
+  | Proof_value t when is_ghost_fpu t -> Ok (Some [])
   | Proof_value t ->
       let* ts = proof_value_types env t in
       Ok (Some ts)
@@ -1692,6 +1933,9 @@ let rec proof_expression env targets (body : S.proof_expr) =
     | _ -> error body.proof_loc "This proof expression returns unit"
   in
   match body.proof_desc with
+  | Proof_value t when is_ghost_fpu t ->
+      let* statement = ghost_fpu env t in
+      unit_statement statement
   | Proof_value t ->
       begin match proof_signature env t with
       | Some _ ->
@@ -4460,6 +4704,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
     {
       ctx;
       var_types = types;
+      logical_definition = false;
       data = ctx.types;
       funcs = spec_funcs;
       vars = List.map named ~f:(fun (x, r, _) -> (x, Raven r));
@@ -4551,8 +4796,8 @@ and implicit_vars env (f : func) =
     do not call [f] itself: these are proven for the function's value, by induction, which
     a precondition bounding the function's own value, as for the code to not overflow,
     would make circular. *)
-let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs origins
-    (f : func) : (R.Callable.t, error) Result.t =
+let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
+    ~proof_support origins (f : func) : (R.Callable.t, error) Result.t =
   let ctx =
     {
       types;
@@ -4567,6 +4812,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs or
       annotations = [];
       spec_funcs;
       proof_lemmas = [];
+      proof_support;
       predicate_bodies = [];
       env = ocaml_env;
       preds;
@@ -5030,8 +5276,8 @@ let establish_invariant ctx ~(f : func) ~at inv args =
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries ~proof_lemmas
-    (functions : (string * string) list) origins ~proc_name ~pure (f : func) :
-    (R.Callable.t, error) Result.t =
+    ~proof_support (functions : (string * string) list) origins ~proc_name ~pure
+    (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -5049,6 +5295,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       annotations;
       spec_funcs = funcs;
       proof_lemmas;
+      proof_support;
       predicate_bodies = [];
       env = ocaml_env;
       preds;
@@ -6268,6 +6515,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
     {
       ctx;
       var_types = List.map params ~f:(fun (x, t, _) -> (x, t));
+      logical_definition = false;
       data = ctx.types;
       funcs = ctx.spec_funcs;
       vars = List.map params ~f:(fun (x, _, _) -> (x, Raven x));
@@ -6489,6 +6737,7 @@ let pred_params ctx ~at (p : S.predicate) param_types =
     {
       ctx;
       var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
+      logical_definition = false;
       data = ctx.types;
       funcs = ctx.spec_funcs;
       vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
@@ -6558,6 +6807,7 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result
         {
           ctx;
           var_types = List.map named ~f:(fun (n, _, t) -> (n, t));
+          logical_definition = false;
           data = ctx.types;
           funcs = ctx.spec_funcs;
           vars = List.map named ~f:(fun (n, raven, _) -> (n, Raven raven));
@@ -6737,7 +6987,8 @@ let action_checks ctx (st : structure) =
     |> Result.map ~f:List.concat
 
 (** The context translating the specifications of declarations, outside functions. *)
-let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins =
+let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+    ?(proof_support = empty_proof_support) origins =
   {
     types;
     refs;
@@ -6751,6 +7002,7 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs o
     annotations = [];
     spec_funcs;
     proof_lemmas = [];
+    proof_support;
     predicate_bodies = [];
     env = ocaml_env;
     preds;
@@ -6818,7 +7070,7 @@ let check_lemma_recursion declarations =
 
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ~proof_lemmas ~predicate_bodies origins declaration =
+    ~proof_lemmas ~proof_support ~predicate_bodies origins declaration =
   match declaration with
   | S.Proof_lemma
       {
@@ -6836,6 +7088,7 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
              origins)
           with
           proof_lemmas;
+          proof_support;
           predicate_bodies;
         }
       in
@@ -6875,6 +7128,7 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       let env =
         {
           ctx;
+          logical_definition = false;
           data = types;
           funcs = spec_funcs;
           var_types = List.map parameters ~f:(fun (x, _, ty, _) -> (x, ty));
@@ -6913,11 +7167,12 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]; [views] are the views of the program, for an
     invariant to hold its half of each. *)
-let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins ~at
-    ~views ~structures (p : S.predicate) (def : definition) param_types :
+let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
+    origins ~at ~views ~structures (p : S.predicate) (def : definition) param_types :
     (R.Callable.t, error) Result.t =
   let ctx =
-    spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
+    spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+      ~proof_support origins
   in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
@@ -7249,7 +7504,9 @@ let predicates (source : Source.t) =
     all source.proof ~f:(function
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
-      | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _ -> Ok None
+      | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _ | Proof_resource _
+      | Proof_field _ | Proof_function _ ->
+          Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
           let* fields =
@@ -7372,7 +7629,80 @@ let predicates (source : Source.t) =
   let* () = Result.all_unit (List.map defined ~f:definition) in
   Ok defined
 
-(** The Raven program of [source]. *)
+(** Logical definitions cannot depend on spatial resources. *)
+let rec pure_logical_body preds (t : S.term) =
+  let visit = pure_logical_body preds in
+  match t.term_desc with
+  | Tvar q
+    when String.equal (qualid_key q) "own"
+         || List.Assoc.mem preds (qualid_key q) ~equal:String.equal ->
+      error t.term_loc "A pure logical function cannot use ownership or predicates"
+  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
+      let* () = visit a in
+      visit b
+  | Tif (a, b, c) ->
+      let* () = visit a in
+      let* () = visit b in
+      visit c
+  | Tmatch (value, cases) ->
+      let* () = visit value in
+      Result.all_unit (List.map cases ~f:(fun (_, body) -> visit body))
+  | Tquant (_, _, body)
+  | Tcomprehension (_, body)
+  | Tfield (body, _)
+  | Tattr (_, body)
+  | Tcast (body, _)
+  | Told body ->
+      visit body
+  | Ttuple ts -> Result.all_unit (List.map ts ~f:visit)
+  | Ttrue | Tfalse | Tconst _ | Tvar _ -> Ok ()
+
+(** Nonrecursive logical definitions are checked with the rest of the proof. *)
+let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+    ~proof_support origins declaration =
+  match declaration with
+  | S.Proof_function { function_name; function_params; function_result; function_body } ->
+      let l = loc function_name.pid_loc in
+      let ctx =
+        spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+          ~proof_support origins
+      in
+      let* params =
+        all function_params ~f:(fun (id, ty) ->
+            let* ty = Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty in
+            let* raven_type = typ ctx ~at:id.pid_loc ty in
+            let raven = Names.fresh ctx.names id.pid_str in
+            Ok (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
+      in
+      let* result_type =
+        Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result
+      in
+      let* result_type = typ ctx ~at:function_name.pid_loc result_type in
+      let env =
+        {
+          ctx;
+          data = types;
+          funcs = spec_funcs;
+          logical_definition = true;
+          vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
+          var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
+        }
+      in
+      let* () = pure_logical_body preds function_body in
+      let* () =
+        Source.check_logical_function ocaml_env ~functions:(List.map spec_funcs ~f:fst)
+          declaration
+      in
+      let* body = formula env function_body in
+      let result = Names.fresh ctx.names "result" in
+      Ok
+        (R.Callable.func ~loc:l
+           ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
+           ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
+           (ident ~loc:l function_name.pid_str)
+           (Some (R.Expr.annotated body result_type)))
+  | _ -> error Location.none "Expected a logical function declaration"
+
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
   (* Each annotation on an atomic step, by the end of the code it follows. *)
@@ -7425,8 +7755,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let types = List.concat (List.concat library_types) @ types @ source.proof_types in
   (* The data types, and the sequences of specifications, which have no module. *)
   let data_types = types in
+  let resource_types =
+    List.concat_map source.proof_resources ~f:(fun r ->
+        r.Source.resource_descriptor :: r.resource_aliases)
+  in
   let types =
-    types @ source.logical_types
+    types @ resource_types @ source.logical_types
     @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
   (* Each data type's module, given the ones declared before it; a record type that is a
@@ -7437,8 +7771,50 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
            Option.some_if
              (Option.is_none d.heap && Option.is_none d.alias)
              (List.take data_types i, d)))
-      ~f:(fun (before, d) -> Datatypes.member (before @ source.logical_types) d)
+      ~f:(fun (before, d) ->
+        let* member =
+          Datatypes.member (before @ resource_types @ source.logical_types) d
+        in
+        Ok (d.Datatypes.module_name, member))
   in
+  let* resource_members =
+    all source.proof_resources ~f:(fun resource ->
+        let at = resource.Source.resource_at in
+        let l = loc at in
+        let* library, arguments =
+          match resource.resource_kind with
+          | S.Resource_set elt ->
+              let* elt = Source.ocaml_type source.env ~at elt in
+              let* elt = Datatypes.typ types ~at elt in
+              Ok ("SetRA", [ elt ])
+          | Resource_auth base ->
+              Ok ("Auth", [ R.Type.named ~loc:l (name ~loc:l base.pid_str) [] ])
+        in
+        let library = R.Name.make ~loc:l ~path:[ "Library" ] library in
+        Ok
+          ( resource.resource_name,
+            R.Member.instance ~loc:l ~def:(library, arguments)
+              (ident ~loc:l resource.resource_name)
+              library ))
+  in
+  let proof_module_names =
+    List.map source.proof_types ~f:(fun d -> d.Datatypes.module_name)
+  in
+  let runtime_modules =
+    List.filter_map modules ~f:(fun (n, m) ->
+        Option.some_if (not (List.mem proof_module_names n ~equal:String.equal)) m)
+  in
+  let proof_modules =
+    List.filter_map source.proof ~f:(function
+      | S.Proof_type { type_name; _ } ->
+          List.Assoc.find modules
+            (String.capitalize type_name.pid_str)
+            ~equal:String.equal
+      | Proof_resource { resource_name; _ } ->
+          List.Assoc.find resource_members resource_name.pid_str ~equal:String.equal
+      | _ -> None)
+  in
+  let modules = runtime_modules @ proof_modules in
   let* record_fields = Datatypes.fields types in
   let refs = ref [] in
   let primitives = ref [] in
@@ -7507,9 +7883,38 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let key = lib.library_name ^ "." ^ p.pred_name.pid_str in
         (key, (key, types)))
   in
+  let* logical_functions =
+    all
+      (List.filter source.proof ~f:(function S.Proof_function _ -> true | _ -> false))
+      ~f:(function
+        | S.Proof_function { function_name; function_params; function_result; _ } ->
+            let* lemma_inputs =
+              all function_params ~f:(fun (id, ty) ->
+                  Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
+            in
+            let* output =
+              Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result
+            in
+            Ok
+              ( function_name.pid_str,
+                {
+                  lemma_raven = function_name.pid_str;
+                  lemma_inputs;
+                  lemma_outputs = [ output ];
+                } )
+        | _ -> error Location.none "Expected a logical function declaration")
+  in
+  let proof_support =
+    {
+      resources = source.proof_resources;
+      ghost_fields = source.proof_fields;
+      logical_functions;
+    }
+  in
   let spec_funcs =
     List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
+    @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
   let lemma_declarations =
     List.filter source.proof ~f:(function S.Proof_lemma _ -> true | _ -> false)
@@ -7919,8 +8324,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
-        predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs origins
-          ~at
+        predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+          ~proof_support origins ~at
           ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
           ~structures p def param_types)
   in
@@ -7934,20 +8339,45 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     all lemma_declarations
       ~f:
         (proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-           ~proof_lemmas ~predicate_bodies origins)
+           ~proof_lemmas ~proof_support ~predicate_bodies origins)
+  in
+  let* logical_members =
+    all
+      (List.filter_mapi source.proof ~f:(fun i declaration ->
+           match declaration with
+           | S.Proof_function _ -> Some (i, declaration)
+           | _ -> None))
+      ~f:(fun (i, declaration) ->
+        let previous =
+          List.filter_map (List.take source.proof i) ~f:(function
+            | S.Proof_function { function_name; _ } -> Some function_name.pid_str
+            | _ -> None)
+        in
+        let logical_functions =
+          List.filter logical_functions ~f:(fun (n, _) ->
+              List.mem previous n ~equal:String.equal)
+        in
+        let spec_funcs =
+          List.filter spec_funcs ~f:(fun (n, _) ->
+              (not (List.Assoc.mem proof_support.logical_functions n ~equal:String.equal))
+              || List.mem previous n ~equal:String.equal)
+        in
+        proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+          ~proof_support:{ proof_support with logical_functions }
+          origins declaration)
   in
   let* pure_funcs =
     all pure
       ~f:
         (func types ~refs ~primitives ~shared ~ocaml_env ~preds
            ~funcs:(List.map pure ~f:(fun f -> (Ident.unique_name f.id, f.raven_name)))
-           ~spec_funcs origins)
+           ~spec_funcs ~proof_support origins)
   in
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
           ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
-          ~proof_lemmas
+          ~proof_lemmas ~proof_support
           ~libraries:
             (List.map source.libraries ~f:(fun (lib : Source.library) ->
                  (lib.library_id, lib.library_name)))
@@ -7962,15 +8392,26 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         Option.some_if (Option.is_none init)
           (R.Member.field ~loc:start ~ghost:true (ident ~loc:start field) typ))
   in
+  let* explicit_fields =
+    all source.proof_fields ~f:(fun field ->
+        let l = loc field.Source.field_at in
+        let* value_type = Datatypes.typ types ~at:field.field_at field.field_value in
+        Ok
+          (R.Member.field ~loc:l ~ghost:true
+             (ident ~loc:l (ghost_field_name field))
+             value_type))
+  in
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members @ modules @ library_modules @ record_fields @ ref_fields
-       @ ghost_fields
+       @ ghost_fields @ explicit_fields
         @ List.concat structure_member_lists
         @ List.concat_map pending_member_lists ~f:List.concat
         @ List.concat action_check_lists
         @ List.map !primitives ~f:snd
-        @ List.map (pred_members @ pure_funcs @ lemma_members) ~f:R.Member.callable
+        @ List.map
+            (logical_members @ pred_members @ pure_funcs @ lemma_members)
+            ~f:R.Member.callable
         @ List.map2_exn funcs procs ~f:(fun f p ->
             (* A trusted function's procedure is assumed. *)
             if f.trusted then R.Member.free (R.Member.callable p) else R.Member.callable p)

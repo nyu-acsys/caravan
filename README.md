@@ -42,6 +42,44 @@ also provides `choose`, whose set must be nonempty. Maps use `Map.const`,
 `Map.get`, and `Map.set`. A constant map may need an explicit type annotation,
 such as `(Map.const 0 : (int, int) map)`.
 
+Proof files can define nonrecursive pure logical functions with typed parameters
+and results. A set comprehension uses an OCaml-style binder:
+
+```ocaml
+let single (value : int) : int set =
+  Set.of_predicate (fun (candidate : int) -> candidate = value)
+```
+
+Logical definitions can call previously declared logical functions and use
+`let`, `if`, and `match`; they cannot read heap ownership or call predicates.
+OCaml checks their bodies and arguments before translation, including reference
+element types. Matches must be exhaustive.
+
+Named instances of `SetRA` and `Auth` expose Raven's resource algebras:
+
+```ocaml
+type fact = Seen of int
+module Facts = SetRA (struct type t = fact end)
+module Authority = Auth (Facts)
+
+let facts : (int Atomic.t, Authority.t) Ghost.field = Ghost.field ()
+```
+
+Each instance has a distinct resource type. Resource operations are qualified,
+such as `Facts.set`, `Authority.auth`, `Authority.frag`, `Authority.auth_frag`,
+and `Authority.full`. These declarations support these library instances;
+arbitrary module definitions are not supported yet.
+
+`Ghost.at facts cell` names a ghost location attached to an owner of the declared
+type. Use it through `own`, for example
+`own (Ghost.at facts cell) (Authority.auth (Facts.set known))`.
+Declaring a field grants no ownership and performs no allocation. In a lemma
+body, `Ghost.fpu location before after` checks a frame-preserving resource update,
+consuming ownership of `before` and producing ownership of `after`. It must preserve
+compatibility with resources held by other threads. Resource fields do not support
+ordinary assignment. Allocation and initialization hooks for runtime code are not
+available yet.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.

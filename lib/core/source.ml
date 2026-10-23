@@ -15,6 +15,24 @@ type library = { library_name : string; library_id : Ident.t; library : interfac
 (** A library that the file uses, which an interface [m.mli] without an implementation
     next to it declares: the module [M], trusted. *)
 
+type proof_resource = {
+  resource_name : string;
+  resource_kind : S.resource_kind;
+  resource_type : Types.type_expr;
+  resource_id : Ident.t;
+  resource_operations : (string * Types.type_expr list * Types.type_expr) list;
+  resource_descriptor : Datatypes.t;
+  resource_aliases : Datatypes.t list;
+  resource_at : Location.t;
+}
+
+type proof_field = {
+  field_name : string;
+  field_owner : Types.type_expr;
+  field_value : Types.type_expr;
+  field_at : Location.t;
+}
+
 type t = {
   file : string;
   text : string;
@@ -27,6 +45,8 @@ type t = {
   logical_types : Datatypes.t list;
       (** The collection types of specifications, identified by their declarations. *)
   proof_types : Datatypes.t list;  (** Algebraic types declared by the proof. *)
+  proof_resources : proof_resource list;
+  proof_fields : proof_field list;
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be
           helped, each on a key. *)
@@ -216,7 +236,10 @@ let proof_constructor_collision env interface proof =
 (** Type-checks the algebraic types of [proof] in [env], after the implementation, and
     returns their descriptors and the environment for the rest of the proof. *)
 let elaborate_proof_types (env : Env.t) (interface : interface option)
-    (proof : S.proof_decl list) : (Env.t * Datatypes.t list, Report.error) Result.t =
+    (proof : S.proof_decl list) :
+    ( Env.t * Datatypes.t list * proof_resource list * proof_field list,
+      Report.error )
+    Result.t =
   let* () =
     match proof_type_collision env interface proof with
     | None -> Ok ()
@@ -233,36 +256,328 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
           (Report.error Type name.pid_loc
              (Printf.sprintf "The proof constructor %s is already declared" name.pid_str))
   in
-  let declarations =
-    List.filter_map proof ~f:(function
-      | Proof_type { type_name; type_ctors } ->
-          let constructor ((name : S.id), (args : S.pty list)) =
-            Ast_helper.Type.constructor ~loc:name.pid_loc
-              ~args:(Pcstr_tuple (List.map args ~f:(core_type ~at:name.pid_loc)))
-              { txt = name.pid_str; loc = name.pid_loc }
-          in
-          Some
-            (Ast_helper.Type.mk ~loc:type_name.pid_loc
-               ~kind:(Ptype_variant (List.map type_ctors ~f:constructor))
-               { txt = type_name.pid_str; loc = type_name.pid_loc })
-      | _ -> None)
+  let checked_type env at typ =
+    (Typetexp.transl_simple_type env ~closed:true (core_type ~at typ)).ctyp_type
   in
-  let* env, reversed =
-    List.fold_result declarations ~init:(env, [])
-      ~f:(fun (env, descriptors) declaration ->
-        let typed, _, _, _, env =
-          Typemod.type_structure env [ Ast_helper.Str.type_ Recursive [ declaration ] ]
-        in
-        let typed_declarations =
-          List.concat_map typed.str_items ~f:(fun item ->
-              match item.str_desc with Tstr_type (_, ds) -> ds | _ -> [])
-        in
-        let* added =
-          Result.all (List.map typed_declarations ~f:Datatypes.of_declaration)
-        in
-        Ok (env, List.rev_append added descriptors))
+  let module_exists env name =
+    try
+      let _ = Env.find_module_by_name (Lident name) env in
+      true
+    with Stdlib.Not_found -> false
   in
-  Ok (env, List.rev reversed)
+  let value_exists env name =
+    try
+      let _ = Env.find_value_by_name (Lident name) env in
+      true
+    with Stdlib.Not_found -> false
+  in
+  let signature env signature = (Typemod.type_interface env signature).sig_final_env in
+  let value env (name : S.id) typ =
+    if value_exists env name.pid_str then
+      Error
+        (Report.error Type name.pid_loc
+           (Printf.sprintf "The proof value %s is already declared" name.pid_str))
+    else
+      Ok
+        (signature env
+           [
+             Ast_helper.Sig.value
+               (Ast_helper.Val.mk ~loc:name.pid_loc
+                  { txt = name.pid_str; loc = name.pid_loc }
+                  typ);
+           ])
+  in
+  let has_resources =
+    List.exists proof ~f:(function
+      | S.Proof_resource _ | Proof_field _ -> true
+      | _ -> false)
+  in
+  let* env =
+    if not has_resources then Ok env
+    else if module_exists env "Ghost" then
+      Error
+        (Report.error Type Location.none "The module Ghost is reserved for proof fields")
+    else
+      Ok
+        (signature env
+           (Parse.interface
+              (Lexing.from_string "module Ghost : sig type ('owner, 'value) field end")))
+  in
+  let* env, reversed, resources, fields =
+    List.fold_result proof ~init:(env, [], [], [])
+      ~f:(fun (env, descriptors, resources, fields) declaration ->
+        match declaration with
+        | S.Proof_type { type_name; type_ctors } ->
+            let constructor ((name : S.id), (args : S.pty list)) =
+              Ast_helper.Type.constructor ~loc:name.pid_loc
+                ~args:(Pcstr_tuple (List.map args ~f:(core_type ~at:name.pid_loc)))
+                { txt = name.pid_str; loc = name.pid_loc }
+            in
+            let declaration =
+              Ast_helper.Type.mk ~loc:type_name.pid_loc
+                ~kind:(Ptype_variant (List.map type_ctors ~f:constructor))
+                { txt = type_name.pid_str; loc = type_name.pid_loc }
+            in
+            let typed, _, _, _, env =
+              Typemod.type_structure env
+                [ Ast_helper.Str.type_ Recursive [ declaration ] ]
+            in
+            let typed_declarations =
+              List.concat_map typed.str_items ~f:(fun item ->
+                  match item.str_desc with Tstr_type (_, ds) -> ds | _ -> [])
+            in
+            let* added =
+              Result.all (List.map typed_declarations ~f:Datatypes.of_declaration)
+            in
+            Ok (env, List.rev_append added descriptors, resources, fields)
+        | Proof_resource { resource_name = name; resource_kind } ->
+            let at = name.pid_loc in
+            let* () =
+              if
+                module_exists env name.pid_str
+                || Option.is_some
+                     (find_type_by_name env (String.uncapitalize name.pid_str))
+                || List.exists proof ~f:(function
+                  | S.Proof_type { type_name; _ } ->
+                      String.equal (String.capitalize type_name.pid_str) name.pid_str
+                  | _ -> false)
+                || List.mem
+                     [ "Ghost"; "SetRA"; "Auth"; "Finset" ]
+                     name.pid_str ~equal:String.equal
+              then
+                Error
+                  (Report.error Type at
+                     (Printf.sprintf "The proof module %s is already declared or reserved"
+                        name.pid_str))
+              else Ok ()
+            in
+            let element_type =
+              match resource_kind with
+              | Resource_set elt -> Some (checked_type env at elt)
+              | Resource_auth _ -> None
+            in
+            let named name =
+              Ast_helper.Typ.constr ~loc:at { txt = Longident.Lident name; loc = at } []
+            in
+            let t = named "t" in
+            let arrow a b = Ast_helper.Typ.arrow ~loc:at Nolabel a b in
+            let* extra_types, extra =
+              match resource_kind with
+              | Resource_set elt ->
+                  let _ = checked_type env at elt in
+                  let set =
+                    Ast_helper.Typ.constr ~loc:at
+                      { txt = Lident "set"; loc = at }
+                      [ named "element" ]
+                  in
+                  Ok
+                    ( [
+                        Ast_helper.Sig.type_ Nonrecursive
+                          [
+                            Ast_helper.Type.mk ~loc:at ~manifest:(core_type ~at elt)
+                              { txt = "element"; loc = at };
+                          ];
+                      ],
+                      [ ("set", arrow set t) ] )
+              | Resource_auth underlying ->
+                  begin match
+                    List.find resources ~f:(fun r ->
+                        String.equal r.resource_name underlying.pid_str)
+                  with
+                  | None ->
+                      Error
+                        (Report.error Type underlying.pid_loc
+                           "Auth requires a previously declared resource module")
+                  | Some _ ->
+                      let base =
+                        Ast_helper.Typ.constr ~loc:at
+                          {
+                            txt =
+                              Ldot
+                                ( { txt = Lident underlying.pid_str; loc = at },
+                                  { txt = "t"; loc = at } );
+                            loc = at;
+                          }
+                          []
+                      in
+                      Ok
+                        ( [],
+                          ("auth_frag", arrow base (arrow base t))
+                          :: List.map [ "auth"; "frag"; "full" ] ~f:(fun n ->
+                              (n, arrow base t)) )
+                  end
+            in
+            let values =
+              extra
+              @ [
+                  ("id", t);
+                  ("top", t);
+                  ("valid", arrow t (named "bool"));
+                  ("comp", arrow t (arrow t t));
+                  ("frame", arrow t (arrow t t));
+                  ("fpuAllowed", arrow t (arrow t (named "bool")));
+                ]
+            in
+            let declaration =
+              Ast_helper.Sig.module_
+                (Ast_helper.Md.mk ~loc:at
+                   { txt = Some name.pid_str; loc = at }
+                   (Ast_helper.Mty.signature ~loc:at
+                      (extra_types
+                      @ [
+                          Ast_helper.Sig.type_ Recursive
+                            [ Ast_helper.Type.mk ~loc:at { txt = "t"; loc = at } ];
+                        ]
+                      @ List.map values ~f:(fun (n, typ) ->
+                          Ast_helper.Sig.value
+                            (Ast_helper.Val.mk ~loc:at { txt = n; loc = at } typ)))))
+            in
+            let typed = Typemod.type_interface env [ declaration ] in
+            let env = typed.sig_final_env in
+            let path, _ = Env.find_module_by_name (Lident name.pid_str) env in
+            let* resource_id =
+              match path with
+              | Pident id -> Ok id
+              | _ ->
+                  Error (Report.error Type at "A proof resource must be a local module")
+            in
+            let resource_type =
+              checked_type env at (PTtyapp (Qdot (Qid name, S.mk_id ~loc:at "t"), []))
+            in
+            let resource_descriptor =
+              Datatypes.resource_type ~name:name.pid_str ~module_id:resource_id ~at
+            in
+            let resource_aliases =
+              Option.to_list
+                (Option.map element_type ~f:(fun typ ->
+                     {
+                       (Datatypes.library_type ~library:name.pid_str
+                          ~library_id:resource_id ~at "element")
+                       with
+                       alias = Some typ;
+                     }))
+            in
+            let* specific_operations =
+              match (resource_kind, element_type) with
+              | Resource_set _, Some element ->
+                  let path, _ = Env.find_type_by_name (Lident "set") env in
+                  Ok [ ("set", [ Ctype.newconstr path [ element ] ], resource_type) ]
+              | Resource_auth underlying, _ ->
+                  begin match
+                    List.find resources ~f:(fun r ->
+                        String.equal r.resource_name underlying.pid_str)
+                  with
+                  | Some base ->
+                      Ok
+                        (( "auth_frag",
+                           [ base.resource_type; base.resource_type ],
+                           resource_type )
+                        :: List.map [ "auth"; "frag"; "full" ] ~f:(fun operation ->
+                            (operation, [ base.resource_type ], resource_type)))
+                  | None ->
+                      Error
+                        (Report.error Type underlying.pid_loc
+                           "Auth requires a previously declared resource module")
+                  end
+              | Resource_set _, None ->
+                  Error (Report.error Type at "A set resource requires an element type")
+            in
+            let resource_operations =
+              specific_operations
+              @ [
+                  ("id", [], resource_type);
+                  ("top", [], resource_type);
+                  ("valid", [ resource_type ], Predef.type_bool);
+                  ("comp", [ resource_type; resource_type ], resource_type);
+                  ("frame", [ resource_type; resource_type ], resource_type);
+                  ("fpuAllowed", [ resource_type; resource_type ], Predef.type_bool);
+                ]
+            in
+            let resource =
+              {
+                resource_name = name.pid_str;
+                resource_kind;
+                resource_type;
+                resource_id;
+                resource_operations;
+                resource_descriptor;
+                resource_aliases;
+                resource_at = at;
+              }
+            in
+            Ok (env, descriptors, resource :: resources, fields)
+        | Proof_field { field_name = name; field_type } ->
+            let at = name.pid_loc in
+            let* owner, content =
+              match field_type with
+              | PTtyapp (Qdot (Qid ghost, field), [ owner; content ])
+                when String.equal ghost.pid_str "Ghost"
+                     && String.equal field.pid_str "field" ->
+                  Ok (checked_type env at owner, checked_type env at content)
+              | _ ->
+                  Error
+                    (Report.error Type at
+                       "A ghost field requires an (owner, resource) Ghost.field type")
+            in
+            let owner_head = Ctype.expand_head env owner in
+            let owner_is_reference =
+              match Types.get_desc owner_head with
+              | Tconstr (p, [ _ ], _) when Datatypes.is_atomic p || Datatypes.is_ref p ->
+                  true
+              | Tconstr (p, [], _) ->
+                  let declaration = Env.find_type p env in
+                  begin match declaration.type_kind with
+                  | Type_record (labels, _) ->
+                      List.exists labels ~f:(fun label ->
+                          match label.Types.ld_mutable with
+                          | Mutable -> true
+                          | Immutable -> false)
+                  | _ -> false
+                  end
+              | _ -> false
+            in
+            let* () =
+              if owner_is_reference then Ok ()
+              else
+                Error
+                  (Report.error Type at "A ghost field owner must be a heap reference")
+            in
+            let* () =
+              if
+                List.exists resources ~f:(fun r ->
+                    match (Types.get_desc content, Types.get_desc r.resource_type) with
+                    | Tconstr (p, [], _), Tconstr (q, [], _) -> Path.same p q
+                    | _ -> false)
+              then Ok ()
+              else
+                Error
+                  (Report.error Type at
+                     "A ghost field value must be a declared resource type")
+            in
+            let* env = value env name (core_type ~at field_type) in
+            Ok
+              ( env,
+                descriptors,
+                resources,
+                {
+                  field_name = name.pid_str;
+                  field_owner = owner;
+                  field_value = content;
+                  field_at = at;
+                }
+                :: fields )
+        | Proof_function { function_name = name; function_params; function_result; _ } ->
+            let at = name.pid_loc in
+            let typ =
+              List.fold_right function_params ~init:(core_type ~at function_result)
+                ~f:(fun (_, param) result ->
+                  Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at param) result)
+            in
+            let* env = value env name typ in
+            Ok (env, descriptors, resources, fields)
+        | _ -> Ok (env, descriptors, resources, fields))
+  in
+  Ok (env, List.rev reversed, List.rev resources, List.rev fields)
 
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
@@ -361,7 +676,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
         Result.map (elaborate_proof_types env interface proof)
-          ~f:(fun (env, proof_types) ->
+          ~f:(fun (env, proof_types, proof_resources, proof_fields) ->
             {
               file;
               text;
@@ -371,6 +686,8 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               sequence;
               logical_types;
               proof_types;
+              proof_resources;
+              proof_fields;
               pending;
               interface;
               proof;
@@ -391,3 +708,259 @@ let ocaml_type (env : Env.t) ~(at : Location.t) (t : S.pty) :
     match Report.of_exn exn with
     | Some error -> Error error
     | None -> Error (Report.error Type at (Stdlib.Printexc.to_string exn)))
+
+(** Compiler-only operations used to type-check logical expressions. *)
+let logical_check_signature =
+  "module Caravan__logical_check : sig\n\
+   type nonrec 'a s = 'a set\n\
+   type nonrec 'a f = 'a finset\n\
+   type nonrec ('k,'v) m = ('k,'v) map\n\
+   val quantify : ('a -> bool) -> bool\n\
+   val implies : bool -> bool -> bool\n\
+   module Set : sig\n\
+   val empty : 'a s\n\
+   val singleton : 'a -> 'a s\n\
+   val mem : 'a -> 'a s -> bool\n\
+   val union : 'a s -> 'a s -> 'a s\n\
+   val inter : 'a s -> 'a s -> 'a s\n\
+   val diff : 'a s -> 'a s -> 'a s\n\
+   val subset : 'a s -> 'a s -> bool\n\
+   val of_predicate : ('a -> bool) -> 'a s\n\
+   end\n\
+   module Finset : sig\n\
+   val empty : 'a f\n\
+   val singleton : 'a -> 'a f\n\
+   val mem : 'a -> 'a f -> bool\n\
+   val union : 'a f -> 'a f -> 'a f\n\
+   val inter : 'a f -> 'a f -> 'a f\n\
+   val diff : 'a f -> 'a f -> 'a f\n\
+   val subset : 'a f -> 'a f -> bool\n\
+   val choose : 'a f -> 'a\n\
+   end\n\
+   module Map : sig\n\
+   val const : 'v -> ('k,'v) m\n\
+   val get : ('k,'v) m -> 'k -> 'v\n\
+   val set : ('k,'v) m -> 'k -> 'v -> ('k,'v) m\n\
+   end\n\
+   end"
+
+let logical_constant ~loc = function
+  | S.Pconst_integer (text, suffix) -> Ast_helper.Const.integer ~loc ?suffix text
+  | Pconst_char c -> Ast_helper.Const.char ~loc c
+  | Pconst_string (text, _) -> Ast_helper.Const.string ~loc text
+  | Pconst_float text -> Ast_helper.Const.float ~loc text
+
+let rec logical_pattern (p : S.pat) =
+  let loc = p.pat_loc in
+  match p.pat_desc with
+  | Pwild -> Ast_helper.Pat.any ~loc ()
+  | Pid name -> Ast_helper.Pat.var ~loc { txt = name.pid_str; loc }
+  | Ptuple pats ->
+      Ast_helper.Pat.tuple ~loc
+        (List.map pats ~f:(fun p -> (None, logical_pattern p)))
+        Closed
+  | Pcast (p, typ) ->
+      Ast_helper.Pat.constraint_ ~loc (logical_pattern p) (core_type ~at:loc typ)
+  | Pconstr (q, arg) ->
+      Ast_helper.Pat.construct ~loc
+        { txt = longident q; loc }
+        (Option.map arg ~f:(fun p -> ([], logical_pattern p)))
+  | Pconst c -> Ast_helper.Pat.constant ~loc (logical_constant ~loc c)
+
+let logical_lambda ~loc (id : S.id) typ body =
+  let pattern =
+    Ast_helper.Pat.var ~loc:id.pid_loc { txt = id.pid_str; loc = id.pid_loc }
+  in
+  let pattern =
+    Option.value_map typ ~default:pattern ~f:(fun typ ->
+        Ast_helper.Pat.constraint_ ~loc pattern (core_type ~at:loc typ))
+  in
+  Ast_helper.Exp.function_ ~loc
+    [ { Parsetree.pparam_loc = loc; pparam_desc = Pparam_val (Nolabel, None, pattern) } ]
+    None (Pfunction_body body)
+
+let logical_helper ~loc path =
+  let path =
+    List.fold path ~init:(Longident.Lident "Caravan__logical_check")
+      ~f:(fun parent name -> Longident.Ldot ({ txt = parent; loc }, { txt = name; loc }))
+  in
+  Ast_helper.Exp.ident ~loc { txt = path; loc }
+
+let logical_identifier ~functions ~loc q =
+  match q with
+  | S.Qdot (Qid m, op)
+    when List.mem [ "Set"; "Finset"; "Map" ] m.pid_str ~equal:String.equal
+         && not (List.mem functions (m.pid_str ^ "." ^ op.pid_str) ~equal:String.equal) ->
+      logical_helper ~loc [ m.pid_str; op.pid_str ]
+  | Qid { pid_str = "->" | "<->"; _ } -> logical_helper ~loc [ "implies" ]
+  | Qid { pid_str = "/\\"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "&&"; loc }
+  | Qid { pid_str = "\\/"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "||"; loc }
+  | Qid { pid_str = "-"; pid_fixity = Prefix; _ } ->
+      Ast_helper.Exp.ident ~loc { txt = Lident "~-"; loc }
+  | _ -> Ast_helper.Exp.ident ~loc { txt = longident q; loc }
+
+let logical_constructor q =
+  let last = match q with S.Qid id | Qdot (_, id) -> id.pid_str in
+  String.equal last "[]" || String.equal last "::" || String.equal last "()"
+  || match String.get last 0 with 'A' .. 'Z' -> true | _ -> false
+
+let rec logical_expression ~functions (term : S.term) =
+  let loc = term.term_loc in
+  let exp = logical_expression ~functions in
+  let apply callee args =
+    Ast_helper.Exp.apply ~loc callee
+      (List.map args ~f:(fun arg -> (Asttypes.Nolabel, arg)))
+  in
+  match term.term_desc with
+  | Ttrue | Tfalse ->
+      Ok
+        (Ast_helper.Exp.construct ~loc
+           {
+             txt = Lident (match term.term_desc with Ttrue -> "true" | _ -> "false");
+             loc;
+           }
+           None)
+  | Tconst c -> Ok (Ast_helper.Exp.constant ~loc (logical_constant ~loc c))
+  | Tvar q when logical_constructor q ->
+      Ok (Ast_helper.Exp.construct ~loc { txt = longident q; loc } None)
+  | Tvar q -> Ok (logical_identifier ~functions ~loc q)
+  | Tapply
+      ( {
+          term_desc = Tapply ({ term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, head);
+          _;
+        },
+        tail ) ->
+      let* head = exp head in
+      let* tail = exp tail in
+      Ok
+        (Ast_helper.Exp.construct ~loc { txt = Lident "::"; loc }
+           (Some (Ast_helper.Exp.tuple ~loc [ (None, head); (None, tail) ])))
+  | Tapply ({ term_desc = Tvar q; _ }, arg) when logical_constructor q ->
+      let* arg = exp arg in
+      Ok (Ast_helper.Exp.construct ~loc { txt = longident q; loc } (Some arg))
+  | Tapply (callee, arg) ->
+      let* callee = exp callee in
+      let* arg = exp arg in
+      Ok (apply callee [ arg ])
+  | Tinfix _ -> exp (S.chain term)
+  | Tif (condition, yes, no) ->
+      let* condition = exp condition in
+      let* yes = exp yes in
+      let* no = exp no in
+      Ok (Ast_helper.Exp.ifthenelse ~loc condition yes (Some no))
+  | Tlet (pattern, rhs, body) ->
+      let* rhs = exp rhs in
+      let* body = exp body in
+      Ok
+        (Ast_helper.Exp.let_ ~loc Nonrecursive
+           [ Ast_helper.Vb.mk ~loc (logical_pattern pattern) rhs ]
+           body)
+  | Tmatch (value, cases) ->
+      let* value = exp value in
+      let* cases =
+        Result.all
+          (List.map cases ~f:(fun (pattern, body) ->
+               let* body = exp body in
+               Ok (Ast_helper.Exp.case (logical_pattern pattern) body)))
+      in
+      Ok (Ast_helper.Exp.match_ ~loc value cases)
+  | Tcast (value, typ) ->
+      let* value = exp value in
+      Ok (Ast_helper.Exp.constraint_ ~loc value (core_type ~at:loc typ))
+  | Ttuple [] -> Ok (Ast_helper.Exp.construct ~loc { txt = Lident "()"; loc } None)
+  | Ttuple values ->
+      let* values = Result.all (List.map values ~f:exp) in
+      Ok (Ast_helper.Exp.tuple ~loc (List.map values ~f:(fun value -> (None, value))))
+  | Tquant (_, binders, body) ->
+      let* body = exp body in
+      Ok
+        (List.fold_right binders ~init:body ~f:(fun (id, typ) body ->
+             apply
+               (logical_helper ~loc [ "quantify" ])
+               [ logical_lambda ~loc id typ body ]))
+  | Tcomprehension ((id, typ), body) ->
+      let* body = exp body in
+      Ok
+        (apply
+           (logical_helper ~loc [ "Set"; "of_predicate" ])
+           [ logical_lambda ~loc id (Some typ) body ])
+  | Tfield (value, field) ->
+      let* value = exp value in
+      Ok (Ast_helper.Exp.field ~loc value { txt = longident field; loc })
+  | Tattr (_, value) | Told value -> exp value
+
+(** Checks OCaml types before Raven erases reference element types. *)
+let check_logical_expression env ~functions ~variables ~expected (term : S.term) =
+  try
+    let* expression = logical_expression ~functions term in
+    let env =
+      (Typemod.type_interface env
+         (Parse.interface (Lexing.from_string logical_check_signature)))
+        .sig_final_env
+    in
+    let add env name typ =
+      Env.add_value (Ident.create_local name)
+        {
+          Types.val_type = typ;
+          val_kind = Val_reg;
+          val_loc = term.term_loc;
+          val_attributes = [];
+          val_uid = Shape.Uid.internal_not_actually_unique;
+        }
+        env
+    in
+    let env =
+      List.fold_right variables ~init:env ~f:(fun (name, typ) env -> add env name typ)
+    in
+    let name = "caravan$logical$expected" in
+    let expected =
+      let argument =
+        match Types.get_desc expected with
+        | Tpoly _ -> expected
+        | _ -> Btype.newgenty (Tpoly (expected, []))
+      in
+      Ctype.newty (Tarrow (Nolabel, argument, Predef.type_unit, Types.commu_ok))
+    in
+    let env = add env name expected in
+    let application =
+      Ast_helper.Exp.apply ~loc:term.term_loc
+        (Ast_helper.Exp.ident ~loc:term.term_loc
+           { txt = Lident name; loc = term.term_loc })
+        [ (Nolabel, expression) ]
+    in
+    let typed = Typecore.type_expression env application in
+    let partial_match = ref None in
+    let default = Tast_iterator.default_iterator in
+    let iterator =
+      {
+        default with
+        expr =
+          (fun self expression ->
+            begin match (expression.Typedtree.exp_desc, !partial_match) with
+            | Texp_match (_, _, _, Partial), None ->
+                partial_match := Some expression.exp_loc
+            | _ -> ()
+            end;
+            default.expr self expression);
+      }
+    in
+    iterator.expr iterator typed;
+    match !partial_match with
+    | None -> Ok ()
+    | Some at -> Error (Report.error Type at "A logical match must be exhaustive")
+  with exn -> (
+    match Report.of_exn exn with
+    | Some error -> Error error
+    | None -> Error (Report.error Type term.term_loc (Stdlib.Printexc.to_string exn)))
+
+let check_logical_function env ~functions = function
+  | S.Proof_function { function_params; function_result; function_body; function_name } ->
+      let* variables =
+        Result.all
+          (List.map function_params ~f:(fun ((id : S.id), typ) ->
+               let* typ = ocaml_type env ~at:id.pid_loc typ in
+               Ok (id.pid_str, typ)))
+      in
+      let* expected = ocaml_type env ~at:function_name.pid_loc function_result in
+      check_logical_expression env ~functions ~variables ~expected function_body
+  | _ -> Ok ()

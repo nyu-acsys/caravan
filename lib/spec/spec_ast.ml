@@ -72,6 +72,7 @@ and term_desc =
       (** A chain of infix operations, as [e1 < e2 < e3], until [chain] desugars it. *)
   | Tif of term * term * term
   | Tquant of quant * binder list * term
+  | Tcomprehension of (id * pty) * term
   | Tattr of string * term
   | Tlet of pat * term * term
   | Tmatch of term * (pat * term) list
@@ -150,10 +151,20 @@ and proof_desc =
   | Proof_fold of term * (id * term) list
   | Proof_unfold of term * id list
 
+type resource_kind = Resource_set of pty | Resource_auth of id
+
 (** A declaration of a proof. *)
 type proof_decl =
   | Proof_predicate of predicate
   | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
+  | Proof_resource of { resource_name : id; resource_kind : resource_kind }
+  | Proof_field of { field_name : id; field_type : pty }
+  | Proof_function of {
+      function_name : id;
+      function_params : (id * pty) list;
+      function_result : pty;
+      function_body : term;
+    }
   | Proof_lemma of {
       lemma_name : id;
       lemma_params : (id * pty) list;
