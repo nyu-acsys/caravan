@@ -158,6 +158,7 @@ type proof_decl =
   | Proof_predicate of predicate
   | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
   | Proof_resource of { resource_name : id; resource_kind : resource_kind }
+  | Proof_au of { au_name : id; au_operation : qualid }
   | Proof_field of { field_name : id; field_type : pty }
   | Proof_function of {
       function_name : id;

@@ -1,0 +1,4 @@
+module Read = Ghost.AU (struct let operation = read end)
+module Other = Ghost.AU (struct let operation = other end)
+
+predicate contents (cell : int Atomic.t) (value : int) = own cell value

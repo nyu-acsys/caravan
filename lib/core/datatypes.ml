@@ -32,6 +32,7 @@ type t = {
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
   collection : collection_kind option;
+  atomic_procedure : string option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
@@ -50,6 +51,7 @@ let list =
     heap = None;
     alias = None;
     collection = None;
+    atomic_procedure = None;
     library = None;
     at = Location.none;
   }
@@ -66,6 +68,7 @@ let option =
     heap = None;
     alias = None;
     collection = None;
+    atomic_procedure = None;
     library = None;
     at = Location.none;
   }
@@ -97,6 +100,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap = None;
           alias = None;
           collection = None;
+          atomic_procedure = None;
           library = None;
           at;
         }
@@ -136,6 +140,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap;
           alias = None;
           collection = None;
+          atomic_procedure = None;
           library = None;
           at;
         }
@@ -149,6 +154,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap = None;
           alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
           collection = None;
+          atomic_procedure = None;
           library = None;
           at;
         }
@@ -172,6 +178,7 @@ let library_type ~library ~library_id ~at name =
     heap = None;
     alias = None;
     collection = None;
+    atomic_procedure = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
   }
@@ -179,6 +186,18 @@ let library_type ~library ~library_id ~at name =
 (** A nominal proof resource, represented by the instantiated Raven module's type. *)
 let resource_type ~name ~module_id ~at =
   { (library_type ~library:name ~library_id:module_id ~at "t") with module_name = name }
+
+(** A nominal proof token for an existing atomic procedure. *)
+let atomic_token ~path ~procedure ~at =
+  {
+    list with
+    id = None;
+    module_name = procedure ^ "_token";
+    ctors = [];
+    library = Some path;
+    atomic_procedure = Some procedure;
+    at;
+  }
 
 (** A specification-only collection, declared as [id]. *)
 let collection id kind =
@@ -192,6 +211,7 @@ let collection id kind =
     heap = None;
     alias = None;
     collection = Some kind;
+    atomic_procedure = None;
     library = None;
     at = Location.none;
   }
@@ -300,6 +320,12 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
+      let d = Option.value_exn (find types p) in
+      Ok
+        (R.Type.atomic_token ~loc:l
+           (R.Name.make ~loc:l (Option.value_exn d.atomic_procedure)))
   | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])

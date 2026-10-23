@@ -1,0 +1,25 @@
+module Read = Ghost.AU (struct let operation = read end)
+
+let token_slot : (Ghost.t, Read.token) Ghost.field = Ghost.field ()
+
+predicate zero (value : int) = value = 0
+
+predicate registration (reg : Ghost.t) (cell : int Atomic.t) =
+  exists token : Read.token.
+    own ~fraction:Permission.half (Ghost.at token_slot reg) token && Read.pending token cell
+
+predicate completed (reg : Ghost.t) (cell : int Atomic.t) (result : int) =
+  exists token : Read.token.
+    own ~fraction:Permission.half (Ghost.at token_slot reg) token && Read.committed token cell result
+
+lemma help (reg : Ghost.t) (cell : int Atomic.t) (result : int)
+  requires (registration reg cell)
+  requires (result = 0)
+  ensures (completed reg cell result) =
+  let token = unfold registration reg cell {token} in
+  let value = Read.access token cell in
+  unfold zero value;
+  assert (value = result);
+  fold zero value;
+  Read.commit token cell result;
+  fold completed reg cell result {token = token}

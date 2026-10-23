@@ -159,8 +159,50 @@ Manual and automatic proofs share runtime translation, primitive implementations
 and ghost-expression lowering. Raven checks permissions, invariant closure,
 atomicity, and contracts; Caravan checks the annotation shape that preserves the
 runtime operation. Manual mode supplies its own invariant proof steps and rejects
-automatic `commit`, `returning`, and `performs` annotations. Explicit AU operations
-and manual proofs of atomic contracts are a subsequent extension.
+automatic `commit`, `returning`, and `performs` annotations.
+
+Manual atomic proofs declare a typed facade in the companion `.proof` file:
+
+```ocaml
+module Read = Ghost.AU (struct let operation = read end)
+```
+
+`Read.token` identifies updates for that procedure. In a proof expression,
+`Read.bind ()` returns the current call's token; repeated binds return the same
+value. `Read.access token cell` opens the atomic precondition and returns its
+implicit parameters, with inferred types. Multiple implicit parameters form a tuple
+in name order. `Read.abort token cell` restores the
+precondition; `Read.commit token cell result` establishes the atomic postcondition.
+Each operation takes the procedure's concrete arguments in their declared order,
+including unit arguments. A unit result is passed as `()`.
+
+For example, with `contents cell value` defined as `own cell value`:
+
+```ocaml
+let read (cell : int Atomic.t) = Atomic.get cell
+(*@ Ghost.scope (fun step ->
+  let token = Read.bind () in
+  let value = Read.access token cell in
+  unfold contents cell value;
+  let observed = step () in
+  fold contents cell value;
+  Read.commit token cell observed;
+  observed)
+*)
+(*@ manual *)
+(*@ result = atomic read cell
+    atomic requires contents cell value
+    atomic ensures contents cell value && result = value *)
+```
+
+`Read.pending token cell` and `Read.committed token cell result` describe the
+corresponding AU resources in predicates and lemma contracts. Tokens can be stored
+in ordinary ghost fields and passed to checked lemmas, allowing a helper to open
+and commit a registered operation. Raven checks the resource and atomicity rules;
+Caravan preserves the procedure-specific token types before translation.
+AU facades currently name procedures in the same implementation without explicit
+ghost parameters. Ghost argument/result transport at runtime calls and specialized
+CAS proofs remain subsequent extensions.
 
 ## Building
 

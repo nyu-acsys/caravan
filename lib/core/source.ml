@@ -33,6 +33,16 @@ type proof_field = {
   field_at : Location.t;
 }
 
+type proof_au = {
+  au_name : string;
+  au_operation : S.qualid;
+  au_operation_path : Path.t;
+  au_operation_type : Types.type_expr;
+  au_token : Types.type_expr;
+  au_token_path : Path.t;
+  au_at : Location.t;
+}
+
 type t = {
   file : string;
   text : string;
@@ -47,6 +57,7 @@ type t = {
   proof_types : Datatypes.t list;  (** Algebraic types declared by the proof. *)
   proof_resources : proof_resource list;
   proof_fields : proof_field list;
+  proof_aus : proof_au list;
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be
           helped, each on a key. *)
@@ -237,7 +248,7 @@ let proof_constructor_collision env interface proof =
     returns their descriptors and the environment for the rest of the proof. *)
 let elaborate_proof_types (env : Env.t) (interface : interface option)
     (proof : S.proof_decl list) :
-    ( Env.t * Datatypes.t list * proof_resource list * proof_field list,
+    ( Env.t * Datatypes.t list * proof_resource list * proof_field list * proof_au list,
       Report.error )
     Result.t =
   let* () =
@@ -308,6 +319,7 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
          (Lexing.from_string
             "module Permission : sig type t val half : t val full : t end"))
   in
+  let aus = ref [] in
   let* env, reversed, resources, fields =
     List.fold_result proof ~init:(env, [], [], [])
       ~f:(fun (env, descriptors, resources, fields) declaration ->
@@ -335,6 +347,109 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
               Result.all (List.map typed_declarations ~f:Datatypes.of_declaration)
             in
             Ok (env, List.rev_append added descriptors, resources, fields)
+        | Proof_au { au_name = name; au_operation = operation } ->
+            let at = name.pid_loc in
+            let* () =
+              if module_exists env name.pid_str then
+                Error
+                  (Report.error Type at
+                     (Printf.sprintf "The proof module %s is already declared"
+                        name.pid_str))
+              else Ok ()
+            in
+            let* operation_path, operation_type =
+              try
+                let path, value = Env.find_value_by_name (longident operation) env in
+                Ok (path, value.Types.val_type)
+              with Stdlib.Not_found ->
+                Error
+                  (Report.error Type (S.qualid_loc operation)
+                     "The AU operation is not an OCaml function")
+            in
+            let rec arguments typ =
+              match Types.get_desc typ with
+              | Tpoly (body, []) -> arguments body
+              | Tarrow (_, argument, rest, _) ->
+                  let args, result = arguments rest in
+                  (argument :: args, result)
+              | _ -> ([], typ)
+            in
+            let args, result = arguments operation_type in
+            let* () =
+              if List.is_empty args then
+                Error (Report.error Type at "The AU operation must be a function")
+              else Ok ()
+            in
+            let declaration =
+              Ast_helper.Sig.module_
+                (Ast_helper.Md.mk ~loc:at
+                   { txt = Some name.pid_str; loc = at }
+                   (Ast_helper.Mty.signature ~loc:at
+                      [
+                        Ast_helper.Sig.type_ Nonrecursive
+                          [ Ast_helper.Type.mk ~loc:at { txt = "token"; loc = at } ];
+                      ]))
+            in
+            let typed = Typemod.type_interface env [ declaration ] in
+            let env = typed.sig_final_env in
+            let module_path, module_declaration =
+              Env.find_module_by_name (Lident name.pid_str) env
+            in
+            let* module_id, module_signature =
+              match (module_path, module_declaration.md_type) with
+              | Pident id, Mty_signature items -> Ok (id, items)
+              | _ -> Error (Report.error Type at "An AU must be a local module")
+            in
+            let token_path, _ =
+              Env.find_type_by_name
+                (Ldot
+                   ({ txt = Lident name.pid_str; loc = at }, { txt = "token"; loc = at }))
+                env
+            in
+            let token = Ctype.newconstr token_path [] in
+            let arrow args result =
+              List.fold_right args ~init:result ~f:(fun arg result ->
+                  Ctype.newty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
+            in
+            let value (name, args, result) =
+              let id = Ident.create_local name in
+              Types.Sig_value
+                ( id,
+                  {
+                    val_type = arrow args result;
+                    val_kind = Val_reg;
+                    val_loc = at;
+                    val_attributes = [];
+                    val_uid = Shape.Uid.internal_not_actually_unique;
+                  },
+                  Exported )
+            in
+            let values =
+              [
+                ("bind", [ Predef.type_unit ], token);
+                ("pending", token :: args, Predef.type_bool);
+                ("committed", token :: (args @ [ result ]), Predef.type_bool);
+                ("abort", token :: args, Predef.type_unit);
+                ("commit", token :: (args @ [ result ]), Predef.type_unit);
+              ]
+            in
+            let env =
+              Env.add_module module_id Mp_present
+                (Mty_signature (module_signature @ List.map values ~f:value))
+                env
+            in
+            aus :=
+              {
+                au_name = name.pid_str;
+                au_operation = operation;
+                au_operation_path = operation_path;
+                au_operation_type = operation_type;
+                au_token = token;
+                au_token_path = token_path;
+                au_at = at;
+              }
+              :: !aus;
+            Ok (env, descriptors, resources, fields)
         | Proof_resource { resource_name = name; resource_kind } ->
             let at = name.pid_loc in
             let* () =
@@ -571,7 +686,7 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
             Ok (env, descriptors, resources, fields)
         | _ -> Ok (env, descriptors, resources, fields))
   in
-  Ok (env, List.rev reversed, List.rev resources, List.rev fields)
+  Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
 
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
@@ -670,7 +785,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
         Result.map (elaborate_proof_types env interface proof)
-          ~f:(fun (env, proof_types, proof_resources, proof_fields) ->
+          ~f:(fun (env, proof_types, proof_resources, proof_fields, proof_aus) ->
             {
               file;
               text;
@@ -682,6 +797,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               proof_types;
               proof_resources;
               proof_fields;
+              proof_aus;
               pending;
               interface;
               proof;

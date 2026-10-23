@@ -374,13 +374,23 @@ type lemma_signature = {
   lemma_outputs : Types.type_expr list;
 }
 
+type atomic_signature = {
+  au_source : Source.proof_au;
+  au_procedure : string;
+  au_inputs : Types.type_expr list;
+  au_result : Types.type_expr;
+  au_implicit : Types.type_expr list;
+}
+
 type proof_support = {
+  atomic_updates : atomic_signature list;
   resources : Source.proof_resource list;
   ghost_fields : Source.proof_field list;
   logical_functions : (string * lemma_signature) list;
 }
 
-let empty_proof_support = { resources = []; ghost_fields = []; logical_functions = [] }
+let empty_proof_support =
+  { atomic_updates = []; resources = []; ghost_fields = []; logical_functions = [] }
 
 type context = {
   types : Datatypes.t list;
@@ -434,6 +444,7 @@ type context = {
           only mention variables, all immutable. *)
   mutable au : au option;
       (** The atomic update, for a function with an atomic contract. *)
+  current_procedure : string option;
   manual : bool;
   access_proofs : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
@@ -719,6 +730,38 @@ let collection_builtin env (q : S.qualid) =
          && not (List.Assoc.mem env.funcs (qualid_key q) ~equal:String.equal) ->
       Some (m.pid_str, f.pid_str)
   | _ -> None
+
+let atomic_method env = function
+  | S.Qdot (Qid m, method_) ->
+      Option.map
+        (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
+             String.equal signature.au_source.au_name m.pid_str))
+        ~f:(fun signature -> (signature, method_.pid_str))
+  | _ -> None
+
+let atomic_inputs signature method_ =
+  let token = signature.au_source.au_token in
+  match method_ with
+  | "bind" -> Some ([ Predef.type_unit ], [ token ])
+  | "access" -> Some (token :: signature.au_inputs, signature.au_implicit)
+  | "abort" -> Some (token :: signature.au_inputs, [])
+  | "commit" -> Some ((token :: signature.au_inputs) @ [ signature.au_result ], [])
+  | "pending" -> Some (token :: signature.au_inputs, [ Predef.type_bool ])
+  | "committed" ->
+      Some ((token :: signature.au_inputs) @ [ signature.au_result ], [ Predef.type_bool ])
+  | _ -> None
+
+(** Raven takes the concrete inputs and outputs as tuples, including empty ones. *)
+let atomic_arguments ~loc:l signature method_ values =
+  match values with
+  | [] -> []
+  | token :: rest ->
+      let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
+      let inputs = R.Expr.tuple ~loc:l inputs in
+      if List.mem [ "commit"; "committed" ] method_ ~equal:String.equal then
+        let outputs = if is_unit signature.au_result then [] else outputs in
+        [ token; inputs; R.Expr.tuple ~loc:l outputs ]
+      else [ token; inputs ]
 
 let resource_operation env = function
   | S.Qdot (Qid m, f) ->
@@ -1144,6 +1187,10 @@ and term_type env (t : S.term) =
       Result.ok
         (Source.ocaml_type env.ctx.env ~at:t.term_loc
            (S.PTtyapp (Qid (S.mk_id ~loc:t.term_loc "set"), [ ty ])))
+  | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (atomic_method env q) ->
+      let signature, method_ = Option.value_exn (atomic_method env q) in
+      Option.bind (atomic_inputs signature method_) ~f:(fun (_, outputs) ->
+          List.hd outputs)
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
       List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
   | Tvar (Qid { pid_str = x; _ }), _ ->
@@ -1204,6 +1251,17 @@ and application env (t : S.term) =
   match (head.term_desc, args) with
   | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       error head.term_loc "A local proof value cannot be called as a logical function"
+  | Tvar q, args when Option.is_some (atomic_method env q) ->
+      let signature, method_ = Option.value_exn (atomic_method env q) in
+      begin match (method_, atomic_inputs signature method_) with
+      | ("pending" | "committed"), Some (inputs, _) ->
+          let* values = typed_arguments env ~at inputs args in
+          let values = atomic_arguments ~loc:l signature method_ values in
+          let procedure = name ~loc:l signature.au_procedure in
+          if String.equal method_ "pending" then Ok (R.Expr.au ~loc:l procedure values)
+          else Ok (R.Expr.au_commit ~loc:l procedure values)
+      | _ -> error at "An AU operation is only allowed in a proof expression"
+      end
   | Tvar q, args when Option.is_some (logical_signature env q) ->
       logical_application env ~at (Option.value_exn (logical_signature env q)) args
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
@@ -1325,35 +1383,41 @@ and application env (t : S.term) =
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args)
   | _ -> unsupported at "A call of a function in a contract"
 
+and typed_arguments env ~at inputs args =
+  if List.length args <> List.length inputs then
+    error at (Printf.sprintf "Expected %d arguments" (List.length inputs))
+  else
+    all (List.zip_exn inputs args) ~f:(fun (ty, value) ->
+        let* () =
+          Source.check_logical_expression env.ctx.env
+            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
+            value
+        in
+        let* () =
+          match term_type env value with
+          | Some actual when not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
+              error value.term_loc
+                (Stdlib.Format.asprintf "Expected logical type %a but found %a"
+                   Printtyp.type_expr ty Printtyp.type_expr actual)
+          | _ -> Ok ()
+        in
+        let* value = expected_formula env (Some ty) value in
+        let* raven_type = typ env.ctx ~at ty in
+        Ok (R.Expr.annotated value raven_type))
+
 and logical_application env ~at signature args =
   let l = loc at in
-  if List.length args <> List.length signature.lemma_inputs then
-    error at
-      (Printf.sprintf "%s expects %d arguments" signature.lemma_raven
-         (List.length signature.lemma_inputs))
-  else
-    let* args =
-      all (List.zip_exn signature.lemma_inputs args) ~f:(fun (ty, value) ->
-          let* () =
-            Source.check_logical_expression env.ctx.env
-              ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
-              value
-          in
-          let* () =
-            match term_type env value with
-            | Some actual when not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
-                error value.term_loc
-                  (Stdlib.Format.asprintf "Expected logical type %a but found %a"
-                     Printtyp.type_expr ty Printtyp.type_expr actual)
-            | _ -> Ok ()
-          in
-          let* value = expected_formula env (Some ty) value in
-          let* raven_type = typ env.ctx ~at ty in
-          Ok (R.Expr.annotated value raven_type))
-    in
-    let n = qualified_name ~loc:l signature.lemma_raven in
-    if String.is_suffix signature.lemma_raven ~suffix:".id" then Ok (R.Expr.var ~loc:l n)
-    else Ok (R.Expr.call ~loc:l n args)
+  let* () =
+    if List.length args = List.length signature.lemma_inputs then Ok ()
+    else
+      error at
+        (Printf.sprintf "%s expects %d arguments" signature.lemma_raven
+           (List.length signature.lemma_inputs))
+  in
+  let* args = typed_arguments env ~at signature.lemma_inputs args in
+  let n = qualified_name ~loc:l signature.lemma_raven in
+  if String.is_suffix signature.lemma_raven ~suffix:".id" then Ok (R.Expr.var ~loc:l n)
+  else Ok (R.Expr.call ~loc:l n args)
 
 (** The OCaml types of the names that the pattern [p] binds, matching a value of type [t].
 *)
@@ -1738,12 +1802,64 @@ let proof_statement env = function
 
 type proof_target = { target_name : string; target_type : Types.type_expr }
 
+let atomic_proof_signature env t =
+  let head, _ = spine t [] in
+  match head.S.term_desc with
+  | Tvar q ->
+      Option.bind (atomic_method env q) ~f:(fun (signature, method_) ->
+          if List.mem [ "bind"; "access"; "abort"; "commit" ] method_ ~equal:String.equal
+          then
+            Option.map (atomic_inputs signature method_) ~f:(fun (inputs, outputs) ->
+                {
+                  lemma_raven = qualid_key q;
+                  lemma_inputs = inputs;
+                  lemma_outputs = outputs;
+                })
+          else None)
+  | _ -> None
+
+let proof_call env t =
+  let head, args = spine t [] in
+  match head.S.term_desc with
+  | Tvar q when Option.is_some (atomic_proof_signature env t) ->
+      let signature, method_ = Option.value_exn (atomic_method env q) in
+      let inputs, outputs = Option.value_exn (atomic_inputs signature method_) in
+      let* values = typed_arguments env ~at:t.term_loc inputs args in
+      let* () =
+        if
+          String.equal method_ "bind"
+          && not
+               (Option.equal String.equal env.ctx.current_procedure
+                  (Some signature.au_procedure))
+        then error t.term_loc "An AU token can only be bound in its own procedure"
+        else Ok ()
+      in
+      let l = loc t.term_loc in
+      let values =
+        if String.equal method_ "bind" then []
+        else atomic_arguments ~loc:l signature method_ values
+      in
+      let method_ =
+        match method_ with
+        | "bind" -> "bindAU"
+        | "access" -> "openAU"
+        | "abort" -> "abortAU"
+        | "commit" -> "commitAU"
+        | _ -> method_
+      in
+      Ok (R.Expr.call ~loc:l (name ~loc:l method_) values, outputs)
+  | _ -> lemma_call env t
+
 let proof_signature env (t : S.term) =
   let head, _ = spine t [] in
-  match head.term_desc with
-  | Tvar (Qid id) when not (List.Assoc.mem env.vars id.pid_str ~equal:String.equal) ->
-      List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal
-  | _ -> None
+  match atomic_proof_signature env t with
+  | Some _ as signature -> signature
+  | None ->
+      begin match head.term_desc with
+      | Tvar (Qid id) when not (List.Assoc.mem env.vars id.pid_str ~equal:String.equal) ->
+          List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal
+      | _ -> None
+      end
 
 let ghost_fpu env t =
   let _, args = spine t [] in
@@ -2092,7 +2208,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
   | Proof_value t ->
       begin match proof_signature env t with
       | Some _ ->
-          let* call, outputs = lemma_call env t in
+          let* call, outputs = proof_call env t in
           if List.length outputs = List.length targets then
             if List.is_empty targets then Ok [ R.Stmt.call ~loc:l call ]
             else
@@ -5139,6 +5255,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
       preds;
       facts = [];
       au = None;
+      current_procedure = None;
       manual = false;
       access_proofs = [];
       initializations = [];
@@ -5626,6 +5743,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       preds;
       facts = [];
       au = None;
+      current_procedure = Some proc_name;
       manual = f.manual;
       access_proofs;
       initializations;
@@ -5768,11 +5886,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
         });
   let atomic = Option.exists f.contract ~f:(fun c -> c.atomic) in
   let* () =
-    if f.manual && atomic then
-      error f.loc
-        "Manual proofs of atomic contracts require explicit AU support, which is not \
-         available yet"
-    else if f.manual && f.trusted then error f.loc "A manual proof cannot also be trusted"
+    if f.manual && f.trusted then error f.loc "A manual proof cannot also be trusted"
     else Ok ()
   in
   let atomic_pres =
@@ -5819,7 +5933,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   in
   let* atomic_ensures = postconditions ~atomic:true atomic_posts in
   let* bind_au =
-    if atomic then
+    if atomic && not f.manual then
       atomic_update ctx env ~at:f.loc ~self:proc_name
         ~role:(Option.value f.role ~default:(Ident.name f.id))
         ~result:(Option.some_if (not (List.is_empty returns)) result_name)
@@ -7443,6 +7557,7 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     preds;
     facts = [];
     au = None;
+    current_procedure = None;
     manual = false;
     access_proofs = [];
     initializations = [];
@@ -7946,7 +8061,7 @@ let predicates (source : Source.t) =
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
       | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _ | Proof_resource _
-      | Proof_field _ | Proof_function _ ->
+      | Proof_field _ | Proof_function _ | Proof_au _ ->
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
@@ -8217,13 +8332,34 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let types = List.concat (List.concat library_types) @ types @ source.proof_types in
   (* The data types, and the sequences of specifications, which have no module. *)
+  let pure = pure_functions funcs in
+  let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
+  let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
+  let* atomic_operations =
+    all source.proof_aus ~f:(fun (au : Source.proof_au) ->
+        match
+          List.find funcs ~f:(fun f -> Path.same au.au_operation_path (Path.Pident f.id))
+        with
+        | None ->
+            error au.au_at "An AU facade must name a procedure in this implementation"
+        | Some f when not (Option.exists f.contract ~f:(fun c -> c.atomic)) ->
+            error au.au_at "An AU facade requires a logically atomic contract"
+        | Some f when not (List.is_empty (ghost_params f)) ->
+            unsupported au.au_at "An AU facade for a procedure with ghost parameters"
+        | Some f -> Ok (au, f))
+  in
+  let token_types =
+    List.map atomic_operations ~f:(fun (au, f) ->
+        Datatypes.atomic_token ~path:au.Source.au_token_path ~procedure:(proc_name f)
+          ~at:au.au_at)
+  in
   let data_types = types in
   let resource_types =
     List.concat_map source.proof_resources ~f:(fun r ->
         r.Source.resource_descriptor :: r.resource_aliases)
   in
   let types =
-    types @ resource_types @ source.logical_types
+    types @ resource_types @ token_types @ source.logical_types
     @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
   (* Each data type's module, given the ones declared before it; a record type that is a
@@ -8236,7 +8372,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
              (List.take data_types i, d)))
       ~f:(fun (before, d) ->
         let* member =
-          Datatypes.member (before @ resource_types @ source.logical_types) d
+          Datatypes.member
+            (before @ resource_types @ token_types @ source.logical_types)
+            d
         in
         Ok (d.Datatypes.module_name, member))
   in
@@ -8281,10 +8419,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* record_fields = Datatypes.fields types in
   let refs = ref [] in
   let primitives = ref [] in
-  let pure = pure_functions funcs in
-  let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
-  (* A pure function's procedure is named apart from its function. *)
-  let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
   let functions = List.map funcs ~f:(fun f -> (Ident.unique_name f.id, proc_name f)) in
   let lifted =
     List.filter_map funcs ~f:(fun f ->
@@ -8369,6 +8503,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let proof_support =
     {
+      atomic_updates = [];
       resources = source.proof_resources;
       ghost_fields = source.proof_fields;
       logical_functions;
@@ -8378,6 +8513,41 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
+  in
+  let* atomic_updates =
+    all atomic_operations ~f:(fun (au_source, f) ->
+        let ctx =
+          spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env ~preds
+            ~spec_funcs ~proof_support origins
+        in
+        let* formals = formals ctx f in
+        let* _, _, implicit, _ =
+          contract_env ctx ~spec_funcs f formals ~result:"result"
+        in
+        let au_inputs =
+          List.filter_map f.params ~f:(fun p ->
+              match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
+        in
+        Ok
+          {
+            au_source;
+            au_procedure = proc_name f;
+            au_inputs;
+            au_result = f.body.exp_type;
+            au_implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
+          })
+  in
+  let proof_support = { proof_support with atomic_updates } in
+  let atomic_predicates =
+    List.concat_map atomic_updates ~f:(fun signature ->
+        List.map [ "pending"; "committed" ] ~f:(fun method_ ->
+            let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
+            let key = signature.au_source.au_name ^ "." ^ method_ in
+            (key, (key, inputs))))
+  in
+  let preds = preds @ atomic_predicates in
+  let spec_funcs =
+    spec_funcs @ List.map atomic_predicates ~f:(fun (key, _) -> (key, key))
   in
   let lemma_declarations =
     List.filter source.proof ~f:(function S.Proof_lemma _ -> true | _ -> false)

@@ -184,6 +184,13 @@ proof:
 
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
+| MODULE n = uident EQUAL ghost = uident DOT au = uident LEFTPAR STRUCT
+    LET operation = lident EQUAL target = lqualid END RIGHTPAR
+    { if ghost.pid_str <> "Ghost" || au.pid_str <> "AU" then
+        raise (Syntax_error (mk_loc $loc(ghost), "Expected Ghost.AU"));
+      if operation.pid_str <> "operation" then
+        raise (Syntax_error (operation.pid_loc, "An AU argument must define operation"));
+      Proof_au { au_name = n; au_operation = target } }
 | MODULE n = uident EQUAL f = uident LEFTPAR STRUCT TYPE t = lident
     EQUAL ty = typ END RIGHTPAR
     { if f.pid_str <> "SetRA" then
@@ -800,16 +807,19 @@ lident_op:
 qualid:
 | id = ident_rich                  { Qid id }
 | q = uqualid DOT id = ident_rich  { Qdot (q, id) }
+| q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
 ;
 
 lqualid_rich:
 | id = lident_rich                 { Qid id }
 | q = uqualid DOT id = lident_rich { Qdot (q, id) }
+| q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
 ;
 
 lqualid:
 | id = lident                      { Qid id }
 | q = uqualid DOT id = lident      { Qdot (q, id) }
+| q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
 ;
 
 uqualid:
