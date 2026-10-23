@@ -16,10 +16,10 @@ Proofs that do not fit their interface; each file has its own run.
   [Error] File "proof_error_3.proof", line 1, columns 10-18:
   1 | predicate is_stack (t : t) = own t []
                 ^^^^^^^^
-  Type Error: The predicate is_stack is declared [@persistent], so it is defined as an invariant.
-  File "proof_error_3.mli", line 2, columns 0-47:
-  2 | (*@ predicate is_stack (t : t) [@persistent] *)
-      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: The invariant is_stack must be defined as an invariant.
+  File "proof_error_3.mli", line 2, columns 0-33:
+  2 | (*@ invariant is_stack (t : t) *)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: Its declaration.
   [1]
   $ caravan --shh proof_error_4.ml

@@ -3,7 +3,7 @@
 
 type t
 
-(*@ predicate is_queue (q : t) [@persistent] *)
+(*@ invariant is_queue (q : t) *)
 (*@ predicate queue (q : t) (xs : int sequence) *)
 
 val create : unit -> t

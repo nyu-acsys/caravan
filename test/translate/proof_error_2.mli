@@ -1,2 +1,2 @@
 type t
-(*@ predicate is_stack (t : t) [@persistent] *)
+(*@ invariant is_stack (t : t) *)

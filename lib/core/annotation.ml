@@ -70,7 +70,19 @@ let parse (annotation : t) entry =
   | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
   | Spec_ast.Syntax_error (loc, message) -> Error (Report.error Syntax loc message)
 
-let predicate (annotation : t) = parse annotation Spec_parser.predicate
+(** Interface invariants declare resources; implementation invariants annotate loops. *)
+let invariant_declaration (annotation : t) =
+  Poly.equal (kind annotation) Loop
+  && String.is_prefix (String.strip annotation.text) ~prefix:"invariant"
+
+let predicate_declaration ~interface annotation =
+  Poly.equal (kind annotation) Predicate || (interface && invariant_declaration annotation)
+
+let predicate (annotation : t) =
+  parse annotation
+    (if invariant_declaration annotation then Spec_parser.invariant_declaration
+     else Spec_parser.predicate)
+
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
 let linearization (annotation : t) = parse annotation Spec_parser.linearization
 let initially (annotation : t) = parse annotation Spec_parser.initially

@@ -31,7 +31,7 @@ All notable changes to this project will be documented in this file.
 - Actions describe ghost-state transitions, infer matching atomic steps, and check that growing fields remain monotone.
 - Pending-call registrations and helping actions support proofs in which another operation completes a call.
 - Ghost parameters can be declared in contracts and inferred at call sites.
-- Trusted library interfaces support abstract types, values, predicates, and function contracts.
+- Trusted library interfaces support abstract types, invariant and predicate declarations, and ordinary and logically atomic function contracts.
 - Functions marked `trusted` assume their contracts and emit a warning.
 - Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
 - Saturn's Treiber stack and Michael-Scott queue are included as case studies, with a separate List/segment queue proof covering the full empty-check helping protocol.

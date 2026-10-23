@@ -4,7 +4,7 @@
 
 type t
 
-(*@ predicate is_stack (t : t) [@persistent] *)
+(*@ invariant is_stack (t : t) *)
 (*@ predicate stack (t : t) (xs : int list) *)
 
 val create : unit -> t

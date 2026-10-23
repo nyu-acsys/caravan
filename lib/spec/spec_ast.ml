@@ -121,7 +121,8 @@ type predicate = {
   pred_name : id;
   pred_params : (id * pty) list;
   pred_body : term option;  (** [None] for a declaration in an interface. *)
-  pred_persistent : bool;  (** [[@persistent]]: duplicable, as an invariant. *)
+  pred_persistent : bool;
+      (** An invariant declaration, duplicable and distinct from ordinary predicates. *)
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
 

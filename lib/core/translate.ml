@@ -5914,6 +5914,27 @@ and implicit_vars env (f : func) =
            t,
            R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ )))
 
+(** Translates each contract channel, quantifying its postcondition-only names. *)
+let contract_postconditions env ~at ?atomic posts =
+  let l = loc at in
+  let* free = free_typed env posts ~at in
+  match (free, posts) with
+  | [], _ | _, [] ->
+      all posts ~f:(fun t ->
+          Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
+  | _ ->
+      let env =
+        List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
+            { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+      in
+      let* posts = all posts ~f:(formula env) in
+      let conj = List.reduce_exn posts ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
+      let vars =
+        List.map free ~f:(fun (_, raven, _, typ, var_loc) ->
+            R.Var.make ~loc:var_loc (ident ~loc:var_loc raven) typ)
+      in
+      Ok [ R.Spec.make ?atomic (R.Expr.exists ~loc:l vars conj) ]
+
 (** The function that contracts call for [f], defined by its body; [funcs] are the
     functions it may call, by their OCaml identifiers' unique names, and [spec_funcs] by
     their OCaml names. Its postconditions are those of [f], under the preconditions that
@@ -6626,25 +6647,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   ctx.facts <- facts;
   (* Names free in the postconditions are existentially quantified, as [j] in
      [ensures own c.count j]. *)
-  let postconditions ?atomic posts =
-    let* free = free_typed env posts ~at:f.loc in
-    match (free, posts) with
-    | [], _ | _, [] ->
-        all posts ~f:(fun t ->
-            Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
-    | _ ->
-        let env =
-          List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
-              { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
-        in
-        let* posts = all posts ~f:(formula env) in
-        let conj = List.reduce_exn posts ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
-        let vars =
-          List.map free ~f:(fun (_, raven, _, typ, l) ->
-              R.Var.make ~loc:l (ident ~loc:l raven) typ)
-        in
-        Ok [ R.Spec.make ?atomic (R.Expr.exists ~loc:l vars conj) ]
-  in
+  let postconditions = contract_postconditions env ~at:f.loc in
   let* ensures =
     postconditions (Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures))
   in
@@ -8056,8 +8059,6 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result
            ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
            x None)
   | [], Some _ -> unsupported at "A contract of a library's value other than a function"
-  | _, Some { atomic = true; _ } ->
-      unsupported at "An atomic contract of a library's function"
   | _ ->
       let header = Option.bind contract ~f:(fun c -> c.header) in
       let* result_name, names =
@@ -8107,31 +8108,36 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result
           vars = List.map named ~f:(fun (n, raven, _) -> (n, Raven raven));
         }
       in
+      let env =
+        if is_unit result then bind env result_name (Value (unit_value ~loc:l)) else env
+      in
       let requires = Option.value_map contract ~default:[] ~f:(fun c -> c.requires) in
-      let ensures = Option.value_map contract ~default:[] ~f:(fun c -> c.ensures) in
-      let* implicit = free_typed env requires ~at in
+      let atomic_requires =
+        Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_requires)
+      in
+      let* implicit = free_typed env (requires @ atomic_requires) ~at in
       let env =
         List.fold implicit ~init:env ~f:(fun env (n, raven, t, _, _) ->
             { (bind env n (Raven raven)) with var_types = (n, t) :: env.var_types })
       in
-      let* requires = all requires ~f:(formula env) in
-      let* existentials = free_typed env ensures ~at in
-      let post_env =
-        List.fold existentials ~init:env ~f:(fun env (n, raven, t, _, _) ->
-            { (bind env n (Raven raven)) with var_types = (n, t) :: env.var_types })
+      let clauses ?atomic terms =
+        all terms ~f:(fun t ->
+            Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
       in
-      let* ensures = all ensures ~f:(formula post_env) in
-      let ensures =
-        match (existentials, ensures) with
-        | [], _ | _, [] -> ensures
-        | _ ->
-            [
-              R.Expr.exists ~loc:l
-                (List.map existentials ~f:(fun (_, raven, _, typ, _) ->
-                     R.Var.make ~loc:l (ident ~loc:l raven) typ))
-                (List.reduce_exn ensures ~f:(fun a b -> R.Expr.binary ~loc:l And a b));
-            ]
+      let* requires = clauses requires in
+      let* atomic_requires = clauses ~atomic:true atomic_requires in
+      let* ensures =
+        contract_postconditions env ~at
+          (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
       in
+      let* atomic_ensures =
+        contract_postconditions env ~at ~atomic:true
+          (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
+      in
+      let in_range =
+        List.filter_map params ~f:(fun (_, raven, typ, _) -> range_spec ~loc:l typ raven)
+      in
+      let result_in_range = Option.to_list (range_spec ~loc:l result "r") in
       Ok
         (R.Callable.proc ~loc:l
            ~formals:
@@ -8139,8 +8145,8 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result
              @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
                  R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ))
            ~returns
-           ~requires:(List.map requires ~f:R.Spec.make)
-           ~ensures:(List.map ensures ~f:R.Spec.make)
+           ~requires:(in_range @ requires @ atomic_requires)
+           ~ensures:(result_in_range @ ensures @ atomic_ensures)
            x None)
 
 (** The lemmas checking that the actions of [st] keep its history's order: that each makes
@@ -8781,19 +8787,20 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
     predicate, and a view an exclusive one, whose value has the type of the declaration's
     last parameter. *)
 let predicates ~data (source : Source.t) =
-  let of_annotations comments =
+  let of_annotations ~interface comments =
     all
-      (List.filter (Annotation.of_comments comments) ~f:(fun a ->
-           Poly.equal (Annotation.kind a) Annotation.Predicate))
+      (List.filter
+         (Annotation.of_comments comments)
+         ~f:(Annotation.predicate_declaration ~interface))
       ~f:(fun a ->
         let* p = Annotation.predicate a in
         Ok (a.loc, p))
   in
   let* declared =
     Option.value_map source.interface ~default:(Ok []) ~f:(fun i ->
-        of_annotations i.interface_comments)
+        of_annotations ~interface:true i.interface_comments)
   in
-  let* annotated = of_annotations source.comments in
+  let* annotated = of_annotations ~interface:false source.comments in
   let name (p : S.predicate) = p.pred_name.pid_str in
   let declaration x = List.find declared ~f:(fun (_, p) -> String.equal (name p) x) in
   let states =
@@ -8912,12 +8919,10 @@ let predicates ~data (source : Source.t) =
         error def_at
           ~related:[ (at, "Its declaration") ]
           (if p.pred_persistent then
-             Printf.sprintf
-               "The predicate %s is declared [@persistent], so it is defined as an \
-                invariant"
-               (name p)
+             Printf.sprintf "The invariant %s must be defined as an invariant" (name p)
            else
-             Printf.sprintf "The invariant %s is declared without [@persistent]" (name p))
+             Printf.sprintf "The predicate %s must be defined as an ordinary predicate"
+               (name p))
     | None, (def_at, definition, _, def_types) :: _ ->
         let* declared_outputs = predicate_output_count data p types in
         let* defined_outputs = predicate_output_count data definition def_types in
@@ -9307,8 +9312,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           | PTtyvar _ -> t
         in
         all
-          (List.filter (Annotation.of_comments lib.library.interface_comments)
-             ~f:(fun a -> Poly.equal (Annotation.kind a) Annotation.Predicate))
+          (List.filter
+             (Annotation.of_comments lib.library.interface_comments)
+             ~f:(Annotation.predicate_declaration ~interface:true))
           ~f:(fun a ->
             let* p = Annotation.predicate a in
             let* () =
@@ -9741,8 +9747,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                   (lib.library_name ^ "." ^ p.pred_name.pid_str, types) ))
         in
         (* In the library's contracts, its predicates go by their own names. *)
+        let own_inputs =
+          List.filter_map own_preds ~f:(fun (local, (qualified, _)) ->
+              Option.map
+                (List.Assoc.find proof_support.predicate_inputs qualified
+                   ~equal:String.equal) ~f:(fun inputs -> (local, inputs)))
+        in
+        let proof_support =
+          {
+            proof_support with
+            predicate_inputs = own_inputs @ proof_support.predicate_inputs;
+          }
+        in
         let ctx =
-          spec_context types ~refs ~primitives ~shared ~ocaml_env
+          spec_context types ~refs ~primitives ~shared ~ocaml_env ~proof_support
             ~preds:(own_preds @ preds)
             ~spec_funcs:
               (List.map own_preds ~f:(fun (p, (raven, _)) -> (p, raven)) @ spec_funcs)
@@ -9760,11 +9778,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               in
               (* Libraries share the program's predicate output convention. *)
               let* outputs = predicate_output_count types p param_types in
+              let outputs = if p.pred_persistent then 0 else outputs in
               let inputs, outputs = List.split_n params (List.length params - outputs) in
+              let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
               Ok
                 (R.Member.free
                    (R.Member.callable
-                      (R.Callable.func ~loc:l ~kind:Pred ~formals:(List.map inputs ~f:snd)
+                      (R.Callable.func ~loc:l ~kind ~formals:(List.map inputs ~f:snd)
                          ~returns:(List.map outputs ~f:snd)
                          (ident ~loc:l p.pred_name.pid_str)
                          None))))
@@ -9783,7 +9803,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                     match Types.get_desc t with
                     | Tarrow (Nolabel, a, r, _) ->
                         let args, result = arrows r in
-                        (a :: args, result)
+                        (Datatypes.expand types a :: args, result)
                     | Tpoly (t, []) -> arrows t
                     | _ -> ([], t)
                   in

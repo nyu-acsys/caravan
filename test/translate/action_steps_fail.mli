@@ -1,6 +1,6 @@
 type t
 
-(*@ predicate is_counter (c : t) [@persistent] *)
+(*@ invariant is_counter (c : t) *)
 (*@ predicate counter (c : t) (n : int) *)
 
 val create : unit -> t

@@ -141,6 +141,7 @@
 %start <Spec_ast.return_adapter> return_adapter
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
+%start <Spec_ast.predicate> invariant_declaration
 %start <Spec_ast.proof_decl list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
@@ -197,10 +198,16 @@ predicate:
 | p = predicate_decl EOF { p }
 ;
 
+invariant_declaration:
+| INVARIANT n = lident ps = pred_param+ EOF
+    { { pred_name = n; pred_params = ps; pred_body = None;
+        pred_persistent = true } }
+;
+
 predicate_decl:
-| PREDICATE n = lident ps = predicate_param+ a = ATTRIBUTE? t = preceded(EQUAL, term)?
+| PREDICATE n = lident ps = predicate_param+ t = preceded(EQUAL, term)?
     { { pred_name = n; pred_params = ps; pred_body = t;
-        pred_persistent = (a = Some "persistent") } }
+        pred_persistent = false } }
 ;
 
 (* The declarations of a proof file. *)

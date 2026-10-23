@@ -19,6 +19,28 @@ validate the implementation against it before verification. Abstract interface
 types, private implementation bindings, and monomorphic interface specializations
 of polymorphic implementations are supported.
 
+Interface-only dependencies found locally or through `-I` expose assumed contracts
+to clients, including logically atomic contracts. For example:
+
+```ocaml
+type t
+(*@ invariant shared (cell : t) *)
+(*@ predicate contents (cell : t) (value : int) *)
+
+val read : t -> int
+(*@ result = atomic read cell
+    requires shared cell
+    atomic requires contents cell value
+    atomic ensures contents cell value && result = value *)
+```
+
+An interface `invariant` declares a duplicable resource whose definition uses
+`invariant` in the implementation's `.proof` file. A `predicate` declares an
+ordinary resource predicate. Imported contracts retain ordinary and atomic
+clauses separately; Raven checks ownership and invariant restoration at calls.
+Their implementations must be verified separately against the same interface.
+A logically atomic contract does not declare a physically atomic operation.
+
 Proof files also support checked lemmas and monomorphic logical variant types.
 A lemma has typed parameters and an expression body after `=`. Optional
 `returns`, `requires`, and `ensures` clauses state its contract explicitly.
