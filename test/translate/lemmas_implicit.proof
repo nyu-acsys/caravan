@@ -1,0 +1,87 @@
+lemma observe (cell : int Atomic.t) (value [@implicit] : int)
+  requires (own cell value)
+  ensures (own cell value) =
+  ()
+
+lemma read (cell : int Atomic.t) (value [@implicit] : int)
+  returns (result : int)
+  requires (own cell value)
+  ensures (own cell value)
+  ensures (result = value) =
+  value
+
+lemma read_twice (cell : int Atomic.t)
+  requires (own cell 7)
+  ensures (own cell 7) =
+  let first = read cell in
+  let second = read cell 7 in
+  assert (first = second)
+
+lemma sum (left : int Atomic.t) (right : int Atomic.t)
+    (left_value [@implicit] : int) (right_value [@implicit] : int)
+  returns (result : int)
+  requires (own left left_value && own right right_value)
+  ensures (own left left_value && own right right_value)
+  ensures (result = left_value + right_value) =
+  left_value + right_value
+
+lemma sum_owned (left : int Atomic.t) (right : int Atomic.t)
+  requires (own left 2 && own right 3)
+  ensures (own left 2 && own right 3) =
+  let total = sum left right in
+  assert (total = 5);
+  let total = sum left right 2 in
+  assert (total = 5)
+
+lemma reference_identity (anchor : int ref) (value [@implicit] : int ref)
+  returns (result : int ref)
+  ensures (result = value) =
+  value
+
+lemma use_reference_override (anchor : int ref) =
+  let result = reference_identity anchor anchor in
+  assert (result = anchor)
+
+lemma keep (cell : int Atomic.t) (fuel : int) (value [@implicit] : int)
+  requires (own cell value && fuel >= 0)
+  ensures (own cell value)
+  variant (fuel) =
+  if fuel > 0 then keep cell (fuel - 1) else ()
+
+lemma keep_owned (cell : int Atomic.t)
+  requires (own cell 7)
+  ensures (own cell 7) =
+  keep cell 3
+
+lemma nine (value [@implicit] : int)
+  returns (result : int)
+  requires (value = 9)
+  ensures (result = 9) =
+  value
+
+lemma use_nine =
+  let result = nine in
+  assert (result = 9)
+
+lemma same_list (values : int list) (saved [@implicit] : int list)
+  returns (result : int list)
+  requires (saved = values)
+  ensures (result = values) = saved
+
+lemma list_projections (values : int list)
+  requires (values <> []) =
+  let tail = same_list values.tl in
+  assert (tail = values.tl)
+
+lemma same_bool (value : bool) (saved [@implicit] : bool)
+  returns (result : bool)
+  requires (saved = value)
+  ensures (result = value) = saved
+
+lemma record_projection (record : projections) =
+  let value = same_bool record.tl in
+  assert (value = record.tl)
+
+lemma shadowed_projection (values : int list) (record : projections) =
+  let value = same_bool (let values = record in values.tl) in
+  assert (value = record.tl)

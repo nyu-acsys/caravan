@@ -28,6 +28,23 @@ Bodies can call other lemmas, use `if` and `match`, and check `assert` expressio
 As in OCaml, `assert false` can finish an unreachable branch of any result type;
 the assertion must still be proved. All lemma bodies are verified.
 
+Trailing lemma parameters can carry `[@implicit]` attributes:
+
+```ocaml
+lemma preserve (cell : int Atomic.t) (value [@implicit] : int)
+  requires (own cell value)
+  ensures (own cell value) =
+  ()
+```
+
+Calling `preserve cell` lets Raven infer `value` from the visible ownership.
+`preserve cell 7` supplies it explicitly. With several implicit parameters,
+callers may supply an initial part of that suffix and leave the rest inferred.
+All explicit parameters must precede implicit ones. Supplied arguments are
+checked against their OCaml types before translation. Inference uses Raven's
+existing witness computation; values hidden inside predicates or not determined
+by available resources may need explicit arguments.
+
 An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
 program code. In a proof body, `unfold p x {n}` names an existential to bind
 with `let value = ... in`, and `fold p x {n = value}` supplies its

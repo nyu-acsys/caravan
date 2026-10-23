@@ -371,6 +371,7 @@ type position = {
 type lemma_signature = {
   lemma_raven : string;
   lemma_inputs : Types.type_expr list;
+  lemma_implicit_count : int;
   lemma_outputs : Types.type_expr list;
 }
 
@@ -795,6 +796,7 @@ let resource_operation env = function
                 {
                   lemma_raven = m.pid_str ^ "." ^ op;
                   lemma_inputs = inputs;
+                  lemma_implicit_count = 0;
                   lemma_outputs = [ result ];
                 }))
   | _ -> None
@@ -1231,6 +1233,10 @@ and term_type env (t : S.term) =
       Option.first_some state
         (Option.bind (term_type env base) ~f:(fun ty ->
              match Datatypes.desc env.data ty with
+             | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list ->
+                 if String.equal f "hd" then Some elt
+                 else if String.equal f "tl" then Some ty
+                 else None
              | Tconstr (p, [], _) ->
                  Option.bind (Datatypes.find env.data p) ~f:(fun d ->
                      match d.ctors with
@@ -1407,12 +1413,17 @@ and application env (t : S.term) =
   | _ -> unsupported at "A call of a function in a contract"
 
 and typed_arguments env ~at inputs args =
+  let is_list t =
+    match Option.map (term_type env t) ~f:(Datatypes.desc env.data) with
+    | Some (Tconstr (p, [ _ ], _)) -> Path.same p Predef.path_list
+    | _ -> false
+  in
   if List.length args <> List.length inputs then
     error at (Printf.sprintf "Expected %d arguments" (List.length inputs))
   else
     all (List.zip_exn inputs args) ~f:(fun (ty, value) ->
         let* () =
-          Source.check_logical_expression env.ctx.env
+          Source.check_logical_expression ~is_list env.ctx.env
             ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
             value
         in
@@ -1762,14 +1773,21 @@ let lemma_call env (t : S.term) =
       begin match List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal with
       | None -> error id.pid_loc (Printf.sprintf "Unknown lemma %s" id.pid_str)
       | Some signature ->
-          if List.length args <> List.length signature.lemma_inputs then
+          let maximum = List.length signature.lemma_inputs in
+          let minimum = maximum - signature.lemma_implicit_count in
+          let arity = List.length args in
+          if arity < minimum || arity > maximum then
             error t.term_loc
-              (Printf.sprintf "Lemma %s expects %d arguments" id.pid_str
-                 (List.length signature.lemma_inputs))
+              (if minimum = maximum then
+                 Printf.sprintf "Lemma %s expects %d arguments" id.pid_str maximum
+               else
+                 Printf.sprintf "Lemma %s expects between %d and %d arguments" id.pid_str
+                   minimum maximum)
           else
             let* args =
-              all (List.zip_exn signature.lemma_inputs args) ~f:(fun (ty, arg) ->
-                  expected_formula env (Some ty) arg)
+              typed_arguments env ~at:t.term_loc
+                (List.take signature.lemma_inputs arity)
+                args
             in
             Ok
               ( R.Expr.call ~loc:(loc t.term_loc)
@@ -1836,6 +1854,7 @@ let atomic_proof_signature env t =
                 {
                   lemma_raven = qualid_key q;
                   lemma_inputs = inputs;
+                  lemma_implicit_count = 0;
                   lemma_outputs = outputs;
                 })
           else None)
@@ -8103,19 +8122,22 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       let signature =
         List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
       in
-      let declare (id, _) ty =
+      let declare ?(implicit = false) (id, _) ty =
         let* raven_type = typ ctx ~at:id.S.pid_loc ty in
         let raven = Names.fresh ctx.names id.pid_str in
         Ok
           ( id.pid_str,
             raven,
             ty,
-            R.Var.make ~loc:(loc id.pid_loc) ~ghost:true (ident ~loc:l raven) raven_type
-          )
+            R.Var.make ~loc:(loc id.pid_loc) ~ghost:true ~implicit (ident ~loc:l raven)
+              raven_type )
       in
       let* inputs =
         all (List.zip_exn lemma_params signature.lemma_inputs) ~f:(fun (parameter, ty) ->
-            declare parameter ty)
+            declare
+              ~implicit:
+                (List.mem (fst parameter).S.pid_attrs "implicit" ~equal:String.equal)
+              parameter ty)
       in
       let* outputs =
         all (List.zip_exn lemma_returns signature.lemma_outputs)
@@ -9045,6 +9067,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 {
                   lemma_raven = function_name.pid_str;
                   lemma_inputs;
+                  lemma_implicit_count = 0;
                   lemma_outputs = [ output ];
                 } )
         | _ -> error Location.none "Expected a logical function declaration")
@@ -9112,6 +9135,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           let types_of ps =
             all ps ~f:(fun (id, ty) -> Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
           in
+          let rec check_parameters seen_implicit = function
+            | [] -> Ok ()
+            | (id, _) :: rest ->
+                let implicit = List.mem id.S.pid_attrs "implicit" ~equal:String.equal in
+                if seen_implicit && not implicit then
+                  error id.pid_loc
+                    "Implicit lemma parameters must follow explicit parameters"
+                else check_parameters (seen_implicit || implicit) rest
+          in
+          let* () = check_parameters false lemma_params in
+          let lemma_implicit_count =
+            List.count lemma_params ~f:(fun (id, _) ->
+                List.mem id.S.pid_attrs "implicit" ~equal:String.equal)
+          in
           let* lemma_inputs = types_of lemma_params in
           let* lemma_outputs = types_of lemma_returns in
           if
@@ -9124,7 +9161,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           else
             Ok
               ( lemma_name.pid_str,
-                { lemma_raven = lemma_name.pid_str; lemma_inputs; lemma_outputs } )
+                {
+                  lemma_raven = lemma_name.pid_str;
+                  lemma_inputs;
+                  lemma_implicit_count;
+                  lemma_outputs;
+                } )
       | _ -> error Location.none "Expected a lemma declaration")
   in
   let* () =

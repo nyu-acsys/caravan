@@ -31,15 +31,9 @@ let rec fix_tail tail new_tail =
   let old_tail =
     Atomic.get tail
     (*@ Ghost.scope (fun step ->
-    let (root, head, last, cursor, retired_values, values, retired_fp, active_fp,
-      retired_links, active_links, waiting, waiting_on) = unfold is_queue q {root; head;
-      last; tail; retired_values; values; retired_fp; active_fp; retired_links;
-      active_links; waiting; waiting_on} in
+    unfold is_queue q;
     let result = step () in
-    fold is_queue q {root = root; head = head; last = last; tail = cursor;
-      retired_values = retired_values; values = values; retired_fp = retired_fp;
-      active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-      waiting = waiting; waiting_on = waiting_on};
+    fold is_queue q;
     result) *)
   in
   if
@@ -79,10 +73,7 @@ let rec fix_tail tail new_tail =
       segment_restore head new_tail next last before after before_fp after_fp before_links
         after_links value
     end;
-    fold is_queue q {root = root; head = head; last = last; tail = cursor;
-      retired_values = retired_values; values = values; retired_fp = retired_fp;
-      active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-      waiting = waiting; waiting_on = waiting_on};
+    fold is_queue q;
     result) *)
     == Nil
     && not
@@ -97,11 +88,7 @@ let rec fix_tail tail new_tail =
         active_fp (Finset.singleton last))) (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting;
       let result = step () in
-      fold is_queue q {root = root; head = head; last = last;
-        tail = (if result then new_tail else cursor); retired_values = retired_values;
-        values = values; retired_fp = retired_fp; active_fp = active_fp;
-        retired_links = retired_links; active_links = active_links; waiting = waiting;
-        waiting_on = waiting_on};
+      fold is_queue q {tail = (if result then new_tail else cursor)};
       result) *))
   then fix_tail tail new_tail
 (*@ Ghost.scope (fun invoke ->
@@ -191,14 +178,10 @@ let push { tail; _ } value =
             (Finset.union retired_links
               (Finset.union active_links (Finset.singleton (Edge (last, value, fresh)))))
             (Finset.union retired_fp (Finset.singleton head)) waiting);
-        fold is_queue q {root = root; head = head; last = fresh; tail = cursor;
-          retired_values = retired_values; values = (values @ [value]);
-          retired_fp = retired_fp;
+        fold is_queue q {last = fresh; values = (values @ [value]);
           active_fp = (Finset.union active_fp (Finset.singleton last));
-          retired_links = retired_links;
           active_links = (Finset.union active_links
-            (Finset.singleton (Edge (last, value, fresh))));
-          waiting = waiting; waiting_on = waiting_on}
+            (Finset.singleton (Edge (last, value, fresh))))}
       end else begin
       begin match exposure with
       | At_last -> ()
@@ -213,10 +196,7 @@ let push { tail; _ } value =
       end;
       fold queue q xs;
       Push.abort token q value;
-      fold is_queue q {root = root; head = head; last = last; tail = cursor;
-        retired_values = retired_values; values = values; retired_fp = retired_fp;
-        active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on}
+      fold is_queue q
       end;
       result) *))
     then
@@ -271,10 +251,7 @@ let push { tail; _ } value =
             (Finset.union retired_fp (Finset.singleton head)) waiting next;
           ()
         end;
-        fold is_queue q {root = root; head = head; last = last; tail = cursor;
-          retired_values = retired_values; values = values; retired_fp = retired_fp;
-          active_fp = active_fp; retired_links = retired_links;
-          active_links = active_links; waiting = waiting; waiting_on = waiting_on};
+        fold is_queue q;
         result) *)
       with
       | Nil -> find_tail_and_enq curr_end node
@@ -311,10 +288,7 @@ let push { tail; _ } value =
     is_queue_published_snapshot q (Finset.union retired_fp (Finset.union active_fp
       (Finset.singleton last))) (Finset.union retired_links active_links) (Finset.union
       retired_fp (Finset.singleton head)) waiting result;
-    fold is_queue q {root = root; head = head; last = last; tail = cursor;
-      retired_values = retired_values; values = values; retired_fp = retired_fp;
-      active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-      waiting = waiting; waiting_on = waiting_on};
+    fold is_queue q;
     (result, token)) *)
   in
   let linked =
@@ -389,14 +363,10 @@ let push { tail; _ } value =
           (Finset.union retired_links
             (Finset.union active_links (Finset.singleton (Edge (last, value, new_tail)))))
           (Finset.union retired_fp (Finset.singleton head)) waiting);
-      fold is_queue q {root = root; head = head; last = new_tail; tail = cursor;
-        retired_values = retired_values; values = (values @ [value]);
-        retired_fp = retired_fp;
+      fold is_queue q {last = new_tail; values = (values @ [value]);
         active_fp = (Finset.union active_fp (Finset.singleton last));
-        retired_links = retired_links;
         active_links = (Finset.union active_links
-          (Finset.singleton (Edge (last, value, new_tail))));
-        waiting = waiting; waiting_on = waiting_on}
+          (Finset.singleton (Edge (last, value, new_tail))))}
     end else begin
     begin match exposure with
     | At_last -> ()
@@ -411,10 +381,7 @@ let push { tail; _ } value =
     end;
     fold queue q xs;
     Push.abort token q value;
-    fold is_queue q {root = root; head = head; last = last; tail = cursor;
-      retired_values = retired_values; values = values; retired_fp = retired_fp;
-      active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-      waiting = waiting; waiting_on = waiting_on}
+    fold is_queue q
     end;
     (result, token)) *)
   in
@@ -470,10 +437,7 @@ let push { tail; _ } value =
           (Finset.union retired_fp (Finset.singleton head)) waiting next;
         ()
       end;
-      fold is_queue q {root = root; head = head; last = last; tail = cursor;
-        retired_values = retired_values; values = values; retired_fp = retired_fp;
-        active_fp = active_fp; retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on};
+      fold is_queue q;
       result) *)
     with
     | Nil -> find_tail_and_enq old_tail newnode
@@ -498,11 +462,7 @@ let push { tail; _ } value =
       (Finset.singleton last))) (Finset.union retired_links active_links) (Finset.union
       retired_fp (Finset.singleton head)) waiting;
     let result = step () in
-    fold is_queue q {root = root; head = head; last = last;
-      tail = (if result then new_tail else cursor); retired_values = retired_values;
-      values = values; retired_fp = retired_fp; active_fp = active_fp;
-      retired_links = retired_links; active_links = active_links; waiting = waiting;
-      waiting_on = waiting_on};
+    fold is_queue q {tail = (if result then new_tail else cursor)};
     result) *))
   then fix_tail tail new_tail
 (*@ Ghost.scope (fun invoke ->
@@ -525,11 +485,7 @@ let rec pop_opt q =
         (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
         (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting result;
-      fold is_queue q {root = root; head = head; last = last; tail = tail;
-        retired_values = retired_values; values = values;
-        retired_fp = retired_fp; active_fp = active_fp;
-        retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on};
+      fold is_queue q;
       result) *)
   in
   match
@@ -589,11 +545,7 @@ let rec pop_opt q =
             (Finset.union retired_fp (Finset.singleton head)) waiting
             (Edge (old_head, value, next))
       end;
-      fold is_queue q {root = root; head = head; last = last; tail = tail;
-        retired_values = retired_values; values = values;
-        retired_fp = retired_fp; active_fp = active_fp;
-        retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on};
+      fold is_queue q;
       result) *)
   with
   | Nil -> None
@@ -677,22 +629,17 @@ let rec pop_opt q =
                   (Finset.singleton (Edge (head, value, next)))) suffix_links)
                 (Finset.union (Finset.union retired_fp (Finset.singleton head))
                   (Finset.singleton next)) waiting);
-            fold is_queue q {root = root; head = next; last = last; tail = tail;
+            fold is_queue q {head = next;
               retired_values = retired_values @ [value]; values = rest;
               retired_fp = Finset.union retired_fp (Finset.singleton head);
               active_fp = suffix_fp;
               retired_links = Finset.union retired_links
                 (Finset.singleton (Edge (head, value, next)));
-              active_links = suffix_links;
-              waiting = waiting; waiting_on = waiting_on}
+              active_links = suffix_links}
           end else begin
             fold queue q xs;
             Pop.abort token q;
-            fold is_queue q {root = root; head = head; last = last; tail = tail;
-              retired_values = retired_values; values = values;
-              retired_fp = retired_fp; active_fp = active_fp;
-              retired_links = retired_links; active_links = active_links;
-              waiting = waiting; waiting_on = waiting_on}
+            fold is_queue q
           end;
           result) *)
       then Some value
@@ -720,11 +667,7 @@ let swing_tail q =
         (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
         (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting result;
-      fold is_queue q {root = root; head = head; last = last; tail = tail;
-        retired_values = retired_values; values = values;
-        retired_fp = retired_fp; active_fp = active_fp;
-        retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on};
+      fold is_queue q;
       result) *)
   in
   match
@@ -778,11 +721,7 @@ let swing_tail q =
             (Finset.union retired_fp (Finset.singleton head)) waiting
             (Edge (old_tail, value, next))
       end;
-      fold is_queue q {root = root; head = head; last = last; tail = tail;
-        retired_values = retired_values; values = values;
-        retired_fp = retired_fp; active_fp = active_fp;
-        retired_links = retired_links; active_links = active_links;
-        waiting = waiting; waiting_on = waiting_on};
+      fold is_queue q;
       result) *)
   with
   | Nil -> ()
@@ -808,17 +747,9 @@ let swing_tail q =
               (Finset.union active_fp (Finset.singleton last))));
           let result = step () in
           if result then
-            fold is_queue q {root = root; head = head; last = last; tail = next;
-              retired_values = retired_values; values = values;
-              retired_fp = retired_fp; active_fp = active_fp;
-              retired_links = retired_links; active_links = active_links;
-              waiting = waiting; waiting_on = waiting_on}
+            fold is_queue q {tail = next}
           else
-            fold is_queue q {root = root; head = head; last = last; tail = tail;
-              retired_values = retired_values; values = values;
-              retired_fp = retired_fp; active_fp = active_fp;
-              retired_links = retired_links; active_links = active_links;
-              waiting = waiting; waiting_on = waiting_on};
+            fold is_queue q;
           result) *)
       then ()
       else ()
@@ -864,11 +795,7 @@ let is_empty q =
           assert (xs <> []);
           fold queue q xs;
           Empty.commit token q false;
-          fold is_queue q {root = root; head = head; last = last; tail = tail;
-            retired_values = retired_values; values = values;
-            retired_fp = retired_fp; active_fp = active_fp;
-            retired_links = retired_links; active_links = active_links;
-            waiting = waiting; waiting_on = waiting_on};
+          fold is_queue q;
           Observed_link link
         end else begin
           let registration = Ghost.alloc [
@@ -888,11 +815,7 @@ let is_empty q =
             (Finset.union retired_links active_links)
             (Finset.union retired_fp (Finset.singleton head))
             (Finset.union waiting (Finset.singleton registration)) registration;
-          fold is_queue q {root = root; head = head; last = last; tail = tail;
-            retired_values = retired_values; values = values;
-            retired_fp = retired_fp; active_fp = active_fp;
-            retired_links = retired_links; active_links = active_links;
-            waiting = Finset.union waiting (Finset.singleton registration);
+          fold is_queue q {waiting = Finset.union waiting (Finset.singleton registration);
             waiting_on = Map.set waiting_on registration result};
           Waiting_on registration
         end
@@ -978,11 +901,7 @@ let is_empty q =
         fold waiting_registration registration q
           {token = token; linked = linked; retired = true}
     end;
-    fold is_queue q {root = root; head = head; last = last; tail = tail;
-      retired_values = retired_values; values = values;
-      retired_fp = retired_fp; active_fp = active_fp;
-      retired_links = retired_links; active_links = active_links;
-      waiting = waiting; waiting_on = waiting_on};
+    fold is_queue q;
     (result, observation)) *)
   in
   observed == Nil

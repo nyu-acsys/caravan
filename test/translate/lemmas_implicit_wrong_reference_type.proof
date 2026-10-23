@@ -1,0 +1,6 @@
+lemma identity (value [@implicit] : int ref) returns (result : int ref)
+  ensures (result = value) = value
+
+lemma wrong (value : bool ref) =
+  let result = identity value in
+  ()

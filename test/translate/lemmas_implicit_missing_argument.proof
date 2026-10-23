@@ -1,0 +1,8 @@
+lemma read (cell : int Atomic.t) (value [@implicit] : int)
+  returns (result : int)
+  requires (own cell value)
+  ensures (own cell value && result = value) = value
+
+lemma missing =
+  let result = read in
+  ()

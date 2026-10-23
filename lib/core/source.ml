@@ -916,9 +916,26 @@ let logical_constructor q =
   String.equal last "[]" || String.equal last "::" || String.equal last "()"
   || match String.get last 0 with 'A' .. 'Z' -> true | _ -> false
 
-let rec logical_expression ~functions (term : S.term) =
+let rec logical_pattern_names (pattern : S.pat) =
+  match pattern.pat_desc with
+  | Pid id -> [ id.pid_str ]
+  | Ptuple patterns -> List.concat_map patterns ~f:logical_pattern_names
+  | Pcast (pattern, _) -> logical_pattern_names pattern
+  | Pconstr (_, Some pattern) -> logical_pattern_names pattern
+  | Pwild | Pconst _ | Pconstr (_, None) -> []
+
+let shadow_list_projection is_list names =
+  let rec shadowed (term : S.term) =
+    match term.term_desc with
+    | Tvar (Qid id) -> List.mem names id.pid_str ~equal:String.equal
+    | Tfield (base, _) -> shadowed base
+    | _ -> false
+  in
+  fun term -> (not (shadowed term)) && is_list term
+
+let rec logical_expression ~functions ~is_list (term : S.term) =
   let loc = term.term_loc in
-  let exp = logical_expression ~functions in
+  let exp = logical_expression ~functions ~is_list in
   let apply callee args =
     Ast_helper.Exp.apply ~loc callee
       (List.map args ~f:(fun arg -> (Asttypes.Nolabel, arg)))
@@ -962,7 +979,8 @@ let rec logical_expression ~functions (term : S.term) =
       Ok (Ast_helper.Exp.ifthenelse ~loc condition yes (Some no))
   | Tlet (pattern, rhs, body) ->
       let* rhs = exp rhs in
-      let* body = exp body in
+      let is_list = shadow_list_projection is_list (logical_pattern_names pattern) in
+      let* body = logical_expression ~functions ~is_list body in
       Ok
         (Ast_helper.Exp.let_ ~loc Nonrecursive
            [ Ast_helper.Vb.mk ~loc (logical_pattern pattern) rhs ]
@@ -972,7 +990,10 @@ let rec logical_expression ~functions (term : S.term) =
       let* cases =
         Result.all
           (List.map cases ~f:(fun (pattern, body) ->
-               let* body = exp body in
+               let is_list =
+                 shadow_list_projection is_list (logical_pattern_names pattern)
+               in
+               let* body = logical_expression ~functions ~is_list body in
                Ok (Ast_helper.Exp.case (logical_pattern pattern) body)))
       in
       Ok (Ast_helper.Exp.match_ ~loc value cases)
@@ -984,27 +1005,39 @@ let rec logical_expression ~functions (term : S.term) =
       let* values = Result.all (List.map values ~f:exp) in
       Ok (Ast_helper.Exp.tuple ~loc (List.map values ~f:(fun value -> (None, value))))
   | Tquant (_, binders, body) ->
-      let* body = exp body in
+      let names = List.map binders ~f:(fun (id, _) -> id.S.pid_str) in
+      let is_list = shadow_list_projection is_list names in
+      let* body = logical_expression ~functions ~is_list body in
       Ok
         (List.fold_right binders ~init:body ~f:(fun (id, typ) body ->
              apply
                (logical_helper ~loc [ "quantify" ])
                [ logical_lambda ~loc id typ body ]))
   | Tcomprehension ((id, typ), body) ->
-      let* body = exp body in
+      let is_list = shadow_list_projection is_list [ id.pid_str ] in
+      let* body = logical_expression ~functions ~is_list body in
       Ok
         (apply
            (logical_helper ~loc [ "Set"; "of_predicate" ])
            [ logical_lambda ~loc id (Some typ) body ])
+  | Tfield (base, Qid { pid_str = ("hd" | "tl") as field; _ }) when is_list base ->
+      let* base = exp base in
+      let id name = S.mk_id ~loc name in
+      let callee =
+        Ast_helper.Exp.ident ~loc
+          { txt = longident (Qdot (Qdot (Qid (id "Stdlib"), id "List"), id field)); loc }
+      in
+      Ok (apply callee [ base ])
   | Tfield (value, field) ->
       let* value = exp value in
       Ok (Ast_helper.Exp.field ~loc value { txt = longident field; loc })
   | Tattr (_, value) | Told value -> exp value
 
 (** Types logical expressions before Raven erases reference element types. *)
-let type_logical_expression env ~functions ~variables ?expected (term : S.term) =
+let type_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
+    ?expected (term : S.term) =
   try
-    let* expression = logical_expression ~functions term in
+    let* expression = logical_expression ~functions ~is_list term in
     let env =
       (Typemod.type_interface env
          (Parse.interface (Lexing.from_string logical_check_signature)))
@@ -1075,8 +1108,8 @@ let infer_logical_expression env ~functions ~variables term :
     (Types.type_expr, Report.error) Result.t =
   type_logical_expression env ~functions ~variables term
 
-let check_logical_expression env ~functions ~variables ~expected term =
-  Result.map (type_logical_expression env ~functions ~variables ~expected term)
+let check_logical_expression ?is_list env ~functions ~variables ~expected term =
+  Result.map (type_logical_expression ?is_list env ~functions ~variables ~expected term)
     ~f:(fun _ -> ())
 
 let check_logical_function env ~functions = function

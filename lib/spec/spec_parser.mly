@@ -232,7 +232,7 @@ proof_decl:
 | LET n = lident ps = pred_param+ COLON ty = typ EQUAL body = term
     { Proof_function { function_name = n; function_params = ps;
         function_result = ty; function_body = body } }
-| LEMMA n = lident ps = pred_param* rs = lemma_returns?
+| LEMMA n = lident ps = lemma_param* rs = lemma_returns?
     cs = lemma_clause* EQUAL body = proof_expr
     { let requires, ensures, variant =
         List.fold_left
@@ -306,6 +306,16 @@ state_field:
         | _ -> None
       in
       { sf_name = x; sf_type = t; sf_grows = (a = Some "grows"); sf_helps = helps } }
+;
+
+lemma_param:
+| LEFTPAR x = lident a = ATTRIBUTE? COLON t = typ RIGHTPAR
+    { let x = match a with
+        | None -> x
+        | Some "implicit" -> add_attr x "implicit"
+        | Some _ -> raise (Syntax_error (mk_loc $loc(a),
+            "Only [@implicit] is supported on lemma parameters"))
+      in (x, t) }
 ;
 
 pred_param:
