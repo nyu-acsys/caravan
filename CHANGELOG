@@ -23,7 +23,7 @@ All notable changes to this project will be documented in this file.
 - Atomic operations support physical comparison and wrapping integer read-modify-write operations.
 - Logically atomic contracts generate linearization proofs, including branches that return results.
 - Read linearization points can be selected with `commit` and conditional `returning` annotations.
-- Contracts can reside in `.mli` interfaces, with predicate definitions in companion `.proof` files.
+- Contracts can reside in `.mli` interfaces checked for OCaml implementation compatibility, with predicate definitions in companion `.proof` files.
 - Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses.
 - Shared structures support persistent invariants and exclusive views of their ghost state.
 - Growing ghost-state fields support histories, snapshots, and facts about past states.

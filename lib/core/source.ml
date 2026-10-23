@@ -84,6 +84,29 @@ let load_interface file =
   let signature = Parse.interface lexbuf in
   { signature; interface_comments = Lexer.comments () }
 
+(** Uses OCaml's inclusion checker before specializing the implementation. *)
+let check_interface env signature interface =
+  try
+    let declared = Typemod.type_interface env interface.signature in
+    Includemod.check_implementation env signature declared.sig_type;
+    Ok ()
+  with exn -> (
+    match Report.of_exn exn with
+    | Some error ->
+        let loc =
+          match interface.signature with
+          | item :: _ when error.loc.loc_start.pos_lnum <= 0 -> item.psig_loc
+          | _ -> error.loc
+        in
+        Error { error with loc }
+    | None ->
+        let loc =
+          match interface.signature with
+          | item :: _ -> item.psig_loc
+          | [] -> Location.none
+        in
+        Error (Report.error Type loc (Stdlib.Printexc.to_string exn)))
+
 (** Links the type variables of [impl], the type of a value, to what they stand for in
     [iface], the type its interface gives it, expanding abbreviations as needed. *)
 let rec specialize env (impl : Types.type_expr) (iface : Types.type_expr) =
@@ -748,7 +771,13 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     Env.set_current_unit
       (Unit_info.make ~check_modname:false ~source_file:file Impl
          (Stdlib.Filename.remove_extension file));
-    let typed, _, _, _, env = Typemod.type_structure env parsed in
+    let interface_env = env in
+    let typed, signature, _, _, env = Typemod.type_structure env parsed in
+    let interface = Option.map (sibling file ".mli") ~f:load_interface in
+    let* () =
+      Option.value_map interface ~default:(Ok ())
+        ~f:(check_interface interface_env signature)
+    in
     (* Specifications have sequences and pending calls, which OCaml does not. *)
     let _, _, _, _, env =
       Typemod.type_structure env
@@ -780,7 +809,6 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               (env, types))
     in
     let logical_types = List.rev logical_types in
-    let interface = Option.map (sibling file ".mli") ~f:load_interface in
     Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->

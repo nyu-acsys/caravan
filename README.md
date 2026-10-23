@@ -14,6 +14,11 @@ of the OCaml source.
 
 Caravan is at an early stage of development: so far, it verifies first-order functions on integers, booleans, tuples, lists, options, variant types, mutable records, references and atomics, with loops, predicates and logically atomic contracts. Specifications go in `(*@ ... *)` comments in the `.ml` or its `.mli`, and predicate definitions in the `.ml` or a `.proof` file next to it.
 
+When a sibling `.mli` exists, Caravan uses OCaml's signature-inclusion checker to
+validate the implementation against it before verification. Abstract interface
+types, private implementation bindings, and monomorphic interface specializations
+of polymorphic implementations are supported.
+
 Proof files also support checked lemmas and monomorphic logical variant types.
 A lemma has typed parameters and an expression body after `=`. Optional
 `returns`, `requires`, and `ensures` clauses state its contract explicitly.
