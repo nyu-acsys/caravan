@@ -27,7 +27,15 @@ let lexeme_loc lexbuf =
     loc_ghost = false;
   }
 
-type kind = Contract | Loop | Predicate | Ghost | Linearization | Initially | Trusted
+type kind =
+  | Contract
+  | Loop
+  | Predicate
+  | Ghost
+  | Linearization
+  | Initially
+  | Initializes
+  | Trusted
 
 (** What [annotation] states, by its first word. *)
 let kind (annotation : t) =
@@ -37,6 +45,7 @@ let kind (annotation : t) =
   | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
   | ("commit" | "returning" | "performs") :: _ -> Linearization
   | "initially" :: _ -> Initially
+  | "initializes" :: _ -> Initializes
   | [ "trusted" ] -> Trusted
   | _ -> Contract
 
@@ -52,6 +61,20 @@ let predicate (annotation : t) = parse annotation Spec_parser.predicate
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
 let linearization (annotation : t) = parse annotation Spec_parser.linearization
 let initially (annotation : t) = parse annotation Spec_parser.initially
+
+let initializes (annotation : t) =
+  let keyword = "initializes" in
+  let stripped = String.lstrip annotation.text in
+  match String.chop_prefix stripped ~prefix:keyword with
+  | None -> parse annotation Spec_parser.term_eof
+  | Some body ->
+      let leading = String.length annotation.text - String.length stripped in
+      let text =
+        String.prefix annotation.text leading
+        ^ String.make (String.length keyword) ' '
+        ^ body
+      in
+      parse { annotation with text } Spec_parser.term_eof
 
 (** The specification of a loop that [annotation] states: its invariants and variants. *)
 let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =

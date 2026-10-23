@@ -1,0 +1,5 @@
+let tag : (Ghost.t, bool) Ghost.field = Ghost.field ()
+
+lemma update_value (owner : Ghost.t)
+  requires (own (Ghost.at tag owner) false) =
+  Ghost.fpu (Ghost.at tag owner) false true

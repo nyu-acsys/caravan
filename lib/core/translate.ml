@@ -434,6 +434,7 @@ type context = {
           only mention variables, all immutable. *)
   mutable au : au option;
       (** The atomic update, for a function with an atomic contract. *)
+  initializations : ((int * int) * Annotation.t) list;
   linearizations : (int * Annotation.t) list;
       (** The annotations on atomic steps, by the offset of the end of the step they
           follow. *)
@@ -759,11 +760,17 @@ let ghost_projection env t =
 
 let ghost_field_name (field : Source.proof_field) = "proof$" ^ field.field_name
 
-let is_ghost_fpu t =
+let ghost_operation t =
   match spine t [] with
-  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, _ ->
-      String.equal m.pid_str "Ghost" && String.equal op.pid_str "fpu"
-  | _ -> false
+  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, _ when String.equal m.pid_str "Ghost" ->
+      Some op.pid_str
+  | _ -> None
+
+let is_ghost_fpu t = Option.equal String.equal (ghost_operation t) (Some "fpu")
+
+let resource_field env (field : Source.proof_field) =
+  List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+      Ctype.is_equal env.ctx.env false [ field.field_value ] [ resource.resource_type ])
 
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
 *)
@@ -953,6 +960,10 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       collection_application env ~at (Option.value_exn (collection_builtin env q)) []
   | Tvar q when Option.is_some (resource_operation env q) ->
       logical_application env ~at (Option.value_exn (resource_operation env q)) []
+  | Tvar (Qdot (Qid m, v))
+    when String.equal m.pid_str "Permission"
+         && List.mem [ "half"; "full" ] v.pid_str ~equal:String.equal ->
+      Ok (R.Expr.real ~loc:l (if String.equal v.pid_str "half" then 0.5 else 1.0))
   | Tvar (Qdot _) -> unsupported at "A qualified name"
   | Tinfix _ -> formula env (S.chain t)
   | Tapply _ -> application env t
@@ -1198,11 +1209,41 @@ and application env (t : S.term) =
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
       let* a = formula env a in
       Ok (R.Expr.not_ ~loc:l a)
-  | Tvar (Qid { pid_str = "own"; _ }), [ location; v ] ->
+  | Tvar (Qid { pid_str = "own"; _ }), ([ location; v ] | [ location; v; _ ]) ->
       let expected = location_type env location in
+      let* () =
+        match (ghost_projection env location, expected) with
+        | Some _, Some expected ->
+            Source.check_logical_expression env.ctx.env
+              ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected v
+        | _ -> Ok ()
+      in
       let* location = location_of env location in
       let* v = expected_formula env expected v in
-      Ok (R.Expr.own ~loc:l [ location; v ])
+      let* fraction =
+        match args with
+        | [ _; _; fraction ] ->
+            let* () =
+              match ghost_projection env (List.hd_exn args) with
+              | Some (field, _) when resource_field env field ->
+                  error at "Resource fields do not take a fractional permission"
+              | _ -> Ok ()
+            in
+            let* permission_type =
+              Source.ocaml_type env.ctx.env ~at
+                (S.PTtyapp
+                   (Qdot (Qid (S.mk_id ~loc:at "Permission"), S.mk_id ~loc:at "t"), []))
+            in
+            let* () =
+              Source.check_logical_expression env.ctx.env
+                ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                ~expected:permission_type fraction
+            in
+            let* fraction = formula env fraction in
+            Ok [ fraction ]
+        | _ -> Ok []
+      in
+      Ok (R.Expr.own ~loc:l ([ location; v ] @ fraction))
   | Tvar (Qid { pid_str = "([])"; _ }), [ s; i ] ->
       let* s = formula env s in
       let* i = formula env i in
@@ -1707,6 +1748,10 @@ let ghost_fpu env t =
       begin match ghost_projection env location with
       | None -> error location.term_loc "Ghost.fpu needs a declared ghost field location"
       | Some (field, _) ->
+          let* () =
+            if resource_field env field then Ok ()
+            else error t.term_loc "Ghost.fpu requires a resource field"
+          in
           let* location = location_of env location in
           let value t =
             let* () =
@@ -1729,6 +1774,61 @@ let ghost_fpu env t =
       end
   | _ -> error t.term_loc "Ghost.fpu expects a location and two resources"
 
+(** Initializers are attached only to fresh allocations. *)
+let ghost_initializers env ~owner t =
+  let* entries =
+    match list_literal t with
+    | Some entries -> Ok entries
+    | None -> error t.S.term_loc "Ghost initializers must be a list literal"
+  in
+  let* fields =
+    all entries ~f:(fun entry ->
+        match spine entry [] with
+        | ( { term_desc = Tvar (Qdot (Qid m, op)); _ },
+            [ { term_desc = Tvar (Qid id); _ }; value ] )
+          when String.equal m.pid_str "Ghost" && String.equal op.pid_str "init" ->
+            begin match
+              List.find env.ctx.proof_support.ghost_fields ~f:(fun field ->
+                  String.equal field.Source.field_name id.pid_str)
+            with
+            | None -> error id.pid_loc "Unknown ghost field"
+            | Some field when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+                error id.pid_loc "This name shadows a ghost field descriptor"
+            | Some field ->
+                let* () =
+                  if Ctype.is_equal env.ctx.env false [ owner ] [ field.field_owner ] then
+                    Ok ()
+                  else error id.pid_loc "This ghost field has a different owner type"
+                in
+                let* () =
+                  Source.check_logical_expression env.ctx.env
+                    ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                    ~expected:field.field_value value
+                in
+                let* value = expected_formula env (Some field.field_value) value in
+                Ok
+                  ( ghost_field_name field,
+                    (name ~loc:(loc entry.term_loc) (ghost_field_name field), Some value)
+                  )
+            end
+        | _ -> error entry.term_loc "Expected Ghost.init field value")
+  in
+  let* () =
+    match List.find_a_dup (List.map fields ~f:fst) ~compare:String.compare with
+    | None -> Ok ()
+    | Some _ -> error t.term_loc "A ghost field is initialized more than once"
+  in
+  Ok (List.map fields ~f:snd)
+
+let ghost_value_location env t =
+  match ghost_projection env t with
+  | None -> error t.S.term_loc "Expected a declared ghost field location"
+  | Some (field, _) when resource_field env field ->
+      error t.term_loc "Ghost.read and Ghost.write require an ordinary value field"
+  | Some (field, _) ->
+      let* location = location_of env t in
+      Ok (field, location)
+
 (** Type information for lexical bindings; annotations resolve logical operations whose
     OCaml result type is not available. Raven checks every generated assignment. *)
 let rec proof_value_types env (t : S.term) =
@@ -1745,21 +1845,28 @@ let rec proof_value_types env (t : S.term) =
       end
 
 and proof_value_type env (t : S.term) =
-  match t.term_desc with
-  | Tcast (_, ty) ->
-      let* ty = Source.ocaml_type env.ctx.env ~at:t.term_loc ty in
-      Ok (Some ty)
-  | Tconst (Pconst_integer _) -> Ok (Some Predef.type_int)
-  | Ttrue | Tfalse -> Ok (Some Predef.type_bool)
-  | Tapply ({ term_desc = Tvar (Qid { pid_str = "Some"; _ }); _ }, value) ->
-      let* ty = proof_value_type env value in
-      Ok (Option.map ty ~f:(fun ty -> Ctype.newconstr Predef.path_option [ ty ]))
-  | Ttuple ts ->
-      let* ts = all ts ~f:(proof_value_type env) in
-      Ok
-        (Option.map (Option.all ts) ~f:(fun ts ->
-             Btype.newgenty (Ttuple (List.map ts ~f:(fun ty -> (None, ty))))))
-  | _ -> Ok (term_type env t)
+  match (ghost_operation t, snd (spine t [])) with
+  | Some "alloc", [ _ ] ->
+      Result.map (Source.ghost_type env.ctx.env ~at:t.term_loc) ~f:Option.some
+  | Some "read", [ location ] ->
+      let* field, _ = ghost_value_location env location in
+      Ok (Some field.field_value)
+  | _ -> (
+      match t.term_desc with
+      | Tcast (_, ty) ->
+          let* ty = Source.ocaml_type env.ctx.env ~at:t.term_loc ty in
+          Ok (Some ty)
+      | Tconst (Pconst_integer _) -> Ok (Some Predef.type_int)
+      | Ttrue | Tfalse -> Ok (Some Predef.type_bool)
+      | Tapply ({ term_desc = Tvar (Qid { pid_str = "Some"; _ }); _ }, value) ->
+          let* ty = proof_value_type env value in
+          Ok (Option.map ty ~f:(fun ty -> Ctype.newconstr Predef.path_option [ ty ]))
+      | Ttuple ts ->
+          let* ts = all ts ~f:(proof_value_type env) in
+          Ok
+            (Option.map (Option.all ts) ~f:(fun ts ->
+                 Btype.newgenty (Ttuple (List.map ts ~f:(fun ty -> (None, ty))))))
+      | _ -> Ok (term_type env t))
 
 let proof_pattern_parts (p : S.pat) = match p.pat_desc with Ptuple ps -> ps | _ -> [ p ]
 
@@ -1881,7 +1988,9 @@ let unfold_result_types env (t : S.term) witnesses =
 
 let rec proof_result_types env (body : S.proof_expr) =
   match body.proof_desc with
-  | Proof_value t when is_ghost_fpu t -> Ok (Some [])
+  | Proof_value t
+    when is_ghost_fpu t || Option.equal String.equal (ghost_operation t) (Some "write") ->
+      Ok (Some [])
   | Proof_value t ->
       let* ts = proof_value_types env t in
       Ok (Some ts)
@@ -1936,6 +2045,46 @@ let rec proof_expression env targets (body : S.proof_expr) =
   | Proof_value t when is_ghost_fpu t ->
       let* statement = ghost_fpu env t in
       unit_statement statement
+  | Proof_value t when Option.equal String.equal (ghost_operation t) (Some "write") ->
+      begin match snd (spine t []) with
+      | [ location; value ] ->
+          let* field, location = ghost_value_location env location in
+          let* () =
+            Source.check_logical_expression env.ctx.env
+              ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+              ~expected:field.field_value value
+          in
+          let* value = expected_formula env (Some field.field_value) value in
+          unit_statement (R.Stmt.assign ~loc:l [ location ] (R.Stmt.expr_rhs value))
+      | _ -> error t.term_loc "Ghost.write expects a location and a value"
+      end
+  | Proof_value t when Option.equal String.equal (ghost_operation t) (Some "read") ->
+      begin match (snd (spine t []), targets) with
+      | [ location ], [ target ] ->
+          let* field, location = ghost_value_location env location in
+          let* () =
+            if
+              Ctype.is_equal env.ctx.env false [ field.field_value ]
+                [ target.target_type ]
+            then Ok ()
+            else error t.term_loc "The ghost read has a different result type"
+          in
+          Ok [ R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs location) ]
+      | _ -> error t.term_loc "Bind the result of Ghost.read location"
+      end
+  | Proof_value t when Option.equal String.equal (ghost_operation t) (Some "alloc") ->
+      begin match (snd (spine t []), targets) with
+      | [ initializers ], [ target ] ->
+          let* owner = Source.ghost_type env.ctx.env ~at:t.term_loc in
+          let* () =
+            if Ctype.is_equal env.ctx.env false [ owner ] [ target.target_type ] then
+              Ok ()
+            else error t.term_loc "Ghost.alloc returns Ghost.t"
+          in
+          let* fields = ghost_initializers env ~owner initializers in
+          Ok [ R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.new_rhs fields) ]
+      | _ -> error t.term_loc "Bind the result of Ghost.alloc initializers"
+      end
   | Proof_value t ->
       begin match proof_signature env t with
       | Some _ ->
@@ -3397,6 +3546,17 @@ let view_allocation ctx ~loc:l (fields : string list) =
   in
   (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
 
+let allocation_initializers ctx (e : Typedtree.expression) =
+  match
+    List.Assoc.find ctx.initializations
+      (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
+      ~equal:Poly.equal
+  with
+  | None -> Ok []
+  | Some annotation ->
+      let* initializers = Annotation.initializes annotation in
+      ghost_initializers (scope_env ctx) ~owner:e.exp_type initializers
+
 (** The statements evaluating [e], and the value of [e] after them; [tail] if the value is
     the function's result. *)
 let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
@@ -3459,10 +3619,11 @@ let rec expr ?(tail = false) (ctx : context) (e : Typedtree.expression) :
           in
           let x = Names.fresh ctx.names "tmp" in
           let views, view_args = view_allocation ctx ~loc:l fields in
+          let* explicit = allocation_initializers ctx e in
           let init =
             R.Stmt.new_rhs
               (List.map2_exn fields args ~f:(fun f v -> (name ~loc:l f, Some v))
-              @ view_args)
+              @ view_args @ explicit)
           in
           Ok
             ( stmts @ views @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
@@ -3705,7 +3866,8 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
       let* stmts, v = expr ctx v in
       let x = Names.fresh ctx.names "tmp" in
       let views, view_args = view_allocation ctx ~loc:l [ field ] in
-      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: view_args) in
+      let* explicit = allocation_initializers ctx e in
+      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: (view_args @ explicit)) in
       Ok
         ( stmts @ views
           @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
@@ -3790,7 +3952,8 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   | ("make" | "make_contended"), [ v ] ->
       let x = Names.fresh ctx.names "tmp" in
       let views, view_args = view_allocation ctx ~loc:l [ field ] in
-      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: view_args) in
+      let* explicit = allocation_initializers ctx e in
+      let init = R.Stmt.new_rhs ((name ~loc:l field, Some v) :: (view_args @ explicit)) in
       Ok
         ( stmts @ views
           @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
@@ -4818,6 +4981,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
       preds;
       facts = [];
       au = None;
+      initializations = [];
       linearizations = [];
       shared;
       invariants = [];
@@ -5275,9 +5439,9 @@ let establish_invariant ctx ~(f : func) ~at inv args =
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries ~proof_lemmas
-    ~proof_support (functions : (string * string) list) origins ~proc_name ~pure
-    (f : func) : (R.Callable.t, error) Result.t =
+    ~initializations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~libraries
+    ~proof_lemmas ~proof_support (functions : (string * string) list) origins ~proc_name
+    ~pure (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -5301,6 +5465,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       preds;
       facts = [];
       au = None;
+      initializations;
       linearizations;
       shared;
       invariants = [];
@@ -6187,6 +6352,76 @@ let atomic_steps (structure : Typedtree.structure) : int list =
   iterator.structure iterator structure;
   !found
 
+(** Resolves allocation annotations to one source expression, including nested calls. *)
+let initialization_annotations (source : Source.t) typed annotations =
+  let initializations =
+    List.filter_map annotations ~f:(fun a ->
+        if Poly.equal (Annotation.kind a) Annotation.Initializes then
+          let rec anchor i =
+            if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1) else i
+          in
+          Some (anchor a.loc.loc_start.pos_cnum, a)
+        else None)
+  in
+  let allocations = ref [] in
+  let allocation_expr iterator (e : Typedtree.expression) =
+    let fresh =
+      match e.exp_desc with
+      | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+          Option.exists (stdlib_name path) ~f:(String.equal "ref")
+          || Option.exists (atomic_name path) ~f:(fun op ->
+              List.mem [ "make"; "make_contended" ] op ~equal:String.equal)
+      | Texp_record { fields; extended_expression = None; _ } ->
+          Array.exists fields ~f:(fun (label, _) ->
+              Poly.equal label.Data_types.lbl_mut Mutable)
+      | _ -> false
+    in
+    begin match e.exp_desc with
+    | Texp_apply _ | Texp_record _ -> allocations := (e, fresh) :: !allocations
+    | _ -> ()
+    end;
+    Tast_iterator.default_iterator.expr iterator e
+  in
+  let iterator = { Tast_iterator.default_iterator with expr = allocation_expr } in
+  iterator.structure iterator typed;
+  let* initializations =
+    all initializations ~f:(fun (anchor, annotation) ->
+        let candidates =
+          List.filter !allocations ~f:(fun (e, _) ->
+              (anchor = step_end e
+              &&
+              match e.exp_desc with
+              | Texp_apply (callee, _) -> anchor >= callee.exp_loc.loc_end.pos_cnum
+              | _ -> true)
+              || anchor = e.exp_loc.loc_end.pos_cnum
+              || List.exists e.exp_extra ~f:(fun (_, at, _) ->
+                  anchor = at.loc_end.pos_cnum))
+        in
+        match
+          List.min_elt candidates ~compare:(fun (a, _) (b, _) ->
+              match
+                Int.compare a.exp_loc.loc_start.pos_cnum b.exp_loc.loc_start.pos_cnum
+              with
+              | 0 -> Int.compare b.exp_loc.loc_end.pos_cnum a.exp_loc.loc_end.pos_cnum
+              | order -> order)
+        with
+        | None | Some (_, false) ->
+            error annotation.loc "This annotation must follow a fresh allocation"
+        | Some (allocation, true) ->
+            Ok
+              ( ( allocation.exp_loc.loc_start.pos_cnum,
+                  allocation.exp_loc.loc_end.pos_cnum ),
+                annotation ))
+  in
+  let* () =
+    match List.find_a_dup (List.map initializations ~f:fst) ~compare:Poly.compare with
+    | None -> Ok ()
+    | Some start ->
+        let annotation = List.Assoc.find_exn initializations start ~equal:Poly.equal in
+        error annotation.loc "An allocation has more than one initializer annotation"
+  in
+  Ok initializations
+
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
 let pure_functions (funcs : func list) : func list =
@@ -7008,6 +7243,7 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     preds;
     facts = [];
     au = None;
+    initializations = [];
     linearizations = [];
     shared;
     invariants = [];
@@ -7718,6 +7954,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* Each follows an application of an [Atomic] operation. *)
   let typed = without_application_operators source.typed in
   let steps = atomic_steps typed in
+  let* initializations = initialization_annotations source typed annotations in
   let* () =
     match
       List.find linearizations ~f:(fun (anchor, _) ->
@@ -8376,8 +8613,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* procs =
     all funcs ~f:(fun f ->
         proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~linearizations ~lifted ~pasts ~past_returns ~ghost_args
-          ~proof_lemmas ~proof_support
+          ~annotations ~initializations ~linearizations ~lifted ~pasts ~past_returns
+          ~ghost_args ~proof_lemmas ~proof_support
           ~libraries:
             (List.map source.libraries ~f:(fun (lib : Source.library) ->
                  (lib.library_id, lib.library_name)))
@@ -8397,9 +8634,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let l = loc field.Source.field_at in
         let* value_type = Datatypes.typ types ~at:field.field_at field.field_value in
         Ok
-          (R.Member.field ~loc:l ~ghost:true
-             (ident ~loc:l (ghost_field_name field))
-             value_type))
+          (Datatypes.field_member ~ghost:true types ~loc:l (ghost_field_name field)
+             value_type field.field_value))
   in
   Ok
     ( R.Program.make ~loc:start

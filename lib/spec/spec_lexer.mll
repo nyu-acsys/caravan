@@ -187,6 +187,8 @@ let op_char_34   = op_char_3 | op_char_4
 let op_char_pref = ['!' '?']
 
 rule token = parse
+  | "~fraction"
+      { FRACTION }
   | "Set.of_predicate"
       { SET_OF_PREDICATE }
   | "[@" space* ([^ ' ' '\n' ']']+ (' '+ [^ ' ' '\n' ']']+)* as lbl) space* ']'

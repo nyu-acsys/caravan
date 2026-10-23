@@ -5,10 +5,8 @@ instances must be declared before use.
   [Error] File "authorities_wrong_instance.proof", line 9, columns 38-83:
   9 |   requires (own (Ghost.at facts cell) (Other_auth.auth (Other_facts.set Set.empty))) = ()
                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Expected an expression of type
-    Facts_auth.T
-  but found an expression of type
-    Other_auth.T.
+  Type Error: This expression has type Other_auth.t but an expression was expected of type
+    Facts_auth.t.
   [1]
 
   $ caravan --shh authorities_wrong_owner.ml
@@ -24,10 +22,8 @@ instances must be declared before use.
   [Error] File "authorities_plain_resource.proof", line 7, columns 38-39:
   7 |   requires (own (Ghost.at facts cell) 0) = ()
                                             ^
-  Type Error: Expected an expression of type
-    Facts_auth.T
-  but found an expression of type
-    Int.
+  Type Error: The constant 0 has type int but an expression was expected of type
+    Facts_auth.t.
   [1]
 
   $ caravan --shh authorities_forward.ml

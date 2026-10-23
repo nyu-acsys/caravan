@@ -1,0 +1,14 @@
+module Facts = SetRA (struct type t = int end)
+module Authority = Auth (Facts)
+let flag : (Ghost.t, bool) Ghost.field = Ghost.field ()
+let facts : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+lemma write_half (cell : Ghost.t)
+  requires (own ~fraction:Permission.half (Ghost.at flag cell) false) =
+  Ghost.write (Ghost.at flag cell) true
+
+lemma read_unowned (cell : Ghost.t) returns (result : bool) =
+  Ghost.read (Ghost.at flag cell)
+
+lemma invalid_resource returns (cell : Ghost.t) =
+  Ghost.alloc [Ghost.init facts Authority.top]

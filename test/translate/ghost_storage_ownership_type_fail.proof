@@ -1,0 +1,4 @@
+let watched : (Ghost.t, int ref) Ghost.field = Ghost.field ()
+
+lemma wrong_value (owner : Ghost.t) (value : bool ref)
+  requires (own (Ghost.at watched owner) value) = ()

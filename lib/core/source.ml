@@ -287,21 +287,26 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
                   typ);
            ])
   in
-  let has_resources =
-    List.exists proof ~f:(function
-      | S.Proof_resource _ | Proof_field _ -> true
-      | _ -> false)
-  in
-  let* env =
-    if not has_resources then Ok env
-    else if module_exists env "Ghost" then
+  let reserve_module env name =
+    try
+      let _, declaration = Env.find_module_by_name (Lident name) env in
       Error
-        (Report.error Type Location.none "The module Ghost is reserved for proof fields")
-    else
-      Ok
-        (signature env
-           (Parse.interface
-              (Lexing.from_string "module Ghost : sig type ('owner, 'value) field end")))
+        (Report.error Type declaration.md_loc
+           (Printf.sprintf "The module %s is reserved for specifications" name))
+    with Stdlib.Not_found -> Ok ()
+  in
+  let* () = reserve_module env "Ghost" in
+  let* () = reserve_module env "Permission" in
+  let env =
+    signature env
+      (Parse.interface
+         (Lexing.from_string "module Ghost : sig type t type ('owner, 'value) field end"))
+  in
+  let env =
+    signature env
+      (Parse.interface
+         (Lexing.from_string
+            "module Permission : sig type t val half : t val full : t end"))
   in
   let* env, reversed, resources, fields =
     List.fold_result proof ~init:(env, [], [], [])
@@ -342,7 +347,7 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
                       String.equal (String.capitalize type_name.pid_str) name.pid_str
                   | _ -> false)
                 || List.mem
-                     [ "Ghost"; "SetRA"; "Auth"; "Finset" ]
+                     [ "Ghost"; "Permission"; "SetRA"; "Auth"; "Finset" ]
                      name.pid_str ~equal:String.equal
               then
                 Error
@@ -517,13 +522,14 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
               | _ ->
                   Error
                     (Report.error Type at
-                       "A ghost field requires an (owner, resource) Ghost.field type")
+                       "A ghost field requires an (owner, value) Ghost.field type")
             in
             let owner_head = Ctype.expand_head env owner in
             let owner_is_reference =
               match Types.get_desc owner_head with
               | Tconstr (p, [ _ ], _) when Datatypes.is_atomic p || Datatypes.is_ref p ->
                   true
+              | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
               | Tconstr (p, [], _) ->
                   let declaration = Env.find_type p env in
                   begin match declaration.type_kind with
@@ -541,18 +547,6 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
               else
                 Error
                   (Report.error Type at "A ghost field owner must be a heap reference")
-            in
-            let* () =
-              if
-                List.exists resources ~f:(fun r ->
-                    match (Types.get_desc content, Types.get_desc r.resource_type) with
-                    | Tconstr (p, [], _), Tconstr (q, [], _) -> Path.same p q
-                    | _ -> false)
-              then Ok ()
-              else
-                Error
-                  (Report.error Type at
-                     "A ghost field value must be a declared resource type")
             in
             let* env = value env name (core_type ~at field_type) in
             Ok
@@ -708,6 +702,11 @@ let ocaml_type (env : Env.t) ~(at : Location.t) (t : S.pty) :
     match Report.of_exn exn with
     | Some error -> Error error
     | None -> Error (Report.error Type at (Stdlib.Printexc.to_string exn)))
+
+(** The opaque OCaml reference type of proof-only storage. *)
+let ghost_type env ~at =
+  ocaml_type env ~at
+    (S.PTtyapp (Qdot (Qid (S.mk_id ~loc:at "Ghost"), S.mk_id ~loc:at "t"), []))
 
 (** Compiler-only operations used to type-check logical expressions. *)
 let logical_check_signature =

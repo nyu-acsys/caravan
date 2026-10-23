@@ -77,8 +77,42 @@ Declaring a field grants no ownership and performs no allocation. In a lemma
 body, `Ghost.fpu location before after` checks a frame-preserving resource update,
 consuming ownership of `before` and producing ownership of `after`. It must preserve
 compatibility with resources held by other threads. Resource fields do not support
-ordinary assignment. Allocation and initialization hooks for runtime code are not
-available yet.
+ordinary assignment.
+
+Ghost fields can also store ordinary values, such as `int list` or `bool`.
+Ownership defaults to a full share; write
+`own ~fraction:Permission.half (Ghost.at contents cell) values` for half ownership.
+`Permission.full` names a full share. In checked proof bodies,
+`Ghost.read (Ghost.at contents cell)` requires a positive share, and
+`Ghost.write (Ghost.at contents cell) values` requires full ownership.
+Resource fields use `Ghost.fpu` instead of these reads and writes.
+
+Initialize explicit ghost fields on fresh concrete allocations:
+
+```ocaml
+let cell = Atomic.make 0
+(*@ initializes [
+  Ghost.init contents [];
+  Ghost.init facts (Authority.full (Facts.set Set.empty))
+] *)
+in
+cell
+```
+
+Each descriptor's owner type must match the allocated reference, and its value
+must have the declared field type. Initializers belong to the same allocation as
+the concrete fields; they cannot attach to an existing reference or a call to a
+constructor function. The supported allocation sites are `ref`, `Atomic.make`,
+`Atomic.make_contended`, and fresh mutable records. A field can occur only once
+in the initializer list. Explicit fields are independent of generated state,
+histories, and action proofs.
+
+Checked proof bodies can allocate a fresh opaque `Ghost.t` reference using
+`Ghost.alloc [Ghost.init linked false; Ghost.init retired false]`, where both
+field descriptors have owner type `Ghost.t`. These allocations and all ghost
+storage operations are erased from the OCaml program. Field reads and
+allocations are proof operations; pure logical definitions cannot perform them.
+`Ghost` and `Permission` are reserved module names.
 
 ## Building
 

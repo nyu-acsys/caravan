@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Proof files support resource algebra instances, typed ghost fields, checked resource updates, and pure fact-set definitions.
+- Proof files support resource algebra instances, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.
 - Generated invariant folds supply explicit witnesses for known state transitions and histories.
 - Source-level verification errors retain solver timeout explanations.
 - Proof files support checked lemmas, logical variant types, and sets and maps.

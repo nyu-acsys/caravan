@@ -38,6 +38,14 @@
 
   let proof_term desc loc = proof_value (mk_term desc loc)
 
+  let fractional_own f fraction location value loc =
+    begin match f.term_desc with
+    | Tvar (Qid id) when id.pid_str = "own" -> ()
+    | _ -> raise (Syntax_error (f.term_loc,
+        "Only own accepts the fraction argument"))
+    end;
+    let apply f arg = mk_term (Tapply (f, arg)) loc in
+    (List.fold_left apply f [location; value; fraction]).term_desc
 
   let add_clause c (keyword, t) =
     match keyword with
@@ -78,7 +86,7 @@
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS
-%token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE
+%token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
 
 (* Keywords *)
 
@@ -177,7 +185,7 @@ proof_decl:
         when m.pid_str = "Ghost" && field.pid_str = "field"
           && im.pid_str = "Ghost" && make.pid_str = "field" -> ()
       | _ -> raise (Syntax_error (n.pid_loc,
-          "A ghost field declaration requires (owner, resource) Ghost.field = Ghost.field ()"))
+          "A ghost field declaration requires (owner, value) Ghost.field = Ghost.field ()"))
       end;
       Proof_field { field_name = n; field_type = ty } }
 | LET n = lident ps = pred_param+ COLON ty = typ EQUAL body = term
@@ -345,6 +353,10 @@ proof_app:
 | e = proof_postfix { e }
 | f = proof_app arg = proof_postfix
     { proof_term (Tapply (term_of_proof f, term_of_proof arg)) $loc }
+| f = proof_postfix FRACTION COLON fraction = proof_postfix
+    location = proof_postfix value = proof_postfix
+    { proof_term (fractional_own (term_of_proof f) (term_of_proof fraction)
+        (term_of_proof location) (term_of_proof value) $loc) $loc }
 ;
 
 proof_postfix:
@@ -492,6 +504,8 @@ term_:
 | term_arg located(term_arg)+
     { let join f (a, e) = mk_term (Tapply (f, a)) ($startpos, e) in
       (List.fold_left join $1 $2).term_desc }
+| f = term_arg FRACTION COLON fraction = term_arg location = term_arg value = term_arg
+    { fractional_own f fraction location value $loc }
 | IF g = term THEN t1 = term ELSE t2 = term
     { Tif (g, t1, t2) }
 | LET ids = pat EQUAL t1 = term IN t2 = term

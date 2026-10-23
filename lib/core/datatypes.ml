@@ -246,6 +246,12 @@ let is_ref (p : Path.t) =
 let is_atomic (p : Path.t) =
   match Path.name p with "Stdlib.Atomic.t" | "Stdlib__Atomic.t" -> true | _ -> false
 
+(** The opaque reference type used for proof-only storage. *)
+let is_ghost (p : Path.t) = String.equal (Path.name p) "Ghost.t"
+
+(** The fractional permission type of specifications. *)
+let is_permission (p : Path.t) = String.equal (Path.name p) "Permission.t"
+
 (** The data type and constructor named [ocaml] in a contract: the latest such
     constructor, as in OCaml, where those of lists and options come first. *)
 let find_ctor (types : t list) (ocaml : string) =
@@ -268,6 +274,8 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
+  | Tconstr (p, [], _) when is_ghost p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [], _) when is_permission p -> Ok (R.Type.real ~loc:l)
   | Tconstr (p, [ elt ], _)
     when Path.same p Predef.path_list || Path.same p Predef.path_option ->
       let* elt = typ types ?self ~at elt in
@@ -311,6 +319,8 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> "Int"
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> "Bool"
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> "Unit"
+  | Tconstr (p, [], _) when is_ghost p -> "Ghost"
+  | Tconstr (p, [], _) when is_permission p -> "Permission"
   | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list -> tag types elt ^ "List"
   | Tconstr (p, [ elt ], _) when Path.same p Predef.path_option ->
       tag types elt ^ "Option"
@@ -340,9 +350,9 @@ let is_int types t =
 
 (** The field [name] of type [typ], for values of the OCaml type [t]: an [int] field's
     values are in [int]'s range, which owning the field then implies. *)
-let field_member types ~loc name typ (t : Types.type_expr) =
+let field_member ?(ghost = false) types ~loc name typ (t : Types.type_expr) =
   let where = Option.some_if (is_int types t) (R.Name.make ~loc Prelude.in_range) in
-  R.Member.field ~loc ?where (R.Ident.make ~loc name) typ
+  R.Member.field ~loc ~ghost ?where (R.Ident.make ~loc name) typ
 
 (** Whether the values of type [t] are immediate or references, so that physical equality
     on them is equality: integers, booleans, unit, references, and variants whose
@@ -354,6 +364,7 @@ let rec immediate (types : t list) (t : Types.type_expr) =
          || Path.same p Predef.path_unit ->
       true
   | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+  | Tconstr (p, [], _) when is_ghost p -> true
   | Tconstr (p, [], _) ->
       begin match find types p with
       | Some { heap = Some _; _ } -> true
@@ -369,6 +380,7 @@ let has_refs (types : t list) (t : Types.type_expr) =
   let rec go seen t =
     match desc types t with
     | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+    | Tconstr (p, [], _) when is_ghost p -> true
     | Tconstr (p, args, _) -> begin
         List.exists args ~f:(go seen)
         ||
