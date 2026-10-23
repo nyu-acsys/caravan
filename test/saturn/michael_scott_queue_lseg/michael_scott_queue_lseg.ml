@@ -49,7 +49,7 @@ let rec fix_tail tail new_tail =
     segment_info root head;
     segment_info head last;
     let exposure =
-      if new_tail = last then At_last
+      if new_tail == last then At_last
       else if Finset.mem new_tail retired_fp then
         let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
           segment_split root head retired_values retired_fp retired_links new_tail in
@@ -96,7 +96,7 @@ let rec fix_tail tail new_tail =
     result) *)
 (*@ manual *)
 (*@ fix_tail [q : t] tail new_tail
-    requires is_queue q && tail = q.tail
+    requires is_queue q && tail == q.tail
     requires own (Ghost.at facts_auth q.head)
       (Fact_auth.frag (Facts.set (Set.singleton (Published new_tail)))) *)
 
@@ -117,7 +117,7 @@ let push { tail; _ } value =
       segment_info root head;
       segment_info head last;
       let exposure =
-        if curr_end = last then At_last
+        if curr_end == last then At_last
         else if Finset.mem curr_end retired_fp then
           let (before, before_fp, before_links, value, next, after, after_fp, after_links)
             =
@@ -135,15 +135,15 @@ let push { tail; _ } value =
       unfold queue q xs;
       let result = step () in
       if result then begin
-        assert (curr_end = last);
+        assert (curr_end == last);
         segment_terminal_outside root head retired_values retired_fp retired_links fresh;
         segment_terminal_outside head last values active_fp active_links fresh;
-        assert (fresh <> last);
+        assert (fresh != last);
         Ghost.write (Ghost.at view_queue q.head) (values @ [value]);
         fold queue q (values @ [value]);
         Push.commit token q value ();
         waiting_help q last (values @ [value]) waiting waiting_on
-          (Set.of_predicate (fun (reg : Ghost.t) -> Map.get waiting_on reg <> last));
+          (Set.of_predicate (fun (reg : Ghost.t) -> Map.get waiting_on reg != last));
         segment_append head last fresh values active_fp active_links value;
         is_queue_fact_link q (Finset.union retired_fp (Finset.union active_fp
           (Finset.singleton last))) (Finset.union retired_links active_links)
@@ -203,7 +203,7 @@ let push { tail; _ } value =
         segment_info root head;
         segment_info head last;
         let exposure =
-          if curr_end = last then At_last
+          if curr_end == last then At_last
           else if Finset.mem curr_end retired_fp then
             let (before, before_fp, before_links, value, next, after, after_fp,
               after_links) =
@@ -254,7 +254,7 @@ let push { tail; _ } value =
           [fresh : node Atomic.t] curr_end node
         requires is_queue q
         requires min_int <= value && value <= max_int
-        requires node = Next (value, fresh) && own fresh Nil
+        requires node === Next (value, fresh) && own fresh Nil
         requires own (Ghost.at facts_auth q.head)
           (Fact_auth.frag (Facts.set (Set.singleton (Published curr_end))))
         requires Push.pending token q value
@@ -292,7 +292,7 @@ let push { tail; _ } value =
     segment_info root head;
     segment_info head last;
     let exposure =
-      if old_tail = last then At_last
+      if old_tail == last then At_last
       else if Finset.mem old_tail retired_fp then
         let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
           segment_split root head retired_values retired_fp retired_links old_tail in
@@ -308,15 +308,15 @@ let push { tail; _ } value =
     unfold queue q xs;
     let result = step () in
     if result then begin
-      assert (old_tail = last);
+      assert (old_tail == last);
       segment_terminal_outside root head retired_values retired_fp retired_links new_tail;
       segment_terminal_outside head last values active_fp active_links new_tail;
-      assert (new_tail <> last);
+      assert (new_tail != last);
       Ghost.write (Ghost.at view_queue q.head) (values @ [value]);
       fold queue q (values @ [value]);
       Push.commit token q value ();
       waiting_help q last (values @ [value]) waiting waiting_on
-        (Set.of_predicate (fun (reg : Ghost.t) -> Map.get waiting_on reg <> last));
+        (Set.of_predicate (fun (reg : Ghost.t) -> Map.get waiting_on reg != last));
       segment_append head last new_tail values active_fp active_links value;
       is_queue_fact_link q (Finset.union retired_fp (Finset.union active_fp
         (Finset.singleton last))) (Finset.union retired_links active_links) (Finset.union
@@ -377,7 +377,7 @@ let push { tail; _ } value =
       segment_info root head;
       segment_info head last;
       let exposure =
-        if old_tail = last then At_last
+        if old_tail == last then At_last
         else if Finset.mem old_tail retired_fp then
           let (before, before_fp, before_links, value, next, after, after_fp, after_links)
             =
@@ -480,13 +480,13 @@ let rec pop_opt q =
       segment_info root head;
       segment_info head last;
       let exposure =
-        if old_head <> head then
+        if old_head != head then
           let (before, before_fp, before_links, value, next,
                after, after_fp, after_links) =
             segment_split root head retired_values retired_fp retired_links old_head in
           Retired_cell (before, before_fp, before_links, value, next,
             after, after_fp, after_links)
-        else if old_head <> last then
+        else if old_head != last then
           let (before, before_fp, before_links, value, next,
                after, after_fp, after_links) =
             segment_split head last values active_fp active_links old_head in
@@ -551,7 +551,7 @@ let rec pop_opt q =
             retired_fp active_fp retired_links active_links;
           let result = step () in
           if result then begin
-            assert (old_head = head);
+            assert (old_head == head);
             segment_info root head;
             segment_edge_endpoints root head retired_values retired_fp retired_links;
             segment_info head last;
@@ -559,7 +559,7 @@ let rec pop_opt q =
             let (active_next, suffix_fp, suffix_links) =
               unfold segment head last values active_fp active_links
                 {next; tail_cells; tail_edges} in
-            assert (active_next = next);
+            assert (active_next == next);
             let (first, rest) =
               match values with
               | [] -> assert false
@@ -645,7 +645,7 @@ let swing_tail q =
       segment_info root head;
       segment_info head last;
       let exposure =
-        if old_tail = last then At_last
+        if old_tail == last then At_last
         else if Finset.mem old_tail retired_fp then
           let (before, before_fp, before_links, value, next,
                after, after_fp, after_links) =
@@ -728,7 +728,7 @@ let is_empty q =
         (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting result;
       let observation =
-        if result <> last then begin
+        if result != last then begin
           segment_info head last;
           let (next, rest_fp, rest_links) =
             unfold segment head last values active_fp active_links
@@ -806,13 +806,13 @@ let is_empty q =
     segment_info root head;
     segment_info head last;
     let exposure =
-      if old_head <> head then
+      if old_head != head then
         let (before, before_fp, before_links, value, next,
              after, after_fp, after_links) =
           segment_split root head retired_values retired_fp retired_links old_head in
         Retired_cell (before, before_fp, before_links, value, next,
           after, after_fp, after_links)
-      else if old_head <> last then
+      else if old_head != last then
         let (before, before_fp, before_links, value, next,
              after, after_fp, after_links) =
           segment_split head last values active_fp active_links old_head in
@@ -841,7 +841,7 @@ let is_empty q =
         | Next (_, _) -> ()
         end
     | Waiting_on registration ->
-        assert (Map.get waiting_on registration = old_head);
+        assert (Map.get waiting_on registration == old_head);
         let (token, linked, retired) =
           unfold waiting_registration registration q {token; linked; retired} in
         begin match result with

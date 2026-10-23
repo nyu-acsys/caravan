@@ -24,12 +24,12 @@ let rec conjuncts (t : S.term) =
       conjuncts a @ conjuncts b
   | _ -> [ t ]
 
-(** The conjuncts of [terms] that make a variable a field of a value, [x = g.f] or
-    [g.f = x]: the variable, the field and the value's name. *)
+(** The conjuncts of [terms] that make a variable a field of a value, [x == g.f] or
+    [g.f == x]: the variable, the field and the value's name. *)
 let field_equations (terms : S.term list) =
   List.filter_map (List.concat_map terms ~f:conjuncts) ~f:(fun t ->
       match spine t [] with
-      | { term_desc = Tvar (Qid { pid_str = "="; _ }); _ }, [ a; b ] ->
+      | { term_desc = Tvar (Qid { pid_str = "=" | "==" | "==="; _ }); _ }, [ a; b ] ->
           begin match (a.term_desc, b.term_desc) with
           | ( Tvar (Qid { pid_str = x; _ }),
               Tfield
@@ -395,6 +395,7 @@ type proof_support = {
   resources : Source.proof_resource list;
   ghost_fields : Source.proof_field list;
   logical_functions : (string * lemma_signature) list;
+  mathematical_types : Datatypes.t list;
   predicate_inputs : (string * int) list;
       (** Explicit overrides of the type-based predicate output convention. *)
 }
@@ -405,6 +406,7 @@ let empty_proof_support =
     resources = [];
     ghost_fields = [];
     logical_functions = [];
+    mathematical_types = [];
     predicate_inputs = [];
   }
 
@@ -553,6 +555,20 @@ let primitive ctx ~at elt op =
         ];
   Ok name
 
+(** The ordinary read or write of a mutable field. *)
+let ordinary_primitive ctx ~at ~field elt op =
+  let name = Primitives.ordinary_name ~field op in
+  let* typ = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.primitives) name ~equal:String.equal) then
+    ctx.primitives :=
+      !(ctx.primitives)
+      @ [
+          ( name,
+            Primitives.ordinary_proc ~field ~typ ~int:(Datatypes.is_int ctx.types elt) op
+          );
+        ];
+  Ok name
+
 (** The Raven field named [label] of the values of type [t] that are references; an
     atomic's contents have the empty label, as in [own a v]. *)
 let field_of_type ctx ~at (t : Types.type_expr) label =
@@ -654,6 +670,27 @@ let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
 let write ~loc:l r field v =
   R.Stmt.assign ~loc:l [ R.Expr.field ~loc:l r (name ~loc:l field) ] (R.Stmt.expr_rhs v)
 
+let ordinary_read ?guard ctx ~at ~field ~elt r =
+  let l = loc at in
+  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Read in
+  let* typ = typ ctx ~at elt in
+  let x = Names.fresh ctx.names "tmp" in
+  let value = R.Expr.var ~loc:l (name ~loc:l x) in
+  let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l proc) [ r ]) in
+  let access =
+    match guard with
+    | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
+    | Some condition ->
+        R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+        @ [ R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [] ]
+  in
+  Ok (access, value)
+
+let ordinary_write ctx ~at ~field ~elt r v =
+  let l = loc at in
+  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Write in
+  Ok (R.Stmt.call ~loc:l (R.Expr.call ~loc:l (name ~loc:l proc) [ r; v ]))
+
 (** The name of [p] if it is a value of the standard library's toplevel. *)
 let stdlib_name (p : Path.t) =
   match p with
@@ -694,6 +731,61 @@ let exact_physical types (a : Typedtree.expression) (b : Typedtree.expression) =
     match e.exp_desc with Texp_construct (_, _, []) -> true | _ -> false
   in
   Datatypes.immediate types a.exp_type || constant a || constant b
+
+let runtime_nullary_constructor (e : Typedtree.expression) =
+  match e.exp_desc with Texp_construct (_, _, []) -> true | _ -> false
+
+let rec unresolved_equality_type types ty =
+  match Datatypes.desc types ty with
+  | Tvar _ | Tunivar _ -> true
+  | Tconstr (_, args, _) -> List.exists args ~f:(unresolved_equality_type types)
+  | Ttuple components ->
+      List.exists components ~f:(fun (_, ty) -> unresolved_equality_type types ty)
+  | Tpoly (ty, []) -> unresolved_equality_type types ty
+  | _ -> false
+
+let potentially_contains_refs types ty =
+  Datatypes.has_refs types ty || unresolved_equality_type types ty
+
+let runtime_structural_equality_unsafe ctx path a b =
+  match stdlib_name path with
+  | Some ("=" | "<>") ->
+      (not (runtime_nullary_constructor a || runtime_nullary_constructor b))
+      && (potentially_contains_refs ctx.types a.exp_type
+         || potentially_contains_refs ctx.types b.exp_type)
+  | _ -> false
+
+let mathematical_type ctx (t : Types.type_expr) =
+  match Datatypes.desc ctx.types t with
+  | Tconstr (p, _, _) ->
+      Option.is_some (Datatypes.collection_kind ctx.types p)
+      || List.exists ctx.proof_support.mathematical_types ~f:(fun d ->
+          Datatypes.declares d p)
+  | _ -> false
+
+let spec_contains_runtime_refs ctx ty =
+  let rec go seen ty =
+    if mathematical_type ctx ty then false
+    else
+      match Datatypes.desc ctx.types ty with
+      | Tvar _ | Tunivar _ -> true
+      | Tconstr (p, [ _ ], _) when Datatypes.is_ref p || Datatypes.is_atomic p -> true
+      | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
+      | Tconstr (p, args, _) ->
+          List.exists args ~f:(go seen)
+          || begin match Datatypes.find ctx.types p with
+          | Some { heap = Some _; _ } -> true
+          | Some { library = Some _; _ } -> true
+          | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same)
+            ->
+              List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (id :: seen)))
+          | _ -> false
+          end
+      | Ttuple components -> List.exists components ~f:(fun (_, ty) -> go seen ty)
+      | Tpoly (ty, []) -> go seen ty
+      | _ -> false
+  in
+  go [] ty
 
 let is_physical (p : Path.t) =
   match stdlib_name p with Some ("==" | "!=") -> true | _ -> false
@@ -739,8 +831,8 @@ let spec_binop (op : string) : R.Expr.binop option =
   | "*" -> Some Mult
   | "/" -> Some Div
   | "mod" -> Some Mod
-  | "=" | "==" -> Some Eq
-  | "<>" | "!=" -> Some Neq
+  | "=" | "==" | "===" -> Some Eq
+  | "<>" | "!=" | "=/=" -> Some Neq
   | "<" -> Some Lt
   | "<=" -> Some Leq
   | ">" -> Some Gt
@@ -892,6 +984,12 @@ let owned_location (t : S.term) =
 let is_constructor x =
   String.equal x "[]" || String.equal x "::"
   || ((not (String.is_empty x)) && Char.is_uppercase x.[0])
+
+let nullary_constructor (t : S.term) =
+  let head, args = spine t [] in
+  match (head.term_desc, args) with
+  | Tvar (Qid { pid_str = constructor; _ }), [] -> is_constructor constructor
+  | _ -> false
 
 (** The arguments of a constructor of [arity], given as [args]: a tuple for several. *)
 let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
@@ -1146,11 +1244,8 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       Ok (R.Expr.tuple ~loc:l ts)
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
-      let scrutinee_type =
-        match scrutinee.term_desc with
-        | Tvar (Qid { pid_str = x; _ }) ->
-            List.Assoc.find env.var_types x ~equal:String.equal
-        | _ -> None
+      let* scrutinee_type =
+        Result.map (equality_term_type env scrutinee) ~f:Option.some
       in
       spec_match env ~at ?scrutinee_type v cases
   | Tattr (_, t) -> formula env t
@@ -1243,10 +1338,29 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
     concatenation. *)
 and term_type env (t : S.term) =
-  match (t.term_desc, spine t []) with
+  match (t.term_desc, spine (S.chain t) []) with
   | Tcast (_, ty), _ -> Result.ok (Source.ocaml_type env.ctx.env ~at:t.term_loc ty)
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
+  | ( _,
+      ( {
+          term_desc =
+            Tvar
+              (Qid
+                 {
+                   pid_str =
+                     ( "=" | "<>" | "==" | "!=" | "===" | "=/=" | "<" | ">" | "<=" | ">="
+                     | "&&" | "||" | "/\\" | "\\/" );
+                   _;
+                 });
+          _;
+        },
+        [ _; _ ] ) ) ->
+      Some Predef.type_bool
+  | ( _,
+      ( { term_desc = Tvar (Qid { pid_str = "+" | "-" | "*" | "/" | "mod"; _ }); _ },
+        [ a; b ] ) ) ->
+      Option.first_some (term_type env a) (term_type env b)
   | Tcomprehension ((_, ty), _), _ ->
       Result.ok
         (Source.ocaml_type env.ctx.env ~at:t.term_loc
@@ -1257,6 +1371,15 @@ and term_type env (t : S.term) =
           List.hd outputs)
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
       List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
+  | _, ({ term_desc = Tvar (Qid { pid_str = "length"; _ }); _ }, [ _ ]) ->
+      Some Predef.type_int
+  | ( _,
+      ( {
+          term_desc = Tvar (Qdot (Qid { pid_str = "List"; _ }, { pid_str = "length"; _ }));
+          _;
+        },
+        [ _ ] ) ) ->
+      Some Predef.type_int
   | Tvar (Qid { pid_str = x; _ }), _ ->
       List.Assoc.find env.var_types x ~equal:String.equal
   | _, ({ term_desc = Tvar (Qid { pid_str = "drop" | "take"; _ }); _ }, [ _; s ]) ->
@@ -1312,6 +1435,28 @@ and location_type env (t : S.term) =
           Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
               field_type env.ctx ty "")
       | _ -> None)
+
+and equality_term_type env (t : S.term) =
+  match term_type env t with
+  | Some ty -> Ok ty
+  | None ->
+      Source.infer_logical_expression env.ctx.env ~functions:(List.map env.funcs ~f:fst)
+        ~variables:env.var_types t
+
+(** Equality operands share a type, so a known operand supplies its context. *)
+and equality_operand_types env a b =
+  match (term_type env a, term_type env b) with
+  | Some a, Some b -> Ok (a, b)
+  | Some ty, None | None, Some ty -> Ok (ty, ty)
+  | None, None ->
+      begin match equality_term_type env a with
+      | Ok ty -> Ok (ty, ty)
+      | Error first ->
+          begin match equality_term_type env b with
+          | Ok ty -> Ok (ty, ty)
+          | Error _ -> Error first
+          end
+      end
 
 (** The application [t] of an operator or a constructor. *)
 and application env (t : S.term) =
@@ -1404,13 +1549,58 @@ and application env (t : S.term) =
       let* a = formula env a in
       let* b = formula env b in
       Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] "++") [ a; b ])
-  | Tvar (Qid { pid_str = op; pid_fixity = Infix; _ }), [ a; b ] ->
-      begin match spec_binop op with
-      | None -> unsupported at (Printf.sprintf "The operator %s" op)
+  | Tvar (Qid ({ pid_str = operator; pid_fixity = Infix; _ } as id)), [ a; b ] ->
+      begin match spec_binop operator with
+      | None -> unsupported at (Printf.sprintf "The operator %s" operator)
       | Some op -> (
+          let* () =
+            match operator with
+            | "===" | "=/=" ->
+                begin match (term_type env a, term_type env b) with
+                | Some left, Some right
+                  when not (Ctype.is_equal env.ctx.env false [ left ] [ right ]) ->
+                    error id.pid_loc
+                      "Logical equality requires operands of the same OCaml type"
+                | _ -> Ok ()
+                end
+            | ("=" | "<>") when not (nullary_constructor a || nullary_constructor b) ->
+                let* a_type, b_type = equality_operand_types env a b in
+                if
+                  spec_contains_runtime_refs env.ctx a_type
+                  || spec_contains_runtime_refs env.ctx b_type
+                then
+                  let direct =
+                    Datatypes.is_heap_ref env.ctx.types a_type
+                    || Datatypes.is_heap_ref env.ctx.types b_type
+                  in
+                  error id.pid_loc
+                    (if direct then
+                       "Structural equality on references is unsupported; use == or != \
+                        for reference identity"
+                     else
+                       "Structural equality on values containing references is \
+                        unsupported")
+                else Ok ()
+            | "==" | "!=" ->
+                if nullary_constructor a || nullary_constructor b then Ok ()
+                else
+                  let* a_type = equality_term_type env a in
+                  let* b_type = equality_term_type env b in
+                  if mathematical_type env.ctx a_type || mathematical_type env.ctx b_type
+                  then
+                    error id.pid_loc
+                      "Physical equality on logical values is unsupported; use = or <>"
+                  else if
+                    Datatypes.immediate env.ctx.types a_type
+                    || Datatypes.immediate env.ctx.types b_type
+                  then Ok ()
+                  else
+                    error id.pid_loc
+                      "Physical equality on boxed values is unsupported in specifications"
+            | _ -> Ok ()
+          in
           (* A literal compared with a sequence is one. *)
-          let a_type = term_type env a
-          and b_type = term_type env b in
+          let a_type = term_type env a and b_type = term_type env b in
           let* a = expected_formula env b_type a in
           let* b = expected_formula env a_type b in
           match op with
@@ -3653,21 +3843,26 @@ let open_pending_structure ctx =
 
 (** The environment of a decision at a step whose result [value] matches [p], in the state
     [opened] of [st]. *)
-let decision_env ctx st (opened : opened) (p : S.pat) value =
+let decision_env ?value_type ctx st (opened : opened) (p : S.pat) value =
   let env =
     bind (scope_env ctx) st.state
       (State
          (List.map2_exn st.fields opened.values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
   in
   match p.pat_desc with
-  | Pid x -> Ok (bind env x.pid_str (Value value))
+  | Pid x ->
+      let env = bind env x.pid_str (Value value) in
+      Ok
+        (Option.value_map value_type ~default:env ~f:(fun ty ->
+             { env with var_types = (x.pid_str, ty) :: env.var_types }))
   | Pwild -> Ok env
   | _ -> unsupported p.pat_loc "A pattern other than a variable, before a choice,"
 
 (** The statements of the step at [at] of the function with the update [au], whose result
     [value] matches [p]: the invariants are open, and [outcome] linearizes the function or
     leaves it to be helped, registered on a pending field. *)
-let decide ctx (au : au) ~(at : Location.t) ~value (p : S.pat) (outcome : S.outcome) =
+let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
+    (outcome : S.outcome) =
   let l = loc at in
   let var x = R.Expr.var ~loc:l (name ~loc:l x) in
   let* st, args, opened =
@@ -3675,7 +3870,7 @@ let decide ctx (au : au) ~(at : Location.t) ~value (p : S.pat) (outcome : S.outc
     | Some found -> Ok found
     | None -> error at "A step that may wait without a structure with pending calls"
   in
-  let* env = decision_env ctx st opened p value in
+  let* env = decision_env ?value_type ctx st opened p value in
   let snapshots = ctx.snapshots in
   let hc = Names.fresh ctx.names "registration" in
   let registered = Names.fresh ctx.names "registered" in
@@ -3933,7 +4128,7 @@ let linearize ?step ?value ?access_type ctx ~at
         | Pending, _ ->
             (* The invariants open, the update not: the step decides. *)
             let opening = use_invariants ctx ~at ~fold:false in
-            let* decision = decide ctx au ~at ~value p o in
+            let* decision = decide ?value_type:access_type ctx au ~at ~value p o in
             Ok (opening @ access @ decision)
         | Registered r, Commits_with result ->
             let opening = use_invariants ctx ~at ~fold:false in
@@ -4255,12 +4450,8 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* field = field_of_label ctx ~at label in
       match field with
       | Some (field, true) ->
-          let* typ = typ ctx ~at e.exp_type in
-          let x = Names.fresh ctx.names "tmp" in
-          let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l v (name ~loc:l field)) in
-          Ok
-            ( stmts @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x),
-              R.Expr.var ~loc:l (name ~loc:l x) )
+          let* reading, value = ordinary_read ctx ~at ~field ~elt:e.exp_type v in
+          Ok (stmts @ reading, value)
       | Some (field, false) -> Ok (stmts, R.Expr.field ~loc:l v (name ~loc:l field))
       | None -> unsupported at "This field"
     end
@@ -4270,9 +4461,8 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* field = field_of_label ctx ~at label in
       match field with
       | Some (field, true) ->
-          Ok
-            ( value_stmts @ record_stmts @ [ write ~loc:l record field value ],
-              unit_value ~loc:l )
+          let* writing = ordinary_write ctx ~at ~field ~elt:label.lbl_arg record value in
+          Ok (value_stmts @ record_stmts @ [ writing ], unit_value ~loc:l)
       | _ -> unsupported at "This field"
     end
   | Texp_match (scrutinee, cases, [], partial) ->
@@ -4344,18 +4534,21 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let* defs =
         all evaluated ~f:(fun ((vb : Typedtree.value_binding), _, v) ->
-            let* cond, binds = pattern ctx vb.vb_pat v in
+            let* reading, cond, binds = pattern ctx vb.vb_pat v in
             match cond with
             | Some _ ->
                 unsupported vb.vb_pat.pat_loc "A refutable pattern in a let binding"
             | None ->
-                all binds ~f:(fun (id, value, t) ->
-                    let* typ = typ ctx ~at t in
-                    let x = Names.bind ~typ:t ctx.names id in
-                    Ok
-                      (R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
-                         (ident ~loc:l x)
-                      @ assume_in_range ~loc:l t x)))
+                let* defs =
+                  all binds ~f:(fun (id, value, t) ->
+                      let* typ = typ ctx ~at t in
+                      let x = Names.bind ~typ:t ctx.names id in
+                      Ok
+                        (R.Stmt.local ~loc:l ~const:true ~typ
+                           ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
+                        @ assume_in_range ~loc:l t x))
+                in
+                Ok (reading @ List.concat defs))
       in
       let last = List.last_exn bindings in
       let* ghost =
@@ -4364,8 +4557,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* body_stmts, body = expr ~tail ~keep_scope ctx body in
       Ok
         ( List.concat_map evaluated ~f:(fun (_, stmts, _) -> stmts)
-          @ List.concat (List.concat defs)
-          @ ghost @ body_stmts,
+          @ List.concat defs @ ghost @ body_stmts,
           body )
   | Texp_let (Recursive, _, _) -> unsupported at "A local recursive function"
   | Texp_sequence (e1, e2) ->
@@ -4469,14 +4661,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
     | _ -> unsupported at "This reference"
   in
   (* The value of the field [field] of the reference [r], read into a variable. *)
-  let read r field typ_of =
-    let* typ = typ ctx ~at typ_of in
-    let x = Names.fresh ctx.names "tmp" in
-    let rhs = R.Stmt.expr_rhs (R.Expr.field ~loc:l r (name ~loc:l field)) in
-    Ok
-      ( R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x),
-        R.Expr.var ~loc:l (name ~loc:l x) )
-  in
+  let read r field typ_of = ordinary_read ctx ~at ~field ~elt:typ_of r in
   match (stdlib_name path, args) with
   | _ when Option.is_some (atomic_name path) ->
       atomic ctx e (Option.value_exn (atomic_name path)) args
@@ -4498,9 +4683,11 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
       Ok (stmts @ reading, v)
   | Some ":=", [ r; v ] ->
       let* field = contents r in
+      let elt = v.exp_type in
       let* v_stmts, v = expr ctx v in
       let* r_stmts, r = expr ctx r in
-      Ok (v_stmts @ r_stmts @ [ write ~loc:l r field v ], unit_value ~loc:l)
+      let* writing = ordinary_write ctx ~at ~field ~elt r v in
+      Ok (v_stmts @ r_stmts @ [ writing ], unit_value ~loc:l)
   | Some (("incr" | "decr") as op), [ r ] ->
       let* field = contents r in
       let* stmts, r = expr ctx r in
@@ -4509,9 +4696,8 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
       let binop : R.Expr.binop = if String.equal op "incr" then Plus else Minus in
       let v' = R.Expr.binary ~loc:l binop v (R.Expr.int ~loc:l 1) in
       let what = if String.equal op "incr" then "increment" else "decrement" in
-      Ok
-        ( stmts @ reading @ [ no_overflow ctx ~at what v'; write ~loc:l r field v' ],
-          unit_value ~loc:l )
+      let* writing = ordinary_write ctx ~at ~field ~elt:int_type r v' in
+      Ok (stmts @ reading @ [ no_overflow ctx ~at what v'; writing ], unit_value ~loc:l)
   | _ -> apply_operator ctx e path args
 
 (** The application of [Atomic.op] to [args], in [e]. *)
@@ -4630,6 +4816,8 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
   let at = e.exp_loc in
   let l = loc at in
   match (binop_of_path path, unop_of_path path, args) with
+  | Some (Eq | Neq), _, [ a; b ] when runtime_structural_equality_unsafe ctx path a b ->
+      error at "Structural equality on values containing references is unsupported"
   | Some ((And | Or) as op), _, [ a; b ] ->
       (* The right operand is evaluated only if the left one does not decide. *)
       let* a_stmts, a = expr ctx a in
@@ -4961,63 +5149,78 @@ and operands ctx (args : Typedtree.expression list) =
   let* evaluated = all (List.rev args) ~f:(fun arg -> expr ctx arg) in
   Ok (List.concat_map evaluated ~f:fst, List.rev_map evaluated ~f:snd)
 
-(** The condition under which the value [v] matches [p], [None] if it always does, and the
-    variables [p] binds, with their values and types. *)
-and pattern ctx (p : Typedtree.pattern) (v : R.Expr.t) =
+(** The accesses and condition for matching [p] against [v], and its bindings. *)
+and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
   let at = p.pat_loc in
   let l = loc at in
   let conjoin conds =
     List.reduce (List.filter_opt conds) ~f:(fun a b -> R.Expr.binary ~loc:l And a b)
   in
-  let components ps values =
-    let* matched = all (List.zip_exn ps values) ~f:(fun (p, v) -> pattern ctx p v) in
-    Ok (List.map matched ~f:fst, List.concat_map matched ~f:snd)
+  let components guard ps values =
+    let* matched =
+      all (List.zip_exn ps values) ~f:(fun (p, (access, v)) ->
+          let* nested, cond, binds = pattern ?guard ctx p v in
+          Ok (access @ nested, cond, binds))
+    in
+    Ok
+      ( List.concat_map matched ~f:(fun (access, _, _) -> access),
+        conjoin (List.map matched ~f:(fun (_, cond, _) -> cond)),
+        List.concat_map matched ~f:(fun (_, _, binds) -> binds) )
   in
   match p.pat_desc with
-  | Tpat_any -> Ok (None, [])
-  | Tpat_var (id, _, _) -> Ok (None, [ (id, v, p.pat_type) ])
+  | Tpat_any -> Ok ([], None, [])
+  | Tpat_var (id, _, _) -> Ok ([], None, [ (id, v, p.pat_type) ])
   | Tpat_alias (q, id, _, _, _) ->
-      let* cond, binds = pattern ctx q v in
-      Ok (cond, binds @ [ (id, v, p.pat_type) ])
+      let* access, cond, binds = pattern ?guard ctx q v in
+      Ok (access, cond, binds @ [ (id, v, p.pat_type) ])
   | Tpat_constant (Const_int n) ->
-      Ok (Some (R.Expr.binary ~loc:l Eq v (R.Expr.int ~loc:l n)), [])
+      Ok ([], Some (R.Expr.binary ~loc:l Eq v (R.Expr.int ~loc:l n)), [])
   | Tpat_tuple ps ->
-      let values = List.mapi ps ~f:(fun i _ -> R.Expr.tuple_get ~loc:l v i) in
-      let* conds, binds = components (List.map ps ~f:snd) values in
-      Ok (conjoin conds, binds)
+      let values = List.mapi ps ~f:(fun i _ -> ([], R.Expr.tuple_get ~loc:l v i)) in
+      components guard (List.map ps ~f:snd) values
   | Tpat_record (fields, _) ->
-      (* The fields of an immutable record. *)
       let* parts =
         all fields ~f:(fun (_, label, p) ->
             let* field = field_of_label ctx ~at label in
             match field with
-            | Some (field, false) -> Ok (p, R.Expr.field ~loc:l v (name ~loc:l field))
-            | Some (_, true) -> unsupported at "A pattern on a mutable field"
+            | Some (field, false) ->
+                Ok (p, ([], R.Expr.field ~loc:l v (name ~loc:l field)))
+            | Some (field, true) ->
+                let* access, value =
+                  ordinary_read ?guard ctx ~at ~field ~elt:label.lbl_arg v
+                in
+                Ok (p, (access, value))
             | None -> unsupported at "This field")
       in
-      let* conds, binds = components (List.map parts ~f:fst) (List.map parts ~f:snd) in
-      Ok (conjoin conds, binds)
+      components guard (List.map parts ~f:fst) (List.map parts ~f:snd)
   | Tpat_construct (_, { cstr_name = ("true" | "false") as b; _ }, [], _) ->
       Ok
-        (Some (R.Expr.binary ~loc:l Eq v (R.Expr.bool ~loc:l (String.equal b "true"))), [])
-  | Tpat_construct (_, { cstr_name = "()"; _ }, [], _) -> Ok (None, [])
+        ( [],
+          Some (R.Expr.binary ~loc:l Eq v (R.Expr.bool ~loc:l (String.equal b "true"))),
+          [] )
+  | Tpat_construct (_, { cstr_name = "()"; _ }, [], _) -> Ok ([], None, [])
   | Tpat_construct (_, cstr, ps, _) ->
       begin match Datatypes.find_cstr ctx.types cstr with
       | None -> unsupported at "This constructor"
       | Some (_, c) ->
           let is_c = R.Expr.is_ ~loc:l v (ident ~loc:l c.raven) in
           let fields =
-            List.map c.fields ~f:(fun f -> R.Expr.field ~loc:l v (name ~loc:l f))
+            List.map c.fields ~f:(fun f -> ([], R.Expr.field ~loc:l v (name ~loc:l f)))
           in
-          let* conds, binds = components ps fields in
-          Ok (conjoin (Some is_c :: conds), binds)
+          let* access, cond, binds =
+            components (conjoin [ guard; Some is_c ]) ps fields
+          in
+          Ok (access, conjoin [ Some is_c; cond ], binds)
       end
   | Tpat_or (p1, p2, _) -> begin
-      let* c1, b1 = pattern ctx p1 v in
-      let* c2, b2 = pattern ctx p2 v in
-      match (c1, c2, b1, b2) with
-      | Some c1, Some c2, [], [] -> Ok (Some (R.Expr.binary ~loc:l Or c1 c2), [])
-      | _, _, [], [] -> Ok (None, [])
+      let* a1, c1, b1 = pattern ?guard ctx p1 v in
+      let* a2, c2, b2 = pattern ?guard ctx p2 v in
+      match (a1, a2, c1, c2, b1, b2) with
+      | [], [], Some c1, Some c2, [], [] ->
+          Ok ([], Some (R.Expr.binary ~loc:l Or c1 c2), [])
+      | [], [], _, _, [], [] -> Ok ([], None, [])
+      | _ :: _, _, _, _, _, _ | _, _ :: _, _, _, _, _ ->
+          unsupported at "An or-pattern reading a mutable field"
       | _ -> unsupported at "An or-pattern binding variables"
     end
   | _ -> unsupported at "This pattern"
@@ -5095,16 +5298,17 @@ and match_cases ?commits ~tail ctx ~at v
         let rec chain = function
           | [] -> Ok (if total then [] else not_exhaustive ())
           | [ (p, rhs) ] when total ->
-              let* _, binds = pattern ctx p v in
-              case_body binds rhs
+              let* access, _, binds = pattern ctx p v in
+              let* body = case_body binds rhs in
+              Ok (access @ body)
           | (p, rhs) :: rest -> begin
-              let* cond, binds = pattern ctx p v in
+              let* access, cond, binds = pattern ctx p v in
               let* body = case_body binds rhs in
               match cond with
-              | None -> Ok body
+              | None -> Ok (access @ body)
               | Some cond ->
                   let* rest = chain rest in
-                  Ok [ R.Stmt.if_ ~loc:l cond body rest ]
+                  Ok (access @ [ R.Stmt.if_ ~loc:l cond body rest ])
             end
         in
         chain cases
@@ -5301,6 +5505,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       | None -> not_pure "This field"
     end
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
+    when runtime_structural_equality_unsafe ctx path a b ->
+      error at "Structural equality on values containing references is unsupported"
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
     when is_physical path && not (exact_physical ctx.types a b) ->
       not_pure "Physical equality on values that are not immediate"
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) -> begin
@@ -5357,16 +5564,20 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
           let rec chain = function
             | [] -> not_pure "An empty match"
             | [ (p, rhs) ] ->
-                let* _, binds = pattern ctx p v in
-                pure_in (with_binds binds) rhs
+                let* access, _, binds = pattern ctx p v in
+                if List.is_empty access then pure_in (with_binds binds) rhs
+                else not_pure "A pattern reading a mutable field"
             | (p, rhs) :: rest -> begin
-                let* cond, binds = pattern ctx p v in
-                let* body = pure_in (with_binds binds) rhs in
-                match cond with
-                | None -> Ok body
-                | Some cond ->
-                    let* rest = chain rest in
-                    Ok (R.Expr.ite ~loc:l cond body rest)
+                let* access, cond, binds = pattern ctx p v in
+                if not (List.is_empty access) then
+                  not_pure "A pattern reading a mutable field"
+                else
+                  let* body = pure_in (with_binds binds) rhs in
+                  match cond with
+                  | None -> Ok body
+                  | Some cond ->
+                      let* rest = chain rest in
+                      Ok (R.Expr.ite ~loc:l cond body rest)
               end
           in
           chain cases
@@ -5506,7 +5717,7 @@ let pattern_params ctx (f : func) formals =
             Some (_, x) ) ->
             let l = loc pat_loc in
             let value = R.Expr.var ~loc:l (name ~loc:l x) in
-            let* cond, binds = pattern ctx pat value in
+            let* access, cond, binds = pattern ctx pat value in
             begin match cond with
             | Some _ -> unsupported pat_loc "A refutable pattern as a parameter"
             | None ->
@@ -5531,7 +5742,7 @@ let pattern_params ctx (f : func) formals =
                         | _ -> ())
                 | _ -> ()
                 end;
-                Ok stmts
+                Ok (access :: stmts)
             end
         | _ -> Ok [])
   in
@@ -5642,7 +5853,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
   Ok (result_name, env, implicit, ghosts)
 
 (** [env] with the names that preconditions of [f] define by a constructor's arguments, as
-    [c] in [requires node = Next (v, c)]: the value's fields. *)
+    [c] in [requires node === Next (v, c)]: the value's fields. *)
 and pattern_definitions env (f : func) =
   let l = R.Loc.none in
   let requires = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
@@ -5654,7 +5865,7 @@ and pattern_definitions env (f : func) =
   in
   let define env (t : S.term) =
     match spine t [] with
-    | ( { term_desc = Tvar (Qid { pid_str = "="; _ }); _ },
+    | ( { term_desc = Tvar (Qid { pid_str = "=" | "==" | "==="; _ }); _ },
         [ ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ } as value); rhs ] )
       when List.Assoc.mem env.vars x ~equal:String.equal ->
         begin match spine rhs [] with
@@ -6587,7 +6798,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
 (** The entry [element] of a fact that [f] ensures about an earlier state, given the
     arguments of a call: a parameter, which [names] names, or the argument of a
     constructor that a precondition matches a parameter with, as [c] in
-    [requires node = Next (v, c)]. *)
+    [requires node === Next (v, c)]. *)
 let entry_of_args types (f : func) (names : string option list) (element : S.term) =
   let l = R.Loc.none in
   let param x =
@@ -6607,7 +6818,7 @@ let entry_of_args types (f : func) (names : string option list) (element : S.ter
   let defined y =
     List.find_map (List.concat_map requires ~f:conjuncts) ~f:(fun t ->
         match spine t [] with
-        | ( { term_desc = Tvar (Qid { pid_str = "="; _ }); _ },
+        | ( { term_desc = Tvar (Qid { pid_str = "=" | "==" | "==="; _ }); _ },
             [ { term_desc = Tvar (Qid { pid_str = x; _ }); _ }; rhs ] ) ->
             begin match (param x, spine rhs []) with
             | Some i, ({ term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args) -> begin
@@ -7688,7 +7899,12 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
             }
         | None -> env)
   in
-  let post_env = bind post_env result_name (Value result) in
+  let post_env =
+    {
+      (bind post_env result_name (Value result)) with
+      var_types = (result_name, helped.body.exp_type) :: post_env.var_types;
+    }
+  in
   let* posts =
     all
       (Option.value_map helped.contract ~default:[] ~f:(fun c -> c.atomic_ensures))
@@ -9152,6 +9368,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       resources = source.proof_resources;
       ghost_fields = source.proof_fields;
       logical_functions;
+      mathematical_types =
+        source.proof_types @ source.logical_types @ resource_types @ token_types;
       predicate_inputs;
     }
   in

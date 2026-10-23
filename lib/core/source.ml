@@ -829,6 +829,8 @@ let logical_check_signature =
   "module Caravan__logical_check : sig\n\
    val quantify : ('a -> bool) -> bool\n\
    val implies : bool -> bool -> bool\n\
+   val equal : 'a -> 'a -> bool\n\
+   val not_equal : 'a -> 'a -> bool\n\
    module Set : sig\n\
    val empty : 'a set\n\
    val singleton : 'a -> 'a set\n\
@@ -904,6 +906,8 @@ let logical_identifier ~functions ~loc q =
     when List.mem [ "Set"; "Finset"; "Map" ] m.pid_str ~equal:String.equal
          && not (List.mem functions (m.pid_str ^ "." ^ op.pid_str) ~equal:String.equal) ->
       logical_helper ~loc [ m.pid_str; op.pid_str ]
+  | Qid { pid_str = "==="; _ } -> logical_helper ~loc [ "equal" ]
+  | Qid { pid_str = "=/="; _ } -> logical_helper ~loc [ "not_equal" ]
   | Qid { pid_str = "->" | "<->"; _ } -> logical_helper ~loc [ "implies" ]
   | Qid { pid_str = "/\\"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "&&"; loc }
   | Qid { pid_str = "\\/"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "||"; loc }

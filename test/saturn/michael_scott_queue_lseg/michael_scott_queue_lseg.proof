@@ -5,11 +5,11 @@ predicate segment (first : node Atomic.t) (limit : node Atomic.t)
     (edges [@implicit] : edge finset) =
   not (Finset.mem limit cells)
   && (match items with
-      | [] -> first = limit && cells = Finset.empty && edges = Finset.empty
+      | [] -> first == limit && cells = Finset.empty && edges = Finset.empty
       | value :: tail ->
           exists next : node Atomic.t, tail_cells : node Atomic.t finset,
             tail_edges : edge finset.
-          first <> limit && not (Finset.mem first tail_cells)
+          first != limit && not (Finset.mem first tail_cells)
           && cells = Finset.union (Finset.singleton first) tail_cells
           && edges = Finset.union (Finset.singleton (Edge (first, value, next))) tail_edges
           && own first (Next (value, next))
@@ -21,8 +21,8 @@ lemma segment_info (first : node Atomic.t) (limit : node Atomic.t)
   requires (segment first limit items cells edges)
   ensures (segment first limit items cells edges)
   ensures (not (Finset.mem limit cells))
-  ensures (items = [] -> first = limit && cells = Finset.empty && edges = Finset.empty)
-  ensures (items <> [] -> Finset.mem first cells && first <> limit) =
+  ensures (items = [] -> first == limit && cells = Finset.empty && edges = Finset.empty)
+  ensures (items <> [] -> Finset.mem first cells && first != limit) =
   let (next, tail_cells, tail_edges) =
     unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
   fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
@@ -55,7 +55,7 @@ lemma segment_append (first : node Atomic.t) (limit : node Atomic.t)
     (successor : node Atomic.t) (items : int list)
     (cells : node Atomic.t finset) (edges : edge finset) (value : int)
   requires (segment first limit items cells edges && own limit (Next (value, successor)))
-  requires (successor <> limit && not (Finset.mem successor cells))
+  requires (successor != limit && not (Finset.mem successor cells))
   ensures (segment first successor (items @ [value])
     (Finset.union cells (Finset.singleton limit))
     (Finset.union edges (Finset.singleton (Edge (limit, value, successor))))) =
@@ -82,14 +82,14 @@ lemma segment_split (first : node Atomic.t) (limit : node Atomic.t)
     (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges))
   ensures (Finset.inter before_cells after_cells = Finset.empty)
   ensures (not (Finset.mem target before_cells) && not (Finset.mem target after_cells))
-  ensures (target <> limit && not (Finset.mem limit before_cells))
+  ensures (target != limit && not (Finset.mem limit before_cells))
   variant (items) =
   let (successor, tail_cells, tail_edges) =
     unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
   match items with
   | [] -> assert false
   | head :: tail ->
-      if first = target then begin
+      if first == target then begin
         fold segment first target [] Finset.empty Finset.empty;
         ([], Finset.empty, Finset.empty, head, successor, tail, tail_cells, tail_edges)
       end else begin
@@ -112,7 +112,7 @@ lemma segment_restore (first : node Atomic.t) (target : node Atomic.t)
     && own target (Next (value, next)) && segment next limit after after_cells after_edges)
   requires (Finset.inter before_cells after_cells = Finset.empty
     && not (Finset.mem target before_cells) && not (Finset.mem target after_cells)
-    && not (Finset.mem limit before_cells) && target <> limit)
+    && not (Finset.mem limit before_cells) && target != limit)
   ensures (segment first limit (before @ (value :: after))
     (Finset.union before_cells (Finset.union (Finset.singleton target) after_cells))
     (Finset.union before_edges
@@ -142,7 +142,7 @@ lemma segment_edge_endpoints (first : node Atomic.t) (limit : node Atomic.t)
   ensures (segment first limit items cells edges)
   ensures (forall edge : edge. Finset.mem edge edges ->
     match edge with Edge (source, _, destination) ->
-      Finset.mem source cells && (Finset.mem destination cells || destination = limit))
+      Finset.mem source cells && (Finset.mem destination cells || destination == limit))
   variant (items) =
   let (next, tail_cells, tail_edges) =
     unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
@@ -160,7 +160,7 @@ lemma segment_edges_functional (first : node Atomic.t) (limit : node Atomic.t)
   ensures (segment first limit items cells edges)
   ensures (forall a : edge, b : edge. Finset.mem a edges && Finset.mem b edges ->
     match a with Edge (source_a, _, _) ->
-      match b with Edge (source_b, _, _) -> source_a = source_b -> a = b)
+      match b with Edge (source_b, _, _) -> source_a == source_b -> a = b)
   variant (items) =
   let (next, tail_cells, tail_edges) =
     unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
@@ -184,7 +184,7 @@ lemma segment_terminal_outside (first : node Atomic.t) (limit : node Atomic.t)
   match items with
   | [] -> fold segment first limit items cells edges
   | _ :: tail ->
-      assert (first <> terminal);
+      assert (first != terminal);
       segment_terminal_outside next limit tail tail_cells tail_edges terminal;
       fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
         tail_edges = tail_edges}
@@ -202,12 +202,12 @@ lemma consecutive_segment_edges (first : node Atomic.t) (middle : node Atomic.t)
     Finset.mem a (Finset.union left_edges right_edges)
     && Finset.mem b (Finset.union left_edges right_edges) ->
       match a with Edge (source_a, _, _) ->
-        match b with Edge (source_b, _, _) -> source_a = source_b -> a = b)
+        match b with Edge (source_b, _, _) -> source_a == source_b -> a = b)
   ensures (forall edge : edge. Finset.mem edge (Finset.union left_edges right_edges) ->
     match edge with Edge (source, _, destination) ->
       Finset.mem source (Finset.union left_cells right_cells)
       && (Finset.mem destination (Finset.union left_cells right_cells)
-        || destination = middle || destination = limit)) =
+        || destination == middle || destination == limit)) =
   segment_edge_endpoints first middle left left_cells left_edges;
   segment_edge_endpoints middle limit right right_cells right_edges;
   segment_edges_functional first middle left left_cells left_edges;
@@ -489,7 +489,7 @@ invariant is_queue (q : t) =
     retired_fp : node Atomic.t finset, active_fp : node Atomic.t finset,
     retired_links : edge finset, active_links : edge finset,
     waiting : Ghost.t finset, waiting_on : (Ghost.t, node Atomic.t) map.
-    q.head <> q.tail
+    q.head != q.tail
     && own q.head head
     && own q.tail tail
     && segment root head retired_values retired_fp retired_links
@@ -509,7 +509,7 @@ invariant is_queue (q : t) =
                  (Finset.union retired_fp
                    (Finset.union active_fp (Finset.singleton last)))
             && own ~fraction:Permission.half (Ghost.at waiting_linked reg)
-                 (Map.get waiting_on reg <> last)
+                 (Map.get waiting_on reg != last)
             && waiting_registration reg q)
     && own ~fraction:Permission.half (Ghost.at view_queue q.head) values
     && own (Ghost.at facts_auth q.head)
@@ -531,19 +531,19 @@ lemma waiting_help (q : t) (cell : node Atomic.t) (xs : int list)
       own ~fraction:Permission.half (Ghost.at waiting_linked reg)
         (Set.mem reg linkedflags)
       && waiting_registration reg q
-      && (Map.get waiting_on reg = cell -> not (Set.mem reg linkedflags)))
+      && (Map.get waiting_on reg == cell -> not (Set.mem reg linkedflags)))
   ensures (own ~fraction:Permission.half (Ghost.at view_queue q.head) xs)
   ensures (forall reg : Ghost.t.
     Finset.mem reg waiting ->
       own ~fraction:Permission.half (Ghost.at waiting_linked reg)
-        (Set.mem reg linkedflags || Map.get waiting_on reg = cell)
+        (Set.mem reg linkedflags || Map.get waiting_on reg == cell)
       && waiting_registration reg q)
   variant (waiting) =
   if waiting <> Finset.empty then begin
     let reg = Finset.choose waiting in
     let rest = Finset.diff waiting (Finset.singleton reg) in
     waiting_help q cell xs rest waiting_on linkedflags;
-    if Map.get waiting_on reg = cell then begin
+    if Map.get waiting_on reg == cell then begin
       let (token, linked, retired) =
         unfold waiting_registration reg q {token; linked; retired} in
       if not retired then begin

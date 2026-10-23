@@ -1,9 +1,9 @@
 predicate segment (first : node Atomic.t) (limit : node Atomic.t) (items : int list) =
   match items with
-  | [] -> first = limit
+  | [] -> first == limit
   | value :: tail ->
     exists next : node Atomic.t.
-      first <> limit && own first (Next (value, next)) && segment next limit tail
+      first != limit && own first (Next (value, next)) && segment next limit tail
 
 invariant singleton (first : node Atomic.t) (limit : node Atomic.t) =
   exists value : int. segment first limit [value] && own limit End
@@ -11,12 +11,12 @@ invariant singleton (first : node Atomic.t) (limit : node Atomic.t) =
 lemma expose (first : node Atomic.t) (limit : node Atomic.t) (value : int)
   returns (next : node Atomic.t)
   requires (segment first limit [value])
-  ensures (first <> limit && own first (Next (value, next)) && segment next limit []) =
+  ensures (first != limit && own first (Next (value, next)) && segment next limit []) =
   let next = unfold segment first limit [value] {next} in
   next
 
 lemma restore (first : node Atomic.t) (limit : node Atomic.t) (value : int)
   (next : node Atomic.t)
-  requires (first <> limit && own first (Next (value, next)) && segment next limit [])
+  requires (first != limit && own first (Next (value, next)) && segment next limit [])
   ensures (segment first limit [value]) =
   fold segment first limit [value] {next = next}

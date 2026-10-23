@@ -1,0 +1,6 @@
+let compare_nested (left : int) (right : int)
+    (first : int ref option) (second : int ref option) : bool =
+  match (first, second) with
+  | Some left, Some right -> left = right
+  | None, _ -> false
+  | Some _, None -> false

@@ -70,4 +70,4 @@ lemma publish (cell : int Atomic.t)
 lemma fresh_registrations =
   let first = Ghost.alloc [Ghost.init linked false] in
   let second = Ghost.alloc [Ghost.init linked false] in
-  assert (first <> second)
+  assert (first != second)

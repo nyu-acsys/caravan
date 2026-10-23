@@ -9,10 +9,10 @@ All notable changes to this project will be documented in this file.
 - Source-level verification errors retain solver timeout explanations.
 - Proof files support checked lemmas with inferable trailing arguments, implicit predicate outputs, general invariants, logical variant types, and sets and maps.
 - First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
-- Contracts support named arguments, quantifiers, chained comparisons, and pattern matching.
-- Variants, tuples, lists, options, records, and type abbreviations are supported.
+- Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
+- Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
 - Contracts can use list concatenation, membership, and length, and call verified pure functions.
-- Mutable record fields, reference cells, and atomics support separation-logic ownership contracts.
+- Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
 - Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
 - Integer fields and quantified integer variables respect OCaml's integer bounds.
 - While and for loops support annotated invariants.

@@ -2,10 +2,10 @@ predicate segment (first : cell option) (last : cell option)
     (path : cell list) (nodes : cell finset) =
   (match last with None -> true | Some c -> not (Finset.mem c nodes))
   && (match path with
-      | [] -> first = last && nodes = Finset.empty
+      | [] -> first === last && nodes = Finset.empty
       | c :: tail ->
           exists next : cell option, rest : cell finset.
-            first = Some c && first <> last && not (Finset.mem c rest)
+            first === Some c && not (first === last) && not (Finset.mem c rest)
             && nodes = Finset.union rest (Finset.singleton c)
             && own c.next next && segment next last tail rest)
 
@@ -13,7 +13,7 @@ lemma segment_info (first : cell option) (last : cell option)
     (path : cell list) (nodes : cell finset)
   requires (segment first last path nodes)
   ensures (segment first last path nodes)
-  ensures (path = [] -> first = last && nodes = Finset.empty)
+  ensures (path = [] -> first === last && nodes = Finset.empty)
   ensures (path <> [] -> Finset.mem path.hd nodes)
   ensures (match last with None -> true | Some c -> not (Finset.mem c nodes))
   =

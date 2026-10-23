@@ -35,12 +35,12 @@ lemma sum_owned (left : int Atomic.t) (right : int Atomic.t)
 
 lemma reference_identity (anchor : int ref) (value [@implicit] : int ref)
   returns (result : int ref)
-  ensures (result = value) =
+  ensures (result == value) =
   value
 
 lemma use_reference_override (anchor : int ref) =
   let result = reference_identity anchor anchor in
-  assert (result = anchor)
+  assert (result == anchor)
 
 lemma keep (cell : int Atomic.t) (fuel : int) (value [@implicit] : int)
   requires (own cell value && fuel >= 0)

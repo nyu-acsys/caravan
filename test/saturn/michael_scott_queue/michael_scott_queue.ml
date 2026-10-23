@@ -17,7 +17,7 @@ let rec fix_tail tail new_tail =
   then fix_tail tail new_tail
 (*@ fix_tail [q : t] tail new_tail
     requires is_queue q
-    requires tail = q.tail
+    requires tail == q.tail
     requires past (mem new_tail s.cells) *)
 
 let push { tail; _ } value =
@@ -29,7 +29,7 @@ let push { tail; _ } value =
     (*@ find_tail_and_enq curr_end node
       continues push
       requires past (mem curr_end s.cells)
-      requires node = Next (v, c) && own c Nil
+      requires node === Next (v, c) && own c Nil
       ensures past (mem c s.cells) *)
   in
   let new_tail = Atomic.make Nil in
@@ -63,7 +63,7 @@ let is_empty q =
     (Atomic.get
        q.head
        (*@ returning c ->
-          if c <> s.cells.(length s.values) then commit false
+          if c != s.cells.(length s.values) then commit false
           else wait in s.waiting on c *))
   (*@ returning Nil -> commit true *)
   == Nil

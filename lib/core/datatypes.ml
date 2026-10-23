@@ -272,6 +272,14 @@ let is_ghost (p : Path.t) = String.equal (Path.name p) "Ghost.t"
 (** The fractional permission type of specifications. *)
 let is_permission (p : Path.t) = String.equal (Path.name p) "Permission.t"
 
+(** Whether [t] itself is a heap reference, rather than a value containing one. *)
+let is_heap_ref (types : t list) (t : Types.type_expr) =
+  match desc types t with
+  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+  | Tconstr (p, [], _) when is_ghost p -> true
+  | Tconstr (p, [], _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
+  | _ -> false
+
 (** The data type and constructor named [ocaml] in a contract: the latest such
     constructor, as in OCaml, where those of lists and options come first. *)
 let find_ctor (types : t list) (ocaml : string) =

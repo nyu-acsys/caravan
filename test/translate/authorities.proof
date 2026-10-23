@@ -18,13 +18,13 @@ let facts_of (published : node Atomic.t finset)
 
 let singleton_cell (cell : node Atomic.t) : node Atomic.t set =
   let original = cell in
-  Set.of_predicate (fun (cell : node Atomic.t) -> cell = original)
+  Set.of_predicate (fun (cell : node Atomic.t) -> cell == original)
 
 lemma singleton_membership (cell : node Atomic.t)
   ensures (Set.mem cell (singleton_cell cell)) = ()
 
 lemma singleton_exclusion (left : node Atomic.t) (right : node Atomic.t)
-  requires (left <> right)
+  requires (left != right)
   ensures (not (Set.mem right (singleton_cell left))) = ()
 
 let first_of_two (items : int list) : int =

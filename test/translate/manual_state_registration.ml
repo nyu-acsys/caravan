@@ -18,7 +18,7 @@ let read_registered (cell : int Atomic.t) =
         match state with
         | Registered registration ->
             let linked = Ghost.read (Ghost.at watched registration) in
-            assert (linked = cell)
+            assert (linked == cell)
         | Linked observed -> assert (observed = observed)
       in
       let result = step () in

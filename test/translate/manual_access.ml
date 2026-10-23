@@ -80,7 +80,7 @@ let read_chain (first : node Atomic.t) (limit : node Atomic.t) = Atomic.get firs
     let (value, tail) = unfold chain first limit {value; tail} in
     let next = expose_head first limit value tail in
     let observed = inspect () in
-    assert (observed = Next (value, next));
+    assert (observed === Next (value, next));
     restore_head first limit value tail next;
     fold chain first limit {value = value; tail = tail};
     observed)

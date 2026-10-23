@@ -1,0 +1,1 @@
+invariant held (cell : int ref) = own cell.contents 0

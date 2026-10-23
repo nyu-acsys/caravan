@@ -80,6 +80,27 @@ also provides `choose`, whose set must be nonempty. Maps use `Map.const`,
 `Map.get`, and `Map.set`. A constant map may need an explicit type annotation,
 such as `(Map.const 0 : (int, int) map)`.
 
+Equality in specifications distinguishes OCaml comparisons from logical equality:
+
+| Operators | Meaning |
+|---|---|
+| `=`, `<>` | Structural equality and inequality on runtime values without references or mutable records; mathematical equality on logical types, sets, and maps. |
+| `==`, `!=` | Physical identity on references, atomics, and mutable records; exact comparison on immediate values. Boxed physical comparisons are rejected in specifications. |
+| `===`, `=/=` | Logical equality and inequality: compare immutable structure recursively and heap references by identity, without reading their contents. |
+
+The specification-only operators `===` and `=/=` translate directly to Raven's
+`=` and `!=`. For example, `[left] === [right]` compares the identities of the
+references in the lists. Ordinary OCaml structural equality on runtime values
+containing references or mutable records is rejected in both code and
+specifications. Tests against nullary constructors, such as `cells = []`, remain
+supported.
+
+Ordinary reference and mutable-record accesses require ownership and translate
+to procedures with ordinary contracts. Reads accept a positive fractional share;
+writes require full ownership. Raven consequently rejects these accesses while a
+shared invariant or atomic update is open. `Atomic` operations retain their
+atomic contracts.
+
 Proof files can define nonrecursive pure logical functions with typed parameters
 and results. A set comprehension uses an OCaml-style binder:
 
