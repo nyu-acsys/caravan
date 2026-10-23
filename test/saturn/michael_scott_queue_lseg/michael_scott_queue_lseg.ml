@@ -46,8 +46,8 @@ let rec fix_tail tail new_tail =
     is_queue_published_observe q new_tail (Finset.union retired_fp (Finset.union active_fp
       (Finset.singleton last))) (Finset.union retired_links active_links) (Finset.union
       retired_fp (Finset.singleton head)) waiting;
-    segment_info root head retired_values retired_fp retired_links;
-    segment_info head last values active_fp active_links;
+    segment_info root head;
+    segment_info head last;
     let exposure =
       if new_tail = last then At_last
       else if Finset.mem new_tail retired_fp then
@@ -114,8 +114,8 @@ let push { tail; _ } value =
       is_queue_published_observe q curr_end (Finset.union retired_fp (Finset.union
         active_fp (Finset.singleton last))) (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head retired_values retired_fp retired_links;
-      segment_info head last values active_fp active_links;
+      segment_info root head;
+      segment_info head last;
       let exposure =
         if curr_end = last then At_last
         else if Finset.mem curr_end retired_fp then
@@ -154,16 +154,6 @@ let push { tail; _ } value =
           (Finset.union (Finset.union retired_links active_links) (Finset.singleton (Edge
             (last, value, fresh))))
           (Finset.union retired_fp (Finset.singleton head)) waiting fresh;
-        assert (Finset.union
-          (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-          (Finset.singleton fresh) =
-          Finset.union retired_fp
-            (Finset.union (Finset.union active_fp (Finset.singleton last))
-              (Finset.singleton fresh)));
-        assert (Finset.union (Finset.union retired_links active_links)
-          (Finset.singleton (Edge (last, value, fresh))) =
-          Finset.union retired_links
-            (Finset.union active_links (Finset.singleton (Edge (last, value, fresh)))));
         assert (facts_of
           (Finset.union
             (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
@@ -210,8 +200,8 @@ let push { tail; _ } value =
         is_queue_published_observe q curr_end (Finset.union retired_fp (Finset.union
           active_fp (Finset.singleton last))) (Finset.union retired_links active_links)
           (Finset.union retired_fp (Finset.singleton head)) waiting;
-        segment_info root head retired_values retired_fp retired_links;
-        segment_info head last values active_fp active_links;
+        segment_info root head;
+        segment_info head last;
         let exposure =
           if curr_end = last then At_last
           else if Finset.mem curr_end retired_fp then
@@ -244,8 +234,6 @@ let push { tail; _ } value =
         | Next (_, next) ->
           consecutive_segment_edges root head last retired_values values retired_fp
             active_fp retired_links active_links;
-          assert (Finset.mem next (Finset.union retired_fp (Finset.union active_fp
-            (Finset.singleton last))));
           is_queue_published_snapshot q (Finset.union retired_fp (Finset.union active_fp
             (Finset.singleton last))) (Finset.union retired_links active_links)
             (Finset.union retired_fp (Finset.singleton head)) waiting next;
@@ -301,8 +289,8 @@ let push { tail; _ } value =
     is_queue_published_observe q old_tail (Finset.union retired_fp (Finset.union active_fp
       (Finset.singleton last))) (Finset.union retired_links active_links) (Finset.union
       retired_fp (Finset.singleton head)) waiting;
-    segment_info root head retired_values retired_fp retired_links;
-    segment_info head last values active_fp active_links;
+    segment_info root head;
+    segment_info head last;
     let exposure =
       if old_tail = last then At_last
       else if Finset.mem old_tail retired_fp then
@@ -339,16 +327,6 @@ let push { tail; _ } value =
         (Finset.union (Finset.union retired_links active_links) (Finset.singleton (Edge
           (last, value, new_tail))))
         (Finset.union retired_fp (Finset.singleton head)) waiting new_tail;
-      assert (Finset.union
-        (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-        (Finset.singleton new_tail) =
-        Finset.union retired_fp
-          (Finset.union (Finset.union active_fp (Finset.singleton last))
-            (Finset.singleton new_tail)));
-      assert (Finset.union (Finset.union retired_links active_links)
-        (Finset.singleton (Edge (last, value, new_tail))) =
-        Finset.union retired_links
-          (Finset.union active_links (Finset.singleton (Edge (last, value, new_tail)))));
       assert (facts_of
         (Finset.union
           (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
@@ -396,8 +374,8 @@ let push { tail; _ } value =
       is_queue_published_observe q old_tail (Finset.union retired_fp (Finset.union
         active_fp (Finset.singleton last))) (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head retired_values retired_fp retired_links;
-      segment_info head last values active_fp active_links;
+      segment_info root head;
+      segment_info head last;
       let exposure =
         if old_tail = last then At_last
         else if Finset.mem old_tail retired_fp then
@@ -430,8 +408,6 @@ let push { tail; _ } value =
       | Next (_, next) ->
         consecutive_segment_edges root head last retired_values values retired_fp
           active_fp retired_links active_links;
-        assert (Finset.mem next (Finset.union retired_fp (Finset.union active_fp
-          (Finset.singleton last))));
         is_queue_published_snapshot q (Finset.union retired_fp (Finset.union active_fp
           (Finset.singleton last))) (Finset.union retired_links active_links)
           (Finset.union retired_fp (Finset.singleton head)) waiting next;
@@ -501,8 +477,8 @@ let rec pop_opt q =
         (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
         (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head retired_values retired_fp retired_links;
-      segment_info head last values active_fp active_links;
+      segment_info root head;
+      segment_info head last;
       let exposure =
         if old_head <> head then
           let (before, before_fp, before_links, value, next,
@@ -576,12 +552,9 @@ let rec pop_opt q =
           let result = step () in
           if result then begin
             assert (old_head = head);
-            segment_info root head retired_values retired_fp retired_links;
+            segment_info root head;
             segment_edge_endpoints root head retired_values retired_fp retired_links;
-            assert (not (Finset.mem old_head retired_fp));
-            assert (not (Finset.mem (Edge (old_head, value, next)) retired_links));
-            assert (Finset.mem (Edge (old_head, value, next)) active_links);
-            segment_info head last values active_fp active_links;
+            segment_info head last;
             assert (values <> []);
             let (active_next, suffix_fp, suffix_links) =
               unfold segment head last values active_fp active_links
@@ -593,11 +566,7 @@ let rec pop_opt q =
               | first :: rest -> (first, rest)
             in
             assert (first = value);
-            segment_info next last rest suffix_fp suffix_links;
-            assert (Finset.mem next (Finset.union suffix_fp (Finset.singleton last)));
-            assert (not (Finset.mem last retired_fp));
-            assert (Finset.inter suffix_fp retired_fp = Finset.empty);
-            assert (next <> head && not (Finset.mem next retired_fp));
+            segment_info next last;
             Ghost.write (Ghost.at view_queue q.head) rest;
             fold queue q rest;
             Pop.commit token q (Some value);
@@ -607,16 +576,6 @@ let rec pop_opt q =
               (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
               (Finset.union retired_links active_links)
               (Finset.union retired_fp (Finset.singleton head)) waiting next;
-            assert (active_fp = Finset.union suffix_fp (Finset.singleton head));
-            assert (active_links = Finset.union suffix_links
-              (Finset.singleton (Edge (head, value, next))));
-            assert (Finset.union retired_fp
-              (Finset.union active_fp (Finset.singleton last)) =
-              Finset.union (Finset.union retired_fp (Finset.singleton head))
-                (Finset.union suffix_fp (Finset.singleton last)));
-            assert (Finset.union retired_links active_links =
-              Finset.union (Finset.union retired_links
-                (Finset.singleton (Edge (head, value, next)))) suffix_links);
             assert (facts_of
               (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
               (Finset.union retired_links active_links)
@@ -683,8 +642,8 @@ let swing_tail q =
         (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
         (Finset.union retired_links active_links)
         (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head retired_values retired_fp retired_links;
-      segment_info head last values active_fp active_links;
+      segment_info root head;
+      segment_info head last;
       let exposure =
         if old_tail = last then At_last
         else if Finset.mem old_tail retired_fp then
@@ -741,10 +700,7 @@ let swing_tail q =
             (Finset.union retired_fp (Finset.singleton head)) waiting;
           consecutive_segment_edges root head last retired_values values
             retired_fp active_fp retired_links active_links;
-          segment_info head last values active_fp active_links;
-          assert (Finset.mem next
-            (Finset.union retired_fp
-              (Finset.union active_fp (Finset.singleton last))));
+          segment_info head last;
           let result = step () in
           if result then
             fold is_queue q {tail = next}
@@ -773,7 +729,7 @@ let is_empty q =
         (Finset.union retired_fp (Finset.singleton head)) waiting result;
       let observation =
         if result <> last then begin
-          segment_info head last values active_fp active_links;
+          segment_info head last;
           let (next, rest_fp, rest_links) =
             unfold segment head last values active_fp active_links
               {next; tail_cells; tail_edges} in
@@ -847,8 +803,8 @@ let is_empty q =
           (Finset.union retired_links active_links)
           (Finset.union retired_fp (Finset.singleton head)) waiting
     end;
-    segment_info root head retired_values retired_fp retired_links;
-    segment_info head last values active_fp active_links;
+    segment_info root head;
+    segment_info head last;
     let exposure =
       if old_head <> head then
         let (before, before_fp, before_links, value, next,

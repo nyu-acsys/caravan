@@ -395,10 +395,45 @@ type proof_support = {
   resources : Source.proof_resource list;
   ghost_fields : Source.proof_field list;
   logical_functions : (string * lemma_signature) list;
+  predicate_inputs : (string * int) list;
+      (** Explicit overrides of the type-based predicate output convention. *)
 }
 
 let empty_proof_support =
-  { atomic_updates = []; resources = []; ghost_fields = []; logical_functions = [] }
+  {
+    atomic_updates = [];
+    resources = [];
+    ghost_fields = [];
+    logical_functions = [];
+    predicate_inputs = [];
+  }
+
+let implicit_parameter_count ~kind parameters =
+  let rec check seen count = function
+    | [] -> Ok (if seen then Some count else None)
+    | (id, _) :: rest ->
+        let implicit = List.mem id.S.pid_attrs "implicit" ~equal:String.equal in
+        if seen && not implicit then
+          error id.pid_loc
+            (Printf.sprintf "Implicit %s parameters must follow explicit parameters" kind)
+        else check (seen || implicit) (if implicit then count + 1 else count) rest
+  in
+  check false 0 parameters
+
+let predicate_output_count data (predicate : S.predicate) types =
+  let* explicit = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
+  match explicit with
+  | Some _ when predicate.pred_persistent ->
+      error predicate.pred_name.pid_loc
+        "Implicit parameter annotations require an ordinary predicate"
+  | Some count -> Ok count
+  | None ->
+      let count =
+        List.length
+          (List.take_while (List.rev types) ~f:(fun typ ->
+               not (Datatypes.has_refs data typ)))
+      in
+      Ok (if count = List.length types then 0 else count)
 
 type context = {
   types : Datatypes.t list;
@@ -966,8 +1001,10 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
           begin match
             List.Assoc.find env.ctx.preds (qualid_key q) ~equal:String.equal
           with
-          | Some (_, types) when List.length types = List.length args ->
-              List.filter_map (List.zip_exn args types) ~f:(fun ((a : S.term), t) ->
+          | Some (_, types) when List.length args <= List.length types ->
+              List.filter_map
+                (List.zip_exn args (List.take types (List.length args)))
+                ~f:(fun ((a : S.term), t) ->
                   match a.term_desc with
                   | Tvar (Qid { pid_str = v; _ }) -> Some (v, t)
                   | _ -> None)
@@ -1014,6 +1051,10 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   | Tconst (Pconst_integer (n, None)) -> Ok (R.Expr.int ~loc:l (Int.of_string n))
   | Tconst _ -> unsupported at "This constant"
   | Tvar (Qid { pid_str = x; _ }) when is_constructor x -> constructor env t []
+  | Tvar (Qid { pid_str = x; _ })
+    when List.Assoc.mem env.ctx.proof_support.predicate_inputs x ~equal:String.equal
+         && not (List.Assoc.mem env.vars x ~equal:String.equal) ->
+      application env t
   | Tvar (Qid { pid_str = x; _ }) ->
       begin match (List.Assoc.find env.vars x ~equal:String.equal, x) with
       | Some (Raven x), _ -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
@@ -1291,6 +1332,13 @@ and application env (t : S.term) =
           else Ok (R.Expr.au_commit ~loc:l procedure values)
       | _ -> error at "An AU operation is only allowed in a proof expression"
       end
+  | Tvar q, _
+    when List.Assoc.mem env.ctx.proof_support.predicate_inputs (qualid_key q)
+           ~equal:String.equal ->
+      let key = qualid_key q in
+      let raven, types = List.Assoc.find_exn env.ctx.preds key ~equal:String.equal in
+      let* args = predicate_arguments env ~at key types args in
+      Ok (R.Expr.call ~loc:l (qualified_name ~loc:l raven) args)
   | Tvar q, args when Option.is_some (logical_signature env q) ->
       logical_application env ~at (Option.value_exn (logical_signature env q)) args
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
@@ -1438,6 +1486,23 @@ and typed_arguments env ~at inputs args =
         let* value = expected_formula env (Some ty) value in
         let* raven_type = typ env.ctx ~at ty in
         Ok (R.Expr.annotated value raven_type))
+
+and predicate_arguments env ~at key types args =
+  match
+    List.Assoc.find env.ctx.proof_support.predicate_inputs key ~equal:String.equal
+  with
+  | None ->
+      if List.length types = List.length args then
+        all (List.zip_exn types args) ~f:(fun (ty, value) ->
+            expected_formula env (Some ty) value)
+      else all args ~f:(formula env)
+  | Some minimum ->
+      let maximum = List.length types and arity = List.length args in
+      if arity < minimum || arity > maximum then
+        error at
+          (Printf.sprintf "Predicate %s expects between %d and %d arguments" key minimum
+             maximum)
+      else typed_arguments env ~at (List.take types arity) args
 
 and logical_application env ~at signature args =
   let l = loc at in
@@ -1802,8 +1867,8 @@ let predicate_use env ~unfold t witnesses make =
   match head.term_desc with
   | Tvar (Qid { pid_str = p; _ }) when List.Assoc.mem env.ctx.preds p ~equal:String.equal
     ->
-      let raven, _ = List.Assoc.find_exn env.ctx.preds p ~equal:String.equal in
-      let* args = all args ~f:(formula env) in
+      let raven, types = List.Assoc.find_exn env.ctx.preds p ~equal:String.equal in
+      let* args = predicate_arguments env ~at:t.term_loc p types args in
       let* witnesses =
         all witnesses ~f:(fun (id, t) ->
             if unfold then
@@ -5744,11 +5809,7 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
   | Tvar (Qid { pid_str = p; _ }), _, _
     when List.Assoc.mem ctx.preds p ~equal:String.equal ->
       let raven, types = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
-      let* args =
-        if List.length types = List.length args then
-          all (List.zip_exn types args) ~f:(fun (t, a) -> expected_formula env (Some t) a)
-        else all args ~f:(formula env)
-      in
+      let* args = predicate_arguments env ~at:t.term_loc p types args in
       Ok (make ~loc:l ~pred:p (name ~loc:l raven) args)
   | _, _, Tif (c, a, b) ->
       let* c = formula env c in
@@ -8213,17 +8274,9 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
       Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
   | Body body ->
       let* body = quantified env body in
-      (* The trailing parameters without references, as the abstract value, are outputs:
-         determined by the others, which Raven checks, and found by Raven at calls. *)
-      let inputs, outputs =
-        let n =
-          List.length
-            (List.take_while (List.rev params) ~f:(fun (_, _, t, _) ->
-                 not (Datatypes.has_refs types t)))
-        in
-        let n = if n = List.length params then 0 else n in
-        List.split_n params (List.length params - n)
-      in
+      (* Explicit output attributes override the trailing reference-free convention. *)
+      let* outputs = predicate_output_count types p param_types in
+      let inputs, outputs = List.split_n params (List.length params - outputs) in
       Ok
         (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
            name (Some body))
@@ -8511,7 +8564,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
     annotation, with the same parameters; an invariant in the proof defines a persistent
     predicate, and a view an exclusive one, whose value has the type of the declaration's
     last parameter. *)
-let predicates (source : Source.t) =
+let predicates ~data (source : Source.t) =
   let of_annotations comments =
     all
       (List.filter (Annotation.of_comments comments) ~f:(fun a ->
@@ -8590,6 +8643,7 @@ let predicates (source : Source.t) =
     let* types =
       all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type source.env ~at t)
     in
+    let* _ = predicate_output_count data p types in
     Ok (at, p, def, types)
   in
   let* declared =
@@ -8648,7 +8702,17 @@ let predicates (source : Source.t) =
                (name p)
            else
              Printf.sprintf "The invariant %s is declared without [@persistent]" (name p))
-    | None, _ -> Ok ()
+    | None, (def_at, definition, _, def_types) :: _ ->
+        let* declared_outputs = predicate_output_count data p types in
+        let* defined_outputs = predicate_output_count data definition def_types in
+        if declared_outputs = defined_outputs then Ok ()
+        else
+          error def_at
+            ~related:[ (at, "Its declaration") ]
+            (Printf.sprintf
+               "The predicate %s has different implicit parameters in its declaration \
+                and definition"
+               (name p))
   in
   let definition (at, p, _, _) =
     match definitions (name p) with
@@ -9001,7 +9065,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let origins = ref [] in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
-  let* predicates = predicates source in
+  let* predicates = predicates ~data:types source in
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
@@ -9043,6 +9107,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             Ok (lib, p, types)))
   in
   let library_preds = List.concat library_preds in
+  let* predicate_inputs =
+    all
+      (List.map predicates ~f:(fun (_, p, _, ts) -> (p.S.pred_name.pid_str, p, ts))
+      @ List.map library_preds ~f:(fun ((lib : Source.library), p, ts) ->
+          (lib.library_name ^ "." ^ p.S.pred_name.pid_str, p, ts)))
+      ~f:(fun (key, p, ts) ->
+        let* count = implicit_parameter_count ~kind:"predicate" p.pred_params in
+        Ok (Option.map count ~f:(fun count -> (key, List.length ts - count))))
+  in
+  let predicate_inputs = List.filter_opt predicate_inputs in
   let preds =
     List.map predicates ~f:(fun (_, p, _, types) ->
         (p.pred_name.pid_str, (p.pred_name.pid_str, types)))
@@ -9078,6 +9152,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       resources = source.proof_resources;
       ghost_fields = source.proof_fields;
       logical_functions;
+      predicate_inputs;
     }
   in
   let spec_funcs =
@@ -9135,20 +9210,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           let types_of ps =
             all ps ~f:(fun (id, ty) -> Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
           in
-          let rec check_parameters seen_implicit = function
-            | [] -> Ok ()
-            | (id, _) :: rest ->
-                let implicit = List.mem id.S.pid_attrs "implicit" ~equal:String.equal in
-                if seen_implicit && not implicit then
-                  error id.pid_loc
-                    "Implicit lemma parameters must follow explicit parameters"
-                else check_parameters (seen_implicit || implicit) rest
-          in
-          let* () = check_parameters false lemma_params in
-          let lemma_implicit_count =
-            List.count lemma_params ~f:(fun (id, _) ->
-                List.mem id.S.pid_attrs "implicit" ~equal:String.equal)
-          in
+          let* implicit = implicit_parameter_count ~kind:"lemma" lemma_params in
+          let lemma_implicit_count = Option.value implicit ~default:0 in
           let* lemma_inputs = types_of lemma_params in
           let* lemma_outputs = types_of lemma_returns in
           if
@@ -9477,16 +9540,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                     let* typ = Datatypes.typ types ~at:x.S.pid_loc t in
                     Ok (t, R.Var.make ~loc:l (ident ~loc:l x.pid_str) typ))
               in
-              (* The trailing parameters without references are outputs, as for the
-                 program's predicates; a library's abstract type may have references. *)
-              let outputs =
-                let n =
-                  List.length
-                    (List.take_while (List.rev params) ~f:(fun (t, _) ->
-                         not (Datatypes.has_refs types t)))
-                in
-                if n = List.length params then 0 else n
-              in
+              (* Libraries share the program's predicate output convention. *)
+              let* outputs = predicate_output_count types p param_types in
               let inputs, outputs = List.split_n params (List.length params - outputs) in
               Ok
                 (R.Member.free

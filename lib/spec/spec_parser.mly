@@ -20,6 +20,14 @@
   let mk_pat p l = { pat_desc = p; pat_loc = mk_loc l }
   let mk_proof d l = { proof_desc = d; proof_loc = mk_loc l }
 
+  let implicit_parameter kind (x, attribute, at, ty) =
+    let x = match attribute with
+      | None -> x
+      | Some "implicit" -> add_attr x "implicit"
+      | Some _ -> raise (Syntax_error (at,
+          "Only [@implicit] is supported on " ^ kind ^ " parameters"))
+    in (x, ty)
+
   let proof_value t = { proof_desc = Proof_value t; proof_loc = t.term_loc }
 
   let rec term_of_proof e =
@@ -190,7 +198,7 @@ predicate:
 ;
 
 predicate_decl:
-| PREDICATE n = lident ps = pred_param+ a = ATTRIBUTE? t = preceded(EQUAL, term)?
+| PREDICATE n = lident ps = predicate_param+ a = ATTRIBUTE? t = preceded(EQUAL, term)?
     { { pred_name = n; pred_params = ps; pred_body = t;
         pred_persistent = (a = Some "persistent") } }
 ;
@@ -308,14 +316,17 @@ state_field:
       { sf_name = x; sf_type = t; sf_grows = (a = Some "grows"); sf_helps = helps } }
 ;
 
-lemma_param:
+annotated_param:
 | LEFTPAR x = lident a = ATTRIBUTE? COLON t = typ RIGHTPAR
-    { let x = match a with
-        | None -> x
-        | Some "implicit" -> add_attr x "implicit"
-        | Some _ -> raise (Syntax_error (mk_loc $loc(a),
-            "Only [@implicit] is supported on lemma parameters"))
-      in (x, t) }
+    { (x, a, mk_loc $loc(a), t) }
+;
+
+lemma_param:
+| p = annotated_param { implicit_parameter "lemma" p }
+;
+
+predicate_param:
+| p = annotated_param { implicit_parameter "predicate" p }
 ;
 
 pred_param:

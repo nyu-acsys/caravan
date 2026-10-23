@@ -1,0 +1,4 @@
+predicate held (cell : int Atomic.t Atomic.t)
+    (value [@implicit] : int Atomic.t) = own cell value
+
+lemma wrong = fold held

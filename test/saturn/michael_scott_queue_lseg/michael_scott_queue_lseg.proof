@@ -1,7 +1,8 @@
 type edge = Edge of node Atomic.t * int * node Atomic.t
 
 predicate segment (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells : node Atomic.t finset) (edges : edge finset) =
+    (items [@implicit] : int list) (cells [@implicit] : node Atomic.t finset)
+    (edges [@implicit] : edge finset) =
   not (Finset.mem limit cells)
   && (match items with
       | [] -> first = limit && cells = Finset.empty && edges = Finset.empty
@@ -15,7 +16,8 @@ predicate segment (first : node Atomic.t) (limit : node Atomic.t)
           && segment next limit tail tail_cells tail_edges)
 
 lemma segment_info (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
+    (items [@implicit] : int list) (cells [@implicit] : node Atomic.t finset)
+    (edges [@implicit] : edge finset)
   requires (segment first limit items cells edges)
   ensures (segment first limit items cells edges)
   ensures (not (Finset.mem limit cells))
@@ -37,7 +39,7 @@ lemma segment_join (first : node Atomic.t) (middle : node Atomic.t)
   ensures (segment first limit (left @ right)
     (Finset.union left_cells right_cells) (Finset.union left_edges right_edges))
   variant (left) =
-  segment_info middle limit right right_cells right_edges;
+  segment_info middle limit;
   let (next, tail_cells, tail_edges) =
     unfold segment first middle left left_cells left_edges {next; tail_cells; tail_edges} in
   match left with
@@ -57,7 +59,7 @@ lemma segment_append (first : node Atomic.t) (limit : node Atomic.t)
   ensures (segment first successor (items @ [value])
     (Finset.union cells (Finset.singleton limit))
     (Finset.union edges (Finset.singleton (Edge (limit, value, successor))))) =
-  segment_info first limit items cells edges;
+  segment_info first limit;
   fold segment successor successor [] Finset.empty Finset.empty;
   fold segment limit successor [value] (Finset.singleton limit)
     (Finset.singleton (Edge (limit, value, successor)))
@@ -115,7 +117,7 @@ lemma segment_restore (first : node Atomic.t) (target : node Atomic.t)
     (Finset.union before_cells (Finset.union (Finset.singleton target) after_cells))
     (Finset.union before_edges
       (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges))) =
-  segment_info next limit after after_cells after_edges;
+  segment_info next limit;
   fold segment target limit (value :: after)
     (Finset.union (Finset.singleton target) after_cells)
     (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges)
@@ -147,7 +149,7 @@ lemma segment_edge_endpoints (first : node Atomic.t) (limit : node Atomic.t)
   match items with
   | [] -> fold segment first limit items cells edges
   | _ :: tail ->
-      segment_info next limit tail tail_cells tail_edges;
+      segment_info next limit;
       segment_edge_endpoints next limit tail tail_cells tail_edges;
       fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
         tail_edges = tail_edges}

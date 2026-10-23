@@ -1,0 +1,8 @@
+predicate footprint (nodes : int Atomic.t list)
+    (cells [@implicit] : int Atomic.t finset) =
+  match nodes with
+  | [] -> true
+  | cell :: tail ->
+      exists rest : int Atomic.t finset.
+        footprint tail rest
+        && cells = Finset.union (Finset.singleton cell) rest

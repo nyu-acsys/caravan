@@ -45,6 +45,27 @@ checked against their OCaml types before translation. Inference uses Raven's
 existing witness computation; values hidden inside predicates or not determined
 by available resources may need explicit arguments.
 
+Ordinary predicates use the same attribute for implicit output parameters,
+including values containing references:
+
+```ocaml
+predicate held (cell : int Atomic.t Atomic.t)
+    (value [@implicit] : int Atomic.t) =
+  own cell value
+```
+
+Write `held cell` to omit the output, or `held cell value` to specify it.
+The same choice is available in `fold` and `unfold`, and callers can supply an
+initial part of a longer output suffix. Raven checks that simultaneously owned
+instances with the same explicit arguments agree on their outputs. It can then
+infer lemma arguments from an owned predicate instance. Constructing or refolding
+an instance may still require explicit output values.
+
+Declarations and definitions must agree on the output parameters. Unannotated
+predicates retain the existing convention of treating trailing parameters that
+contain no references as outputs. Explicit output attributes apply to ordinary
+predicates; invariants retain their existing parameter handling.
+
 An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
 program code. In a proof body, `unfold p x {n}` names an existential to bind
 with `let value = ... in`, and `fold p x {n = value}` supplies its
