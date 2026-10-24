@@ -74,7 +74,7 @@ let file ~(include_dirs : string list) ~(emit_rav : bool) ~(smt_timeout : int)
           Report.print error;
           false
       | Ok (program, _) when emit_rav ->
-          Logs.app (fun m -> m "%s" (R.Program.to_string program));
+          Logs.app (fun m -> m "%a" R.Program.pr program);
           true
       | Ok (program, origins) ->
           let result = R.verify ~options:{ R.default_options with smt_timeout } program in

@@ -46,8 +46,8 @@ let to_diagnostic (e : error) : R.Diagnostic.t =
 
 let print_diagnostic (d : R.Diagnostic.t) =
   match d.severity with
-  | Warning -> Logs.warn (fun m -> m "%s" (R.Diagnostic.to_string d))
-  | Error -> Logs.err (fun m -> m "%s" (R.Diagnostic.to_string d))
+  | Warning -> Logs.warn (fun m -> m "%a" R.Diagnostic.pr d)
+  | Error -> Logs.err (fun m -> m "%a" R.Diagnostic.pr d)
 
 let print (e : error) = print_diagnostic (to_diagnostic e)
 
