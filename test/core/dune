@@ -7,3 +7,13 @@
  (name function_types)
  (modules function_types)
  (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name module_paths)
+ (modules module_paths)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))

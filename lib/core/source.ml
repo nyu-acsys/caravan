@@ -9,6 +9,7 @@ let ( let* ) = Result.( >>= )
 type interface = {
   signature : Parsetree.signature;
   interface_comments : (string * Location.t) list;
+  scope : Declaration_scope.t;
 }
 
 type library = { library_name : string; library_id : Ident.t; library : interface }
@@ -46,6 +47,7 @@ type proof_au = {
 type t = {
   file : string;
   text : string;
+  scope : Declaration_scope.t;
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   env : Env.t;
@@ -82,7 +84,11 @@ let load_interface file =
   Location.input_name := file;
   Lexer.init ();
   let signature = Parse.interface lexbuf in
-  { signature; interface_comments = Lexer.comments () }
+  {
+    signature;
+    interface_comments = Lexer.comments ();
+    scope = Declaration_scope.of_lexbuf ~file lexbuf;
+  }
 
 (** Uses OCaml's inclusion checker before specializing the implementation. *)
 let check_interface env signature interface =
@@ -767,6 +773,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     Location.input_name := file;
     Lexer.init ();
     let parsed = Parse.implementation lexbuf in
+    let scope = Declaration_scope.of_lexbuf ~file lexbuf in
     let comments = Lexer.comments () in
     Env.set_current_unit
       (Unit_info.make ~check_modname:false ~source_file:file Impl
@@ -832,6 +839,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
             {
               file;
               text;
+              scope;
               typed;
               comments;
               env;
