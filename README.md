@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/nyu-acsys/caravan/main/LICENSE"><img alt="MIT licensed" src="https://img.shields.io/badge/license-MIT-blue.svg"/></a>
-  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml?query=branch%3Adev"><img alt="Builds, tests &amp; co" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg?branch=dev"/></a>
+  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml"><img alt="Builds, tests &amp; co" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg"/></a>
 </p>
 
 Caravan verifies multicore OCaml programs. It translates OCaml 5 code, with
