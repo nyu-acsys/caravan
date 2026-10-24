@@ -1,4 +1,4 @@
-(* Saturn's Michael-Scott queue, of integers: creation, push and pop, without backoff, and
+(* Saturn's Michael-Scott queue, of integers: creation, push and pop, and
    moving the tail on by a cell. *)
 
 type node = Nil | Next of int * node Atomic.t
@@ -42,28 +42,45 @@ let push { tail; _ } value =
     end;
   if not (Atomic.compare_and_set tail old_tail new_tail) then fix_tail tail new_tail
 
-let rec pop_opt q =
+let rec pop_opt q backoff =
   let old_head = Atomic.get q.head in
   match Atomic.get old_head (*@ returning Nil -> commit *) with
   | Nil -> None
   | Next (value, next) ->
-      if Atomic.compare_and_set q.head old_head next then Some value else pop_opt q
+      if Atomic.compare_and_set q.head old_head next then Some value
+      else
+        let backoff = Backoff.once backoff in
+        pop_opt q backoff
 
-let swing_tail q =
-  let old_tail = Atomic.get q.tail in
-  match Atomic.get old_tail with
-  | Nil -> ()
-  | Next (_, next) -> if Atomic.compare_and_set q.tail old_tail next then () else ()
+let pop_opt q = pop_opt q Backoff.default
 
 (* If the head's cell is the last at the first read, the call waits for it to be linked,
    which commits the call with false; it commits with true if the cell is still the last
    at the second read. *)
-let is_empty q =
+let is_empty { head; _ } =
   Atomic.get
     (Atomic.get
-       q.head
+       head
        (*@ returning c ->
           if c != s.cells.(length s.values) then commit false
           else wait in s.waiting on c *))
   (*@ returning Nil -> commit true *)
   == Nil
+
+let of_list list =
+  let tail_ = Atomic.make Nil in
+  let tail = Atomic.make_contended tail_ in
+  let rec build_next = function
+    | [] -> tail_
+    | hd :: tl -> Atomic.make @@ Next (hd, build_next tl)
+    (*@ fold built_chain result tail_ xs *)
+    (*@ result = build_next xs
+      requires own tail_ Nil
+      ensures own tail_ Nil && built_chain result tail_ xs *)
+  in
+  let head = Atomic.make_contended @@ build_next list in
+  { head; tail }
+(*@ initially
+  let cell_list = expose_built_chain (Some q.head) tail_ list in
+  { cells = to_sequence cell_list; values = to_sequence list;
+    head = 0; tail = List.length list } *)

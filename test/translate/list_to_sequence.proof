@@ -1,0 +1,42 @@
+let converted (values : int list) : int sequence = to_sequence values
+
+let tail_converted (values : int list) : int sequence =
+  match values with
+  | [] -> to_sequence ([] : int list)
+  | _ :: rest -> to_sequence rest
+
+let shadowed (to_sequence : int) : int = to_sequence
+let locally_shadowed (value : int) : int = let to_sequence = value in to_sequence
+let quantified_shadow (ignored : unit) : bool = forall to_sequence : int. to_sequence = to_sequence
+
+lemma examples
+  ensures (converted [] = [])
+  ensures (to_sequence [1] = [1])
+  ensures (to_sequence [1; 2; 3] = [1; 2; 3])
+  ensures ((to_sequence [] : int sequence) = [])
+  ensures (tail_converted [1; 2; 3] = [2; 3])
+  ensures (shadowed 7 = 7 && locally_shadowed 9 = 9 && quantified_shadow ()) =
+  ()
+
+lemma conversion_length (values : int list)
+  ensures (length (to_sequence values) = List.length values) =
+  let result = to_sequence values in
+  assert (length result = List.length values)
+
+lemma cons (value : int) (rest : int list)
+  ensures (to_sequence (value :: rest) = [value] ++ to_sequence rest) =
+  ()
+
+lemma references (first : int ref) (second : int ref)
+  ensures ((to_sequence [first; second]).(0) == first)
+  ensures ((to_sequence [first; second]).(1) == second) =
+  ()
+
+lemma nested (values : int list)
+  ensures (to_sequence [values] = [values]) =
+  ()
+
+lemma projected_tail (values : int list)
+  requires (values <> [])
+  ensures (to_sequence values = [values.hd] ++ to_sequence values.tl) =
+  ()

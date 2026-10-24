@@ -1,0 +1,4 @@
+let observed (value : int) : int = to_sequence value
+
+lemma same (value : int)
+  ensures (observed value = value) = ()

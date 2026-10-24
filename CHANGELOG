@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 - Contracts can use list concatenation, membership, and length, and call verified pure functions.
 - Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
 - Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
-- Integer fields and quantified integer variables respect OCaml's integer bounds.
+- Specifications provide unbounded `integer` indices while OCaml `int` fields and quantifiers retain machine bounds.
 - While and for loops support annotated invariants.
 - Let bindings and function parameters support tuple and record patterns.
 - Local functions can capture surrounding variables and continue an enclosing function's atomic contract.
@@ -24,17 +24,17 @@ All notable changes to this project will be documented in this file.
 - Logically atomic contracts generate linearization proofs, including branches that return results.
 - Read linearization points can be selected with `commit` and conditional `returning` annotations.
 - Contracts can reside in `.mli` interfaces checked for OCaml implementation compatibility, with predicate definitions in companion `.proof` files.
-- Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses.
+- Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses, including stateful nested reads.
 - Shared structures support persistent invariants and exclusive views of their ghost state.
 - Growing ghost-state fields support histories, snapshots, and facts about past states.
-- Specifications support sequences and ownership of their entries by index.
+- Specifications support sequences, checked list conversion, and ownership by index with dynamic initialization and scoped ghost bindings.
 - Actions describe ghost-state transitions, infer matching atomic steps, and check that growing fields remain monotone.
 - Pending-call registrations and helping actions support proofs in which another operation completes a call.
 - Ghost parameters can be declared in contracts and inferred at call sites.
 - Trusted library interfaces support abstract types, invariant and predicate declarations, and ordinary and logically atomic function contracts.
 - Functions marked `trusted` assume their contracts and emit a warning.
 - Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
-- Saturn case studies include Treiber stack, Michael-Scott queue with full helping and a separate List/segment proof, and an interface-verified stack-drain client.
+- Saturn case studies include Treiber stack, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
 - `--emit-rav` prints the generated Raven program for standalone parsing and verification.
 - `--smt-timeout` controls the solver timeout for each query.
 - `-I` adds directories to the library interface search path.

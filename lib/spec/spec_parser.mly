@@ -145,7 +145,7 @@
 %start <Spec_ast.proof_decl list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
-%start <(Spec_ast.id * Spec_ast.term) list> initially
+%start <Spec_ast.initialization> initially
 %%
 
 contract:
@@ -354,7 +354,13 @@ linearization:
 ;
 
 initially:
-| INITIALLY LEFTBRC fs = semicolon_list1(field_value) RIGHTBRC EOF { fs }
+| INITIALLY init = initial_expression EOF { init }
+;
+
+initial_expression:
+| LEFTBRC fs = semicolon_list1(field_value) RIGHTBRC { Initial_record fs }
+| LET p = pat EQUAL value = proof_expr IN body = initial_expression
+    { Initial_let (p, value, body) }
 ;
 
 field_value:

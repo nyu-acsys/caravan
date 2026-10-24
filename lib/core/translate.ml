@@ -345,6 +345,7 @@ type shared = {
       (** The views, by their names, with their ghost fields, which hold a client's view
           of the state, half in the view and half in the invariant. *)
   structures : structure list;
+  mutable dynamic_indices : bool;
   anchors : (string * (string * R.Type.t * R.Expr.t option) list) list;
       (** The ghost fields of the views and histories, by the field whose allocation
           allocates them, the field of the structure's reference, with their initial
@@ -352,7 +353,8 @@ type shared = {
 }
 (** The shared structures of a program: invariants and views. *)
 
-let no_shared = { persistent = []; views = []; structures = []; anchors = [] }
+let no_shared =
+  { persistent = []; views = []; structures = []; anchors = []; dynamic_indices = false }
 
 type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
 (** The state of an open invariant: the variables of its fields and of the index maps of
@@ -1069,7 +1071,18 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     || List.exists env.ctx.proof_support.ghost_fields ~f:(fun f ->
         String.equal f.Source.field_name x)
     || List.mem
-         [ "own"; "not"; "max_int"; "min_int"; "mod"; "length"; "last"; "drop"; "take" ]
+         [
+           "own";
+           "not";
+           "max_int";
+           "min_int";
+           "mod";
+           "length";
+           "last";
+           "drop";
+           "take";
+           "to_sequence";
+         ]
          x ~equal:String.equal
   in
   let free =
@@ -1329,10 +1342,23 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
         Option.exists (Datatypes.find env.data p) ~f:Datatypes.is_sequence
     | _ -> false
   in
-  match (Option.map expected ~f:is_sequence, literal t) with
-  | Some true, Some elements ->
+  match (expected, literal t) with
+  | Some ty, Some elements when is_sequence ty ->
       let* elements = all elements ~f:(formula env) in
       Ok (R.Expr.seq ~loc:(loc t.term_loc) elements)
+  | Some expected, _
+    when match spine t [] with
+         | { term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, _ ->
+             (not (List.Assoc.mem env.funcs "to_sequence" ~equal:String.equal))
+             && not (List.Assoc.mem env.vars "to_sequence" ~equal:String.equal)
+         | _ -> false ->
+      let* () =
+        Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.env
+          ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected t
+      in
+      let* value = formula env t in
+      let* ty = typ env.ctx ~at:t.term_loc expected in
+      Ok (R.Expr.annotated value ty)
   | _ -> formula env t
 
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
@@ -1371,6 +1397,10 @@ and term_type env (t : S.term) =
           List.hd outputs)
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
       List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
+  | _, ({ term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, [ _ ]) ->
+      Result.ok
+        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.env
+           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "length"; _ }); _ }, [ _ ]) ->
       Some Predef.type_int
   | ( _,
@@ -1419,6 +1449,11 @@ and term_type env (t : S.term) =
       | _ -> None
       end
   | _ -> None
+
+and is_list_term env t =
+  match Option.map (term_type env t) ~f:(Datatypes.desc env.data) with
+  | Some (Tconstr (p, [ _ ], _)) -> Path.same p Predef.path_list
+  | _ -> false
 
 (** The OCaml type of the values that the location [t] holds, where it is known. *)
 and location_type env (t : S.term) =
@@ -1624,6 +1659,15 @@ and application env (t : S.term) =
       in
       let func = List.Assoc.find_exn env.funcs f ~equal:String.equal in
       Ok (R.Expr.call ~loc:l (qualified_name ~loc:l func) args)
+  | Tvar (Qid { pid_str = "to_sequence"; _ }), args ->
+      if List.length args <> 1 then error at "to_sequence expects a list"
+      else
+        let* _ =
+          Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.env
+            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t
+        in
+        let* args = all args ~f:(formula env) in
+        Ok (R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "of_list") args)
   | Tvar (Qid { pid_str = ("length" | "last" | "drop" | "take") as f; _ }), args -> begin
       let* args = all args ~f:(formula env) in
       let length s =
@@ -1651,11 +1695,7 @@ and application env (t : S.term) =
   | _ -> unsupported at "A call of a function in a contract"
 
 and typed_arguments env ~at inputs args =
-  let is_list t =
-    match Option.map (term_type env t) ~f:(Datatypes.desc env.data) with
-    | Some (Tconstr (p, [ _ ], _)) -> Path.same p Predef.path_list
-    | _ -> false
-  in
+  let is_list = is_list_term env in
   if List.length args <> List.length inputs then
     error at (Printf.sprintf "Expected %d arguments" (List.length inputs))
   else
@@ -2827,6 +2867,30 @@ let rec proof_names (body : S.proof_expr) =
       @ List.concat_map cases ~f:(fun (p, body) ->
           List.filter (proof_names body) ~f:(fun name ->
               not (List.mem (pat_names p) name ~equal:String.equal)))
+
+let stateful_access access_proofs (e : Typedtree.expression) =
+  let key = (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) in
+  match List.Assoc.find access_proofs key ~equal:Poly.equal with
+  | None -> Ok false
+  | Some annotation ->
+      Result.map (Annotation.scope annotation) ~f:(fun scope ->
+          Option.is_some scope.scope_state)
+
+let atomic_read_argument (e : Typedtree.expression) =
+  match e.exp_desc with
+  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg argument) ])
+    when Option.equal String.equal (atomic_name path) (Some "get") ->
+      Some argument
+  | _ -> None
+
+(** State stays local to a directly nested pair of explicitly stateful reads. *)
+let nested_stateful_read access_proofs e =
+  match atomic_read_argument e with
+  | Some argument when Option.is_some (atomic_read_argument argument) ->
+      let* outer = stateful_access access_proofs e in
+      let* inner = stateful_access access_proofs argument in
+      Ok (Option.some_if (outer && inner) argument)
+  | _ -> Ok None
 
 (** A checked wrapper invokes the original operation once. *)
 let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
@@ -4360,12 +4424,7 @@ let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
     | None -> Ok []
     | Some a -> return_proof ctx a ~result_type:e.exp_type ~result:value
   in
-  let* stateful =
-    match List.Assoc.find ctx.access_proofs key ~equal:Poly.equal with
-    | None -> Ok false
-    | Some a ->
-        Result.map (Annotation.scope a) ~f:(fun scope -> Option.is_some scope.scope_state)
-  in
+  let* stateful = stateful_access ctx.access_proofs e in
   if not (continue_state && stateful) then ctx.proof_state <- incoming;
   if not keep_scope then ctx.names.scope <- incoming_names;
   ctx.return_covered <- covered;
@@ -4752,7 +4811,14 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | _ -> element e.exp_type
   in
   let* field = atomic_field ctx ~at elt in
-  let* stmts, values = operands ctx args in
+  let* nested = nested_stateful_read ctx.access_proofs e in
+  let* stmts, values =
+    match nested with
+    | Some argument ->
+        let* stmts, value = expr ~continue_state:true ctx argument in
+        Ok (stmts, [ value ])
+    | None -> operands ctx args
+  in
   let primitive op = primitive ctx ~at elt op in
   match (op, values) with
   | ("make" | "make_contended"), [ v ] ->
@@ -6299,34 +6365,65 @@ let invariant_apps ctx env (terms : S.term list) =
       let* args = all args ~f:(formula env) in
       Ok (raven, args))
 
+(** Initializer bindings are local to the state record and its establishment. *)
+let rec initial_bindings env initialization continuation =
+  match initialization with
+  | S.Initial_record fields -> continuation env fields
+  | Initial_let (pattern, rhs, body) ->
+      proof_binding ~ghost_rhs:true env pattern rhs (fun env ->
+          initial_bindings env body continuation)
+
+let initializer_annotation ctx (f : func) =
+  let window (a : Annotation.t) =
+    a.loc.loc_start.pos_cnum >= f.body.exp_loc.loc_end.pos_cnum
+    && Option.for_all f.next ~f:(fun next ->
+        a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
+    && Poly.equal (Annotation.kind a) Annotation.Initially
+  in
+  match List.filter ctx.annotations ~f:window with
+  | [] -> Ok None
+  | [ a ] -> Result.map (Annotation.initially a) ~f:(fun initial -> Some (a, initial))
+  | _ :: a :: _ -> error a.loc "A constructor has at most one initially annotation"
+
+let check_initial_fields ctx established fields =
+  let known =
+    List.concat_map ctx.shared.structures ~f:(fun st ->
+        if List.exists established ~f:(fun (inv, _) -> String.equal inv st.invariant) then
+          List.map st.fields ~f:(fun (field, _, _, _, _) -> field)
+        else [])
+  in
+  let rec check seen = function
+    | [] -> Ok ()
+    | ((id : S.id), _) :: rest ->
+        if List.mem seen id.pid_str ~equal:String.equal then
+          error id.pid_loc
+            (Printf.sprintf "The initial field %s is given twice" id.pid_str)
+        else if not (List.mem known id.pid_str ~equal:String.equal) then
+          error id.pid_loc (Printf.sprintf "Unknown initial state field %s" id.pid_str)
+        else check (id.pid_str :: seen) rest
+  in
+  check [] fields
+
 (** The statements establishing the invariant [inv] with [args] at the end of [f], at
     [at]: with the initial state of its structure, as [f]'s annotation
     [(*@ initially { ... } *)] gives it, the history of that state and the index maps of
     its fields owned by index. *)
-let establish_invariant ctx ~(f : func) ~at inv args =
+let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
   let l = loc at in
   match List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv) with
   | None -> Ok [ R.Stmt.fold ~loc:l (name ~loc:l inv) args ]
-  | Some st -> begin
-      let window (a : Annotation.t) =
-        a.loc.loc_start.pos_cnum >= f.body.exp_loc.loc_end.pos_cnum
-        && Option.for_all f.next ~f:(fun next ->
-            a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
-        && Poly.equal (Annotation.kind a) Annotation.Initially
-      in
-      match List.filter ctx.annotations ~f:window with
-      | [] when (not (has_history st)) && List.is_empty st.chains ->
+  | Some st ->
+      begin match initial with
+      | None when (not (has_history st)) && List.is_empty st.chains ->
           (* The witnesses are computed. *)
           Ok [ R.Stmt.fold ~loc:l (name ~loc:l inv) args ]
-      | [] ->
+      | None ->
           error f.loc
             (Printf.sprintf
                "This function establishes %s, whose initial state it gives as (*@ \
                 initially { ... } *)"
                inv)
-      | a :: _ ->
-          let* initial = Annotation.initially a in
-          let env = scope_env ctx in
+      | Some ((a : Annotation.t), initial) ->
           let* values =
             all st.fields ~f:(fun (field, raven, _, t, _) ->
                 match
@@ -6351,9 +6448,9 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                 Option.map (entries rest) ~f:(fun rest -> h :: rest)
             | _ -> None
           in
-          let* indices =
+          let* indexed =
             all st.chains ~f:(fun (field, index) ->
-                let _, _, term =
+                let _, entries_value, term =
                   List.find_exn values ~f:(fun (raven, _, _) ->
                       String.equal raven (st.state ^ "_" ^ field))
                 in
@@ -6361,15 +6458,35 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                 | Some es ->
                     let* es = all es ~f:(formula env) in
                     Ok
-                      ( ident ~loc:l index,
-                        R.Expr.map_literal ~loc:l
-                          (List.mapi es ~f:(fun i e -> (e, R.Expr.int ~loc:l i)))
-                          (R.Expr.int ~loc:l 0) )
+                      ( [],
+                        ( ident ~loc:l index,
+                          R.Expr.map_literal ~loc:l
+                            (List.mapi es ~f:(fun i e -> (e, R.Expr.int ~loc:l i)))
+                            (R.Expr.int ~loc:l 0) ) )
                 | None ->
-                    unsupported term.term_loc
-                      "An initial value other than a list of entries, for a field owned \
-                       by index,")
+                    ctx.shared.dynamic_indices <- true;
+                    let l = loc term.term_loc in
+                    let target = Names.fresh ctx.names "initial_index" in
+                    let index_type =
+                      R.Type.map ~loc:l (R.Type.ref ~loc:l) (R.Type.int ~loc:l)
+                    in
+                    ctx.origins :=
+                      {
+                        at = term.term_loc;
+                        code = Precondition;
+                        message = "The cells of this indexed field may not be distinct";
+                        related = [];
+                      }
+                      :: !(ctx.origins);
+                    Ok
+                      ( R.Stmt.local ~loc:l ~ghost:true ~typ:index_type
+                          ~init:
+                            (R.Stmt.expr_rhs
+                               (Indexed_initialization.call ~loc:l entries_value))
+                          (ident ~loc:l target),
+                        (ident ~loc:l index, R.Expr.var ~loc:l (name ~loc:l target)) ))
           in
+          let index_statements, indices = List.unzip indexed in
           (* The keys of no registrations. *)
           let ons =
             List.map st.pendings ~f:(fun p ->
@@ -6412,7 +6529,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
             else []
           in
           Ok
-            (history
+            (List.concat index_statements @ history
             @ [
                 R.Stmt.fold ~loc:l
                   ~witnesses:
@@ -6420,7 +6537,7 @@ let establish_invariant ctx ~(f : func) ~at inv args =
                     @ indices @ ons)
                   (name ~loc:l inv) args;
               ])
-    end
+      end
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
@@ -6786,11 +6903,20 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
                          ~f:(fun def -> (def, "The invariant")));
                 }
                 :: !(ctx.origins));
-          let* folds =
-            all established ~f:(fun (inv, args) ->
-                establish_invariant ctx ~f ~at inv args)
+          let establish initial_env initial =
+            let* folds =
+              all established ~f:(fun (inv, args) ->
+                  establish_invariant ctx ~f ~at ~env:initial_env ~initial inv args)
+            in
+            Ok (List.concat views @ List.concat folds)
           in
-          Ok (List.concat views @ List.concat folds)
+          let* annotated = initializer_annotation ctx f in
+          match annotated with
+          | None -> establish (scope_env ctx) None
+          | Some (annotation, initial) ->
+              initial_bindings (scope_env ctx) initial (fun initial_env fields ->
+                  let* () = check_initial_fields ctx established fields in
+                  establish initial_env (Some (annotation, fields)))
     in
     let body = bind_au @ bound @ first @ stmts @ assignment @ establish @ last in
     Ok
@@ -9059,7 +9185,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
   let funcs = inherit_contracts (funcs @ List.concat lifted) in
   let* access_proofs = access_annotations source typed annotations ~functions:funcs in
-  let state_targets = ref [] in
+  let state_targets = ref [] and nested_reads = ref [] in
   let remember (e : Typedtree.expression) =
     state_targets :=
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) :: !state_targets
@@ -9076,6 +9202,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     | _ -> ()
   in
   let visit iterator (e : Typedtree.expression) =
+    if Option.is_some (atomic_read_argument e) then nested_reads := e :: !nested_reads;
     begin match e.exp_desc with
     | Texp_let (Nonrecursive, [ binding ], body) ->
         remember binding.vb_expr;
@@ -9100,6 +9227,15 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       iterator.expr iterator f.body);
   let* () =
     Result.all_unit
+      (List.map !nested_reads ~f:(fun e ->
+           let* argument = nested_stateful_read access_proofs e in
+           Option.iter argument ~f:(fun argument ->
+               remember e;
+               remember argument);
+           Ok ()))
+  in
+  let* () =
+    Result.all_unit
       (List.map access_proofs ~f:(fun (key, a) ->
            let* scope = Annotation.scope a in
            if
@@ -9107,8 +9243,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
              && not (List.mem !state_targets key ~equal:Poly.equal)
            then
              error a.loc
-               "A stateful scope needs a direct let binding, sequence continuation, or \
-                lexical tail"
+               "A stateful scope needs a direct let binding, sequence continuation, \
+                lexical tail, or directly nested stateful read"
            else Ok ()))
   in
   let tails = ref [] in
@@ -9672,6 +9808,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         List.map views ~f:(fun (p, _, _) ->
             (p.pred_name.pid_str, view_field p.pred_name.pid_str));
       structures;
+      dynamic_indices = false;
       anchors =
         List.map
           (List.dedup_and_sort (List.map view_fields ~f:fst) ~compare:String.compare)
@@ -9930,8 +10067,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   Ok
     ( R.Program.make ~loc:start
-        (Prelude.members @ modules @ library_modules @ record_fields @ ref_fields
-       @ ghost_fields @ explicit_fields
+        (Prelude.members
+        @ (if shared.dynamic_indices then Indexed_initialization.members else [])
+        @ modules @ library_modules @ record_fields @ ref_fields @ ghost_fields
+        @ explicit_fields
         @ List.concat structure_member_lists
         @ List.concat_map pending_member_lists ~f:List.concat
         @ List.concat action_check_lists

@@ -245,7 +245,8 @@ let view_queue : (node Atomic.t Atomic.t, int list) Ghost.field = Ghost.field ()
 
 module Empty = Ghost.AU (struct let operation = is_empty end)
 module Push = Ghost.AU (struct let operation = push end)
-module Pop = Ghost.AU (struct let operation = pop_opt end)
+module Pop = Ghost.AU (struct let operation = pop_as end)
+module PopOpt = Ghost.AU (struct let operation = pop_opt end)
 
 let facts_of (published : node Atomic.t finset) (links : edge finset)
     (seen : node Atomic.t finset) (waiting : Ghost.t finset) : fact set =
@@ -559,3 +560,58 @@ lemma waiting_help (q : t) (cell : node Atomic.t) (xs : int list)
         {token = token; linked = true; retired = retired}
     end else ()
   end else ()
+
+lemma segment_excludes_owned (first : node Atomic.t) (limit : node Atomic.t)
+    (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
+    (other : node Atomic.t) (other_value : node)
+  requires (segment first limit items cells edges && own other other_value)
+  ensures (segment first limit items cells edges && own other other_value)
+  ensures (not (Finset.mem other cells))
+  variant (items) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  match items with
+  | [] -> fold segment first limit items cells edges
+  | _ :: tail ->
+      assert (first != other);
+      segment_excludes_owned next limit tail tail_cells tail_edges other other_value;
+      fold segment first limit items cells edges
+        {next = next; tail_cells = tail_cells; tail_edges = tail_edges}
+
+lemma segment_prepend (first : node Atomic.t) (limit : node Atomic.t)
+    (value : int) (items : int list) (next [@implicit] : node Atomic.t)
+    (cells [@implicit] : node Atomic.t finset) (edges [@implicit] : edge finset)
+  requires (own first (Next (value, next)) && own limit Nil
+    && segment next limit items cells edges)
+  ensures (own limit Nil && segment first limit (value :: items)
+    (Finset.union (Finset.singleton first) cells)
+    (Finset.union (Finset.singleton (Edge (first, value, next))) edges)) =
+  segment_info next limit items cells edges;
+  segment_excludes_owned next limit items cells edges first (Next (value, next));
+  assert (first != limit);
+  fold segment first limit (value :: items)
+    (Finset.union (Finset.singleton first) cells)
+    (Finset.union (Finset.singleton (Edge (first, value, next))) edges)
+    {next = next; tail_cells = cells; tail_edges = edges}
+
+lemma initialize_built_queue (q : t) (last : node Atomic.t) (values : int list)
+    (root [@implicit] : node Atomic.t) (cells [@implicit] : node Atomic.t finset)
+    (edges [@implicit] : edge finset)
+  requires (own q.head root && own q.tail last && own last Nil
+    && segment root last values cells edges
+    && own (Ghost.at view_queue q.head) values
+    && own (Ghost.at facts_auth q.head) (Fact_auth.full (Facts.set Set.empty)))
+  ensures (is_queue q && queue q values) =
+  assert (q.head != q.tail);
+  segment_info root last values cells edges;
+  fold queue q values;
+  fold segment root root [] Finset.empty Finset.empty;
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.full (Facts.set Set.empty))
+    (Fact_auth.full (Facts.set
+      (facts_of (Finset.union cells (Finset.singleton last)) edges
+        (Finset.singleton root) Finset.empty)));
+  fold is_queue q {root = root; head = root; last = last; tail = last;
+    retired_values = []; values = values; retired_fp = Finset.empty; active_fp = cells;
+    retired_links = Finset.empty; active_links = edges; waiting = Finset.empty;
+    waiting_on = (Map.const last : (Ghost.t, node Atomic.t) map)}

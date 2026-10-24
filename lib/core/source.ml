@@ -50,10 +50,10 @@ type t = {
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   env : Env.t;
       (** The environment at the end of the file, for types in annotations, with the type
-          [sequence], [finset], [set], and [map] of specifications. *)
+          [integer], [sequence], [finset], [set], and [map] of specifications. *)
   sequence : Path.t;  (** The type ['a sequence] of specifications. *)
   logical_types : Datatypes.t list;
-      (** The collection types of specifications, identified by their declarations. *)
+      (** The logical types of specifications, identified by their declarations. *)
   proof_types : Datatypes.t list;  (** Algebraic types declared by the proof. *)
   proof_resources : proof_resource list;
   proof_fields : proof_field list;
@@ -808,6 +808,21 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               in
               (env, types))
     in
+    let env, logical_types =
+      match find_type_by_name env "integer" with
+      | Some _ -> (env, logical_types)
+      | None ->
+          let _, _, _, _, env =
+            Typemod.type_structure env
+              (Parse.implementation (Lexing.from_string "type integer = int"))
+          in
+          let logical_types =
+            match find_type_by_name env "integer" with
+            | Some (Pident id, _) -> Datatypes.logical_integer id :: logical_types
+            | _ -> logical_types
+          in
+          (env, logical_types)
+    in
     let logical_types = List.rev logical_types in
     Option.iter interface ~f:(specialize_to_interface env typed);
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
@@ -859,6 +874,7 @@ let logical_check_signature =
    val implies : bool -> bool -> bool\n\
    val equal : 'a -> 'a -> bool\n\
    val not_equal : 'a -> 'a -> bool\n\
+   val to_sequence : 'a list -> 'a sequence\n\
    module Set : sig\n\
    val empty : 'a set\n\
    val singleton : 'a -> 'a set\n\
@@ -934,6 +950,9 @@ let logical_identifier ~functions ~loc q =
     when List.mem [ "Set"; "Finset"; "Map" ] m.pid_str ~equal:String.equal
          && not (List.mem functions (m.pid_str ^ "." ^ op.pid_str) ~equal:String.equal) ->
       logical_helper ~loc [ m.pid_str; op.pid_str ]
+  | Qid { pid_str = "to_sequence"; _ }
+    when not (List.mem functions "to_sequence" ~equal:String.equal) ->
+      logical_helper ~loc [ "to_sequence" ]
   | Qid { pid_str = "==="; _ } -> logical_helper ~loc [ "equal" ]
   | Qid { pid_str = "=/="; _ } -> logical_helper ~loc [ "not_equal" ]
   | Qid { pid_str = "->" | "<->"; _ } -> logical_helper ~loc [ "implies" ]
@@ -1012,6 +1031,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tlet (pattern, rhs, body) ->
       let* rhs = exp rhs in
       let is_list = shadow_list_projection is_list (logical_pattern_names pattern) in
+      let functions = logical_pattern_names pattern @ functions in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (Ast_helper.Exp.let_ ~loc Nonrecursive
@@ -1025,6 +1045,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
                let is_list =
                  shadow_list_projection is_list (logical_pattern_names pattern)
                in
+               let functions = logical_pattern_names pattern @ functions in
                let* body = logical_expression ~functions ~is_list body in
                Ok (Ast_helper.Exp.case (logical_pattern pattern) body)))
       in
@@ -1039,6 +1060,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tquant (_, binders, body) ->
       let names = List.map binders ~f:(fun (id, _) -> id.S.pid_str) in
       let is_list = shadow_list_projection is_list names in
+      let functions = names @ functions in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (List.fold_right binders ~init:body ~f:(fun (id, typ) body ->
@@ -1047,6 +1069,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
                [ logical_lambda ~loc id typ body ]))
   | Tcomprehension ((id, typ), body) ->
       let is_list = shadow_list_projection is_list [ id.pid_str ] in
+      let functions = id.pid_str :: functions in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (apply
@@ -1069,6 +1092,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
 let type_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
     ?expected (term : S.term) =
   try
+    let functions = List.map variables ~f:fst @ functions in
     let* expression = logical_expression ~functions ~is_list term in
     let env =
       (Typemod.type_interface env
@@ -1136,9 +1160,9 @@ let type_logical_expression ?(is_list = fun _ -> false) env ~functions ~variable
     | Some error -> Error error
     | None -> Error (Report.error Type term.term_loc (Stdlib.Printexc.to_string exn)))
 
-let infer_logical_expression env ~functions ~variables term :
+let infer_logical_expression ?is_list env ~functions ~variables term :
     (Types.type_expr, Report.error) Result.t =
-  type_logical_expression env ~functions ~variables term
+  type_logical_expression ?is_list env ~functions ~variables term
 
 let check_logical_expression ?is_list env ~functions ~variables ~expected term =
   Result.map (type_logical_expression ?is_list env ~functions ~variables ~expected term)

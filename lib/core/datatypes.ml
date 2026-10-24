@@ -32,6 +32,7 @@ type t = {
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
   collection : collection_kind option;
+  mathematical_integer : bool;
   atomic_procedure : string option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
@@ -51,6 +52,7 @@ let list =
     heap = None;
     alias = None;
     collection = None;
+    mathematical_integer = false;
     atomic_procedure = None;
     library = None;
     at = Location.none;
@@ -68,6 +70,7 @@ let option =
     heap = None;
     alias = None;
     collection = None;
+    mathematical_integer = false;
     atomic_procedure = None;
     library = None;
     at = Location.none;
@@ -100,6 +103,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap = None;
           alias = None;
           collection = None;
+          mathematical_integer = false;
           atomic_procedure = None;
           library = None;
           at;
@@ -140,6 +144,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap;
           alias = None;
           collection = None;
+          mathematical_integer = false;
           atomic_procedure = None;
           library = None;
           at;
@@ -154,6 +159,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           heap = None;
           alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
           collection = None;
+          mathematical_integer = false;
           atomic_procedure = None;
           library = None;
           at;
@@ -178,6 +184,7 @@ let library_type ~library ~library_id ~at name =
     heap = None;
     alias = None;
     collection = None;
+    mathematical_integer = false;
     atomic_procedure = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
@@ -211,9 +218,21 @@ let collection id kind =
     heap = None;
     alias = None;
     collection = Some kind;
+    mathematical_integer = false;
     atomic_procedure = None;
     library = None;
     at = Location.none;
+  }
+
+(** The unbounded integer type of specifications. *)
+let logical_integer id =
+  {
+    list with
+    id = Some id;
+    module_name = "Int";
+    ctors = [];
+    alias = Some Predef.type_int;
+    mathematical_integer = true;
   }
 
 let sequence id = collection id Sequence
@@ -373,13 +392,15 @@ let rec tag (types : t list) (t : Types.type_expr) : string =
   | Tpoly (t, []) -> tag types t
   | _ -> "Other"
 
-let is_int types t =
-  match desc types t with
-  | Tconstr (p, [], _) -> Path.same p Predef.path_int
-  | Tpoly (t, []) -> (
-      match desc types t with
-      | Tconstr (p, [], _) -> Path.same p Predef.path_int
-      | _ -> false)
+let rec is_int types t =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) ->
+      begin match find types p with
+      | Some { mathematical_integer = true; _ } -> false
+      | Some { alias = Some t; _ } -> is_int types t
+      | _ -> Path.same p Predef.path_int
+      end
+  | Tpoly (t, []) -> is_int types t
   | _ -> false
 
 (** The field [name] of type [typ], for values of the OCaml type [t]: an [int] field's

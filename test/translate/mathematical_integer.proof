@@ -1,0 +1,9 @@
+let stored : (Ghost.t, integer) Ghost.field = Ghost.field ()
+
+lemma storage =
+  let cell = Ghost.alloc [Ghost.init stored (max_int + 1)] in
+  let value = Ghost.read (Ghost.at stored cell) in
+  assert (value > max_int)
+
+lemma arithmetic (value : integer) returns (result : integer)
+  ensures (result > value) = value + 1

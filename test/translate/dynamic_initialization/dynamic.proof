@@ -1,0 +1,18 @@
+type state = { cells : int Atomic.t sequence [@grows]; size : integer }
+
+invariant valid (q : t) (s : state) =
+  s.size = length s.cells && own q 0
+  && (forall i : integer. 0 <= i && i < length s.cells -> own s.cells.(i) 7)
+
+lemma empty_cells (ignored : unit) returns (cells : int Atomic.t list)
+  ensures (cells === []) = []
+
+lemma one_cell (cell : int Atomic.t) returns (cells : int Atomic.t list)
+  ensures (cells === [cell]) = [cell]
+
+lemma two_cells (first : int Atomic.t) (second : int Atomic.t)
+  returns (cells : int Atomic.t list) (size : integer)
+  ensures (cells === [first; second] && size = 2) = ([first; second], 2)
+
+lemma keep_cells (cells : int Atomic.t list) returns (result : int Atomic.t list)
+  ensures (result === cells) = cells

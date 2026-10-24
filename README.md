@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/nyu-acsys/caravan/main/LICENSE"><img alt="MIT licensed" src="https://img.shields.io/badge/license-MIT-blue.svg"/></a>
-  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml"><img alt="Builds, tests &amp; co" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg?branch=main"/></a>
+  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml?query=branch%3Adev"><img alt="Builds, tests &amp; co" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg?branch=dev"/></a>
 </p>
 
 Caravan verifies multicore OCaml programs. It translates OCaml 5 code, with
@@ -106,6 +106,37 @@ names are not already declared by the program. `Finset` and `Set` provide
 also provides `choose`, whose set must be nonempty. Maps use `Map.const`,
 `Map.get`, and `Map.set`. A constant map may need an explicit type annotation,
 such as `(Map.const 0 : (int, int) map)`.
+
+Specifications also provide `'a sequence` with indexing, `length`, `last`, `drop`,
+`take`, and concatenation using `++`. `to_sequence xs` converts an OCaml list to a
+logical sequence, preserving order and length. It uses Raven's checked `Seq.of_list`
+laws and is unavailable in executable OCaml. Reference element types are checked
+before translation; for example, an `int ref list` converts to `int ref sequence`.
+An existing function or local binding named `to_sequence` keeps its own meaning.
+
+Use the specification-only type `integer` for unbounded mathematical indices and
+arithmetic. Quantifiers over `int` retain OCaml's machine bounds; quantifiers over
+`integer` range over all integers. The type is introduced only if the program has
+not declared its own `integer`, and is unavailable in executable OCaml.
+
+An automatic constructor can recover ghost values through checked lemma calls
+before establishing its initial shared state:
+
+```ocaml
+(*@ initially
+  let cell_list = expose_built_chain (Some q.head) tail_ list in
+  { cells = to_sequence cell_list;
+    values = to_sequence list;
+    head = 0;
+    tail = List.length list } *)
+```
+
+Initializer bindings are local to that annotation. They execute after the runtime
+result is available and before the initial views, history, and invariant are
+established. The helpers must prove the required ownership and state facts.
+For a dynamic sequence owned by index, Caravan derives the index map through a
+checked helper requiring distinct entries; literal initializers retain their
+existing translation. Unknown, duplicate, and missing state fields are rejected.
 
 Equality in specifications distinguishes OCaml comparisons from logical equality:
 
@@ -369,12 +400,16 @@ without a separate abort-restoration proof at that primitive call.
 
 The [List/segment Michael–Scott queue](test/saturn/michael_scott_queue_lseg/)
 combines these features in a complete manual proof. Its FIFO contracts cover
-`create`, `push`, `pop_opt`, and `is_empty`, including the empty-check helping
-protocol; `swing_tail` and the recursive enqueue/tail helpers are also checked.
+`create`, `of_list`, `push`, `pop_opt`, and `is_empty`, including the empty-check
+helping protocol; the recursive enqueue/tail helpers are also checked.
 The proof uses algebraic lists, heap segments, and monotone fact snapshots.
 It retains explicit witnesses and resource updates as a reference for future
 automation. The original sequence/history queue remains a separate case study in
 [test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
+
+The additional `swing_tail` operation has no Saturn counterpart. Its history and
+segment proofs live in the separate [queue tail advancement case study](test/case_studies/queue_tail_advance/),
+which reuses the queue implementations and proof definitions.
 
 The [stack drain client](test/saturn/stack_drain/) adapts Saturn's tutorial to
 our Treiber stack interface. Its contract says that draining a stack containing

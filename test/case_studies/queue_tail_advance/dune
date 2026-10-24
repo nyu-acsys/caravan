@@ -1,0 +1,38 @@
+(rule
+ (target michael_scott_queue.ml)
+ (deps
+  ../../saturn/michael_scott_queue/michael_scott_queue.ml
+  history_tail.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (cat %{deps}))))
+
+(rule
+ (target michael_scott_queue_lseg.ml)
+ (deps
+  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
+  segment_tail.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (cat %{deps}))))
+
+(copy_files ../../saturn/michael_scott_queue/*.mli)
+
+(copy_files ../../saturn/michael_scott_queue/*.proof)
+
+(copy_files ../../saturn/michael_scott_queue_lseg/*.mli)
+
+(copy_files ../../saturn/michael_scott_queue_lseg/*.proof)
+
+(cram
+ (deps
+  %{bin:caravan}
+  michael_scott_queue.ml
+  michael_scott_queue.mli
+  michael_scott_queue.proof
+  michael_scott_queue_lseg.ml
+  michael_scott_queue_lseg.mli
+  michael_scott_queue_lseg.proof
+  ../../saturn/backoff/backoff.mli))

@@ -156,6 +156,10 @@ and proof_desc =
   | Proof_fold of term * (id * term) list
   | Proof_unfold of term * id list
 
+type initialization =
+  | Initial_record of (id * term) list
+  | Initial_let of pat * proof_expr * initialization
+
 type access_scope = {
   scope_operation : id;
   scope_state : pat option;

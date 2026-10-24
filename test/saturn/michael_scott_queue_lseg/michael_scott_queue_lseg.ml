@@ -279,9 +279,12 @@ let push { tail; _ } value =
     fold is_queue q;
     (result, token)) *)
   in
-  let linked =
-    Atomic.compare_and_set old_tail Nil newnode
-    (*@ Ghost.State.scope (fun step token ->
+  if
+    not
+      (Atomic.compare_and_set old_tail Nil
+         newnode
+         (*@ Ghost.scope (fun step ->
+    let token = Push.bind () in
     let (root, head, last, cursor, retired_values, values, retired_fp, active_fp,
       retired_links, active_links, waiting, waiting_on) = unfold is_queue q {root; head;
       last; tail; retired_values; values; retired_fp; active_fp; retired_links;
@@ -361,9 +364,8 @@ let push { tail; _ } value =
     Push.abort token q value;
     fold is_queue q
     end;
-    (result, token)) *)
-  in
-  if not linked then
+    result) *))
+  then
     begin match
       Atomic.get old_tail
       (*@ Ghost.scope (fun step ->
@@ -446,7 +448,7 @@ let push { tail; _ } value =
     result) *)
 (*@ manual *)
 
-let rec pop_opt q =
+let rec pop_as q backoff =
   let old_head =
     Atomic.get q.head
     (*@ Ghost.scope (fun step ->
@@ -509,11 +511,11 @@ let rec pop_opt q =
       begin match result with
       | Nil ->
           let token = Pop.bind () in
-          let xs = Pop.access token q in
+          let xs = Pop.access token q initial_backoff in
           unfold queue q xs;
           assert (xs = []);
           fold queue q xs;
-          Pop.commit token q None
+          Pop.commit token q initial_backoff None
       | Next (value, next) ->
           is_queue_link_snapshot q
             (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
@@ -536,7 +538,7 @@ let rec pop_opt q =
               retired_fp; active_fp; retired_links; active_links; waiting;
               waiting_on} in
           let token = Pop.bind () in
-          let xs = Pop.access token q in
+          let xs = Pop.access token q initial_backoff in
           unfold queue q xs;
           assert (xs = values);
           is_queue_head_observe q old_head
@@ -569,7 +571,7 @@ let rec pop_opt q =
             segment_info next last;
             Ghost.write (Ghost.at view_queue q.head) rest;
             fold queue q rest;
-            Pop.commit token q (Some value);
+            Pop.commit token q initial_backoff (Some value);
             segment_append root head next retired_values retired_fp
               retired_links value;
             is_queue_fact_pop q
@@ -597,124 +599,43 @@ let rec pop_opt q =
               active_links = suffix_links}
           end else begin
             fold queue q xs;
-            Pop.abort token q;
+            Pop.abort token q initial_backoff;
             fold is_queue q
           end;
           result) *)
       then Some value
-      else pop_opt q
+      else
+        let backoff = Backoff.once backoff in
+        pop_as q backoff
 (*@ Ghost.scope (fun invoke ->
           let token = Pop.bind () in
-          let xs = Pop.access token q in
+          let xs = Pop.access token q initial_backoff in
           let result = invoke () in
-          Pop.commit token q result;
+          Pop.commit token q initial_backoff result;
           result) *)
 (*@ manual *)
 
-let swing_tail q =
-  let old_tail =
-    Atomic.get q.tail
-    (*@ Ghost.scope (fun step ->
-      let (root, head, last, tail, retired_values, values,
-           retired_fp, active_fp, retired_links, active_links,
-           waiting, waiting_on) =
-        unfold is_queue q {root; head; last; tail; retired_values; values;
-          retired_fp; active_fp; retired_links; active_links; waiting;
-          waiting_on} in
-      let result = step () in
-      is_queue_published_snapshot q
-        (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-        (Finset.union retired_links active_links)
-        (Finset.union retired_fp (Finset.singleton head)) waiting result;
-      fold is_queue q;
-      result) *)
-  in
-  match
-    Atomic.get old_tail
-    (*@ Ghost.scope (fun step ->
-      let (root, head, last, tail, retired_values, values,
-           retired_fp, active_fp, retired_links, active_links,
-           waiting, waiting_on) =
-        unfold is_queue q {root; head; last; tail; retired_values; values;
-          retired_fp; active_fp; retired_links; active_links; waiting;
-          waiting_on} in
-      is_queue_published_observe q old_tail
-        (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-        (Finset.union retired_links active_links)
-        (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head;
-      segment_info head last;
-      let exposure =
-        if old_tail == last then At_last
-        else if Finset.mem old_tail retired_fp then
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split root head retired_values retired_fp retired_links old_tail in
-          Retired_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-        else
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split head last values active_fp active_links old_tail in
-          Active_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-      in
-      let result = step () in
-      begin match exposure with
-      | At_last -> ()
-      | Retired_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore root old_tail next head before after
-            before_fp after_fp before_links after_links value
-      | Active_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore head old_tail next last before after
-            before_fp after_fp before_links after_links value
-      end;
-      begin match result with
-      | Nil -> ()
-      | Next (value, next) ->
-          is_queue_link_snapshot q
-            (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-            (Finset.union retired_links active_links)
-            (Finset.union retired_fp (Finset.singleton head)) waiting
-            (Edge (old_tail, value, next))
-      end;
-      fold is_queue q;
-      result) *)
-  with
-  | Nil -> ()
-  | Next (value, next) ->
-      if
-        Atomic.compare_and_set q.tail old_tail next
-        (*@ Ghost.scope (fun step ->
-          let (root, head, last, tail, retired_values, values,
-               retired_fp, active_fp, retired_links, active_links,
-               waiting, waiting_on) =
-            unfold is_queue q {root; head; last; tail; retired_values; values;
-              retired_fp; active_fp; retired_links; active_links; waiting;
-              waiting_on} in
-          is_queue_link_observe q (Edge (old_tail, value, next))
-            (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-            (Finset.union retired_links active_links)
-            (Finset.union retired_fp (Finset.singleton head)) waiting;
-          consecutive_segment_edges root head last retired_values values
-            retired_fp active_fp retired_links active_links;
-          segment_info head last;
-          let result = step () in
-          if result then
-            fold is_queue q {tail = next}
-          else
-            fold is_queue q;
-          result) *)
-      then ()
-      else ()
+(*@ result = atomic pop_as q initial_backoff
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures match xs with
+      | [] -> result = None && queue q []
+      | value :: rest -> result = Some value && queue q rest *)
+
+let pop_opt q = pop_as q Backoff.default
+(*@ Ghost.scope (fun invoke ->
+    let token = PopOpt.bind () in
+    let xs = PopOpt.access token q in
+    let result = invoke () in
+    PopOpt.commit token q result;
+    result) *)
 (*@ manual *)
 
-let is_empty q =
-  let old_head =
-    Atomic.get q.head
-    (*@ Ghost.State.scope (fun step () ->
+let is_empty { head; _ } =
+  Atomic.get
+    (Atomic.get
+       head
+       (*@ Ghost.State.scope (fun step () ->
       let token = Empty.bind () in
       let (root, head, last, tail, retired_values, values,
            retired_fp, active_fp, retired_links, active_links,
@@ -776,11 +697,8 @@ let is_empty q =
           Waiting_on registration
         end
       in
-      (result, observation)) *)
-  in
-  let observed =
-    Atomic.get old_head
-    (*@ Ghost.State.scope (fun step (observation : empty_observation) ->
+      (result, (result, observation))) *))
+  (*@ Ghost.State.scope (fun step (old_head, observation) ->
     let (root, head, last, tail, retired_values, values,
          retired_fp, active_fp, retired_links, active_links,
          waiting, waiting_on) =
@@ -858,7 +776,28 @@ let is_empty q =
           {token = token; linked = linked; retired = true}
     end;
     fold is_queue q;
-    (result, observation)) *)
+    (result, ())) *)
+  == Nil
+(*@ manual *)
+
+let of_list list =
+  let tail_ = Atomic.make Nil in
+  let tail = Atomic.make_contended tail_ in
+  let rec build_next = function
+    | [] -> tail_
+    | hd :: tl -> Atomic.make @@ Next (hd, build_next tl)
+    (*@ proof match xs with
+    | [] -> fold segment result tail_ [] Finset.empty Finset.empty
+    | hd :: tl -> segment_prepend result tail_ hd tl *)
+    (*@ result = build_next xs
+      requires own tail_ Nil
+      ensures own tail_ Nil && segment result tail_ xs *)
   in
-  observed == Nil
+  let head =
+    Atomic.make_contended @@ build_next list
+    (*@ initializes [Ghost.init view_queue list;
+      Ghost.init facts_auth (Fact_auth.full (Facts.set Set.empty))] *)
+  in
+  { head; tail }
+(*@ proof initialize_built_queue q tail_ list *)
 (*@ manual *)
