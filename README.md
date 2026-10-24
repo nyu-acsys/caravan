@@ -219,6 +219,10 @@ mode. A `(*@ proof ... *)` block uses the same expression language as checked
 lemmas, including lexical bindings and fold/unfold witnesses. Block-local names
 do not escape into the runtime program.
 
+Proof blocks can use parameter names from the contract when those names do not
+shadow OCaml bindings. This also names the implicit argument of `function` syntax;
+ordinary OCaml bindings retain their lexical precedence.
+
 An access annotation attaches a proof closure to one `Atomic` operation or
 runtime call:
 

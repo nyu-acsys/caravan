@@ -1,3 +1,9 @@
 (test
  (name diagnostics)
+ (modules diagnostics)
  (libraries caravan_core compiler-libs.common raven-ivl.api))
+
+(test
+ (name function_types)
+ (modules function_types)
+ (libraries base caravan_core compiler-libs.common))

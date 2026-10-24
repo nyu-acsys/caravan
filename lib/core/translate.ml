@@ -6493,7 +6493,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     (List.zip_exn (List.zip_exn f.params arg_names) formals)
     ~f:(fun ((parameter, source), (formal, _, _)) ->
       match (parameter.Typedtree.fp_kind, source, formal) with
-      | ( Tparam_pat { pat_desc = Tpat_record _ | Tpat_tuple _; pat_type; _ },
+      | ( Tparam_pat { pat_desc = Tpat_var _ | Tpat_record _ | Tpat_tuple _; pat_type; _ },
           Some source,
           Some (_, raven) )
         when not (List.Assoc.mem ctx.names.scope source ~equal:String.equal) ->
@@ -6925,6 +6925,10 @@ let inherit_contracts (funcs : func list) =
           }
       | _ -> f)
 
+(** The value type bound by an argument scheme, without instantiating quantifiers. *)
+let argument_value_type t =
+  match Types.get_desc t with Tpoly _ -> Btype.tpoly_get_mono_opt t | _ -> Some t
+
 (** The parameters and body of the function [e]: as written, or, for
     [function p1 -> e1 | ...], with its last parameter and a match on it. *)
 let function_parts (e : Typedtree.expression) =
@@ -6934,7 +6938,9 @@ let function_parts (e : Typedtree.expression) =
       (* The type of the last parameter, and the result's, after the others. *)
       let rec after n (t : Types.type_expr) =
         match Types.get_desc t with
-        | Tarrow (_, a, r, _) -> if n = 0 then Some (a, r) else after (n - 1) r
+        | Tarrow (_, a, r, _) ->
+            if n = 0 then Option.map (argument_value_type a) ~f:(fun a -> (a, r))
+            else after (n - 1) r
         | Tpoly (t, []) -> after n t
         | _ -> None
       in
