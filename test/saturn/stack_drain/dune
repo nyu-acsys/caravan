@@ -1,0 +1,12 @@
+(copy_files ../treiber_stack/treiber_stack.mli)
+
+(cram
+ (deps
+  %{bin:caravan}
+  treiber_stack.mli
+  (glob_files *.ml)
+  (glob_files *.mli)
+  ../treiber_stack/treiber_stack.ml
+  ../treiber_stack/treiber_stack.mli
+  ../treiber_stack/treiber_stack.proof
+  ../backoff/backoff.mli))

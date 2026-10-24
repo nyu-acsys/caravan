@@ -372,6 +372,13 @@ It retains explicit witnesses and resource updates as a reference for future
 automation. The original sequence/history queue remains a separate case study in
 [test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
 
+The [stack drain client](test/saturn/stack_drain/) adapts Saturn's tutorial to
+our Treiber stack interface. Its contract says that draining a stack containing
+`xs` returns `xs` and leaves the stack empty. It needs no inline proof annotations
+or companion proof file. The regression verifies both the stack implementation
+and the client against the same interface, with the representation hidden from
+the client.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.
