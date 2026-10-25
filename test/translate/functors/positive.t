@@ -37,3 +37,6 @@
 
   $ caravan --shh fresh_record.ml
   Verification successful.
+
+  $ caravan --shh unit.ml
+  Verification successful.

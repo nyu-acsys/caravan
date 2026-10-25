@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Static modules, nested signatures, checked module aliases, and monomorphic functor applications support qualified calls, ordinary and atomic contracts, and shared result types across repeated applications.
+- Static modules, nested signatures, checked module aliases, and monomorphic named and unit functors preserve type identities and support qualified calls and ordinary and atomic contracts.
 - Proof files support resource algebra instances, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.
 - Generated invariant folds supply explicit witnesses for known state transitions and histories.
 - Source-level verification errors retain solver timeout explanations.

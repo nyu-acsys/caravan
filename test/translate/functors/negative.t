@@ -24,13 +24,6 @@
   Related Location: The actual module operation.
   [1]
 
-  $ caravan --shh unit_fail.ml
-  [Error] File "unit_fail.ml", line 1, column 12 to line 3, column 3:
-  1 | module Make () = struct
-                  ^^^^^^^^^^^
-  Unsupported Error: A unit functor is not supported yet.
-  [1]
-
   $ caravan --shh higher_order_fail.ml
   [Error] File "higher_order_fail.ml", line 5, columns 25-48:
   5 | module Make (F : functor (Cell : Value) -> Value) = struct

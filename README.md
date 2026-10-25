@@ -102,10 +102,13 @@ names retain their definition-time scope. Unused functor bodies are not verified
 Result variants and records share their types and mutable fields across repeated
 applications to the same module, including aliases. Distinct argument modules
 retain distinct result types.
+Unit functors such as `module Make () = ...` are also supported: separate
+`Make ()` applications have fresh nominal result types and mutable fields, while aliases
+of one result share its identity. Each application is verified separately.
 See the separate
 [`functor_stack_drain`](test/examples/functor_stack_drain) example.
 
-Type aliases in results are supported; unit or curried functors, higher-order or
+Type aliases in results are supported; curried functors, higher-order or
 imported functors, anonymous arguments, nested parameter
 modules, and shared-state initializers inside functors remain unsupported.
 
