@@ -1,6 +1,6 @@
 # Queue tail advancement
 
-This case study verifies `swing_tail`, a one-step Michael–Scott queue-tail
+This example verifies `swing_tail`, a one-step Michael–Scott queue-tail
 advancement operation. It is an additional verification example, with no matching
 operation in Saturn's queue implementation.
 
@@ -22,5 +22,5 @@ case studies without maintaining another copy of them.
 Run both proofs with:
 
 ```sh
-dune build @test/case_studies/queue_tail_advance/runtest
+dune build @test/examples/queue_tail_advance/runtest
 ```

@@ -62,10 +62,10 @@
   [1]
 
   $ caravan --shh functor_fail.ml
-  [Error] File "functor_fail.ml", line 1, column 12 to line 6, column 3:
-  1 | module Make (Argument : sig
-                  ^^^^^^^^^^^^^^^
-  Unsupported Error: A functor is not supported yet.
+  [Error] File "functor_fail.ml", line 2, columns 2-17:
+  2 |   val value : int
+        ^^^^^^^^^^^^^^^
+  Unsupported Error: A non-function value in a functor parameter is not supported yet.
   [1]
 
   $ caravan --shh include_fail.ml

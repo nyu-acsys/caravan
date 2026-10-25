@@ -31,10 +31,10 @@ Clients verified against interface-only dependencies use abstract types instead.
 
 Imported interfaces can expose nested modules with ordinary or logically atomic
 contracts. The module client in
-[`test/case_studies/module_stack_drain`](test/case_studies/module_stack_drain)
+[`test/examples/module_stack_drain`](test/examples/module_stack_drain)
 uses these contracts through an alias of the stack module.
 
-Functor applications, recursive and local modules, `open`, `include`, and module
+Recursive and local modules, `open`, `include`, and module
 initialization expressions are not supported yet. Specification calls through
 constrained module signatures, nested implementation predicates, and shared-state
 declarations remain outside this module support.
@@ -92,6 +92,19 @@ Explicit ghost adaptations, public AU tokens, non-function values, nested module
 members, and resource definitions in signatures are unsupported. An already checked
 view cannot yet be constrained again by a callable signature in its enclosing
 `.mli`; use named checked bindings for successive views.
+
+Named monomorphic functors with one module parameter and a structure body support
+concrete path applications such as `module Client = Drain (Treiber_stack)`.
+Each application checks the complete argument against the parameter signature and
+verifies a separate body specialization. Parameter calls use that signature's
+contracts, including its abstract resources and logically atomic clauses. Captured
+names retain their definition-time scope. Unused functor bodies are not verified.
+See the separate
+[`functor_stack_drain`](test/examples/functor_stack_drain) example.
+
+Type aliases in results are supported; fresh result datatypes, unit or curried
+functors, higher-order or imported functors, anonymous arguments, nested parameter
+modules, and shared-state initializers inside functors remain unsupported.
 
 Proof files also support checked lemmas and monomorphic logical variant types.
 A lemma has typed parameters and an expression body after `=`. Optional
@@ -460,7 +473,7 @@ automation. The original sequence/history queue remains a separate case study in
 [test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
 
 The additional `swing_tail` operation has no Saturn counterpart. Its history and
-segment proofs live in the separate [queue tail advancement case study](test/case_studies/queue_tail_advance/),
+segment proofs live in the separate [queue tail advancement example](test/examples/queue_tail_advance/),
 which reuses the queue implementations and proof definitions.
 
 The [stack drain client](test/saturn/stack_drain/) adapts Saturn's tutorial to
@@ -490,3 +503,6 @@ $ ln -s ../../raven vendor/raven
 ```
 
 Raven runs [Z3](https://github.com/Z3Prover/z3) (>= 4.13.0), which has to be on the path.
+
+See [test organization](test/README.md) for the distinction between focused
+regressions, verification examples, Saturn studies, and independent case studies.

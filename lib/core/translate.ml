@@ -9745,6 +9745,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Set.union backend_names.used (Set.of_list (module String) reserved);
   let fresh = Names.fresh backend_names in
   let* inventory = Module_inventory.build source typed in
+  let typed = inventory.structure in
   let* libraries = Library_modules.flatten ~fresh source.libraries in
   let* checked_operations =
     all inventory.bindings ~f:(fun binding ->

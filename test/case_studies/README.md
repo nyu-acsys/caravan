@@ -1,8 +1,8 @@
-# Other case studies
+# Independent case studies
 
-This directory contains complete verification examples that do not match an
-upstream Saturn implementation. Focused translator regressions belong in
-`test/translate`; annotated Saturn examples belong in `test/saturn`.
+This directory is reserved for substantial data structure implementations and
+their proofs developed independently of Saturn.
 
-- [Queue tail advancement](queue_tail_advance/): the additional `swing_tail`
-  operation checked with both the history and segment queue invariants.
+Saturn implementations and clients belong in `test/saturn`. Smaller verified
+clients, proof patterns, and algorithm fragments belong in `test/examples`;
+focused translator regressions belong in `test/translate`.

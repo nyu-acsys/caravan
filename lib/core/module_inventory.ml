@@ -61,6 +61,7 @@ type checked_binding = {
 }
 
 type t = {
+  structure : Typedtree.structure;
   values : value list;
   types : type_definition list;
   aliases : (Path.t * Path.t) list;
@@ -68,6 +69,7 @@ type t = {
 }
 
 type module_view = {
+  functor_definition : functor_definition option;
   checked : checked_binding ref option;
   identity : Path.t option;
   alias_target : Path.t option;
@@ -75,6 +77,13 @@ type module_view = {
   types : (string * type_definition ref) list;
   modules : (string * module_view) list;
   modtypes : (string * signature_view) list;
+}
+
+and functor_definition = {
+  parameter_name : string;
+  template : Typedtree.module_expr;
+  environment : Env.t;
+  annotations : Annotation.t list;
 }
 
 type signature_origin = {
@@ -93,6 +102,7 @@ let empty_signature =
 
 let empty_module =
   {
+    functor_definition = None;
     checked = None;
     identity = None;
     alias_target = None;
@@ -127,6 +137,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let all_types = ref [] in
   let aliases = ref [] in
   let bindings = ref [] in
+  let expansions = ref [] in
+  let templates = ref [] in
   let modules = ref [] in
   let modtypes = ref [] in
   let imported_signatures = ref [] in
@@ -672,9 +684,148 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               apply_signature signature view
           | Tmodtype_implicit -> effective expression.mod_env expression.mod_loc mty view
           end
-    | Tmod_functor _ -> unavailable expression.mod_loc "A functor"
-    | Tmod_apply _ | Tmod_apply_unit _ ->
-        unavailable expression.mod_loc "A functor application"
+    | Tmod_functor (Named (Some _, { txt = Some name; _ }, parameter_type), body) ->
+        let* parameter_view = signature_type ~imported:false annotations parameter_type in
+        let* () =
+          if List.is_empty parameter_view.signature_modules then Ok ()
+          else unavailable parameter_type.mty_loc "Nested modules in a functor parameter"
+        in
+        let* () =
+          List.fold_result parameter_view.signature_values ~init:()
+            ~f:(fun () (_, value) ->
+              match
+                Types.get_desc
+                  (Ctype.expand_head value.site.environment
+                     value.declaration.val_val.val_type)
+              with
+              | Types.Tarrow _ -> Ok ()
+              | _ ->
+                  unavailable value.site.item_loc
+                    "A non-function value in a functor parameter")
+        in
+        let* () =
+          match body.mod_desc with
+          | Tmod_structure _ -> Ok ()
+          | _ -> unavailable body.mod_loc "A functor without a direct structure body"
+        in
+        let* () =
+          let invalid = ref None in
+          let type_declaration iterator declaration =
+            begin match
+              ( declaration.Typedtree.typ_type.type_kind,
+                declaration.typ_type.type_manifest )
+            with
+            | Types.Type_abstract _, Some _ -> ()
+            | _ -> if Option.is_none !invalid then invalid := Some declaration.typ_loc
+            end;
+            Tast_iterator.default_iterator.type_declaration iterator declaration
+          in
+          let iterator = { Tast_iterator.default_iterator with type_declaration } in
+          iterator.module_expr iterator body;
+          match !invalid with
+          | None -> Ok ()
+          | Some at -> unavailable at "A fresh datatype in a functor body"
+        in
+        let* () =
+          List.fold_result annotations ~init:() ~f:(fun () annotation ->
+              if
+                within body.mod_loc annotation.Annotation.loc
+                && List.mem
+                     [ Annotation.Initially; Initializes ]
+                     (Annotation.kind annotation) ~equal:Poly.equal
+              then
+                unavailable annotation.loc "A shared-state initializer in a functor body"
+              else Ok ())
+        in
+        Ok
+          {
+            empty_module with
+            functor_definition =
+              Some
+                {
+                  parameter_name = name;
+                  template = expression;
+                  environment = expression.mod_env;
+                  annotations;
+                };
+          }
+    | Tmod_functor (Unit, _) -> unavailable expression.mod_loc "A unit functor"
+    | Tmod_functor (Named (None, _, _), _)
+    | Tmod_functor (Named (Some _, { txt = None; _ }, _), _) ->
+        unavailable expression.mod_loc "An anonymous functor parameter"
+    | Tmod_apply (callee, argument, _) ->
+        let rec callee_path (callee : Typedtree.module_expr) =
+          match callee.mod_desc with
+          | Tmod_ident (path, _) -> Ok path
+          | Tmod_constraint (body, _, Tmodtype_implicit, _) -> callee_path body
+          | _ -> unavailable callee.mod_loc "A non-path functor application"
+        in
+        let* path = callee_path callee in
+        let* template = resolve_module expression.mod_loc expression.mod_env path in
+        let* definition =
+          match template.functor_definition with
+          | Some definition -> Ok definition
+          | None ->
+              unavailable expression.mod_loc "An application of an unavailable functor"
+        in
+        let* actual =
+          match argument.mod_desc with
+          | Tmod_ident (path, _) -> resolve_module argument.mod_loc argument.mod_env path
+          | _ -> unavailable argument.mod_loc "A non-path functor argument"
+        in
+        let* actual_path =
+          match (actual.identity, actual.functor_definition) with
+          | Some path, None -> Ok path
+          | _ -> unavailable argument.mod_loc "A higher-order functor argument"
+        in
+        let* parameter, parameter_type, body =
+          try
+            let mapper = Untypeast.default_mapper in
+            let parsed = mapper.module_expr mapper definition.template in
+            let template, _ = Typemod.type_module definition.environment parsed in
+            match template.mod_desc with
+            | Tmod_functor (Named (Some parameter, _, parameter_type), body) ->
+                Ok (parameter, parameter_type, body)
+            | _ ->
+                unavailable expression.mod_loc "A non-structural functor specialization"
+          with exn ->
+            Error
+              (Option.value (Report.of_exn exn)
+                 ~default:
+                   (Report.error Type expression.mod_loc (Stdlib.Printexc.to_string exn)))
+        in
+        let* expected =
+          signature_type ~imported:false definition.annotations parameter_type
+        in
+        let parameter_path = Path.Pident parameter in
+        let add_parameter env =
+          Env.add_module ~noalias:true parameter Types.Mp_present parameter_type.mty_type
+            env
+        in
+        let binding =
+          ref
+            {
+              actual_path;
+              expected;
+              site =
+                {
+                  environment = add_parameter expression.mod_env;
+                  scope = scope expression.mod_loc;
+                  annotations;
+                  item_loc = expression.mod_loc;
+                  next = None;
+                };
+              namespace = namespace @ [ definition.parameter_name ];
+              paths = [];
+            }
+        in
+        bindings := binding :: !bindings;
+        publish parameter_path
+          { empty_module with checked = Some binding; identity = Some parameter_path };
+        let* view = module_expression definition.annotations namespace body in
+        expansions := (expression, body) :: !expansions;
+        Ok view
+    | Tmod_apply_unit _ -> unavailable expression.mod_loc "A unit functor application"
     | Tmod_unpack _ -> unavailable expression.mod_loc "A first-class module"
   and collect_structure annotations namespace declaration_scope
       (structure : Typedtree.structure) =
@@ -795,6 +946,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       | Tmod_ident _ -> nested
                       | _ -> { nested with identity = Some (Path.Pident id) }
                     in
+                    if Option.is_some nested.functor_definition then
+                      templates := id :: !templates;
                     publish (Path.Pident id) nested;
                     Ok { view with modules = bind view.modules name nested }
                 | _ -> unavailable declaration.mb_loc "An anonymous module binding"
@@ -845,6 +998,26 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   in
   Ok
     {
+      structure =
+        (let module_expr mapper expression =
+           match List.Assoc.find !expansions expression ~equal:phys_equal with
+           | Some body -> Tast_mapper.default.module_expr mapper body
+           | None -> Tast_mapper.default.module_expr mapper expression
+         in
+         let map_structure mapper structure =
+           let str_items =
+             List.filter structure.Typedtree.str_items ~f:(fun item ->
+                 match item.Typedtree.str_desc with
+                 | Tstr_module { mb_id = Some id; _ } ->
+                     not (List.mem !templates id ~equal:Ident.same)
+                 | _ -> true)
+           in
+           Tast_mapper.default.structure mapper { structure with str_items }
+         in
+         let mapper =
+           { Tast_mapper.default with module_expr; structure = map_structure }
+         in
+         mapper.structure mapper structure);
       values = List.rev_map !all_values ~f:(fun value -> !value);
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
