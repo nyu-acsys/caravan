@@ -31,3 +31,9 @@
 
   $ caravan --shh inline_parameter.ml
   Verification successful.
+
+  $ caravan --shh fresh_variant.ml
+  Verification successful.
+
+  $ caravan --shh fresh_record.ml
+  Verification successful.

@@ -52,20 +52,6 @@
   Unsupported Error: A functor without a direct structure body is not supported yet.
   [1]
 
-  $ caravan --shh fresh_variant_fail.ml
-  [Error] File "fresh_variant_fail.ml", line 10, columns 2-25:
-  10 |   type t = Wrap of Cell.t
-         ^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A fresh datatype in a functor body is not supported yet.
-  [1]
-
-  $ caravan --shh fresh_record_fail.ml
-  [Error] File "fresh_record_fail.ml", line 10, columns 2-28:
-  10 |   type t = { cell : Cell.t }
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A fresh datatype in a functor body is not supported yet.
-  [1]
-
   $ caravan --shh hidden_parameter_fail.ml
   [Error] File "hidden_parameter_fail.ml", line 16, columns 13-24:
   16 | let read x = Client.Cell.read x

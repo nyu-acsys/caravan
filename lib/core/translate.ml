@@ -1571,22 +1571,25 @@ and term_type env (t : S.term) =
       in
       Option.first_some state
         (Option.bind (term_type env base) ~f:(fun ty ->
-             match Datatypes.desc env.data ty with
-             | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list ->
-                 if String.equal f "hd" then Some elt
-                 else if String.equal f "tl" then Some ty
-                 else None
-             | Tconstr (p, [], _) ->
-                 Option.bind (Datatypes.find env.data p) ~f:(fun d ->
-                     match d.ctors with
-                     | [ c ] ->
-                         Option.map
-                           (List.Assoc.find
-                              (List.zip_exn c.fields c.args)
-                              f ~equal:String.equal)
-                           ~f:(Datatypes.expand env.data)
-                     | _ -> None)
-             | _ -> None))
+             let fallback =
+               match Datatypes.desc env.data ty with
+               | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list ->
+                   if String.equal f "hd" then Some elt
+                   else if String.equal f "tl" then Some ty
+                   else None
+               | Tconstr (p, [], _) ->
+                   Option.bind (Datatypes.find env.data p) ~f:(fun d ->
+                       match d.ctors with
+                       | [ c ] ->
+                           Option.map
+                             (List.Assoc.find
+                                (List.zip_exn c.fields c.args)
+                                f ~equal:String.equal)
+                             ~f:(Datatypes.expand env.data)
+                       | _ -> None)
+               | _ -> None
+             in
+             Option.first_some (source_field_type env.ctx ty f) fallback))
   | _, ({ term_desc = Tvar (Qid { pid_str = "([])" | "last"; _ }); _ }, s :: _) ->
       (* An entry of a sequence. *)
       begin match Option.map (term_type env s) ~f:(Datatypes.desc env.data) with
@@ -1921,13 +1924,17 @@ and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_e
         | "::", [ elt ] when Path.same path Predef.path_list -> [ elt; t ]
         | "Some", [ elt ] when Path.same path Predef.path_option -> [ elt ]
         | _ ->
-            begin match Datatypes.find env.data path with
-            | Some d ->
-                Option.value_map
-                  (List.find d.ctors ~f:(fun ctor -> String.equal ctor.ocaml c))
-                  ~default:[]
-                  ~f:(fun ctor -> ctor.args)
-            | None -> []
+            begin match find_constructor env q with
+            | Some (d, ctor) when Datatypes.declares d path -> ctor.args
+            | Some _ | None ->
+                begin match Datatypes.find env.data path with
+                | Some d ->
+                    Option.value_map
+                      (List.find d.ctors ~f:(fun ctor -> String.equal ctor.ocaml c))
+                      ~default:[]
+                      ~f:(fun ctor -> ctor.args)
+                | None -> []
+                end
             end
       in
       let arg_patterns =
@@ -9921,15 +9928,23 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             | _ -> Ok []))
   in
   let types = List.concat (List.concat library_types) @ types @ source.proof_types in
-  let relative root path =
-    let rec components path suffix =
-      if Path.same root path then Some suffix
-      else
-        match path with
-        | Path.Pdot (parent, name) -> components parent (name :: suffix)
-        | Pident _ | Papply _ | Pextra_ty _ -> None
-    in
-    components path []
+  let rec alias_path ~target ~alias path =
+    if Path.same target path then Some alias
+    else
+      match path with
+      | Path.Pdot (parent, name) ->
+          Option.map (alias_path ~target ~alias parent) ~f:(fun parent ->
+              Path.Pdot (parent, name))
+      | Papply (head, argument) ->
+          let head_alias = alias_path ~target ~alias head in
+          let argument_alias = alias_path ~target ~alias argument in
+          if Option.is_none head_alias && Option.is_none argument_alias then None
+          else
+            Some
+              (Path.Papply
+                 ( Option.value head_alias ~default:head,
+                   Option.value argument_alias ~default:argument ))
+      | Pident _ | Pextra_ty _ -> None
   in
   let types =
     List.map types ~f:(fun data ->
@@ -9940,10 +9955,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let rec expand remaining paths =
           let aliases =
             List.concat_map inventory.aliases ~f:(fun (alias, target) ->
-                List.filter_map paths ~f:(fun path ->
-                    Option.map (relative target path) ~f:(fun suffix ->
-                        List.fold suffix ~init:alias ~f:(fun parent name ->
-                            Path.Pdot (parent, name)))))
+                List.filter_map paths ~f:(alias_path ~target ~alias))
           in
           let expanded = Datatypes.with_paths data (paths @ aliases) in
           if remaining = 0 || List.length expanded.paths = List.length paths then expanded

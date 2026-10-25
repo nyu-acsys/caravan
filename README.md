@@ -99,11 +99,14 @@ Each application checks the complete argument against the parameter signature an
 verifies a separate body specialization. Parameter calls use that signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
 names retain their definition-time scope. Unused functor bodies are not verified.
+Result variants and records share their types and mutable fields across repeated
+applications to the same module, including aliases. Distinct argument modules
+retain distinct result types.
 See the separate
 [`functor_stack_drain`](test/examples/functor_stack_drain) example.
 
-Type aliases in results are supported; fresh result datatypes, unit or curried
-functors, higher-order or imported functors, anonymous arguments, nested parameter
+Type aliases in results are supported; unit or curried functors, higher-order or
+imported functors, anonymous arguments, nested parameter
 modules, and shared-state initializers inside functors remain unsupported.
 
 Proof files also support checked lemmas and monomorphic logical variant types.

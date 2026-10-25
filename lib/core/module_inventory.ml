@@ -72,6 +72,8 @@ type module_view = {
   functor_definition : functor_definition option;
   checked : checked_binding ref option;
   identity : Path.t option;
+  application_identity : Path.t option;
+      (** Nominal module identity, independent of the checked operation view. *)
   alias_target : Path.t option;
   values : (string * value ref) list;
   types : (string * type_definition ref) list;
@@ -105,6 +107,7 @@ let empty_module =
     functor_definition = None;
     checked = None;
     identity = None;
+    application_identity = None;
     alias_target = None;
     values = [];
     types = [];
@@ -135,6 +138,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     (t, Report.error) Result.t =
   let all_values = ref [] in
   let all_types = ref [] in
+  let result_types : (Path.t * type_definition ref) list ref = ref [] in
   let aliases = ref [] in
   let bindings = ref [] in
   let expansions = ref [] in
@@ -159,12 +163,27 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     List.iter signature.signature_modules ~f:(fun (name, nested) ->
         publish_signature (Path.Pdot (path, name)) nested.signature_body)
   in
+  let publish_type_paths path view =
+    let rec publish path view =
+      List.iter view.types ~f:(fun (name, definition) ->
+          definition :=
+            {
+              !definition with
+              paths = add_path !definition.paths (Path.Pdot (path, name));
+            });
+      List.iter view.modules ~f:(fun (name, nested) ->
+          publish (Path.Pdot (path, name)) nested)
+    in
+    publish path view
+  in
   let rec publish path view =
     register modules path view;
     Option.iter view.checked ~f:(fun binding ->
         binding := { !binding with paths = add_path !binding.paths path });
     if Option.is_none view.checked then
-      Option.iter view.alias_target ~f:(fun target -> register aliases path target);
+      Option.iter (Option.first_some view.alias_target view.application_identity)
+        ~f:(fun target ->
+          if not (Path.same path target) then register aliases path target);
     List.iter view.values ~f:(fun (name, value) ->
         value := { !value with paths = add_path !value.paths (Path.Pdot (path, name)) });
     List.iter view.types ~f:(fun (name, definition) ->
@@ -196,7 +215,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 match Mtype.scrape env declaration.md_type with
                 | Types.Mty_functor _ -> unavailable at "An alias of an imported functor"
                 | Mty_signature _ | Mty_ident _ | Mty_alias _ ->
-                    Ok { empty_module with identity = Some normalized }
+                    Ok
+                      {
+                        empty_module with
+                        identity = Some normalized;
+                        application_identity = Some normalized;
+                      }
               with exn ->
                 Error
                   (Option.value (Report.of_exn exn)
@@ -466,13 +490,14 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     in
     items { empty_signature with signature_resources } signature.sig_items
   in
+  let signature_module_substitution substitution path signature =
+    List.fold signature.signature_modules ~init:substitution
+      ~f:(fun substitution (name, nested) ->
+        Option.value_map nested.signature_id ~default:substitution ~f:(fun id ->
+            Subst.add_module id (Path.Pdot (path, name)) substitution))
+  in
   let rec signature_aliases substitution path signature =
-    let substitution =
-      List.fold signature.signature_modules ~init:substitution
-        ~f:(fun substitution (name, nested) ->
-          Option.value_map nested.signature_id ~default:substitution ~f:(fun id ->
-              Subst.add_module id (Path.Pdot (path, name)) substitution))
-    in
+    let substitution = signature_module_substitution substitution path signature in
     List.iter signature.signature_modules ~f:(fun (name, nested) ->
         let path = Path.Pdot (path, name) in
         match nested.signature_alias with
@@ -570,6 +595,47 @@ let build (source : Source.t) (structure : Typedtree.structure) :
         }
   in
   let apply_signature signature view = constrain Subst.identity signature view in
+  let seal_application_identity path signature view =
+    let rec identities substitution path signature =
+      let substitution = signature_module_substitution substitution path signature in
+      List.concat_map signature.signature_modules ~f:(fun (name, nested) ->
+          let path = Path.Pdot (path, name) in
+          let target =
+            Option.value_map nested.signature_alias ~default:path
+              ~f:(Subst.module_path substitution)
+          in
+          (path, target) :: identities substitution path nested.signature_body)
+    in
+    let identities = (path, path) :: identities Subst.identity path signature in
+    let rec canonical path =
+      match List.Assoc.find identities path ~equal:Path.same with
+      | Some target -> if Path.same target path then path else canonical target
+      | None ->
+          begin match lookup modules path with
+          | Some view -> Option.value view.application_identity ~default:path
+          | None ->
+              begin match path with
+              | Path.Pdot (parent, name) -> Path.Pdot (canonical parent, name)
+              | Papply (head, argument) -> Path.Papply (canonical head, canonical argument)
+              | Pident _ | Pextra_ty _ -> path
+              end
+          end
+    in
+    let rec seal path view =
+      let target = canonical path in
+      let modules =
+        List.map view.modules ~f:(fun (name, nested) ->
+            (name, seal (Path.Pdot (target, name)) nested))
+      in
+      {
+        view with
+        application_identity = Some target;
+        alias_target = Option.some_if (not (Path.same path target)) target;
+        modules;
+      }
+    in
+    seal path view
+  in
   let rec effective env at mty view =
     match Mtype.scrape env mty with
     | Types.Mty_signature signature ->
@@ -609,15 +675,23 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Sig_typext _ | Sig_class _ | Sig_class_type _ ->
                 unavailable at "This constrained module signature item")
         in
-        Ok { result with identity = view.identity; checked = view.checked }
+        Ok
+          {
+            result with
+            identity = view.identity;
+            application_identity = view.application_identity;
+            checked = view.checked;
+          }
     | Mty_alias path -> resolve_module at env path
     | Mty_functor _ -> unavailable at "A functor signature"
     | Mty_ident _ -> unavailable at "An abstract module signature"
   in
-  let rec module_expression annotations namespace (expression : Typedtree.module_expr) =
+  let rec module_expression annotations namespace ~identity
+      (expression : Typedtree.module_expr) =
     match expression.mod_desc with
     | Tmod_structure structure ->
-        collect_structure annotations namespace (scope expression.mod_loc) structure
+        collect_structure annotations namespace ~identity (scope expression.mod_loc)
+          structure
     | Tmod_ident (path, _) ->
         let* view = resolve_module expression.mod_loc expression.mod_env path in
         Ok
@@ -633,7 +707,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | _ -> false
         in
         if alias body then
-          let* actual = module_expression annotations namespace body in
+          let* actual = module_expression annotations namespace ~identity body in
           begin match annotation with
           | Tmodtype_implicit -> Ok actual
           | Tmodtype_explicit mty ->
@@ -668,10 +742,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               in
               let binding = ref { actual_path; expected; site; namespace; paths = [] } in
               bindings := binding :: !bindings;
-              Ok { empty_module with checked = Some binding; identity = actual.identity }
+              Ok
+                {
+                  empty_module with
+                  checked = Some binding;
+                  identity = actual.identity;
+                  application_identity = identity;
+                }
           end
         else
-          let* view = module_expression annotations namespace body in
+          let* view = module_expression annotations namespace ~identity body in
           begin match annotation with
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
@@ -681,7 +761,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   unavailable mty.mty_loc
                     "A resource declaration on an inline module structure"
               in
-              apply_signature signature view
+              let* view = apply_signature signature view in
+              Ok
+                (Option.value_map identity ~default:view ~f:(fun path ->
+                     seal_application_identity path signature view))
           | Tmodtype_implicit -> effective expression.mod_env expression.mod_loc mty view
           end
     | Tmod_functor (Named (Some _, { txt = Some name; _ }, parameter_type), body) ->
@@ -709,22 +792,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | _ -> unavailable body.mod_loc "A functor without a direct structure body"
         in
         let* () =
-          let invalid = ref None in
+          let valid = ref (Ok ()) in
           let type_declaration iterator declaration =
-            begin match
-              ( declaration.Typedtree.typ_type.type_kind,
-                declaration.typ_type.type_manifest )
-            with
-            | Types.Type_abstract _, Some _ -> ()
-            | _ -> if Option.is_none !invalid then invalid := Some declaration.typ_loc
-            end;
+            valid :=
+              Result.bind !valid ~f:(fun () ->
+                  Result.map (Datatypes.of_declaration declaration) ~f:(fun _ -> ()));
             Tast_iterator.default_iterator.type_declaration iterator declaration
           in
           let iterator = { Tast_iterator.default_iterator with type_declaration } in
           iterator.module_expr iterator body;
-          match !invalid with
-          | None -> Ok ()
-          | Some at -> unavailable at "A fresh datatype in a functor body"
+          !valid
         in
         let* () =
           List.fold_result annotations ~init:() ~f:(fun () annotation ->
@@ -740,6 +817,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
         Ok
           {
             empty_module with
+            application_identity = identity;
             functor_definition =
               Some
                 {
@@ -754,13 +832,14 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     | Tmod_functor (Named (Some _, { txt = None; _ }, _), _) ->
         unavailable expression.mod_loc "An anonymous functor parameter"
     | Tmod_apply (callee, argument, _) ->
-        let rec callee_path (callee : Typedtree.module_expr) =
-          match callee.mod_desc with
+        let rec static_path description (value : Typedtree.module_expr) =
+          match value.mod_desc with
           | Tmod_ident (path, _) -> Ok path
-          | Tmod_constraint (body, _, Tmodtype_implicit, _) -> callee_path body
-          | _ -> unavailable callee.mod_loc "A non-path functor application"
+          | Tmod_constraint (body, _, Tmodtype_implicit, _) ->
+              static_path description body
+          | _ -> unavailable value.mod_loc description
         in
-        let* path = callee_path callee in
+        let* path = static_path "A non-path functor application" callee in
         let* template = resolve_module expression.mod_loc expression.mod_env path in
         let* definition =
           match template.functor_definition with
@@ -769,14 +848,19 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               unavailable expression.mod_loc "An application of an unavailable functor"
         in
         let* actual =
-          match argument.mod_desc with
-          | Tmod_ident (path, _) -> resolve_module argument.mod_loc argument.mod_env path
-          | _ -> unavailable argument.mod_loc "A non-path functor argument"
+          let* path = static_path "A non-path functor argument" argument in
+          resolve_module argument.mod_loc argument.mod_env path
         in
         let* actual_path =
           match (actual.identity, actual.functor_definition) with
           | Some path, None -> Ok path
           | _ -> unavailable argument.mod_loc "A higher-order functor argument"
+        in
+        let* application_identity =
+          match (template.application_identity, actual.application_identity) with
+          | Some head, Some argument -> Ok (Path.Papply (head, argument))
+          | _ ->
+              unavailable expression.mod_loc "A functor application without an identity"
         in
         let* parameter, parameter_type, body =
           try
@@ -821,13 +905,22 @@ let build (source : Source.t) (structure : Typedtree.structure) :
         in
         bindings := binding :: !bindings;
         publish parameter_path
-          { empty_module with checked = Some binding; identity = Some parameter_path };
-        let* view = module_expression definition.annotations namespace body in
+          {
+            empty_module with
+            checked = Some binding;
+            identity = Some parameter_path;
+            application_identity = actual.application_identity;
+          };
+        let* view =
+          module_expression definition.annotations namespace
+            ~identity:(Some application_identity) body
+        in
+        publish_type_paths application_identity view;
         expansions := (expression, body) :: !expansions;
         Ok view
     | Tmod_apply_unit _ -> unavailable expression.mod_loc "A unit functor application"
     | Tmod_unpack _ -> unavailable expression.mod_loc "A first-class module"
-  and collect_structure annotations namespace declaration_scope
+  and collect_structure annotations namespace ~identity declaration_scope
       (structure : Typedtree.structure) =
     let all_annotations = annotations in
     let children =
@@ -890,15 +983,25 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Tstr_type (_, declarations) ->
                 let types =
                   List.fold declarations ~init:view.types ~f:(fun bindings declaration ->
-                      let definition =
-                        ref
-                          {
-                            declaration;
-                            namespace;
-                            paths = [ Path.Pident declaration.typ_id ];
-                          }
+                      let path = Path.Pident declaration.typ_id in
+                      let key =
+                        Option.value_map identity ~default:path ~f:(fun parent ->
+                            Path.Pdot (parent, declaration.typ_name.txt))
                       in
-                      all_types := definition :: !all_types;
+                      let definition =
+                        match lookup result_types key with
+                        | Some definition ->
+                            definition :=
+                              { !definition with paths = add_path !definition.paths path };
+                            definition
+                        | None ->
+                            let definition =
+                              ref { declaration; namespace; paths = [ path; key ] }
+                            in
+                            register result_types key definition;
+                            all_types := definition :: !all_types;
+                            definition
+                      in
                       bind bindings declaration.typ_name.txt definition)
                 in
                 Ok { view with types }
@@ -931,7 +1034,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 begin match (declaration.mb_id, declaration.mb_name.txt) with
                 | Some id, Some name ->
                     let* nested =
-                      module_expression all_annotations (namespace @ [ name ])
+                      let identity =
+                        Some
+                          (Option.value_map identity ~default:(Path.Pident id)
+                             ~f:(fun parent -> Path.Pdot (parent, name)))
+                      in
+                      module_expression all_annotations (namespace @ [ name ]) ~identity
                         declaration.mb_expr
                     in
                     begin match declaration.mb_expr.mod_desc with
@@ -975,10 +1083,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           in
           items view rest
     in
-    items empty_module structure.str_items
+    items { empty_module with application_identity = identity } structure.str_items
   in
   let* view =
-    collect_structure (Annotation.of_comments source.comments) [] source.scope structure
+    collect_structure
+      (Annotation.of_comments source.comments)
+      [] ~identity:None source.scope structure
   in
   let* () =
     match source.interface with

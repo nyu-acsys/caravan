@@ -293,14 +293,16 @@ let rec expand (types : t list) (t : Types.type_expr) =
 
 let desc types t = Types.get_desc (expand types t)
 
-(** The data type and constructor of [cstr]. *)
+(** The backend constructor of [cstr], retaining its source payload types. *)
 let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
   match Types.get_desc cstr.cstr_res with
   | Tconstr (p, _, _) ->
       Option.bind (find types p) ~f:(fun d ->
           Option.map
             (List.find d.ctors ~f:(fun c -> String.equal c.ocaml cstr.cstr_name))
-            ~f:(fun c -> (d, c)))
+            ~f:(fun c ->
+              let args = if Option.is_some d.id then cstr.cstr_args else c.args in
+              (d, { c with args })))
   | _ -> None
 
 (** Whether [p] is the path of [Stdlib.ref]. *)
