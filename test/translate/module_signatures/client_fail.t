@@ -10,10 +10,18 @@
   [1]
 
   $ caravan --shh constrained_alias.ml
-  [Error] File "constrained_alias.ml", line 5, columns 15-49:
+  [Error] File "constrained_alias.ml", line 5, columns 49-49:
   5 | module Checked : Contract_api.Identity = Original
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A constrained module alias is not supported yet.
+                                                       ^
+  Verification Error: The module argument does not establish this view's postcondition.
+  File "./contract_api.mli", line 4, columns 2-27:
+  4 |   val identity : int -> int
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  Related Location: The requested module operation.
+  File "constrained_alias.ml", line 2, columns 2-36:
+  2 |   let identity (value : int) = value
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Related Location: The actual module operation.
   [1]
 
   $ caravan --shh abstract_contract.ml

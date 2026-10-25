@@ -30,7 +30,7 @@ let rec determined typ =
   | _ -> true
 
 let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = [])
-    ~environment ~variables terms =
+    ?(predicates = fun _ -> None) ~environment ~variables terms =
   let at =
     Option.value_map (List.hd terms) ~default:Location.none ~f:(fun term ->
         term.S.term_loc)
@@ -44,8 +44,8 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
         | _ -> substitution)
   in
   let normalize typ = Subst.type_expr logical_substitution (monotype typ) in
-  let infer variables term =
-    Source.infer_logical_expression environment ~functions:[]
+  let infer ?(functions = []) variables term =
+    Source.infer_logical_expression environment ~functions
       ~variables:
         (List.filter_map variables ~f:(fun (name, typ) ->
              Option.map typ ~f:(fun typ -> (name, normalize typ))))
@@ -288,6 +288,10 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
         | Some typ -> Ok typ
         | None ->
             begin match Source.value_path environment q with
+            | None when Option.is_some (Source.logical_builtin_path ~functions:[] q) ->
+                Result.map
+                  (infer variables (S.mk_term (Tvar q) (S.qualid_loc q)))
+                  ~f:Option.some
             | None -> Ok None
             | Some path ->
                 compiler ~at:id.pid_loc (fun () ->
@@ -296,6 +300,10 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
         end
     | Qdot _ ->
         begin match Source.value_path environment q with
+        | None when Option.is_some (Source.logical_builtin_path ~functions:[] q) ->
+            Result.map
+              (infer variables (S.mk_term (Tvar q) (S.qualid_loc q)))
+              ~f:Option.some
         | None -> Ok None
         | Some path ->
             compiler ~at:(S.qualid_loc q) (fun () ->
@@ -319,111 +327,165 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                 require ~at:argument.S.term_loc expected typ)))
         ~f:(fun _ -> ())
     in
-    match (primitive, arguments, types) with
-    | Some ("length" | "last"), [ argument ], [ typ ] ->
-        let* shape = collection ~at:argument.term_loc typ in
-        if Poly.equal primitive (Some "length") then Ok (Some Predef.type_int)
-        else Ok (Option.map shape ~f:snd)
-    | Some ("drop" | "take"), [ count; argument ], [ count_type; typ ] ->
-        let* () = require ~at:count.term_loc Predef.type_int count_type in
-        let* _ = collection ~at:argument.term_loc typ in
-        Ok typ
-    | Some "([])", [ argument; index ], [ typ; index_type ] ->
-        let* shape = collection ~map:true ~at:argument.term_loc typ in
-        let* () =
-          Option.value_map shape ~default:(Ok ()) ~f:(fun (key, _) ->
-              require ~at:index.term_loc key index_type)
+    let predicate = match callee.S.term_desc with Tvar q -> predicates q | _ -> None in
+    match predicate with
+    | Some expected ->
+        let rec consume expected arguments types =
+          match (expected, arguments, types) with
+          | _, [], [] -> Ok ()
+          | expected :: rest, argument :: arguments, actual :: types ->
+              let* contextual =
+                if list_literal argument then sequence_list expected else Ok None
+              in
+              let* () =
+                require ~at:argument.S.term_loc
+                  (Option.value contextual ~default:expected)
+                  actual
+              in
+              consume rest arguments types
+          | [], _ :: _, _ :: _ ->
+              Error
+                (Report.error Type term.term_loc
+                   "This predicate call supplies too many arguments")
+          | _ ->
+              Error
+                (Report.error Type term.term_loc
+                   "The predicate argument types could not be determined")
         in
-        Ok (Option.map shape ~f:snd)
-    | Some ("++" | "@"), [ left; right ], [ left_type; right_type ] ->
-        let* left_shape = collection ~at:left.term_loc left_type in
-        let* right_shape = collection ~at:right.term_loc right_type in
-        let* () =
-          match (left_shape, right_shape) with
-          | Some (_, left), Some (_, right) -> compatible ~at:term.term_loc left right
-          | _ -> Ok ()
-        in
-        Ok (Option.first_some left_type right_type)
-    | Some "own", location :: _, Some typ :: _ ->
-        let* () = opaque_location location typ in
-        Ok None
-    | Some ("+" | "-" | "*" | "/" | "mod" | "~-"), _, _ ->
-        let* () = all Predef.type_int in
-        Ok (Some Predef.type_int)
-    | Some ("<" | "<=" | ">" | ">="), _, _ ->
-        let* () = all Predef.type_int in
+        let* () = consume expected arguments types in
         Ok (Some Predef.type_bool)
-    | Some ("&&" | "||" | "/\\" | "\\/" | "->" | "<->" | "not"), _, _ ->
-        let* () = all Predef.type_bool in
-        Ok (Some Predef.type_bool)
-    | ( Some ("=" | "<>" | "==" | "!=" | "===" | "=/="),
-        [ left_term; right_term ],
-        [ Some left; Some right ] ) ->
-        let* () = equality left_term left right_term right in
-        Ok (Some Predef.type_bool)
-    | Some ("=" | "<>" | "==" | "!=" | "===" | "=/="), _, _ -> Ok (Some Predef.type_bool)
-    | _ ->
-        let* callee_type = walk variables callee in
-        let* () =
-          if restricted && Option.is_none callee_type then
-            let* restricted_arguments =
-              Result.all
-                (List.map2_exn arguments types ~f:(fun argument typ ->
-                     Option.value_map typ ~default:(Ok false)
-                       ~f:(restricted_argument ~at:argument.S.term_loc)))
+    | None -> (
+        match (primitive, arguments, types) with
+        | Some ("length" | "last"), [ argument ], [ typ ] ->
+            let* shape = collection ~at:argument.term_loc typ in
+            if Poly.equal primitive (Some "length") then Ok (Some Predef.type_int)
+            else Ok (Option.map shape ~f:snd)
+        | Some ("drop" | "take"), [ count; argument ], [ count_type; typ ] ->
+            let* () = require ~at:count.term_loc Predef.type_int count_type in
+            let* _ = collection ~at:argument.term_loc typ in
+            Ok typ
+        | Some "([])", [ argument; index ], [ typ; index_type ] ->
+            let* shape = collection ~map:true ~at:argument.term_loc typ in
+            let* () =
+              Option.value_map shape ~default:(Ok ()) ~f:(fun (key, _) ->
+                  require ~at:index.term_loc key index_type)
             in
-            if List.exists restricted_arguments ~f:Fn.id then
-              Report.unsupported term.term_loc
-                "A predicate call involving an abstract signature type"
-            else Ok ()
-          else Ok ()
-        in
-        let rec consume typ arguments types =
-          match (typ, arguments, types) with
-          | _, [], [] -> Ok typ
-          | Some typ, argument :: arguments, actual :: types ->
-              begin match Types.get_desc typ with
-              | Tpoly (typ, []) ->
-                  consume (Some typ) (argument :: arguments) (actual :: types)
-              | Tarrow (_, expected, result, _) ->
-                  let* () = require ~at:argument.S.term_loc expected actual in
-                  consume (Some result) arguments types
-              | _ -> Ok None
-              end
-          | None, _ :: arguments, _ :: types -> consume None arguments types
-          | _ -> Ok None
-        in
-        let* result = consume callee_type arguments types in
-        if Option.is_some callee_type then
-          let rec placeholder name (argument : S.term) typ =
-            match (argument.term_desc, Types.get_desc (monotype typ)) with
-            | Ttuple arguments, Ttuple types
-              when List.length arguments = List.length types ->
-                let components =
-                  List.mapi (List.zip_exn arguments types)
-                    ~f:(fun index (argument, (_, typ)) ->
-                      placeholder (name ^ "$" ^ Int.to_string index) argument typ)
+            Ok (Option.map shape ~f:snd)
+        | Some ("++" | "@"), [ left; right ], [ left_type; right_type ] ->
+            let* left_shape = collection ~at:left.term_loc left_type in
+            let* right_shape = collection ~at:right.term_loc right_type in
+            let* () =
+              match (left_shape, right_shape) with
+              | Some (_, left), Some (_, right) -> compatible ~at:term.term_loc left right
+              | _ -> Ok ()
+            in
+            Ok (Option.first_some left_type right_type)
+        | Some "own", location :: _, Some typ :: _ ->
+            let* () = opaque_location location typ in
+            Ok None
+        | Some ("+" | "-" | "*" | "/" | "mod" | "~-"), _, _ ->
+            let* () = all Predef.type_int in
+            Ok (Some Predef.type_int)
+        | Some ("<" | "<=" | ">" | ">="), _, _ ->
+            let* () = all Predef.type_int in
+            Ok (Some Predef.type_bool)
+        | Some ("&&" | "||" | "/\\" | "\\/" | "->" | "<->" | "not"), _, _ ->
+            let* () = all Predef.type_bool in
+            Ok (Some Predef.type_bool)
+        | ( Some ("=" | "<>" | "==" | "!=" | "===" | "=/="),
+            [ left_term; right_term ],
+            [ Some left; Some right ] ) ->
+            let* () = equality left_term left right_term right in
+            Ok (Some Predef.type_bool)
+        | Some ("=" | "<>" | "==" | "!=" | "===" | "=/="), _, _ ->
+            Ok (Some Predef.type_bool)
+        | _ ->
+            let* callee_type = walk variables callee in
+            let* () =
+              if restricted && Option.is_none callee_type then
+                let* restricted_arguments =
+                  Result.all
+                    (List.map2_exn arguments types ~f:(fun argument typ ->
+                         Option.value_map typ ~default:(Ok false)
+                           ~f:(restricted_argument ~at:argument.S.term_loc)))
                 in
-                ( S.mk_term (Ttuple (List.map components ~f:fst)) argument.term_loc,
-                  List.concat_map components ~f:snd )
-            | _ ->
-                let name = synthetic name in
-                (variable name, [ (name.pid_str, Some typ) ])
-          in
-          let placeholders =
-            List.mapi (List.zip_exn arguments types) ~f:(fun index (argument, typ) ->
-                placeholder
-                  ("argument" ^ Int.to_string index)
-                  argument
-                  (Option.value typ ~default:(Ctype.newvar ())))
-          in
-          let expression =
-            List.fold placeholders ~init:callee ~f:(fun callee (argument, _) ->
-                S.mk_term (Tapply (callee, argument)) term.term_loc)
-          in
-          let* typ = infer (List.concat_map placeholders ~f:snd @ variables) expression in
-          Ok (Some typ)
-        else Ok result
+                if List.exists restricted_arguments ~f:Fn.id then
+                  Report.unsupported term.term_loc
+                    "A predicate call involving an abstract signature type"
+                else Ok ()
+              else Ok ()
+            in
+            let rec consume typ arguments types =
+              match (typ, arguments, types) with
+              | _, [], [] -> Ok typ
+              | Some typ, argument :: arguments, actual :: types ->
+                  begin match Types.get_desc typ with
+                  | Tpoly (typ, []) ->
+                      consume (Some typ) (argument :: arguments) (actual :: types)
+                  | Tarrow (_, expected, result, _) ->
+                      let* () = require ~at:argument.S.term_loc expected actual in
+                      consume (Some result) arguments types
+                  | _ -> Ok None
+                  end
+              | None, _ :: arguments, _ :: types -> consume None arguments types
+              | _ -> Ok None
+            in
+            let* result = consume callee_type arguments types in
+            if Option.is_some callee_type then
+              let rec placeholder name (argument : S.term) typ =
+                match (argument.term_desc, Types.get_desc (monotype typ)) with
+                | Ttuple arguments, Ttuple types
+                  when List.length arguments = List.length types ->
+                    let components =
+                      List.mapi (List.zip_exn arguments types)
+                        ~f:(fun index (argument, (_, typ)) ->
+                          placeholder (name ^ "$" ^ Int.to_string index) argument typ)
+                    in
+                    ( S.mk_term (Ttuple (List.map components ~f:fst)) argument.term_loc,
+                      List.concat_map components ~f:snd )
+                | _ ->
+                    let name =
+                      match argument.term_desc with
+                      | Tvar (Qid original) -> original
+                      | _ -> S.mk_id ~loc:argument.term_loc ("caravan$public$" ^ name)
+                    in
+                    (variable name, [ (name.pid_str, Some typ) ])
+              in
+              let placeholders =
+                List.mapi (List.zip_exn arguments types) ~f:(fun index (argument, typ) ->
+                    placeholder
+                      ("argument" ^ Int.to_string index)
+                      argument
+                      (Option.value typ ~default:(Ctype.newvar ())))
+              in
+              let expression =
+                List.fold placeholders ~init:callee ~f:(fun callee (argument, _) ->
+                    S.mk_term (Tapply (callee, argument)) term.term_loc)
+              in
+              let functions =
+                match callee.term_desc with
+                | Tvar q when Option.is_some (Source.value_path environment q) ->
+                    [ Qualified_name.to_string (Qualified_name.of_spec q) ]
+                | _ -> []
+              in
+              let* typ =
+                Result.map_error
+                  (infer ~functions
+                     (List.concat_map placeholders ~f:snd @ variables)
+                     expression)
+                  ~f:(fun error ->
+                    let message =
+                      List.fold (List.concat_map placeholders ~f:snd)
+                        ~init:error.Report.message ~f:(fun message (name, _) ->
+                          if String.is_prefix name ~prefix:"caravan$public$argument" then
+                            String.substr_replace_all message
+                              ~pattern:("The value " ^ name) ~with_:"This argument"
+                          else message)
+                    in
+                    { error with message })
+              in
+              Ok (Some typ)
+            else Ok result)
   and walk variables (term : S.term) =
     match term.term_desc with
     | Ttrue | Tfalse -> Ok (Some Predef.type_bool)
@@ -562,17 +624,20 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                   typ))))
     ~f:(fun _ -> ())
 
-let expression ?(logical_types = []) ~environment ~variables term =
-  terms ~logical_types ~environment ~variables [ term ]
+let expression ?(logical_types = []) ?predicates ~environment ~variables term =
+  terms ~logical_types ?predicates ~environment ~variables [ term ]
 
-let check ?(logical_types = []) ?(restricted = false) source
+let check ?(logical_types = []) ?(restricted = false) ?predicates ?environment source
     (signature : Module_inventory.signature_value) (contract : S.contract) =
   let logical_types =
     match source.Source.sequence with
     | Pident id -> Datatypes.sequence id :: logical_types
     | Pdot _ | Papply _ | Pextra_ty _ -> logical_types
   in
-  let environment = Source.annotation_env source signature.site.environment in
+  let environment =
+    Option.value environment
+      ~default:(Source.annotation_env source signature.site.environment)
+  in
   let proof_ids =
     List.map source.spec_bindings ~f:(function
         | Types.Sig_value (id, _, _)
@@ -620,12 +685,12 @@ let check ?(logical_types = []) ?(restricted = false) source
         Ok ((Option.value result ~default:"result", result_type) :: (inputs @ ghosts))
   in
   let* () =
-    terms ~logical_types ~restricted ~proof_ids ~environment ~variables
+    terms ~logical_types ~restricted ~proof_ids ?predicates ~environment ~variables
       ~expected:Predef.type_bool
       (contract.requires @ contract.ensures @ contract.atomic_requires
      @ contract.atomic_ensures)
   in
-  terms ~logical_types ~restricted ~proof_ids ~environment ~variables
+  terms ~logical_types ~restricted ~proof_ids ?predicates ~environment ~variables
     ~expected:Predef.type_int contract.variant
 
 (** Lowering shares the implementation's lexical names only when their meanings agree. *)

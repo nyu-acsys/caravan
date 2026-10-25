@@ -35,10 +35,9 @@ contracts. The module client in
 uses these contracts through an alias of the stack module.
 
 Functor applications, recursive and local modules, `open`, `include`, and module
-initialization expressions are not supported yet. Signature constraints on module
-aliases and specification calls through constrained module signatures are also
-unsupported. Nested implementation predicates and shared-state declarations remain
-outside this module support.
+initialization expressions are not supported yet. Specification calls through
+constrained module signatures, nested implementation predicates, and shared-state
+declarations remain outside this module support.
 
 Interface-only dependencies found locally or through `-I` expose assumed contracts
 to clients, including logically atomic contracts. For example:
@@ -61,6 +60,38 @@ ordinary resource predicate. Imported contracts retain ordinary and atomic
 clauses separately; Raven checks ownership and invariant restoration at calls.
 Their implementations must be verified separately against the same interface.
 A logically atomic contract does not declare a physically atomic operation.
+
+Module types can declare abstract resources using the same annotation forms. A
+constrained alias checks the actual operations against the requested contracts:
+
+```ocaml
+module type READER = sig
+  type t
+  (*@ invariant shared (cell : t) *)
+  (*@ predicate contents (cell : t) (value : int) *)
+
+  val read : t -> int
+  (*@ result = atomic read cell
+      requires shared cell
+      atomic requires contents cell value && value >= 0
+      atomic ensures contents cell value && result >= 0 *)
+end
+
+module Checked : READER = Cell
+```
+
+Given the preceding `Cell` interface, this view requires nonnegative contents and
+promises a nonnegative result. The original contract remains available through
+`Cell`; callers through `Checked` use the requested contract. Both paths refer to
+the same resources, while source-visible type equalities follow OCaml's ascription.
+Raven checks the forwarding proof, including restoration when an atomic call aborts.
+
+Checked bindings currently support first-order functions with matching operation
+kinds, resource parameter modes, and concrete and inferred-state argument shapes.
+Explicit ghost adaptations, public AU tokens, non-function values, nested module
+members, and resource definitions in signatures are unsupported. An already checked
+view cannot yet be constrained again by a callable signature in its enclosing
+`.mli`; use named checked bindings for successive views.
 
 Proof files also support checked lemmas and monomorphic logical variant types.
 A lemma has typed parameters and an expression body after `=`. Optional

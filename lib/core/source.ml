@@ -1107,23 +1107,29 @@ let logical_helper ~loc path =
   in
   Ast_helper.Exp.ident ~loc { txt = path; loc }
 
-let logical_identifier ~functions ~loc q =
-  match q with
+let logical_builtin_path ~functions = function
   | S.Qdot (Qid m, op)
     when List.mem [ "Set"; "Finset"; "Map" ] m.pid_str ~equal:String.equal
          && not (List.mem functions (m.pid_str ^ "." ^ op.pid_str) ~equal:String.equal) ->
-      logical_helper ~loc [ m.pid_str; op.pid_str ]
+      Some [ m.pid_str; op.pid_str ]
   | Qid { pid_str = "to_sequence"; _ }
     when not (List.mem functions "to_sequence" ~equal:String.equal) ->
-      logical_helper ~loc [ "to_sequence" ]
-  | Qid { pid_str = "==="; _ } -> logical_helper ~loc [ "equal" ]
-  | Qid { pid_str = "=/="; _ } -> logical_helper ~loc [ "not_equal" ]
-  | Qid { pid_str = "->" | "<->"; _ } -> logical_helper ~loc [ "implies" ]
-  | Qid { pid_str = "/\\"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "&&"; loc }
-  | Qid { pid_str = "\\/"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "||"; loc }
-  | Qid { pid_str = "-"; pid_fixity = Prefix; _ } ->
-      Ast_helper.Exp.ident ~loc { txt = Lident "~-"; loc }
-  | _ -> Ast_helper.Exp.ident ~loc { txt = longident q; loc }
+      Some [ "to_sequence" ]
+  | Qid { pid_str = "==="; _ } -> Some [ "equal" ]
+  | Qid { pid_str = "=/="; _ } -> Some [ "not_equal" ]
+  | Qid { pid_str = "->" | "<->"; _ } -> Some [ "implies" ]
+  | _ -> None
+
+let logical_identifier ~functions ~loc q =
+  match logical_builtin_path ~functions q with
+  | Some path -> logical_helper ~loc path
+  | None -> (
+      match q with
+      | Qid { pid_str = "/\\"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "&&"; loc }
+      | Qid { pid_str = "\\/"; _ } -> Ast_helper.Exp.ident ~loc { txt = Lident "||"; loc }
+      | Qid { pid_str = "-"; pid_fixity = Prefix; _ } ->
+          Ast_helper.Exp.ident ~loc { txt = Lident "~-"; loc }
+      | _ -> Ast_helper.Exp.ident ~loc { txt = longident q; loc })
 
 let logical_constructor q =
   let last = match q with S.Qid id | Qdot (_, id) -> id.pid_str in

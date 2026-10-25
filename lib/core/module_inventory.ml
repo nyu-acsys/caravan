@@ -32,10 +32,10 @@ type type_definition = {
   paths : Path.t list;
 }
 
-type t = {
-  values : value list;
-  types : type_definition list;
-  aliases : (Path.t * Path.t) list;
+type signature_resource = {
+  declaration : Caravan_spec.Spec_ast.predicate;
+  declaration_id : Ident.t;
+  site : site;
 }
 
 type signature_module = {
@@ -45,13 +45,30 @@ type signature_module = {
 }
 
 and signature_view = {
+  signature_resources : (string * signature_resource) list;
   signature_values : (string * signature_value) list;
   signature_types : (string * Typedtree.type_declaration) list;
   signature_modules : (string * signature_module) list;
   signature_modtypes : (string * signature_view) list;
 }
 
+type checked_binding = {
+  actual_path : Path.t;
+  expected : signature_view;
+  site : site;
+  namespace : string list;
+  paths : Path.t list;
+}
+
+type t = {
+  values : value list;
+  types : type_definition list;
+  aliases : (Path.t * Path.t) list;
+  bindings : checked_binding list;
+}
+
 type module_view = {
+  checked : checked_binding ref option;
   identity : Path.t option;
   alias_target : Path.t option;
   values : (string * value ref) list;
@@ -67,6 +84,7 @@ type signature_origin = {
 
 let empty_signature =
   {
+    signature_resources = [];
     signature_values = [];
     signature_types = [];
     signature_modules = [];
@@ -75,6 +93,7 @@ let empty_signature =
 
 let empty_module =
   {
+    checked = None;
     identity = None;
     alias_target = None;
     values = [];
@@ -107,6 +126,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let all_values = ref [] in
   let all_types = ref [] in
   let aliases = ref [] in
+  let bindings = ref [] in
   let modules = ref [] in
   let modtypes = ref [] in
   let imported_signatures = ref [] in
@@ -129,7 +149,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   in
   let rec publish path view =
     register modules path view;
-    Option.iter view.alias_target ~f:(fun target -> register aliases path target);
+    Option.iter view.checked ~f:(fun binding ->
+        binding := { !binding with paths = add_path !binding.paths path });
+    if Option.is_none view.checked then
+      Option.iter view.alias_target ~f:(fun target -> register aliases path target);
     List.iter view.values ~f:(fun (name, value) ->
         value := { !value with paths = add_path !value.paths (Path.Pdot (path, name)) });
     List.iter view.types ~f:(fun (name, definition) ->
@@ -283,8 +306,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   Error
                     (Report.error Type annotation.loc
                        "This contract is outside a signature value declaration")
-            | Loop | Predicate | Ghost | Scope | Returns | Proof | Manual | Linearization
-            | Initially | Initializes | Trusted ->
+            | Predicate -> Ok ()
+            | Loop when Annotation.invariant_declaration annotation -> Ok ()
+            | Loop | Ghost | Scope | Returns | Proof | Manual | Linearization | Initially
+            | Initializes | Trusted ->
                 if shared then Ok ()
                 else
                   unavailable annotation.loc
@@ -392,7 +417,42 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           in
           items view rest
     in
-    items empty_signature signature.sig_items
+    let* signature_resources =
+      List.filter annotations ~f:(Annotation.predicate_declaration ~interface:true)
+      |> List.map ~f:(fun annotation ->
+          let* declaration = Annotation.predicate annotation in
+          let* () =
+            if shared || Option.is_none declaration.pred_body then Ok ()
+            else unavailable annotation.loc "A resource definition in a module signature"
+          in
+          let environment =
+            List.find_map signature.sig_items ~f:(fun item ->
+                if
+                  item.Typedtree.sig_loc.loc_start.pos_cnum
+                  >= annotation.loc.loc_end.pos_cnum
+                then Some item.sig_env
+                else None)
+            |> Option.value ~default:signature.sig_final_env
+          in
+          let site =
+            {
+              environment;
+              scope = declaration_scope;
+              annotations;
+              item_loc = annotation.loc;
+              next = None;
+            }
+          in
+          Ok
+            ( declaration.pred_name.pid_str,
+              {
+                declaration;
+                declaration_id = Ident.create_local declaration.pred_name.pid_str;
+                site;
+              } ))
+      |> Result.all
+    in
+    items { empty_signature with signature_resources } signature.sig_items
   in
   let rec signature_aliases substitution path signature =
     let substitution =
@@ -445,46 +505,57 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | _ -> substitution))
   in
   let rec constrain substitution signature view =
-    let* substitution = substitutions substitution signature view in
-    let* values =
-      List.map signature.signature_values ~f:(fun (name, signature_value) ->
-          match member view.values name with
-          | None -> missing signature_value.site.item_loc name
-          | Some value ->
-              let signature_value = { signature_value with substitution } in
-              value :=
-                { !value with signatures = !value.signatures @ [ signature_value ] };
-              Ok (name, value))
-      |> Result.all
-    in
-    let* types =
-      List.map signature.signature_types ~f:(fun (name, declaration) ->
-          match member view.types name with
-          | None -> missing declaration.typ_loc name
-          | Some definition -> Ok (name, definition))
-      |> Result.all
-    in
-    let* nested_modules =
-      List.map signature.signature_modules ~f:(fun (name, signature) ->
-          match member view.modules name with
-          | None -> missing source.scope.location name
-          | Some view ->
-              begin match signature.signature_alias with
-              | Some _ -> Ok (name, view)
-              | None ->
-                  let* view = constrain substitution signature.signature_body view in
-                  Ok (name, view)
-              end)
-      |> Result.all
-    in
-    Ok
-      {
-        view with
-        values;
-        types;
-        modules = nested_modules;
-        modtypes = signature.signature_modtypes;
-      }
+    if Option.is_some view.checked then
+      begin match (signature.signature_resources, signature.signature_values) with
+      | (_, resource) :: _, _ ->
+          unavailable resource.site.item_loc
+            "A resource-bearing interface constraint on a checked module view"
+      | [], (_, value) :: _ ->
+          unavailable value.site.item_loc
+            "An additional interface contract on a checked module view"
+      | [], [] -> Ok view
+      end
+    else
+      let* substitution = substitutions substitution signature view in
+      let* values =
+        List.map signature.signature_values ~f:(fun (name, signature_value) ->
+            match member view.values name with
+            | None -> missing signature_value.site.item_loc name
+            | Some value ->
+                let signature_value = { signature_value with substitution } in
+                value :=
+                  { !value with signatures = !value.signatures @ [ signature_value ] };
+                Ok (name, value))
+        |> Result.all
+      in
+      let* types =
+        List.map signature.signature_types ~f:(fun (name, declaration) ->
+            match member view.types name with
+            | None -> missing declaration.typ_loc name
+            | Some definition -> Ok (name, definition))
+        |> Result.all
+      in
+      let* nested_modules =
+        List.map signature.signature_modules ~f:(fun (name, signature) ->
+            match member view.modules name with
+            | None -> missing source.scope.location name
+            | Some view ->
+                begin match signature.signature_alias with
+                | Some _ -> Ok (name, view)
+                | None ->
+                    let* view = constrain substitution signature.signature_body view in
+                    Ok (name, view)
+                end)
+        |> Result.all
+      in
+      Ok
+        {
+          view with
+          values;
+          types;
+          modules = nested_modules;
+          modtypes = signature.signature_modtypes;
+        }
   in
   let apply_signature signature view = constrain Subst.identity signature view in
   let rec effective env at mty view =
@@ -526,7 +597,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Sig_typext _ | Sig_class _ | Sig_class_type _ ->
                 unavailable at "This constrained module signature item")
         in
-        Ok { result with identity = view.identity }
+        Ok { result with identity = view.identity; checked = view.checked }
     | Mty_alias path -> resolve_module at env path
     | Mty_functor _ -> unavailable at "A functor signature"
     | Mty_ident _ -> unavailable at "An abstract module signature"
@@ -549,12 +620,55 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | Tmod_constraint (body, _, _, _) -> alias body
           | _ -> false
         in
-        if alias body then unavailable expression.mod_loc "A constrained module alias"
+        if alias body then
+          let* actual = module_expression annotations namespace body in
+          begin match annotation with
+          | Tmodtype_implicit -> Ok actual
+          | Tmodtype_explicit mty ->
+              let* () =
+                match actual.checked with
+                | Some binding when List.is_empty !binding.paths ->
+                    unavailable expression.mod_loc
+                      "Nested inline constraints on a checked module view"
+                | Some _ | None -> Ok ()
+              in
+              let* expected = signature_type ~imported:false annotations mty in
+              let* () =
+                if List.is_empty expected.signature_modules then Ok ()
+                else
+                  unavailable expression.mod_loc "Nested modules in a checked module view"
+              in
+              let* actual_path =
+                match actual.identity with
+                | Some path -> Ok path
+                | None ->
+                    unavailable expression.mod_loc
+                      "A checked module without a static path"
+              in
+              let site =
+                {
+                  environment = expression.mod_env;
+                  scope = scope expression.mod_loc;
+                  annotations;
+                  item_loc = expression.mod_loc;
+                  next = None;
+                }
+              in
+              let binding = ref { actual_path; expected; site; namespace; paths = [] } in
+              bindings := binding :: !bindings;
+              Ok { empty_module with checked = Some binding; identity = actual.identity }
+          end
         else
           let* view = module_expression annotations namespace body in
           begin match annotation with
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
+              let* () =
+                if List.is_empty signature.signature_resources then Ok ()
+                else
+                  unavailable mty.mty_loc
+                    "A resource declaration on an inline module structure"
+              in
               apply_signature signature view
           | Tmodtype_implicit -> effective expression.mod_env expression.mod_loc mty view
           end
@@ -669,6 +783,13 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       module_expression all_annotations (namespace @ [ name ])
                         declaration.mb_expr
                     in
+                    begin match declaration.mb_expr.mod_desc with
+                    | Tmod_ident _ -> ()
+                    | _ ->
+                        Option.iter nested.checked ~f:(fun binding ->
+                            binding :=
+                              { !binding with site = { !binding.site with environment } })
+                    end;
                     let nested =
                       match declaration.mb_expr.mod_desc with
                       | Tmod_ident _ -> nested
@@ -727,4 +848,5 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       values = List.rev_map !all_values ~f:(fun value -> !value);
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
+      bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
     }

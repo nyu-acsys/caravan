@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Static modules, nested signatures, and module aliases support qualified calls and imported ordinary and atomic contracts.
+- Static modules, nested signatures, and checked module aliases support qualified calls and ordinary and atomic contracts with shared resource identities.
 - Proof files support resource algebra instances, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.
 - Generated invariant folds supply explicit witnesses for known state transitions and histories.
 - Source-level verification errors retain solver timeout explanations.
