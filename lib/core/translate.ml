@@ -8512,10 +8512,12 @@ type checked_view = {
   view_types : Datatypes.t list;
 }
 
-let checked_type_substitution binding path =
-  List.fold binding.Module_inventory.expected.signature_types ~init:Subst.identity
+let checked_type_substitution ?(substitution = Subst.identity) binding path =
+  List.fold binding.Module_inventory.expected.signature_types ~init:substitution
     ~f:(fun substitution (name, declaration) ->
-      Subst.add_type declaration.Typedtree.typ_id (Path.Pdot (path, name)) substitution)
+      Subst.add_type declaration.Typedtree.typ_id
+        (Subst.module_path substitution (Path.Pdot (path, name)))
+        substitution)
 
 let checked_raw_types types binding =
   List.map types ~f:(fun data ->
@@ -10182,7 +10184,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~f:(fun (views, resources) binding ->
         let source_path = List.hd_exn binding.Module_inventory.paths in
         let source_substitution = checked_type_substitution binding source_path in
-        let actual_substitution = checked_type_substitution binding binding.actual_path in
+        let actual_substitution =
+          checked_type_substitution ~substitution:binding.parameter_substitution binding
+            binding.actual_path
+        in
         let view_types = checked_raw_types types binding in
         let* view_resources =
           all binding.expected.signature_resources ~f:(fun (member, formal) ->
@@ -10227,7 +10232,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                       List.for_all2_exn projected actual.resource_types
                         ~f:(fun expected actual ->
                           Ctype.is_equal binding.site.environment false [ expected ]
-                            [ actual ])
+                            [ Subst.type_expr binding.parameter_substitution actual ])
                     then Ok ()
                     else
                       error binding.site.item_loc
@@ -11084,7 +11089,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               ~f:(fun (_, _, a, _, _) (_, _, b, _, _) ->
                 Ctype.is_equal binding.site.environment false
                   [ Subst.type_expr view.view_actual_substitution a ]
-                  [ Subst.type_expr actual_projection b ])
+                  [
+                    Subst.type_expr binding.parameter_substitution
+                      (Subst.type_expr actual_projection b);
+                  ])
           then Ok ()
           else error at "The module operation has different implicit argument types"
         in

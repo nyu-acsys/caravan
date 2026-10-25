@@ -93,8 +93,10 @@ members, and resource definitions in signatures are unsupported. An already chec
 view cannot yet be constrained again by a callable signature in its enclosing
 `.mli`; use named checked bindings for successive views.
 
-Named monomorphic functors with one module parameter and a structure body support
+Monomorphic functors with named module parameters and a structure body support
 concrete path applications such as `module Client = Drain (Treiber_stack)`.
+Curried applications and partial applications such as `module With_A = Make (A)`
+and `module Client = With_A (B)` preserve the same result types as `Make (A) (B)`.
 Each application checks the complete argument against the parameter signature and
 verifies a separate body specialization. Parameter calls use that signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
@@ -108,7 +110,7 @@ of one result share its identity. Each application is verified separately.
 See the separate
 [`functor_stack_drain`](test/examples/functor_stack_drain) example.
 
-Type aliases in results are supported; curried functors, higher-order or
+Type aliases in results are supported; higher-order or
 imported functors, anonymous arguments, nested parameter
 modules, and shared-state initializers inside functors remain unsupported.
 

@@ -38,13 +38,6 @@
   Unsupported Error: A non-path functor argument is not supported yet.
   [1]
 
-  $ caravan --shh curried_fail.ml
-  [Error] File "curried_fail.ml", line 5, column 27 to line 7, column 3:
-  5 | module Make (Left : Value) (Right : Value) = struct
-                                 ^^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A functor without a direct structure body is not supported yet.
-  [1]
-
   $ caravan --shh hidden_parameter_fail.ml
   [Error] File "hidden_parameter_fail.ml", line 16, columns 13-24:
   16 | let read x = Client.Cell.read x

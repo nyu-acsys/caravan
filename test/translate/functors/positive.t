@@ -40,3 +40,6 @@
 
   $ caravan --shh unit.ml
   Verification successful.
+
+  $ caravan --shh curried.ml
+  Verification successful.
