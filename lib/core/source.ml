@@ -8,6 +8,7 @@ let ( let* ) = Result.( >>= )
 
 type interface = {
   signature : Parsetree.signature;
+  typed_signature : Typedtree.signature option;
   interface_comments : (string * Location.t) list;
   scope : Declaration_scope.t;
 }
@@ -66,7 +67,82 @@ type t = {
   interface : interface option;
   proof : S.proof_decl list;  (** The declarations of the proof. *)
   libraries : library list;
+  spec_bindings : Types.signature;
 }
+
+(** The specification declarations added after the runtime program was typed. *)
+let specification_bindings runtime_env env =
+  let boundary = Env.summary runtime_env in
+  let rec collect seen bindings summary =
+    if phys_equal summary boundary then bindings
+    else
+      let binding previous id declaration =
+        if List.mem seen id ~equal:Ident.same then collect seen bindings previous
+        else collect (id :: seen) (declaration :: bindings) previous
+      in
+      match summary with
+      | Env.Env_empty -> bindings
+      | Env_value (previous, id, declaration) ->
+          binding previous id (Types.Sig_value (id, declaration, Exported))
+      | Env_type (previous, id, declaration) ->
+          binding previous id (Types.Sig_type (id, declaration, Trec_not, Exported))
+      | Env_module (previous, id, presence, declaration) ->
+          binding previous id
+            (Types.Sig_module (id, presence, declaration, Trec_not, Exported))
+      | Env_modtype (previous, id, declaration) ->
+          binding previous id (Types.Sig_modtype (id, declaration, Exported))
+      | Env_extension (previous, _, _)
+      | Env_class (previous, _, _)
+      | Env_cltype (previous, _, _)
+      | Env_open (previous, _)
+      | Env_not_aliasable (previous, _)
+      | Env_constraints (previous, _)
+      | Env_copy_types previous
+      | Env_persistent (previous, _)
+      | Env_value_unbound (previous, _, _)
+      | Env_module_unbound (previous, _, _) ->
+          collect seen bindings previous
+  in
+  collect [] [] (Env.summary env)
+
+(** Adds the shared specification identities without hiding lexical runtime names. *)
+let annotation_env source lexical_env =
+  let find lookup id =
+    try Some (lookup (Longident.Lident (Ident.name id)) lexical_env)
+    with Stdlib.Not_found -> None
+  in
+  List.fold source.spec_bindings ~init:lexical_env ~f:(fun env -> function
+    | Types.Sig_type (id, declaration, _, _) ->
+        begin match find Env.find_type_by_name id with
+        | None -> Env.add_type ~check:false id declaration env
+        | Some (Pident local, declaration') ->
+            Env.add_type ~check:false local declaration'
+              (Env.add_type ~check:false id declaration env)
+        | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
+        end
+    | Sig_value (id, declaration, _) ->
+        begin match find Env.find_value_by_name id with
+        | None -> Env.add_value id declaration env
+        | Some (Pident local, declaration') ->
+            Env.add_value local declaration' (Env.add_value id declaration env)
+        | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
+        end
+    | Sig_module (id, presence, declaration, _, _) ->
+        begin match find Env.find_module_by_name id with
+        | None -> Env.add_module_declaration ~check:false id presence declaration env
+        | Some (Pident local, declaration') ->
+            Env.add_module_declaration ~check:false local Mp_present declaration'
+              (Env.add_module_declaration ~check:false id presence declaration env)
+        | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
+        end
+    | Sig_modtype (id, declaration, _) ->
+        begin match find Env.find_modtype_by_name id with
+        | None -> Env.add_modtype id declaration env
+        | Some (Pident local, declaration') ->
+            Env.add_modtype local declaration' (Env.add_modtype id declaration env)
+        | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
+        end
+    | Sig_typext _ | Sig_class _ | Sig_class_type _ -> env)
 
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
 let sibling file ext =
@@ -86,6 +162,7 @@ let load_interface file =
   let signature = Parse.interface lexbuf in
   {
     signature;
+    typed_signature = None;
     interface_comments = Lexer.comments ();
     scope = Declaration_scope.of_lexbuf ~file lexbuf;
   }
@@ -95,7 +172,7 @@ let check_interface env signature interface =
   try
     let declared = Typemod.type_interface env interface.signature in
     Includemod.check_implementation env signature declared.sig_type;
-    Ok ()
+    Ok { interface with typed_signature = Some declared }
   with exn -> (
     match Report.of_exn exn with
     | Some error ->
@@ -145,31 +222,96 @@ let rec specialize env (impl : Types.type_expr) (iface : Types.type_expr) =
 (** Specializes the values of [typed] to the types that [interface] gives them: the
     translation is monomorphic, and an interface fixes the types of the values it
     declares. *)
-let specialize_to_interface env (typed : Typedtree.structure) (interface : interface) =
-  let declared =
-    List.filter_map interface.signature ~f:(fun item ->
-        match item.psig_desc with
-        | Psig_value vd -> Some (vd.pval_name.txt, vd.pval_type)
-        | _ -> None)
+let specialize_to_interface _env (typed : Typedtree.structure)
+    (interface : interface option) =
+  let exported_value signature name =
+    List.find_map signature ~f:(function
+      | Types.Sig_value (id, description, Exported) when String.equal (Ident.name id) name
+        ->
+          Some (id, description)
+      | _ -> None)
   in
-  List.iter typed.str_items ~f:(fun item ->
-      match item.str_desc with
-      | Tstr_value (_, bindings) ->
-          List.iter bindings ~f:(fun (vb : Typedtree.value_binding) ->
-              match vb.vb_pat.pat_desc with
-              | Tpat_var (id, _, _) ->
-                  begin match
-                    List.Assoc.find declared (Ident.name id) ~equal:String.equal
-                  with
-                  | Some ct ->
-                      let iface =
-                        (Typetexp.transl_simple_type env ~closed:false ct).ctyp_type
-                      in
-                      specialize env vb.vb_expr.exp_type iface
-                  | None -> ()
-                  end
-              | _ -> ())
-      | _ -> ())
+  let exported_type signature name =
+    List.find_map signature ~f:(function
+      | Types.Sig_type (id, _, _, Exported) when String.equal (Ident.name id) name ->
+          Some id
+      | _ -> None)
+  in
+  let exported_module signature name =
+    List.find_map signature ~f:(function
+      | Types.Sig_module (id, _, declaration, _, Exported)
+        when String.equal (Ident.name id) name ->
+          Some (id, declaration)
+      | _ -> None)
+  in
+  let rec structure signature_env substitution (typed : Typedtree.structure) signature =
+    let signature_env = Env.add_signature signature signature_env in
+    let substitution =
+      List.fold signature ~init:substitution ~f:(fun substitution -> function
+        | Types.Sig_type (id, _, _, Exported) ->
+            Option.value_map
+              (exported_type typed.str_type (Ident.name id))
+              ~default:substitution
+              ~f:(fun body -> Subst.add_type id (Pident body) substitution)
+        | Sig_module (id, _, _, _, Exported) ->
+            Option.value_map
+              (exported_module typed.str_type (Ident.name id))
+              ~default:substitution
+              ~f:(fun (body, _) -> Subst.add_module id (Pident body) substitution)
+        | _ -> substitution)
+    in
+    List.iter typed.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_value (_, bindings) ->
+            List.iter bindings ~f:(fun (vb : Typedtree.value_binding) ->
+                match vb.vb_pat.pat_desc with
+                | Tpat_var (id, _, _) ->
+                    begin match exported_value signature (Ident.name id) with
+                    | Some (_, description) ->
+                        specialize typed.str_final_env vb.vb_expr.exp_type
+                          (Subst.type_expr substitution description.val_type)
+                    | None -> ()
+                    end
+                | _ -> ())
+        | Tstr_module { mb_id = Some id; mb_expr; _ } ->
+            begin match
+              ( exported_module typed.str_type (Ident.name id),
+                exported_module signature (Ident.name id) )
+            with
+            | Some (exported, _), Some (_, declaration) when Ident.same exported id ->
+                view signature_env substitution mb_expr declaration.md_type
+            | _ -> ()
+            end
+        | _ -> ())
+  and view signature_env substitution (body : Typedtree.module_expr) signature =
+    match body.mod_desc with
+    | Tmod_constraint (body, _, _, _) -> view signature_env substitution body signature
+    | Tmod_structure typed ->
+        begin match Mtype.scrape signature_env signature with
+        | Mty_signature signature -> structure signature_env substitution typed signature
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ -> ()
+        end
+    | Tmod_ident _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ ->
+        ()
+  in
+  let rec constraints (typed : Typedtree.structure) =
+    List.iter typed.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_module binding -> module_constraints binding.mb_expr
+        | _ -> ())
+  and module_constraints (body : Typedtree.module_expr) =
+    match body.mod_desc with
+    | Tmod_constraint (inner, signature, _, _) ->
+        module_constraints inner;
+        view body.mod_env Subst.identity inner signature
+    | Tmod_structure typed -> constraints typed
+    | Tmod_ident _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ ->
+        ()
+  in
+  constraints typed;
+  Option.iter interface ~f:(fun interface ->
+      Option.iter interface.typed_signature ~f:(fun declared ->
+          structure declared.sig_final_env Subst.identity typed declared.sig_type))
 
 (** The declarations of the proof in [file]. *)
 let load_proof file : (S.proof_decl list, Report.error) Result.t =
@@ -759,11 +901,20 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                  (Ast_helper.Mty.signature library.signature))
           in
           let typed = Typemod.type_interface env [ declaration ] in
-          let library_id =
+          let library_id, typed_signature =
             match typed.sig_items with
-            | [ { sig_desc = Tsig_module { md_id = Some id; _ }; _ } ] -> id
-            | _ -> Ident.create_local library_name
+            | [
+             {
+               sig_desc =
+                 Tsig_module
+                   { md_id = Some id; md_type = { mty_desc = Tmty_signature s; _ }; _ };
+               _;
+             };
+            ] ->
+                (id, Some s)
+            | _ -> (Ident.create_local library_name, None)
           in
+          let library = { library with typed_signature } in
           (typed.sig_final_env, { library_name; library_id; library } :: libraries))
     in
     let libraries = List.rev libraries in
@@ -780,10 +931,13 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
          (Stdlib.Filename.remove_extension file));
     let interface_env = env in
     let typed, signature, _, _, env = Typemod.type_structure env parsed in
+    let runtime_env = env in
     let interface = Option.map (sibling file ".mli") ~f:load_interface in
-    let* () =
-      Option.value_map interface ~default:(Ok ())
-        ~f:(check_interface interface_env signature)
+    let* interface =
+      match interface with
+      | None -> Ok None
+      | Some interface ->
+          Result.map (check_interface interface_env signature interface) ~f:Option.some
     in
     (* Specifications have sequences and pending calls, which OCaml does not. *)
     let _, _, _, _, env =
@@ -831,7 +985,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
           (env, logical_types)
     in
     let logical_types = List.rev logical_types in
-    Option.iter interface ~f:(specialize_to_interface env typed);
+    specialize_to_interface env typed interface;
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
         Result.map (elaborate_proof_types env interface proof)
@@ -853,6 +1007,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               interface;
               proof;
               libraries;
+              spec_bindings = specification_bindings runtime_env env;
             }))
   with exn -> (
     match Report.of_exn exn with
@@ -1187,3 +1342,27 @@ let check_logical_function env ~functions = function
       let* expected = ocaml_type env ~at:function_name.pid_loc function_result in
       check_logical_expression env ~functions ~variables ~expected function_body
   | _ -> Ok ()
+
+(** Compiler paths retain the identity selected by lexical module aliases. *)
+let normalize_value_path env ~at path =
+  try Ok (Env.normalize_value_path (Some at) env path)
+  with exn -> (
+    match Report.of_exn exn with
+    | Some error -> Error error
+    | None -> Error (Report.error Type at (Stdlib.Printexc.to_string exn)))
+
+let value_path env q =
+  try
+    let path, _ = Env.find_value_by_name (longident q) env in
+    Some (Env.normalize_value_path None env path)
+  with Stdlib.Not_found -> None
+
+let module_path env q =
+  try
+    let path, _ = Env.find_module_by_name (longident q) env in
+    Some (Env.normalize_module_path None env path)
+  with Stdlib.Not_found -> None
+
+let constructor env q =
+  try Some (Env.find_constructor_by_name (longident q) env)
+  with Stdlib.Not_found -> None

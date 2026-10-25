@@ -393,6 +393,8 @@ type atomic_signature = {
 }
 
 type proof_support = {
+  runtime_functions : string Path_bindings.t;
+  library_paths : string list Path_bindings.t;
   atomic_updates : atomic_signature list;
   resources : Source.proof_resource list;
   ghost_fields : Source.proof_field list;
@@ -404,6 +406,8 @@ type proof_support = {
 
 let empty_proof_support =
   {
+    runtime_functions = Path_bindings.empty;
+    library_paths = Path_bindings.empty;
     atomic_updates = [];
     resources = [];
     ghost_fields = [];
@@ -861,8 +865,28 @@ let resolved_call functions libraries path =
 
 let library_paths libraries =
   Path_bindings.of_list
-    (List.map libraries ~f:(fun (lib : Source.library) ->
-         (Path.Pident lib.library_id, [ lib.library_name ])))
+    (List.map libraries ~f:(fun (lib : Library_modules.t) ->
+         (lib.library_path, [ lib.library_name ])))
+
+let runtime_spec env q =
+  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
+      Path_bindings.find env.ctx.proof_support.runtime_functions path)
+
+let logical_key env q =
+  match q with
+  | S.Qid _ -> qualid_key q
+  | Qdot (parent, id) ->
+      begin match
+        Option.bind
+          (Source.module_path env.ctx.env parent)
+          ~f:(Path_bindings.find env.ctx.proof_support.library_paths)
+      with
+      | None -> qualid_key q
+      | Some path -> Qualified_name.to_string Qualified_name.{ path; name = id.pid_str }
+      end
+
+let find_constructor env q =
+  Option.bind (Source.constructor env.ctx.env q) ~f:(Datatypes.find_cstr env.data)
 
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)
@@ -1040,6 +1064,24 @@ let rec term_names (t : S.term) : string list =
   | Ttuple ts -> List.concat_map ts ~f:term_names
   | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
 
+let rec term_references bound (t : S.term) =
+  let refs = term_references bound in
+  match t.term_desc with
+  | Tvar (Qid id) when List.mem bound id.pid_str ~equal:String.equal -> []
+  | Tvar q -> [ q ]
+  | Ttrue | Tfalse | Tconst _ -> []
+  | Tapply (a, b) | Tinfix (a, _, b) -> refs a @ refs b
+  | Tif (a, b, c) -> refs a @ refs b @ refs c
+  | Tquant (_, binders, body) ->
+      term_references (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+  | Tcomprehension ((id, _), body) -> term_references (id.pid_str :: bound) body
+  | Tlet (p, a, b) -> refs a @ term_references (pat_names p @ bound) b
+  | Tmatch (t, cases) ->
+      refs t
+      @ List.concat_map cases ~f:(fun (p, b) -> term_references (pat_names p @ bound) b)
+  | Ttuple ts -> List.concat_map ts ~f:refs
+  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> refs t
+
 (** The location of the first occurrence of the name [x] in [terms]. *)
 let name_loc (terms : S.term list) x ~default =
   let rec find (t : S.term) =
@@ -1117,7 +1159,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
       match head.term_desc with
       | Tvar q ->
           begin match
-            List.Assoc.find env.ctx.preds (qualid_key q) ~equal:String.equal
+            List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal
           with
           | Some (_, types) when List.length args <= List.length types ->
               List.filter_map
@@ -1159,8 +1201,35 @@ let state_fields env x =
   | Some (State fields) -> Some fields
   | _ -> None
 
+(** Whether a local module has a hidden representation in this lexical environment. *)
+let opaque_module_path env path =
+  match path with
+  | Path.Pdot _ ->
+      Option.exists (Datatypes.find env.ctx.types path) ~f:(fun data ->
+          Option.is_some data.id
+          &&
+            try
+              let declaration = Env.find_type path env.ctx.env in
+              (match declaration.type_kind with
+                | Types.Type_abstract _ -> true
+                | _ -> false)
+              && Option.is_none declaration.type_manifest
+              || Poly.equal declaration.type_private Asttypes.Private
+            with Stdlib.Not_found -> false)
+  | Pident _ | Papply _ | Pextra_ty _ -> false
+
+let opaque_module_types env =
+  List.exists env.ctx.types ~f:(fun data ->
+      List.exists data.Datatypes.paths ~f:(opaque_module_path env))
+
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
+  let* () =
+    if opaque_module_types env then
+      Signature_contract.expression ~logical_types:env.data ~environment:env.ctx.env
+        ~variables:env.var_types t
+    else Ok ()
+  in
   let at = t.term_loc in
   let l = loc at in
   match t.term_desc with
@@ -1169,6 +1238,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   | Tconst (Pconst_integer (n, None)) -> Ok (R.Expr.int ~loc:l (Int.of_string n))
   | Tconst _ -> unsupported at "This constant"
   | Tvar (Qid { pid_str = x; _ }) when is_constructor x -> constructor env t []
+  | Tvar (Qdot (_, id)) when is_constructor id.pid_str -> constructor env t []
   | Tvar (Qid { pid_str = x; _ })
     when List.Assoc.mem env.ctx.proof_support.predicate_inputs x ~equal:String.equal
          && not (List.Assoc.mem env.vars x ~equal:String.equal) ->
@@ -1342,6 +1412,13 @@ and collection_application env ~at (module_name, function_name) args =
            module_name function_name)
 
 and expected_formula env (expected : Types.type_expr option) (t : S.term) =
+  let* () =
+    match expected with
+    | Some expected when opaque_module_types env ->
+        Signature_contract.terms ~expected ~logical_types:env.data
+          ~environment:env.ctx.env ~variables:env.var_types [ t ]
+    | Some _ | None -> Ok ()
+  in
   let literal = list_literal in
   let is_sequence ty =
     match Datatypes.desc env.data ty with
@@ -1404,6 +1481,10 @@ and term_type env (t : S.term) =
           List.hd outputs)
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
       List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
+  | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
+      Result.ok
+        (Source.infer_logical_expression env.ctx.env
+           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, [ _ ]) ->
       Result.ok
         (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.env
@@ -1520,14 +1601,17 @@ and application env (t : S.term) =
       | _ -> error at "An AU operation is only allowed in a proof expression"
       end
   | Tvar q, _
-    when List.Assoc.mem env.ctx.proof_support.predicate_inputs (qualid_key q)
+    when List.Assoc.mem env.ctx.proof_support.predicate_inputs (logical_key env q)
            ~equal:String.equal ->
-      let key = qualid_key q in
+      let key = logical_key env q in
       let raven, types = List.Assoc.find_exn env.ctx.preds key ~equal:String.equal in
       let* args = predicate_arguments env ~at key types args in
       Ok (R.Expr.call ~loc:l (qualified_name ~loc:l raven) args)
   | Tvar q, args when Option.is_some (logical_signature env q) ->
       logical_application env ~at (Option.value_exn (logical_signature env q)) args
+  | Tvar q, args when Option.is_some (runtime_spec env q) ->
+      let* args = all args ~f:(formula env) in
+      Ok (R.Expr.call ~loc:l (name ~loc:l (Option.value_exn (runtime_spec env q))) args)
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
       collection_application env ~at (Option.value_exn (collection_builtin env q)) args
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
@@ -1651,8 +1735,16 @@ and application env (t : S.term) =
           | _ -> Ok (R.Expr.binary ~loc:l op a b))
       end
   | Tvar (Qid { pid_str = c; _ }), _ when is_constructor c -> constructor env t args
-  | Tvar q, _ :: _ when List.Assoc.mem env.funcs (qualid_key q) ~equal:String.equal ->
-      let f = qualid_key q in
+  | Tvar (Qdot (_, id)), _ when is_constructor id.pid_str -> constructor env t args
+  | Tvar q, _ :: _
+    when List.Assoc.mem env.funcs (logical_key env q) ~equal:String.equal
+         && not
+              (List.exists env.ctx.proof_support.runtime_functions.entries
+                 ~f:(fun (_, target) ->
+                   String.equal target
+                     (List.Assoc.find_exn env.funcs (logical_key env q)
+                        ~equal:String.equal))) ->
+      let f = logical_key env q in
       (* A predicate's arguments have its parameters' types. *)
       let expected =
         match List.Assoc.find env.ctx.preds f ~equal:String.equal with
@@ -1764,7 +1856,8 @@ and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_e
   | Pcast (p, _), _ -> pattern_types env p t
   | Ptuple ps, Ttuple ts when List.length ps = List.length ts ->
       List.concat_map (List.zip_exn ps ts) ~f:(fun (p, (_, t)) -> pattern_types env p t)
-  | Pconstr (Qid { pid_str = c; _ }, arg), Tconstr (path, args, _) -> begin
+  | Pconstr (q, arg), Tconstr (path, args, _) -> begin
+      let c = match q with Qid id | Qdot (_, id) -> id.pid_str in
       let arg_types =
         match (c, args) with
         | "::", [ elt ] when Path.same path Predef.path_list -> [ elt; t ]
@@ -1816,6 +1909,16 @@ and quantified env (t : S.term) =
 and location_of env (t : S.term) =
   let at = t.term_loc in
   let l = loc at in
+  let* () =
+    match term_type env t with
+    | Some typ -> (
+        match Types.get_desc (Ctype.expand_head env.ctx.env typ) with
+        | Tconstr (path, _, _) when opaque_module_path env path ->
+            error at
+              "Ownership of an abstract module type must be exposed through a predicate"
+        | _ -> Ok ())
+    | None -> Ok ()
+  in
   match ghost_projection env t with
   | Some (field, owner) ->
       let* () =
@@ -1889,8 +1992,9 @@ and constructor env (t : S.term) args =
   let at = t.term_loc in
   let l = loc at in
   let head, _ = spine t [] in
-  let c_name = match head.term_desc with Tvar (Qid id) -> id.pid_str | _ -> "" in
-  match Datatypes.find_ctor env.data c_name with
+  let q = match head.term_desc with Tvar q -> q | _ -> Qid (S.mk_id ~loc:at "") in
+  let c_name = qualid_key q in
+  match find_constructor env q with
   | None -> error head.term_loc (Printf.sprintf "Unbound constructor %s" c_name)
   | Some (d, c) ->
       let tuple (a : S.term) =
@@ -1928,8 +2032,9 @@ and spec_pattern env (p : S.pat) (v : R.Expr.t) =
       Ok
         (Some (R.Expr.binary ~loc:l Eq v (R.Expr.bool ~loc:l (String.equal b "true"))), [])
   | Pconstr (Qid { pid_str = "()"; _ }, None) -> Ok (None, [])
-  | Pconstr (Qid { pid_str = c_name; _ }, arg) ->
-      begin match Datatypes.find_ctor env.data c_name with
+  | Pconstr (q, arg) ->
+      let c_name = qualid_key q in
+      begin match find_constructor env q with
       | None -> error at (Printf.sprintf "Unbound constructor %s" c_name)
       | Some (_, c) ->
           let tuple (p : S.pat) =
@@ -1942,7 +2047,6 @@ and spec_pattern env (p : S.pat) (v : R.Expr.t) =
           let* conds, binds = components args fields in
           Ok (conjoin (Some (R.Expr.is_ ~loc:l v (ident ~loc:l c.raven)) :: conds), binds)
       end
-  | Pconstr (Qdot _, _) -> unsupported at "A qualified constructor"
 
 (** A match on the value [v] in a contract: a Raven match if the cases are flat, and
     otherwise conditional expressions, whose last case is not tested. *)
@@ -1964,14 +2068,14 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
         Some [ (`Any (Option.join (flat_arg p)), (p, body)) ]
     | ((p : S.pat), body) :: rest ->
         begin match p.pat_desc with
-        | Pconstr (Qid { pid_str = c_name; _ }, arg) -> begin
+        | Pconstr (q, arg) -> begin
             let args =
               match arg with
               | None -> Some []
               | Some { pat_desc = Ptuple ps; _ } -> Option.all (List.map ps ~f:flat_arg)
               | Some p -> Option.map (flat_arg p) ~f:(fun a -> [ a ])
             in
-            match (Datatypes.find_ctor env.data c_name, args) with
+            match (find_constructor env q, args) with
             | Some (_, c), Some args
               when List.length args = List.length c.fields
                    && not (List.mem seen c.raven ~equal:String.equal) ->
@@ -4447,6 +4551,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | Some x -> Ok ([], R.Expr.var ~loc:l (name ~loc:l x))
       | None -> unsupported at "A function used as a value")
   | Texp_ident (path, _, _) -> (
+      let* path = Source.normalize_value_path e.exp_env ~at path in
       match Path_bindings.member ctx.libraries path with
       | Some member -> Ok ([], R.Expr.call ~loc:l (Qualified_name.raven ~loc:l member) [])
       | None ->
@@ -4512,7 +4617,17 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | Some (field, true) ->
           let* reading, value = ordinary_read ctx ~at ~field ~elt:e.exp_type v in
           Ok (stmts @ reading, value)
-      | Some (field, false) -> Ok (stmts, R.Expr.field ~loc:l v (name ~loc:l field))
+      | Some (field, false) ->
+          let value = R.Expr.field ~loc:l v (name ~loc:l field) in
+          if is_int e.exp_type then
+            let x = Names.fresh ctx.names "tmp" in
+            Ok
+              ( stmts
+                @ R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l)
+                    ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
+                @ assume_in_range ~loc:l e.exp_type x,
+                R.Expr.var ~loc:l (name ~loc:l x) )
+          else Ok (stmts, value)
       | None -> unsupported at "This field"
     end
   | Texp_setfield (record, _, label, value) -> begin
@@ -4955,6 +5070,7 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
           let v = R.Expr.neg ~loc:l a in
           Ok (stmts @ [ no_overflow ctx ~at "negation" v ], v))
   | None, None, _ -> (
+      let* path = Source.normalize_value_path e.exp_env ~at path in
       match resolved_call ctx.functions ctx.libraries path with
       | Some f -> call ctx e f args
       | None -> (
@@ -5576,6 +5692,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       | _, Some `Not, _, [ a ] -> Ok (R.Expr.not_ ~loc:l a)
       | _, Some `Neg, _, [ a ] -> Ok (R.Expr.neg ~loc:l a)
       | None, None, path, _ ->
+          let* path = Source.normalize_value_path e.exp_env ~at path in
           begin match Path_bindings.find funcs path with
           | Some f -> Ok (R.Expr.call ~loc:l (qualified_name ~loc:l f) args)
           | None -> not_pure ("A call of " ^ Path.name path)
@@ -5641,6 +5758,10 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
 
 type func = {
   id : Ident.t;
+  namespace : string list;
+  paths : Path.t list;
+  environment : Env.t;
+  signature_sites : Module_inventory.signature_value list;
   raven_name : string;
   params : Typedtree.function_param list;
   body : Typedtree.expression;
@@ -5662,6 +5783,34 @@ type func = {
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
     a local function lifted to the top level. *)
+
+let contract_bound_names (f : func) =
+  let found = ref [] in
+  let pat : type k. Tast_iterator.iterator -> k Typedtree.general_pattern -> unit =
+   fun iterator pattern ->
+    (match pattern.pat_desc with
+    | Tpat_var (id, _, _) | Tpat_alias (_, id, _, _, _) ->
+        found := Ident.name id :: !found
+    | _ -> ());
+    Tast_iterator.default_iterator.pat iterator pattern
+  in
+  let iterator = { Tast_iterator.default_iterator with pat } in
+  List.iter f.params ~f:(fun parameter ->
+      match parameter.Typedtree.fp_kind with
+      | Tparam_pat p | Tparam_optional_default (p, _) -> iterator.pat iterator p);
+  let header = Option.bind f.contract ~f:(fun c -> c.S.header) in
+  !found
+  @ Option.value_map header ~default:[] ~f:(fun h ->
+      List.filter_map (h.hd_args @ h.hd_ret) ~f:(function
+        | S.Lvar id | Lghost (id, _) -> Some id.pid_str
+        | Lunit _ | Lwild -> None))
+
+let refers_to f term =
+  List.exists
+    (term_references (contract_bound_names f) term)
+    ~f:(fun q ->
+      Option.exists (Source.value_path f.environment q) ~f:(fun path ->
+          List.mem f.paths path ~equal:Path.same))
 
 (** The ghost parameters that the contract of [f] gives it, as [q] in
     [fix_tail [q : t] tail new_tail]. *)
@@ -5923,12 +6072,12 @@ and pattern_definitions env (f : func) =
         [ ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ } as value); rhs ] )
       when List.Assoc.mem env.vars x ~equal:String.equal ->
         begin match spine rhs [] with
-        | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args
+        | { term_desc = Tvar (Qid { pid_str = c; _ } as q); _ }, args
           when Char.is_uppercase c.[0] -> begin
             let args =
               match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args
             in
-            match (Datatypes.find_ctor env.data c, formula env value) with
+            match (find_constructor env q, formula env value) with
             | Some (_, ctor), Ok v when List.length ctor.fields = List.length args ->
                 List.fold
                   (List.zip_exn args (List.zip_exn ctor.fields ctor.args))
@@ -6056,9 +6205,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
     | [] -> Ok ()
     | _ -> unsupported f.loc "A pure function with ghost parameters"
   in
-  let calls_self (t : S.term) =
-    List.mem (term_names t) (Ident.name f.id) ~equal:String.equal
-  in
+  let calls_self = refers_to f in
   let clauses select = Option.value_map f.contract ~default:[] ~f:select in
   let* requires =
     all
@@ -6777,7 +6924,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   in
   (* The value of a pure function's function. *)
   let defined =
-    if pure && not (List.is_empty returns) then
+    if pure && List.is_empty f.signature_sites && not (List.is_empty returns) then
       let args =
         List.map formals ~f:(fun (ocaml, _, _) ->
             match ocaml with
@@ -7176,7 +7323,7 @@ let interface_contracts (interface : Source.interface) =
   let nexts =
     List.map (List.drop items 1) ~f:(fun (i : Parsetree.signature_item) ->
         Some i.psig_loc)
-    @ [ None ]
+    @ if List.is_empty items then [] else [ None ]
   in
   let* contracts =
     all (List.zip_exn items nexts) ~f:(fun ((item : Parsetree.signature_item), next) ->
@@ -7193,92 +7340,135 @@ let interface_contracts (interface : Source.interface) =
 
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
-let items ?scope ?(interface = []) (structure : Typedtree.structure)
-    (annotations : Annotation.t list) : (Datatypes.t list * func list, error) Result.t =
-  let items = structure.str_items in
-  let nexts =
-    List.map (List.drop items 1) ~f:(fun (i : Typedtree.structure_item) -> Some i.str_loc)
-    @ [ None ]
-  in
-  (* A definition that a later one of the same name shadows is named apart, and the
-     interface's contract is the last one's. *)
-  let defined =
-    List.concat_map items ~f:(fun (i : Typedtree.structure_item) ->
-        match i.str_desc with
-        | Tstr_value (_, bindings) ->
-            List.filter_map bindings ~f:(fun (vb : Typedtree.value_binding) ->
-                match vb.vb_pat.pat_desc with Tpat_var (id, _, _) -> Some id | _ -> None)
-        | _ -> [])
-  in
-  let shadowed id =
-    let rec after = function
-      | [] -> []
-      | x :: rest -> if Ident.same x id then rest else after rest
-    in
-    List.exists (after defined) ~f:(fun x -> String.equal (Ident.name x) (Ident.name id))
-  in
-  let earlier id =
-    List.count
-      (List.take_while defined ~f:(fun x -> not (Ident.same x id)))
-      ~f:(fun x -> String.equal (Ident.name x) (Ident.name id))
-  in
-  let item ((item : Typedtree.structure_item), next) =
-    match item.str_desc with
-    | Tstr_type (_, decls) ->
-        let* types = all decls ~f:Datatypes.of_declaration in
-        Ok (types, [])
-    | Tstr_value (_, bindings) ->
-        let* funcs =
-          all bindings ~f:(fun (vb : Typedtree.value_binding) ->
-              match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
-              | Tpat_var (id, _, _), Some (params, body) ->
-                  let* contract =
-                    contract_after ?scope annotations ~item_loc:item.str_loc ~next
-                  in
-                  let* contract =
-                    match
-                      ( contract,
-                        if shadowed id then None
-                        else List.Assoc.find interface (Ident.name id) ~equal:String.equal
-                      )
-                    with
-                    | Some _, Some (_, at) ->
-                        error vb.vb_loc
-                          ~related:[ (at, "Its contract in the interface") ]
-                          (Printf.sprintf
-                             "%s has a contract in its interface and another one here"
-                             (Ident.name id))
-                    | Some c, None | None, Some (c, _) -> Ok (Some c)
-                    | None, None -> Ok None
-                  in
-                  Ok
-                    {
-                      id;
-                      raven_name =
-                        (if shadowed id then
-                           Printf.sprintf "%s_%d" (Ident.name id) (earlier id + 1)
-                         else Ident.name id);
-                      params;
-                      body;
-                      loc = vb.vb_loc;
-                      contract;
-                      next;
-                      prefix = [];
-                      prefix_count = 0;
-                      captured = [];
-                      role = None;
-                      manual =
-                        manual_after ?scope annotations ~item_loc:item.str_loc ~next;
-                      trusted =
-                        trusted_after ?scope annotations ~item_loc:item.str_loc ~next;
-                    }
-              | _ -> unsupported vb.vb_loc "This definition")
+let items source ~fresh (inventory : Module_inventory.t) =
+  let* data =
+    all inventory.types ~f:(fun (entry : Module_inventory.type_definition) ->
+        let* data = Datatypes.of_declaration entry.declaration in
+        let data = Datatypes.with_paths data entry.paths in
+        let base = String.concat ~sep:"_" (entry.namespace @ [ data.module_name ]) in
+        let data = Datatypes.with_name data (fresh base) in
+        let heap =
+          Option.map data.heap
+            ~f:
+              (List.map ~f:(fun (field : Datatypes.field) ->
+                   { field with raven_field = fresh field.raven_field }))
         in
-        Ok ([], funcs)
-    | _ -> unsupported item.str_loc "This structure item"
+        Ok { data with heap })
   in
-  let* items = all (List.zip_exn items nexts) ~f:item in
-  Ok (List.concat_map items ~f:fst, List.concat_map items ~f:snd)
+  let same_scope (a : Module_inventory.value) (b : Module_inventory.value) =
+    let a = a.site.scope.location and b = b.site.scope.location in
+    a.loc_start.pos_cnum = b.loc_start.pos_cnum && a.loc_end.pos_cnum = b.loc_end.pos_cnum
+  in
+  let* functions =
+    all inventory.values ~f:(fun (entry : Module_inventory.value) ->
+        let vb = entry.binding in
+        match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
+        | Tpat_var (id, _, _), Some (params, body) ->
+            let site = entry.site in
+            let* own =
+              contract_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                ~next:site.next
+            in
+            let* supplied =
+              all entry.signatures ~f:(fun (view : Module_inventory.signature_value) ->
+                  let site = view.site in
+                  let* contract =
+                    contract_after ~scope:site.scope site.annotations
+                      ~item_loc:site.item_loc ~next:site.next
+                  in
+                  let* () =
+                    match contract with
+                    | None -> Ok ()
+                    | Some contract ->
+                        let* () =
+                          Signature_contract.lowerable source view
+                            ~environment:
+                              (Source.annotation_env source entry.site.environment)
+                            contract
+                        in
+                        Signature_contract.check
+                          ~restricted:(not (List.is_empty entry.namespace))
+                          ~logical_types:source.Source.logical_types source view contract
+                  in
+                  Ok (Option.map contract ~f:(fun contract -> (contract, site.item_loc))))
+            in
+            let supplied = List.filter_opt supplied in
+            let* contract =
+              match (own, supplied) with
+              | Some _, (_, at) :: _ ->
+                  let root = List.is_empty entry.namespace in
+                  error vb.vb_loc
+                    ~related:
+                      [
+                        ( at,
+                          if root then "Its contract in the interface"
+                          else "Its contract in the signature" );
+                      ]
+                    (if root then
+                       Printf.sprintf
+                         "%s has a contract in its interface and another one here"
+                         (Ident.name id)
+                     else
+                       "A function has a contract in its signature and another one here")
+              | None, (contract, _) :: [] -> Ok (Some contract)
+              | None, [] -> Ok None
+              | Some _, []
+                when (not (List.is_empty entry.signatures))
+                     && not (List.is_empty entry.namespace) ->
+                  error vb.vb_loc
+                    "An exported module member's contract must be declared in its \
+                     signature"
+              | Some contract, [] -> Ok (Some contract)
+              | None, _ :: (_, at) :: _ ->
+                  error at "Multiple contracts for a module member are unsupported"
+            in
+            let earlier =
+              List.take_while inventory.values ~f:(fun other ->
+                  not (phys_equal other entry))
+            in
+            let later = List.drop inventory.values (List.length earlier + 1) in
+            let same_name other =
+              same_scope entry other
+              &&
+              match other.Module_inventory.binding.vb_pat.pat_desc with
+              | Tpat_var (other, _, _) -> String.equal (Ident.name id) (Ident.name other)
+              | _ -> false
+            in
+            let base =
+              if List.is_empty entry.namespace && List.exists later ~f:same_name then
+                Printf.sprintf "%s_%d" (Ident.name id)
+                  (1 + List.count earlier ~f:same_name)
+              else
+                String.uncapitalize
+                  (String.concat ~sep:"_" (entry.namespace @ [ Ident.name id ]))
+            in
+            Ok
+              {
+                id;
+                namespace = entry.namespace;
+                paths = entry.paths;
+                environment = Source.annotation_env source site.environment;
+                signature_sites = entry.signatures;
+                raven_name = fresh base;
+                params;
+                body;
+                loc = vb.vb_loc;
+                contract;
+                next = site.next;
+                prefix = [];
+                prefix_count = 0;
+                captured = [];
+                role = None;
+                manual =
+                  manual_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                    ~next:site.next;
+                trusted =
+                  trusted_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                    ~next:site.next;
+              }
+        | _ -> unsupported vb.vb_loc "This definition")
+  in
+  Ok (data, functions)
 
 (** The identifiers that [e] refers to by a name of its own. *)
 let referenced (e : Typedtree.expression) : Ident.t list =
@@ -7331,7 +7521,7 @@ let params_bound (params : Typedtree.function_param list) : Ident.t list =
     their contracts in [annotations]: one after the function's definition, before the
     expression it is local to. A function that [continues] [outer] takes [outer]'s
     parameters first and has its contract too; another may not use [outer]'s variables. *)
-let local_functions (outer : func) (annotations : Annotation.t list) =
+let local_functions ~source (outer : func) (annotations : Annotation.t list) =
   let found = ref [] in
   let expr iterator (e : Typedtree.expression) =
     begin match e.exp_desc with
@@ -7461,7 +7651,13 @@ let local_functions (outer : func) (annotations : Annotation.t list) =
       Ok
         {
           id;
-          raven_name = Ident.name id;
+          namespace = outer.namespace;
+          paths = [ Path.Pident id ];
+          environment = Source.annotation_env source rest.exp_env;
+          signature_sites = [];
+          raven_name =
+            (if List.is_empty outer.namespace then Ident.name id
+             else String.concat ~sep:"_" [ outer.raven_name; Ident.name id ]);
           params = prefix_params @ captured_params @ params;
           body;
           loc = vb.vb_loc;
@@ -7581,18 +7777,24 @@ let initialization_annotations source typed annotations =
   attached_annotations source typed annotations ~kind:Annotation.Initializes ~is_target
     ~description:"This annotation must follow a fresh allocation"
 
-let access_annotations source typed annotations ~functions =
+let access_annotations ~libraries source typed annotations ~functions =
   let functions =
-    Path_bindings.of_list (List.map functions ~f:(fun f -> (Path.Pident f.id, ())))
+    Path_bindings.of_list
+      (List.concat_map functions ~f:(fun f ->
+           List.map f.paths ~f:(fun path -> (path, ()))))
   in
-  let libraries = library_paths source.Source.libraries in
+  let libraries = library_paths libraries in
   let is_target (e : Typedtree.expression) =
     match e.exp_desc with
-    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
         Option.exists (atomic_name path) ~f:(fun op ->
             not (String.is_prefix op ~prefix:"make"))
-        || Path_bindings.mem functions path
-        || Option.is_some (Path_bindings.member libraries path)
+        ||
+        match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
+        | Ok path ->
+            Path_bindings.mem functions path
+            || Option.is_some (Path_bindings.member libraries path)
+        | Error _ -> false)
     | _ -> false
   in
   attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
@@ -7600,25 +7802,79 @@ let access_annotations source typed annotations ~functions =
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
-let pure_functions (funcs : func list) : func list =
-  let contract_names =
+let pure_functions (funcs : func list) =
+  let* () =
+    Result.all_unit
+      (List.map funcs ~f:(fun f ->
+           let clauses =
+             Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
+                 c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures @ c.variant)
+           in
+           Result.all_unit
+             (List.map clauses ~f:(fun term ->
+                  Result.all_unit
+                    (List.map
+                       (term_references (contract_bound_names f) term)
+                       ~f:(fun q ->
+                         match Source.value_path f.environment q with
+                         | Some (Path.Pdot _ as path)
+                           when List.exists funcs ~f:(fun target ->
+                                    (not (List.is_empty target.signature_sites))
+                                    && List.mem target.paths path ~equal:Path.same) ->
+                             unsupported term.term_loc
+                               "A specification call through a constrained module \
+                                signature"
+                         | Some _ | None -> Ok ()))))))
+  in
+  let referenced_in_contracts =
     List.concat_map funcs ~f:(fun f ->
         Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
-            List.concat_map (c.requires @ c.ensures @ c.variant) ~f:term_names))
+            List.concat_map
+              (c.requires @ c.ensures @ c.variant)
+              ~f:(fun t ->
+                List.filter_map
+                  (term_references (contract_bound_names f) t)
+                  ~f:(Source.value_path f.environment))))
   in
   let seeds =
     List.filter funcs ~f:(fun f ->
-        List.mem contract_names (Ident.name f.id) ~equal:String.equal
+        List.exists f.paths ~f:(fun path ->
+            List.mem referenced_in_contracts path ~equal:Path.same)
         || Option.exists f.contract ~f:(fun (c : S.contract) -> c.pure))
   in
-  let is_in set (f : func) = List.exists set ~f:(fun g -> Ident.same g.id f.id) in
+  let is_in set f = List.exists set ~f:(fun g -> Ident.same g.id f.id) in
+  let references body =
+    let paths = ref [] in
+    let expr iterator (e : Typedtree.expression) =
+      (match e.exp_desc with
+      | Texp_ident (path, _, _) -> paths := (e.exp_env, e.exp_loc, path) :: !paths
+      | _ -> ());
+      Tast_iterator.default_iterator.expr iterator e
+    in
+    let iterator = { Tast_iterator.default_iterator with expr } in
+    iterator.expr iterator body;
+    all !paths ~f:(fun (env, at, path) ->
+        let* path = Source.normalize_value_path env ~at path in
+        let* () =
+          match path with
+          | Path.Pdot _
+            when List.exists funcs ~f:(fun target ->
+                     (not (List.is_empty target.signature_sites))
+                     && List.mem target.paths path ~equal:Path.same) ->
+              unsupported at "A pure call through a constrained module signature"
+          | _ -> Ok ()
+        in
+        Ok path)
+  in
   let rec close set =
-    let called = List.concat_map set ~f:(fun f -> referenced f.body) in
+    let* called = all set ~f:(fun f -> references f.body) in
+    let called = List.concat called in
     let added =
       List.filter funcs ~f:(fun f ->
-          (not (is_in set f)) && List.exists called ~f:(fun id -> Ident.same id f.id))
+          (not (is_in set f))
+          && List.exists f.paths ~f:(fun path -> List.mem called path ~equal:Path.same))
     in
-    if List.is_empty added then set else close (set @ added)
+    if List.is_empty added then Ok set else close (set @ added)
   in
   close seeds
 
@@ -9166,13 +9422,77 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         error a.loc "This annotation does not follow an atomic step, as Atomic.get t"
     | None -> Ok ()
   in
-  let* interface =
-    Option.value_map source.interface ~default:(Ok []) ~f:interface_contracts
+  let backend_names = Names.create () in
+  backend_names.used <-
+    Set.of_list
+      (module String)
+      [
+        "Library";
+        "List";
+        "Option";
+        "Seq";
+        "FinSet";
+        "Set";
+        "Map";
+        "Int";
+        "Real";
+        "Bool";
+        Prelude.div;
+        Prelude.mod_;
+        Prelude.in_range;
+        Prelude.wrap;
+      ];
+  let reserved =
+    List.map source.libraries ~f:(fun lib -> lib.Source.library_name)
+    @ List.map source.proof_types ~f:(fun data -> data.Datatypes.module_name)
+    @ List.concat_map source.proof_resources ~f:(fun resource ->
+        List.map (resource.Source.resource_descriptor :: resource.resource_aliases)
+          ~f:(fun data -> data.Datatypes.module_name))
+    @ List.filter_map source.proof ~f:(function
+      | S.Proof_function { function_name; _ } -> Some function_name.pid_str
+      | Proof_lemma { lemma_name; _ } -> Some lemma_name.pid_str
+      | Proof_predicate p -> Some p.pred_name.pid_str
+      | Proof_invariant { inv_name; _ } -> Some inv_name.pid_str
+      | Proof_view { view_name; _ } -> Some view_name.pid_str
+      | _ -> None)
   in
-  let* types, funcs = items ~scope:source.scope ~interface typed annotations in
-  let* lifted = all funcs ~f:(fun f -> local_functions f annotations) in
-  let funcs = inherit_contracts (funcs @ List.concat lifted) in
-  let* access_proofs = access_annotations source typed annotations ~functions:funcs in
+  let declarations ~interface comments =
+    List.filter
+      (Annotation.of_comments comments)
+      ~f:(Annotation.predicate_declaration ~interface)
+  in
+  let declarations =
+    declarations ~interface:false source.comments
+    @ Option.value_map source.interface ~default:[] ~f:(fun interface ->
+        declarations ~interface:true interface.Source.interface_comments)
+  in
+  let* declared_predicates = all declarations ~f:Annotation.predicate in
+  let reserved =
+    reserved @ List.map declared_predicates ~f:(fun p -> p.S.pred_name.pid_str)
+  in
+  backend_names.used <-
+    Set.union backend_names.used (Set.of_list (module String) reserved);
+  let fresh = Names.fresh backend_names in
+  let* inventory = Module_inventory.build source typed in
+  let* libraries = Library_modules.flatten ~fresh source.libraries in
+  List.iter libraries ~f:(fun lib ->
+      List.iter lib.Library_modules.library.signature ~f:(fun item ->
+          match item.Parsetree.psig_desc with
+          | Psig_type (_, decls) ->
+              List.iter decls ~f:(fun decl ->
+                  backend_names.used <-
+                    Set.add backend_names.used
+                      (lib.library_name ^ "_" ^ decl.Parsetree.ptype_name.txt))
+          | _ -> ()));
+  let* types, funcs = items source ~fresh inventory in
+  let* lifted = all funcs ~f:(fun f -> local_functions ~source f annotations) in
+  let lifted =
+    List.map (List.concat lifted) ~f:(fun f -> { f with raven_name = fresh f.raven_name })
+  in
+  let funcs = inherit_contracts (funcs @ lifted) in
+  let* access_proofs =
+    access_annotations ~libraries source typed annotations ~functions:funcs
+  in
   let state_targets = ref [] and nested_reads = ref [] in
   let remember (e : Typedtree.expression) =
     state_targets :=
@@ -9278,7 +9598,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   (* The abstract types of the libraries. *)
   let* library_types =
-    all source.libraries ~f:(fun (lib : Source.library) ->
+    all libraries ~f:(fun (lib : Library_modules.t) ->
         all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
             match item.psig_desc with
             | Psig_type (_, decls) ->
@@ -9286,9 +9606,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                     match (decl.ptype_kind, decl.ptype_manifest, decl.ptype_params) with
                     | Ptype_abstract, None, [] ->
                         Ok
-                          (Datatypes.library_type ~library:lib.library_name
-                             ~library_id:lib.library_id ~at:decl.ptype_loc
-                             decl.ptype_name.txt)
+                          ( Datatypes.library_type ~library:lib.library_name
+                              ~library_id:lib.library_id ~at:decl.ptype_loc
+                              decl.ptype_name.txt
+                          |> fun descriptor ->
+                            Datatypes.with_paths descriptor
+                              [ Path.Pdot (lib.library_path, decl.ptype_name.txt) ] )
                     | _ ->
                         unsupported decl.ptype_loc
                           "A type of a library other than an abstract one without \
@@ -9296,10 +9619,44 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             | _ -> Ok []))
   in
   let types = List.concat (List.concat library_types) @ types @ source.proof_types in
+  let relative root path =
+    let rec components path suffix =
+      if Path.same root path then Some suffix
+      else
+        match path with
+        | Path.Pdot (parent, name) -> components parent (name :: suffix)
+        | Pident _ | Papply _ | Pextra_ty _ -> None
+    in
+    components path []
+  in
+  let types =
+    List.map types ~f:(fun data ->
+        let declared =
+          data.Datatypes.paths @ Option.to_list data.library
+          @ Option.to_list (Option.map data.id ~f:(fun id -> Path.Pident id))
+        in
+        let rec expand remaining paths =
+          let aliases =
+            List.concat_map inventory.aliases ~f:(fun (alias, target) ->
+                List.filter_map paths ~f:(fun path ->
+                    Option.map (relative target path) ~f:(fun suffix ->
+                        List.fold suffix ~init:alias ~f:(fun parent name ->
+                            Path.Pdot (parent, name)))))
+          in
+          let expanded = Datatypes.with_paths data (paths @ aliases) in
+          if remaining = 0 || List.length expanded.paths = List.length paths then expanded
+          else expand (remaining - 1) expanded.paths
+        in
+        expand (List.length inventory.aliases) declared)
+  in
   (* The data types, and the sequences of specifications, which have no module. *)
-  let pure = pure_functions funcs in
+  let* pure = pure_functions funcs in
   let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
-  let proc_name (f : func) = if is_pure f then f.raven_name ^ "_impl" else f.raven_name in
+  let procedures =
+    List.map funcs ~f:(fun f ->
+        (f.id, if is_pure f then fresh (f.raven_name ^ "_impl") else f.raven_name))
+  in
+  let proc_name (f : func) = List.Assoc.find_exn procedures f.id ~equal:Ident.same in
   let* procedure_signatures =
     all funcs ~f:(fun f ->
         let outputs = ghost_results f in
@@ -9313,7 +9670,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let declared xs =
           all xs ~f:(fun (id, pty) ->
-              let* t = Source.ocaml_type source.env ~at:id.S.pid_loc pty in
+              let* t = Source.ocaml_type f.environment ~at:id.S.pid_loc pty in
               Ok (id.pid_str, t))
         in
         let* procedure_inputs = declared (ghost_params f) in
@@ -9405,7 +9762,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let refs = ref [] in
   let primitives = ref [] in
   let functions =
-    Path_bindings.of_list (List.map funcs ~f:(fun f -> (Path.Pident f.id, proc_name f)))
+    Path_bindings.of_list
+      (List.concat_map funcs ~f:(fun f ->
+           List.map f.paths ~f:(fun path -> (path, proc_name f))))
   in
   let lifted =
     List.filter_map funcs ~f:(fun f ->
@@ -9422,7 +9781,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
-    all source.libraries ~f:(fun (lib : Source.library) ->
+    all libraries ~f:(fun (lib : Library_modules.t) ->
         let declared =
           List.concat_map lib.library.signature
             ~f:(fun (item : Parsetree.signature_item) ->
@@ -9435,9 +9794,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let rec qualify (t : S.pty) : S.pty =
           match t with
           | PTtyapp (Qid x, args) when List.mem declared x.pid_str ~equal:String.equal ->
-              PTtyapp
-                ( Qdot (Qid (S.mk_id ~loc:x.pid_loc lib.library_name), x),
-                  List.map args ~f:qualify )
+              let parts = String.split lib.source_name ~on:'.' in
+              let parent =
+                List.fold (List.tl_exn parts)
+                  ~init:(S.Qid (S.mk_id ~loc:x.pid_loc (List.hd_exn parts)))
+                  ~f:(fun q part -> S.Qdot (q, S.mk_id ~loc:x.pid_loc part))
+              in
+              PTtyapp (Qdot (parent, x), List.map args ~f:qualify)
           | PTtyapp (q, args) -> PTtyapp (q, List.map args ~f:qualify)
           | PTtuple ts -> PTtuple (List.map ts ~f:qualify)
           | PTarrow (a, b) -> PTarrow (qualify a, qualify b)
@@ -9464,19 +9827,33 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* predicate_inputs =
     all
       (List.map predicates ~f:(fun (_, p, _, ts) -> (p.S.pred_name.pid_str, p, ts))
-      @ List.map library_preds ~f:(fun ((lib : Source.library), p, ts) ->
-          (lib.library_name ^ "." ^ p.S.pred_name.pid_str, p, ts)))
+      @ List.map library_preds ~f:(fun ((lib : Library_modules.t), p, ts) ->
+          (lib.source_name ^ "." ^ p.S.pred_name.pid_str, p, ts)))
       ~f:(fun (key, p, ts) ->
         let* count = implicit_parameter_count ~kind:"predicate" p.pred_params in
         Ok (Option.map count ~f:(fun count -> (key, List.length ts - count))))
   in
   let predicate_inputs = List.filter_opt predicate_inputs in
+  let predicate_inputs =
+    predicate_inputs
+    @ List.filter_map library_preds ~f:(fun (lib, p, _) ->
+        Option.map
+          (List.Assoc.find predicate_inputs
+             (lib.Library_modules.source_name ^ "." ^ p.S.pred_name.pid_str)
+             ~equal:String.equal)
+          ~f:(fun count -> (lib.library_name ^ "." ^ p.pred_name.pid_str, count)))
+  in
   let preds =
     List.map predicates ~f:(fun (_, p, _, types) ->
         (p.pred_name.pid_str, (p.pred_name.pid_str, types)))
-    @ List.map library_preds ~f:(fun ((lib : Source.library), p, types) ->
-        let key = lib.library_name ^ "." ^ p.pred_name.pid_str in
-        (key, (key, types)))
+    @ List.map library_preds ~f:(fun ((lib : Library_modules.t), p, types) ->
+        let key = lib.source_name ^ "." ^ p.pred_name.pid_str in
+        (key, (lib.library_name ^ "." ^ p.pred_name.pid_str, types)))
+  in
+  let preds =
+    preds
+    @ List.filter_map preds ~f:(fun (_, (target, types)) ->
+        Some (target, (target, types)))
   in
   let* logical_functions =
     all
@@ -9502,6 +9879,14 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let proof_support =
     {
+      runtime_functions =
+        Path_bindings.of_list
+          (List.concat_map pure ~f:(fun f ->
+               List.filter_map f.paths ~f:(fun path ->
+                   match path with
+                   | Path.Pdot _ when not (List.is_empty f.signature_sites) -> None
+                   | _ -> Some (path, f.raven_name))));
+      library_paths = library_paths libraries;
       atomic_updates = [];
       resources = source.proof_resources;
       ghost_fields = source.proof_fields;
@@ -9512,7 +9897,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     }
   in
   let spec_funcs =
-    List.map pure ~f:(fun f -> (Ident.name f.id, f.raven_name))
+    List.map pure ~f:(fun f ->
+        (String.concat ~sep:"." (f.namespace @ [ Ident.name f.id ]), f.raven_name))
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
@@ -9870,10 +10256,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* Each library's module, trusted: its abstract predicates, and its values, as functions
      without arguments, and functions, as procedures with their contracts. *)
   let* library_modules =
-    all source.libraries ~f:(fun (lib : Source.library) ->
+    all libraries ~f:(fun (lib : Library_modules.t) ->
         let l = loc Location.none in
         let own_preds =
-          List.filter_map library_preds ~f:(fun ((lib' : Source.library), p, types) ->
+          List.filter_map library_preds ~f:(fun ((lib' : Library_modules.t), p, types) ->
               Option.some_if
                 (String.equal lib'.library_name lib.library_name)
                 ( p.pred_name.pid_str,
@@ -9901,7 +10287,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let* pred_members =
           all
-            (List.filter library_preds ~f:(fun ((lib' : Source.library), _, _) ->
+            (List.filter library_preds ~f:(fun ((lib' : Library_modules.t), _, _) ->
                  String.equal lib'.library_name lib.library_name))
             ~f:(fun (_, (p : S.predicate), param_types) ->
               let* params =
@@ -9929,9 +10315,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               | Psig_value vd ->
                   let at = vd.pval_loc in
                   let x = vd.pval_name.txt in
-                  let value =
-                    Env.find_value (Pdot (Pident lib.library_id, x)) source.env
-                  in
+                  let value = Env.find_value (Pdot (lib.library_path, x)) source.env in
                   let rec arrows (t : Types.type_expr) =
                     match Types.get_desc t with
                     | Tarrow (Nolabel, a, r, _) ->
@@ -10021,22 +10405,22 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           origins declaration)
   in
   let* pure_funcs =
-    all pure
-      ~f:
-        (func types ~refs ~primitives ~shared ~ocaml_env ~preds
-           ~funcs:
-             (Path_bindings.of_list
-                (List.map pure ~f:(fun f -> (Path.Pident f.id, f.raven_name))))
-           ~spec_funcs ~proof_support origins)
+    all pure ~f:(fun f ->
+        func types ~refs ~primitives ~shared ~ocaml_env:f.environment ~preds
+          ~funcs:
+            (Path_bindings.of_list
+               (List.concat_map pure ~f:(fun f ->
+                    List.map f.paths ~f:(fun path -> (path, f.raven_name)))))
+          ~spec_funcs ~proof_support origins f)
   in
   let* procs =
     all funcs ~f:(fun f ->
-        proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs:spec_funcs
-          ~annotations ~access_proofs ~return_proofs ~initializations ~linearizations
-          ~lifted ~pasts ~past_returns ~ghost_args ~procedure_signatures ~proof_lemmas
-          ~proof_support ~predicate_bodies
-          ~libraries:(library_paths source.libraries)
-          functions origins ~proc_name:(proc_name f) ~pure:(is_pure f) f)
+        proc types ~refs ~primitives ~shared ~ocaml_env:f.environment ~preds
+          ~funcs:spec_funcs ~annotations ~access_proofs ~return_proofs ~initializations
+          ~linearizations ~lifted ~pasts ~past_returns ~ghost_args ~procedure_signatures
+          ~proof_lemmas ~proof_support ~predicate_bodies
+          ~libraries:(library_paths libraries) functions origins ~proc_name:(proc_name f)
+          ~pure:(is_pure f) f)
   in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in

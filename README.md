@@ -19,6 +19,27 @@ validate the implementation against it before verification. Abstract interface
 types, private implementation bindings, and monomorphic interface specializations
 of polymorphic implementations are supported.
 
+Functions and monomorphic types can be grouped in `module ... = struct ... end`,
+including nested modules. Calls and annotations resolve names in their enclosing
+OCaml scope. Plain module aliases retain the original types and ownership predicates.
+Named signatures and `.mli` files restrict the members available to callers;
+place exported function contracts in the signature. Private function bodies are
+also verified.
+
+A client in the same source file uses the module's concrete type encoding.
+Clients verified against interface-only dependencies use abstract types instead.
+
+Imported interfaces can expose nested modules with ordinary or logically atomic
+contracts. The module client in
+[`test/case_studies/module_stack_drain`](test/case_studies/module_stack_drain)
+uses these contracts through an alias of the stack module.
+
+Functor applications, recursive and local modules, `open`, `include`, and module
+initialization expressions are not supported yet. Signature constraints on module
+aliases and specification calls through constrained module signatures are also
+unsupported. Nested implementation predicates and shared-state declarations remain
+outside this module support.
+
 Interface-only dependencies found locally or through `-I` expose assumed contracts
 to clients, including logically atomic contracts. For example:
 
@@ -185,7 +206,7 @@ let facts : (int Atomic.t, Authority.t) Ghost.field = Ghost.field ()
 Each instance has a distinct resource type. Resource operations are qualified,
 such as `Facts.set`, `Authority.auth`, `Authority.frag`, `Authority.auth_frag`,
 and `Authority.full`. These declarations support these library instances;
-arbitrary module definitions are not supported yet.
+general proof-module definitions are not supported yet.
 
 `Ghost.at facts cell` names a ghost location attached to an owner of the declared
 type. Use it through `own`, for example

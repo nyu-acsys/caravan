@@ -27,6 +27,7 @@ type collection_kind = Sequence | FinSet | Set | Map
 
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
+  paths : Path.t list;  (** Other paths naming the same implementation type. *)
   module_name : string;
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
@@ -43,6 +44,7 @@ type t = {
 let list =
   {
     id = None;
+    paths = [];
     module_name = "List";
     ctors =
       [
@@ -61,6 +63,7 @@ let list =
 let option =
   {
     id = None;
+    paths = [];
     module_name = "Option";
     ctors =
       [
@@ -98,6 +101,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       Ok
         {
           id = Some decl.typ_id;
+          paths = [];
           module_name = String.capitalize decl.typ_name.txt;
           ctors;
           heap = None;
@@ -139,6 +143,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       Ok
         {
           id = Some decl.typ_id;
+          paths = [];
           module_name = String.capitalize name;
           ctors;
           heap;
@@ -154,6 +159,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       Ok
         {
           id = Some decl.typ_id;
+          paths = [];
           module_name = String.capitalize decl.typ_name.txt;
           ctors = [];
           heap = None;
@@ -168,17 +174,38 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       Report.unsupported at "A type with parameters"
   | _ -> Report.unsupported at "This type definition"
 
+(** Adds paths naming the same implementation type. *)
+let with_paths (d : t) paths =
+  let paths =
+    List.fold paths ~init:d.paths ~f:(fun paths path ->
+        if List.mem paths path ~equal:Path.same then paths else paths @ [ path ])
+  in
+  { d with paths }
+
+(** Uses the allocated Raven name for the type and its record fields. *)
+let with_name (d : t) module_name =
+  let record_name = String.uncapitalize module_name in
+  let ctors =
+    List.map d.ctors ~f:(fun c ->
+        if String.is_empty c.ocaml then { c with raven = record_name } else c)
+  in
+  let heap =
+    Option.map d.heap ~f:(fun fields ->
+        List.map fields ~f:(fun f -> { f with raven_field = record_name ^ "_" ^ f.label }))
+  in
+  { d with module_name; ctors; heap }
+
 let declares (d : t) (p : Path.t) =
-  match (d.id, d.library, p) with
-  | Some id, _, Pident id' -> Ident.same id id'
-  | _, Some q, _ -> Path.same p q
-  | _ -> false
+  (match (d.id, p) with Some id, Pident id' -> Ident.same id id' | _ -> false)
+  || Option.exists d.library ~f:(Path.same p)
+  || List.mem d.paths p ~equal:Path.same
 
 (** The abstract type [name] of the library [library], the module with the identifier
     [library_id], declared at [at]. *)
 let library_type ~library ~library_id ~at name =
   {
     id = None;
+    paths = [];
     module_name = library ^ "_" ^ name;
     ctors = [];
     heap = None;
@@ -213,6 +240,7 @@ let collection id kind =
   in
   {
     id = Some id;
+    paths = [];
     module_name;
     ctors = [];
     heap = None;
