@@ -62,12 +62,22 @@ type checked_binding = {
   paths : Path.t list;
 }
 
+type specialization = {
+  template : Typedtree.module_expr;
+  parameter : Ident.t;
+  argument : checked_binding;
+  members : (string * Ident.t) list;
+  identity : Path.t;
+  declarations : Typedtree.type_declaration list;
+}
+
 type t = {
   structure : Typedtree.structure;
   values : value list;
   types : type_definition list;
   aliases : (Path.t * Path.t) list;
   bindings : checked_binding list;
+  specializations : specialization list;
 }
 
 type module_view = {
@@ -143,6 +153,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let result_types : (Path.t * type_definition ref) list ref = ref [] in
   let aliases = ref [] in
   let bindings = ref [] in
+  let specializations = ref [] in
   let expansions = ref [] in
   let stage_identities = ref [] in
   let parameter_substitution = ref Subst.identity in
@@ -958,9 +969,30 @@ let build (source : Source.t) (structure : Typedtree.structure) :
              ~default:
                (Report.error Type expression.mod_loc (Stdlib.Printexc.to_string exn)))
     in
-    let* () =
+    let* argument_binding =
       match (parameter, definition.parameter_name, actual) with
-      | Unit, None, None -> Ok ()
+      | Unit, None, None ->
+          let parameter = Ident.create_local "Unit" in
+          let binding =
+            ref
+              {
+                actual_path = application_identity;
+                parameter_substitution = !parameter_substitution;
+                expected = empty_signature;
+                site =
+                  {
+                    environment = expression.mod_env;
+                    scope = scope expression.mod_loc;
+                    annotations;
+                    item_loc = expression.mod_loc;
+                    next = None;
+                  };
+                namespace = namespace @ [ "Unit" ];
+                paths = [ Path.Pident parameter ];
+              }
+          in
+          bindings := binding :: !bindings;
+          Ok (Some (parameter, binding))
       | ( Named (Some parameter, _, parameter_type),
           Some parameter_name,
           Some (actual, actual_path) ) ->
@@ -1002,7 +1034,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               identity = Some parameter_path;
               application_identity = actual.application_identity;
             };
-          Ok ()
+          Ok (Some (parameter, binding))
       | _ ->
           unavailable expression.mod_loc
             "A functor specialization with the wrong parameter shape"
@@ -1013,7 +1045,25 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     in
     if Option.is_none view.functor_definition then begin
       publish_type_paths application_identity view;
-      expansions := (expression, body) :: !expansions
+      expansions := (expression, body) :: !expansions;
+      Option.iter argument_binding ~f:(fun (parameter, binding) ->
+          let declarations =
+            match body.mod_desc with
+            | Tmod_structure body ->
+                List.concat_map body.str_items ~f:(fun item ->
+                    match item.Typedtree.str_desc with
+                    | Tstr_type (_, declarations) -> declarations
+                    | _ -> [])
+            | _ -> []
+          in
+          specializations :=
+            ( definition.template,
+              parameter,
+              binding,
+              view.values,
+              application_identity,
+              declarations )
+            :: !specializations)
     end;
     Ok view
   and collect_structure annotations namespace ~identity declaration_scope
@@ -1228,4 +1278,19 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
       bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
+      specializations =
+        List.rev_map !specializations
+          ~f:(fun (template, parameter, argument, values, identity, declarations) ->
+            {
+              template;
+              parameter;
+              argument = !argument;
+              identity;
+              declarations;
+              members =
+                List.filter_map values ~f:(fun (member, value) ->
+                    match !value.binding.vb_pat.pat_desc with
+                    | Tpat_var (id, _, _) -> Some (member, id)
+                    | _ -> None);
+            });
     }

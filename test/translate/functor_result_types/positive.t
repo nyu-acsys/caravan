@@ -40,6 +40,9 @@
   1
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' distinct.rav
+  1
+
+  $ grep -c '^module Layout.*Fresh()' distinct.rav
   2
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' sealed.rav

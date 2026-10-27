@@ -35,6 +35,9 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' mutable_record.rav
+  1
+
+  $ grep -c '^module Layout.*Fresh()' mutable_record.rav
   2
 
   $ caravan --shh --emit-rav manifest_alias.ml > manifest_alias.rav
@@ -57,6 +60,9 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' named_argument.rav
+  1
+
+  $ grep -c '^module Layout.*Fresh()' named_argument.rav
   2
 
   $ caravan --shh --emit-rav named_legal.ml > named_legal.rav

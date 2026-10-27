@@ -184,6 +184,28 @@
   Type Error: This specification has type Left.t, but Right.t is required.
   [1]
 
+  $ caravan --shh checked_strengthening_fail.ml
+  [Error] File "checked_strengthening_fail.ml", line 23, columns 34-34:
+  23 | module Readapted : Strong = Hidden
+                                         ^
+  Verification Error: The module argument does not establish this view's postcondition.
+  File "checked_strengthening_fail.ml", line 5, columns 2-21:
+  5 |   val read : t -> int
+        ^^^^^^^^^^^^^^^^^^^
+  Related Location: The requested module operation.
+  File "checked_strengthening_fail.ml", line 15, columns 2-21:
+  15 |   val read : t -> int
+         ^^^^^^^^^^^^^^^^^^^
+  Related Location: The actual module operation.
+  [1]
+
+  $ caravan --shh inline_distinct_fail.ml
+  [Error] File "inline_distinct_fail.ml", line 20, columns 9-21:
+  20 |   assert (result = 7)
+                ^^^^^^^^^^^^
+  Verification Error: This assertion may be violated.
+  [1]
+
   $ caravan --shh mli_strengthening_fail.ml
   [Error] File "mli_strengthening_fail.mli", line 2, columns 2-20:
   2 |   val f : int -> int

@@ -39,6 +39,9 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' distinct.rav
+  1
+
+  $ grep -c '^module Layout.*Fresh()' distinct.rav
   2
 
   $ caravan --shh --emit-rav trailing_unit.ml > trailing_unit.rav

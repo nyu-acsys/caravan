@@ -29,12 +29,14 @@ type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
   paths : Path.t list;  (** Other paths naming the same implementation type. *)
   module_name : string;
+  module_path : string list option;
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
   collection : collection_kind option;
   mathematical_integer : bool;
   atomic_procedure : string option;
+  backend_type : Qualified_name.t option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
@@ -56,6 +58,8 @@ let list =
     collection = None;
     mathematical_integer = false;
     atomic_procedure = None;
+    backend_type = None;
+    module_path = None;
     library = None;
     at = Location.none;
   }
@@ -75,6 +79,8 @@ let option =
     collection = None;
     mathematical_integer = false;
     atomic_procedure = None;
+    backend_type = None;
+    module_path = None;
     library = None;
     at = Location.none;
   }
@@ -109,6 +115,8 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           collection = None;
           mathematical_integer = false;
           atomic_procedure = None;
+          backend_type = None;
+          module_path = None;
           library = None;
           at;
         }
@@ -151,6 +159,8 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           collection = None;
           mathematical_integer = false;
           atomic_procedure = None;
+          backend_type = None;
+          module_path = None;
           library = None;
           at;
         }
@@ -167,6 +177,8 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           collection = None;
           mathematical_integer = false;
           atomic_procedure = None;
+          backend_type = None;
+          module_path = None;
           library = None;
           at;
         }
@@ -213,6 +225,8 @@ let library_type ~library ~library_id ~at name =
     collection = None;
     mathematical_integer = false;
     atomic_procedure = None;
+    backend_type = None;
+    module_path = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
   }
@@ -220,6 +234,16 @@ let library_type ~library ~library_id ~at name =
 (** A nominal proof resource, represented by the instantiated Raven module's type. *)
 let resource_type ~name ~module_id ~at =
   { (library_type ~library:name ~library_id:module_id ~at "t") with module_name = name }
+
+let parameter_type ~parameter ~name ~declaration ~backend =
+  {
+    (library_type ~library:"Parameter" ~library_id:parameter
+       ~at:declaration.Typedtree.typ_loc name)
+    with
+    id = Some declaration.typ_id;
+    backend_type = Some backend;
+    alias = Option.map declaration.typ_manifest ~f:(fun t -> t.Typedtree.ctyp_type);
+  }
 
 (** A nominal proof token for an existing atomic procedure. *)
 let atomic_token ~path ~procedure ~at =
@@ -248,6 +272,8 @@ let collection id kind =
     collection = Some kind;
     mathematical_integer = false;
     atomic_procedure = None;
+    backend_type = None;
+    module_path = None;
     library = None;
     at = Location.none;
   }
@@ -340,7 +366,7 @@ let find_ctor (types : t list) (ocaml : string) =
         ~f:(fun c -> (d, c)))
 
 let ctor_name ~loc:l (d : t) (c : ctor) =
-  R.Name.make ~loc:l ~path:[ d.module_name ] c.raven
+  R.Name.make ~loc:l ~path:(Option.value d.module_path ~default:[ d.module_name ]) c.raven
 
 (** The Raven type of the OCaml type [t]; [self] is the data type being defined, if any,
     which its module calls [T]. *)
@@ -377,6 +403,13 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.backend_type) ->
+      let d = Option.value_exn (find types p) in
+      Ok
+        (R.Type.named ~loc:l
+           (Qualified_name.raven ~loc:l (Option.value_exn d.backend_type))
+           [])
   | Tconstr (p, [], _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
       let d = Option.value_exn (find types p) in
@@ -489,14 +522,14 @@ let find_label (types : t list) (label : Data_types.label_description) =
   | _ -> None
 
 (** The fields declaring the fields of the record types of [types] that are references. *)
-let fields (types : t list) : (R.Member.t list, Report.error) Result.t =
+let fields ?declarations (types : t list) : (R.Member.t list, Report.error) Result.t =
   let field (d : t) (f : field) =
     let* typ = typ types ~at:d.at f.typ in
     let l = loc d.at in
     Ok (field_member types ~loc:l f.raven_field typ f.typ)
   in
   Result.all
-    (List.concat_map types ~f:(fun d ->
+    (List.concat_map (Option.value declarations ~default:types) ~f:(fun d ->
          List.map (Option.value d.heap ~default:[]) ~f:(field d)))
 
 (** The module declaring [d], given the data types declared before it. *)

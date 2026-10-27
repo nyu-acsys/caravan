@@ -32,9 +32,11 @@ let ordinary_name ~field = function
   | Write -> field ^ "_ordinary_write"
 
 (** An ordinary field access is a call so it cannot be used as an atomic step. *)
-let ordinary_proc ~field ~(typ : R.Type.t) ~int op : R.Member.t =
+let ordinary_proc ?declaration_name ~field ~(typ : R.Type.t) ~int op : R.Member.t =
   let x = var "x" and v = var "v" in
-  let content = R.Expr.field ~loc x (R.Name.make ~loc field) in
+  let content =
+    R.Expr.field ~loc x (Qualified_name.raven ~loc (Qualified_name.of_string field))
+  in
   let formal x t = R.Var.make ~loc (ident x) t in
   let ghost x t = R.Var.make ~loc ~ghost:true ~implicit:true (ident x) t in
   let one = R.Expr.real ~loc 1.0 in
@@ -60,7 +62,7 @@ let ordinary_proc ~field ~(typ : R.Type.t) ~int op : R.Member.t =
   in
   R.Member.callable
     (R.Callable.proc ~loc ~formals ~returns ~requires ~ensures
-       (ident (ordinary_name ~field op))
+       (ident (Option.value declaration_name ~default:(ordinary_name ~field op)))
        (Some body))
 
 (** The procedure performing [op] on [field], whose values have type [typ]; [exact] if
@@ -68,7 +70,9 @@ let ordinary_proc ~field ~(typ : R.Type.t) ~int op : R.Member.t =
     then required to be. *)
 let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
   let x = var "x" and v = var "v" and q = var "q" in
-  let content = R.Expr.field ~loc x (R.Name.make ~loc field) in
+  let content =
+    R.Expr.field ~loc x (Qualified_name.raven ~loc (Qualified_name.of_string field))
+  in
   let own value = R.Expr.own ~loc [ content; value; q ] in
   let formal x t = R.Var.make ~loc (ident x) t in
   let ghost x t = R.Var.make ~loc ~ghost:true ~implicit:true (ident x) t in
