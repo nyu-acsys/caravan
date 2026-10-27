@@ -13,8 +13,15 @@ end
 
 module First = Make (Generic_persistent_actual)
 module Repeated = Make (Generic_persistent_actual)
+module Actual_alias = Generic_persistent_actual
+module Via_alias = Make (Actual_alias)
+module Other = Make (Generic_persistent_other)
 
 let client x =
   First.touch x;
-  Repeated.touch x
+  Repeated.touch x;
+  Via_alias.touch x
 (*@ client x requires Generic_persistent_actual.shared x ensures Generic_persistent_actual.shared x *)
+
+let other_client x = Other.touch x
+(*@ other_client x requires Generic_persistent_other.shared x ensures Generic_persistent_other.shared x *)

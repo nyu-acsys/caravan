@@ -25,8 +25,12 @@
   Verification successful.
 
   $ caravan --shh --emit-rav generic_persistent.ml > persistent.rav
-  $ sed -n '/^module Generic_.*\[/p' persistent.rav
-  $ raven --shh --typeonly persistent.rav
+  $ raven --shh --fingerprints persistent.rav > persistent.fingerprints
+  $ grep -c ' Generic_.*\.method_' persistent.fingerprints
+  1
+  $ grep -c '^[0-9a-f]\{32\} ' persistent.fingerprints
+  5
+  $ raven --shh persistent.rav
   Verification successful.
 
   $ caravan --shh generic_ref.ml

@@ -34,10 +34,6 @@ let eligible (source : Module_inventory.specialization) =
     List.for_all signature.signature_types ~f:(fun (_, declaration) ->
         match declaration.Typedtree.typ_kind with Ttype_abstract -> true | _ -> false)
   in
-  let ordinary_resources =
-    List.for_all signature.signature_resources ~f:(fun (_, resource) ->
-        not resource.Module_inventory.declaration.pred_persistent)
-  in
   let body =
     match source.template.mod_desc with
     | Tmod_functor ((Named (Some _, _, _) | Unit), { mod_desc = Tmod_structure body; _ })
@@ -97,7 +93,7 @@ let eligible (source : Module_inventory.specialization) =
             | _ -> false)
     | _ -> false
   in
-  (not (List.is_empty source.members)) && abstract_types && ordinary_resources && body
+  (not (List.is_empty source.members)) && abstract_types && body
 
 let plan ~fresh sources =
   let application source =

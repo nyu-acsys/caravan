@@ -442,6 +442,7 @@ let predicate_output_count data (predicate : S.predicate) types =
       error predicate.pred_name.pid_loc
         "Implicit parameter annotations require an ordinary predicate"
   | Some count -> Ok count
+  | None when predicate.pred_persistent -> Ok 0
   | None ->
       let count =
         List.length
@@ -11136,7 +11137,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               in
               (* Libraries share the program's predicate output convention. *)
               let* outputs = predicate_output_count types p param_types in
-              let outputs = if p.pred_persistent then 0 else outputs in
               let inputs, outputs = List.split_n params (List.length params - outputs) in
               let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
               Ok
@@ -11540,10 +11540,14 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let member =
           if aliases then
-            R.Callable.resource_alias ~loc:l ~formals ~returns (ident ~loc:l stem)
+            let kind =
+              if p.pred_persistent then R.Callable.Invariant else R.Callable.Predicate
+            in
+            R.Callable.resource_alias ~loc:l ~kind ~formals ~returns (ident ~loc:l stem)
               (qualified_name ~loc:l resource.resource_backend)
           else
-            R.Callable.func ~loc:l ~kind:Pred ~formals ~returns (ident ~loc:l stem) None
+            let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
+            R.Callable.func ~loc:l ~kind ~formals ~returns (ident ~loc:l stem) None
         in
         Ok (R.Member.callable member))
   in

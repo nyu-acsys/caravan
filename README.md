@@ -97,8 +97,10 @@ Monomorphic functors with named module parameters and a structure body support
 concrete path applications such as `module Client = Drain (Treiber_stack)`.
 Curried applications and partial applications such as `module With_A = Make (A)`
 and `module Client = With_A (B)` preserve the same result types as `Make (A) (B)`.
-Each application checks the complete argument against the parameter signature and
-verifies a separate body specialization. Parameter calls use that signature's
+Each application checks the complete argument against the parameter signature.
+Eligible bodies share one generic proof across applications, including parameters
+with invariant resources. Manual proofs and other unsupported generic encodings
+retain separate verified specializations. Parameter calls use the signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
 names retain their definition-time scope. Unused functor bodies are not verified.
 Result variants and records share their types and mutable fields across repeated
@@ -106,7 +108,7 @@ applications to the same module, including aliases. Distinct argument modules
 retain distinct result types.
 Unit functors such as `module Make () = ...` are also supported: separate
 `Make ()` applications have fresh nominal result types and mutable fields, while aliases
-of one result share its identity. Each application is verified separately.
+of one result share its identity.
 See the separate
 [`functor_stack_drain`](test/examples/functor_stack_drain) example.
 
