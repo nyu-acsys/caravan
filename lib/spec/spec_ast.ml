@@ -174,8 +174,18 @@ type return_adapter = {
 
 type resource_kind = Resource_set of pty | Resource_auth of id
 
+type proof_module_parameter =
+  | Proof_named_parameter of id * qualid
+  | Proof_unit_parameter of Location.t
+
 (** A declaration of a proof. *)
 type proof_decl =
+  | Proof_module of {
+      module_name : id;
+      module_parameters : proof_module_parameter list;
+      module_declarations : proof_decl list;
+      module_loc : Location.t;
+    }
   | Proof_predicate of predicate
   | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
   | Proof_resource of { resource_name : id; resource_kind : resource_kind }

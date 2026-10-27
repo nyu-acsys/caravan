@@ -217,6 +217,12 @@ proof:
 
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
+| MODULE n = uident EQUAL ds = proof_module_body
+    { Proof_module { module_name = n; module_parameters = [];
+        module_declarations = ds; module_loc = mk_loc $loc } }
+| MODULE n = uident ps = proof_module_parameter+ EQUAL ds = proof_module_body
+    { Proof_module { module_name = n; module_parameters = ps;
+        module_declarations = ds; module_loc = mk_loc $loc } }
 | MODULE n = uident EQUAL ghost = uident DOT au = uident LEFTPAR STRUCT
     LET operation = lident EQUAL target = lqualid END RIGHTPAR
     { if ghost.pid_str <> "Ghost" || au.pid_str <> "AU" then
@@ -282,6 +288,16 @@ proof_decl:
       Proof_action { action_name = n; action_params = ps; action_step = step;
                      action_consumes = consumes; action_state = s; action_update = fs;
                      action_linearizes = ls; action_helps = h } }
+;
+
+proof_module_body:
+| STRUCT ds = proof_decl* END { ds }
+;
+
+proof_module_parameter:
+| LEFTPAR n = uident COLON ty = uqualid RIGHTPAR
+    { Proof_named_parameter (n, ty) }
+| LEFTPAR RIGHTPAR { Proof_unit_parameter (mk_loc $loc) }
 ;
 
 type_ctor:

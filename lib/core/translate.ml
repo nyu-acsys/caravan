@@ -9479,8 +9479,8 @@ let predicates ~data (source : Source.t) =
     all source.proof ~f:(function
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
-      | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _ | Proof_resource _
-      | Proof_field _ | Proof_function _ | Proof_au _ ->
+      | Proof_module _ | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _
+      | Proof_resource _ | Proof_field _ | Proof_function _ | Proof_au _ ->
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
@@ -9848,6 +9848,15 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
                      phys_equal member.source other)))))
 
 let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
+  let* () =
+    match
+      List.find source.proof_scopes.declarations ~f:(fun entry ->
+          not (List.is_empty entry.Proof_scopes.scope.namespace))
+    with
+    | None -> Ok ()
+    | Some entry ->
+        unsupported entry.name.pid_loc "A proof declaration inside a source module"
+  in
   let annotations = Annotation.of_comments source.comments in
   (* Each annotation on an atomic step, by the end of the code it follows. *)
   let linearizations =

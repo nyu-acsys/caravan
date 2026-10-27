@@ -66,6 +66,7 @@ type t = {
           helped, each on a key. *)
   interface : interface option;
   proof : S.proof_decl list;  (** The declarations of the proof. *)
+  proof_scopes : Proof_scopes.t;
   libraries : library list;
   spec_bindings : Types.signature;
 }
@@ -988,27 +989,31 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     specialize_to_interface env typed interface;
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
-        Result.map (elaborate_proof_types env interface proof)
+        Result.bind (elaborate_proof_types env interface proof)
           ~f:(fun (env, proof_types, proof_resources, proof_fields, proof_aus) ->
-            {
-              file;
-              text;
-              scope;
-              typed;
-              comments;
-              env;
-              sequence;
-              logical_types;
-              proof_types;
-              proof_resources;
-              proof_fields;
-              proof_aus;
-              pending;
-              interface;
-              proof;
-              libraries;
-              spec_bindings = specification_bindings runtime_env env;
-            }))
+            Result.map
+              (Proof_scopes.resolve ~location:scope.location ~environment:env typed proof)
+              ~f:(fun proof_scopes ->
+                {
+                  file;
+                  text;
+                  scope;
+                  typed;
+                  comments;
+                  env;
+                  sequence;
+                  logical_types;
+                  proof_types;
+                  proof_resources;
+                  proof_fields;
+                  proof_aus;
+                  pending;
+                  interface;
+                  proof;
+                  proof_scopes;
+                  libraries;
+                  spec_bindings = specification_bindings runtime_env env;
+                })))
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

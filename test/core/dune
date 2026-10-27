@@ -17,3 +17,8 @@
   caravan_spec
   compiler-libs.common
   raven-ivl.api))
+
+(test
+ (name proof_scopes)
+ (modules proof_scopes)
+ (libraries base caravan_core caravan_spec compiler-libs.common))
