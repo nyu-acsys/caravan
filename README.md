@@ -27,10 +27,11 @@ place exported function contracts in the signature. Private function bodies are
 also verified.
 
 Static source modules can have mirrored blocks in their companion `.proof` file,
-containing predicates, invariants and lemmas. Inside a block, proofs can use private
-implementation types. Module signatures expose abstract resource contracts while
+containing logical types and functions, predicates, invariants and lemmas. Proofs
+can use private implementation types. Module signatures expose abstract resource contracts while
 hiding their definitions and implementation lemmas. Aliases preserve resource
-identity. Other scoped declarations and functor proof bodies are not supported yet.
+identity. Scoped resource-algebra instances, ghost fields, AU facades, state/action
+declarations and functor proof bodies are not supported yet.
 
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.

@@ -1,0 +1,11 @@
+module Left = struct
+  type model = Item of t
+  let payload (value : model) : int = match value with Item value -> value
+end
+
+module Right = struct
+  type model = Item of t
+end
+
+lemma mismatch (value : Right.model)
+  ensures (Left.payload value = 0) = ()

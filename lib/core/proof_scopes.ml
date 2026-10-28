@@ -14,6 +14,7 @@ type scope = {
   parameters : Typedtree.functor_parameter list;
   structure : Typedtree.structure;
   public_type : Types.module_type option;
+  sealed : bool;
   source_location : Location.t;
   proof_location : Location.t option;
 }
@@ -46,6 +47,29 @@ let find_namespace inventory namespace =
 
 let find_owner inventory owner =
   List.find inventory.scopes ~f:(fun scope -> Option.equal Path.same scope.owner owner)
+
+let rec canonical_owner inventory path =
+  match path with
+  | Path.Pident id ->
+      Option.value_map
+        (List.find inventory.scopes ~f:(fun scope ->
+             Option.exists scope.declaration_id ~f:(Ident.same id)))
+        ~default:path
+        ~f:(fun scope -> Option.value scope.owner ~default:path)
+  | Pdot (parent, name) -> Path.Pdot (canonical_owner inventory parent, name)
+  | Papply (fn, argument) ->
+      Path.Papply (canonical_owner inventory fn, canonical_owner inventory argument)
+  | Pextra_ty (path, extra) -> Path.Pextra_ty (canonical_owner inventory path, extra)
+
+let map_environments inventory ~f =
+  let update scope = { scope with environment = f scope } in
+  {
+    root = update inventory.root;
+    scopes = List.map inventory.scopes ~f:update;
+    declarations =
+      List.map inventory.declarations ~f:(fun entry ->
+          { entry with scope = update entry.scope });
+  }
 
 let compiler_error ~at exn =
   Option.value (Report.of_exn exn)
@@ -177,6 +201,7 @@ let child_scope parent (name : S.id) parameters location =
           parameters = source_parameters;
           structure;
           public_type = Some mb_expr.mod_type;
+          sealed = (match mb_expr.mod_desc with Tmod_constraint _ -> true | _ -> false);
           source_location = declaration.mb_loc;
           proof_location = Some location;
         }
@@ -193,6 +218,7 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
       parameters = [];
       structure;
       public_type = None;
+      sealed = false;
       source_location = location;
       proof_location = None;
     }

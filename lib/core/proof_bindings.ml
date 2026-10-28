@@ -5,7 +5,10 @@ module S = Caravan_spec.Spec_ast
 
 let ( let* ) = Result.( >>= )
 
-type kind = Predicate of S.predicate * S.term | Lemma of S.proof_decl
+type kind =
+  | Predicate of S.predicate * S.term
+  | Lemma of S.proof_decl
+  | Function of S.proof_decl
 
 type binding = {
   entry : Proof_scopes.entry;
@@ -100,19 +103,43 @@ let exported inventory source scope name kind =
       scope
   in
   match kind with
-  | Lemma _ -> List.is_empty relevant
+  | Lemma _ | Function _ -> List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint scope name ancestor constraint_)
 
-let opaque t binding =
+let remaining_constraints t ~scope binding =
+  relevant_constraints t.constraints t.scopes binding.entry.scope
+  |> List.filter ~f:(fun (ancestor, constraint_) ->
+      let boundary =
+        Option.value
+          (Proof_scopes.find_owner t.scopes constraint_.Module_inventory.boundary)
+          ~default:ancestor
+      in
+      not
+        (Option.exists scope ~f:(fun caller ->
+             Option.is_some
+               (drop_prefix boundary.Proof_scopes.namespace caller.Proof_scopes.namespace))))
+
+let visible t ~scope binding =
+  let relevant = remaining_constraints t ~scope binding in
   match binding.kind with
-  | Lemma _ -> false
+  | Lemma _ | Function _ -> List.is_empty relevant
   | Predicate _ ->
-      binding.exported
-      && not
-           (List.is_empty
-              (relevant_constraints t.constraints t.scopes binding.entry.scope))
+      List.for_all relevant ~f:(fun (ancestor, constraint_) ->
+          visible_in_constraint binding.entry.scope binding.entry.name.pid_str ancestor
+            constraint_)
+
+let opaque_at t ~scope binding =
+  match binding.kind with
+  | Lemma _ | Function _ -> false
+  | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
+
+let opaque t binding = binding.exported && opaque_at t ~scope:None binding
+
+let local_exports t ~scope =
+  List.filter t.bindings ~f:(fun binding ->
+      (not binding.exported) && visible t ~scope binding)
 
 let opaque_keys t =
   List.filter_map t.bindings ~f:(fun binding ->
@@ -184,8 +211,12 @@ let supported entry =
       Ok (Predicate (predicate, inv_body), predicate.pred_params)
   | Proof_lemma { lemma_params; lemma_returns; _ } ->
       Ok (Lemma entry.declaration, lemma_params @ lemma_returns)
+  | Proof_function { function_params; function_result; function_name; _ } ->
+      Ok
+        ( Function entry.declaration,
+          function_params @ [ (function_name, function_result) ] )
   | Proof_module _ | Proof_type _ | Proof_resource _ | Proof_au _ | Proof_field _
-  | Proof_function _ | Proof_state _ | Proof_view _ | Proof_action _ ->
+  | Proof_state _ | Proof_view _ | Proof_action _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -208,9 +239,19 @@ let functor_ancestor scopes scope =
 let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
   let scopes = source.proof_scopes in
   let projection = public_projection inventory scopes in
+  let projection =
+    List.fold source.proof_types ~init:projection ~f:(fun projection data ->
+        match
+          ( data.Datatypes.id,
+            List.find data.paths ~f:(function Path.Pdot _ -> true | _ -> false) )
+        with
+        | Some id, Some path -> Subst.add_type id path projection
+        | _ -> projection)
+  in
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
-        Option.is_some entry.Proof_scopes.scope.owner)
+        Option.is_some entry.Proof_scopes.scope.owner
+        && match entry.declaration with S.Proof_type _ -> false | _ -> true)
   in
   let* () =
     List.fold_result entries ~init:[] ~f:(fun previous entry ->
@@ -263,7 +304,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
         let* public_types =
           let declared =
             match kind with
-            | Lemma _ -> None
+            | Lemma _ | Function _ -> None
             | Predicate _ ->
                 Option.bind
                   (List.last (restricting_constraints inventory.constraints scope))
@@ -334,6 +375,45 @@ let canonical_key t key =
         Some binding.backend
       else None)
 
+let canonical_owner t path = Proof_scopes.canonical_owner t.scopes path
+
+(** Expresses public signatures through the module paths visible in a lexical scope. *)
+let context_type t ~environment =
+  let replacements =
+    List.filter_map t.scopes.scopes ~f:(fun scope ->
+        match (scope.Proof_scopes.owner, List.last scope.namespace) with
+        | Some owner, Some member ->
+            let q = S.Qid (S.mk_id ~loc:scope.source_location member) in
+            Option.bind (Source.module_path environment q) ~f:(fun path ->
+                Option.some_if
+                  (Path.same (canonical_owner t path) owner && not (Path.same owner path))
+                  (owner, path))
+        | _ -> None)
+  in
+  let rec path original =
+    match List.Assoc.find replacements original ~equal:Path.same with
+    | Some replacement -> replacement
+    | None -> (
+        match original with
+        | Path.Pdot (parent, member) -> Path.Pdot (path parent, member)
+        | Papply (head, argument) -> Path.Papply (path head, path argument)
+        | Pextra_ty (parent, extra) -> Path.Pextra_ty (path parent, extra)
+        | Pident _ -> original)
+  in
+  let rec typ original =
+    match Types.get_desc original with
+    | Tconstr (owner, arguments, _) ->
+        Ctype.newconstr (path owner) (List.map arguments ~f:typ)
+    | Ttuple fields ->
+        Btype.newgenty
+          (Ttuple (List.map fields ~f:(fun (label, field) -> (label, typ field))))
+    | Tarrow (label, argument, result, mode) ->
+        Btype.newgenty (Tarrow (label, typ argument, typ result, mode))
+    | Tpoly (body, variables) -> Btype.newgenty (Tpoly (typ body, variables))
+    | _ -> original
+  in
+  if List.is_empty replacements then Fn.id else typ
+
 let resolve t ~scope ~environment (q : S.qualid) =
   match q with
   | Qid id ->
@@ -362,9 +442,10 @@ let resolve t ~scope ~environment (q : S.qualid) =
                  "$runtime$" ^ Ident.unique_name id)))
   | Qdot (parent, id) ->
       Option.bind (Source.module_path environment parent) ~f:(fun owner ->
+          let owner = canonical_owner t owner in
           List.find_map t.bindings ~f:(fun binding ->
               if
-                binding.exported
+                visible t ~scope binding
                 && same_owner binding.entry.scope.owner (Some owner)
                 && String.equal binding.entry.name.pid_str id.pid_str
               then Some binding.public_key

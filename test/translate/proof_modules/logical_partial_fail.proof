@@ -1,0 +1,4 @@
+module Model = struct
+  let first (x : int) (y : int) : int = x
+  let invalid (x : int) : int = first x
+end

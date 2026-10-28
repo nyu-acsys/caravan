@@ -1,0 +1,91 @@
+module Outer = struct
+  let seed (x : t) : int = x
+
+  module Base = struct
+    type model = Empty | Item of t
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+
+    lemma item (value : t) ensures (payload (Item value) = value) = ()
+  end
+
+  module Left = struct
+    type model = Empty | Item of t
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+  end
+
+  module Right = struct
+    type model = Empty | Item of t
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+  end
+
+  module Inherited = struct
+    type model = Empty | Item of t | Link of model
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> seed value | Link _ -> 0
+
+    lemma item (value : t) ensures (payload (Item value) = value) = ()
+
+    module Deep = struct
+      type choice = Nothing | Something of model
+
+      let project (value : choice) : int =
+        match value with Nothing -> 0 | Something value -> payload value
+
+      lemma item (value : t)
+        ensures (project (Something (Item value)) = value) = ()
+    end
+  end
+
+  module Later = struct
+    type borrowed = Borrowed of Base.model
+
+    let from_base (value : Base.t) : int = Base.payload (Base.Item value)
+
+    let from_borrowed (value : borrowed) : int =
+      match value with Borrowed value -> Base.payload value
+
+    lemma item (value : Base.t) ensures (from_base value = value) = ()
+
+    lemma borrowed (value : Base.t)
+      ensures (from_borrowed (Borrowed (Base.Item value)) = value) = ()
+  end
+end
+
+module A_B = struct
+  type model = Empty | Item of t
+
+  let payload (value : model) : int =
+    match value with Empty -> 0 | Item value -> value
+
+  lemma item (value : t) ensures (payload (Item value) = value) = ()
+end
+
+module A = struct
+  module B = struct
+    type model = Empty | Item of t
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+
+    lemma item (value : t) ensures (payload (Item value) = value) = ()
+  end
+end
+
+lemma aliases (left : Outer.Alias.t) (right : Outer.Right.t)
+  ensures
+    (Outer.Alias.payload (Outer.Alias.Item left) = left
+    && Outer.Right.payload (Outer.Right.Item right) = right) =
+  ()
+
+lemma flattened_names (flat : A_B.t) (nested : A.B.t)
+  ensures
+    (A_B.payload (A_B.Item flat) = flat
+    && A.B.payload (A.B.Item nested) = nested) =
+  ()

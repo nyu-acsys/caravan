@@ -107,12 +107,20 @@ let specification_bindings runtime_env env =
   collect [] [] (Env.summary env)
 
 (** Adds the shared specification identities without hiding lexical runtime names. *)
-let annotation_env source lexical_env =
+let source_module_ids (structure : Typedtree.structure) =
+  List.concat_map structure.str_items ~f:(fun item ->
+      match item.str_desc with
+      | Tstr_module { mb_id = Some id; _ } -> [ id ]
+      | Tstr_recmodule declarations ->
+          List.filter_map declarations ~f:(fun declaration -> declaration.mb_id)
+      | _ -> [])
+
+let add_spec_bindings ?(source_modules = []) spec_bindings lexical_env =
   let find lookup id =
     try Some (lookup (Longident.Lident (Ident.name id)) lexical_env)
     with Stdlib.Not_found -> None
   in
-  List.fold source.spec_bindings ~init:lexical_env ~f:(fun env -> function
+  List.fold spec_bindings ~init:lexical_env ~f:(fun env -> function
     | Types.Sig_type (id, declaration, _, _) ->
         begin match find Env.find_type_by_name id with
         | None -> Env.add_type ~check:false id declaration env
@@ -129,13 +137,25 @@ let annotation_env source lexical_env =
         | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
         end
     | Sig_module (id, presence, declaration, _, _) ->
-        begin match find Env.find_module_by_name id with
-        | None -> Env.add_module_declaration ~check:false id presence declaration env
-        | Some (Pident local, declaration') ->
-            Env.add_module_declaration ~check:false local Mp_present declaration'
-              (Env.add_module_declaration ~check:false id presence declaration env)
-        | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
-        end
+        let lexical = find Env.find_module_by_name id in
+        let visible =
+          (not (List.mem source_modules id ~equal:Ident.same))
+          || Option.exists lexical ~f:(function
+            | Pident local, _ -> Ident.same local id
+            | _ -> false)
+        in
+        if not visible then env
+        else
+          begin match lexical with
+          | None -> Env.add_module_declaration ~check:false id presence declaration env
+          | Some (Pident local, declaration') ->
+              let declaration' =
+                if Ident.same local id then declaration else declaration'
+              in
+              Env.add_module_declaration ~check:false local Mp_present declaration'
+                (Env.add_module_declaration ~check:false id presence declaration env)
+          | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
+          end
     | Sig_modtype (id, declaration, _) ->
         begin match find Env.find_modtype_by_name id with
         | None -> Env.add_modtype id declaration env
@@ -144,6 +164,11 @@ let annotation_env source lexical_env =
         | Some ((Pdot _ | Papply _ | Pextra_ty _), _) -> env
         end
     | Sig_typext _ | Sig_class _ | Sig_class_type _ -> env)
+
+let annotation_env source lexical_env =
+  add_spec_bindings
+    ~source_modules:(source_module_ids source.typed)
+    source.spec_bindings lexical_env
 
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
 let sibling file ext =
@@ -418,11 +443,13 @@ let proof_constructor_collision env interface proof =
 
 (** Type-checks the algebraic types of [proof] in [env], after the implementation, and
     returns their descriptors and the environment for the rest of the proof. *)
-let elaborate_proof_types (env : Env.t) (interface : interface option)
+let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
+    ?complete_proof (env : Env.t) (interface : interface option)
     (proof : S.proof_decl list) :
     ( Env.t * Datatypes.t list * proof_resource list * proof_field list * proof_au list,
       Report.error )
     Result.t =
+  let complete_proof = Option.value complete_proof ~default:proof in
   let* () =
     match proof_type_collision env interface proof with
     | None -> Ok ()
@@ -478,22 +505,32 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
            (Printf.sprintf "The module %s is reserved for specifications" name))
     with Stdlib.Not_found -> Ok ()
   in
-  let* () = reserve_module env "Ghost" in
-  let* () = reserve_module env "Permission" in
-  let env =
-    signature env
-      (Parse.interface
-         (Lexing.from_string "module Ghost : sig type t type ('owner, 'value) field end"))
+  let* env =
+    if not add_standard then Ok env
+    else
+      let* () = reserve_module env "Ghost" in
+      let* () = reserve_module env "Permission" in
+      let env =
+        signature env
+          (Parse.interface
+             (Lexing.from_string
+                "module Ghost : sig type t type ('owner, 'value) field end"))
+      in
+      Ok
+        (signature env
+           (Parse.interface
+              (Lexing.from_string
+                 "module Permission : sig type t val half : t val full : t end")))
   in
-  let env =
-    signature env
-      (Parse.interface
-         (Lexing.from_string
-            "module Permission : sig type t val half : t val full : t end"))
-  in
-  let aus = ref [] in
+  let previous_types, previous_resources, previous_fields, previous_aus = previous in
+  let aus = ref (List.rev previous_aus) in
   let* env, reversed, resources, fields =
-    List.fold_result proof ~init:(env, [], [], [])
+    List.fold_result proof
+      ~init:
+        ( env,
+          List.rev previous_types,
+          List.rev previous_resources,
+          List.rev previous_fields )
       ~f:(fun (env, descriptors, resources, fields) declaration ->
         match declaration with
         | S.Proof_type { type_name; type_ctors } ->
@@ -629,7 +666,7 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
                 module_exists env name.pid_str
                 || Option.is_some
                      (find_type_by_name env (String.uncapitalize name.pid_str))
-                || List.exists proof ~f:(function
+                || List.exists complete_proof ~f:(function
                   | S.Proof_type { type_name; _ } ->
                       String.equal (String.capitalize type_name.pid_str) name.pid_str
                   | _ -> false)
@@ -860,6 +897,243 @@ let elaborate_proof_types (env : Env.t) (interface : interface option)
   in
   Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
 
+let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
+  let root_bindings = specification_bindings runtime_env root_env in
+  let aliases =
+    List.concat_map scopes.scopes ~f:(fun scope ->
+        List.concat_map scope.structure.str_items ~f:(fun item ->
+            match item.str_desc with
+            | Tstr_module
+                { mb_id = Some id; mb_expr; mb_name = { txt = Some name; _ }; _ } ->
+                begin match mb_expr.mod_desc with
+                | Tmod_ident (target, _) ->
+                    let alias =
+                      Option.value_map scope.owner ~default:(Path.Pident id)
+                        ~f:(fun owner -> Path.Pdot (owner, name))
+                    in
+                    let target =
+                      Env.normalize_module_path None scope.environment target
+                      |> Proof_scopes.canonical_owner scopes
+                    in
+                    if Path.same alias (Path.Pident id) then [ (alias, target) ]
+                    else [ (alias, target); (Path.Pident id, target) ]
+                | _ -> []
+                end
+            | _ -> []))
+  in
+  let prefix names path =
+    let rec check names path =
+      match (names, path) with
+      | [], _ -> true
+      | name :: names, part :: path when String.equal name part -> check names path
+      | _ -> false
+    in
+    check names path
+  in
+  let nested =
+    List.filter scopes.scopes ~f:(fun scope ->
+        Option.is_some scope.owner
+        && Option.value_map only ~default:true ~f:(fun namespace ->
+            prefix namespace scope.namespace))
+  in
+  let visible_sibling scope (previous_scope, _, _) =
+    let parent =
+      List.take scope.Proof_scopes.namespace (List.length scope.namespace - 1)
+    in
+    match List.rev previous_scope.Proof_scopes.namespace with
+    | _ :: reversed_parent -> List.equal String.equal (List.rev reversed_parent) parent
+    | [] -> false
+  in
+  let overlay_sibling env (previous_scope, _, bindings) =
+    match (previous_scope.Proof_scopes.declaration_id, previous_scope.namespace) with
+    | Some id, namespace when (not previous_scope.sealed) && not (List.is_empty bindings)
+      ->
+        let name = List.last_exn namespace in
+        begin try
+          match Env.find_module_by_name (Lident name) env with
+          | Pident found, declaration when Ident.same found id ->
+              begin match declaration.md_type with
+              | Mty_signature signature ->
+                  Env.add_module_declaration ~check:false id Mp_present
+                    { declaration with md_type = Mty_signature (signature @ bindings) }
+                    env
+              | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
+              end
+          | _ -> env
+        with Stdlib.Not_found -> env
+        end
+    | _ -> env
+  in
+  let refresh_aliases env owner =
+    List.fold aliases ~init:env ~f:(fun env (alias, target) ->
+        if not (Path.same target owner) then env
+        else
+          match alias with
+          | Pident id ->
+              begin try
+                match Env.find_module_by_name (Lident (Ident.name id)) env with
+                | Pident found, declaration when Ident.same found id ->
+                    Env.add_module_declaration ~check:false id Mp_present declaration env
+                | _ -> env
+              with Stdlib.Not_found -> env
+              end
+          | Pdot _ | Papply _ | Pextra_ty _ -> env)
+  in
+  let* typed =
+    List.fold_result nested ~init:[] ~f:(fun previous scope ->
+        let declarations = Proof_scopes.declarations_in scopes scope in
+        let proof =
+          List.filter_map declarations ~f:(fun entry ->
+              match entry.declaration with
+              | S.Proof_type _ | Proof_function _ -> Some entry.declaration
+              | _ -> None)
+        in
+        let under_functor =
+          List.exists scopes.scopes ~f:(fun ancestor ->
+              prefix ancestor.Proof_scopes.namespace scope.namespace
+              && not (List.is_empty ancestor.parameters))
+        in
+        let* () =
+          if List.is_empty proof || not under_functor then Ok ()
+          else
+            Report.unsupported
+              (Option.value scope.proof_location ~default:scope.source_location)
+              "A logical type or function inside a functor proof"
+        in
+        let inherited =
+          List.filter previous ~f:(fun (ancestor, _, _) ->
+              prefix ancestor.Proof_scopes.namespace scope.namespace)
+        in
+        let own_names =
+          List.filter_map proof ~f:(function
+            | S.Proof_type { type_name; _ } -> Some type_name.pid_str
+            | Proof_function { function_name; _ } -> Some function_name.pid_str
+            | _ -> None)
+        in
+        let without_shadowed bindings =
+          List.filter bindings ~f:(function
+            | Types.Sig_type (id, _, _, _) | Sig_value (id, _, _) ->
+                not (List.mem own_names (Ident.name id) ~equal:String.equal)
+            | _ -> true)
+        in
+        let base =
+          add_spec_bindings
+            ~source_modules:(source_module_ids scopes.root.structure)
+            (without_shadowed root_bindings)
+            scope.environment
+        in
+        let base =
+          List.fold inherited ~init:base ~f:(fun env (_, _, bindings) ->
+              add_spec_bindings (without_shadowed bindings) env)
+        in
+        let base =
+          List.fold previous ~init:base ~f:(fun env previous_entry ->
+              if visible_sibling scope previous_entry then
+                let env = overlay_sibling env previous_entry in
+                let previous_scope, _, _ = previous_entry in
+                Option.value_map previous_scope.owner ~default:env ~f:(fun owner ->
+                    refresh_aliases env owner)
+              else env)
+        in
+        let* env, types, _, _, _ =
+          elaborate_proof_types ~add_standard:false base None proof
+        in
+        let namespaced =
+          List.map types ~f:(fun data ->
+              let name =
+                String.capitalize
+                  (String.concat ~sep:"_" (scope.namespace @ [ data.module_name ]))
+              in
+              let data = Datatypes.with_name data name in
+              match (scope.owner, data.id) with
+              | Some owner, Some id ->
+                  let paths =
+                    [ Path.Pdot (owner, Ident.name id) ]
+                    @ Option.to_list
+                        (Option.map scope.declaration_id ~f:(fun module_id ->
+                             Path.Pdot (Path.Pident module_id, Ident.name id)))
+                    @ List.filter_map aliases ~f:(fun (alias, target) ->
+                        Option.some_if (Path.same target owner)
+                          (Path.Pdot (alias, Ident.name id)))
+                  in
+                  Datatypes.with_paths data paths
+              | _ -> data)
+        in
+        let bindings = specification_bindings base env in
+        Ok (previous @ [ (scope, (env, namespaced), bindings) ]))
+  in
+  let module_chain scope =
+    List.mapi scope.Proof_scopes.namespace ~f:(fun index name ->
+        let namespace = List.take scope.namespace (index + 1) in
+        Option.map (Proof_scopes.find_namespace scopes namespace) ~f:(fun member ->
+            (name, member.declaration_id, member.sealed)))
+    |> Option.all
+  in
+  let rec extend_signature signature chain bindings =
+    match chain with
+    | [] -> signature @ bindings
+    | (name, Some id, _) :: rest ->
+        List.map signature ~f:(function
+          | Types.Sig_module (found, presence, declaration, rec_status, visibility)
+            when Ident.same found id && String.equal (Ident.name found) name ->
+              let declaration =
+                match declaration.md_type with
+                | Mty_signature body ->
+                    {
+                      declaration with
+                      md_type = Mty_signature (extend_signature body rest bindings);
+                    }
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ -> declaration
+              in
+              Types.Sig_module (found, presence, declaration, rec_status, visibility)
+          | item -> item)
+    | (_, None, _) :: _ -> signature
+  in
+  let qualified_env =
+    List.fold typed ~init:root_env ~f:(fun env (scope, _, bindings) ->
+        match module_chain scope with
+        | Some ((name, Some id, _) :: rest as chain)
+          when (not (List.is_empty bindings))
+               && List.for_all chain ~f:(fun (_, _, sealed) -> not sealed) ->
+            begin match Env.find_module_by_name (Lident name) env with
+            | Pident found, declaration when Ident.same found id ->
+                begin match declaration.md_type with
+                | Mty_signature signature ->
+                    let signature = extend_signature signature rest bindings in
+                    Env.add_module_declaration ~check:false id Mp_present
+                      { declaration with md_type = Mty_signature signature }
+                      env
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
+                end
+            | _ -> env
+            end
+        | _ -> env)
+  in
+  let qualified_env =
+    List.fold aliases ~init:qualified_env ~f:(fun env (alias, _) ->
+        match alias with
+        | Path.Pident id ->
+            begin try
+              match Env.find_module_by_name (Lident (Ident.name id)) env with
+              | Pident found, declaration when Ident.same found id ->
+                  Env.add_module_declaration ~check:false id Mp_present declaration env
+              | _ -> env
+            with Stdlib.Not_found -> env
+            end
+        | Pdot _ | Papply _ | Pextra_ty _ -> env)
+  in
+  let scopes =
+    Proof_scopes.map_environments scopes ~f:(fun scope ->
+        match
+          List.find typed ~f:(fun (candidate, _, _) ->
+              Option.equal Ident.same candidate.declaration_id scope.declaration_id)
+        with
+        | Some (_, (env, _), _) -> env
+        | None -> if Option.is_none scope.owner then qualified_env else scope.environment)
+  in
+  let types = List.concat_map typed ~f:(fun (_, (_, types), _) -> types) in
+  Ok (qualified_env, scopes, types)
+
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
 let library_files ~include_dirs file =
@@ -989,31 +1263,74 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     specialize_to_interface env typed interface;
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
-        Result.bind (elaborate_proof_types env interface proof)
-          ~f:(fun (env, proof_types, proof_resources, proof_fields, proof_aus) ->
-            Result.map
-              (Proof_scopes.resolve ~location:scope.location ~environment:env typed proof)
-              ~f:(fun proof_scopes ->
-                {
-                  file;
-                  text;
-                  scope;
-                  typed;
-                  comments;
-                  env;
-                  sequence;
-                  logical_types;
-                  proof_types;
-                  proof_resources;
-                  proof_fields;
-                  proof_aus;
-                  pending;
-                  interface;
-                  proof;
-                  proof_scopes;
-                  libraries;
-                  spec_bindings = specification_bindings runtime_env env;
-                })))
+        let* env, _, _, _, _ = elaborate_proof_types env interface [] in
+        let* proof_scopes =
+          Proof_scopes.resolve ~location:scope.location ~environment:env typed proof
+        in
+        let initial = (env, [], [], [], [], [], proof_scopes) in
+        Result.map
+          (List.fold_result proof ~init:initial
+             ~f:(fun
+                 (env, root_types, scoped_types, resources, fields, aus, proof_scopes)
+                 declaration
+               ->
+               match declaration with
+               | S.Proof_module { module_name; _ } ->
+                   let* env, proof_scopes, types =
+                     scoped_proof_types ~only:[ module_name.pid_str ] runtime_env env
+                       proof_scopes
+                   in
+                   Ok
+                     ( env,
+                       root_types,
+                       scoped_types @ types,
+                       resources,
+                       fields,
+                       aus,
+                       proof_scopes )
+               | declaration ->
+                   let* env, root_types, resources, fields, aus =
+                     elaborate_proof_types ~add_standard:false
+                       ~previous:(root_types, resources, fields, aus)
+                       ~complete_proof:proof env interface [ declaration ]
+                   in
+                   Ok (env, root_types, scoped_types, resources, fields, aus, proof_scopes)))
+          ~f:(fun
+              ( env,
+                root_types,
+                scoped_types,
+                proof_resources,
+                proof_fields,
+                proof_aus,
+                proof_scopes )
+            ->
+            let proof_scopes =
+              Proof_scopes.map_environments proof_scopes ~f:(fun scope ->
+                  if Option.is_none scope.owner then env else scope.environment)
+            in
+            {
+              file;
+              text;
+              scope;
+              typed;
+              comments;
+              env;
+              sequence;
+              logical_types;
+              proof_types =
+                List.sort (root_types @ scoped_types) ~compare:(fun a b ->
+                    Int.compare a.Datatypes.at.loc_start.pos_cnum
+                      b.Datatypes.at.loc_start.pos_cnum);
+              proof_resources;
+              proof_fields;
+              proof_aus;
+              pending;
+              interface;
+              proof;
+              proof_scopes;
+              libraries;
+              spec_bindings = specification_bindings runtime_env env;
+            }))
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

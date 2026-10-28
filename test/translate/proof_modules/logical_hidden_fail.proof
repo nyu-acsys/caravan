@@ -1,0 +1,6 @@
+module Model = struct
+  type model = Item of t
+  let payload (x : model) : t = match x with Item value -> value
+end
+
+lemma leak (x : Alias.model) = ()

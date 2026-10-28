@@ -1,0 +1,28 @@
+module Left = struct
+  type model = Empty | Item of t
+  let payload (value : model) : int =
+    match value with Empty -> 0 | Item value -> value
+
+  lemma compute (value : t) ensures (payload (Item value) = value) = ()
+end
+
+module Right = struct
+  type model = Empty | Item of t
+  let payload (value : model) : bool =
+    match value with Empty -> false | Item value -> value
+
+  lemma compute (value : t) ensures (payload (Item value) = value) = ()
+end
+
+lemma outside (value : Alias.model)
+  ensures (Alias.payload value = Left.payload value) = ()
+
+let outer (value : Alias.model) : int = Alias.payload value
+
+type wrapped = Wrap of Alias.model
+
+let unwrap (value : wrapped) : Alias.model =
+  match value with Wrap value -> value
+
+lemma compose (value : Alias.model)
+  ensures (outer (unwrap (Wrap value)) = Alias.payload value) = ()

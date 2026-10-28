@@ -43,10 +43,10 @@ Pure logical definitions cannot read ownership or assume recursive equations.
   [1]
 
   $ caravan --shh authorities_pure_recursive.ml
-  [Error] File "authorities_pure_recursive.proof", line 1, columns 35-49:
+  [Error] File "authorities_pure_recursive.proof", line 1, columns 35-43:
   1 | let circular (value : int) : int = circular value
-                                         ^^^^^^^^^^^^^^
-  Unsupported Error: A call of a function in a contract is not supported yet.
+                                         ^^^^^^^^
+  Type Error: A logical function can only call earlier logical definitions.
   [1]
 
 Logical definitions and calls retain OCaml reference types and lexical scope.

@@ -1,0 +1,23 @@
+module Outer = struct
+  module A = struct
+    type model = Item of int
+    let payload (value : model) : int = match value with Item value -> value
+    predicate held (cell : int Atomic.t) = own cell 0
+
+    lemma preserve (cell : int Atomic.t)
+      requires (held cell) ensures (held cell) = ()
+  end
+
+  module B = struct
+    let payload (value : A.model) : int = A.payload value
+
+    lemma compute (value : int)
+      ensures (payload (A.Item value) = value) = ()
+
+    lemma preserve (cell : int Atomic.t)
+      requires (A.held cell) ensures (A.held cell) =
+      A.preserve cell;
+      unfold A.held cell;
+      fold A.held cell
+  end
+end

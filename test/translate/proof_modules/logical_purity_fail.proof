@@ -1,0 +1,5 @@
+module Model = struct
+  predicate held (x : int Atomic.t) = own x 0
+end
+
+let invalid (x : int Atomic.t) : bool = Alias.held x

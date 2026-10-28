@@ -73,6 +73,7 @@ type specialization = {
 
 type resource_constraint = {
   owner : Path.t option;
+  boundary : Path.t option;
   signature : signature_view;
   substitution : Subst.t;
   at : Location.t;
@@ -566,7 +567,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | Some id, Some path -> Subst.add_module id path substitution
               | _ -> substitution))
   in
-  let rec constrain ~restricts_visibility at substitution signature view =
+  let rec constrain ~restricts_visibility ~boundary at substitution signature view =
     if Option.is_some view.checked then
       begin match (signature.signature_resources, signature.signature_values) with
       | (_, resource) :: _, _ ->
@@ -582,6 +583,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       constraints :=
         {
           owner = Option.first_some view.application_identity view.identity;
+          boundary;
           signature;
           substitution;
           at;
@@ -615,7 +617,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 | Some _ -> Ok (name, view)
                 | None ->
                     let* view =
-                      constrain ~restricts_visibility at substitution
+                      constrain ~restricts_visibility ~boundary at substitution
                         signature.signature_body view
                     in
                     Ok (name, view)
@@ -632,7 +634,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
         }
   in
   let apply_signature ~restricts_visibility at signature view =
-    constrain ~restricts_visibility at Subst.identity signature view
+    let boundary = Option.first_some view.application_identity view.identity in
+    constrain ~restricts_visibility ~boundary at Subst.identity signature view
   in
   let seal_application_identity path signature view =
     let rec identities substitution path signature =
