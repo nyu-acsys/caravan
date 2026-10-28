@@ -30,8 +30,9 @@ Static source modules can have mirrored blocks in their companion `.proof` file,
 containing logical types and functions, resource-algebra instances, ghost fields,
 predicates, invariants and lemmas. Proofs can use private implementation types.
 Module signatures expose abstract resource contracts while hiding their definitions
-and implementation lemmas. Aliases preserve resource identity. Scoped AU facades, state/action declarations and functor proof bodies are
-not supported yet.
+and implementation lemmas. Aliases preserve resource identity. AU facades can be
+scoped to source modules, with qualified operation and token names. Scoped
+state/view/action declarations and functor proof bodies are not supported yet.
 
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.

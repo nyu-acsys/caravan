@@ -11,6 +11,7 @@ type kind =
   | Function of S.proof_decl
   | Resource of Source.proof_resource
   | Field of Source.proof_field
+  | Atomic of Source.proof_au
 
 type binding = {
   entry : Proof_scopes.entry;
@@ -105,7 +106,7 @@ let exported inventory source scope name kind =
       scope
   in
   match kind with
-  | Lemma _ | Function _ | Resource _ | Field _ -> List.is_empty relevant
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint scope name ancestor constraint_)
@@ -126,7 +127,7 @@ let remaining_constraints t ~scope binding =
 let visible t ~scope binding =
   let relevant = remaining_constraints t ~scope binding in
   match binding.kind with
-  | Lemma _ | Function _ | Resource _ | Field _ -> List.is_empty relevant
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint binding.entry.scope binding.entry.name.pid_str ancestor
@@ -134,7 +135,7 @@ let visible t ~scope binding =
 
 let opaque_at t ~scope binding =
   match binding.kind with
-  | Lemma _ | Function _ | Resource _ | Field _ -> false
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> false
   | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
 
 let opaque t binding = binding.exported && opaque_at t ~scope:None binding
@@ -174,7 +175,13 @@ let public_projection inventory scopes =
     List.fold inventory.Module_inventory.types ~init:module_substitution
       ~f:(fun substitution definition ->
         match Proof_scopes.find_namespace scopes definition.namespace with
-        | None -> substitution
+        | None ->
+            begin match
+              List.find definition.paths ~f:(function Path.Pdot _ -> true | _ -> false)
+            with
+            | None -> substitution
+            | Some path -> Subst.add_type definition.declaration.typ_id path substitution
+            end
         | Some scope ->
             begin match scope.owner with
             | None -> substitution
@@ -239,8 +246,15 @@ let supported (source : Source.t) entry =
             (Report.error Type entry.name.pid_loc
                "Missing elaborated ghost field declaration")
       end
-  | Proof_module _ | Proof_type _ | Proof_au _ | Proof_state _ | Proof_view _
-  | Proof_action _ ->
+  | Proof_au _ ->
+      begin match
+        List.find source.proof_aus ~f:(fun au -> Poly.equal au.au_at entry.name.pid_loc)
+      with
+      | Some au -> Ok (Atomic au, [])
+      | None ->
+          Error (Report.error Type entry.name.pid_loc "Missing elaborated AU facade")
+      end
+  | Proof_module _ | Proof_type _ | Proof_state _ | Proof_view _ | Proof_action _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -275,6 +289,10 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
   let projection =
     List.fold source.proof_resources ~init:projection ~f:(fun projection resource ->
         Subst.add_module resource.Source.resource_id resource.resource_path projection)
+  in
+  let projection =
+    List.fold source.proof_aus ~init:projection ~f:(fun projection au ->
+        Subst.add_module au.Source.au_id au.au_path projection)
   in
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
@@ -332,7 +350,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
         let* public_types =
           let declared =
             match kind with
-            | Lemma _ | Function _ | Resource _ | Field _ -> None
+            | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None
             | Predicate _ ->
                 Option.bind
                   (List.last (restricting_constraints inventory.constraints scope))

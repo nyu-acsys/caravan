@@ -1,0 +1,3 @@
+module Counter = struct
+  module Read = Ghost.AU (struct let operation = read end)
+end

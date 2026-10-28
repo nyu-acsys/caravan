@@ -47,11 +47,16 @@ type proof_field = {
 
 type proof_au = {
   au_name : string;
+  au_scope : Path.t option;
+  au_id : Ident.t;
+  au_path : Path.t;
+  au_environment : Env.t;
   au_operation : S.qualid;
   au_operation_path : Path.t;
   au_operation_type : Types.type_expr;
   au_token : Types.type_expr;
   au_token_path : Path.t;
+  au_token_paths : Path.t list;
   au_at : Location.t;
 }
 
@@ -602,7 +607,9 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
             let* operation_path, operation_type =
               try
                 let path, value = Env.find_value_by_name (longident operation) env in
-                Ok (path, value.Types.val_type)
+                Ok
+                  ( Env.normalize_value_path (Some at) env path |> canonical_owner,
+                    value.Types.val_type )
               with Stdlib.Not_found ->
                 Error
                   (Report.error Type (S.qualid_loc operation)
@@ -683,11 +690,16 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
             aus :=
               {
                 au_name = name.pid_str;
+                au_scope = None;
+                au_id = module_id;
+                au_path = module_path;
+                au_environment = env;
                 au_operation = operation;
                 au_operation_path = operation_path;
                 au_operation_type = operation_type;
                 au_token = token;
                 au_token_path = token_path;
+                au_token_paths = [ token_path ];
                 au_at = at;
               }
               :: !aus;
@@ -1060,7 +1072,8 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
         let proof =
           List.filter_map declarations ~f:(fun entry ->
               match entry.declaration with
-              | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _ ->
+              | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
+              | Proof_au _ ->
                   Some entry.declaration
               | _ -> None)
         in
@@ -1074,7 +1087,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
           else
             Report.unsupported
               (Option.value scope.proof_location ~default:scope.source_location)
-              "A type, function, resource, or field inside a functor proof"
+              "A type, function, resource, field, or AU inside a functor proof"
         in
         let inherited =
           List.filter previous ~f:(fun (ancestor, _, _) ->
@@ -1082,7 +1095,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
         in
         let known_resources =
           previous_resources
-          @ List.concat_map previous ~f:(fun (_, (_, _, resources, _), _) -> resources)
+          @ List.concat_map previous ~f:(fun (_, (_, _, resources, _, _), _) -> resources)
         in
         let own_names =
           List.filter_map proof ~f:(function
@@ -1090,6 +1103,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
             | Proof_function { function_name; _ } -> Some function_name.pid_str
             | Proof_resource { resource_name; _ } -> Some resource_name.pid_str
             | Proof_field { field_name; _ } -> Some field_name.pid_str
+            | Proof_au { au_name; _ } -> Some au_name.pid_str
             | _ -> None)
         in
         let without_shadowed bindings =
@@ -1119,7 +1133,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                     refresh_aliases env owner)
               else env)
         in
-        let* env, types, resources, fields, _ =
+        let* env, types, resources, fields, aus =
           elaborate_proof_types ~add_standard:false ~previous:([], known_resources, [], [])
             ~canonical_owner:(Proof_scopes.canonical_owner scopes)
             base None proof
@@ -1173,6 +1187,34 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                 field_environment = env;
               })
         in
+        let aus =
+          List.map aus ~f:(fun au ->
+              let path =
+                Option.value_map scope.owner ~default:au.au_path ~f:(fun owner ->
+                    Path.Pdot (owner, au.au_name))
+              in
+              let module_paths =
+                path
+                :: Option.to_list
+                     (Option.map scope.declaration_id ~f:(fun id ->
+                          Path.Pdot (Path.Pident id, au.au_name)))
+                @ List.filter_map aliases ~f:(fun (alias, target) ->
+                    Option.bind scope.owner ~f:(fun owner ->
+                        Option.some_if (Path.same target owner)
+                          (Path.Pdot (alias, au.au_name))))
+              in
+              let token_paths =
+                au.au_token_path
+                :: List.map module_paths ~f:(fun path -> Path.Pdot (path, "token"))
+              in
+              {
+                au with
+                au_scope = scope.owner;
+                au_path = path;
+                au_environment = env;
+                au_token_paths = List.dedup_and_sort token_paths ~compare:Path.compare;
+              })
+        in
         let namespaced =
           List.map types ~f:(fun data ->
               let name =
@@ -1195,7 +1237,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
               | _ -> data)
         in
         let bindings = specification_bindings base env in
-        Ok (previous @ [ (scope, (env, namespaced, resources, fields), bindings) ]))
+        Ok (previous @ [ (scope, (env, namespaced, resources, fields, aus), bindings) ]))
   in
   let module_chain scope =
     List.mapi scope.Proof_scopes.namespace ~f:(fun index name ->
@@ -1263,15 +1305,16 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
           List.find typed ~f:(fun (candidate, _, _) ->
               Option.equal Ident.same candidate.declaration_id scope.declaration_id)
         with
-        | Some (_, (env, _, _, _), _) -> env
+        | Some (_, (env, _, _, _, _), _) -> env
         | None -> if Option.is_none scope.owner then qualified_env else scope.environment)
   in
-  let types = List.concat_map typed ~f:(fun (_, (_, types, _, _), _) -> types) in
+  let types = List.concat_map typed ~f:(fun (_, (_, types, _, _, _), _) -> types) in
   let resources =
-    List.concat_map typed ~f:(fun (_, (_, _, resources, _), _) -> resources)
+    List.concat_map typed ~f:(fun (_, (_, _, resources, _, _), _) -> resources)
   in
-  let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields), _) -> fields) in
-  Ok (qualified_env, scopes, types, resources, fields)
+  let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields, _), _) -> fields) in
+  let aus = List.concat_map typed ~f:(fun (_, (_, _, _, _, aus), _) -> aus) in
+  Ok (qualified_env, scopes, types, resources, fields, aus)
 
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
@@ -1415,7 +1458,12 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                ->
                match declaration with
                | S.Proof_module { module_name; _ } ->
-                   let* env, proof_scopes, types, module_resources, module_fields =
+                   let* ( env,
+                          proof_scopes,
+                          types,
+                          module_resources,
+                          module_fields,
+                          module_aus ) =
                      scoped_proof_types ~only:[ module_name.pid_str ]
                        ~previous_resources:resources runtime_env env proof_scopes
                    in
@@ -1425,7 +1473,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                        scoped_types @ types,
                        resources @ module_resources,
                        fields @ module_fields,
-                       aus,
+                       aus @ module_aus,
                        proof_scopes )
                | declaration ->
                    let* env, root_types, resources, fields, aus =

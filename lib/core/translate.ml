@@ -384,7 +384,18 @@ type procedure_signature = {
   procedure_result : Types.type_expr;
 }
 
+type atomic_shape = {
+  inputs : Types.type_expr list;
+  result : Types.type_expr;
+  ghost_outputs : Types.type_expr list;
+  implicit : Types.type_expr list;
+}
+
 type atomic_signature = {
+  au_key : string;
+  au_owner : Path.t option;
+  au_private : atomic_shape;
+  au_token : Types.type_expr;
   au_source : Source.proof_au;
   au_procedure : string;
   au_inputs : Types.type_expr list;
@@ -928,8 +939,25 @@ let runtime_spec env q =
   Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
       Path_bindings.find env.ctx.proof_support.runtime_functions path)
 
+let atomic_method env = function
+  | S.Qdot (parent, method_) ->
+      Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+          let path = env.ctx.proof_support.canonical_path path in
+          Option.map
+            (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
+                 Path.same path signature.au_source.au_path
+                 || Path.same path (Pident signature.au_source.au_id)))
+            ~f:(fun signature -> (signature, method_.pid_str)))
+  | Qid _ -> None
+
 let logical_key env q =
-  match env.ctx.proof_support.proof_key env.ctx.env q with
+  let atomic_key =
+    Option.bind (atomic_method env q) ~f:(fun (signature, method_) ->
+        Option.some_if
+          (List.mem [ "pending"; "committed" ] method_ ~equal:String.equal)
+          (signature.au_key ^ "." ^ method_))
+  in
+  match Option.first_some atomic_key (env.ctx.proof_support.proof_key env.ctx.env q) with
   | Some key -> key
   | None ->
       begin match q with
@@ -974,16 +1002,8 @@ let collection_builtin env (q : S.qualid) =
       Some (m.pid_str, f.pid_str)
   | _ -> None
 
-let atomic_method env = function
-  | S.Qdot (Qid m, method_) ->
-      Option.map
-        (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
-             String.equal signature.au_source.au_name m.pid_str))
-        ~f:(fun signature -> (signature, method_.pid_str))
-  | _ -> None
-
 let atomic_inputs signature method_ =
-  let token = signature.au_source.au_token in
+  let token = signature.au_token in
   match method_ with
   | "bind" -> Some ([ Predef.type_unit ], [ token ])
   | "access" -> Some (token :: signature.au_inputs, signature.au_implicit)
@@ -9936,7 +9956,7 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
 
 let scoped_predicate (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Lemma _ | Function _ | Resource _ | Field _ -> None
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None
   | Predicate (p, body) ->
       let p = { p with S.pred_name = { p.pred_name with pid_str = binding.backend } } in
       let definition = if p.pred_persistent then Direct_invariant body else Body body in
@@ -9944,7 +9964,7 @@ let scoped_predicate (binding : Proof_bindings.binding) =
 
 let scoped_lemma (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Predicate _ | Function _ | Resource _ | Field _ -> None
+  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ -> None
   | Lemma (S.Proof_lemma lemma) ->
       Some
         (S.Proof_lemma
@@ -9960,7 +9980,7 @@ let scoped_function (binding : Proof_bindings.binding) =
              declaration with
              function_name = { declaration.function_name with pid_str = binding.backend };
            })
-  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ -> None
+  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None
 
 let signature_has_refs ~types ~environment ~substitution typ =
   let rec contains seen typ =
@@ -10017,7 +10037,7 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let* actual =
                       match binding.kind with
                       | Predicate (p, _) -> Ok p
-                      | Lemma _ | Function _ | Resource _ | Field _ ->
+                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ ->
                           error binding.entry.name.pid_loc
                             "A module resource must be defined as a predicate or \
                              invariant"
@@ -10673,7 +10693,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* atomic_operations =
     all source.proof_aus ~f:(fun (au : Source.proof_au) ->
         match
-          List.find funcs ~f:(fun f -> Path.same au.au_operation_path (Path.Pident f.id))
+          List.find funcs ~f:(fun f ->
+              List.mem f.paths au.au_operation_path ~equal:Path.same)
         with
         | None ->
             error au.au_at "An AU facade must name a procedure in this implementation"
@@ -10683,8 +10704,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let token_types =
     List.map atomic_operations ~f:(fun (au, f) ->
-        Datatypes.atomic_token ~path:au.Source.au_token_path ~procedure:(proc_name f)
-          ~at:au.au_at)
+        Datatypes.with_paths
+          (Datatypes.atomic_token ~path:au.Source.au_token_path ~procedure:(proc_name f)
+             ~at:au.au_at)
+          au.au_token_paths)
   in
   let data_types = types in
   let resource_types =
@@ -11267,7 +11290,80 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
-  let proof_context scope preds spec_funcs proof_support =
+  let atomic_predicates signatures =
+    List.concat_map signatures ~f:(fun signature ->
+        List.map [ "pending"; "committed" ] ~f:(fun method_ ->
+            let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
+            let key = signature.au_key ^ "." ^ method_ in
+            (key, (key, inputs))))
+  in
+  let context_atomic ?current_procedure scope signatures =
+    let environment =
+      Option.value_map scope ~default:source.env ~f:(fun scope ->
+          Source.annotation_env source scope.Proof_scopes.environment)
+    in
+    let public = Proof_bindings.public_type scoped_proofs in
+    let rebase = Proof_bindings.context_type scoped_proofs ~environment in
+    let inside owner =
+      match (owner, scope) with
+      | None, _ -> true
+      | Some owner, Some caller ->
+          Option.exists (Proof_scopes.find_owner source.proof_scopes (Some owner))
+            ~f:(fun parent ->
+              Option.is_some
+                (Proof_bindings.drop_prefix parent.namespace caller.Proof_scopes.namespace))
+      | Some _, None -> false
+    in
+    List.filter_map signatures ~f:(fun signature ->
+        let au = signature.au_source in
+        let binding =
+          List.find scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Atomic actual -> Ident.same actual.au_id au.au_id
+              | _ -> false)
+        in
+        if
+          Option.exists binding ~f:(fun binding ->
+              not (Proof_bindings.visible scoped_proofs ~scope binding))
+        then None
+        else
+          let private_operation =
+            Option.equal String.equal current_procedure (Some signature.au_procedure)
+            || inside signature.au_owner
+          in
+          let project =
+            if private_operation then Fn.id else fun ty -> rebase (public ty)
+          in
+          let token =
+            if inside au.au_scope then au.au_token else rebase (public au.au_token)
+          in
+          Some
+            {
+              signature with
+              au_token = token;
+              au_inputs = List.map signature.au_private.inputs ~f:project;
+              au_result = project signature.au_private.result;
+              au_ghost_outputs = List.map signature.au_private.ghost_outputs ~f:project;
+              au_implicit = List.map signature.au_private.implicit ~f:project;
+            })
+  in
+  let proof_context ?current_procedure scope preds spec_funcs proof_support =
+    let atomic_updates =
+      context_atomic ?current_procedure scope proof_support.atomic_updates
+    in
+    let atomic_keys = List.map (atomic_predicates proof_support.atomic_updates) ~f:fst in
+    let atomic_preds = atomic_predicates atomic_updates in
+    let preds =
+      List.filter preds ~f:(fun (key, _) ->
+          not (List.mem atomic_keys key ~equal:String.equal))
+      @ atomic_preds
+    in
+    let spec_funcs =
+      List.filter spec_funcs ~f:(fun (key, _) ->
+          not (List.mem atomic_keys key ~equal:String.equal))
+      @ List.map atomic_preds ~f:(fun (key, _) -> (key, key))
+    in
+    let proof_support = { proof_support with atomic_updates } in
     let resources, ghost_fields = proof_assets scope in
     let proof_support = { proof_support with resources; ghost_fields } in
     let environment =
@@ -11281,7 +11377,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           match binding.kind with
           | Predicate _ ->
               Some (binding.public_key, (binding.backend, binding.public_types))
-          | Lemma _ | Function _ | Resource _ | Field _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None)
       @ preds
     in
     let predicate_inputs =
@@ -11346,7 +11442,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Predicate _ -> Some (binding.backend, (binding.backend, binding.private_types))
-          | Lemma _ | Function _ | Resource _ | Field _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None)
     in
     let inputs =
       List.filter_map bindings ~f:(fun binding ->
@@ -11364,7 +11460,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Function _ -> Some (binding.entry.name.pid_str, binding.backend)
-          | Predicate _ | Lemma _ | Resource _ | Field _ -> None)
+          | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ -> None)
       @ List.map private_functions ~f:(fun (key, signature) ->
           (key, signature.lemma_raven))
       @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
@@ -11381,7 +11477,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* atomic_updates =
     all atomic_operations ~f:(fun (au_source, f) ->
         let preds, spec_funcs, proof_support =
-          proof_context
+          proof_context ~current_procedure:(proc_name f)
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
             preds spec_funcs proof_support
         in
@@ -11401,8 +11497,38 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
           @ List.map signature.procedure_inputs ~f:snd
         in
+        let shape =
+          {
+            inputs = au_inputs;
+            result = f.body.exp_type;
+            ghost_outputs = List.map signature.procedure_outputs ~f:snd;
+            implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
+          }
+        in
+        let key =
+          List.find_map scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Atomic actual when Ident.same actual.au_id au_source.au_id ->
+                  Some binding.backend
+              | _ -> None)
+          |> Option.value ~default:au_source.au_name
+        in
+        let owner =
+          match Proof_bindings.scope_for_location scoped_proofs f.loc with
+          | Some scope when List.equal String.equal scope.namespace f.namespace ->
+              scope.owner
+          | _ ->
+              List.find_map f.paths ~f:(function
+                | Path.Pdot (owner, _) ->
+                    Some (Proof_bindings.canonical_owner scoped_proofs owner)
+                | _ -> None)
+        in
         Ok
           {
+            au_key = key;
+            au_owner = owner;
+            au_private = shape;
+            au_token = au_source.au_token;
             au_source;
             au_procedure = proc_name f;
             au_inputs;
@@ -11412,13 +11538,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           })
   in
   let proof_support = { proof_support with atomic_updates } in
-  let atomic_predicates =
-    List.concat_map atomic_updates ~f:(fun signature ->
-        List.map [ "pending"; "committed" ] ~f:(fun method_ ->
-            let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
-            let key = signature.au_source.au_name ^ "." ^ method_ in
-            (key, (key, inputs))))
-  in
+  let atomic_predicates = atomic_predicates (context_atomic None atomic_updates) in
   let preds = preds @ atomic_predicates in
   let spec_funcs =
     spec_funcs @ List.map atomic_predicates ~f:(fun (key, _) -> (key, key))
@@ -11980,7 +12100,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               with
               | Some f ->
                   let preds, spec_funcs, proof_support =
-                    proof_context
+                    proof_context ~current_procedure:(proc_name f)
                       (Proof_bindings.scope_for_location scoped_proofs f.loc)
                       preds spec_funcs proof_support
                   in
@@ -12567,7 +12687,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let body_context f =
     let preds, spec_funcs, proof_support =
-      proof_context
+      proof_context ~current_procedure:(proc_name f)
         (Proof_bindings.scope_for_location scoped_proofs f.loc)
         preds spec_funcs proof_support
     in
