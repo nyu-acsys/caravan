@@ -38,6 +38,12 @@ type signature_resource = {
   site : site;
 }
 
+type signature_ghost_module = {
+  ghost_declaration : Caravan_spec.Spec_ast.ghost_module;
+  ghost_resource : Source.proof_resource;
+  site : site;
+}
+
 type signature_module = {
   signature_id : Ident.t option;
   signature_body : signature_view;
@@ -46,6 +52,7 @@ type signature_module = {
 
 and signature_view = {
   signature_resources : (string * signature_resource) list;
+  signature_ghost_modules : (string * signature_ghost_module) list;
   signature_values : (string * signature_value) list;
   signature_types : (string * Typedtree.type_declaration) list;
   signature_modules : (string * signature_module) list;
@@ -116,9 +123,16 @@ type signature_origin = {
   annotations : Annotation.t list;
 }
 
+let rec direct_body (expression : Typedtree.module_expr) =
+  match expression.mod_desc with
+  | Tmod_structure body -> Some body
+  | Tmod_constraint (body, _, _, _) -> direct_body body
+  | _ -> None
+
 let empty_signature =
   {
     signature_resources = [];
+    signature_ghost_modules = [];
     signature_values = [];
     signature_types = [];
     signature_modules = [];
@@ -369,7 +383,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   Error
                     (Report.error Type annotation.loc
                        "This contract is outside a signature value declaration")
-            | Predicate -> Ok ()
+            | Predicate | Ghost_module -> Ok ()
             | Loop when Annotation.invariant_declaration annotation -> Ok ()
             | Loop | Ghost | Scope | Returns | Proof | Manual | Linearization | Initially
             | Initializes | Trusted ->
@@ -378,13 +392,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   unavailable annotation.loc
                     "A declaration annotation in a nested module signature")
     in
-    let rec items view = function
+    let rec items ghost_declarations view = function
       | [] -> Ok view
       | (item : Typedtree.signature_item) :: rest ->
-          let environment, next =
+          let raw_environment, next =
             match rest with
             | next :: _ -> (next.sig_env, Some next.sig_loc)
             | [] -> (signature.sig_final_env, None)
+          in
+          let* environment =
+            Source.signature_ghost_environment source ghost_declarations raw_environment
           in
           let site =
             {
@@ -478,7 +495,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Tsig_typext _ | Tsig_exception _ | Tsig_class _ | Tsig_class_type _ ->
                 unavailable item.sig_loc "This module signature item"
           in
-          items view rest
+          items ghost_declarations view rest
     in
     let* signature_resources =
       List.filter annotations ~f:(Annotation.predicate_declaration ~interface:true)
@@ -515,7 +532,92 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               } ))
       |> Result.all
     in
-    items { empty_signature with signature_resources } signature.sig_items
+    let* signature_ghost_modules =
+      List.filter annotations ~f:(fun annotation ->
+          Poly.equal (Annotation.kind annotation) Ghost_module)
+      |> List.fold_result ~init:[] ~f:(fun declarations annotation ->
+          let* declaration = Annotation.ghost_module annotation in
+          let* ghost_resource = Source.signature_resource source declaration in
+          let name = declaration.ghost_module_name.pid_str in
+          let at = Caravan_spec.Spec_ast.qualid_loc declaration.ghost_module_interface in
+          let* signatures = Proof_library.signatures at in
+          let* () =
+            let path = Proof_library.path_of_qualid declaration.ghost_module_interface in
+            match Proof_library.find signatures path with
+            | None ->
+                Error
+                  (Report.error Type at
+                     ("Unknown Raven library interface " ^ String.concat ~sep:"." path))
+            | Some selected
+              when selected.interface
+                   && Proof_library.is_resource_algebra signatures selected ->
+                Ok ()
+            | Some _ ->
+                Error
+                  (Report.error Type at
+                     "An abstract proof module must name a resource algebra interface")
+          in
+          let duplicate = List.Assoc.mem declarations name ~equal:String.equal in
+          let runtime_module =
+            List.exists signature.sig_items ~f:(fun item ->
+                match item.Typedtree.sig_desc with
+                | Tsig_module member ->
+                    Option.equal String.equal member.md_name.txt (Some name)
+                | _ -> false)
+          in
+          let* () =
+            if duplicate || runtime_module then
+              Error
+                (Report.error Type declaration.ghost_module_name.pid_loc
+                   (Printf.sprintf "The signature module %s is already declared" name))
+            else Ok ()
+          in
+          let environment =
+            List.find_map signature.sig_items ~f:(fun item ->
+                if
+                  item.Typedtree.sig_loc.loc_start.pos_cnum
+                  >= annotation.loc.loc_end.pos_cnum
+                then Some item.sig_env
+                else None)
+            |> Option.value ~default:signature.sig_final_env
+          in
+          let site =
+            {
+              environment;
+              scope = declaration_scope;
+              annotations;
+              item_loc = annotation.loc;
+              next = None;
+            }
+          in
+          Ok
+            ((name, { ghost_declaration = declaration; ghost_resource; site })
+            :: declarations))
+    in
+    let ghost_declarations =
+      List.map signature_ghost_modules ~f:(fun (_, ghost) -> ghost.ghost_declaration)
+    in
+    let* signature_resources =
+      List.map signature_resources ~f:(fun (name, resource) ->
+          let* environment =
+            Source.signature_ghost_environment source ghost_declarations
+              resource.site.environment
+          in
+          Ok (name, { resource with site = { resource.site with environment } }))
+      |> Result.all
+    in
+    let* signature_ghost_modules =
+      List.map signature_ghost_modules ~f:(fun (name, ghost) ->
+          let* environment =
+            Source.signature_ghost_environment source ghost_declarations
+              ghost.site.environment
+          in
+          Ok (name, { ghost with site = { ghost.site with environment } }))
+      |> Result.all
+    in
+    items ghost_declarations
+      { empty_signature with signature_resources; signature_ghost_modules }
+      signature.sig_items
   in
   let signature_module_substitution substitution path signature =
     List.fold signature.signature_modules ~init:substitution
@@ -547,6 +649,59 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             signature_aliases Subst.identity path signature;
             Ok ())
   in
+  let actual_ghost_resource view name at =
+    let rec owner_paths path =
+      path
+      ::
+      (match path with
+      | Path.Papply (head, _) -> owner_paths head
+      | Pident _ | Pdot _ | Pextra_ty _ -> [])
+    in
+    let owners =
+      List.concat_map
+        (List.filter_opt [ view.identity; view.application_identity ])
+        ~f:owner_paths
+    in
+    match
+      List.find_map owners ~f:(fun owner ->
+          let path = Path.Pdot (owner, name) in
+          List.find source.proof_resources ~f:(fun resource ->
+              Source.resource_has_path resource path))
+    with
+    | Some resource -> Ok resource
+    | None ->
+        Error
+          (Report.error Type at
+             (Printf.sprintf "The module has no proof resource %s" name))
+  in
+  let ghost_substitutions ~implementation substitution signature view =
+    List.fold_result signature.signature_ghost_modules ~init:substitution
+      ~f:(fun substitution (name, ghost) ->
+        let* actual = actual_ghost_resource view name ghost.site.item_loc in
+        let exposed =
+          if implementation then actual
+          else Option.value actual.resource_public ~default:actual
+        in
+        let path =
+          if implementation then Path.Pident actual.resource_id else exposed.resource_path
+        in
+        let substitution =
+          Subst.add_module ghost.ghost_resource.resource_id path substitution
+        in
+        let carrier =
+          match Types.get_desc exposed.resource_type with
+          | Tconstr (path, [], _) -> path
+          | _ -> Path.Pdot (path, "t")
+        in
+        Ok
+          (List.fold ghost.ghost_resource.resource_type_members ~init:substitution
+             ~f:(fun substitution (member, id, _) ->
+               let path =
+                 if String.equal member "T" then carrier
+                 else Path.Pdot (path, String.uncapitalize member)
+               in
+               Subst.add_type id path substitution)))
+  in
   let substitutions substitution signature view =
     let* substitution =
       List.fold_result signature.signature_types ~init:substitution
@@ -558,15 +713,18 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 (Subst.add_type declaration.typ_id
                    (Path.Pident !definition.declaration.typ_id) substitution))
     in
-    List.fold_result signature.signature_modules ~init:substitution
-      ~f:(fun substitution (name, nested) ->
-        match member view.modules name with
-        | None -> missing source.scope.location name
-        | Some view ->
-            Ok
-              (match (nested.signature_id, view.identity) with
-              | Some id, Some path -> Subst.add_module id path substitution
-              | _ -> substitution))
+    let* substitution =
+      List.fold_result signature.signature_modules ~init:substitution
+        ~f:(fun substitution (name, nested) ->
+          match member view.modules name with
+          | None -> missing source.scope.location name
+          | Some view ->
+              Ok
+                (match (nested.signature_id, view.identity) with
+                | Some id, Some path -> Subst.add_module id path substitution
+                | _ -> substitution))
+    in
+    ghost_substitutions ~implementation:true substitution signature view
   in
   let root_module_path name =
     List.find_map (List.rev structure.str_items) ~f:(fun item ->
@@ -579,14 +737,21 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let rec constrain ~restricts_visibility ~boundary ~result_owner at substitution
       signature view =
     if Option.is_some view.checked then
-      begin match (signature.signature_resources, signature.signature_values) with
-      | (_, resource) :: _, _ ->
+      begin match
+        ( signature.signature_ghost_modules,
+          signature.signature_resources,
+          signature.signature_values )
+      with
+      | (_, ghost) :: _, _, _ ->
+          unavailable ghost.site.item_loc
+            "An abstract proof module constraint on a checked module view"
+      | [], (_, resource) :: _, _ ->
           unavailable resource.site.item_loc
             "A resource-bearing interface constraint on a checked module view"
-      | [], (_, value) :: _ ->
+      | [], [], (_, value) :: _ ->
           unavailable value.site.item_loc
             "An additional interface contract on a checked module view"
-      | [], [] -> Ok view
+      | [], [], [] -> Ok view
       end
     else
       let* substitution = substitutions substitution signature view in
@@ -606,7 +771,21 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             match member view.values name with
             | None -> missing signature_value.site.item_loc name
             | Some value ->
-                let signature_value = { signature_value with substitution } in
+                let declarations =
+                  List.map signature.signature_ghost_modules ~f:(fun (_, ghost) ->
+                      ghost.ghost_declaration)
+                in
+                let* environment =
+                  Source.realize_signature_ghost_environment source ~substitution
+                    declarations signature_value.site.environment
+                in
+                let signature_value =
+                  {
+                    signature_value with
+                    substitution;
+                    site = { signature_value.site with environment };
+                  }
+                in
                 value :=
                   { !value with signatures = !value.signatures @ [ signature_value ] };
                 Ok (name, value))
@@ -875,9 +1054,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               let* body =
                 match body.mod_desc with
                 | Tmod_functor _ -> Result.map (parameters body) ~f:snd
-                | Tmod_structure _ -> Ok body
                 | _ ->
-                    unavailable body.mod_loc "A functor without a direct structure body"
+                    if Option.is_some (direct_body body) then Ok body
+                    else
+                      unavailable body.mod_loc "A functor without a direct structure body"
               in
               Ok (parameter_name, body)
           | _ -> unavailable expression.mod_loc "A non-structural functor declaration"
@@ -1043,11 +1223,15 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           let* expected =
             signature_type ~imported:false definition.annotations parameter_type
           in
+          let* substitution =
+            ghost_substitutions ~implementation:false !parameter_substitution expected
+              actual
+          in
           let parameter_path = Path.Pident parameter in
           parameter_substitution :=
             Subst.add_module parameter
-              (Subst.module_path !parameter_substitution actual_path)
-              !parameter_substitution;
+              (Subst.module_path substitution actual_path)
+              substitution;
           let environment =
             Env.add_module ~noalias:true parameter Types.Mp_present
               parameter_type.mty_type expression.mod_env
@@ -1092,13 +1276,13 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       expansions := (expression, body) :: !expansions;
       Option.iter argument_binding ~f:(fun (parameter, binding) ->
           let declarations =
-            match body.mod_desc with
-            | Tmod_structure body ->
+            match direct_body body with
+            | Some body ->
                 List.concat_map body.str_items ~f:(fun item ->
                     match item.Typedtree.str_desc with
                     | Tstr_type (_, declarations) -> declarations
                     | _ -> [])
-            | _ -> []
+            | None -> []
           in
           specializations :=
             ( definition.template,
@@ -1147,6 +1331,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 Error
                   (Report.error Type annotation.loc
                      "This contract is outside a function declaration")
+          | Ghost_module ->
+              unavailable annotation.loc
+                "An abstract proof module outside a module signature"
           | Predicate | Loop | Ghost | Scope | Returns | Proof | Manual | Linearization
           | Initially | Initializes | Trusted ->
               Ok ())

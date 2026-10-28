@@ -1,0 +1,38 @@
+module A = struct
+  module R = Excl (struct type t = int end)
+end
+
+module B = struct
+  module R = Nat
+end
+
+module Make (X : VIEW) = struct
+  module Alias = X.R
+  module Authority = Auth (X.R)
+  let slot : (Ghost.t, X.R.t) Ghost.field = Ghost.field ()
+  let wrapped : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+  lemma identities
+    ensures (X.R.valid X.R.id && Authority.valid Authority.id && Alias.valid Alias.id) = ()
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (own (Ghost.at slot cell) X.R.id)
+    ensures (own (Ghost.at wrapped cell) Authority.id) =
+    Ghost.alloc [Ghost.init slot X.R.id; Ghost.init wrapped Authority.id]
+
+  lemma preserve (cell : Ghost.t)
+    requires (X.R.fpuAllowed X.R.id X.R.id)
+    requires (own (Ghost.at slot cell) X.R.id)
+    ensures (own (Ghost.at slot cell) X.R.id) =
+    Ghost.fpu (Ghost.at slot cell) X.R.id X.R.id
+end
+
+lemma use_one =
+  One.identities;
+  let cell = One.allocate in
+  ()
+
+lemma use_two =
+  Two.identities;
+  let cell = Two.allocate in
+  Two.preserve cell

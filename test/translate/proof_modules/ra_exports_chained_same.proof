@@ -1,0 +1,7 @@
+module Outer = struct
+  module B = struct
+    module R = Nat
+  end
+end
+
+module Public = Auth (Outer.B.R)

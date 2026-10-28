@@ -1,0 +1,29 @@
+module A = struct
+  module R = Nat
+end
+
+module Make (X : VIEW) = struct
+  module Local : ResourceAlgebra = struct
+    type t = Wrap of X.R.t
+    let id : t = Wrap X.R.id
+    let valid (value : t) : bool =
+      match value with Wrap inner -> X.R.valid inner
+    let comp (left : t) (right : t) : t =
+      match (left, right) with (Wrap left, Wrap right) -> Wrap (X.R.comp left right)
+    let frame (whole : t) (part : t) : t =
+      match (whole, part) with (Wrap whole, Wrap part) -> Wrap (X.R.frame whole part)
+    let fpuAllowed (before : t) (after : t) : bool =
+      match (before, after) with
+      | (Wrap before, Wrap after) -> X.R.fpuAllowed before after
+
+    let stored : (Ghost.t, t) Ghost.field = Ghost.field ()
+    lemma allocate returns (cell : Ghost.t)
+      ensures (own (Ghost.at stored cell) id) =
+      Ghost.alloc [Ghost.init stored id]
+  end
+
+  module Wrapped = Auth (Local)
+  lemma identity ensures (Local.valid Local.id && Wrapped.valid Wrapped.id) = ()
+end
+
+lemma client ensures (One.Local.valid One.Local.id) = ()

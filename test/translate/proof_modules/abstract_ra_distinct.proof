@@ -1,0 +1,9 @@
+module A = struct
+  module Left = Nat
+  module Right = Excl (struct type t = int end)
+end
+
+module Make (X : VIEW) = struct
+  lemma mixed
+    ensures (X.Right.comp X.Left.id X.Right.id = X.Right.id) = ()
+end

@@ -35,9 +35,14 @@ let eligible (source : Module_inventory.specialization) =
         match declaration.Typedtree.typ_kind with Ttype_abstract -> true | _ -> false)
   in
   let body =
-    match source.template.mod_desc with
-    | Tmod_functor ((Named (Some _, _, _) | Unit), { mod_desc = Tmod_structure body; _ })
-      ->
+    let direct_body =
+      match source.template.mod_desc with
+      | Tmod_functor ((Named (Some _, _, _) | Unit), body) ->
+          Module_inventory.direct_body body
+      | _ -> None
+    in
+    match direct_body with
+    | Some body ->
         let heap_access = ref false in
         let bindings =
           List.concat_map body.str_items ~f:(fun item ->
@@ -91,7 +96,7 @@ let eligible (source : Module_inventory.specialization) =
                         List.is_empty declaration.typ_params
                     | _ -> false)
             | _ -> false)
-    | _ -> false
+    | None -> false
   in
   (not (List.is_empty source.members)) && abstract_types && body
 
@@ -168,14 +173,32 @@ let member groups id =
               (group, application, stem))))
 
 let types group ~owner =
-  List.map group.representative.argument.expected.signature_types
-    ~f:(fun (source, declaration) ->
-      let backend =
-        Qualified_name.
-          {
-            path = owner;
-            name = List.Assoc.find_exn group.types source ~equal:String.equal;
-          }
-      in
-      Datatypes.parameter_type ~parameter:group.representative.parameter ~name:source
-        ~declaration ~backend)
+  let formal_types =
+    List.map group.representative.argument.expected.signature_types
+      ~f:(fun (source, declaration) ->
+        let backend =
+          Qualified_name.
+            {
+              path = owner;
+              name = List.Assoc.find_exn group.types source ~equal:String.equal;
+            }
+        in
+        Datatypes.parameter_type ~parameter:group.representative.parameter ~name:source
+          ~declaration ~backend)
+  in
+  let ghost_types =
+    List.map group.representative.argument.expected.signature_ghost_modules
+      ~f:(fun (name, ghost) ->
+        let backend = Qualified_name.{ path = owner @ [ name ]; name = "T" } in
+        let descriptor = ghost.Module_inventory.ghost_resource.resource_descriptor in
+        {
+          descriptor with
+          Datatypes.id = None;
+          module_path = Some (owner @ [ name ]);
+          backend_type = Some backend;
+          paths =
+            Path.Pdot (Path.Pdot (Path.Pident group.representative.parameter, name), "t")
+            :: descriptor.paths;
+        })
+  in
+  formal_types @ ghost_types

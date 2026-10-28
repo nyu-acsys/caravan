@@ -177,7 +177,7 @@ let implementation ~at expression =
   in
   body [] expression
 
-let child_scope parent (name : S.id) parameters location =
+let child_scope ?(check_header = true) parent (name : S.id) parameters location =
   match direct_module parent.structure name.pid_str with
   | None ->
       Error
@@ -188,7 +188,11 @@ let child_scope parent (name : S.id) parameters location =
       Report.unsupported name.pid_loc "A proof block for an anonymous module"
   | Some ({ mb_id = Some id; mb_expr; _ } as declaration) ->
       let* source_parameters, structure = implementation ~at:name.pid_loc mb_expr in
-      let* () = check_parameters ~at:name.pid_loc source_parameters parameters in
+      let* () =
+        if check_header then
+          check_parameters ~at:name.pid_loc source_parameters parameters
+        else Ok ()
+      in
       let owner =
         Option.value_map parent.owner ~default:(Path.Pident id) ~f:(fun parent ->
             Path.Pdot (parent, name.pid_str))
@@ -212,8 +216,11 @@ let child_scope parent (name : S.id) parameters location =
 let definition_scope parent (name : S.id) interface location =
   let at = name.pid_loc in
   let* () =
-    if Option.is_none parent.owner then Ok ()
-    else Report.unsupported at "A proof-defined module inside another module"
+    match parent.parameters with
+    | [] | [ Named (Some _, _, _) ] -> Ok ()
+    | _ ->
+        Report.unsupported at
+          "A proof-defined module inside a multi-parameter or unit functor"
   in
   let* id, public_type =
     match Env.find_module_by_name (Longident.Lident name.pid_str) parent.environment with
@@ -223,7 +230,10 @@ let definition_scope parent (name : S.id) interface location =
   let structure, _, _, _, _ = Typemod.type_structure parent.environment [] in
   Ok
     {
-      owner = Some (Path.Pident id);
+      owner =
+        Some
+          (Option.value_map parent.owner ~default:(Path.Pident id) ~f:(fun owner ->
+               Path.Pdot (owner, name.pid_str)));
       declaration_id = Some id;
       namespace = parent.namespace @ [ name.pid_str ];
       parent = parent.owner;
@@ -237,8 +247,8 @@ let definition_scope parent (name : S.id) interface location =
       proof_location = Some location;
     }
 
-let resolve ?(location = Location.none) ~environment (structure : Typedtree.structure)
-    declarations =
+let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_definition
+    (structure : Typedtree.structure) declarations =
   let root =
     {
       owner = None;
@@ -255,9 +265,13 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
       proof_location = None;
     }
   in
-  let rec collect scope scopes entries declarations =
-    List.fold_result declarations ~init:(scopes, entries)
-      ~f:(fun (scopes, entries) declaration ->
+  let replace_scope scope scopes =
+    List.map scopes ~f:(fun previous ->
+        if same_scope scope previous then scope else previous)
+  in
+  let rec collect state scope scopes entries declarations =
+    List.fold_result declarations ~init:(state, scope, scopes, entries)
+      ~f:(fun (state, scope, scopes, entries) declaration ->
         match declaration with
         | S.Proof_module
             { module_name; module_parameters; module_declarations; module_loc } ->
@@ -271,10 +285,18 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
                           (Option.map previous.proof_location ~f:(fun at ->
                                (at, "Its other proof block"))))
                      "A source module has more than one proof block")
-            | None -> collect nested (nested :: scopes) entries module_declarations
+            | None ->
+                let* state, _, scopes, entries =
+                  collect state nested (nested :: scopes) entries module_declarations
+                in
+                Ok (state, scope, scopes, entries)
             end
         | S.Proof_definition
             { module_name; module_interface; module_declarations; module_loc } ->
+            let* state, scope =
+              prepare_definition state scope module_name module_interface
+            in
+            let scopes = replace_scope scope scopes in
             let* nested =
               definition_scope scope module_name module_interface module_loc
             in
@@ -283,17 +305,37 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
                 Error
                   (Report.error Type module_name.pid_loc
                      "A proof-defined module has more than one definition")
-            | None -> collect nested (nested :: scopes) entries module_declarations
+            | None ->
+                let header =
+                  {
+                    id = Ident.create_local module_name.pid_str;
+                    name = module_name;
+                    declaration;
+                    scope;
+                  }
+                in
+                let* state, _, scopes, entries =
+                  collect state nested (nested :: scopes) (header :: entries)
+                    module_declarations
+                in
+                Ok (state, scope, scopes, entries)
             end
         | declaration ->
             let name = name declaration in
             let entry =
               { id = Ident.create_local name.pid_str; name; declaration; scope }
             in
-            Ok (scopes, entry :: entries))
+            Ok (state, scope, scopes, entry :: entries))
   in
-  let* scopes, declarations = collect root [ root ] [] declarations in
-  Ok { root; scopes = List.rev scopes; declarations = List.rev declarations }
+  let* state, root, scopes, declarations = collect state root [ root ] [] declarations in
+  Ok (state, { root; scopes = List.rev scopes; declarations = List.rev declarations })
+
+let resolve ?location ~environment structure declarations =
+  Result.map
+    (resolve_prepared ?location ~environment ~state:()
+       ~prepare_definition:(fun () scope _ _ -> Ok ((), scope))
+       structure declarations)
+    ~f:snd
 
 (** Module owners containing a source annotation, including scopes without proof blocks.
 *)

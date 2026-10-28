@@ -1,0 +1,26 @@
+module A = struct
+  module R = Nat
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+
+  predicate token (cell : Ghost.t) (value : R.t) =
+    own (Ghost.at slot cell) value
+end
+
+module Direct_auth = Auth (View.R)
+module Nested_auth = Auth (View.Nested.R)
+let direct_slot : (Ghost.t, View.R.t) Ghost.field = Ghost.field ()
+let nested_slot : (Ghost.t, View.Nested.R.t) Ghost.field = Ghost.field ()
+
+lemma imported_ids
+  ensures (View.R.valid View.R.id)
+  ensures (View.Nested.R.valid View.Nested.R.id)
+  ensures (Direct_auth.valid Direct_auth.id)
+  ensures (Nested_auth.valid Nested_auth.id) = ()
+
+lemma public_carrier (cell : Ghost.t)
+  requires (A.token cell A.R.id)
+  ensures (A.token cell A.R.id) = ()
+
+lemma direct_carrier (cell : Ghost.t)
+  requires (View.direct_token cell View.R.id)
+  ensures (View.direct_token cell View.R.id) = ()

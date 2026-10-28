@@ -1,0 +1,6 @@
+module A = struct
+  module R = Nat
+  lemma private_helper ensures (R.valid R.id) = ()
+end
+
+lemma hidden_helper = A.private_helper

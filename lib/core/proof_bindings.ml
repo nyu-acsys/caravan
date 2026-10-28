@@ -123,6 +123,16 @@ let visible_in_constraint scope name ancestor constraint_ =
           List.Assoc.mem signature.signature_resources name ~equal:String.equal
       end
 
+let resource_in_constraint scope name ancestor constraint_ =
+  match drop_prefix ancestor.Proof_scopes.namespace scope.Proof_scopes.namespace with
+  | None -> true
+  | Some suffix ->
+      begin match signature_member constraint_.Module_inventory.signature suffix with
+      | None -> false
+      | Some signature ->
+          List.Assoc.mem signature.signature_ghost_modules name ~equal:String.equal
+      end
+
 let relevant_constraints constraints scopes scope =
   let ancestors =
     List.filter scopes.Proof_scopes.scopes ~f:(fun ancestor ->
@@ -142,11 +152,14 @@ let exported inventory source scope name kind =
   if Option.is_some template || Option.is_some scope.Proof_scopes.definition then false
   else
     match kind with
-    | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+    | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
         List.is_empty relevant
     | Predicate _ ->
         List.for_all relevant ~f:(fun (ancestor, constraint_) ->
             visible_in_constraint scope name ancestor constraint_)
+    | Resource _ ->
+        List.for_all relevant ~f:(fun (ancestor, constraint_) ->
+            resource_in_constraint scope name ancestor constraint_)
 
 let remaining_constraints t ~scope binding =
   relevant_constraints t.constraints t.scopes binding.entry.scope
@@ -173,16 +186,21 @@ let visible t ~scope binding =
   inside_template
   &&
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
       List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint binding.entry.scope binding.entry.name.pid_str ancestor
             constraint_)
+  | Resource _ ->
+      List.for_all relevant ~f:(fun (ancestor, constraint_) ->
+          resource_in_constraint binding.entry.scope binding.entry.name.pid_str ancestor
+            constraint_)
 
 let opaque_at t ~scope binding =
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ -> false
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ -> false
+  | Resource _ -> not (List.is_empty (remaining_constraints t ~scope binding))
   | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
 
 let opaque t binding = binding.exported && opaque_at t ~scope:None binding
@@ -193,13 +211,27 @@ let local_exports t ~scope =
 
 let opaque_keys t =
   List.filter_map t.bindings ~f:(fun binding ->
-      Option.some_if (opaque t binding) binding.public_key)
+      match binding.kind with
+      | Predicate _ -> Option.some_if (opaque t binding) binding.public_key
+      | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+          None)
 
 let rec signature_type_projection substitution owner signature =
   let substitution =
     List.fold signature.Module_inventory.signature_types ~init:substitution
       ~f:(fun substitution (name, declaration) ->
         Subst.add_type declaration.Typedtree.typ_id (Path.Pdot (owner, name)) substitution)
+  in
+  let substitution =
+    List.fold signature.signature_ghost_modules ~init:substitution
+      ~f:(fun substitution (name, ghost) ->
+        let path = Path.Pdot (owner, name) in
+        let substitution =
+          Subst.add_module ghost.ghost_resource.resource_id path substitution
+        in
+        List.fold ghost.ghost_resource.resource_type_members ~init:substitution
+          ~f:(fun substitution (member, id, _) ->
+            Subst.add_type id (Path.Pdot (path, String.uncapitalize member)) substitution))
   in
   List.fold signature.signature_modules ~init:substitution
     ~f:(fun substitution (name, nested) ->
@@ -391,7 +423,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       Ok
         ( Function entry.declaration,
           function_params @ [ (function_name, function_result) ] )
-  | Proof_resource _ ->
+  | Proof_resource _ | Proof_definition _ ->
       begin match
         List.find source.proof_resources ~f:(fun resource ->
             Poly.equal resource.resource_at entry.name.pid_loc)
@@ -421,7 +453,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       | None ->
           Error (Report.error Type entry.name.pid_loc "Missing elaborated AU facade")
       end
-  | Proof_module _ | Proof_definition _ | Proof_type _ ->
+  | Proof_module _ | Proof_type _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -468,10 +500,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
         Option.is_some entry.Proof_scopes.scope.owner
-        &&
-        match entry.declaration with
-        | S.Proof_type _ | S.Proof_definition _ -> false
-        | _ -> true)
+        && match entry.declaration with S.Proof_type _ -> false | _ -> true)
   in
   let* () =
     List.fold_result entries ~init:[] ~f:(fun previous entry ->
@@ -501,8 +530,11 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
           | Some ancestor ->
               begin match (ancestor.parameters, entry.declaration) with
               | ( [ Named (Some _, _, _) ],
-                  (S.Proof_predicate _ | Proof_lemma _ | Proof_function _) )
-                when same_owner ancestor.owner scope.owner ->
+                  ( S.Proof_predicate _ | Proof_lemma _ | Proof_function _
+                  | Proof_resource _ | Proof_definition _ | Proof_field _ ) )
+                when same_owner ancestor.owner scope.owner
+                     || Option.is_some scope.definition
+                        && same_owner ancestor.owner scope.parent ->
                   Ok ()
               | _ ->
                   Report.unsupported entry.name.pid_loc
@@ -559,18 +591,29 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
               ->
                 None
             | Predicate _ ->
-                Option.bind
-                  (List.last (restricting_constraints inventory.constraints scope))
-                  ~f:(fun constraint_ ->
-                    Option.map
-                      (List.Assoc.find
-                         constraint_.Module_inventory.signature.signature_resources
-                         entry.name.pid_str ~equal:String.equal) ~f:(fun formal ->
-                        (constraint_, formal)))
+                relevant_constraints inventory.constraints source.proof_scopes scope
+                |> List.filter_map ~f:(fun (ancestor, constraint_) ->
+                    Option.bind
+                      (drop_prefix ancestor.Proof_scopes.namespace scope.namespace)
+                      ~f:(fun suffix ->
+                        Option.bind
+                          (signature_member constraint_.Module_inventory.signature suffix)
+                          ~f:(fun signature ->
+                            Option.map
+                              (List.Assoc.find signature.signature_resources
+                                 entry.name.pid_str ~equal:String.equal) ~f:(fun formal ->
+                                (ancestor, signature, formal)))))
+                |> List.max_elt
+                     ~compare:(fun
+                         ((left : Proof_scopes.scope), _, _)
+                         ((right : Proof_scopes.scope), _, _)
+                       ->
+                       Int.compare (List.length left.namespace)
+                         (List.length right.namespace))
           in
           match declared with
           | None -> Ok (List.map private_types ~f:(Subst.type_expr projection))
-          | Some (constraint_, formal) ->
+          | Some (_, signature, formal) ->
               let signature_environment =
                 Source.annotation_env source formal.site.environment
               in
@@ -579,7 +622,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
               in
               let projection =
                 Option.value_map scope.owner ~default:projection ~f:(fun owner ->
-                    signature_type_projection projection owner constraint_.signature)
+                    signature_type_projection projection owner signature)
               in
               Ok (List.map types ~f:(Subst.type_expr projection))
         in
@@ -636,6 +679,10 @@ let application_visible ?owners t ~scope (view : application) =
   | Predicate _ ->
       List.for_all constraints ~f:(fun constraint_ ->
           List.Assoc.mem constraint_.Module_inventory.signature.signature_resources
+            view.source.entry.name.pid_str ~equal:String.equal)
+  | Resource _ ->
+      List.for_all constraints ~f:(fun constraint_ ->
+          List.Assoc.mem constraint_.Module_inventory.signature.signature_ghost_modules
             view.source.entry.name.pid_str ~equal:String.equal)
   | _ -> List.is_empty constraints
 

@@ -29,6 +29,7 @@ let mk_id ?(fixity = Normal) ?(attrs = []) ~loc str =
 let add_attr id attr = { id with pid_attrs = attr :: id.pid_attrs }
 
 type qualid = Qid of id | Qdot of qualid * id
+type ghost_module = { ghost_module_name : id; ghost_module_interface : qualid }
 
 let rec qualid_loc = function Qid id -> id.pid_loc | Qdot (_, id) -> id.pid_loc
 

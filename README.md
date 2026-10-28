@@ -38,15 +38,21 @@ by manual scopes and clients of applied result modules. Their definitions and pr
 are translated once in a shared Raven functor, with shared result layouts for
 applicative model types.
 Aliases preserve proof member identity, while result signatures expose declared
-predicates opaquely and hide implementation lemmas. Other functor-owned proof
-declarations are not supported yet.
+predicates opaquely and hide implementation lemmas. Functor proofs can also
+instantiate resource algebras and declare ghost fields; functor-owned AU facades
+and state/action declarations remain unsupported.
 
 Proofs can instantiate Raven library modules using OCaml-style module applications.
 Their types, constructors, operations and parameter requirements come from Raven's
 checked signatures; resource algebras are recognized by their `ResourceAlgebra`
 interface. Proofs can define their own resource algebras with
 `module M : ResourceAlgebra = struct … end`; Raven checks the algebra laws and
-the interface hides implementation details.
+the interface hides implementation details. Functor parameter signatures can declare
+an abstract proof algebra with `(*@ module R : ResourceAlgebra *)`; generic proofs use
+its operations and may wrap it in library functors such as `Auth`. Signatures and
+imported interfaces can export these algebras and use their carriers in predicates
+and contracts. User-defined algebras may also be nested in source module and
+functor proof blocks. Contract-only functors need no empty proof block.
 
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.

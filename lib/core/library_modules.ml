@@ -17,6 +17,14 @@ type named_signature = {
   interface : Source.interface;
 }
 
+let environment (source : Source.t) library =
+  match Env.open_signature Asttypes.Override library.library_path source.env with
+  | Ok environment -> Ok environment
+  | Error (`Not_found | `Functor) ->
+      Error
+        (Report.error Type library.library.scope.location
+           ("Cannot resolve imported module " ^ library.source_name))
+
 let contains (outer : Location.t) (inner : Location.t) =
   outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
@@ -54,6 +62,7 @@ let direct_comments (interface : Source.interface) (signature : Typedtree.signat
               Error
                 (Report.error Type annotation.loc
                    "This contract is outside an imported value declaration")
+        | Ghost_module -> Ok ()
         | Loop | Predicate | Ghost | Scope | Returns | Proof | Manual | Linearization
         | Initially | Initializes | Trusted ->
             Ok ())

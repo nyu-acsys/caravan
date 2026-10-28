@@ -31,6 +31,7 @@ type kind =
   | Contract
   | Loop
   | Predicate
+  | Ghost_module
   | Ghost
   | Scope
   | Returns
@@ -50,6 +51,7 @@ let kind (annotation : t) =
   with
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
+  | "module" :: _ -> Ghost_module
   | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
   | ("Ghost.scope" | "Ghost.State.scope") :: _ -> Scope
   | "Ghost.returns" :: _ -> Returns
@@ -83,6 +85,7 @@ let predicate (annotation : t) =
     (if invariant_declaration annotation then Spec_parser.invariant_declaration
      else Spec_parser.predicate)
 
+let ghost_module (annotation : t) = parse annotation Spec_parser.ghost_module_declaration
 let ghost_stmts (annotation : t) = parse annotation Spec_parser.ghost_stmts
 let linearization (annotation : t) = parse annotation Spec_parser.linearization
 let initially (annotation : t) = parse annotation Spec_parser.initially

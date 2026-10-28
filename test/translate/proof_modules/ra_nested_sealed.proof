@@ -1,0 +1,12 @@
+module A = struct
+  module R : ResourceAlgebra = struct
+    type t = Unit
+    let id : t = Unit
+    let valid (value : t) : bool = true
+    let comp (left : t) (right : t) : t = Unit
+    let frame (whole : t) (part : t) : t = Unit
+    let fpuAllowed (before : t) (after : t) : bool = true
+  end
+end
+
+module Public = Auth (A.R)

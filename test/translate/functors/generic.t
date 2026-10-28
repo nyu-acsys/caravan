@@ -104,11 +104,15 @@
   Verification successful.
 
   $ caravan --shh generic_shadowed.ml
-  [Error] File "generic_shadowed.ml", line 9, column 28 to line 15, column 3:
-  9 | module Make (Cell : View) = struct
-                                  ^^^^^^
-  Unsupported Error: A functor without a direct structure body is not supported yet.
-  [1]
+  Verification successful.
+
+  $ caravan --shh --emit-rav generic_shadowed.ml > shadowed.rav
+  $ grep -c '^proc first_read' shadowed.rav
+  2
+  $ grep -c '^proc second_read' shadowed.rav
+  2
+  $ raven --shh shadowed.rav
+  Verification successful.
 
   $ caravan --shh generic_later_argument_fail.ml
   [Error] File "generic_later_argument_fail.ml", line 15, columns 22-48:

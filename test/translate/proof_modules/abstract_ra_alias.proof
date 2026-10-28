@@ -1,0 +1,12 @@
+module A = struct
+  module R = Nat
+end
+
+module Make (X : VIEW) = struct
+  lemma valid_identity ensures (X.R.valid X.R.id) = ()
+end
+
+module Make_alias (X : VIEW_ALIAS) = struct
+  lemma compose_identity
+    ensures (X.R.comp X.R.id X.R.id = X.R.id) = ()
+end

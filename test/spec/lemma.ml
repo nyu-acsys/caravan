@@ -13,6 +13,10 @@ let parse_ghost source =
   let lexbuf = Lexing.from_string source in
   Spec_parser.ghost_stmts Spec_lexer.token lexbuf
 
+let parse_ghost_module source =
+  let lexbuf = Lexing.from_string source in
+  Spec_parser.ghost_module_declaration Spec_lexer.token lexbuf
+
 let rec proof_kinds expr =
   match expr.proof_desc with
   | Proof_value _ -> [ "value" ]
@@ -27,6 +31,18 @@ let rec proof_kinds expr =
   | Proof_unfold (_, names) -> [ (if names = [] then "unfold" else "unfold with names") ]
 
 let () =
+  begin match parse_ghost_module "module R : ResourceAlgebra" with
+  | {
+   ghost_module_name = { pid_str = "R"; _ };
+   ghost_module_interface = Qid { pid_str = "ResourceAlgebra"; _ };
+  } ->
+      ()
+  | _ -> failwith "abstract proof module was not parsed"
+  end;
+  begin match parse_ghost_module "module R : Library.ResourceAlgebra" with
+  | { ghost_module_interface = Qdot (Qid _, { pid_str = "ResourceAlgebra"; _ }); _ } -> ()
+  | _ -> failwith "qualified abstract proof module interface was not parsed"
+  end;
   let proof =
     parse_proof
       {|lemma step (x : int) (y : int) returns (r : int) (s : int)

@@ -142,11 +142,17 @@
 %start <Spec_ast.loop_spec> loop_spec
 %start <Spec_ast.predicate> predicate
 %start <Spec_ast.predicate> invariant_declaration
+%start <Spec_ast.ghost_module> ghost_module_declaration
 %start <Spec_ast.proof_decl list> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
 %start <Spec_ast.initialization> initially
 %%
+
+ghost_module_declaration:
+| MODULE name = uident COLON interface = uqualid EOF
+    { { ghost_module_name = name; ghost_module_interface = interface } }
+;
 
 contract:
 | h = header? cs = clause* EOF { mk_contract h cs }

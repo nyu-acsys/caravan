@@ -1,0 +1,4 @@
+module Hidden = Excl (struct type t = Opaque.t end)
+
+lemma hidden_representation
+  ensures (Hidden.valid (Hidden.excl 1)) = ()

@@ -33,6 +33,7 @@ type proof_resource = {
   resource_interfaces : string list list;
   resource_alias_of : Path.t option;
   resource_definition : bool;
+  resource_abstract : bool;
   resource_representation : Types.type_expr option;
   resource_type_members : (string * Ident.t * Types.type_declaration) list;
   resource_type : Types.type_expr;
@@ -42,7 +43,15 @@ type proof_resource = {
   resource_descriptor : Datatypes.t;
   resource_aliases : Datatypes.t list;
   resource_at : Location.t;
+  resource_public : proof_resource option;
+  resource_application : (Path.t * Ident.t) option;
 }
+
+let resource_has_path resource path =
+  Path.same path resource.resource_path
+  || Path.same path (Path.Pident resource.resource_id)
+  || Option.exists resource.resource_application ~f:(fun (identity, _) ->
+      Path.same path (Path.Pdot (identity, resource.resource_name)))
 
 type proof_field = {
   field_name : string;
@@ -86,6 +95,7 @@ type t = {
       (** The logical types of specifications, identified by their declarations. *)
   proof_types : Datatypes.t list;  (** Algebraic types declared by the proof. *)
   proof_resources : proof_resource list;
+  signature_resources : (Location.t * proof_resource) list;
   proof_fields : proof_field list;
   proof_aus : proof_au list;
   pending : Path.t;
@@ -316,6 +326,92 @@ let annotation_env ?at source lexical_env =
           in
           add_spec_bindings ~source_modules bindings env)
 
+let project_ghost_parameter source ~original ~target lexical_env =
+  let resources =
+    List.filter source.proof_resources ~f:(fun resource ->
+        resource.resource_abstract
+        &&
+        match resource.resource_path with
+        | Path.Pdot (Pident parameter, _) -> Ident.same parameter original
+        | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false)
+  in
+  match resources with
+  | [] -> Ok lexical_env
+  | first :: _ ->
+      let at = first.resource_at in
+      let error message = Error (Report.error Type at message) in
+      let compiler f =
+        try Ok (f ())
+        with exn ->
+          Error
+            (Option.value (Report.of_exn exn)
+               ~default:(Report.error Type at (Stdlib.Printexc.to_string exn)))
+      in
+      let* scope =
+        match
+          List.find source.proof_scopes.scopes ~f:(fun scope ->
+              List.exists scope.Proof_scopes.parameters ~f:(function
+                | Typedtree.Named (Some id, _, _) -> Ident.same id original
+                | Unit | Named (None, _, _) -> false))
+        with
+        | Some scope -> Ok scope
+        | None -> error "The abstract proof parameter has no source scope"
+      in
+      let* original_signature =
+        let* module_type =
+          compiler (fun () ->
+              let declaration = Env.find_module (Pident original) scope.environment in
+              Mtype.scrape scope.environment declaration.md_type)
+        in
+        match module_type with
+        | Mty_signature members -> Ok members
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            error "The abstract proof parameter has no signature"
+      in
+      let names = List.map resources ~f:(fun resource -> resource.resource_name) in
+      let ghost_members =
+        List.filter original_signature ~f:(function
+          | Types.Sig_module (id, _, _, _, _) ->
+              List.mem names (Ident.name id) ~equal:String.equal
+          | _ -> false)
+      in
+      let* () =
+        if List.length ghost_members = List.length resources then Ok ()
+        else error "An abstract proof module is missing from its parameter signature"
+      in
+      let* lexical_env =
+        compiler (fun () ->
+            List.fold resources ~init:lexical_env ~f:(fun env resource ->
+                List.fold resource.resource_type_members ~init:env
+                  ~f:(fun env (_, id, declaration) ->
+                    Env.add_type ~check:false id declaration env)))
+      in
+      let* target_declaration =
+        compiler (fun () -> Env.find_module (Pident target) lexical_env)
+      in
+      let* target_signature =
+        let* module_type =
+          compiler (fun () -> Mtype.scrape lexical_env target_declaration.md_type)
+        in
+        match module_type with
+        | Mty_signature members -> Ok members
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            error "The specialized proof parameter has no signature"
+      in
+      let target_signature =
+        List.filter target_signature ~f:(function
+          | Types.Sig_module (id, _, _, _, _) ->
+              not (List.mem names (Ident.name id) ~equal:String.equal)
+          | _ -> true)
+      in
+      compiler (fun () ->
+          Env.add_module_declaration ~check:false target Mp_present
+            {
+              target_declaration with
+              md_type = Mty_signature (target_signature @ ghost_members);
+            }
+            lexical_env)
+
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
 let sibling file ext =
   let other = Stdlib.Filename.remove_extension file ^ ext in
@@ -521,6 +617,17 @@ let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
   | PTarrow (a, b) ->
       Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at a) (core_type ~at b)
 
+let rec monotype typ =
+  match Types.get_desc typ with Tpoly (body, []) -> monotype body | _ -> typ
+
+let rec function_arguments typ =
+  let typ = monotype typ in
+  match Types.get_desc typ with
+  | Tarrow (_, argument, rest, _) ->
+      let arguments, result = function_arguments rest in
+      (monotype argument :: arguments, result)
+  | _ -> ([], typ)
+
 let find_type_by_name env name =
   try Some (Env.find_type_by_name (Lident name) env) with Stdlib.Not_found -> None
 
@@ -672,6 +779,29 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                  "module Permission : sig type t val half : t val full : t end")))
   in
   let previous_types, previous_resources, previous_fields, previous_aus = previous in
+  let resource_at_path env resources path =
+    let private_id =
+      List.find resources ~f:(fun resource ->
+          Path.same path (Pident resource.resource_id))
+    in
+    let private_representation =
+      try
+        let declaration = Env.find_type (Path.Pdot (path, "t")) env in
+        Option.is_some declaration.type_manifest
+      with Stdlib.Not_found -> false
+    in
+    let public_view =
+      if private_representation then None
+      else
+        List.find_map resources ~f:(fun resource ->
+            Option.bind resource.resource_public ~f:(fun public ->
+                Option.some_if (resource_has_path public path) public))
+    in
+    let private_path =
+      List.find resources ~f:(fun resource -> resource_has_path resource path)
+    in
+    Option.first_some private_id (Option.first_some public_view private_path)
+  in
   let aus = ref (List.rev previous_aus) in
   let* env, reversed, resources, fields =
     List.fold_result proof
@@ -725,19 +855,6 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 Error
                   (Report.error Type (S.qualid_loc operation)
                      "The AU operation is not an OCaml function")
-            in
-            let rec function_arguments typ =
-              match Types.get_desc typ with
-              | Tpoly (body, []) -> function_arguments body
-              | Tarrow (_, argument, rest, _) ->
-                  let args, result = function_arguments rest in
-                  let rec monotype typ =
-                    match Types.get_desc typ with
-                    | Tpoly (body, []) -> monotype body
-                    | _ -> typ
-                  in
-                  (monotype argument :: args, result)
-              | _ -> ([], typ)
             in
             let args, result = function_arguments operation_type in
             let* () =
@@ -826,9 +943,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
               try
                 let path, _ = Env.find_module_by_name (longident resource_functor) env in
                 let path = Env.normalize_module_path None env path |> canonical_owner in
-                List.find resources ~f:(fun resource ->
-                    Path.same path resource.resource_path
-                    || Path.same path (Pident resource.resource_id))
+                resource_at_path env resources path
               with Stdlib.Not_found -> None
             in
             let* () =
@@ -902,11 +1017,14 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     resource_arguments = [];
                     resource_alias_of = Some target.resource_path;
                     resource_definition = false;
+                    resource_abstract = false;
                     resource_representation = None;
                     resource_id;
                     resource_descriptor = descriptor;
                     resource_aliases = aliases;
                     resource_at = at;
+                    resource_public = None;
+                    resource_application = None;
                   }
                 in
                 Ok (env, descriptors, resource :: resources, fields)
@@ -930,6 +1048,11 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 let library_types = Proof_library.member_types signatures library in
                 let library_constants =
                   Proof_library.member_constants signatures library
+                in
+                let ra_interface =
+                  if Proof_library.is_resource_algebra signatures library then
+                    Proof_library.find signatures [ "ResourceAlgebra" ]
+                  else None
                 in
                 let* () =
                   if
@@ -995,11 +1118,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                       "The proof module argument is not declared")
                              in
                              let* actual =
-                               match
-                                 List.find resources ~f:(fun resource ->
-                                     Path.same path resource.resource_path
-                                     || Path.same path (Pident resource.resource_id))
-                               with
+                               match resource_at_path env resources path with
                                | Some resource -> Ok resource
                                | None ->
                                    Error
@@ -1026,27 +1145,35 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                              in
                              Ok (Module_argument path)))
                 in
-                let resource_at_path path =
-                  List.find resources ~f:(fun resource ->
-                      Path.same path resource.resource_path
-                      || Path.same path (Pident resource.resource_id))
-                in
                 let rec same_resource left right =
-                  if Path.same left.resource_path right.resource_path then true
+                  if Ident.same left.resource_id right.resource_id then true
                   else
                     match (left.resource_alias_of, right.resource_alias_of) with
                     | Some path, _ ->
-                        Option.exists (resource_at_path path) ~f:(fun target ->
-                            same_resource target right)
+                        Option.exists (resource_at_path env resources path)
+                          ~f:(fun target -> same_resource target right)
                     | _, Some path ->
-                        Option.exists (resource_at_path path) ~f:(fun target ->
-                            same_resource left target)
+                        Option.exists (resource_at_path env resources path)
+                          ~f:(fun target -> same_resource left target)
                     | None, None ->
-                        (not left.resource_definition)
-                        && (not right.resource_definition)
-                        && List.equal String.equal left.resource_functor
-                             right.resource_functor
-                        && same_arguments left.resource_arguments right.resource_arguments
+                        begin match
+                          (left.resource_application, right.resource_application)
+                        with
+                        | Some (left_app, left_template), Some (right_app, right_template)
+                          ->
+                            Path.same left_app right_app
+                            && Ident.same left_template right_template
+                        | Some _, None | None, Some _ -> false
+                        | None, None ->
+                            (not left.resource_definition)
+                            && (not right.resource_definition)
+                            && (not left.resource_abstract)
+                            && (not right.resource_abstract)
+                            && List.equal String.equal left.resource_functor
+                                 right.resource_functor
+                            && same_arguments left.resource_arguments
+                                 right.resource_arguments
+                        end
                 and same_arguments left right =
                   List.length left = List.length right
                   && List.for_all2_exn left right ~f:(fun left right ->
@@ -1057,7 +1184,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                           if Path.same left right then true
                           else
                             begin match
-                              (resource_at_path left, resource_at_path right)
+                              ( resource_at_path env resources left,
+                                resource_at_path env resources right )
                             with
                             | Some left, Some right -> same_resource left right
                             | _ -> false
@@ -1070,6 +1198,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   List.find resources ~f:(fun resource ->
                       Option.is_none resource.resource_alias_of
                       && (not resource.resource_definition)
+                      && (not resource.resource_abstract)
                       && List.equal String.equal resource.resource_functor library.path
                       && same_arguments resource.resource_arguments arguments)
                 in
@@ -1183,10 +1312,28 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         ])
                 in
                 let operations = Proof_library.member_operations signatures library in
+                let ra_operations =
+                  Option.value_map ra_interface ~default:[] ~f:(fun selected ->
+                      Proof_library.member_operations signatures selected)
+                in
+                let ra_constants =
+                  Option.value_map ra_interface ~default:[] ~f:(fun selected ->
+                      Proof_library.member_constants signatures selected)
+                in
                 let* operation_items =
                   Result.all
                     (List.map operations ~f:(fun operation ->
-                         let* typ = operation_type operation in
+                         let* typ =
+                           match
+                             ( ra_interface,
+                               List.find ra_operations ~f:(fun inherited ->
+                                   String.equal inherited.name operation.name) )
+                           with
+                           | Some selected, Some inherited ->
+                               Proof_library.operation_type ~at ~signature:selected
+                                 ~substitutions:[] inherited
+                           | _ -> operation_type operation
+                         in
                          Ok
                            (Ast_helper.Sig.value
                               (Ast_helper.Val.mk ~loc:at
@@ -1201,7 +1348,16 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                String.equal operation.name name)
                          then Ok None
                          else
-                           let* typ = metadata_type typ in
+                           let* typ =
+                             match
+                               ( ra_interface,
+                                 List.Assoc.find ra_constants name ~equal:String.equal )
+                             with
+                             | Some selected, Some inherited ->
+                                 Proof_library.ocaml_type ~at ~signature:selected
+                                   ~substitutions:[] inherited
+                             | _ -> metadata_type typ
+                           in
                            Ok
                              (Some
                                 (Ast_helper.Sig.value
@@ -1248,19 +1404,6 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         alias = Some (checked_type env at typ);
                       })
                 in
-                let rec function_arguments typ =
-                  match Types.get_desc typ with
-                  | Tpoly (body, []) -> function_arguments body
-                  | Tarrow (_, argument, rest, _) ->
-                      let args, result = function_arguments rest in
-                      let rec monotype typ =
-                        match Types.get_desc typ with
-                        | Tpoly (body, []) -> monotype body
-                        | _ -> typ
-                      in
-                      (monotype argument :: args, result)
-                  | _ -> ([], typ)
-                in
                 let value_type operation =
                   let qualified =
                     Longident.Ldot
@@ -1293,6 +1436,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     resource_interfaces = Proof_library.interface_paths signatures library;
                     resource_alias_of = None;
                     resource_definition = false;
+                    resource_abstract = false;
                     resource_representation = None;
                     resource_type_members = type_members;
                     resource_type;
@@ -1302,6 +1446,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     resource_descriptor;
                     resource_aliases;
                     resource_at = at;
+                    resource_public = None;
+                    resource_application = None;
                   }
                 in
                 Ok (env, descriptors, resource :: resources, fields)
@@ -1349,15 +1495,13 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   let canonical =
                     Env.normalize_module_path None env module_path |> canonical_owner
                   in
-                  List.find_map resources ~f:(fun resource ->
-                      let resource_path = canonical_owner resource.resource_path in
-                      Option.some_if
-                        (resource.resource_is_ra
-                        && (Path.same module_path resource.resource_path
-                           || Path.same module_path (Pident resource.resource_id)
-                           || Path.same canonical resource_path
-                           || Path.same canonical (Pident resource.resource_id)))
-                        resource.resource_path)
+                  Option.bind
+                    (Option.first_some
+                       (resource_at_path env resources module_path)
+                       (resource_at_path env resources canonical))
+                    ~f:(fun resource ->
+                      Option.some_if resource.resource_is_ra
+                        (Path.Pident resource.resource_id))
               | _ -> None
             in
             let* env = value env name (core_type ~at field_type) in
@@ -1397,8 +1541,212 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
   in
   Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
 
-let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
-    (scopes : Proof_scopes.t) =
+let signature_ghost_modules ~comments (scope : Proof_scopes.scope) =
+  let within (outer : Location.t) (inner : Location.t) =
+    String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
+    && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
+    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+  in
+  match scope.parameters with
+  | [
+   Named
+     ( Some parameter,
+       _,
+       ({ mty_desc = Tmty_ident (path, _); mty_env; mty_loc; _ } : Typedtree.module_type)
+     );
+  ] ->
+      let rec declared seen path =
+        let path = Env.normalize_modtype_path mty_env path in
+        if List.mem seen path ~equal:Path.same then
+          Error (Report.error Type mty_loc "A cyclic module type alias")
+        else
+          let declaration = Env.find_modtype path mty_env in
+          match declaration.mtd_type with
+          | Some (Mty_ident next) -> declared (path :: seen) next
+          | Some (Mty_signature _ | Mty_functor _ | Mty_alias _) | None -> Ok declaration
+      in
+      let* declaration = declared [] path in
+      let nested =
+        match declaration.mtd_type with
+        | Some module_type ->
+            begin match Mtype.scrape mty_env module_type with
+            | Mty_signature members ->
+                List.filter_map members ~f:(function
+                  | Types.Sig_module (_, _, declaration, _, _) -> Some declaration.md_loc
+                  | Sig_modtype (_, declaration, _) -> Some declaration.mtd_loc
+                  | _ -> None)
+            | Mty_ident _ | Mty_functor _ | Mty_alias _ -> []
+            end
+        | None -> []
+      in
+      let annotations =
+        Annotation.of_comments comments
+        |> List.filter ~f:(fun annotation ->
+            Poly.equal (Annotation.kind annotation) Annotation.Ghost_module
+            && within declaration.mtd_loc annotation.loc
+            && not (List.exists nested ~f:(fun loc -> within loc annotation.loc)))
+      in
+      let* modules = Result.all (List.map annotations ~f:Annotation.ghost_module) in
+      Ok (Some (parameter, modules))
+  | [ Named _ ] | [ Unit ] | _ -> Ok None
+
+let implicit_ghost_scopes ~comments (scopes : Proof_scopes.t) =
+  let has_body (expression : Typedtree.module_expr) =
+    let rec body expression =
+      match expression.Typedtree.mod_desc with
+      | Tmod_structure _ | Tmod_functor _ -> true
+      | Tmod_constraint (inner, _, _, _) -> body inner
+      | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ -> false
+    in
+    body expression
+  in
+  let rec collect parent =
+    List.fold_result parent.Proof_scopes.structure.str_items ~init:[]
+      ~f:(fun found item ->
+        match item.Typedtree.str_desc with
+        | Tstr_module
+            { mb_id = Some id; mb_name = { txt = Some name; loc }; mb_expr; mb_loc; _ }
+          when has_body mb_expr ->
+            let name = S.mk_id ~loc name in
+            let* candidate =
+              Proof_scopes.child_scope ~check_header:false parent name [] mb_loc
+            in
+            if not (Option.exists candidate.declaration_id ~f:(Ident.same id)) then
+              Ok found
+            else
+              let existing =
+                List.find scopes.scopes ~f:(fun scope ->
+                    Option.exists scope.Proof_scopes.declaration_id ~f:(Ident.same id))
+              in
+              let current = Option.value existing ~default:candidate in
+              let* abstract =
+                match current.parameters with
+                | [ Named (Some _, _, { mty_desc = Tmty_ident _; _ }) ] ->
+                    let* declared = signature_ghost_modules ~comments current in
+                    Ok
+                      (Option.exists declared ~f:(fun (_, modules) ->
+                           not (List.is_empty modules)))
+                | _ -> Ok false
+              in
+              let found =
+                if abstract && Option.is_none existing then found @ [ candidate ]
+                else found
+              in
+              if List.is_empty current.parameters then
+                let* nested = collect current in
+                Ok (found @ nested)
+              else Ok found
+        | _ -> Ok found)
+  in
+  let* implicit = collect scopes.root in
+  let ordered =
+    List.stable_sort (scopes.scopes @ implicit) ~compare:(fun left right ->
+        Int.compare left.source_location.loc_start.pos_cnum
+          right.source_location.loc_start.pos_cnum)
+  in
+  Ok ({ scopes with scopes = ordered }, implicit)
+
+let public_ghost_occurrences ?public_interface ~comments scopes
+    (scope : Proof_scopes.scope) =
+  let parent =
+    Option.value_map scope.Proof_scopes.parent ~default:scopes.Proof_scopes.root.structure
+      ~f:(fun path ->
+        Option.value_map (Proof_scopes.find_owner scopes (Some path))
+          ~default:scopes.root.structure ~f:(fun owner -> owner.structure))
+  in
+  let rec explicit_type (expression : Typedtree.module_expr) =
+    match expression.mod_desc with
+    | Tmod_constraint (_, _, Tmodtype_explicit typ, _) -> Some typ
+    | Tmod_functor (_, body) | Tmod_constraint (body, _, Tmodtype_implicit, _) ->
+        explicit_type body
+    | Tmod_structure _ | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _
+      ->
+        None
+  in
+  let signature_location (typ : Typedtree.module_type) =
+    match typ.mty_desc with
+    | Tmty_ident (path, _) ->
+        let declaration = Env.find_modtype path typ.mty_env in
+        declaration.mtd_loc
+    | Tmty_signature _ | Tmty_functor _ | Tmty_with _ | Tmty_typeof _ | Tmty_alias _ ->
+        typ.mty_loc
+  in
+  let explicit =
+    List.find_map parent.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_module { mb_id = Some id; mb_expr; _ }
+          when Option.exists scope.declaration_id ~f:(Ident.same id) ->
+            explicit_type mb_expr
+        | _ -> None)
+  in
+  let interface_type =
+    match (scope.namespace, public_interface) with
+    | [ name ], Some interface ->
+        Option.bind interface.typed_signature ~f:(fun signature ->
+            List.find_map signature.sig_items ~f:(fun item ->
+                match item.sig_desc with
+                | Tsig_module { md_id = Some id; md_type; _ }
+                  when String.equal (Ident.name id) name ->
+                    Some md_type
+                | _ -> None))
+    | _ -> None
+  in
+  match Option.first_some interface_type explicit with
+  | None -> Ok []
+  | Some typ ->
+      let location = signature_location typ in
+      let within (outer : Location.t) (inner : Location.t) =
+        String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
+        && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
+        && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+      in
+      let annotations = Annotation.of_comments comments in
+      let rec collect names location signature =
+        let children =
+          List.filter_map signature ~f:(function
+            | Types.Sig_module (id, _, declaration, _, _) ->
+                Some (Some (Ident.name id), declaration.md_loc, declaration.md_type)
+            | Sig_modtype (_, declaration, _) ->
+                Some (None, declaration.mtd_loc, Types.Mty_signature [])
+            | _ -> None)
+        in
+        let direct =
+          List.filter annotations ~f:(fun annotation ->
+              Poly.equal (Annotation.kind annotation) Annotation.Ghost_module
+              && within location annotation.loc
+              && not
+                   (List.exists children ~f:(fun (_, child, _) ->
+                        within child annotation.loc)))
+        in
+        let* direct = Result.all (List.map direct ~f:Annotation.ghost_module) in
+        let* nested =
+          List.filter_map children ~f:(function
+            | Some name, child, module_type ->
+                begin match Mtype.scrape typ.mty_env module_type with
+                | Mty_signature body -> Some (collect (names @ [ name ]) child body)
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
+                end
+            | None, _, _ -> None)
+          |> Result.all
+        in
+        Ok
+          (List.map direct ~f:(fun declaration -> (names, declaration))
+          @ List.concat nested)
+      in
+      begin match Mtype.scrape typ.mty_env typ.mty_type with
+      | Mty_signature body -> collect [] location body
+      | Mty_ident _ | Mty_functor _ | Mty_alias _ -> Ok []
+      end
+
+let public_ghost_modules ?public_interface ~comments scopes scope =
+  let* occurrences = public_ghost_occurrences ?public_interface ~comments scopes scope in
+  Ok
+    (List.filter_map occurrences ~f:(function
+      | [], declaration -> Some declaration
+      | _ :: _, _ -> None))
+
+let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = [])
+    ~comments runtime_env root_env (scopes : Proof_scopes.t) =
   let root_bindings = specification_bindings runtime_env root_env in
   let aliases =
     List.concat_map scopes.scopes ~f:(fun scope ->
@@ -1434,6 +1782,9 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
   let nested =
     List.filter scopes.scopes ~f:(fun scope ->
         Option.is_some scope.owner
+        && Option.value_map only_ids ~default:true ~f:(fun ids ->
+            Option.exists scope.declaration_id ~f:(fun id ->
+                List.mem ids id ~equal:Ident.same))
         && Option.value_map only ~default:true ~f:(fun namespace ->
             prefix namespace scope.namespace))
   in
@@ -1480,6 +1831,170 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
               end
           | Pdot _ | Papply _ | Pextra_ty _ -> env)
   in
+  let abstract_resources scope base =
+    let* declared = signature_ghost_modules ~comments scope in
+    match declared with
+    | None -> Ok (base, [])
+    | Some (parameter, modules) ->
+        List.fold_result modules ~init:(base, []) ~f:(fun (base, resources) declaration ->
+            let name = declaration.S.ghost_module_name in
+            let interface = declaration.ghost_module_interface in
+            let at = name.pid_loc in
+            let* signatures = Proof_library.signatures at in
+            let* () =
+              match
+                Proof_library.find signatures (Proof_library.path_of_qualid interface)
+              with
+              | Some selected
+                when selected.interface
+                     && Proof_library.is_resource_algebra signatures selected ->
+                  Ok ()
+              | Some _ ->
+                  Error
+                    (Report.error Type (S.qualid_loc interface)
+                       "An abstract proof module must name a ResourceAlgebra interface")
+              | None ->
+                  Error
+                    (Report.error Type (S.qualid_loc interface)
+                       "Unknown Raven library interface")
+            in
+            let backend =
+              String.concat ~sep:"_"
+                (scope.namespace
+                @ [
+                    Ident.name parameter;
+                    name.pid_str;
+                    Int.to_string at.loc_start.pos_cnum;
+                  ])
+            in
+            let temporary = S.mk_id ~loc:at backend in
+            let* generated_env, _, generated, _, _ =
+              elaborate_proof_types ~add_standard:false ~allow_interfaces:true base None
+                [
+                  S.Proof_resource
+                    {
+                      resource_name = temporary;
+                      resource_functor = interface;
+                      resource_arguments = [];
+                    };
+                ]
+            in
+            let* generated =
+              match generated with
+              | [ resource ] -> Ok resource
+              | _ ->
+                  Error (Report.error Type at "An abstract resource could not be typed")
+            in
+            let hidden =
+              List.fold (specification_bindings base generated_env) ~init:base
+                ~f:(fun env -> function
+                | Types.Sig_type (id, declaration, _, _) ->
+                    Env.add_type ~check:false id declaration env
+                | _ -> env)
+            in
+            let parameter_declaration = Env.find_module (Pident parameter) hidden in
+            let* body =
+              match Mtype.scrape hidden parameter_declaration.md_type with
+              | Mty_signature body -> Ok body
+              | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+                  Error
+                    (Report.error Type at
+                       "A ghost module requires a named module signature")
+            in
+            let* () =
+              if
+                List.exists body ~f:(function
+                  | Types.Sig_module (id, _, _, _, _) ->
+                      String.equal (Ident.name id) name.pid_str
+                  | _ -> false)
+              then
+                Error
+                  (Report.error Type at
+                     (Printf.sprintf "The module %s is already declared" name.pid_str))
+              else Ok ()
+            in
+            let id = Ident.create_local name.pid_str in
+            let generated_declaration =
+              Env.find_module (Pident generated.resource_id) generated_env
+            in
+            let item =
+              Types.Sig_module
+                ( id,
+                  Mp_present,
+                  { generated_declaration with md_loc = at },
+                  Trec_not,
+                  Exported )
+            in
+            let env =
+              Env.add_module_declaration ~check:false parameter Mp_present
+                { parameter_declaration with md_type = Mty_signature (body @ [ item ]) }
+                hidden
+            in
+            let path = Path.Pdot (Pident parameter, name.pid_str) in
+            let type_path, _ =
+              Env.find_type_by_name
+                (Ldot
+                   ( {
+                       txt =
+                         Ldot
+                           ( { txt = Lident (Ident.name parameter); loc = at },
+                             { txt = name.pid_str; loc = at } );
+                       loc = at;
+                     },
+                     { txt = "t"; loc = at } ))
+                env
+            in
+            let typ = Ctype.newconstr type_path [] in
+            let operations =
+              List.map generated.resource_operations ~f:(fun (operation, _, _) ->
+                  let value = Env.find_value (Path.Pdot (path, operation)) env in
+                  let inputs, output = function_arguments value.val_type in
+                  (operation, inputs, output))
+            in
+            let descriptor =
+              Datatypes.resource_type ~name:backend ~module_id:id ~at |> fun descriptor ->
+              Datatypes.with_paths descriptor
+                (Path.Pdot (path, "t") :: generated.resource_descriptor.paths)
+            in
+            let resource =
+              {
+                generated with
+                resource_name = name.pid_str;
+                resource_backend = backend;
+                resource_scope = scope.owner;
+                resource_path = path;
+                resource_environment = env;
+                resource_abstract = true;
+                resource_type = typ;
+                resource_id = id;
+                resource_operations = operations;
+                resource_descriptor = descriptor;
+                resource_at = at;
+              }
+            in
+            Ok (env, resources @ [ resource ]))
+  in
+  let public_functor_result scope =
+    let rec result (expression : Typedtree.module_expr) =
+      match expression.mod_desc with
+      | Tmod_functor (_, body) | Tmod_constraint (body, _, Tmodtype_implicit, _) ->
+          result body
+      | Tmod_structure _ -> true
+      | Tmod_constraint (_, _, Tmodtype_explicit _, _) -> false
+      | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ -> false
+    in
+    let parent =
+      Option.value_map scope.Proof_scopes.parent ~default:scopes.root.structure
+        ~f:(fun path ->
+          Option.value_map (Proof_scopes.find_owner scopes (Some path))
+            ~default:scopes.root.structure ~f:(fun scope -> scope.structure))
+    in
+    List.exists parent.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_module { mb_id = Some id; mb_expr; _ } ->
+            Option.exists scope.declaration_id ~f:(Ident.same id) && result mb_expr
+        | _ -> false)
+  in
   let* typed =
     List.fold_result nested ~init:[] ~f:(fun previous scope ->
         let declarations = Proof_scopes.declarations_in scopes scope in
@@ -1499,11 +2014,15 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
         let allowed_functor_proof =
           match functor_ancestor with
           | Some ancestor
-            when Option.equal Ident.same ancestor.declaration_id scope.declaration_id ->
+            when Option.equal Ident.same ancestor.declaration_id scope.declaration_id
+                 || Option.is_some scope.definition
+                    && Option.equal Path.same scope.parent ancestor.owner ->
               begin match ancestor.parameters with
               | [ Named (Some _, _, _) ] ->
                   List.for_all proof ~f:(function
-                    | S.Proof_type _ | Proof_function _ -> true
+                    | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
+                      ->
+                        true
                     | _ -> false)
               | _ -> false
               end
@@ -1552,8 +2071,13 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
             scope.environment
         in
         let base =
-          List.fold inherited ~init:base ~f:(fun env (_, _, bindings) ->
-              add_spec_bindings (without_shadowed bindings) env)
+          List.fold inherited ~init:base
+            ~f:(fun env (ancestor, (ancestor_env, _, _, _, _), bindings) ->
+              let inherited_bindings =
+                if List.is_empty ancestor.Proof_scopes.parameters then bindings
+                else specification_bindings ancestor.environment ancestor_env
+              in
+              add_spec_bindings (without_shadowed inherited_bindings) env)
         in
         let base =
           List.fold previous ~init:base ~f:(fun env previous_entry ->
@@ -1564,10 +2088,11 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                     refresh_aliases env owner)
               else env)
         in
+        let* base, abstract_resources = abstract_resources scope base in
         let* env, types, resources, fields, aus =
           elaborate_proof_types ~add_standard:false
             ~allow_shadowing:(Option.is_some scope.definition)
-            ~previous:([], known_resources, [], [])
+            ~previous:([], known_resources @ abstract_resources, [], [])
             ~canonical_owner:(Proof_scopes.canonical_owner scopes)
             base None proof
         in
@@ -1643,48 +2168,227 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                     (Proof_library.ocaml_type ~at ~signature:selected ~substitutions:[]
                        typ))
         in
+        let* exported_ghosts =
+          public_ghost_modules ?public_interface ~comments scopes scope
+        in
         let resources =
           List.filter resources ~f:(fun resource ->
               not
                 (List.exists known_resources ~f:(fun known ->
                      Ident.same known.resource_id resource.resource_id)))
           |> List.map ~f:(fun resource ->
-              let path =
-                Option.value_map scope.owner ~default:(Path.Pident resource.resource_id)
-                  ~f:(fun owner -> Path.Pdot (owner, resource.resource_name))
+              if resource.resource_abstract then
+                { resource with resource_environment = env }
+              else
+                let path =
+                  Option.value_map scope.owner ~default:(Path.Pident resource.resource_id)
+                    ~f:(fun owner -> Path.Pdot (owner, resource.resource_name))
+                in
+                let module_paths =
+                  if
+                    (not (public_functor_result scope))
+                    && List.exists exported_ghosts ~f:(fun declaration ->
+                        String.equal declaration.S.ghost_module_name.pid_str
+                          resource.resource_name)
+                  then []
+                  else
+                    path
+                    :: Option.to_list
+                         (Option.map scope.declaration_id ~f:(fun id ->
+                              Path.Pdot (Path.Pident id, resource.resource_name)))
+                    @ List.filter_map aliases ~f:(fun (alias, target) ->
+                        Option.bind scope.owner ~f:(fun owner ->
+                            Option.some_if (Path.same target owner)
+                              (Path.Pdot (alias, resource.resource_name))))
+                in
+                let descriptor =
+                  Datatypes.with_paths resource.resource_descriptor
+                    (List.map module_paths ~f:(fun path -> Path.Pdot (path, "t")))
+                in
+                let aliases =
+                  List.map resource.resource_aliases ~f:(fun alias ->
+                      let member =
+                        match alias.Datatypes.library with
+                        | Some (Pdot (_, member)) -> member
+                        | _ -> "element"
+                      in
+                      Datatypes.with_paths alias
+                        (List.map module_paths ~f:(fun path -> Path.Pdot (path, member))))
+                in
+                {
+                  resource with
+                  resource_scope = scope.owner;
+                  resource_path = path;
+                  resource_environment = env;
+                  resource_descriptor = descriptor;
+                  resource_aliases = aliases;
+                })
+        in
+        let owned_definitions =
+          List.filter known_resources ~f:(fun resource ->
+              resource.resource_definition
+              && Option.equal Path.same resource.resource_scope scope.owner)
+          |> List.map ~f:(fun resource ->
+              if
+                (not (public_functor_result scope))
+                && List.exists exported_ghosts ~f:(fun declaration ->
+                    String.equal declaration.S.ghost_module_name.pid_str
+                      resource.resource_name)
+              then resource
+              else
+                {
+                  resource with
+                  resource_descriptor =
+                    Datatypes.with_paths resource.resource_descriptor
+                      [ Path.Pdot (resource.resource_path, "t") ];
+                })
+        in
+        let resources = owned_definitions @ resources in
+        let* resources =
+          List.fold_result exported_ghosts ~init:resources
+            ~f:(fun resources declaration ->
+              let name = declaration.S.ghost_module_name in
+              let at = name.pid_loc in
+              let* private_resource =
+                match
+                  List.find resources ~f:(fun resource ->
+                      String.equal resource.resource_name name.pid_str)
+                with
+                | Some resource -> Ok resource
+                | None ->
+                    Error
+                      (Report.error Type at
+                         (Printf.sprintf
+                            "The source module export %s has no proof implementation"
+                            name.pid_str))
               in
-              let module_paths =
-                path
-                :: Option.to_list
-                     (Option.map scope.declaration_id ~f:(fun id ->
-                          Path.Pdot (Path.Pident id, resource.resource_name)))
-                @ List.filter_map aliases ~f:(fun (alias, target) ->
-                    Option.bind scope.owner ~f:(fun owner ->
-                        Option.some_if (Path.same target owner)
-                          (Path.Pdot (alias, resource.resource_name))))
+              let* signatures = Proof_library.signatures at in
+              let interface =
+                Proof_library.path_of_qualid declaration.ghost_module_interface
               in
+              let* selected =
+                match Proof_library.find signatures interface with
+                | Some selected
+                  when selected.interface
+                       && Proof_library.is_resource_algebra signatures selected ->
+                    Ok selected
+                | Some _ ->
+                    Error
+                      (Report.error Type at
+                         "An exported proof module must name a ResourceAlgebra interface")
+                | None -> Error (Report.error Type at "Unknown Raven library interface")
+              in
+              let* () =
+                if
+                  private_resource.resource_is_ra
+                  && (List.equal String.equal private_resource.resource_functor
+                        selected.path
+                     || List.exists private_resource.resource_interfaces
+                          ~f:(List.equal String.equal selected.path))
+                then Ok ()
+                else
+                  Error
+                    (Report.error Type at
+                       "The exported proof module does not implement its interface")
+              in
+              let temporary =
+                S.mk_id ~loc:at
+                  (Compiler_types.internal_name ~at (name.pid_str ^ "_public"))
+              in
+              let* generated_env, _, generated, _, _ =
+                elaborate_proof_types ~add_standard:false ~allow_interfaces:true base None
+                  [
+                    S.Proof_resource
+                      {
+                        resource_name = temporary;
+                        resource_functor = declaration.ghost_module_interface;
+                        resource_arguments = [];
+                      };
+                  ]
+              in
+              let* generated =
+                match generated with
+                | [ resource ] -> Ok resource
+                | _ -> Error (Report.error Type at "A public resource could not be typed")
+              in
+              let owner = Option.value_exn scope.owner in
+              let public_path = Path.Pdot (owner, name.pid_str) in
+              let public_id = Ident.create_local name.pid_str in
+              let substitution =
+                Subst.add_module generated.resource_id public_path Subst.identity
+              in
+              let substitution =
+                List.fold generated.resource_type_members ~init:substitution
+                  ~f:(fun substitution (member, id, _) ->
+                    if String.equal member "T" then
+                      Subst.add_type id (Path.Pdot (public_path, "t")) substitution
+                    else substitution)
+              in
+              let generated_declaration =
+                Env.find_module (Pident generated.resource_id) generated_env
+              in
+              let* public_signature =
+                match generated_declaration.md_type with
+                | Mty_signature body ->
+                    let body = Subst.signature Keep substitution body in
+                    Ok
+                      (List.map body ~f:(function
+                        | Types.Sig_type (id, declaration, rec_status, visibility)
+                          when String.equal (Ident.name id) "t" ->
+                            Types.Sig_type
+                              ( id,
+                                { declaration with type_manifest = None },
+                                rec_status,
+                                visibility )
+                        | item -> item))
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+                    Error (Report.error Type at "A public resource must be a module")
+              in
+              let public_declaration =
+                { generated_declaration with md_type = Mty_signature public_signature }
+              in
+              let public_env =
+                Env.add_module_declaration ~check:false public_id Mp_present
+                  public_declaration generated_env
+              in
+              let resource_type = Ctype.newconstr (Path.Pdot (public_path, "t")) [] in
               let descriptor =
-                Datatypes.with_paths resource.resource_descriptor
-                  (List.map module_paths ~f:(fun path -> Path.Pdot (path, "t")))
+                Datatypes.resource_type ~name:name.pid_str ~module_id:public_id ~at
+                |> fun descriptor ->
+                Datatypes.with_paths descriptor [ Path.Pdot (public_path, "t") ]
               in
-              let aliases =
-                List.map resource.resource_aliases ~f:(fun alias ->
-                    let member =
-                      match alias.Datatypes.library with
-                      | Some (Pdot (_, member)) -> member
-                      | _ -> "element"
-                    in
-                    Datatypes.with_paths alias
-                      (List.map module_paths ~f:(fun path -> Path.Pdot (path, member))))
+              let public =
+                {
+                  generated with
+                  resource_name = name.pid_str;
+                  resource_backend = name.pid_str ^ "_public";
+                  resource_scope = scope.owner;
+                  resource_path = public_path;
+                  resource_environment = public_env;
+                  resource_functor = selected.path;
+                  resource_alias_of = None;
+                  resource_abstract = false;
+                  resource_type_members = [];
+                  resource_type;
+                  resource_id = public_id;
+                  resource_operations =
+                    List.map generated.resource_operations
+                      ~f:(fun (operation, inputs, output) ->
+                        ( operation,
+                          List.map inputs ~f:(Subst.type_expr substitution),
+                          Subst.type_expr substitution output ));
+                  resource_descriptor = descriptor;
+                  resource_aliases = [];
+                  resource_at = at;
+                  resource_public = None;
+                  resource_application = None;
+                }
               in
-              {
-                resource with
-                resource_scope = scope.owner;
-                resource_path = path;
-                resource_environment = env;
-                resource_descriptor = descriptor;
-                resource_aliases = aliases;
-              })
+              Ok
+                (List.map resources ~f:(fun resource ->
+                     if Ident.same resource.resource_id private_resource.resource_id then
+                       { resource with resource_public = Some public }
+                     else resource)))
         in
         let fields =
           let private_t =
@@ -1698,7 +2402,11 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
               let field_resource =
                 match (private_t, Types.get_desc field.field_value) with
                 | Some private_t, Tconstr (path, [], _) when Path.same path private_t ->
-                    scope.owner
+                    Option.bind scope.owner ~f:(fun owner ->
+                        List.find_map known_resources ~f:(fun resource ->
+                            Option.some_if
+                              (Path.same owner resource.resource_path)
+                              (Path.Pident resource.resource_id)))
                 | _ -> field.field_resource
               in
               {
@@ -1763,6 +2471,15 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
               | _ -> data)
         in
         let bindings = specification_bindings base env in
+        let bindings =
+          bindings
+          @ List.map owned_definitions ~f:(fun resource ->
+              let declaration =
+                Env.find_module (Pident resource.resource_id) scope.environment
+              in
+              Types.Sig_module
+                (resource.resource_id, Mp_present, declaration, Trec_not, Exported))
+        in
         Ok (previous @ [ (scope, (env, namespaced, resources, fields, aus), bindings) ]))
   in
   let module_chain scope =
@@ -1772,19 +2489,33 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
             (name, member.declaration_id, member.sealed)))
     |> Option.all
   in
-  let rec extend_signature signature chain bindings =
+  let rec extend_signature env signature chain bindings =
     match chain with
     | [] -> signature @ bindings
     | (name, Some id, _) :: rest ->
+        let target =
+          if
+            List.exists signature ~f:(function
+              | Types.Sig_module (found, _, _, _, _) -> Ident.same found id
+              | _ -> false)
+          then Some id
+          else
+            List.find_map (List.rev signature) ~f:(function
+              | Types.Sig_module (found, _, _, _, _)
+                when String.equal (Ident.name found) name ->
+                  Some found
+              | _ -> None)
+        in
         List.map signature ~f:(function
           | Types.Sig_module (found, presence, declaration, rec_status, visibility)
-            when Ident.same found id && String.equal (Ident.name found) name ->
+            when Option.exists target ~f:(Ident.same found)
+                 && String.equal (Ident.name found) name ->
               let declaration =
-                match declaration.md_type with
+                match Mtype.scrape env declaration.md_type with
                 | Mty_signature body ->
                     {
                       declaration with
-                      md_type = Mty_signature (extend_signature body rest bindings);
+                      md_type = Mty_signature (extend_signature env body rest bindings);
                     }
                 | Mty_functor (parameter, Mty_signature body) when List.is_empty rest ->
                     {
@@ -1797,27 +2528,6 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
           | item -> item)
     | (_, None, _) :: _ -> signature
   in
-  let public_functor_result scope =
-    let rec result (expression : Typedtree.module_expr) =
-      match expression.mod_desc with
-      | Tmod_functor (_, body) | Tmod_constraint (body, _, Tmodtype_implicit, _) ->
-          result body
-      | Tmod_structure _ -> true
-      | Tmod_constraint (_, _, Tmodtype_explicit _, _) -> false
-      | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ -> false
-    in
-    let parent =
-      Option.value_map scope.Proof_scopes.parent ~default:scopes.root.structure
-        ~f:(fun path ->
-          Option.value_map (Proof_scopes.find_owner scopes (Some path))
-            ~default:scopes.root.structure ~f:(fun scope -> scope.structure))
-    in
-    List.exists parent.str_items ~f:(fun item ->
-        match item.str_desc with
-        | Tstr_module { mb_id = Some id; mb_expr; _ } ->
-            Option.exists scope.declaration_id ~f:(Ident.same id) && result mb_expr
-        | _ -> false)
-  in
   let qualified_env =
     List.fold typed ~init:root_env ~f:(fun env (scope, _, bindings) ->
         match module_chain scope with
@@ -1827,9 +2537,9 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                && (List.is_empty scope.parameters || public_functor_result scope) ->
             begin match Env.find_module_by_name (Lident name) env with
             | Pident found, declaration when Ident.same found id ->
-                begin match declaration.md_type with
+                begin match Mtype.scrape env declaration.md_type with
                 | Mty_signature signature ->
-                    let signature = extend_signature signature rest bindings in
+                    let signature = extend_signature env signature rest bindings in
                     Env.add_module_declaration ~check:false id Mp_present
                       { declaration with md_type = Mty_signature signature }
                       env
@@ -1844,6 +2554,48 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                 end
             | _ -> env
             end
+        | _ -> env)
+  in
+  let qualified_env =
+    List.fold typed ~init:qualified_env ~f:(fun env (scope, (_, _, resources, _, _), _) ->
+        match module_chain scope with
+        | Some ((root_name, Some root_id, _) :: rest)
+          when not (public_functor_result scope) ->
+            List.fold resources ~init:env ~f:(fun env resource ->
+                match resource.resource_public with
+                | None -> env
+                | Some public ->
+                    let declaration =
+                      Env.find_module (Pident public.resource_id)
+                        public.resource_environment
+                    in
+                    let member =
+                      Types.Sig_module
+                        (public.resource_id, Mp_present, declaration, Trec_not, Exported)
+                    in
+                    begin match Env.find_module_by_name (Lident root_name) env with
+                    | Pident found, root when Ident.same found root_id ->
+                        let patched =
+                          match Mtype.scrape env root.md_type with
+                          | Mty_signature signature ->
+                              Some
+                                (Types.Mty_signature
+                                   (extend_signature env signature rest [ member ]))
+                          | Mty_functor (parameter, result) when List.is_empty rest ->
+                              begin match Mtype.scrape env result with
+                              | Mty_signature body ->
+                                  Some
+                                    (Types.Mty_functor
+                                       (parameter, Types.Mty_signature (body @ [ member ])))
+                              | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
+                              end
+                          | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
+                        in
+                        Option.value_map patched ~default:env ~f:(fun md_type ->
+                            Env.add_module_declaration ~check:false root_id Mp_present
+                              { root with md_type } env)
+                    | _ -> env
+                    end)
         | _ -> env)
   in
   let module_path expression =
@@ -1892,6 +2644,7 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
             own @ nested mb_expr
         | _ -> [])
   in
+  let application_carriers = ref [] in
   let qualified_env =
     List.fold (applications [] scopes.root.structure) ~init:qualified_env
       ~f:(fun env (chain, (functor_path, argument_path)) ->
@@ -1911,10 +2664,38 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
         in
         begin match template with
         | None -> env
-        | Some (scope, _, bindings) ->
+        | Some (scope, (_, _, resources, _, _), bindings) ->
             begin match scope.parameters with
             | [ Named (Some parameter, _, _) ] ->
                 let identity = Path.Papply (functor_path, argument_path) in
+                let carrier_identity =
+                  Path.Papply
+                    ( Env.normalize_module_path None env functor_path,
+                      Env.normalize_module_path None env argument_path )
+                in
+                let env =
+                  List.fold resources ~init:env ~f:(fun env resource ->
+                      List.fold resource.resource_type_members ~init:env
+                        ~f:(fun env (_, hidden, declaration) ->
+                          let existing =
+                            List.find !application_carriers
+                              ~f:(fun (identity, member, _) ->
+                                Path.same identity carrier_identity
+                                && Ident.same member hidden)
+                          in
+                          match existing with
+                          | Some _ -> env
+                          | None ->
+                              let anchor =
+                                Ident.create_local
+                                  (Compiler_types.internal_name ~at:resource.resource_at
+                                     (resource.resource_name ^ "_app"))
+                              in
+                              application_carriers :=
+                                (carrier_identity, hidden, anchor)
+                                :: !application_carriers;
+                              Env.add_type ~check:false anchor declaration env))
+                in
                 let substitution =
                   Subst.add_module parameter argument_path Subst.identity
                 in
@@ -1922,6 +2703,13 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                   List.fold (source_type_ids scope.structure) ~init:substitution
                     ~f:(fun substitution (id, name) ->
                       Subst.add_type id (Path.Pdot (identity, name)) substitution)
+                in
+                let substitution =
+                  List.fold !application_carriers ~init:substitution
+                    ~f:(fun substitution (key, hidden, anchor) ->
+                      if Path.same key carrier_identity then
+                        Subst.add_type hidden (Path.Pident anchor) substitution
+                      else substitution)
                 in
                 let bindings = Subst.signature Keep substitution bindings in
                 let bindings =
@@ -1935,13 +2723,14 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                 | (root_name, Some root_id, _) :: rest ->
                     begin match Env.find_module_by_name (Lident root_name) env with
                     | Pident found, declaration when Ident.same found root_id ->
-                        begin match declaration.md_type with
+                        begin match Mtype.scrape env declaration.md_type with
                         | Mty_signature signature ->
                             Env.add_module_declaration ~check:false root_id Mp_present
                               {
                                 declaration with
                                 md_type =
-                                  Mty_signature (extend_signature signature rest bindings);
+                                  Mty_signature
+                                    (extend_signature env signature rest bindings);
                               }
                               env
                         | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
@@ -1953,6 +2742,260 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
             | _ -> env
             end
         end)
+  in
+  let qualified_env =
+    List.fold aliases ~init:qualified_env ~f:(fun env (alias, _) ->
+        match alias with
+        | Path.Pident id ->
+            begin try
+              match Env.find_module_by_name (Lident (Ident.name id)) env with
+              | Pident found, declaration when Ident.same found id ->
+                  Env.add_module_declaration ~check:false id Mp_present declaration env
+              | _ -> env
+            with Stdlib.Not_found -> env
+            end
+        | Pdot _ | Papply _ | Pextra_ty _ -> env)
+  in
+  let application_resources =
+    List.concat_map (applications [] scopes.root.structure)
+      ~f:(fun (chain, (functor_path, argument_path)) ->
+        let normalized =
+          Env.normalize_module_path None qualified_env functor_path
+          |> Proof_scopes.canonical_owner scopes
+        in
+        let template =
+          List.find typed ~f:(fun (scope, _, _) ->
+              Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
+              &&
+              match scope.parameters with
+              | [ Named (Some _, _, _) ] -> true
+              | _ -> false)
+        in
+        let view_owner =
+          List.fold chain ~init:None ~f:(fun path (name, id, _) ->
+              match (path, id) with
+              | None, Some id -> Some (Path.Pident id)
+              | Some path, Some _ -> Some (Path.Pdot (path, name))
+              | _, None -> path)
+        in
+        match (template, view_owner) with
+        | Some (scope, (_, _, resources, _, _), _), Some view_owner ->
+            begin match scope.parameters with
+            | [ Named (Some parameter, _, _) ] ->
+                let carrier_identity =
+                  Path.Papply
+                    ( Env.normalize_module_path None qualified_env functor_path,
+                      Env.normalize_module_path None qualified_env argument_path )
+                in
+                List.filter resources ~f:(fun resource ->
+                    (not resource.resource_abstract)
+                    && Option.equal Path.same resource.resource_scope scope.owner)
+                |> List.map ~f:(fun resource ->
+                    let view_path = Path.Pdot (view_owner, resource.resource_name) in
+                    let project original =
+                      let id = Ident.create_local original.resource_name in
+                      let path = Path.Pdot (view_owner, original.resource_name) in
+                      let substitution =
+                        Subst.add_module parameter argument_path Subst.identity
+                        |> Subst.add_module original.resource_id path
+                      in
+                      let substitution =
+                        List.fold original.resource_type_members ~init:substitution
+                          ~f:(fun substitution (_, hidden, _) ->
+                            let anchor =
+                              List.find_map !application_carriers
+                                ~f:(fun (key, member, anchor) ->
+                                  Option.some_if
+                                    (Path.same key carrier_identity
+                                    && Ident.same member hidden)
+                                    anchor)
+                            in
+                            let target =
+                              Option.value_map anchor
+                                ~default:(Path.Pdot (path, "t"))
+                                ~f:(fun anchor -> Path.Pident anchor)
+                            in
+                            Subst.add_type hidden target substitution)
+                      in
+                      let descriptor =
+                        Datatypes.resource_type ~name:original.resource_name ~module_id:id
+                          ~at:original.resource_at
+                      in
+                      let descriptor =
+                        if Option.is_some original.resource_public then descriptor
+                        else Datatypes.with_paths descriptor [ Path.Pdot (path, "t") ]
+                      in
+                      {
+                        original with
+                        resource_scope = None;
+                        resource_path = path;
+                        resource_environment = qualified_env;
+                        resource_arguments =
+                          List.map original.resource_arguments ~f:(function
+                            | Type_argument typ ->
+                                Type_argument (Subst.type_expr substitution typ)
+                            | Module_argument path ->
+                                Module_argument (Subst.module_path substitution path));
+                        resource_alias_of =
+                          Option.map original.resource_alias_of
+                            ~f:(Subst.module_path substitution);
+                        resource_type_members = [];
+                        resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
+                        resource_id = id;
+                        resource_operations =
+                          List.map original.resource_operations
+                            ~f:(fun (name, inputs, output) ->
+                              ( name,
+                                List.map inputs ~f:(Subst.type_expr substitution),
+                                Subst.type_expr substitution output ));
+                        resource_descriptor = descriptor;
+                        resource_aliases =
+                          List.map original.resource_aliases ~f:(fun alias ->
+                              let member =
+                                match alias.Datatypes.library with
+                                | Some (Pdot (_, member)) -> member
+                                | _ -> "element"
+                              in
+                              {
+                                (Datatypes.library_type ~library:original.resource_name
+                                   ~library_id:id ~at:original.resource_at member)
+                                with
+                                alias =
+                                  Option.map alias.alias ~f:(Subst.type_expr substitution);
+                              });
+                        resource_public = None;
+                        resource_application =
+                          Some (carrier_identity, original.resource_id);
+                      }
+                    in
+                    let projected = project resource in
+                    let public =
+                      Option.map resource.resource_public ~f:(fun public ->
+                          { (project public) with resource_path = view_path })
+                    in
+                    { projected with resource_public = public })
+            | _ -> []
+            end
+        | _ -> [])
+  in
+  let qualified_env =
+    List.fold application_resources ~init:qualified_env ~f:(fun env resource ->
+        match
+          (resource.resource_path, resource.resource_public, resource.resource_application)
+        with
+        | Path.Pdot (Pident result_id, name), Some public, Some (identity, template_id) ->
+            let template =
+              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _), _) ->
+                  Option.bind
+                    (List.find resources ~f:(fun original ->
+                         Ident.same original.resource_id template_id))
+                    ~f:(fun original ->
+                      Option.map original.resource_public ~f:(fun exported ->
+                          (scope, exported))))
+            in
+            begin match template with
+            | None -> env
+            | Some (scope, _) when public_functor_result scope -> env
+            | Some (scope, template_public) ->
+                let carrier_identity =
+                  match identity with
+                  | Path.Papply (fn, argument) ->
+                      Path.Papply
+                        ( Env.normalize_module_path None env fn,
+                          Env.normalize_module_path None env argument )
+                  | Pident _ | Pdot _ | Pextra_ty _ -> identity
+                in
+                let declaration =
+                  Env.find_module (Path.Pident template_public.resource_id)
+                    template_public.resource_environment
+                in
+                let env, anchor =
+                  let existing =
+                    List.find !application_carriers ~f:(fun (key, member, _) ->
+                        Path.same key carrier_identity
+                        && Ident.same member template_public.resource_id)
+                  in
+                  match existing with
+                  | Some (_, _, anchor) -> (env, Some anchor)
+                  | None ->
+                      begin match declaration.md_type with
+                      | Mty_signature body ->
+                          begin match
+                            List.find_map body ~f:(function
+                              | Types.Sig_type (id, typ, _, _)
+                                when String.equal (Ident.name id) "t" ->
+                                  Some typ
+                              | _ -> None)
+                          with
+                          | None -> (env, None)
+                          | Some typ ->
+                              let anchor =
+                                Ident.create_local
+                                  (Compiler_types.internal_name
+                                     ~at:template_public.resource_at
+                                     (template_public.resource_name ^ "_public_app"))
+                              in
+                              application_carriers :=
+                                (carrier_identity, template_public.resource_id, anchor)
+                                :: !application_carriers;
+                              (Env.add_type ~check:false anchor typ env, Some anchor)
+                          end
+                      | Mty_ident _ | Mty_functor _ | Mty_alias _ -> (env, None)
+                      end
+                in
+                let substitution =
+                  Option.value_map scope.declaration_id ~default:Subst.identity
+                    ~f:(fun id ->
+                      Subst.add_module id (Path.Pident result_id) Subst.identity)
+                  |> Subst.add_module template_public.resource_id public.resource_path
+                in
+                let declaration =
+                  match declaration.md_type with
+                  | Mty_signature body ->
+                      let body = Subst.signature Keep substitution body in
+                      let body =
+                        List.map body ~f:(function
+                          | Types.Sig_type (id, typ, rec_status, visibility)
+                            when String.equal (Ident.name id) "t" ->
+                              let typ =
+                                Option.value_map anchor ~default:typ ~f:(fun anchor ->
+                                    {
+                                      typ with
+                                      type_manifest =
+                                        Some (Ctype.newconstr (Path.Pident anchor) []);
+                                    })
+                              in
+                              Types.Sig_type (id, typ, rec_status, visibility)
+                          | item -> item)
+                      in
+                      { declaration with md_type = Mty_signature body }
+                  | Mty_ident _ | Mty_functor _ | Mty_alias _ -> declaration
+                in
+                let member =
+                  Types.Sig_module
+                    (public.resource_id, Mp_present, declaration, Trec_not, Exported)
+                in
+                begin match
+                  Env.find_module_by_name (Lident (Ident.name result_id)) env
+                with
+                | Pident found, result when Ident.same found result_id ->
+                    begin match Mtype.scrape env result.md_type with
+                    | Mty_signature signature ->
+                        let signature =
+                          List.filter signature ~f:(function
+                            | Types.Sig_module (id, _, _, _, _) ->
+                                not (String.equal (Ident.name id) name)
+                            | _ -> true)
+                        in
+                        Env.add_module_declaration ~check:false result_id Mp_present
+                          { result with md_type = Mty_signature (signature @ [ member ]) }
+                          env
+                    | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
+                    end
+                | _ -> env
+                end
+            end
+        | _ -> env)
   in
   let qualified_env =
     List.fold aliases ~init:qualified_env ~f:(fun env (alias, _) ->
@@ -1979,10 +3022,476 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
   let types = List.concat_map typed ~f:(fun (_, (_, types, _, _, _), _) -> types) in
   let resources =
     List.concat_map typed ~f:(fun (_, (_, _, resources, _, _), _) -> resources)
+    @ List.map application_resources ~f:(fun resource ->
+        {
+          resource with
+          resource_environment = qualified_env;
+          resource_public =
+            Option.map resource.resource_public ~f:(fun public ->
+                { public with resource_environment = qualified_env });
+        })
+  in
+  let* () =
+    List.fold_result scopes.scopes ~init:() ~f:(fun () scope ->
+        if public_functor_result scope then Ok ()
+        else
+          let* occurrences =
+            public_ghost_occurrences ?public_interface ~comments scopes scope
+          in
+          List.fold_result occurrences ~init:() ~f:(fun () (suffix, declaration) ->
+              match (scope.owner, suffix) with
+              | Some owner, _ :: _ ->
+                  let path =
+                    List.fold suffix ~init:owner ~f:(fun path name ->
+                        Path.Pdot (path, name))
+                    |> fun path -> Path.Pdot (path, declaration.ghost_module_name.pid_str)
+                  in
+                  let at = declaration.ghost_module_name.pid_loc in
+                  let* selected =
+                    let* signatures = Proof_library.signatures at in
+                    match
+                      Proof_library.find signatures
+                        (Proof_library.path_of_qualid declaration.ghost_module_interface)
+                    with
+                    | Some selected when selected.interface -> Ok selected
+                    | Some _ | None ->
+                        Error
+                          (Report.error Type at
+                             "Unknown nested resource algebra interface")
+                  in
+                  let inner =
+                    List.find (previous_resources @ resources) ~f:(fun resource ->
+                        Path.same resource.resource_path path)
+                  in
+                  begin match inner with
+                  | Some { resource_public = Some public; _ }
+                    when List.equal String.equal public.resource_functor selected.path ->
+                      Ok ()
+                  | Some _ ->
+                      Error
+                        (Report.error Type at
+                           "A nested resource algebra export changes interface across \
+                            source seals")
+                  | None ->
+                      Error
+                        (Report.error Type at
+                           "A nested resource algebra export has no proof implementation")
+                  end
+              | Some _, [] | None, _ -> Ok ()))
   in
   let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields, _), _) -> fields) in
   let aus = List.concat_map typed ~f:(fun (_, (_, _, _, _, aus), _) -> aus) in
   Ok (qualified_env, scopes, types, resources, fields, aus)
+
+let signature_ghost_resources env comments =
+  Annotation.of_comments comments
+  |> List.filter ~f:(fun annotation ->
+      Poly.equal (Annotation.kind annotation) Annotation.Ghost_module)
+  |> List.fold_result ~init:[] ~f:(fun resources annotation ->
+      let* declaration = Annotation.ghost_module annotation in
+      let name = declaration.S.ghost_module_name in
+      let at = name.pid_loc in
+      let* signatures = Proof_library.signatures at in
+      let* selected =
+        match
+          Proof_library.find signatures
+            (Proof_library.path_of_qualid declaration.ghost_module_interface)
+        with
+        | Some selected
+          when selected.interface && Proof_library.is_resource_algebra signatures selected
+          ->
+            Ok selected
+        | Some _ ->
+            Error
+              (Report.error Type at
+                 "An abstract proof module must name a ResourceAlgebra interface")
+        | None -> Error (Report.error Type at "Unknown Raven library interface")
+      in
+      let temporary =
+        S.mk_id ~loc:at (Compiler_types.internal_name ~at (name.pid_str ^ "_signature"))
+      in
+      let* generated_env, _, generated, _, _ =
+        elaborate_proof_types ~add_standard:false ~allow_interfaces:true env None
+          [
+            S.Proof_resource
+              {
+                resource_name = temporary;
+                resource_functor = declaration.ghost_module_interface;
+                resource_arguments = [];
+              };
+          ]
+      in
+      let* generated =
+        match generated with
+        | [ resource ] -> Ok resource
+        | _ -> Error (Report.error Type at "A signature resource could not be typed")
+      in
+      let id = Ident.create_local name.pid_str in
+      let path = Path.Pident id in
+      let substitution = Subst.add_module generated.resource_id path Subst.identity in
+      let substitution =
+        List.fold generated.resource_type_members ~init:substitution
+          ~f:(fun substitution (member, hidden, _) ->
+            if String.equal member "T" then
+              Subst.add_type hidden (Path.Pdot (path, "t")) substitution
+            else substitution)
+      in
+      let generated_declaration =
+        Env.find_module (Pident generated.resource_id) generated_env
+      in
+      let* body =
+        match generated_declaration.md_type with
+        | Mty_signature body ->
+            Ok
+              (Subst.signature Keep substitution body
+              |> List.map ~f:(function
+                | Types.Sig_type (id, typ, rec_status, visibility)
+                  when String.equal (Ident.name id) "t" ->
+                    Types.Sig_type
+                      (id, { typ with type_manifest = None }, rec_status, visibility)
+                | item -> item))
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            Error (Report.error Type at "A signature resource must be a module")
+      in
+      let environment =
+        Env.add_module_declaration ~check:false id Mp_present
+          { generated_declaration with md_type = Mty_signature body; md_loc = at }
+          generated_env
+      in
+      let resource =
+        {
+          generated with
+          resource_name = name.pid_str;
+          resource_backend = Compiler_types.internal_name ~at (name.pid_str ^ "_signature");
+          resource_scope = None;
+          resource_path = path;
+          resource_environment = environment;
+          resource_functor = selected.path;
+          resource_alias_of = None;
+          resource_abstract = true;
+          resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
+          resource_id = id;
+          resource_operations =
+            List.map generated.resource_operations ~f:(fun (operation, args, result) ->
+                ( operation,
+                  List.map args ~f:(Subst.type_expr substitution),
+                  Subst.type_expr substitution result ));
+          resource_descriptor =
+            Datatypes.resource_type ~name:name.pid_str ~module_id:id ~at;
+          resource_aliases = [];
+          resource_at = at;
+          resource_public = None;
+          resource_application = None;
+        }
+      in
+      Ok (resources @ [ (at, resource) ]))
+
+let signature_resource source (declaration : S.ghost_module) =
+  let at = declaration.ghost_module_name.pid_loc in
+  match
+    List.find source.signature_resources ~f:(fun (location, _) ->
+        String.equal location.loc_start.pos_fname at.loc_start.pos_fname
+        && location.loc_start.pos_cnum = at.loc_start.pos_cnum
+        && location.loc_end.pos_cnum = at.loc_end.pos_cnum)
+  with
+  | Some (_, resource) -> Ok resource
+  | None -> Error (Report.error Type at "The signature resource is not declared")
+
+let signature_ghost_environment source declarations env =
+  List.fold_result declarations ~init:env ~f:(fun env declaration ->
+      let* resource = signature_resource source declaration in
+      let env =
+        List.fold resource.resource_type_members ~init:env ~f:(fun env (_, id, typ) ->
+            Env.add_type ~check:false id typ env)
+      in
+      let module_declaration =
+        Env.find_module (Pident resource.resource_id) resource.resource_environment
+      in
+      Ok
+        (Env.add_module_declaration ~check:false resource.resource_id Mp_present
+           module_declaration env))
+
+let realize_signature_ghost_environment source ~substitution declarations env =
+  let* env = signature_ghost_environment source declarations env in
+  List.fold_result declarations ~init:env ~f:(fun env declaration ->
+      let* resource = signature_resource source declaration in
+      let path = Subst.module_path substitution (Path.Pident resource.resource_id) in
+      if Path.same path (Path.Pident resource.resource_id) then Ok env
+      else
+        let views =
+          List.concat_map source.proof_resources ~f:(fun resource ->
+              Option.to_list resource.resource_public @ [ resource ])
+        in
+        let actual =
+          Option.first_some
+            (List.find views ~f:(fun resource ->
+                 Path.same path (Pident resource.resource_id)))
+            (List.find views ~f:(fun resource -> resource_has_path resource path))
+        in
+        let env =
+          Option.value_map actual ~default:env ~f:(fun actual ->
+              let env =
+                List.fold actual.resource_type_members ~init:env
+                  ~f:(fun env (_, id, typ) -> Env.add_type ~check:false id typ env)
+              in
+              let source_environment = actual.resource_environment in
+              let rec module_roots path =
+                match path with
+                | Path.Pident id -> [ id ]
+                | Pdot (parent, _) | Pextra_ty (parent, _) -> module_roots parent
+                | Papply (fn, argument) -> module_roots fn @ module_roots argument
+              in
+              let env =
+                List.fold (module_roots path) ~init:env ~f:(fun env id ->
+                    let find source_env =
+                      try Some (Env.find_module (Pident id) source_env)
+                      with Stdlib.Not_found -> None
+                    in
+                    let binding =
+                      Option.first_some (find source.env) (find source_environment)
+                    in
+                    Option.value_map binding ~default:env ~f:(fun binding ->
+                        Env.add_module_declaration ~check:false id Mp_present binding env))
+              in
+              let actual_declaration =
+                try Some (Env.find_module (Pident actual.resource_id) source_environment)
+                with Stdlib.Not_found -> None
+              in
+              Option.value_map actual_declaration ~default:env ~f:(fun binding ->
+                  Env.add_module_declaration ~check:false actual.resource_id Mp_present
+                    binding env))
+        in
+        let original =
+          Env.find_module (Pident resource.resource_id) resource.resource_environment
+        in
+        Ok
+          (Env.add_module_declaration ~check:false resource.resource_id Mp_present
+             { original with md_type = Mty_alias path }
+             env))
+
+let imported_proof_resources env libraries =
+  let within (outer : Location.t) (inner : Location.t) =
+    String.equal outer.Location.loc_start.pos_fname inner.loc_start.pos_fname
+    && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
+    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+  in
+  let children signature =
+    List.filter_map signature ~f:(function
+      | Types.Sig_module (_, _, declaration, _, _) -> Some declaration.md_loc
+      | Sig_modtype (_, declaration, _) -> Some declaration.mtd_loc
+      | _ -> None)
+  in
+  let rec append env signature names member =
+    match names with
+    | [] -> signature @ [ member ]
+    | name :: rest ->
+        List.map signature ~f:(function
+          | Types.Sig_module (id, presence, declaration, rec_status, visibility)
+            when String.equal (Ident.name id) name ->
+              let declaration =
+                match Mtype.scrape env declaration.md_type with
+                | Mty_signature body ->
+                    {
+                      declaration with
+                      md_type = Mty_signature (append env body rest member);
+                    }
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ -> declaration
+              in
+              Types.Sig_module (id, presence, declaration, rec_status, visibility)
+          | item -> item)
+  in
+  List.fold_result libraries ~init:(env, []) ~f:(fun (env, resources) library ->
+      let library_module = Env.find_module (Pident library.library_id) env in
+      let* signature =
+        match Mtype.scrape env library_module.md_type with
+        | Mty_signature body -> Ok body
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            Error
+              (Report.error Type library.library.scope.location
+                 "An imported interface must be a module signature")
+      in
+      let annotations = Annotation.of_comments library.library.interface_comments in
+      let rec collect path names location signature =
+        let nested = children signature in
+        let direct =
+          List.filter annotations ~f:(fun annotation ->
+              Poly.equal (Annotation.kind annotation) Annotation.Ghost_module
+              && within location annotation.loc
+              && not (List.exists nested ~f:(fun child -> within child annotation.loc)))
+        in
+        let* direct = Result.all (List.map direct ~f:Annotation.ghost_module) in
+        let* () =
+          List.fold_result direct ~init:() ~f:(fun () declaration ->
+              let name = declaration.S.ghost_module_name in
+              if
+                List.exists signature ~f:(function
+                  | Types.Sig_module (id, _, _, _, _) ->
+                      String.equal (Ident.name id) name.pid_str
+                  | _ -> false)
+              then
+                Error
+                  (Report.error Type name.pid_loc
+                     (Printf.sprintf "The module %s is already declared" name.pid_str))
+              else Ok ())
+        in
+        let* descendants =
+          Result.all
+            (List.filter_map signature ~f:(function
+              | Types.Sig_module (id, _, declaration, _, _) ->
+                  begin match Mtype.scrape env declaration.md_type with
+                  | Mty_signature body ->
+                      Some
+                        (collect
+                           (Path.Pdot (path, Ident.name id))
+                           (names @ [ Ident.name id ])
+                           declaration.md_loc body)
+                  | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
+                  end
+              | _ -> None))
+        in
+        Ok
+          (List.map direct ~f:(fun declaration -> (path, names, declaration))
+          @ List.concat descendants)
+      in
+      let* declarations =
+        collect (Pident library.library_id) [ library.library_name ]
+          library.library.scope.location signature
+      in
+      List.fold_result declarations ~init:(env, resources)
+        ~f:(fun (env, resources) (owner, names, declaration) ->
+          let name = declaration.S.ghost_module_name in
+          let at = name.pid_loc in
+          let* signatures = Proof_library.signatures at in
+          let* selected =
+            match
+              Proof_library.find signatures
+                (Proof_library.path_of_qualid declaration.ghost_module_interface)
+            with
+            | Some selected
+              when selected.interface
+                   && Proof_library.is_resource_algebra signatures selected ->
+                Ok selected
+            | Some _ ->
+                Error
+                  (Report.error Type at
+                     "An imported proof module must name a ResourceAlgebra interface")
+            | None -> Error (Report.error Type at "Unknown Raven library interface")
+          in
+          let* () =
+            if
+              List.exists resources ~f:(fun resource ->
+                  Path.same resource.resource_path (Path.Pdot (owner, name.pid_str)))
+            then
+              Error
+                (Report.error Type at
+                   (Printf.sprintf "The module %s is already declared" name.pid_str))
+            else Ok ()
+          in
+          let temporary =
+            S.mk_id ~loc:at (Compiler_types.internal_name ~at name.pid_str)
+          in
+          let* generated_env, _, generated, _, _ =
+            elaborate_proof_types ~add_standard:false ~allow_interfaces:true env None
+              [
+                S.Proof_resource
+                  {
+                    resource_name = temporary;
+                    resource_functor = declaration.ghost_module_interface;
+                    resource_arguments = [];
+                  };
+              ]
+          in
+          let* generated =
+            match generated with
+            | [ resource ] -> Ok resource
+            | _ -> Error (Report.error Type at "An imported resource could not be typed")
+          in
+          let path = Path.Pdot (owner, name.pid_str) in
+          let id = Ident.create_local name.pid_str in
+          let substitution = Subst.add_module generated.resource_id path Subst.identity in
+          let substitution =
+            List.fold generated.resource_type_members ~init:substitution
+              ~f:(fun substitution (member, hidden, _) ->
+                if String.equal member "T" then
+                  Subst.add_type hidden (Path.Pdot (path, "t")) substitution
+                else substitution)
+          in
+          let generated_declaration =
+            Env.find_module (Pident generated.resource_id) generated_env
+          in
+          let* body =
+            match generated_declaration.md_type with
+            | Mty_signature body ->
+                Ok
+                  (Subst.signature Keep substitution body
+                  |> List.map ~f:(function
+                    | Types.Sig_type (id, declaration, rec_status, visibility)
+                      when String.equal (Ident.name id) "t" ->
+                        Types.Sig_type
+                          ( id,
+                            { declaration with type_manifest = None },
+                            rec_status,
+                            visibility )
+                    | item -> item))
+            | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+                Error (Report.error Type at "An imported resource must be a module")
+          in
+          let member =
+            Types.Sig_module
+              ( id,
+                Mp_present,
+                { generated_declaration with md_type = Mty_signature body; md_loc = at },
+                Trec_not,
+                Exported )
+          in
+          let root = Env.find_module (Pident library.library_id) env in
+          let* root_signature =
+            match Mtype.scrape env root.md_type with
+            | Mty_signature body -> Ok body
+            | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+                Error (Report.error Type at "An imported library must be a module")
+          in
+          let env =
+            Env.add_module_declaration ~check:false library.library_id Mp_present
+              {
+                root with
+                md_type =
+                  Mty_signature (append env root_signature (List.tl_exn names) member);
+              }
+              env
+          in
+          let descriptor =
+            Datatypes.resource_type ~name:name.pid_str ~module_id:id ~at
+            |> fun descriptor -> Datatypes.with_paths descriptor [ Path.Pdot (path, "t") ]
+          in
+          let resource =
+            {
+              generated with
+              resource_name = name.pid_str;
+              resource_backend = String.concat ~sep:"_" (names @ [ name.pid_str ]);
+              resource_scope = None;
+              resource_path = path;
+              resource_environment = env;
+              resource_functor = selected.path;
+              resource_alias_of = None;
+              resource_abstract = true;
+              resource_type_members = [];
+              resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
+              resource_id = id;
+              resource_operations =
+                List.map generated.resource_operations
+                  ~f:(fun (operation, args, result) ->
+                    ( operation,
+                      List.map args ~f:(Subst.type_expr substitution),
+                      Subst.type_expr substitution result ));
+              resource_descriptor = descriptor;
+              resource_aliases = [];
+              resource_at = at;
+              resource_public = None;
+              resource_application = None;
+            }
+          in
+          Ok (env, resources @ [ resource ])))
 
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
@@ -2111,66 +3620,104 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     in
     let logical_types = List.rev logical_types in
     specialize_to_interface env typed interface;
+    let signature_comments =
+      comments
+      @ Option.value_map interface ~default:[] ~f:(fun interface ->
+          interface.interface_comments)
+      @ List.concat_map libraries ~f:(fun library -> library.library.interface_comments)
+    in
     let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
     Result.bind proof ~f:(fun proof ->
         let* env, _, _, _, _ = elaborate_proof_types env interface [] in
-        let* env, definitions =
-          List.fold_result proof ~init:(env, []) ~f:(fun (env, resources) -> function
-            | S.Proof_definition { module_name; module_interface; _ } ->
-                let declaration =
-                  S.Proof_resource
-                    {
-                      resource_name = module_name;
-                      resource_functor = module_interface;
-                      resource_arguments = [];
-                    }
-                in
-                let* env, _, resources, _, _ =
-                  elaborate_proof_types ~add_standard:false ~allow_interfaces:true
-                    ~previous:([], resources, [], []) env None [ declaration ]
-                in
-                let* signatures = Proof_library.signatures module_name.pid_loc in
-                let* selected =
-                  match
-                    Proof_library.find signatures
-                      (Proof_library.path_of_qualid module_interface)
-                  with
-                  | Some selected when selected.interface -> Ok selected
-                  | Some _ ->
-                      Error
-                        (Report.error Type
-                           (S.qualid_loc module_interface)
-                           "A proof-defined module must name an interface")
-                  | None ->
-                      Error
-                        (Report.error Type
-                           (S.qualid_loc module_interface)
-                           "Unknown Raven library interface")
-                in
-                let* () =
-                  if Proof_library.is_resource_algebra signatures selected then Ok ()
-                  else
-                    Error
-                      (Report.error Type
-                         (S.qualid_loc module_interface)
-                         "A proof-defined module must implement ResourceAlgebra")
-                in
-                let resources =
-                  List.map resources ~f:(fun resource ->
-                      if
-                        String.equal resource.resource_name module_name.pid_str
-                        && Poly.equal resource.resource_at module_name.pid_loc
-                      then { resource with resource_definition = true }
-                      else resource)
-                in
-                Ok (env, resources)
-            | _ -> Ok (env, resources))
+        let* signature_resources = signature_ghost_resources env signature_comments in
+        let* env, imported_resources = imported_proof_resources env libraries in
+        let prepare_definition (root_env, resources) parent module_name module_interface =
+          let declaration =
+            S.Proof_resource
+              {
+                resource_name = module_name;
+                resource_functor = module_interface;
+                resource_arguments = [];
+              }
+          in
+          let* local_env, _, all_resources, _, _ =
+            elaborate_proof_types ~add_standard:false ~allow_interfaces:true
+              ~previous:([], resources, [], []) parent.Proof_scopes.environment None
+              [ declaration ]
+          in
+          let* signatures = Proof_library.signatures module_name.pid_loc in
+          let* selected =
+            match
+              Proof_library.find signatures
+                (Proof_library.path_of_qualid module_interface)
+            with
+            | Some selected when selected.interface -> Ok selected
+            | Some _ ->
+                Error
+                  (Report.error Type
+                     (S.qualid_loc module_interface)
+                     "A proof-defined module must name an interface")
+            | None ->
+                Error
+                  (Report.error Type
+                     (S.qualid_loc module_interface)
+                     "Unknown Raven library interface")
+          in
+          let* () =
+            if Proof_library.is_resource_algebra signatures selected then Ok ()
+            else
+              Error
+                (Report.error Type
+                   (S.qualid_loc module_interface)
+                   "A proof-defined module must implement ResourceAlgebra")
+          in
+          let* new_resource =
+            match
+              List.filter all_resources ~f:(fun resource ->
+                  not
+                    (List.exists resources ~f:(fun known ->
+                         Ident.same known.resource_id resource.resource_id)))
+            with
+            | [ resource ] -> Ok resource
+            | _ ->
+                Error
+                  (Report.error Type module_name.pid_loc
+                     "A proof-defined module could not be registered")
+          in
+          let path =
+            Option.value_map parent.owner ~default:(Path.Pident new_resource.resource_id)
+              ~f:(fun owner -> Path.Pdot (owner, module_name.pid_str))
+          in
+          let resource =
+            {
+              new_resource with
+              resource_scope = parent.owner;
+              resource_path = path;
+              resource_environment = local_env;
+              resource_definition = true;
+            }
+          in
+          let root_env = if Option.is_none parent.owner then local_env else root_env in
+          Ok
+            ((root_env, resources @ [ resource ]), { parent with environment = local_env })
         in
-        let* proof_scopes =
-          Proof_scopes.resolve ~location:scope.location ~environment:env typed proof
+        let* (env, definitions), proof_scopes =
+          Proof_scopes.resolve_prepared ~location:scope.location ~environment:env
+            ~state:(env, imported_resources) ~prepare_definition typed proof
+        in
+        let merge_resources existing additions =
+          List.fold additions ~init:existing ~f:(fun existing added ->
+              if
+                List.exists existing ~f:(fun resource ->
+                    Ident.same resource.resource_id added.resource_id)
+              then
+                List.map existing ~f:(fun resource ->
+                    if Ident.same resource.resource_id added.resource_id then added
+                    else resource)
+              else existing @ [ added ])
         in
         let initial = (env, [], [], definitions, [], [], proof_scopes) in
-        Result.map
+        Result.bind
           (List.fold_result proof ~init:initial
              ~f:(fun
                  (env, root_types, scoped_types, resources, fields, aus, proof_scopes)
@@ -2185,13 +3732,14 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                           module_fields,
                           module_aus ) =
                      scoped_proof_types ~only:[ module_name.pid_str ]
+                       ?public_interface:interface ~comments:signature_comments
                        ~previous_resources:resources runtime_env env proof_scopes
                    in
                    Ok
                      ( env,
                        root_types,
                        scoped_types @ types,
-                       resources @ module_resources,
+                       merge_resources resources module_resources,
                        fields @ module_fields,
                        aus @ module_aus,
                        proof_scopes )
@@ -2203,35 +3751,14 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                           module_fields,
                           module_aus ) =
                      scoped_proof_types ~only:[ module_name.pid_str ]
+                       ?public_interface:interface ~comments:signature_comments
                        ~previous_resources:resources runtime_env env proof_scopes
-                   in
-                   let* representation =
-                     match
-                       List.find types ~f:(fun data ->
-                           String.equal data.Datatypes.module_name
-                             (module_name.pid_str ^ "_T"))
-                     with
-                     | Some { Datatypes.id = Some id; _ } ->
-                         Ok (Ctype.newconstr (Path.Pident id) [])
-                     | Some { Datatypes.id = None; _ } | None ->
-                         Error
-                           (Report.error Type module_name.pid_loc
-                              "A proof-defined resource algebra must declare type t")
-                   in
-                   let resources =
-                     List.map resources ~f:(fun resource ->
-                         if
-                           String.equal resource.resource_name module_name.pid_str
-                           && resource.resource_definition
-                         then
-                           { resource with resource_representation = Some representation }
-                         else resource)
                    in
                    Ok
                      ( env,
                        root_types,
                        scoped_types @ types,
-                       resources @ module_resources,
+                       merge_resources resources module_resources,
                        fields @ module_fields,
                        aus @ module_aus,
                        proof_scopes )
@@ -2251,33 +3778,110 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                 proof_aus,
                 proof_scopes )
             ->
+            let* proof_scopes, implicit =
+              implicit_ghost_scopes ~comments:signature_comments proof_scopes
+            in
+            let* ( env,
+                   proof_scopes,
+                   implicit_types,
+                   implicit_resources,
+                   implicit_fields,
+                   implicit_aus ) =
+              match implicit with
+              | [] -> Ok (env, proof_scopes, [], [], [], [])
+              | _ ->
+                  scoped_proof_types
+                    ~only_ids:
+                      (List.filter_map implicit ~f:(fun scope ->
+                           scope.Proof_scopes.declaration_id))
+                    ?public_interface:interface ~comments:signature_comments
+                    ~previous_resources:proof_resources runtime_env env proof_scopes
+            in
             let proof_scopes =
               Proof_scopes.map_environments proof_scopes ~f:(fun scope ->
                   if Option.is_none scope.owner then env else scope.environment)
             in
-            {
-              file;
-              text;
-              scope;
-              typed;
-              comments;
-              env;
-              sequence;
-              logical_types;
-              proof_types =
-                List.sort (root_types @ scoped_types) ~compare:(fun a b ->
-                    Int.compare a.Datatypes.at.loc_start.pos_cnum
-                      b.Datatypes.at.loc_start.pos_cnum);
-              proof_resources;
-              proof_fields;
-              proof_aus;
-              pending;
-              interface;
-              proof;
-              proof_scopes;
-              libraries;
-              spec_bindings = specification_bindings runtime_env env;
-            }))
+            let proof_types = root_types @ scoped_types @ implicit_types in
+            let* proof_resources =
+              Result.all
+                (List.map (proof_resources @ implicit_resources) ~f:(fun resource ->
+                     if
+                       (not resource.resource_definition)
+                       || Option.is_some resource.resource_application
+                     then Ok resource
+                     else
+                       let at = resource.resource_at in
+                       let* definition =
+                         match
+                           List.find proof_scopes.scopes ~f:(fun scope ->
+                               Option.exists scope.owner
+                                 ~f:(Path.same resource.resource_path)
+                               && Option.exists scope.declaration_id
+                                    ~f:(Ident.same resource.resource_id))
+                         with
+                         | Some scope -> Ok scope
+                         | None ->
+                             Error
+                               (Report.error Type at
+                                  "A proof-defined resource has no owning scope")
+                       in
+                       let* type_id =
+                         try
+                           match
+                             Env.find_type_by_name (Lident "t") definition.environment
+                           with
+                           | Pident id, _ -> Ok id
+                           | _ ->
+                               Error
+                                 (Report.error Type at
+                                    "A proof-defined resource algebra must declare type t")
+                         with Stdlib.Not_found ->
+                           Error
+                             (Report.error Type at
+                                "A proof-defined resource algebra must declare type t")
+                       in
+                       let* () =
+                         if
+                           List.exists proof_types ~f:(fun data ->
+                               Option.exists data.Datatypes.id ~f:(Ident.same type_id))
+                         then Ok ()
+                         else
+                           Error
+                             (Report.error Type at
+                                "A proof-defined resource algebra must declare type t")
+                       in
+                       Ok
+                         {
+                           resource with
+                           resource_representation =
+                             Some (Ctype.newconstr (Path.Pident type_id) []);
+                         }))
+            in
+            Ok
+              {
+                file;
+                text;
+                scope;
+                typed;
+                comments;
+                env;
+                sequence;
+                logical_types;
+                proof_types =
+                  List.sort proof_types ~compare:(fun a b ->
+                      Int.compare a.Datatypes.at.loc_start.pos_cnum
+                        b.Datatypes.at.loc_start.pos_cnum);
+                proof_resources;
+                signature_resources;
+                proof_fields = proof_fields @ implicit_fields;
+                proof_aus = proof_aus @ implicit_aus;
+                pending;
+                interface;
+                proof;
+                proof_scopes;
+                libraries;
+                spec_bindings = specification_bindings runtime_env env;
+              }))
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

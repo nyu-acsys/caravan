@@ -3,4 +3,6 @@
   %{bin:caravan}
   (glob_files *.ml)
   (glob_files *.mli)
+  (glob_files abstract_ra_lib/*.mli)
+  (glob_files ra_exports_lib/*.mli)
   (glob_files *.proof)))

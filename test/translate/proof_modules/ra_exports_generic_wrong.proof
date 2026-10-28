@@ -1,0 +1,4 @@
+module A = struct module R = Nat end
+module Make (X : INPUT) = struct
+  module Authority = Option (struct type t = int end)
+end

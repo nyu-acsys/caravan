@@ -22,6 +22,11 @@ let models source plan =
       Option.exists (model_owner source data) ~f:(fun scope ->
           Option.equal Path.same scope.owner plan.scope.owner))
 
+let resources source plan =
+  List.filter source.Source.proof_resources ~f:(fun resource ->
+      (not resource.Source.resource_abstract)
+      && Option.equal Path.same resource.resource_scope plan.scope.owner)
+
 let has_models source (specialization : Module_inventory.specialization) =
   match specialization.template.mod_desc with
   | Tmod_functor (Named (Some parameter, _, _), _) ->
@@ -44,15 +49,47 @@ let symbolic_models source plan ~owner =
   List.map (models source plan) ~f:(fun data -> model_descriptor data ~owner)
 
 let parameter_types plan ~owner =
-  Generic_modules.types plan.group ~owner
-  |> List.map2_exn plan.group.types ~f:(fun (name, _) descriptor ->
-      let path = Path.Pdot (Path.Pident plan.parameter, name) in
-      { descriptor with Datatypes.id = None; library = Some path; paths = [ path ] })
+  let descriptors = Generic_modules.types plan.group ~owner in
+  let formal_types, ghost_types =
+    List.split_n descriptors (List.length plan.group.types)
+  in
+  let formal_types =
+    List.map2_exn plan.group.types formal_types ~f:(fun (name, _) descriptor ->
+        let path = Path.Pdot (Path.Pident plan.parameter, name) in
+        { descriptor with Datatypes.id = None; library = Some path; paths = [ path ] })
+  in
+  let ghost_types =
+    List.map2_exn plan.group.representative.argument.expected.signature_ghost_modules
+      ghost_types ~f:(fun (name, _) descriptor ->
+        Datatypes.with_paths descriptor
+          [ Path.Pdot (Path.Pdot (Path.Pident plan.parameter, name), "t") ])
+  in
+  formal_types @ ghost_types
 
 let model_projection source plan path substitution =
   List.fold (models source plan) ~init:substitution ~f:(fun substitution data ->
       Option.value_map data.Datatypes.id ~default:substitution ~f:(fun id ->
           Subst.add_type id (Path.Pdot (path, Ident.name id)) substitution))
+
+let resource_projection source plan path substitution =
+  let substitution =
+    match plan.scope.owner with
+    | Some (Path.Pident id) -> Subst.add_module id path substitution
+    | Some (Pdot _ | Papply _ | Pextra_ty _) | None -> substitution
+  in
+  List.fold (resources source plan) ~init:substitution ~f:(fun substitution resource ->
+      let owner = Path.Pdot (path, resource.resource_name) in
+      let add_resource substitution resource =
+        let substitution =
+          Subst.add_module resource.Source.resource_id owner substitution
+        in
+        List.fold resource.resource_type_members ~init:substitution
+          ~f:(fun substitution (member, id, _) ->
+            Subst.add_type id (Path.Pdot (owner, String.uncapitalize member)) substitution)
+      in
+      let substitution = add_resource substitution resource in
+      Option.value_map resource.resource_public ~default:substitution
+        ~f:(add_resource substitution))
 
 let nullary_alias (declaration : Typedtree.type_declaration) =
   match declaration.typ_kind with
@@ -106,7 +143,9 @@ let plan groups scopes =
 let owner plans scope =
   Option.bind scope ~f:(fun scope ->
       List.find plans ~f:(fun plan ->
-          Option.equal Path.same plan.scope.owner scope.Proof_scopes.owner))
+          Option.equal Path.same plan.scope.owner scope.Proof_scopes.owner
+          || Option.is_some scope.definition
+             && Option.equal Path.same plan.scope.owner scope.parent))
 
 let projection plan =
   List.fold plan.aliases
@@ -178,7 +217,7 @@ let application_projection source plan (application : Module_inventory.specializ
           (Path.Pdot (path, original.typ_name.txt))
           substitution)
   in
-  model_projection source plan path projection
+  model_projection source plan path projection |> resource_projection source plan path
 
 let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
     (proofs : Proof_bindings.t) plans =
@@ -209,6 +248,9 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
               Error
                 (Report.error Type original.typ_loc
                    "The application has no typed declaration for this proof type alias"))
+    in
+    let private_projection =
+      resource_projection source plan application_source.identity private_projection
     in
     let* environment =
       match members with
@@ -310,6 +352,76 @@ let model_types source inventory plans =
                     })))
       in
       symbolic @ concrete)
+
+let resource_applications source inventory plans =
+  List.concat_map plans ~f:(fun plan ->
+      List.concat_map plan.group.applications ~f:(fun instance ->
+          let paths = application_paths source inventory instance.source in
+          List.concat_map paths ~f:(fun path ->
+              let projection = application_projection source plan instance.source path in
+              let project_type = Subst.type_expr projection in
+              let project_path = Subst.module_path projection in
+              List.map (resources source plan) ~f:(fun resource ->
+                  let owner = Path.Pdot (path, resource.resource_name) in
+                  let rec project (resource : Source.proof_resource) =
+                    let leaf =
+                      (Qualified_name.of_string resource.resource_backend).name
+                    in
+                    let backend = instance.name ^ "." ^ leaf in
+                    let descriptor member (data : Datatypes.t) =
+                      let type_path = Path.Pdot (owner, member) in
+                      {
+                        data with
+                        Datatypes.id = None;
+                        library = None;
+                        paths =
+                          [
+                            type_path;
+                            Path.Pdot
+                              ( Path.Pdot
+                                  (instance.source.identity, resource.resource_name),
+                                member );
+                          ];
+                        module_name = backend;
+                        module_path = Some (String.split backend ~on:'.');
+                        backend_type =
+                          Some
+                            Qualified_name.
+                              { path = String.split backend ~on:'.'; name = "T" };
+                        alias = Option.map data.alias ~f:project_type;
+                      }
+                    in
+                    {
+                      resource with
+                      Source.resource_backend = backend;
+                      resource_path = owner;
+                      resource_type = project_type resource.resource_type;
+                      resource_representation =
+                        Option.map resource.resource_representation ~f:project_type;
+                      resource_alias_of =
+                        Option.map resource.resource_alias_of ~f:project_path;
+                      resource_arguments =
+                        List.map resource.resource_arguments ~f:(function
+                          | Source.Type_argument typ ->
+                              Source.Type_argument (project_type typ)
+                          | Module_argument path -> Module_argument (project_path path));
+                      resource_operations =
+                        List.map resource.resource_operations
+                          ~f:(fun (name, inputs, output) ->
+                            (name, List.map inputs ~f:project_type, project_type output));
+                      resource_descriptor = descriptor "t" resource.resource_descriptor;
+                      resource_aliases =
+                        List.map resource.resource_aliases ~f:(fun alias ->
+                            let member =
+                              match alias.Datatypes.library with
+                              | Some (Path.Pdot (_, member)) -> member
+                              | _ -> "element"
+                            in
+                            descriptor member alias);
+                      resource_public = Option.map resource.resource_public ~f:project;
+                    }
+                  in
+                  project resource))))
 
 let layout_dependencies plans (data : Datatypes.t) =
   match data.module_path with
