@@ -41,9 +41,10 @@ A different invariant on the same source type cannot supply a worker's mask.
   Verification Error: Cannot call method_touch. The invariant shared required by method_touch is not available in the current mask.
   [1]
 
-Manual proof scopes continue to use verified specializations.
+Manual proof scopes share a verified generic worker.
 
   $ caravan --shh --emit-rav manual.ml > manual.rav
   $ sed -n '/^module Generic_.*\[/p' manual.rav
+  module Generic_Left_Cell[Parameter: Argument_Left_Cell]
   $ raven --shh manual.rav
   Verification successful.

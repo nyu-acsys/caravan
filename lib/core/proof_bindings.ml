@@ -57,6 +57,11 @@ let drop_prefix prefix names =
   in
   go prefix names
 
+let functor_ancestor scopes scope =
+  List.find scopes.Proof_scopes.scopes ~f:(fun ancestor ->
+      Option.is_some (drop_prefix ancestor.namespace scope.Proof_scopes.namespace)
+      && not (List.is_empty ancestor.parameters))
+
 let contains (outer : Location.t) (inner : Location.t) =
   outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
@@ -114,16 +119,19 @@ let relevant_constraints constraints scopes scope =
           (ancestor, constraint_)))
 
 let exported inventory source scope name kind =
+  let template = functor_ancestor source.Source.proof_scopes scope in
   let relevant =
     relevant_constraints inventory.Module_inventory.constraints source.Source.proof_scopes
       scope
   in
-  match kind with
-  | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
-      List.is_empty relevant
-  | Predicate _ ->
-      List.for_all relevant ~f:(fun (ancestor, constraint_) ->
-          visible_in_constraint scope name ancestor constraint_)
+  if Option.is_some template then false
+  else
+    match kind with
+    | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+        List.is_empty relevant
+    | Predicate _ ->
+        List.for_all relevant ~f:(fun (ancestor, constraint_) ->
+            visible_in_constraint scope name ancestor constraint_)
 
 let remaining_constraints t ~scope binding =
   relevant_constraints t.constraints t.scopes binding.entry.scope
@@ -139,7 +147,16 @@ let remaining_constraints t ~scope binding =
                (drop_prefix boundary.Proof_scopes.namespace caller.Proof_scopes.namespace))))
 
 let visible t ~scope binding =
+  let inside_template =
+    match functor_ancestor t.scopes binding.entry.scope with
+    | None -> true
+    | Some owner ->
+        Option.exists scope ~f:(fun scope ->
+            Option.is_some (drop_prefix owner.namespace scope.Proof_scopes.namespace))
+  in
   let relevant = remaining_constraints t ~scope binding in
+  inside_template
+  &&
   match binding.kind with
   | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
       List.is_empty relevant
@@ -404,11 +421,6 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
            | Proof_module _ -> "module"
            | Proof_predicate _ | Proof_invariant _ | Proof_lemma _ -> "proof"))
 
-let functor_ancestor scopes scope =
-  List.find scopes.Proof_scopes.scopes ~f:(fun ancestor ->
-      Option.is_some (drop_prefix ancestor.namespace scope.Proof_scopes.namespace)
-      && not (List.is_empty ancestor.parameters))
-
 let declaration_namespace = function
   | S.Proof_state _ -> `State
   | Proof_action _ -> `Action
@@ -468,9 +480,14 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
           match functor_ancestor scopes scope with
           | None -> Ok ()
           | Some ancestor ->
-              Report.unsupported entry.name.pid_loc
-                (Printf.sprintf "A proof declaration inside functor %s"
-                   (String.concat ~sep:"." ancestor.namespace))
+              begin match (ancestor.parameters, entry.declaration) with
+              | [ Named (Some _, _, _) ], (S.Proof_predicate _ | Proof_lemma _)
+                when same_owner ancestor.owner scope.owner ->
+                  Ok ()
+              | _ ->
+                  Report.unsupported entry.name.pid_loc
+                    "This declaration or nested scope in a functor proof"
+              end
         in
         let* kind, parameters = supported source inventory entry in
         let* () =

@@ -1,0 +1,10 @@
+module Make (Cell : CELL) = struct
+  predicate wrapped (cell : Cell.t) (n [@implicit] : int) =
+    exists same : Cell.t. same === cell && Cell.counter same n
+
+  lemma preserve (cell : Cell.t) (n [@implicit] : int)
+    requires (wrapped cell n)
+    ensures (wrapped cell n) =
+    let same = unfold wrapped cell n { same } in
+    fold wrapped cell n { same = same }
+end

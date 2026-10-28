@@ -2352,7 +2352,7 @@ let lemma_call env (t : S.term) =
             in
             Ok
               ( R.Expr.call ~loc:(loc t.term_loc)
-                  (name ~loc:(loc t.term_loc) signature.lemma_raven)
+                  (qualified_name ~loc:(loc t.term_loc) signature.lemma_raven)
                   args,
                 signature.lemma_outputs )
       end
@@ -2392,7 +2392,7 @@ let predicate_use env ~unfold t witnesses make =
               Ok (ident ~loc:(loc id.pid_loc) id.pid_str, value))
       in
       let l = loc t.S.term_loc in
-      Ok (make ~loc:l ?witnesses:(Some witnesses) (name ~loc:l raven) args)
+      Ok (make ~loc:l ?witnesses:(Some witnesses) (qualified_name ~loc:l raven) args)
   | _ -> error t.term_loc "Expected a predicate applied to its arguments"
 
 (** Ghost annotations invoke checked proof operations. *)
@@ -6439,7 +6439,7 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
       let* args =
         predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
       in
-      Ok (make ~loc:l ~pred:key (name ~loc:l raven) args)
+      Ok (make ~loc:l ~pred:key (qualified_name ~loc:l raven) args)
   | _, _, Tif (c, a, b) ->
       let* c = formula env c in
       let* a = uses ctx env ~at make a in
@@ -9282,7 +9282,7 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
            ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
            ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
            ~requires ~ensures ~decreases
-           (ident ~loc:l signature.lemma_raven)
+           (ident ~loc:l lemma_name.pid_str)
            (Some body))
   | _ -> error Location.none "Expected a lemma declaration"
 
@@ -9947,7 +9947,6 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
                     ~f:(fun f ->
                       List.is_empty f.captured && List.is_empty f.prefix
                       && List.is_empty f.signature_sites
-                      && (not f.manual)
                       && (Option.is_some group.world || not (field_contract f.contract))
                       && Option.is_none f.role
                       && not
@@ -9969,7 +9968,10 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
               let at = annotation.Annotation.loc in
               at.loc_start.pos_cnum >= body.loc_start.pos_cnum
               && at.loc_end.pos_cnum <= body.loc_end.pos_cnum
-              && not (Poly.equal (Annotation.kind annotation) Annotation.Contract))
+              &&
+              match Annotation.kind annotation with
+              | Contract | Manual | Scope -> false
+              | _ -> true)
         in
         let representation_stable =
           List.for_all group.applications ~f:(fun application ->
@@ -10609,10 +10611,33 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         not
           (List.exists funcs ~f:(fun f ->
                Option.is_some (Generic_modules.member [ group ] f.id)
-               && not
-                    (List.is_empty
-                       (Proof_bindings.private_bindings scoped_proofs
-                          ~scope:(Proof_bindings.scope_for_location scoped_proofs f.loc))))))
+               && List.exists
+                    (Proof_bindings.private_bindings scoped_proofs
+                       ~scope:(Proof_bindings.scope_for_location scoped_proofs f.loc))
+                    ~f:(fun binding ->
+                      Option.is_none
+                        (Proof_bindings.functor_ancestor source.proof_scopes
+                           binding.entry.scope)))))
+  in
+  let* generic_proofs = Generic_proofs.plan generics source.proof_scopes in
+  let* generic_proof_types =
+    all generic_proofs ~f:Generic_proofs.types |> Result.map ~f:List.concat
+  in
+  let* _ =
+    all scoped_proofs.bindings ~f:(fun binding ->
+        if
+          Option.is_none
+            (Proof_bindings.functor_ancestor source.proof_scopes binding.entry.scope)
+          || Option.is_some
+               (Generic_proofs.owner generic_proofs (Some binding.entry.scope))
+        then Ok ()
+        else
+          unsupported binding.entry.name.pid_loc
+            "A functor proof without a supported generic runtime body and application")
+  in
+  let proof_owner name =
+    Option.bind (scoped_binding name) ~f:(fun binding ->
+        Generic_proofs.owner generic_proofs (Some binding.entry.scope))
   in
   let layouts = Result_layouts.plan types generics in
   let* types = Result_layouts.concrete layouts types in
@@ -10790,7 +10815,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         r.Source.resource_descriptor :: r.resource_aliases)
   in
   let types =
-    types @ resource_types @ token_types @ source.logical_types
+    generic_proof_types @ types @ resource_types @ token_types @ source.logical_types
     @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
   (* Each data type's module, given the ones declared before it; a record type that is a
@@ -11557,6 +11582,85 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         predicate_inputs = inputs @ proof_support.predicate_inputs;
         logical_functions = private_functions @ proof_support.logical_functions;
       } )
+  in
+  let* generic_parameters =
+    all generic_proofs ~f:(fun plan ->
+        let signature = plan.Generic_proofs.group.representative.argument.expected in
+        let substitution =
+          List.fold signature.signature_types ~init:Subst.identity
+            ~f:(fun substitution (name, declaration) ->
+              Subst.add_type declaration.Typedtree.typ_id
+                (Path.Pdot (Path.Pident plan.parameter, name))
+                substitution)
+        in
+        let* resources =
+          all signature.signature_resources ~f:(fun (name, formal) ->
+              let environment =
+                Source.annotation_env source formal.Module_inventory.site.environment
+              in
+              let* ts =
+                all formal.declaration.pred_params ~f:(fun (id, ty) ->
+                    Source.ocaml_type environment ~at:id.S.pid_loc ty)
+              in
+              let ts = List.map ts ~f:(Subst.type_expr substitution) in
+              let* outputs = predicate_output_count types formal.declaration ts in
+              let stem =
+                List.Assoc.find_exn plan.group.resources name ~equal:String.equal
+              in
+              let key = plan.group.name ^ "." ^ plan.group.parameter ^ "." ^ stem in
+              Ok (name, key, ts, List.length ts - outputs))
+        in
+        Ok (plan.group.name, resources))
+  in
+  let generic_context plan ~projection (preds, spec_funcs, support) =
+    let project = Subst.type_expr projection in
+    let target backend =
+      match scoped_binding backend with
+      | Some binding when Generic_proofs.contains plan binding ->
+          Generic_proofs.member plan backend
+      | _ -> backend
+    in
+    let parameters =
+      List.Assoc.find_exn generic_parameters plan.Generic_proofs.group.name
+        ~equal:String.equal
+    in
+    let preds =
+      List.map preds ~f:(fun (key, (backend, ts)) ->
+          (key, (target backend, List.map ts ~f:project)))
+    in
+    let preds =
+      List.map parameters ~f:(fun (_, key, ts, _) -> (key, (key, List.map ts ~f:project)))
+      @ preds
+    in
+    let spec_funcs =
+      List.map parameters ~f:(fun (_, key, _, _) -> (key, key))
+      @ List.map spec_funcs ~f:(fun (key, backend) -> (key, target backend))
+    in
+    let predicate_views =
+      List.fold parameters ~init:support.predicate_views
+        ~f:(fun views (name, key, _, _) ->
+          List.fold [ plan.parameter; plan.group.representative.parameter ] ~init:views
+            ~f:(fun views parameter ->
+              Path_bindings.add views (Path.Pdot (Path.Pident parameter, name)) key))
+    in
+    ( preds,
+      spec_funcs,
+      {
+        support with
+        predicate_views;
+        predicate_inputs =
+          List.map parameters ~f:(fun (_, key, _, inputs) -> (key, inputs))
+          @ support.predicate_inputs;
+        opaque_predicates =
+          List.map parameters ~f:(fun (_, key, _, _) -> key) @ support.opaque_predicates;
+      } )
+  in
+  let proof_context_for ~preds ~spec_funcs ~proof_support name =
+    let scope = declaration_scope name in
+    let context = proof_context scope preds spec_funcs proof_support in
+    match proof_owner name with
+    | None -> context
+    | Some plan -> generic_context plan ~projection:Subst.identity context
   in
   let* atomic_updates =
     all atomic_operations ~f:(fun (au_source, f) ->
@@ -12811,9 +12915,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
-        let scope = declaration_scope p.pred_name.pid_str in
         let preds, spec_funcs, proof_support =
-          proof_context scope preds spec_funcs proof_support
+          proof_context_for ~preds ~spec_funcs ~proof_support p.pred_name.pid_str
         in
         predicate types ~refs ~primitives ~shared
           ~ocaml_env:(declaration_environment p.pred_name.pid_str)
@@ -12882,16 +12985,38 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         | _ -> None)
     @ predicate_bodies
   in
+  let generic_lemmas plan ~projection lemmas =
+    List.map lemmas ~f:(fun (key, signature) ->
+        let backend =
+          match scoped_binding signature.lemma_raven with
+          | Some binding when Generic_proofs.contains plan binding ->
+              Generic_proofs.member plan binding.backend
+          | _ -> signature.lemma_raven
+        in
+        ( key,
+          {
+            signature with
+            lemma_raven = backend;
+            lemma_inputs = List.map signature.lemma_inputs ~f:(Subst.type_expr projection);
+            lemma_outputs =
+              List.map signature.lemma_outputs ~f:(Subst.type_expr projection);
+          } ))
+  in
   let* lemma_members =
     all lemma_declarations ~f:(fun declaration ->
         let declaration_name = (Proof_scopes.name declaration).pid_str in
         let scope = declaration_scope declaration_name in
         let preds, spec_funcs, proof_support =
-          proof_context scope preds spec_funcs proof_support
+          proof_context_for ~preds ~spec_funcs ~proof_support declaration_name
+        in
+        let lemmas = lemma_context scope in
+        let lemmas =
+          Option.value_map (proof_owner declaration_name) ~default:lemmas ~f:(fun plan ->
+              generic_lemmas plan ~projection:Subst.identity lemmas)
         in
         proof_lemma types ~refs ~primitives ~shared
           ~ocaml_env:(declaration_environment declaration_name)
-          ~preds ~spec_funcs ~proof_lemmas:(lemma_context scope) ~proof_support
+          ~preds ~spec_funcs ~proof_lemmas:lemmas ~proof_support
           ~predicate_bodies:(body_contexts scope) origins declaration)
   in
   let* logical_members =
@@ -12976,6 +13101,17 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     match body_owner f with
     | None -> (types, preds, functions, pure_functions, spec_funcs, proof_support)
     | Some (group, _) ->
+        let preds, spec_funcs, proof_support =
+          match
+            List.find generic_proofs ~f:(fun plan ->
+                phys_equal plan.Generic_proofs.group group)
+          with
+          | None -> (preds, spec_funcs, proof_support)
+          | Some plan ->
+              generic_context plan
+                ~projection:(Generic_proofs.projection plan)
+                (preds, spec_funcs, proof_support)
+        in
         let body_types =
           List.Assoc.find_exn generic_body_types group.name ~equal:String.equal
           @ Generic_modules.types group
@@ -13098,10 +13234,31 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 ~past_structures:(past_structures f) ~past_returns ~ghost_args
                 ~procedure_signatures
                 ~proof_lemmas:
-                  (lemma_context (Proof_bindings.scope_for_location scoped_proofs f.loc))
+                  (let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+                   let lemmas = lemma_context scope in
+                   match Generic_proofs.owner generic_proofs scope with
+                   | None -> lemmas
+                   | Some plan ->
+                       generic_lemmas plan
+                         ~projection:(Generic_proofs.projection plan)
+                         lemmas)
                 ~proof_support
                 ~predicate_bodies:
-                  (body_contexts (Proof_bindings.scope_for_location scoped_proofs f.loc))
+                  (let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+                   let bodies = body_contexts scope in
+                   match Generic_proofs.owner generic_proofs scope with
+                   | None -> bodies
+                   | Some plan ->
+                       List.map bodies ~f:(fun (key, body) ->
+                           ( key,
+                             {
+                               body with
+                               project_type =
+                                 (fun ty ->
+                                   Subst.type_expr
+                                     (Generic_proofs.projection plan)
+                                     (body.project_type ty));
+                             } )))
                 ~libraries:(library_paths libraries) functions origins
                 ~proc_name:(body_proc_name f) ~pure:(is_pure f) ?declaration_name
                 ~primitive_namespace ~pure_name:(body_pure_reference f) f
@@ -13119,6 +13276,32 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let procedure_member (f, member) =
     if f.trusted then R.Member.free (R.Member.callable member)
     else R.Member.callable member
+  in
+  let predicate_members =
+    List.zip_exn
+      (List.map predicates ~f:(fun (_, p, _, _) -> p.S.pred_name.pid_str))
+      pred_members
+  in
+  let proof_lemma_members =
+    List.zip_exn
+      (List.map lemma_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
+      lemma_members
+  in
+  let proof_members = predicate_members @ proof_lemma_members in
+  let owned_proofs group =
+    List.filter_map proof_members ~f:(fun (name, member) ->
+        Option.bind (proof_owner name) ~f:(fun plan ->
+            Option.some_if
+              (phys_equal plan.Generic_proofs.group group)
+              (R.Member.callable member)))
+  in
+  let pred_members =
+    List.filter_map predicate_members ~f:(fun (name, member) ->
+        Option.some_if (Option.is_none (proof_owner name)) member)
+  in
+  let lemma_members =
+    List.filter_map proof_lemma_members ~f:(fun (name, member) ->
+        Option.some_if (Option.is_none (proof_owner name)) member)
   in
   let* generic_implementations =
     all generics ~f:(fun group ->
@@ -13138,6 +13321,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                ~f:snd
             @ List.map (owned (Some group) pure_funcs) ~f:(fun (_, member) ->
                 R.Member.callable member)
+            @ owned_proofs group
             @ List.map (owned (Some group) procs) ~f:procedure_member)
         in
         match group.world with

@@ -1,0 +1,10 @@
+module Make (Cell : CELL) = struct
+  predicate wrapped (cell : Cell.t) (n [@implicit] : int) =
+    Cell.counter cell n
+
+  lemma preserve (cell : Cell.t) (n [@implicit] : int)
+    requires (wrapped cell n)
+    ensures (wrapped cell n) =
+    unfold wrapped cell;
+    fold wrapped cell n
+end
