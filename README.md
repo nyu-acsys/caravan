@@ -39,8 +39,10 @@ are translated once in a shared Raven functor, with shared result layouts for
 applicative model types.
 Aliases preserve proof member identity, while result signatures expose declared
 predicates opaquely and hide implementation lemmas. Functor proofs can also
-instantiate resource algebras and declare ghost fields; functor-owned AU facades
-and state/action declarations remain unsupported.
+instantiate resource algebras, declare ghost fields, and use AU facades for their
+own operations. Tokens retain their application identities through aliases;
+Raven checks their lifecycle and atomicity. Functor-owned state/action declarations
+remain unsupported.
 
 Proofs can instantiate Raven library modules using OCaml-style module applications.
 Their types, constructors, operations and parameter requirements come from Raven's

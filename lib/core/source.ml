@@ -79,7 +79,17 @@ type proof_au = {
   au_token_path : Path.t;
   au_token_paths : Path.t list;
   au_at : Location.t;
+  au_application : (Path.t * Ident.t) option;
 }
+
+let au_has_path au path =
+  Path.same path au.au_path
+  || Path.same path (Path.Pident au.au_id)
+  || Option.exists au.au_application ~f:(fun (identity, _) ->
+      Path.same path (Path.Pdot (identity, au.au_name)))
+  || List.exists au.au_token_paths ~f:(function
+    | Path.Pdot (owner, "token") -> Path.same path owner
+    | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false)
 
 type t = {
   file : string;
@@ -159,6 +169,25 @@ let source_type_ids (structure : Typedtree.structure) =
           List.map declarations ~f:(fun declaration ->
               (declaration.typ_id, declaration.typ_name.txt))
       | _ -> [])
+
+let scoped_value_name (scope : Proof_scopes.scope) path =
+  let values =
+    List.concat_map scope.structure.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_value (_, bindings) ->
+            List.filter_map bindings ~f:(fun binding ->
+                match binding.vb_pat.pat_desc with
+                | Tpat_var (id, _, _) -> Some (id, Ident.name id)
+                | _ -> None)
+        | _ -> [])
+  in
+  match path with
+  | Path.Pident id -> List.Assoc.find values id ~equal:Ident.same
+  | Pdot (owner, name)
+    when Option.exists scope.owner ~f:(Path.same owner)
+         && List.exists values ~f:(fun (_, member) -> String.equal member name) ->
+      Some name
+  | Pdot _ | Papply _ | Pextra_ty _ -> None
 
 let add_spec_bindings ?(source_modules = []) spec_bindings lexical_env =
   let find lookup id =
@@ -934,6 +963,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 au_token_path = token_path;
                 au_token_paths = [ token_path ];
                 au_at = at;
+                au_application = None;
               }
               :: !aus;
             Ok (env, descriptors, resources, fields)
@@ -2021,7 +2051,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               | [ Named (Some _, _, _) ] ->
                   List.for_all proof ~f:(function
                     | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
-                      ->
+                    | Proof_au _ ->
                         true
                     | _ -> false)
               | _ -> false
@@ -2714,7 +2744,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 let bindings = Subst.signature Keep substitution bindings in
                 let bindings =
                   match
-                    Mtype.strengthen ~aliasable:true env (Mty_signature bindings) identity
+                    Mtype.strengthen ~aliasable:true env (Mty_signature bindings)
+                      carrier_identity
                   with
                   | Mty_signature bindings -> bindings
                   | Mty_ident _ | Mty_functor _ | Mty_alias _ -> bindings
@@ -3010,6 +3041,84 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             end
         | Pdot _ | Papply _ | Pextra_ty _ -> env)
   in
+  let application_aus =
+    List.concat_map (applications [] scopes.root.structure)
+      ~f:(fun (chain, (functor_path, argument_path)) ->
+        let normalized =
+          Env.normalize_module_path None qualified_env functor_path
+          |> Proof_scopes.canonical_owner scopes
+        in
+        let template =
+          List.find typed ~f:(fun (scope, _, _) ->
+              Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
+              &&
+              match scope.parameters with
+              | [ Named (Some _, _, _) ] -> true
+              | _ -> false)
+        in
+        let view_owner =
+          List.fold chain ~init:None ~f:(fun path (name, id, _) ->
+              match (path, id) with
+              | None, Some id -> Some (Path.Pident id)
+              | Some path, Some _ -> Some (Path.Pdot (path, name))
+              | _, None -> path)
+        in
+        match (template, view_owner) with
+        | Some (scope, (_, _, _, _, aus), _), Some view_owner ->
+            begin match scope.parameters with
+            | [ Named (Some parameter, _, _) ] ->
+                let identity = Path.Papply (functor_path, argument_path) in
+                let carrier_identity =
+                  Path.Papply
+                    ( Env.normalize_module_path None qualified_env functor_path,
+                      Env.normalize_module_path None qualified_env argument_path )
+                in
+                let substitution =
+                  Subst.add_module parameter argument_path Subst.identity
+                in
+                let substitution =
+                  List.fold (source_type_ids scope.structure) ~init:substitution
+                    ~f:(fun substitution (id, name) ->
+                      Subst.add_type id (Path.Pdot (identity, name)) substitution)
+                in
+                List.filter aus ~f:(fun au ->
+                    Option.equal Path.same au.au_scope scope.owner)
+                |> List.map ~f:(fun au ->
+                    let path = Path.Pdot (view_owner, au.au_name) in
+                    let token_path = Path.Pdot (path, "token") in
+                    let identity_path = Path.Pdot (carrier_identity, au.au_name) in
+                    let token_paths =
+                      [ token_path; Path.Pdot (identity_path, "token") ]
+                      @ List.filter_map aliases ~f:(fun (alias, target) ->
+                          Option.some_if
+                            (Path.same target view_owner
+                            || Path.same target carrier_identity)
+                            (Path.Pdot (Path.Pdot (alias, au.au_name), "token")))
+                      |> List.dedup_and_sort ~compare:Path.compare
+                    in
+                    let operation_path =
+                      Option.value_map (scoped_value_name scope au.au_operation_path)
+                        ~default:(Subst.module_path substitution au.au_operation_path)
+                        ~f:(fun name -> Path.Pdot (view_owner, name))
+                    in
+                    {
+                      au with
+                      au_scope = None;
+                      au_id = Ident.create_local au.au_name;
+                      au_path = path;
+                      au_environment = qualified_env;
+                      au_operation_path = operation_path;
+                      au_operation_type =
+                        Subst.type_expr substitution au.au_operation_type;
+                      au_token = Ctype.newconstr token_path [];
+                      au_token_path = token_path;
+                      au_token_paths = token_paths;
+                      au_application = Some (carrier_identity, au.au_id);
+                    })
+            | _ -> []
+            end
+        | _ -> [])
+  in
   let scopes =
     Proof_scopes.map_environments scopes ~f:(fun scope ->
         match
@@ -3080,7 +3189,10 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               | Some _, [] | None, _ -> Ok ()))
   in
   let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields, _), _) -> fields) in
-  let aus = List.concat_map typed ~f:(fun (_, (_, _, _, _, aus), _) -> aus) in
+  let aus =
+    List.concat_map typed ~f:(fun (_, (_, _, _, _, aus), _) -> aus)
+    @ List.map application_aus ~f:(fun au -> { au with au_environment = qualified_env })
+  in
   Ok (qualified_env, scopes, types, resources, fields, aus)
 
 let signature_ghost_resources env comments =

@@ -71,25 +71,35 @@ let model_projection source plan path substitution =
       Option.value_map data.Datatypes.id ~default:substitution ~f:(fun id ->
           Subst.add_type id (Path.Pdot (path, Ident.name id)) substitution))
 
-let resource_projection source plan path substitution =
+let asset_projection source plan path substitution =
   let substitution =
     match plan.scope.owner with
     | Some (Path.Pident id) -> Subst.add_module id path substitution
     | Some (Pdot _ | Papply _ | Pextra_ty _) | None -> substitution
   in
-  List.fold (resources source plan) ~init:substitution ~f:(fun substitution resource ->
-      let owner = Path.Pdot (path, resource.resource_name) in
-      let add_resource substitution resource =
-        let substitution =
-          Subst.add_module resource.Source.resource_id owner substitution
+  let substitution =
+    List.fold (resources source plan) ~init:substitution ~f:(fun substitution resource ->
+        let owner = Path.Pdot (path, resource.resource_name) in
+        let add_resource substitution resource =
+          let substitution =
+            Subst.add_module resource.Source.resource_id owner substitution
+          in
+          List.fold resource.resource_type_members ~init:substitution
+            ~f:(fun substitution (member, id, _) ->
+              Subst.add_type id
+                (Path.Pdot (owner, String.uncapitalize member))
+                substitution)
         in
-        List.fold resource.resource_type_members ~init:substitution
-          ~f:(fun substitution (member, id, _) ->
-            Subst.add_type id (Path.Pdot (owner, String.uncapitalize member)) substitution)
-      in
-      let substitution = add_resource substitution resource in
-      Option.value_map resource.resource_public ~default:substitution
-        ~f:(add_resource substitution))
+        let substitution = add_resource substitution resource in
+        Option.value_map resource.resource_public ~default:substitution
+          ~f:(add_resource substitution))
+  in
+  List.fold source.Source.proof_aus ~init:substitution ~f:(fun substitution au ->
+      if
+        Option.is_none au.Source.au_application
+        && Option.equal Path.same au.au_scope plan.scope.owner
+      then Subst.add_module au.au_id (Path.Pdot (path, au.au_name)) substitution
+      else substitution)
 
 let nullary_alias (declaration : Typedtree.type_declaration) =
   match declaration.typ_kind with
@@ -155,6 +165,14 @@ let projection plan =
       Subst.add_type source.Typedtree.typ_id (Path.Pident target.Typedtree.typ_id)
         substitution)
 
+let source_projection plan =
+  List.fold plan.aliases
+    ~init:
+      (Subst.add_module plan.group.representative.parameter (Path.Pident plan.parameter)
+         Subst.identity) ~f:(fun substitution (source, target) ->
+      Subst.add_type target.Typedtree.typ_id (Path.Pident source.Typedtree.typ_id)
+        substitution)
+
 let types plan =
   let parameters =
     parameter_types plan
@@ -217,7 +235,20 @@ let application_projection source plan (application : Module_inventory.specializ
           (Path.Pdot (path, original.typ_name.txt))
           substitution)
   in
-  model_projection source plan path projection |> resource_projection source plan path
+  model_projection source plan path projection |> asset_projection source plan path
+
+let implementation_projection (application : Module_inventory.specialization) path =
+  let argument =
+    match application.identity with
+    | Path.Papply (_, argument) -> argument
+    | _ -> application.argument.actual_path
+  in
+  List.fold application.declarations
+    ~init:(Subst.add_module application.parameter argument Subst.identity)
+    ~f:(fun substitution declaration ->
+      Subst.add_type declaration.Typedtree.typ_id
+        (Path.Pdot (path, declaration.typ_name.txt))
+        substitution)
 
 let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
     (proofs : Proof_bindings.t) plans =
@@ -250,7 +281,7 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
                    "The application has no typed declaration for this proof type alias"))
     in
     let private_projection =
-      resource_projection source plan application_source.identity private_projection
+      asset_projection source plan application_source.identity private_projection
     in
     let* environment =
       match members with

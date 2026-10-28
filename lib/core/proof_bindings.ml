@@ -447,7 +447,8 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       end
   | Proof_au _ ->
       begin match
-        List.find source.proof_aus ~f:(fun au -> Poly.equal au.au_at entry.name.pid_loc)
+        List.find source.proof_aus ~f:(fun au ->
+            Option.is_none au.au_application && Poly.equal au.au_at entry.name.pid_loc)
       with
       | Some au -> Ok (Atomic au, [])
       | None ->
@@ -531,7 +532,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
               begin match (ancestor.parameters, entry.declaration) with
               | ( [ Named (Some _, _, _) ],
                   ( S.Proof_predicate _ | Proof_lemma _ | Proof_function _
-                  | Proof_resource _ | Proof_definition _ | Proof_field _ ) )
+                  | Proof_resource _ | Proof_definition _ | Proof_field _ | Proof_au _ ) )
                 when same_owner ancestor.owner scope.owner
                      || Option.is_some scope.definition
                         && same_owner ancestor.owner scope.parent ->

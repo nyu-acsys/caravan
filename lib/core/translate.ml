@@ -958,8 +958,7 @@ let atomic_method env = function
           let path = env.ctx.proof_support.canonical_path path in
           Option.map
             (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
-                 Path.same path signature.au_source.au_path
-                 || Path.same path (Pident signature.au_source.au_id)))
+                 Source.au_has_path signature.au_source path))
             ~f:(fun signature -> (signature, method_.pid_str)))
   | Qid _ -> None
 
@@ -1728,7 +1727,7 @@ and application env (t : S.term) =
       | ("pending" | "committed"), Some (inputs, _) ->
           let* values = typed_arguments env ~at inputs args in
           let values = atomic_arguments ~loc:l signature method_ values in
-          let procedure = name ~loc:l signature.au_procedure in
+          let procedure = qualified_name ~loc:l signature.au_procedure in
           if String.equal method_ "pending" then Ok (R.Expr.au ~loc:l procedure values)
           else Ok (R.Expr.au_commit ~loc:l procedure values)
       | _ -> error at "An AU operation is only allowed in a proof expression"
@@ -10024,11 +10023,7 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
                       List.is_empty f.captured && List.is_empty f.prefix
                       && same_signature_sites application f
                       && (Option.is_some group.world || not (field_contract f.contract))
-                      && Option.is_none f.role
-                      && not
-                           (List.exists source.proof_aus ~f:(fun au ->
-                                List.mem f.paths au.Source.au_operation_path
-                                  ~equal:Path.same)))))
+                      && Option.is_none f.role)))
         in
         let* parameter_contracts =
           all group.representative.argument.expected.signature_values
@@ -11145,12 +11140,37 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             { procedure_inputs; procedure_outputs; procedure_result = f.body.exp_type } ))
   in
   let procedure_signatures = with_body_names procedure_signatures in
+  let au_plan (au : Source.proof_au) =
+    if Option.is_none au.au_application then asset_owner au.au_scope else None
+  in
+  let au_procedure au f =
+    match au_plan au with Some _ -> body_proc_name f | None -> proc_name f
+  in
+  let au_application_view (au : Source.proof_au) =
+    Option.bind au.au_application ~f:(fun (_, template) ->
+        List.find scoped_proofs.applications ~f:(fun view ->
+            match view.source.kind with
+            | Atomic original ->
+                Ident.same original.au_id template
+                && Path.same au.au_path (Path.Pdot (view.path, au.au_name))
+            | _ -> false))
+  in
   let* atomic_operations =
     all source.proof_aus ~f:(fun (au : Source.proof_au) ->
-        match
-          List.find funcs ~f:(fun f ->
-              List.mem f.paths au.au_operation_path ~equal:Path.same)
-        with
+        let operation =
+          match au_plan au with
+          | None ->
+              List.find funcs ~f:(fun f ->
+                  List.mem f.paths au.au_operation_path ~equal:Path.same)
+          | Some plan ->
+              Option.bind (Source.scoped_value_name plan.scope au.au_operation_path)
+                ~f:(fun member ->
+                  Option.bind
+                    (List.Assoc.find plan.group.representative.members member
+                       ~equal:String.equal) ~f:(fun id ->
+                      List.find funcs ~f:(fun f -> Ident.same f.id id)))
+        in
+        match operation with
         | None ->
             error au.au_at "An AU facade must name a procedure in this implementation"
         | Some f when not (Option.exists f.contract ~f:(fun c -> c.atomic)) ->
@@ -11160,8 +11180,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let token_types =
     List.map atomic_operations ~f:(fun (au, f) ->
         Datatypes.with_paths
-          (Datatypes.atomic_token ~path:au.Source.au_token_path ~procedure:(proc_name f)
-             ~at:au.au_at)
+          (Datatypes.atomic_token ~path:au.Source.au_token_path
+             ~procedure:(au_procedure au f) ~at:au.au_at)
           au.au_token_paths)
   in
   let generic_models = Generic_proofs.model_types source inventory generic_proofs in
@@ -11923,8 +11943,14 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               | _ -> false)
         in
         if
-          Option.exists binding ~f:(fun binding ->
-              not (Proof_bindings.visible scoped_proofs ~scope binding))
+          match au.au_application with
+          | None ->
+              Option.exists binding ~f:(fun binding ->
+                  not (Proof_bindings.visible scoped_proofs ~scope binding))
+          | Some _ ->
+              not
+                (Option.exists (au_application_view au)
+                   ~f:(Proof_bindings.application_visible scoped_proofs ~scope))
         then None
         else
           let private_operation =
@@ -12257,6 +12283,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 field_resource =
                   Option.map field.field_resource ~f:(Subst.module_path projection);
               });
+        atomic_updates =
+          List.map support.atomic_updates ~f:(fun signature ->
+              {
+                signature with
+                au_token = project signature.au_token;
+                au_inputs = List.map signature.au_inputs ~f:project;
+                au_result = project signature.au_result;
+                au_ghost_outputs = List.map signature.au_ghost_outputs ~f:project;
+                au_implicit = List.map signature.au_implicit ~f:project;
+              });
         logical_functions =
           List.map support.logical_functions ~f:(fun (key, signature) ->
               ( key,
@@ -12287,6 +12323,14 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
             preds spec_funcs proof_support
         in
+        let preds, spec_funcs, proof_support =
+          match au_plan au_source with
+          | None -> (preds, spec_funcs, proof_support)
+          | Some plan ->
+              generic_context plan
+                ~projection:(Generic_proofs.projection plan)
+                (preds, spec_funcs, proof_support)
+        in
         let ctx =
           spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env:f.environment
             ~preds ~spec_funcs ~proof_support origins
@@ -12303,31 +12347,54 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
           @ List.map signature.procedure_inputs ~f:snd
         in
+        let project =
+          match au_plan au_source with
+          | Some plan -> Subst.type_expr (Generic_proofs.source_projection plan)
+          | None ->
+              begin match Generic_modules.member generics f.id with
+              | Some (_, application, _) ->
+                  let path =
+                    match au_source.au_operation_path with
+                    | Path.Pdot (owner, _) -> owner
+                    | _ -> application.source.identity
+                  in
+                  Subst.type_expr
+                    (Generic_proofs.implementation_projection application.source path)
+              | None -> Fn.id
+              end
+        in
         let shape =
           {
-            inputs = au_inputs;
-            result = f.body.exp_type;
-            ghost_outputs = List.map signature.procedure_outputs ~f:snd;
-            implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
+            inputs = List.map au_inputs ~f:project;
+            result = project f.body.exp_type;
+            ghost_outputs =
+              List.map signature.procedure_outputs ~f:(fun (_, ty) -> project ty);
+            implicit = List.map implicit ~f:(fun (_, _, ty, _) -> project ty);
           }
         in
         let key =
-          List.find_map scoped_proofs.bindings ~f:(fun binding ->
-              match binding.kind with
-              | Atomic actual when Ident.same actual.au_id au_source.au_id ->
-                  Some binding.backend
-              | _ -> None)
+          Option.first_some
+            (Option.map (au_application_view au_source) ~f:(fun view -> view.key))
+            (List.find_map scoped_proofs.bindings ~f:(fun binding ->
+                 match binding.kind with
+                 | Atomic actual when Ident.same actual.au_id au_source.au_id ->
+                     Some binding.backend
+                 | _ -> None))
           |> Option.value ~default:au_source.au_name
         in
         let owner =
-          match Proof_bindings.scope_for_location scoped_proofs f.loc with
-          | Some scope when List.equal String.equal scope.namespace f.namespace ->
-              scope.owner
-          | _ ->
-              List.find_map f.paths ~f:(function
-                | Path.Pdot (owner, _) ->
-                    Some (Proof_bindings.canonical_owner scoped_proofs owner)
-                | _ -> None)
+          match au_plan au_source with
+          | Some plan -> plan.scope.owner
+          | None ->
+              begin match Proof_bindings.scope_for_location scoped_proofs f.loc with
+              | Some scope when List.equal String.equal scope.namespace f.namespace ->
+                  scope.owner
+              | _ ->
+                  List.find_map f.paths ~f:(function
+                    | Path.Pdot (owner, _) ->
+                        Some (Proof_bindings.canonical_owner scoped_proofs owner)
+                    | _ -> None)
+              end
         in
         Ok
           {
@@ -12336,11 +12403,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             au_private = shape;
             au_token = au_source.au_token;
             au_source;
-            au_procedure = proc_name f;
-            au_inputs;
-            au_result = f.body.exp_type;
-            au_ghost_outputs = List.map signature.procedure_outputs ~f:snd;
-            au_implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
+            au_procedure = au_procedure au_source f;
+            au_inputs = shape.inputs;
+            au_result = shape.result;
+            au_ghost_outputs = shape.ghost_outputs;
+            au_implicit = shape.implicit;
           })
   in
   let proof_support = { proof_support with atomic_updates } in

@@ -1,0 +1,46 @@
+module Make (X : INPUT) = struct
+  module Read = Ghost.AU (struct let operation = read end)
+
+  lemma preserve_private (token : Read.token) (value : int)
+    requires (Read.pending token value)
+    ensures (Read.pending token value) = ()
+  lemma preserve_committed (token : Read.token) (value : int) (result : int)
+    requires (Read.committed token value result)
+    ensures (Read.committed token value result) = ()
+end
+
+let one_slot : (Ghost.t, One.Read.token) Ghost.field = Ghost.field ()
+let two_slot : (Ghost.t, Two.Read.token) Ghost.field = Ghost.field ()
+
+lemma one (token : One.Read.token) (value : int)
+  requires (One.Read.pending token value)
+  ensures (Alias.Read.pending token value) =
+  One.preserve_private token value
+
+lemma repeated (token : One.Read.token) (value : int)
+  requires (One.Read.pending token value)
+  ensures (Again.Read.pending token value) = ()
+
+lemma alias_application (token : One.Read.token) (value : int)
+  requires (One.Read.pending token value)
+  ensures (Aliased.Read.pending token value) = ()
+
+lemma two (token : Two.Read.token) (value : int)
+  requires (Two.Read.pending token value)
+  ensures (Two.Read.pending token value) =
+  Two.preserve_private token value
+
+lemma committed (token : One.Read.token) (value : int) (result : int)
+  requires (One.Read.committed token value result)
+  ensures (Alias.Read.committed token value result) =
+  One.preserve_committed token value result
+
+lemma repeated_helper (token : Again.Read.token) (value : int)
+  requires (One.Read.pending token value)
+  ensures (Aliased.Read.pending token value) =
+  Again.preserve_private token value
+
+lemma aliased_helper (token : Aliased.Read.token) (value : int)
+  requires (One.Read.pending token value)
+  ensures (Again.Read.pending token value) =
+  Aliased.preserve_private token value

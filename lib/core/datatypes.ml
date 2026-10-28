@@ -415,7 +415,8 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let d = Option.value_exn (find types p) in
       Ok
         (R.Type.atomic_token ~loc:l
-           (R.Name.make ~loc:l (Option.value_exn d.atomic_procedure)))
+           (Qualified_name.raven ~loc:l
+              (Qualified_name.of_string (Option.value_exn d.atomic_procedure))))
   | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
