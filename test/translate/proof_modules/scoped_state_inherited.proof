@@ -1,0 +1,14 @@
+module Model = struct
+  type readiness = Ready | Waiting
+  type state = { value : int; ready : readiness }
+
+  module Cell = struct
+    invariant live (cell : t) (s : state) =
+      own cell s.value && s.value = 0 && s.ready = Ready
+  end
+end
+
+module Other = struct
+  invariant live (cell : t) (s : Model.state) =
+    own cell s.value && s.value = 0 && s.ready = Model.Ready
+end

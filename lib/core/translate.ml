@@ -138,7 +138,7 @@ type action = {
           [None] for any. *)
   state : string;
   update : (string * S.term) list;  (** The fields it changes. *)
-  linearizes : string list;
+  linearizes : Ident.t list;
   helps : (string * S.term * S.term) option;
       (** The pending field whose calls it helps, the key and the result. *)
   action_at : Location.t;
@@ -152,7 +152,7 @@ type pending = {
   pending_field : string;
   pending_on : string;  (** The existential of the keys of the registrations. *)
   key_type : Types.type_expr;
-  helped : string;  (** The function whose calls wait. *)
+  helped : Ident.t;  (** The function whose calls wait. *)
   helping : string * S.term * S.term;
       (** The key whose calls the action that helps commits, and the result, in terms of
           the state before the action, named as the action names it. *)
@@ -207,7 +207,7 @@ type au = {
       (** The action that the step performs if it commits, as [(*@ performs pop *)] or by
           its step, with the condition, if any, under which the step is the action's. *)
   self : string;  (** The procedure's name. *)
-  role : string;
+  role : Ident.t;
       (** The function that the update is of: [self], or the one it continues. *)
   ghost_results : R.Expr.t list;
       (** The ghost results witnessing facts about earlier states, which the update
@@ -227,7 +227,87 @@ type au = {
 }
 (** The atomic update of a function with an atomic contract. *)
 
+type lemma_signature = {
+  lemma_raven : string;
+  lemma_inputs : Types.type_expr list;
+  lemma_implicit_count : int;
+  lemma_outputs : Types.type_expr list;
+}
+
+type procedure_signature = {
+  procedure_inputs : (string * Types.type_expr) list;
+  procedure_outputs : (string * Types.type_expr) list;
+  procedure_result : Types.type_expr;
+}
+
+type atomic_shape = {
+  inputs : Types.type_expr list;
+  result : Types.type_expr;
+  ghost_outputs : Types.type_expr list;
+  implicit : Types.type_expr list;
+}
+
+type atomic_signature = {
+  au_key : string;
+  au_owner : Path.t option;
+  au_private : atomic_shape;
+  au_token : Types.type_expr;
+  au_source : Source.proof_au;
+  au_procedure : string;
+  au_inputs : Types.type_expr list;
+  au_result : Types.type_expr;
+  au_ghost_outputs : Types.type_expr list;
+  au_implicit : Types.type_expr list;
+}
+
+type proof_support = {
+  runtime_functions : Qualified_name.t Path_bindings.t;
+  predicate_views : string Path_bindings.t;
+  public_types : Path.t list;
+  strict_source_types : bool;
+  library_paths : string list Path_bindings.t;
+  atomic_updates : atomic_signature list;
+  resources : Source.proof_resource list;
+  ghost_fields : Source.proof_field list;
+  canonical_path : Path.t -> Path.t;
+  logical_functions : (string * lemma_signature) list;
+  mathematical_types : Datatypes.t list;
+  predicate_inputs : (string * int) list;
+      (** Explicit overrides of the type-based predicate output convention. *)
+  proof_key : Env.t -> S.qualid -> string option;
+  action_key : S.id -> string option;
+  opaque_predicates : string list;
+}
+
+let empty_proof_support =
+  {
+    runtime_functions = Path_bindings.empty;
+    predicate_views = Path_bindings.empty;
+    public_types = [];
+    strict_source_types = false;
+    library_paths = Path_bindings.empty;
+    atomic_updates = [];
+    resources = [];
+    ghost_fields = [];
+    canonical_path = Fn.id;
+    logical_functions = [];
+    mathematical_types = [];
+    predicate_inputs = [];
+    proof_key = (fun _ _ -> None);
+    action_key = (fun _ -> None);
+    opaque_predicates = [];
+  }
+
+type declaration_context = {
+  declaration_predicates : (string * (string * Types.type_expr list)) list;
+  declaration_functions : (string * string) list;
+  declaration_support : proof_support;
+}
+
 type structure = {
+  context : declaration_context;
+  scope : Proof_scopes.scope option;
+  environment : Env.t;
   invariant : string;
   state : string;
   fields : (string * string * R.Type.t * Types.type_expr * bool) list;
@@ -301,12 +381,13 @@ let past_of structures (t : S.term) =
               _;
             };
           ] ) ->
-          Option.bind
-            (List.find structures ~f:(fun st -> String.equal st.state s))
-            ~f:(fun st ->
-              Option.some_if
-                (List.Assoc.mem st.chains f ~equal:String.equal)
-                { inv = st.invariant; field = f; element })
+          begin match
+            List.filter structures ~f:(fun st ->
+                String.equal st.state s && List.Assoc.mem st.chains f ~equal:String.equal)
+          with
+          | [ st ] -> Some { inv = st.invariant; field = f; element }
+          | [] | _ :: _ :: _ -> None
+          end
       | _ -> None
       end
   | _ -> None
@@ -371,75 +452,6 @@ type position = {
 (** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
     index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
 
-type lemma_signature = {
-  lemma_raven : string;
-  lemma_inputs : Types.type_expr list;
-  lemma_implicit_count : int;
-  lemma_outputs : Types.type_expr list;
-}
-
-type procedure_signature = {
-  procedure_inputs : (string * Types.type_expr) list;
-  procedure_outputs : (string * Types.type_expr) list;
-  procedure_result : Types.type_expr;
-}
-
-type atomic_shape = {
-  inputs : Types.type_expr list;
-  result : Types.type_expr;
-  ghost_outputs : Types.type_expr list;
-  implicit : Types.type_expr list;
-}
-
-type atomic_signature = {
-  au_key : string;
-  au_owner : Path.t option;
-  au_private : atomic_shape;
-  au_token : Types.type_expr;
-  au_source : Source.proof_au;
-  au_procedure : string;
-  au_inputs : Types.type_expr list;
-  au_result : Types.type_expr;
-  au_ghost_outputs : Types.type_expr list;
-  au_implicit : Types.type_expr list;
-}
-
-type proof_support = {
-  runtime_functions : Qualified_name.t Path_bindings.t;
-  predicate_views : string Path_bindings.t;
-  public_types : Path.t list;
-  strict_source_types : bool;
-  library_paths : string list Path_bindings.t;
-  atomic_updates : atomic_signature list;
-  resources : Source.proof_resource list;
-  ghost_fields : Source.proof_field list;
-  canonical_path : Path.t -> Path.t;
-  logical_functions : (string * lemma_signature) list;
-  mathematical_types : Datatypes.t list;
-  predicate_inputs : (string * int) list;
-      (** Explicit overrides of the type-based predicate output convention. *)
-  proof_key : Env.t -> S.qualid -> string option;
-  opaque_predicates : string list;
-}
-
-let empty_proof_support =
-  {
-    runtime_functions = Path_bindings.empty;
-    predicate_views = Path_bindings.empty;
-    public_types = [];
-    strict_source_types = false;
-    library_paths = Path_bindings.empty;
-    atomic_updates = [];
-    resources = [];
-    ghost_fields = [];
-    canonical_path = Fn.id;
-    logical_functions = [];
-    mathematical_types = [];
-    predicate_inputs = [];
-    proof_key = (fun _ _ -> None);
-    opaque_predicates = [];
-  }
-
 let implicit_parameter_count ~kind parameters =
   let rec check seen count = function
     | [] -> Ok (if seen then Some count else None)
@@ -492,10 +504,10 @@ type context = {
       (** The facts about earlier states that procedures ensure, by their names, each
           witnessed by two ghost results: the invariant, the field, and the entry, given
           the arguments, if it is known. *)
-  lifted : (string * (int * Ident.t list * string option)) list;
+  lifted : (string * (int * Ident.t list * Ident.t option)) list;
       (** The lifted local functions, by their procedures' names, with the number of
           parameters of the function they continue, which they take first, the variables
-          of their context they use, which they take next, and the function's name. *)
+          of their context they use, which they take next, and the function's identity. *)
   ghost_args : (string * (int * string) option list) list;
       (** The ghost parameters of procedures, by their names: for each, the position of a
           parameter that a precondition makes a field of it, with the field, as [tail] in
@@ -3489,8 +3501,18 @@ let anchored ctx ~loc ~pred (e : R.Expr.t) =
 (** The environment of an action's terms: the state [values] of [st], its parameters with
     their [bindings] and the invariant's parameters, with the values [args]. *)
 let action_env ctx st inv_params args values bindings =
+  let ctx =
+    {
+      ctx with
+      env = st.environment;
+      preds = st.context.declaration_predicates;
+      spec_funcs = st.context.declaration_functions;
+      proof_support = st.context.declaration_support;
+    }
+  in
+  let env = { (scope_env ctx) with vars = []; var_types = [] } in
   let env =
-    bind (scope_env ctx) st.state
+    bind env st.state
       (State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
   in
   let env =
@@ -3567,10 +3589,7 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
 (** The views of [st], whose invariant has the arguments [args], in the state [values]:
     each view, its inputs and its value. *)
 let views_after ctx st args values =
-  let env =
-    bind (scope_env ctx) st.state
-      (State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) e -> (f, (e, t)))))
-  in
+  let env = action_env ctx st st.params args values [] in
   all st.views ~f:(fun ((v : S.predicate), value) ->
       let inputs = List.take args (List.length v.pred_params - 1) in
       let env =
@@ -4038,7 +4057,7 @@ let rec bind_params env st (opened : opened) params (pattern : S.term) actual =
   | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, args when Char.is_uppercase c.[0] ->
     begin
       let args = match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args in
-      match Datatypes.find_ctor env.data c with
+      match find_constructor env (S.Qid (S.mk_id ~loc:pattern.term_loc c)) with
       | Some (_, ctor) when List.length ctor.fields = List.length args ->
           List.concat
             (List.map2_exn args ctor.fields ~f:(fun a f ->
@@ -4130,9 +4149,10 @@ let step_performings ctx ~at ~op ~field ~location args =
       | _ -> [])
 
 (** The action named [a] of a structure, for [(*@ performs a *)]. *)
-let named_action ctx a =
+let named_action ctx (a : S.id) =
+  let key = Option.value (ctx.proof_support.action_key a) ~default:a.pid_str in
   List.find_map ctx.shared.structures ~f:(fun st ->
-      List.find st.actions ~f:(fun act -> String.equal act.action a))
+      List.find st.actions ~f:(fun act -> String.equal act.action key))
 
 (** The offset of the end of the step [e], where an annotation on it starts: that of its
     last argument, since a parenthesized step's location includes the parentheses, which
@@ -4505,7 +4525,7 @@ let linearize ?step ?value ?access_type ctx ~at
                    function. *)
                   let linearizing =
                     List.filter (performings ()) ~f:(fun (p, _) ->
-                        List.mem p.performed.linearizes au.role ~equal:String.equal)
+                        List.mem p.performed.linearizes au.role ~equal:Ident.same)
                   in
                   begin match (linearizing, au.performing) with
                   | _, Some _ | [], None -> Ok []
@@ -5055,7 +5075,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     match (annotation, default) with
     | None, _ -> Ok default
     | Some (S.Performs a), _ ->
-        begin match named_action ctx a.pid_str with
+        begin match named_action ctx a with
         | Some performed ->
             Option.iter ctx.au ~f:(fun au ->
                 au.performing <- Some ({ performed; bindings = [] }, None));
@@ -5345,8 +5365,8 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
   let* retry =
     match ctx.au with
     | Some au
-      when String.equal au.self f
-           || Option.exists role ~f:(fun r -> String.equal r au.role) ->
+      when String.equal au.self f || Option.exists role ~f:(fun r -> Ident.same r au.role)
+      ->
         begin match au.state with
         | Pending ->
             let* opening, values = au.open_ ~at:e.exp_loc ~unfold:false in
@@ -5938,7 +5958,7 @@ type func = {
   body : Typedtree.expression;
   loc : Location.t;
   contract : S.contract option;
-  next : Location.t option;  (** The location of the next structure item, if any. *)
+  next : Location.t option;  (** The next item or the end of the enclosing scope. *)
   prefix : Ident.t list;
       (** The variables of the parameters of the function that a lifted local function
           continues, which its parameters start with. *)
@@ -5950,7 +5970,7 @@ type func = {
   trusted : bool;
       (** Whether the function is trusted, as [(*@ trusted *)] after it says: its contract
           assumed, its body not translated. *)
-  role : string option;  (** The function whose atomic update it continues. *)
+  role : Ident.t option;  (** The function whose atomic update it continues. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
     a local function lifted to the top level. *)
@@ -6724,6 +6744,10 @@ let check_initial_fields ctx established fields =
             (Printf.sprintf "The initial field %s is given twice" id.pid_str)
         else if not (List.mem known id.pid_str ~equal:String.equal) then
           error id.pid_loc (Printf.sprintf "Unknown initial state field %s" id.pid_str)
+        else if List.count known ~f:(String.equal id.pid_str) > 1 then
+          error id.pid_loc
+            (Printf.sprintf
+               "The initial field %s belongs to several established invariants" id.pid_str)
         else check (id.pid_str :: seen) rest
   in
   check [] fields
@@ -6867,10 +6891,10 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     ~access_proofs ~return_proofs ~initializations ~linearizations ~lifted ~pasts
-    ~past_returns ~ghost_args ~procedure_signatures ~libraries ~proof_lemmas
-    ~proof_support ~predicate_bodies (functions : string Path_bindings.t) origins
-    ~proc_name ~pure ?declaration_name ?pure_name ?(primitive_namespace = []) (f : func) :
-    (R.Callable.t, error) Result.t =
+    ~past_structures ~past_returns ~ghost_args ~procedure_signatures ~libraries
+    ~proof_lemmas ~proof_support ~predicate_bodies (functions : string Path_bindings.t)
+    origins ~proc_name ~pure ?declaration_name ?pure_name ?(primitive_namespace = [])
+    (f : func) : (R.Callable.t, error) Result.t =
   let names = Names.create () in
   let ctx =
     {
@@ -6918,7 +6942,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   (* Facts about earlier states are ghost parameters and results. *)
   let split terms =
     List.partition_map terms ~f:(fun t ->
-        match past_of shared.structures t with Some p -> First p | None -> Second t)
+        match past_of past_structures t with Some p -> First p | None -> Second t)
   in
   let past_pres, past_posts, f =
     match f.contract with
@@ -7103,7 +7127,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* bind_au =
     if atomic && not f.manual then
       atomic_update ctx env ~at:f.loc ~self:proc_name
-        ~role:(Option.value f.role ~default:(Ident.name f.id))
+        ~role:(Option.value f.role ~default:f.id)
         ~result:(Option.some_if (not (List.is_empty returns)) result_name)
         implicit_decls ~pres:atomic_pres ~posts:atomic_posts
         ~past_results:
@@ -7290,7 +7314,12 @@ let entry_of_args types (f : func) (names : string option list) (element : S.ter
                 let args =
                   match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args
                 in
-                match Datatypes.find_ctor types c with
+                match
+                  Option.bind
+                    (Source.constructor f.environment
+                       (S.Qid (S.mk_id ~loc:element.term_loc c)))
+                    ~f:(Datatypes.find_cstr types)
+                with
                 | Some (_, ctor) when List.length ctor.fields = List.length args ->
                     List.find_map (List.zip_exn args ctor.fields) ~f:(fun (a, field) ->
                         match a.S.term_desc with
@@ -7383,7 +7412,7 @@ let inherit_contracts (funcs : func list) =
           {
             f with
             contract = Some { contract with header = Some header };
-            role = Some (Ident.name g.id);
+            role = Some g.id;
           }
       | _ -> f)
 
@@ -7682,7 +7711,14 @@ let items source ~fresh (inventory : Module_inventory.t) =
                 body;
                 loc = vb.vb_loc;
                 contract;
-                next = site.next;
+                next =
+                  Some
+                    (Option.value site.next
+                       ~default:
+                         {
+                           site.scope.location with
+                           loc_start = site.scope.location.loc_end;
+                         });
                 prefix = [];
                 prefix_count = 0;
                 captured = [];
@@ -7899,7 +7935,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
             || manual_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
           trusted =
             trusted_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
-          role = Option.map continues ~f:(fun g -> g.pid_str);
+          role = Option.map continues ~f:(fun _ -> outer.id);
         })
 
 (** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
@@ -8115,7 +8151,13 @@ let pure_functions (funcs : func list) =
 type definition =
   | Body of S.term
   | Direct_invariant of S.term
-  | Invariant of { state : string; fields : S.state_field list; body : S.term }
+  | Invariant of {
+      state : string;
+      fields : S.state_field list;
+      body : S.term;
+      field_environment : Env.t;
+      field_scope : Proof_scopes.scope option;
+    }
   | View of { value : S.term }
 
 (** The ghost field holding the client's view [v] of a state. *)
@@ -8962,7 +9004,7 @@ let action_checks ctx (st : structure) =
                 | [ { term_desc = Ttuple ts; _ } ] -> ts
                 | _ -> ctor_args
               in
-              match Datatypes.find_ctor ctx.types c with
+              match find_constructor env (S.Qid (S.mk_id ~loc:pattern.term_loc c)) with
               | Some (_, ctor) when List.length ctor.args = List.length ctor_args ->
                   List.concat (List.map2_exn ctor_args ctor.args ~f:typed)
               | _ -> []
@@ -9243,10 +9285,9 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
   | _ -> error Location.none "Expected a lemma declaration"
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
-    [param_types], defined as [def]; [views] are the views of the program, for an
-    invariant to hold its half of each. *)
+    [param_types], defined as [def]. Each stateful invariant holds half of its views. *)
 let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
-    origins ~at ~views ~structures (p : S.predicate) (def : definition) param_types :
+    origins ~at ~structures (p : S.predicate) (def : definition) param_types :
     (R.Callable.t, error) Result.t =
   let ctx =
     spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
@@ -9295,7 +9336,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
                    R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
                    R.Expr.real ~loc:l 0.5;
                  ])))
-  | Invariant { state; fields = _; body } ->
+  | Invariant { state; body; _ } ->
       (* The state's fields are existentials, as are the index maps of the fields owned by
          index; its views hold the other halves of their ghost fields, and its history
          the authority over the states it extends. *)
@@ -9307,6 +9348,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
         | Some st -> Ok st
         | None -> error at "An invariant without a state"
       in
+      let views = st.views in
       let var x = R.Expr.var ~loc:l (R.Name.make ~loc:l x) in
       let state_env =
         bind env state
@@ -9611,7 +9653,15 @@ let predicates ~data (source : Source.t) =
             | PTtyapp (Qid t, []) when List.Assoc.mem states t.pid_str ~equal:String.equal
               ->
                 let fields = List.Assoc.find_exn states t.pid_str ~equal:String.equal in
-                (inv_params, Invariant { state = state.pid_str; fields; body = inv_body })
+                ( inv_params,
+                  Invariant
+                    {
+                      state = state.pid_str;
+                      fields;
+                      body = inv_body;
+                      field_environment = source.env;
+                      field_scope = None;
+                    } )
             | _ -> (inv_params @ [ (state, state_type) ], Direct_invariant inv_body)
           in
           Ok
@@ -9956,15 +10006,29 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
 
 let scoped_predicate (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None
-  | Predicate (p, body) ->
+  | Predicate (p, definition) ->
       let p = { p with S.pred_name = { p.pred_name with pid_str = binding.backend } } in
-      let definition = if p.pred_persistent then Direct_invariant body else Body body in
+      let definition =
+        match definition with
+        | Plain body -> if p.pred_persistent then Direct_invariant body else Body body
+        | Stateful { state; fields; body; environment; state_scope } ->
+            Invariant
+              {
+                state;
+                fields;
+                body;
+                field_environment = environment;
+                field_scope = Some state_scope;
+              }
+        | View value -> View { value }
+      in
       Some (p.pred_name.pid_loc, p, definition, binding.private_types)
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ -> None
 
 let scoped_lemma (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ -> None
+  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+      None
   | Lemma (S.Proof_lemma lemma) ->
       Some
         (S.Proof_lemma
@@ -9980,7 +10044,9 @@ let scoped_function (binding : Proof_bindings.binding) =
              declaration with
              function_name = { declaration.function_name with pid_str = binding.backend };
            })
-  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None
+  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
+  | Action _ ->
+      None
 
 let signature_has_refs ~types ~environment ~substitution typ =
   let rec contains seen typ =
@@ -10037,7 +10103,8 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let* actual =
                       match binding.kind with
                       | Predicate (p, _) -> Ok p
-                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ ->
+                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
+                      | Action _ ->
                           error binding.entry.name.pid_loc
                             "A module resource must be defined as a predicate or \
                              invariant"
@@ -11274,6 +11341,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       proof_key =
         (fun environment q ->
           Proof_bindings.resolve scoped_proofs ~scope:None ~environment q);
+      action_key =
+        (fun id ->
+          Proof_bindings.action_key scoped_proofs
+            ~scope:(Proof_bindings.scope_for_location scoped_proofs id.S.pid_loc)
+            id);
       opaque_predicates =
         Proof_bindings.opaque_keys scoped_proofs
         @ List.map checked_resource_entries ~f:(fun (_, key, _, _) -> key)
@@ -11377,7 +11449,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           match binding.kind with
           | Predicate _ ->
               Some (binding.public_key, (binding.backend, binding.public_types))
-          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+              None)
       @ preds
     in
     let predicate_inputs =
@@ -11442,7 +11515,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Predicate _ -> Some (binding.backend, (binding.backend, binding.private_types))
-          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+              None)
     in
     let inputs =
       List.filter_map bindings ~f:(fun binding ->
@@ -11460,7 +11534,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Function _ -> Some (binding.entry.name.pid_str, binding.backend)
-          | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ -> None)
+          | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | State _ | Action _
+            ->
+              None)
       @ List.map private_functions ~f:(fun (key, signature) ->
           (key, signature.lemma_raven))
       @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
@@ -11675,48 +11751,130 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let* typ = Datatypes.typ types ~at (List.last_exn param_types) in
         Ok (anchor, (view_field p.pred_name.pid_str, typ, None)))
   in
+  let resolve_function ~environment (id : S.id) =
+    match Source.value_path environment (S.Qid id) with
+    | Some path ->
+        let path = Proof_bindings.canonical_owner scoped_proofs path in
+        begin match
+          List.find funcs ~f:(fun f -> List.mem f.paths path ~equal:Path.same)
+        with
+        | Some f -> Ok f.id
+        | None ->
+            error id.pid_loc
+              (Printf.sprintf "There is no implementation function %s" id.pid_str)
+        end
+    | None ->
+        error id.pid_loc
+          (Printf.sprintf "There is no implementation function %s" id.pid_str)
+  in
   (* The structures with a state, and their histories, allocated empty. *)
-  let actions =
-    List.filter_map source.proof ~f:(function
-      | Proof_action
-          {
-            action_name;
-            action_params;
-            action_step;
-            action_consumes = _;
-            action_state;
-            action_update;
-            action_linearizes;
-            action_helps;
-          } ->
-          let id (x : S.id) = x.pid_str in
-          let helps =
-            Option.bind action_helps ~f:(fun (field, key, result) ->
-                match field.term_desc with
-                | Tfield (_, Qid f) -> Some (f.pid_str, key, result)
-                | _ -> None)
-          in
-          Some
-            {
-              action = action_name.pid_str;
-              params = List.map action_params ~f:id;
-              step = Option.map action_step ~f:(fun (op, args) -> (op.pid_str, args));
-              state = action_state.pid_str;
-              update = List.map action_update ~f:(fun (f, t) -> (f.S.pid_str, t));
-              linearizes = List.map action_linearizes ~f:id;
-              helps;
-              action_at = action_name.pid_loc;
-            }
-      | _ -> None)
+  let action_declarations =
+    List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+        match entry.Proof_scopes.declaration with
+        | S.Proof_action declaration ->
+            let scope = Option.some_if (Option.is_some entry.scope.owner) entry.scope in
+            let backend =
+              Option.value_map
+                (List.find scoped_proofs.bindings ~f:(fun binding ->
+                     Ident.same binding.entry.id entry.id))
+                ~default:declaration.action_name.pid_str
+                ~f:(fun binding -> binding.backend)
+            in
+            Some
+              ( scope,
+                Source.annotation_env source entry.scope.environment,
+                backend,
+                entry.declaration )
+        | _ -> None)
+  in
+  let* actions =
+    all action_declarations ~f:(fun (scope, environment, backend, proof) ->
+        match proof with
+        | S.Proof_action declaration ->
+            let* linearizes =
+              all declaration.action_linearizes ~f:(resolve_function ~environment)
+            in
+            let helps =
+              Option.bind declaration.action_helps ~f:(fun (field, key, result) ->
+                  match field.term_desc with
+                  | Tfield (_, Qid field) -> Some (field.pid_str, key, result)
+                  | _ -> None)
+            in
+            Ok
+              ( scope,
+                {
+                  action = backend;
+                  params = List.map declaration.action_params ~f:(fun id -> id.S.pid_str);
+                  step =
+                    Option.map declaration.action_step ~f:(fun (op, args) ->
+                        (op.pid_str, args));
+                  state = declaration.action_state.pid_str;
+                  update =
+                    List.map declaration.action_update ~f:(fun (field, term) ->
+                        (field.S.pid_str, term));
+                  linearizes;
+                  helps;
+                  action_at = declaration.action_name.pid_loc;
+                } )
+        | _ -> error Location.none "Expected an action declaration")
+  in
+  let same_scope a b =
+    Option.equal
+      (fun a b -> Option.equal Path.same a.Proof_scopes.owner b.Proof_scopes.owner)
+      a b
   in
   let* structures =
     all
       (List.filter_map predicates ~f:(fun (at, p, def, param_types) ->
            match def with
-           | Invariant { state; fields; body } ->
-               Some (at, p, state, fields, body, param_types)
+           | Invariant { state; fields; body; field_environment; field_scope } ->
+               Some
+                 (at, p, state, fields, body, param_types, field_environment, field_scope)
            | Body _ | Direct_invariant _ | View _ -> None))
-      ~f:(fun (at, (p : S.predicate), state, state_fields, body, param_types) ->
+      ~f:(fun
+          ( at,
+            (p : S.predicate),
+            state,
+            state_fields,
+            body,
+            param_types,
+            field_environment,
+            field_scope )
+        ->
+        let scope = declaration_scope p.pred_name.pid_str in
+        let environment = declaration_environment p.pred_name.pid_str in
+        let declaration_predicates, declaration_functions, declaration_support =
+          proof_context scope preds spec_funcs proof_support
+        in
+        let context =
+          { declaration_predicates; declaration_functions; declaration_support }
+        in
+        let field_type term =
+          let* ty = Source.ocaml_type field_environment ~at term in
+          let private_state =
+            match (field_scope, scope) with
+            | None, _ -> true
+            | Some owner, Some caller ->
+                Option.is_some
+                  (Proof_bindings.drop_prefix owner.namespace caller.namespace)
+            | Some _, None -> false
+          in
+          Ok
+            (if private_state then ty
+             else
+               Proof_bindings.context_type scoped_proofs ~environment
+                 (Proof_bindings.public_type scoped_proofs ty))
+        in
+        let actions =
+          List.filter_map actions ~f:(fun (owner, action) ->
+              Option.some_if
+                (same_scope owner scope
+                && String.equal action.state state
+                && List.for_all action.update ~f:(fun (field, _) ->
+                    List.exists state_fields ~f:(fun sf ->
+                        String.equal sf.S.sf_name.pid_str field)))
+                action)
+        in
         (* The key type of a field of pending calls. *)
         let pending_key t =
           match Datatypes.desc types t with
@@ -11725,7 +11883,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let* fields =
           all state_fields ~f:(fun (sf : S.state_field) ->
-              let* t = Source.ocaml_type ocaml_env ~at sf.sf_type in
+              let* t = field_type sf.sf_type in
               let raven = state ^ "_" ^ sf.sf_name.pid_str in
               match pending_key t with
               | Some _ ->
@@ -11743,14 +11901,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let* pendings =
           all
             (List.filter_map state_fields ~f:(fun (sf : S.state_field) ->
-                 match Source.ocaml_type ocaml_env ~at sf.sf_type with
+                 match field_type sf.sf_type with
                  | Ok t -> Option.map (pending_key t) ~f:(fun key -> (sf, key))
                  | Error _ -> None))
             ~f:(fun ((sf : S.state_field), key) ->
               let field = sf.sf_name.pid_str in
               let* helped =
                 match sf.sf_helps with
-                | Some f -> Ok f
+                | Some f ->
+                    resolve_function ~environment:field_environment
+                      (S.mk_id ~loc:sf.sf_name.pid_loc f)
                 | None ->
                     error sf.sf_name.pid_loc
                       "A field of pending calls names the function whose calls wait, as \
@@ -11788,6 +11948,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         Ok
           {
+            context;
+            scope;
+            environment;
             invariant = p.pred_name.pid_str;
             state;
             fields;
@@ -11822,9 +11985,61 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 (List.map p.pred_params ~f:(fun (x, _) -> x.S.pid_str))
                 (List.take param_types (List.length p.pred_params));
             structure_type = List.hd_exn param_types;
-            views = List.map views ~f:(fun (p, value, _) -> (p, value));
+            views =
+              List.filter_map views ~f:(fun (view, value, view_types) ->
+                  let params = List.drop_last_exn view_types in
+                  let state_names =
+                    List.filter_map (term_references [] value) ~f:(function
+                      | S.Qid id
+                        when (not
+                                (List.exists view.pred_params ~f:(fun (parameter, _) ->
+                                     String.equal parameter.S.pid_str id.pid_str)))
+                             && List.exists predicates
+                                  ~f:(fun (_, predicate, definition, _) ->
+                                    same_scope scope
+                                      (declaration_scope predicate.S.pred_name.pid_str)
+                                    &&
+                                    match definition with
+                                    | Invariant { state; _ } ->
+                                        String.equal state id.pid_str
+                                    | _ -> false) ->
+                          Some id.pid_str
+                      | Qid _ | Qdot _ -> None)
+                  in
+                  Option.some_if
+                    (same_scope scope (declaration_scope view.pred_name.pid_str)
+                    && List.length params = List.length param_types
+                    && Ctype.is_equal environment false params param_types
+                    && (List.is_empty state_names
+                       || List.mem state_names state ~equal:String.equal))
+                    (view, value));
             at;
           })
+  in
+  let* _ =
+    all actions ~f:(fun (_, action) ->
+        match
+          List.filter structures ~f:(fun st ->
+              List.exists st.actions ~f:(fun a -> String.equal a.action action.action))
+        with
+        | [ _ ] -> Ok ()
+        | [] -> error action.action_at "No stateful invariant matches this action"
+        | _ ->
+            error action.action_at
+              "Several stateful invariants match this action: use distinct state binders")
+  in
+  let* _ =
+    all views ~f:(fun (view, _, _) ->
+        match
+          List.filter structures ~f:(fun st ->
+              List.exists st.views ~f:(fun (p, _) ->
+                  String.equal p.S.pred_name.pid_str view.S.pred_name.pid_str))
+        with
+        | [ _ ] -> Ok ()
+        | [] -> error view.pred_name.pid_loc "No stateful invariant matches this view"
+        | _ ->
+            error view.pred_name.pid_loc
+              "Several stateful invariants match this view: use distinct state binders")
   in
   let* structure_member_lists =
     all structures ~f:(fun st -> structure_members types st ~at:st.at)
@@ -11868,9 +12083,65 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                   Option.some_if (String.equal a anchor) f) ));
     }
   in
+  let past_structures (f : func) =
+    let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+    let _, _, support = proof_context scope preds spec_funcs proof_support in
+    let references =
+      Option.value_map f.contract ~default:[] ~f:(fun c ->
+          List.concat_map (c.requires @ c.ensures) ~f:(term_references []))
+    in
+    let keys =
+      List.filter_map references ~f:(fun q ->
+          let key =
+            match (support.proof_key f.environment q, q) with
+            | Some key, _ -> Some key
+            | None, S.Qid id -> Some id.pid_str
+            | None, Qdot _ -> None
+          in
+          Option.map key ~f:(fun key ->
+              Option.value (Proof_bindings.canonical_key scoped_proofs key) ~default:key))
+    in
+    let selected =
+      List.filter structures ~f:(fun st ->
+          List.mem keys st.invariant ~equal:String.equal
+          || List.exists st.views ~f:(fun (p, _) ->
+              List.mem keys p.S.pred_name.pid_str ~equal:String.equal))
+    in
+    if not (List.is_empty selected) then selected
+    else
+      let namespace =
+        Option.value_map scope ~default:[] ~f:(fun s -> s.Proof_scopes.namespace)
+      in
+      let owner st =
+        Option.value_map st.scope ~default:[] ~f:(fun s -> s.Proof_scopes.namespace)
+      in
+      let visible =
+        List.filter structures ~f:(fun st ->
+            Option.is_some (Proof_bindings.drop_prefix (owner st) namespace))
+      in
+      List.filter visible ~f:(fun st ->
+          not
+            (List.exists visible ~f:(fun other ->
+                 String.equal st.state other.state
+                 && List.length (owner other) > List.length (owner st))))
+  in
   (* The facts about earlier states in contracts, by the parameter they are about. *)
   let* pasts =
     all funcs ~f:(fun f ->
+        let structures = past_structures f in
+        let* _ =
+          all
+            (Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires @ c.ensures))
+            ~f:(fun term ->
+              if
+                List.count structures ~f:(fun st -> Option.is_some (past_of [ st ] term))
+                > 1
+              then
+                error term.term_loc
+                  "Several stateful invariants match this past fact: use distinct state \
+                   binders"
+              else Ok ())
+        in
         let clauses select =
           Option.value_map f.contract ~default:[] ~f:select
           |> List.filter_map ~f:(past_of structures)
@@ -12506,24 +12777,29 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* The checks that the actions keep the histories' orders. *)
   let* action_check_lists =
     all structures ~f:(fun st ->
+        let preds, spec_funcs, proof_support =
+          proof_context st.scope preds spec_funcs proof_support
+        in
         action_checks
-          (spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-             origins)
+          (spec_context types ~refs ~primitives ~shared ~ocaml_env:st.environment ~preds
+             ~spec_funcs ~proof_support origins)
           st)
   in
   let* pending_member_lists =
     all structures ~f:(fun st ->
         all st.pendings ~f:(fun p ->
-            match
-              List.find funcs ~f:(fun f -> String.equal (Ident.name f.id) p.helped)
-            with
+            match List.find funcs ~f:(fun f -> Ident.same f.id p.helped) with
             | Some helped ->
+                let preds, spec_funcs, proof_support =
+                  proof_context st.scope preds spec_funcs proof_support
+                in
                 pending_members
-                  (spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds
-                     ~spec_funcs origins)
+                  (spec_context types ~refs ~primitives ~shared ~ocaml_env:st.environment
+                     ~preds ~spec_funcs ~proof_support origins)
                   st p helped ~helped_proc:(proc_name helped)
             | None ->
-                error st.at (Printf.sprintf "There is no function %s to help" p.helped)))
+                error st.at
+                  (Printf.sprintf "There is no function %s to help" (Ident.name p.helped))))
   in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
@@ -12533,9 +12809,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         predicate types ~refs ~primitives ~shared
           ~ocaml_env:(declaration_environment p.pred_name.pid_str)
-          ~preds ~spec_funcs ~proof_support origins ~at
-          ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
-          ~structures p def param_types)
+          ~preds ~spec_funcs ~proof_support origins ~at ~structures p def param_types)
   in
   let predicate_bodies =
     List.filter_map predicates ~f:(fun (_, p, definition, _) ->
@@ -12549,7 +12823,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         | Invariant _ | View _ -> None)
     @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
         match binding.kind with
-        | Predicate (_, body)
+        | Predicate (_, Plain body)
           when binding.exported && not (Proof_bindings.opaque scoped_proofs binding) ->
             Some
               ( binding.public_key,
@@ -12569,7 +12843,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     let predicate_bodies =
       List.filter_map scoped_proofs.bindings ~f:(fun binding ->
           match binding.kind with
-          | Predicate (_, body)
+          | Predicate (_, Plain body)
             when Proof_bindings.visible scoped_proofs ~scope binding
                  && not (Proof_bindings.opaque_at scoped_proofs ~scope binding) ->
               Some
@@ -12589,7 +12863,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
       ~f:(fun binding ->
         match binding.kind with
-        | Predicate (_, body) ->
+        | Predicate (_, Plain body) ->
             Some
               ( binding.backend,
                 {
@@ -12813,7 +13087,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               proc data ~refs ~primitives ~shared ~ocaml_env:f.environment
                 ~preds:predicates ~funcs:spec_funcs ~annotations ~access_proofs
                 ~return_proofs ~initializations ~linearizations ~lifted ~pasts
-                ~past_returns ~ghost_args ~procedure_signatures
+                ~past_structures:(past_structures f) ~past_returns ~ghost_args
+                ~procedure_signatures
                 ~proof_lemmas:
                   (lemma_context (Proof_bindings.scope_for_location scoped_proofs f.loc))
                 ~proof_support

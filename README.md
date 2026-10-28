@@ -31,8 +31,9 @@ containing logical types and functions, resource-algebra instances, ghost fields
 predicates, invariants and lemmas. Proofs can use private implementation types.
 Module signatures expose abstract resource contracts while hiding their definitions
 and implementation lemmas. Aliases preserve resource identity. AU facades can be
-scoped to source modules, with qualified operation and token names. Scoped
-state/view/action declarations and functor proof bodies are not supported yet.
+scoped to source modules, with qualified operation and token names. State records,
+views and actions also support static module scopes. Functor proof bodies are not
+supported yet.
 
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.
@@ -326,6 +327,13 @@ When the final parameter names a ghost state record declared in the proof, Carav
 elaborates the existing state-based form with its generated support. Otherwise,
 all parameters are invariant inputs and the body is emitted directly, without
 state, history, or action synthesis.
+
+State records, stateful invariants, views and actions can appear in mirrored static
+module blocks. State field types use their declaration's environment. Views and
+actions belong to a stateful invariant in the same proof scope: parameter types and
+state binders identify the invariant, and ambiguous matches are rejected. Signatures
+export the invariant and view contracts while hiding their state representation and
+actions. Aliases retain their identities; sibling modules can reuse proof names.
 
 A `(*@ manual *)` annotation after a function selects a checked manual proof.
 The function keeps its OCaml implementation and contract; its proof supplies

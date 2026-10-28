@@ -1,0 +1,6 @@
+module Counter = struct
+  type state = { value : int }
+  invariant first (cell : t) (s : state) = own cell s.value
+  invariant second (cell : t) (s : state) = own cell s.value
+  action advance = { s with value = s.value + 1 }
+end

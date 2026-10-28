@@ -1,0 +1,15 @@
+module Left = struct
+  type state = { cells : t sequence [@grows] }
+
+  invariant live (root : t) (s : state) =
+    own root 0
+    && (forall i : integer. 0 <= i && i < length s.cells -> own s.cells.(i) 0)
+end
+
+module Right = struct
+  type state = { cells : t sequence [@grows] }
+
+  invariant live (root : t) (s : state) =
+    own root 0
+    && (forall i : integer. 0 <= i && i < length s.cells -> own s.cells.(i) 0)
+end

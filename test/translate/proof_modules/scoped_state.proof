@@ -1,0 +1,22 @@
+module Counter = struct
+  type state = { value : int }
+
+  invariant is_counter (c : t) (s : state) =
+    0 <= s.value && s.value <= 1 && own c s.value
+
+  view counter (c : t) = s.value
+
+  action set_one = compare_and_set c 0 1 ~> { s with value = 1 } linearizes set_one
+end
+
+module Other = struct
+  let advance (ignored : int) : int = 2
+  type state = { value : int [@grows] }
+
+  invariant is_counter (c : t) (s : state) =
+    0 <= s.value && s.value <= 2 && own c s.value
+
+  view counter (c : t) = s.value
+
+  action set_one = compare_and_set c 0 2 ~> { s with value = s.value + advance 0 } linearizes set_one
+end
