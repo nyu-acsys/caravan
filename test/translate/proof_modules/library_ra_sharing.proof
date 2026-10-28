@@ -1,0 +1,13 @@
+module First = Excl (struct type t = int end)
+module Second = Excl (struct type t = int end)
+module Auth_first = Auth (First)
+module Auth_second = Auth (Second)
+
+lemma shared
+  ensures (Second.valid (First.excl 1))
+  ensures (Auth_second.valid (Auth_first.frag First.id)) = ()
+
+module Auth = Excl (struct type t = int end)
+module Qualified = Library.Auth (Auth)
+
+lemma qualified_library ensures (Qualified.valid Qualified.id) = ()

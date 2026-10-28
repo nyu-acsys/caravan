@@ -1,0 +1,3 @@
+module Exclusive = Excl (struct type t = int end)
+
+lemma wrong_value ensures (Exclusive.valid (Exclusive.excl true)) = ()

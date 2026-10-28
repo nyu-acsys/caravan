@@ -41,6 +41,13 @@ Aliases preserve proof member identity, while result signatures expose declared
 predicates opaquely and hide implementation lemmas. Other functor-owned proof
 declarations are not supported yet.
 
+Proofs can instantiate Raven library modules using OCaml-style module applications.
+Their types, constructors, operations and parameter requirements come from Raven's
+checked signatures; resource algebras are recognized by their `ResourceAlgebra`
+interface. Proofs can define their own resource algebras with
+`module M : ResourceAlgebra = struct … end`; Raven checks the algebra laws and
+the interface hides implementation details.
+
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.
 

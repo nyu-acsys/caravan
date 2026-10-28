@@ -1,0 +1,4 @@
+module Bit : ResourceAlgebra = struct
+  type t = Empty
+  let id : t = Empty
+end

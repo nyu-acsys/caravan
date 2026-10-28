@@ -15,6 +15,7 @@ type scope = {
   structure : Typedtree.structure;
   public_type : Types.module_type option;
   sealed : bool;
+  definition : S.qualid option;
   source_location : Location.t;
   proof_location : Location.t option;
 }
@@ -24,6 +25,7 @@ type t = { root : scope; scopes : scope list; declarations : entry list }
 
 let name = function
   | S.Proof_module { module_name; _ } -> module_name
+  | Proof_definition { module_name; _ } -> module_name
   | Proof_predicate p -> p.pred_name
   | Proof_type { type_name; _ } -> type_name
   | Proof_resource { resource_name; _ } -> resource_name
@@ -202,9 +204,38 @@ let child_scope parent (name : S.id) parameters location =
           structure;
           public_type = Some mb_expr.mod_type;
           sealed = (match mb_expr.mod_desc with Tmod_constraint _ -> true | _ -> false);
+          definition = None;
           source_location = declaration.mb_loc;
           proof_location = Some location;
         }
+
+let definition_scope parent (name : S.id) interface location =
+  let at = name.pid_loc in
+  let* () =
+    if Option.is_none parent.owner then Ok ()
+    else Report.unsupported at "A proof-defined module inside another module"
+  in
+  let* id, public_type =
+    match Env.find_module_by_name (Longident.Lident name.pid_str) parent.environment with
+    | Pident id, declaration -> Ok (id, declaration.md_type)
+    | _ -> Error (Report.error Type at "A proof-defined module must be local")
+  in
+  let structure, _, _, _, _ = Typemod.type_structure parent.environment [] in
+  Ok
+    {
+      owner = Some (Path.Pident id);
+      declaration_id = Some id;
+      namespace = parent.namespace @ [ name.pid_str ];
+      parent = parent.owner;
+      environment = parent.environment;
+      parameters = [];
+      structure;
+      public_type = Some public_type;
+      sealed = true;
+      definition = Some interface;
+      source_location = location;
+      proof_location = Some location;
+    }
 
 let resolve ?(location = Location.none) ~environment (structure : Typedtree.structure)
     declarations =
@@ -219,6 +250,7 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
       structure;
       public_type = None;
       sealed = false;
+      definition = None;
       source_location = location;
       proof_location = None;
     }
@@ -241,6 +273,18 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
                      "A source module has more than one proof block")
             | None -> collect nested (nested :: scopes) entries module_declarations
             end
+        | S.Proof_definition
+            { module_name; module_interface; module_declarations; module_loc } ->
+            let* nested =
+              definition_scope scope module_name module_interface module_loc
+            in
+            begin match List.find scopes ~f:(same_scope nested) with
+            | Some _ ->
+                Error
+                  (Report.error Type module_name.pid_loc
+                     "A proof-defined module has more than one definition")
+            | None -> collect nested (nested :: scopes) entries module_declarations
+            end
         | declaration ->
             let name = name declaration in
             let entry =
@@ -255,7 +299,8 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
 *)
 let owner_paths_at inventory (location : Location.t) =
   let inside outer =
-    outer.Location.loc_start.pos_cnum <= location.loc_start.pos_cnum
+    String.equal outer.Location.loc_start.pos_fname location.loc_start.pos_fname
+    && outer.loc_start.pos_cnum <= location.loc_start.pos_cnum
     && location.loc_end.pos_cnum <= outer.loc_end.pos_cnum
   in
   let rec structure parent (body : Typedtree.structure) =

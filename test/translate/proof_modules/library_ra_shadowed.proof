@@ -1,0 +1,2 @@
+module Auth = SetRA (struct type t = int end)
+module Invalid = Auth (Auth)

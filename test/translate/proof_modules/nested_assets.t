@@ -18,7 +18,7 @@ A containing signature keeps implementation fields private from clients.
   $ caravan --shh nested_assets_hidden_fail.ml 2>&1 | grep -F 'Type Error: Unknown or inaccessible ghost field.'
   Type Error: Unknown or inaccessible ghost field.
 
-Resource instance types remain nominally distinct, including equal functor arguments.
+Resource instances with different functor arguments retain distinct types.
 
   $ cp nested_assets.ml nested_assets_wrong_instance_fail.ml
   $ caravan --shh nested_assets_wrong_instance_fail.ml 2>&1 | grep -F 'Type Error: This expression has type Sibling_authority.t'

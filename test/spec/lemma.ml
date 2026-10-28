@@ -153,7 +153,10 @@ let () =
   | _ -> failwith "unexpected logical type or state declarations"
   end;
   begin match parse_proof "module Authority = Auth (Owner.Facts)" with
-  | [ Proof_resource { resource_kind = Resource_auth (Qdot (Qid owner, facts)); _ } ] ->
+  | [
+   Proof_resource
+     { resource_arguments = [ Proof_module_argument (Qdot (Qid owner, facts)) ]; _ };
+  ] ->
       assert (owner.pid_str = "Owner");
       assert (facts.pid_str = "Facts")
   | _ -> failwith "qualified resource argument was not parsed"
@@ -172,9 +175,14 @@ let () =
   with
   | [
    Proof_type _;
-   Proof_resource { resource_name = facts; resource_kind = Resource_set _ };
    Proof_resource
-     { resource_name = authority; resource_kind = Resource_auth (Qid argument) };
+     { resource_name = facts; resource_arguments = [ Proof_type_argument _ ]; _ };
+   Proof_resource
+     {
+       resource_name = authority;
+       resource_arguments = [ Proof_module_argument (Qid argument) ];
+       _;
+     };
    Proof_field { field_name; field_type = PTtyapp (_, [ _; _ ]) };
    Proof_function fn;
    Proof_lemma use;
@@ -197,6 +205,24 @@ let () =
       end
   | _ -> failwith "unexpected resource declarations"
   end;
+  begin match parse_proof "module Combined = Library.Product (First) (Second)" with
+  | [
+   Proof_resource
+     {
+       resource_functor = Qdot (Qid library, product);
+       resource_arguments = [ Proof_module_argument _; Proof_module_argument _ ];
+       _;
+     };
+  ] ->
+      assert (library.pid_str = "Library");
+      assert (product.pid_str = "Product")
+  | _ -> failwith "generic proof module application was not parsed"
+  end;
+  begin match parse_proof "module Unlisted = NewFunctor (struct type t = int end)" with
+  | [ Proof_resource { resource_functor = Qid name; _ } ] ->
+      assert (name.pid_str = "NewFunctor")
+  | _ -> failwith "proof module names were restricted by the parser"
+  end;
   let rejected source =
     let lexbuf = Lexing.from_string source in
     match Spec_parser.proof Spec_lexer.token lexbuf with
@@ -206,9 +232,7 @@ let () =
   in
   List.iter rejected
     [
-      "module Facts = Unknown (struct type t = int end)";
       "module Facts = SetRA (struct type element = int end)";
-      "module Authority = Unknown (Facts)";
       "let facts : (int, Authority.t) Ghost.field = Other.field ()";
       "let facts : int = Ghost.field ()";
       "let facts_of x : int set = Set.empty";

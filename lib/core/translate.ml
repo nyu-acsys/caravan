@@ -229,6 +229,7 @@ type au = {
 
 type lemma_signature = {
   lemma_raven : string;
+  lemma_constant : bool;
   lemma_inputs : Types.type_expr list;
   lemma_implicit_count : int;
   lemma_outputs : Types.type_expr list;
@@ -1047,24 +1048,27 @@ let atomic_arguments ~loc:l signature method_ values =
         [ token; inputs; R.Expr.tuple ~loc:l outputs ]
       else [ token; inputs ]
 
+let resource_module env parent =
+  Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+      let path = env.ctx.proof_support.canonical_path path in
+      List.find env.ctx.proof_support.resources ~f:(fun resource ->
+          Path.same path resource.Source.resource_path
+          || Path.same path (Pident resource.resource_id)))
+
 let resource_operation env = function
   | S.Qdot (parent, operation) ->
-      Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
-          let path = env.ctx.proof_support.canonical_path path in
-          Option.bind
-            (List.find env.ctx.proof_support.resources ~f:(fun resource ->
-                 Path.same path resource.Source.resource_path
-                 || Path.same path (Pident resource.resource_id)))
-            ~f:(fun resource ->
-              List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
-                  Option.some_if
-                    (String.equal name operation.pid_str)
-                    {
-                      lemma_raven = resource.resource_backend ^ "." ^ name;
-                      lemma_inputs = inputs;
-                      lemma_implicit_count = 0;
-                      lemma_outputs = [ result ];
-                    })))
+      Option.bind (resource_module env parent) ~f:(fun resource ->
+          List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
+              Option.some_if
+                (String.equal name operation.pid_str)
+                {
+                  lemma_raven = resource.resource_backend ^ "." ^ name;
+                  lemma_constant =
+                    List.mem resource.resource_constants name ~equal:String.equal;
+                  lemma_inputs = inputs;
+                  lemma_implicit_count = 0;
+                  lemma_outputs = [ result ];
+                }))
   | Qid _ -> None
 
 let logical_signature env q =
@@ -1107,9 +1111,19 @@ let ghost_operation t =
 
 let is_ghost_fpu t = Option.equal String.equal (ghost_operation t) (Some "fpu")
 
+let same_named_type left right =
+  match (Types.get_desc left, Types.get_desc right) with
+  | Tconstr (left, [], _), Tconstr (right, [], _) -> Path.same left right
+  | _ -> false
+
 let resource_field env (field : Source.proof_field) =
-  List.exists env.ctx.proof_support.resources ~f:(fun resource ->
-      Ctype.is_equal env.ctx.env false [ field.field_value ] [ resource.resource_type ])
+  Option.exists field.field_resource ~f:(fun owner ->
+      List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+          resource.resource_is_ra
+          && (Path.same owner resource.resource_path
+             || Path.same owner (Path.Pident resource.resource_id))))
+  || List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+      resource.resource_is_ra && same_named_type field.field_value resource.resource_type)
 
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
 *)
@@ -1366,6 +1380,8 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       collection_application env ~at (Option.value_exn (collection_builtin env q)) []
   | Tvar q when Option.is_some (resource_operation env q) ->
       logical_application env ~at (Option.value_exn (resource_operation env q)) []
+  | Tvar (Qdot (parent, _) as q) when Option.is_some (resource_module env parent) ->
+      error at ("Unknown proof module member " ^ qualid_key q)
   | Tvar (Qdot (Qid m, v))
     when String.equal m.pid_str "Permission"
          && List.mem [ "half"; "full" ] v.pid_str ~equal:String.equal ->
@@ -1731,6 +1747,8 @@ and application env (t : S.term) =
         (R.Expr.call ~loc:l
            (Qualified_name.raven ~loc:l (Option.value_exn (runtime_spec env q)))
            args)
+  | Tvar (Qdot (parent, _) as q), _ when Option.is_some (resource_module env parent) ->
+      error at ("Unknown proof module member " ^ qualid_key q)
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
       collection_application env ~at (Option.value_exn (collection_builtin env q)) args
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
@@ -1981,7 +1999,7 @@ and logical_application env ~at signature args =
   in
   let* args = typed_arguments env ~at signature.lemma_inputs args in
   let n = qualified_name ~loc:l signature.lemma_raven in
-  if String.is_suffix signature.lemma_raven ~suffix:".id" then Ok (R.Expr.var ~loc:l n)
+  if signature.lemma_constant then Ok (R.Expr.var ~loc:l n)
   else Ok (R.Expr.call ~loc:l n args)
 
 (** The OCaml types of the names that the pattern [p] binds, matching a value of type [t].
@@ -2422,6 +2440,7 @@ let atomic_proof_signature env t =
             Option.map (atomic_inputs signature method_) ~f:(fun (inputs, outputs) ->
                 {
                   lemma_raven = qualid_key q;
+                  lemma_constant = false;
                   lemma_inputs = inputs;
                   lemma_implicit_count = 0;
                   lemma_outputs = outputs;
@@ -9189,7 +9208,7 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
 
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ~proof_lemmas ~proof_support ~predicate_bodies origins declaration =
+    ~proof_lemmas ~proof_support ~predicate_bodies ?member_name origins declaration =
   match declaration with
   | S.Proof_lemma
       {
@@ -9282,15 +9301,15 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
            ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
            ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
            ~requires ~ensures ~decreases
-           (ident ~loc:l lemma_name.pid_str)
+           (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
            (Some body))
   | _ -> error Location.none "Expected a lemma declaration"
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]. Each stateful invariant holds half of its views. *)
 let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
-    origins ~at ~structures (p : S.predicate) (def : definition) param_types :
-    (R.Callable.t, error) Result.t =
+    ?declaration_name origins ~at ~structures (p : S.predicate) (def : definition)
+    param_types : (R.Callable.t, error) Result.t =
   let ctx =
     spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       ~proof_support origins
@@ -9298,7 +9317,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
-  let name = ident ~loc:l p.pred_name.pid_str in
+  let name = ident ~loc:l (Option.value declaration_name ~default:p.pred_name.pid_str) in
   match def with
   | Direct_invariant body ->
       let* body = quantified env body in
@@ -9645,8 +9664,9 @@ let predicates ~data (source : Source.t) =
     all source.proof ~f:(function
       | S.Proof_predicate p ->
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
-      | Proof_module _ | Proof_state _ | Proof_action _ | Proof_lemma _ | Proof_type _
-      | Proof_resource _ | Proof_field _ | Proof_function _ | Proof_au _ ->
+      | Proof_module _ | Proof_definition _ | Proof_state _ | Proof_action _
+      | Proof_lemma _ | Proof_type _ | Proof_resource _ | Proof_field _ | Proof_function _
+      | Proof_au _ ->
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
@@ -9803,7 +9823,7 @@ let pure_logical_body env (t : S.term) =
 
 (** Nonrecursive logical definitions are checked with the rest of the proof. *)
 let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ~proof_support origins declaration =
+    ~proof_support ?member_name ~as_value origins declaration =
   match declaration with
   | S.Proof_function { function_name; function_params; function_result; function_body } ->
       let l = loc function_name.pid_loc in
@@ -9839,12 +9859,18 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       in
       let* body = formula env function_body in
       let result = Names.fresh ctx.names "result" in
-      Ok
-        (R.Callable.func ~loc:l
-           ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
-           ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
-           (ident ~loc:l function_name.pid_str)
-           (Some (R.Expr.annotated body result_type)))
+      let member =
+        ident ~loc:l (Option.value member_name ~default:function_name.pid_str)
+      in
+      let body = R.Expr.annotated body result_type in
+      if as_value then Ok (R.Member.value ~loc:l ~typ:result_type member (Some body))
+      else
+        Ok
+          (R.Member.callable
+             (R.Callable.func ~loc:l
+                ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
+                ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
+                member (Some body)))
   | _ -> error Location.none "Expected a logical function declaration"
 
 let scoped_contract_context types ~refs ~primitives ~shared ~environment ~proof_support
@@ -10342,6 +10368,38 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             else data);
     }
   in
+  let resource_implementations =
+    List.filter_map source.proof_resources ~f:(fun resource ->
+        Option.some_if resource.Source.resource_definition
+          (resource.resource_id, fresh ("Implementation_" ^ resource.resource_backend)))
+  in
+  let proof_implementations =
+    List.filter_map source.proof_resources ~f:(fun resource ->
+        Option.some_if resource.Source.resource_definition
+          (resource.resource_id, fresh ("Proofs_" ^ resource.resource_backend)))
+  in
+  let implementation resource =
+    List.Assoc.find resource_implementations resource.Source.resource_id ~equal:Ident.same
+  in
+  let proof_implementation resource =
+    List.Assoc.find proof_implementations resource.Source.resource_id ~equal:Ident.same
+  in
+  let definition_resource scope =
+    Option.bind scope.Proof_scopes.owner ~f:(fun owner ->
+        List.find source.proof_resources ~f:(fun resource ->
+            resource.resource_definition
+            && Path.same owner (Path.Pident resource.resource_id)))
+  in
+  let definition_target (binding : Proof_bindings.binding) =
+    Option.bind (definition_resource binding.entry.scope) ~f:(fun resource ->
+        let backend =
+          match binding.kind with
+          | Predicate _ | Lemma _ -> proof_implementation resource
+          | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+              implementation resource
+        in
+        Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))
+  in
   let* inventory = Module_inventory.build source typed in
   let* scoped_proofs = Proof_bindings.build ~fresh source inventory in
   let scoped_binding name =
@@ -10353,6 +10411,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let declaration_environment name =
     Option.value_map (scoped_binding name) ~default:source.env ~f:(fun binding ->
         binding.environment)
+  in
+  let definition_member_name name =
+    Option.bind (scoped_binding name) ~f:(fun binding ->
+        Option.map (definition_target binding) ~f:(fun _ -> binding.entry.name.pid_str))
   in
   let proof_assets scope =
     let environment =
@@ -10884,36 +10946,79 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         Ok (d.Datatypes.module_name, member))
   in
+  let proof_module path ~at =
+    match
+      List.find source.proof_resources ~f:(fun resource ->
+          Path.same resource.Source.resource_path path
+          || Path.same (Path.Pident resource.resource_id) path)
+    with
+    | Some resource -> Ok resource
+    | None -> error at "The proof module argument has no translated declaration"
+  in
+  let rec depends_on_definition seen resource =
+    if List.mem seen resource.Source.resource_id ~equal:Ident.same then false
+    else if resource.resource_definition then true
+    else
+      let seen = resource.resource_id :: seen in
+      let dependency path =
+        List.exists source.proof_resources ~f:(fun argument ->
+            (Path.same path argument.resource_path
+            || Path.same path (Path.Pident argument.resource_id))
+            && depends_on_definition seen argument)
+      in
+      Option.exists resource.resource_alias_of ~f:dependency
+      || List.exists resource.resource_arguments ~f:(function
+        | Source.Type_argument _ -> false
+        | Module_argument path -> dependency path)
+  in
+  let deferred_resources =
+    List.filter source.proof_resources ~f:(depends_on_definition [])
+  in
   let* resource_members =
     all source.proof_resources ~f:(fun resource ->
         let at = resource.Source.resource_at in
         let l = loc at in
-        let* library, arguments =
-          match resource.resource_kind with
-          | S.Resource_set elt ->
-              let* elt = Source.ocaml_type resource.resource_environment ~at elt in
-              let* elt = Datatypes.typ types ~at elt in
-              Ok ("SetRA", [ elt ])
-          | Resource_auth _ ->
-              begin match
-                List.find source.proof_resources ~f:(fun base ->
-                    Option.exists resource.resource_auth_path ~f:(fun path ->
-                        Path.same path base.Source.resource_path
-                        || Path.same path (Pident base.resource_id)))
-              with
-              | Some base ->
-                  Ok
-                    ( "Auth",
-                      [ R.Type.named ~loc:l (name ~loc:l base.resource_backend) [] ] )
-              | None -> error at "Auth requires a previously declared resource module"
-              end
+        let* member =
+          match (resource.resource_definition, resource.resource_alias_of) with
+          | true, _ ->
+              let* backend =
+                match implementation resource with
+                | Some backend -> Ok backend
+                | None -> error at "Missing resource algebra implementation"
+              in
+              let interface =
+                qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+              in
+              Ok
+                (R.Member.alias ~loc:l ~typ:interface ~sealed:true
+                   (ident ~loc:l resource.resource_backend)
+                   (qualified_name ~loc:l backend))
+          | false, Some path ->
+              let* target = proof_module path ~at in
+              Ok
+                (R.Member.alias ~loc:l
+                   (ident ~loc:l resource.resource_backend)
+                   (qualified_name ~loc:l target.resource_backend))
+          | false, None ->
+              let* arguments =
+                all resource.resource_arguments ~f:(function
+                  | Source.Type_argument typ -> Datatypes.typ types ~at typ
+                  | Module_argument path ->
+                      let* argument = proof_module path ~at in
+                      Ok
+                        (R.Type.named ~loc:l
+                           (qualified_name ~loc:l argument.resource_backend)
+                           []))
+              in
+              let library =
+                qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+              in
+              Ok
+                (R.Member.instance ~loc:l ~def:(library, arguments)
+                   (ident ~loc:l resource.resource_backend)
+                   library)
         in
-        let library = R.Name.make ~loc:l ~path:[ "Library" ] library in
-        Ok
-          ( resource.resource_backend,
-            R.Member.instance ~loc:l ~def:(library, arguments)
-              (ident ~loc:l resource.resource_backend)
-              library ))
+        Ok (resource.resource_backend, member))
   in
   let proof_module_names =
     List.map source.proof_types ~f:(fun data -> data.Datatypes.module_name)
@@ -10934,35 +11039,32 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         | Proof_resource _ ->
             Option.bind
               (List.find source.proof_resources ~f:(fun resource ->
-                   Poly.equal resource.Source.resource_at entry.name.pid_loc))
+                   Poly.equal resource.Source.resource_at entry.name.pid_loc
+                   && not (depends_on_definition [] resource)))
               ~f:(fun resource ->
                 List.Assoc.find resource_members resource.resource_backend
                   ~equal:String.equal)
         | _ -> None)
   in
+  let deferred_resource_members =
+    List.filter_map deferred_resources ~f:(fun resource ->
+        List.Assoc.find resource_members resource.resource_backend ~equal:String.equal)
+  in
   let rec resource_dependencies seen resource =
-    match resource.Source.resource_kind with
-    | S.Resource_set elt ->
-        let* t =
-          Source.ocaml_type resource.resource_environment ~at:resource.resource_at elt
-        in
-        Ok
-          (Result_layouts.type_dependencies
-             ~additional:(Generic_proofs.layout_dependencies generic_proofs)
-             layouts types t)
-    | Resource_auth _ -> (
-        if List.mem seen resource.resource_id ~equal:Ident.same then Ok []
-        else
-          match
-            List.find source.proof_resources ~f:(fun base ->
-                Option.exists resource.resource_auth_path ~f:(fun path ->
-                    Path.same path base.Source.resource_path
-                    || Path.same path (Pident base.resource_id)))
-          with
-          | None ->
-              error resource.resource_at
-                "Auth requires a previously declared resource module"
-          | Some base -> resource_dependencies (resource.resource_id :: seen) base)
+    if List.mem seen resource.Source.resource_id ~equal:Ident.same then Ok []
+    else
+      let* dependencies =
+        all resource.resource_arguments ~f:(function
+          | Source.Type_argument typ ->
+              Ok
+                (Result_layouts.type_dependencies
+                   ~additional:(Generic_proofs.layout_dependencies generic_proofs)
+                   layouts types typ)
+          | Module_argument path ->
+              let* argument = proof_module path ~at:resource.resource_at in
+              resource_dependencies (resource.resource_id :: seen) argument)
+      in
+      Ok (List.concat dependencies)
   in
   let* module_declarations =
     all (runtime_modules @ proof_modules) ~f:(fun member ->
@@ -11422,6 +11524,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             ( function_name.pid_str,
               {
                 lemma_raven = function_name.pid_str;
+                lemma_constant = List.is_empty function_params;
                 lemma_inputs;
                 lemma_implicit_count = 0;
                 lemma_outputs = [ output ];
@@ -11714,7 +11817,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     let private_preds =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
-          | Predicate _ -> Some (binding.backend, (binding.backend, binding.private_types))
+          | Predicate _ ->
+              Some
+                ( binding.backend,
+                  ( Option.value (definition_target binding) ~default:binding.backend,
+                    binding.private_types ) )
           | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
               None)
     in
@@ -11728,12 +11835,22 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           Option.map
             (List.Assoc.find all_logical_functions binding.backend ~equal:String.equal)
-            ~f:(fun signature -> (binding.backend, signature)))
+            ~f:(fun signature ->
+              ( binding.backend,
+                {
+                  signature with
+                  lemma_raven =
+                    Option.value (definition_target binding)
+                      ~default:signature.lemma_raven;
+                } )))
     in
     ( private_preds @ preds,
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
-          | Function _ -> Some (binding.entry.name.pid_str, binding.backend)
+          | Function _ ->
+              Some
+                ( binding.entry.name.pid_str,
+                  Option.value (definition_target binding) ~default:binding.backend )
           | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | State _ | Action _
             ->
               None)
@@ -11952,6 +12069,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               ( lemma_name.pid_str,
                 {
                   lemma_raven = lemma_name.pid_str;
+                  lemma_constant = false;
                   lemma_inputs;
                   lemma_implicit_count;
                   lemma_outputs;
@@ -12035,7 +12153,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
       ~f:(fun binding ->
         Option.map (List.Assoc.find all_proof_lemmas binding.backend ~equal:String.equal)
-          ~f:(fun signature -> (binding.backend, signature)))
+          ~f:(fun signature ->
+            ( binding.backend,
+              {
+                signature with
+                lemma_raven =
+                  Option.value (definition_target binding) ~default:signature.lemma_raven;
+              } )))
     @ proof_lemmas
   in
   (* The views, with their values, and their ghost fields, on the structures. *)
@@ -13117,7 +13241,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         predicate types ~refs ~primitives ~shared
           ~ocaml_env:(declaration_environment p.pred_name.pid_str)
-          ~preds ~spec_funcs ~proof_support origins ~at ~structures p def param_types)
+          ~preds ~spec_funcs ~proof_support
+          ?declaration_name:(definition_member_name p.pred_name.pid_str)
+          origins ~at ~structures p def param_types)
   in
   let predicate_bodies =
     List.filter_map predicates ~f:(fun (_, p, definition, _) ->
@@ -13233,7 +13359,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         proof_lemma types ~refs ~primitives ~shared
           ~ocaml_env:(declaration_environment declaration_name)
           ~preds ~spec_funcs ~proof_lemmas:lemmas ~proof_support
-          ~predicate_bodies:(body_contexts scope) origins declaration)
+          ~predicate_bodies:(body_contexts scope)
+          ?member_name:(definition_member_name declaration_name)
+          origins declaration)
   in
   let* logical_members =
     all
@@ -13250,18 +13378,26 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let implementation_key backend =
           Option.value
-            (List.find_map scoped_proofs.applications ~f:(fun view ->
-                 Option.some_if (String.equal view.backend backend) view.source.backend))
+            (List.find_map scoped_proofs.bindings ~f:(fun binding ->
+                 Option.some_if
+                   (Option.equal String.equal (definition_target binding) (Some backend))
+                   binding.backend))
             ~default:
               (Option.value
-                 (List.find_map scoped_proofs.bindings ~f:(fun binding ->
-                      Option.bind (proof_owner binding.backend) ~f:(fun plan ->
-                          Option.some_if
-                            (String.equal
-                               (Generic_proofs.member plan binding.backend)
-                               backend)
-                            binding.backend)))
-                 ~default:backend)
+                 (List.find_map scoped_proofs.applications ~f:(fun view ->
+                      Option.some_if
+                        (String.equal view.backend backend)
+                        view.source.backend))
+                 ~default:
+                   (Option.value
+                      (List.find_map scoped_proofs.bindings ~f:(fun binding ->
+                           Option.bind (proof_owner binding.backend) ~f:(fun plan ->
+                               Option.some_if
+                                 (String.equal
+                                    (Generic_proofs.member plan binding.backend)
+                                    backend)
+                                 binding.backend)))
+                      ~default:backend))
         in
         let available signature =
           List.mem previous (implementation_key signature.lemma_raven) ~equal:String.equal
@@ -13308,6 +13444,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           ~ocaml_env:(declaration_environment declaration_name)
           ~preds ~spec_funcs
           ~proof_support:{ proof_support with logical_functions }
+          ?member_name:(definition_member_name declaration_name)
+          ~as_value:
+            (match declaration with
+            | S.Proof_function { function_params = []; _ } -> true
+            | _ -> false)
           origins declaration)
   in
   let pure_functions =
@@ -13523,25 +13664,97 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       (List.map logical_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
       logical_members
   in
-  let proof_members = predicate_members @ proof_lemma_members @ logical_members in
+  let proof_members =
+    List.map (predicate_members @ proof_lemma_members) ~f:(fun (name, member) ->
+        (name, R.Member.callable member))
+    @ logical_members
+  in
+  let* definition_modules =
+    all
+      (List.filter source.proof_resources ~f:(fun resource ->
+           resource.Source.resource_definition))
+      ~f:(fun resource ->
+        let at = resource.resource_at in
+        let l = loc at in
+        let* backend, representation =
+          match (implementation resource, resource.resource_representation) with
+          | Some backend, Some representation -> Ok (backend, representation)
+          | _ -> error at "Missing resource algebra representation"
+        in
+        let* representation = Datatypes.typ types ~at representation in
+        let carrier =
+          R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "T") (Some representation)
+        in
+        let members =
+          List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+              Option.bind
+                (List.find scoped_proofs.bindings ~f:(fun binding ->
+                     Ident.same binding.entry.id entry.id
+                     && (match binding.kind with Function _ -> true | _ -> false)
+                     && Option.exists (definition_resource binding.entry.scope)
+                          ~f:(fun owner ->
+                            Ident.same owner.resource_id resource.resource_id)))
+                ~f:(fun binding ->
+                  List.Assoc.find proof_members binding.backend ~equal:String.equal))
+        in
+        let interface =
+          qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+        in
+        Ok
+          (R.Member.module_ ~loc:l
+             ~implements:[ (interface, []) ]
+             (ident ~loc:l backend) (carrier :: members)))
+  in
+  let definition_proof_modules =
+    List.filter_map source.proof_resources ~f:(fun resource ->
+        if not resource.resource_definition then None
+        else
+          Option.bind (proof_implementation resource) ~f:(fun backend ->
+              let members =
+                List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+                    Option.bind
+                      (List.find scoped_proofs.bindings ~f:(fun binding ->
+                           Ident.same binding.entry.id entry.id
+                           && (match binding.kind with
+                             | Predicate _ | Lemma _ -> true
+                             | _ -> false)
+                           && Option.exists (definition_resource binding.entry.scope)
+                                ~f:(fun owner ->
+                                  Ident.same owner.resource_id resource.resource_id)))
+                      ~f:(fun binding ->
+                        List.Assoc.find proof_members binding.backend ~equal:String.equal))
+              in
+              Option.some_if
+                (not (List.is_empty members))
+                (R.Member.module_ ~loc:(loc resource.resource_at)
+                   (ident ~loc:(loc resource.resource_at) backend)
+                   members)))
+  in
   let owned_proofs group =
     List.filter_map proof_members ~f:(fun (name, member) ->
         Option.bind (proof_owner name) ~f:(fun plan ->
-            Option.some_if
-              (phys_equal plan.Generic_proofs.group group)
-              (R.Member.callable member)))
+            Option.some_if (phys_equal plan.Generic_proofs.group group) member))
   in
   let pred_members =
     List.filter_map predicate_members ~f:(fun (name, member) ->
-        Option.some_if (Option.is_none (proof_owner name)) member)
+        Option.some_if
+          (Option.is_none (proof_owner name)
+          && Option.is_none (Option.bind (scoped_binding name) ~f:definition_target))
+          member)
   in
   let lemma_members =
     List.filter_map proof_lemma_members ~f:(fun (name, member) ->
-        Option.some_if (Option.is_none (proof_owner name)) member)
+        Option.some_if
+          (Option.is_none (proof_owner name)
+          && Option.is_none (Option.bind (scoped_binding name) ~f:definition_target))
+          member)
   in
   let logical_members =
     List.filter_map logical_members ~f:(fun (name, member) ->
-        Option.some_if (Option.is_none (proof_owner name)) member)
+        Option.some_if
+          (Option.is_none (proof_owner name)
+          && Option.is_none (Option.bind (scoped_binding name) ~f:definition_target))
+          member)
   in
   let* generic_implementations =
     all generics ~f:(fun group ->
@@ -13742,7 +13955,47 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* explicit_fields =
     all source.proof_fields ~f:(fun field ->
         let l = loc field.Source.field_at in
-        let* value_type = Datatypes.typ types ~at:field.field_at field.field_value in
+        let* value_type =
+          match field.field_resource with
+          | None ->
+              begin match
+                List.find source.proof_resources ~f:(fun resource ->
+                    resource.resource_is_ra
+                    && same_named_type field.field_value resource.resource_type)
+              with
+              | None -> Datatypes.typ types ~at:field.field_at field.field_value
+              | Some resource ->
+                  Ok
+                    (R.Type.named ~loc:l
+                       (qualified_name ~loc:l resource.resource_backend)
+                       [])
+              end
+          | Some owner ->
+              begin match
+                List.find source.proof_resources ~f:(fun resource ->
+                    Path.same owner resource.resource_path
+                    || Path.same owner (Path.Pident resource.resource_id))
+              with
+              | None -> error field.field_at "Unknown resource algebra for field"
+              | Some resource ->
+                  let private_representation =
+                    resource.resource_definition
+                    && Option.exists resource.resource_representation ~f:(fun rep ->
+                        same_named_type field.field_value rep)
+                  in
+                  let* backend =
+                    if private_representation then
+                      match implementation resource with
+                      | Some backend -> Ok backend
+                      | None ->
+                          error field.field_at "Missing resource algebra implementation"
+                    else Ok resource.resource_backend
+                  in
+                  if resource.resource_is_ra then
+                    Ok (R.Type.named ~loc:l (qualified_name ~loc:l backend) [])
+                  else error field.field_at "The field resource is not a resource algebra"
+              end
+        in
         Ok
           (Datatypes.field_member ~ghost:true types ~loc:l (ghost_field_name field)
              value_type field.field_value))
@@ -13751,16 +14004,17 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     ( R.Program.make ~loc:start
         (Prelude.members
         @ (if shared.dynamic_indices then Indexed_initialization.members else [])
-        @ modules @ library_modules @ native_modules @ ghost_fields @ explicit_fields
+        @ modules @ library_modules @ native_modules @ definition_modules
+        @ deferred_resource_members @ ghost_fields @ explicit_fields
+        @ definition_proof_modules
         @ List.concat structure_member_lists
         @ List.concat_map pending_member_lists ~f:List.concat
         @ List.concat action_check_lists
         @ List.concat_map !pending_declarations ~f:snd
         @ ref_fields @ List.map !primitives ~f:snd
         @ List.map
-            (logical_members @ pred_members
-            @ List.map (owned None pure_funcs) ~f:snd
-            @ lemma_members)
+            (pred_members @ List.map (owned None pure_funcs) ~f:snd @ lemma_members)
             ~f:R.Member.callable
+        @ logical_members
         @ List.map (owned None procs) ~f:procedure_member),
       !origins )

@@ -1,0 +1,2 @@
+module Values = Option (struct type t = int end)
+module Invalid = Auth (Values)

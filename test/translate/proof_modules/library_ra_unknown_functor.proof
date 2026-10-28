@@ -1,0 +1,1 @@
+module Unknown = NoSuchFunctor (struct type t = int end)

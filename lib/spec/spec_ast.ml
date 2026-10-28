@@ -172,7 +172,9 @@ type return_adapter = {
   returns_body : proof_expr;
 }
 
-type resource_kind = Resource_set of pty | Resource_auth of qualid
+type proof_module_argument =
+  | Proof_type_argument of pty
+  | Proof_module_argument of qualid
 
 type proof_module_parameter =
   | Proof_named_parameter of id * qualid
@@ -186,9 +188,19 @@ type proof_decl =
       module_declarations : proof_decl list;
       module_loc : Location.t;
     }
+  | Proof_definition of {
+      module_name : id;
+      module_interface : qualid;
+      module_declarations : proof_decl list;
+      module_loc : Location.t;
+    }
   | Proof_predicate of predicate
   | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
-  | Proof_resource of { resource_name : id; resource_kind : resource_kind }
+  | Proof_resource of {
+      resource_name : id;
+      resource_functor : qualid;
+      resource_arguments : proof_module_argument list;
+    }
   | Proof_au of { au_name : id; au_operation : qualid }
   | Proof_field of { field_name : id; field_type : pty }
   | Proof_function of {

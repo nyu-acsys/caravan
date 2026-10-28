@@ -18,6 +18,7 @@ let text doc = Format_doc.asprintf "%a" Format_doc.pp_doc doc
 
 (** The error the compiler's front end reports with [exn], if it is one. *)
 let of_exn (exn : exn) : error option =
+  let exn = Compiler_types.diagnostic_exception exn in
   let kind = match exn with Syntaxerr.Error _ | Lexer.Error _ -> Syntax | _ -> Type in
   match Location.error_of_exn exn with
   | Some (`Ok report) ->

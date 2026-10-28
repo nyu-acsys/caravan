@@ -30,7 +30,7 @@ instances must be declared before use.
   [Error] File "authorities_forward.proof", line 1, columns 26-31:
   1 | module Facts_auth = Auth (Facts)
                                 ^^^^^
-  Type Error: Auth requires a previously declared resource module.
+  Type Error: The proof module argument is not declared.
   [1]
 
 Pure logical definitions cannot read ownership or assume recursive equations.

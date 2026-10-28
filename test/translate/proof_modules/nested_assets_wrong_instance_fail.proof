@@ -22,7 +22,7 @@ module Outer = struct
     type witness = Witness of A.fact
     module Qualified = Auth (A.Facts)
     module Alias_qualified = Auth (Alias.Facts)
-    module Sibling = SetRA (struct type t = A.fact end)
+    module Sibling = SetRA (struct type t = bool end)
     module Sibling_authority = Auth (Sibling)
 
     lemma incompatible (cell : Ghost.t)

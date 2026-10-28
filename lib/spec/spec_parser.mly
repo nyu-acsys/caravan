@@ -215,6 +215,15 @@ proof:
 | ds = proof_decl* EOF { ds }
 ;
 
+proof_module_argument:
+| LEFTPAR STRUCT TYPE t = lident EQUAL ty = typ END RIGHTPAR
+    { if t.pid_str <> "t" then
+        raise (Syntax_error (t.pid_loc, "A type argument must define type t"));
+      Proof_type_argument ty }
+| LEFTPAR a = uqualid RIGHTPAR
+    { Proof_module_argument a }
+;
+
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
 | MODULE n = uident EQUAL ds = proof_module_body
@@ -223,36 +232,39 @@ proof_decl:
 | MODULE n = uident ps = proof_module_parameter+ EQUAL ds = proof_module_body
     { Proof_module { module_name = n; module_parameters = ps;
         module_declarations = ds; module_loc = mk_loc $loc } }
-| MODULE n = uident EQUAL ghost = uident DOT au = uident LEFTPAR STRUCT
+| MODULE n = uident COLON interface = uqualid EQUAL ds = proof_module_body
+    { Proof_definition { module_name = n; module_interface = interface;
+        module_declarations = ds; module_loc = mk_loc $loc } }
+| MODULE n = uident EQUAL f = uqualid LEFTPAR STRUCT
     LET operation = lident EQUAL target = lqualid END RIGHTPAR
-    { if ghost.pid_str <> "Ghost" || au.pid_str <> "AU" then
-        raise (Syntax_error (mk_loc $loc(ghost), "Expected Ghost.AU"));
+    { begin match f with
+      | Qdot (Qid ghost, au) when ghost.pid_str = "Ghost" && au.pid_str = "AU" -> ()
+      | _ -> raise (Syntax_error (qualid_loc f, "Expected Ghost.AU"))
+      end;
       if operation.pid_str <> "operation" then
         raise (Syntax_error (operation.pid_loc, "An AU argument must define operation"));
       Proof_au { au_name = n; au_operation = target } }
-| MODULE n = uident EQUAL f = uident LEFTPAR STRUCT TYPE t = lident
-    EQUAL ty = typ END RIGHTPAR
-    { if f.pid_str <> "SetRA" then
-        raise (Syntax_error (f.pid_loc, "Unsupported resource functor: " ^ f.pid_str));
-      if t.pid_str <> "t" then
-        raise (Syntax_error (t.pid_loc, "A SetRA argument must define type t"));
-      Proof_resource { resource_name = n; resource_kind = Resource_set ty } }
-| MODULE n = uident EQUAL f = uident LEFTPAR a = uqualid RIGHTPAR
-    { if f.pid_str <> "Auth" then
-        raise (Syntax_error (f.pid_loc, "Unsupported resource functor: " ^ f.pid_str));
-      Proof_resource { resource_name = n; resource_kind = Resource_auth a } }
-| LET n = lident COLON ty = typ EQUAL init = lqualid LEFTPAR RIGHTPAR
-    { begin match ty, init with
-      | PTtyapp (Qdot (Qid m, field), [_; _]), Qdot (Qid im, make)
-        when m.pid_str = "Ghost" && field.pid_str = "field"
-          && im.pid_str = "Ghost" && make.pid_str = "field" -> ()
-      | _ -> raise (Syntax_error (n.pid_loc,
-          "A ghost field declaration requires (owner, value) Ghost.field = Ghost.field ()"))
-      end;
-      Proof_field { field_name = n; field_type = ty } }
-| LET n = lident ps = pred_param+ COLON ty = typ EQUAL body = term
-    { Proof_function { function_name = n; function_params = ps;
-        function_result = ty; function_body = body } }
+| MODULE n = uident EQUAL f = uqualid args = proof_module_argument*
+    { Proof_resource { resource_name = n; resource_functor = f; resource_arguments = args } }
+| LET n = lident ps = pred_param* COLON ty = typ EQUAL body = term
+    { let field_type = match ty with
+        | PTtyapp (Qdot (Qid m, field), [_; _])
+          when m.pid_str = "Ghost" && field.pid_str = "field" -> true
+        | _ -> false
+      in
+      let field_init = match body.term_desc with
+        | Tapply ({term_desc = Tvar (Qdot (Qid m, f)); _}, {term_desc = Ttuple []; _})
+          when m.pid_str = "Ghost" && f.pid_str = "field" -> true
+        | _ -> false
+      in
+      if ps = [] && (field_type || field_init) then begin
+        if not (field_type && field_init) then
+          raise (Syntax_error (n.pid_loc,
+            "A ghost field declaration requires (owner, value) Ghost.field = Ghost.field ()"));
+        Proof_field { field_name = n; field_type = ty }
+      end else
+        Proof_function { function_name = n; function_params = ps;
+          function_result = ty; function_body = body } }
 | LEMMA n = lident ps = lemma_param* rs = lemma_returns?
     cs = lemma_clause* EQUAL body = proof_expr
     { let requires, ensures, variant =

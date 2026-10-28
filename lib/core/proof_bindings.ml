@@ -77,7 +77,8 @@ let functor_ancestor scopes scope =
       && not (List.is_empty ancestor.parameters))
 
 let contains (outer : Location.t) (inner : Location.t) =
-  outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
+  String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
+  && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
 
 let scope_for_namespace t namespace =
@@ -138,7 +139,7 @@ let exported inventory source scope name kind =
     relevant_constraints inventory.Module_inventory.constraints source.Source.proof_scopes
       scope
   in
-  if Option.is_some template then false
+  if Option.is_some template || Option.is_some scope.Proof_scopes.definition then false
   else
     match kind with
     | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
@@ -420,11 +421,12 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       | None ->
           Error (Report.error Type entry.name.pid_loc "Missing elaborated AU facade")
       end
-  | Proof_module _ | Proof_type _ ->
+  | Proof_module _ | Proof_definition _ | Proof_type _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
            | Proof_type _ -> "type"
+           | Proof_definition _ -> "definition"
            | Proof_resource _ -> "resource"
            | Proof_au _ -> "atomic update"
            | Proof_field _ -> "field"
@@ -466,7 +468,10 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
         Option.is_some entry.Proof_scopes.scope.owner
-        && match entry.declaration with S.Proof_type _ -> false | _ -> true)
+        &&
+        match entry.declaration with
+        | S.Proof_type _ | S.Proof_definition _ -> false
+        | _ -> true)
   in
   let* () =
     List.fold_result entries ~init:[] ~f:(fun previous entry ->
