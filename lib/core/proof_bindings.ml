@@ -495,7 +495,8 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
           | None -> Ok ()
           | Some ancestor ->
               begin match (ancestor.parameters, entry.declaration) with
-              | [ Named (Some _, _, _) ], (S.Proof_predicate _ | Proof_lemma _)
+              | ( [ Named (Some _, _, _) ],
+                  (S.Proof_predicate _ | Proof_lemma _ | Proof_function _) )
                 when same_owner ancestor.owner scope.owner ->
                   Ok ()
               | _ ->

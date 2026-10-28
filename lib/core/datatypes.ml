@@ -486,7 +486,7 @@ let rec immediate (types : t list) (t : Types.type_expr) =
   | Tconstr (p, [], _) ->
       begin match find types p with
       | Some { heap = Some _; _ } -> true
-      | Some { id = Some _; ctors; _ } ->
+      | Some { ctors = _ :: _ as ctors; _ } ->
           List.for_all ctors ~f:(fun c -> List.is_empty c.args)
       | _ -> false
       end
@@ -505,8 +505,8 @@ let has_refs (types : t list) (t : Types.type_expr) =
         match find types p with
         | Some { heap = Some _; _ } -> true
         | Some { library = Some _; _ } -> true
-        | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same) ->
-            List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (id :: seen)))
+        | Some d when not (List.mem seen p ~equal:Path.same) ->
+            List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (p :: seen)))
         | _ -> false
       end
     | Ttuple components -> List.exists components ~f:(fun (_, t) -> go seen t)

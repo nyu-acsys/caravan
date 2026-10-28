@@ -103,7 +103,7 @@ let contains layouts data =
   List.exists layouts ~f:(fun entry -> same_type entry.concrete data)
 
 (** A declaration can precede its users once every required layout has been emitted. *)
-let type_dependencies layouts types =
+let type_dependencies ?(additional = fun _ -> []) layouts types =
   let rec collect seen t =
     match Datatypes.desc types t with
     | Types.Tconstr (path, args, _) ->
@@ -118,7 +118,7 @@ let type_dependencies layouts types =
                     Option.some_if (same_type entry.concrete d)
                       (owner layouts entry).layout)
               in
-              own @ arguments
+              own @ additional d @ arguments
               @ List.concat_map d.ctors ~f:(fun c ->
                   List.concat_map c.args ~f:(collect (d.module_name :: seen)))
           | _ -> arguments
@@ -129,7 +129,7 @@ let type_dependencies layouts types =
   in
   collect []
 
-let dependencies layouts types data =
-  let collect = type_dependencies layouts types in
+let dependencies ?additional layouts types data =
+  let collect = type_dependencies ?additional layouts types in
   List.concat_map data.Datatypes.ctors ~f:(fun c -> List.concat_map c.args ~f:collect)
   @ List.concat_map (Option.value data.heap ~default:[]) ~f:(fun f -> collect f.typ)

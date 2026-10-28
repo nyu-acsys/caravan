@@ -1,0 +1,9 @@
+module Static = struct
+  type model = Empty | Item of t
+  let payload (value : t) : model = Item value
+end
+
+module Make (Cell : CELL) = struct
+  type model = Empty | Item of t
+  let payload (value : t) : model = Item value
+end

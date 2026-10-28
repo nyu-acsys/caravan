@@ -9882,7 +9882,11 @@ let logical_contract = function
       c.atomic || not (List.is_empty (c.atomic_requires @ c.atomic_ensures))
 
 let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
-  let groups = Generic_modules.plan ~fresh inventory.Module_inventory.specializations in
+  let groups =
+    Generic_modules.plan
+      ~proof_layout:(Generic_proofs.has_models source)
+      ~fresh inventory.Module_inventory.specializations
+  in
   let annotations = Annotation.of_comments source.comments in
   let rec field_term (term : S.term) =
     match term.term_desc with
@@ -10658,6 +10662,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           unsupported binding.entry.name.pid_loc
             "A functor proof without a supported generic runtime body and application")
   in
+  let* _ =
+    all source.proof_types ~f:(fun data ->
+        match Generic_proofs.model_owner source data with
+        | Some scope
+          when Option.is_some (Proof_bindings.functor_ancestor source.proof_scopes scope)
+               && Option.is_none (Generic_proofs.owner generic_proofs (Some scope)) ->
+            unsupported data.Datatypes.at
+              "A functor proof without a supported generic runtime body and application"
+        | Some _ | None -> Ok ())
+  in
   let proof_owner name =
     Option.bind (scoped_binding name) ~f:(fun binding ->
         Generic_proofs.owner generic_proofs (Some binding.entry.scope))
@@ -10836,13 +10850,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
              ~at:au.au_at)
           au.au_token_paths)
   in
-  let data_types = types in
+  let generic_models = Generic_proofs.model_types source inventory generic_proofs in
+  let generic_model data =
+    List.exists generic_proofs ~f:(fun plan ->
+        List.exists (Generic_proofs.models source plan) ~f:(fun model ->
+            Poly.equal model.Datatypes.at data.Datatypes.at))
+  in
+  let data_types = List.filter types ~f:(fun data -> not (generic_model data)) in
   let resource_types =
     List.concat_map source.proof_resources ~f:(fun r ->
         r.Source.resource_descriptor :: r.resource_aliases)
   in
   let types =
-    generic_proof_types @ types @ resource_types @ token_types @ source.logical_types
+    generic_models @ generic_proof_types @ types @ resource_types @ token_types
+    @ source.logical_types
     @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
   (* Each data type's module, given the ones declared before it; a record type that is a
@@ -10857,7 +10878,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~f:(fun (before, d) ->
         let* member =
           Datatypes.member
-            (before @ resource_types @ token_types @ source.logical_types)
+            (generic_proof_types @ generic_models @ before @ resource_types @ token_types
+           @ source.logical_types)
             d
         in
         Ok (d.Datatypes.module_name, member))
@@ -10924,7 +10946,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let* t =
           Source.ocaml_type resource.resource_environment ~at:resource.resource_at elt
         in
-        Ok (Result_layouts.type_dependencies layouts types t)
+        Ok
+          (Result_layouts.type_dependencies
+             ~additional:(Generic_proofs.layout_dependencies generic_proofs)
+             layouts types t)
     | Resource_auth _ -> (
         if List.mem seen resource.resource_id ~equal:Ident.same then Ok []
         else
@@ -10950,7 +10975,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 List.find_exn data_types ~f:(fun d ->
                     String.equal d.Datatypes.module_name source_name)
               in
-              Ok (Result_layouts.dependencies layouts types data)
+              Ok
+                (Result_layouts.dependencies
+                   ~additional:(Generic_proofs.layout_dependencies generic_proofs)
+                   layouts types data)
           | None ->
               let resource_name =
                 fst
@@ -10970,7 +10998,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       (List.filter types ~f:(fun d -> not (Result_layouts.contains layouts d)))
       ~f:(fun d ->
         let* fields = Datatypes.fields ~declarations:[ d ] types in
-        Ok (Result_layouts.dependencies layouts types d, fields))
+        Ok
+          ( Result_layouts.dependencies
+              ~additional:(Generic_proofs.layout_dependencies generic_proofs)
+              layouts types d,
+            fields ))
   in
   let pending_declarations = ref (module_declarations @ field_declarations) in
   let available_layouts = ref [] in
@@ -11436,7 +11468,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       canonical_path = Proof_bindings.canonical_owner scoped_proofs;
       logical_functions;
       mathematical_types =
-        source.proof_types @ source.logical_types @ resource_types @ token_types;
+        generic_models @ source.proof_types @ source.logical_types @ resource_types
+        @ token_types;
       predicate_inputs;
       proof_key =
         (fun environment q ->
@@ -11630,6 +11663,36 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             (List.Assoc.find scoped_inputs view.source.backend ~equal:String.equal)
             ~f:(fun count -> (view.key, count)))
     in
+    let application_functions =
+      List.filter_map application_views ~f:(fun view ->
+          match view.source.kind with
+          | Function _ ->
+              Option.map
+                (List.Assoc.find all_logical_functions view.source.backend
+                   ~equal:String.equal) ~f:(fun signature ->
+                  let inputs, outputs =
+                    List.split_n view.types (List.length signature.lemma_inputs)
+                  in
+                  ( view.key,
+                    {
+                      signature with
+                      lemma_raven = view.backend;
+                      lemma_inputs = List.map inputs ~f:project;
+                      lemma_outputs = List.map outputs ~f:project;
+                    } ))
+          | _ -> None)
+    in
+    let proof_support =
+      {
+        proof_support with
+        logical_functions = application_functions @ proof_support.logical_functions;
+      }
+    in
+    let spec_funcs =
+      List.map application_functions ~f:(fun (key, signature) ->
+          (key, signature.lemma_raven))
+      @ spec_funcs
+    in
     let preds = application_preds @ preds in
     let spec_funcs =
       List.map application_preds ~f:(fun (key, (backend, _)) -> (key, backend))
@@ -11752,6 +11815,15 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       {
         support with
         predicate_views;
+        logical_functions =
+          List.map support.logical_functions ~f:(fun (key, signature) ->
+              ( key,
+                {
+                  signature with
+                  lemma_raven = target signature.lemma_raven;
+                  lemma_inputs = List.map signature.lemma_inputs ~f:project;
+                  lemma_outputs = List.map signature.lemma_outputs ~f:project;
+                } ));
         predicate_inputs =
           List.map parameters ~f:(fun (_, key, _, inputs) -> (key, inputs))
           @ support.predicate_inputs;
@@ -13170,14 +13242,29 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let declaration_name = (Proof_scopes.name declaration).pid_str in
         let scope = declaration_scope declaration_name in
         let preds, spec_funcs, proof_support =
-          proof_context scope preds spec_funcs proof_support
+          proof_context_for ~preds ~spec_funcs ~proof_support declaration_name
         in
         let previous =
           List.map (List.take logical_declarations i) ~f:(fun declaration ->
               (Proof_scopes.name declaration).pid_str)
         in
+        let implementation_key backend =
+          Option.value
+            (List.find_map scoped_proofs.applications ~f:(fun view ->
+                 Option.some_if (String.equal view.backend backend) view.source.backend))
+            ~default:
+              (Option.value
+                 (List.find_map scoped_proofs.bindings ~f:(fun binding ->
+                      Option.bind (proof_owner binding.backend) ~f:(fun plan ->
+                          Option.some_if
+                            (String.equal
+                               (Generic_proofs.member plan binding.backend)
+                               backend)
+                            binding.backend)))
+                 ~default:backend)
+        in
         let available signature =
-          List.mem previous signature.lemma_raven ~equal:String.equal
+          List.mem previous (implementation_key signature.lemma_raven) ~equal:String.equal
         in
         let logical_functions =
           List.filter proof_support.logical_functions ~f:(fun (_, signature) ->
@@ -13431,7 +13518,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       (List.map lemma_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
       lemma_members
   in
-  let proof_members = predicate_members @ proof_lemma_members in
+  let logical_members =
+    List.zip_exn
+      (List.map logical_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
+      logical_members
+  in
+  let proof_members = predicate_members @ proof_lemma_members @ logical_members in
   let owned_proofs group =
     List.filter_map proof_members ~f:(fun (name, member) ->
         Option.bind (proof_owner name) ~f:(fun plan ->
@@ -13445,6 +13537,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let lemma_members =
     List.filter_map proof_lemma_members ~f:(fun (name, member) ->
+        Option.some_if (Option.is_none (proof_owner name)) member)
+  in
+  let logical_members =
+    List.filter_map logical_members ~f:(fun (name, member) ->
         Option.some_if (Option.is_none (proof_owner name)) member)
   in
   let* generic_implementations =
@@ -13474,8 +13570,23 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             let* layout_types =
               Result_layouts.symbolic layouts group ~owner:[ world; "Shape" ]
             in
+            let proof_plan =
+              List.find generic_proofs ~f:(fun plan ->
+                  phys_equal plan.Generic_proofs.group group)
+            in
+            let model_types =
+              Option.value_map proof_plan ~default:[] ~f:(fun plan ->
+                  Generic_proofs.symbolic_models source plan ~owner:[ world; "Shape" ])
+            in
+            let parameter_types =
+              Option.value_map proof_plan ~default:[] ~f:(fun plan ->
+                  Generic_proofs.parameter_types plan ~owner:[ world ])
+            in
+            let layout_types = layout_types @ model_types in
             let environment =
-              layout_types @ Generic_modules.types group ~owner:[ world ] @ types
+              layout_types @ parameter_types
+              @ Generic_modules.types group ~owner:[ world ]
+              @ types
             in
             let* data_members =
               all

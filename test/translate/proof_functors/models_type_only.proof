@@ -1,0 +1,11 @@
+module Make (Cell : CELL) = struct
+  type model = Empty | Item of Cell.t
+end
+
+lemma first_item (cell : First.t)
+  ensures (First.Item cell = Alias.Item cell) =
+  let (value : First.model) = First.Item cell in
+  match value with First.Empty -> () | First.Item _ -> ()
+
+lemma second_item (cell : Second.t)
+  ensures (Second.Item cell = Second.Item cell) = ()

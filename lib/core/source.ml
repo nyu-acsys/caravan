@@ -130,6 +130,14 @@ let source_module_ids (structure : Typedtree.structure) =
           List.filter_map declarations ~f:(fun declaration -> declaration.mb_id)
       | _ -> [])
 
+let source_type_ids (structure : Typedtree.structure) =
+  List.concat_map structure.str_items ~f:(fun item ->
+      match item.str_desc with
+      | Tstr_type (_, declarations) ->
+          List.map declarations ~f:(fun declaration ->
+              (declaration.typ_id, declaration.typ_name.txt))
+      | _ -> [])
+
 let add_spec_bindings ?(source_modules = []) spec_bindings lexical_env =
   let find lookup id =
     try Some (lookup (Longident.Lident (Ident.name id)) lexical_env)
@@ -191,6 +199,40 @@ let annotation_env ?at source lexical_env =
     outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
     && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
   in
+  let same_declaration a b = (not (Poly.equal a Location.none)) && Poly.equal a b in
+  let previous_summary = function
+    | Env.Env_empty -> None
+    | Env_value (previous, _, _)
+    | Env_type (previous, _, _)
+    | Env_module (previous, _, _, _)
+    | Env_modtype (previous, _, _)
+    | Env_extension (previous, _, _)
+    | Env_class (previous, _, _)
+    | Env_cltype (previous, _, _)
+    | Env_open (previous, _)
+    | Env_not_aliasable (previous, _)
+    | Env_constraints (previous, _)
+    | Env_copy_types previous
+    | Env_persistent (previous, _)
+    | Env_value_unbound (previous, _, _)
+    | Env_module_unbound (previous, _, _) ->
+        Some previous
+  in
+  let rec matching_module name loc (summary : Env.summary) =
+    match summary with
+    | Env_module (_, id, _, declaration)
+      when String.equal (Ident.name id) name && same_declaration loc declaration.md_loc ->
+        Some (Path.Pident id)
+    | _ -> Option.bind (previous_summary summary) ~f:(matching_module name loc)
+  in
+  let rec matching_type name loc (summary : Env.summary) =
+    match summary with
+    | Env_type (_, id, declaration)
+      when String.equal (Ident.name id) name && same_declaration loc declaration.type_loc
+      ->
+        Some (Path.Pident id)
+    | _ -> Option.bind (previous_summary summary) ~f:(matching_type name loc)
+  in
   match at with
   | None -> env
   | Some at ->
@@ -205,6 +247,59 @@ let annotation_env ?at source lexical_env =
       Option.value_map scope ~default:env ~f:(fun scope ->
           let bindings =
             specification_bindings scope.structure.str_final_env scope.environment
+          in
+          let parameter_projection =
+            match scope.parameters with
+            | [ Named (Some parameter, _, _) ] ->
+                begin try
+                  let original =
+                    Env.find_module (Pident parameter) scope.structure.str_final_env
+                  in
+                  Option.bind
+                    (matching_module (Ident.name parameter) original.md_loc
+                       (Env.summary lexical_env))
+                    ~f:(fun path ->
+                      Option.some_if
+                        (not (Path.same path (Pident parameter)))
+                        (parameter, path))
+                with Stdlib.Not_found -> None
+                end
+            | _ -> None
+          in
+          let substitution, changed =
+            match parameter_projection with
+            | None -> (Subst.identity, false)
+            | Some (parameter, path) ->
+                let substitution = Subst.add_module parameter path Subst.identity in
+                List.fold (source_type_ids scope.structure) ~init:(substitution, true)
+                  ~f:(fun (substitution, changed) (id, name) ->
+                    try
+                      let original =
+                        Env.find_type (Pident id) scope.structure.str_final_env
+                      in
+                      begin match
+                        matching_type name original.type_loc (Env.summary lexical_env)
+                      with
+                      | Some path when not (Path.same path (Pident id)) ->
+                          (Subst.add_type id path substitution, true)
+                      | Some _ | None -> (substitution, changed)
+                      end
+                    with Stdlib.Not_found -> (substitution, changed))
+          in
+          let bindings =
+            if not changed then bindings
+            else
+              List.map bindings ~f:(function
+                | Types.Sig_type (id, declaration, rec_status, visibility) ->
+                    Types.Sig_type
+                      ( id,
+                        Subst.type_declaration substitution declaration,
+                        rec_status,
+                        visibility )
+                | Sig_value (id, description, visibility) ->
+                    Sig_value
+                      (id, Subst.value_description substitution description, visibility)
+                | item -> item)
           in
           add_spec_bindings ~source_modules bindings env)
 
@@ -1077,13 +1172,30 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                   Some entry.declaration
               | _ -> None)
         in
-        let under_functor =
-          List.exists scopes.scopes ~f:(fun ancestor ->
+        let functor_ancestor =
+          List.find scopes.scopes ~f:(fun ancestor ->
               prefix ancestor.Proof_scopes.namespace scope.namespace
               && not (List.is_empty ancestor.parameters))
         in
+        let allowed_functor_proof =
+          match functor_ancestor with
+          | Some ancestor
+            when Option.equal Ident.same ancestor.declaration_id scope.declaration_id ->
+              begin match ancestor.parameters with
+              | [ Named (Some _, _, _) ] ->
+                  List.for_all proof ~f:(function
+                    | S.Proof_type _ | Proof_function _ -> true
+                    | _ -> false)
+              | _ -> false
+              end
+          | Some _ | None -> false
+        in
         let* () =
-          if List.is_empty proof || not under_functor then Ok ()
+          if
+            List.is_empty proof
+            || Option.is_none functor_ancestor
+            || allowed_functor_proof
+          then Ok ()
           else
             Report.unsupported
               (Option.value scope.proof_location ~default:scope.source_location)
@@ -1260,18 +1372,45 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                       declaration with
                       md_type = Mty_signature (extend_signature body rest bindings);
                     }
+                | Mty_functor (parameter, Mty_signature body) when List.is_empty rest ->
+                    {
+                      declaration with
+                      md_type = Mty_functor (parameter, Mty_signature (body @ bindings));
+                    }
                 | Mty_ident _ | Mty_functor _ | Mty_alias _ -> declaration
               in
               Types.Sig_module (found, presence, declaration, rec_status, visibility)
           | item -> item)
     | (_, None, _) :: _ -> signature
   in
+  let public_functor_result scope =
+    let rec result (expression : Typedtree.module_expr) =
+      match expression.mod_desc with
+      | Tmod_functor (_, body) | Tmod_constraint (body, _, Tmodtype_implicit, _) ->
+          result body
+      | Tmod_structure _ -> true
+      | Tmod_constraint (_, _, Tmodtype_explicit _, _) -> false
+      | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ -> false
+    in
+    let parent =
+      Option.value_map scope.Proof_scopes.parent ~default:scopes.root.structure
+        ~f:(fun path ->
+          Option.value_map (Proof_scopes.find_owner scopes (Some path))
+            ~default:scopes.root.structure ~f:(fun scope -> scope.structure))
+    in
+    List.exists parent.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_module { mb_id = Some id; mb_expr; _ } ->
+            Option.exists scope.declaration_id ~f:(Ident.same id) && result mb_expr
+        | _ -> false)
+  in
   let qualified_env =
     List.fold typed ~init:root_env ~f:(fun env (scope, _, bindings) ->
         match module_chain scope with
         | Some ((name, Some id, _) :: rest as chain)
           when (not (List.is_empty bindings))
-               && List.for_all chain ~f:(fun (_, _, sealed) -> not sealed) ->
+               && List.for_all chain ~f:(fun (_, _, sealed) -> not sealed)
+               && (List.is_empty scope.parameters || public_functor_result scope) ->
             begin match Env.find_module_by_name (Lident name) env with
             | Pident found, declaration when Ident.same found id ->
                 begin match declaration.md_type with
@@ -1280,11 +1419,126 @@ let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
                     Env.add_module_declaration ~check:false id Mp_present
                       { declaration with md_type = Mty_signature signature }
                       env
+                | Mty_functor (parameter, Mty_signature body) when List.is_empty rest ->
+                    Env.add_module_declaration ~check:false id Mp_present
+                      {
+                        declaration with
+                        md_type = Mty_functor (parameter, Mty_signature (body @ bindings));
+                      }
+                      env
                 | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
                 end
             | _ -> env
             end
         | _ -> env)
+  in
+  let module_path expression =
+    let rec path (expression : Typedtree.module_expr) =
+      match expression.mod_desc with
+      | Tmod_ident (path, _) -> Some path
+      | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> path inner
+      | Tmod_structure _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _
+      | Tmod_unpack _
+      | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
+          None
+    in
+    path expression
+  in
+  let application expression =
+    let rec applied (expression : Typedtree.module_expr) =
+      match expression.mod_desc with
+      | Tmod_apply (functor_expression, argument_expression, _) ->
+          Option.both (module_path functor_expression) (module_path argument_expression)
+      | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> applied inner
+      | Tmod_ident _ | Tmod_structure _ | Tmod_functor _ | Tmod_apply_unit _
+      | Tmod_unpack _
+      | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
+          None
+    in
+    applied expression
+  in
+  let rec applications chain (structure : Typedtree.structure) =
+    List.concat_map structure.str_items ~f:(fun item ->
+        match item.str_desc with
+        | Tstr_module { mb_id = Some id; mb_name = { txt = Some name; _ }; mb_expr; _ } ->
+            let chain = chain @ [ (name, Some id, false) ] in
+            let own =
+              Option.to_list
+                (Option.map (application mb_expr) ~f:(fun app -> (chain, app)))
+            in
+            let rec nested (expression : Typedtree.module_expr) =
+              match expression.mod_desc with
+              | Tmod_structure structure -> applications chain structure
+              | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> nested inner
+              | Tmod_ident _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _
+              | Tmod_unpack _
+              | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
+                  []
+            in
+            own @ nested mb_expr
+        | _ -> [])
+  in
+  let qualified_env =
+    List.fold (applications [] scopes.root.structure) ~init:qualified_env
+      ~f:(fun env (chain, (functor_path, argument_path)) ->
+        let normalized =
+          Env.normalize_module_path None env functor_path
+          |> Proof_scopes.canonical_owner scopes
+        in
+        let template =
+          List.find typed ~f:(fun (scope, _, bindings) ->
+              (not (List.is_empty bindings))
+              && Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
+              && public_functor_result scope
+              &&
+              match scope.parameters with
+              | [ Named (Some _, _, _) ] -> true
+              | _ -> false)
+        in
+        begin match template with
+        | None -> env
+        | Some (scope, _, bindings) ->
+            begin match scope.parameters with
+            | [ Named (Some parameter, _, _) ] ->
+                let identity = Path.Papply (functor_path, argument_path) in
+                let substitution =
+                  Subst.add_module parameter argument_path Subst.identity
+                in
+                let substitution =
+                  List.fold (source_type_ids scope.structure) ~init:substitution
+                    ~f:(fun substitution (id, name) ->
+                      Subst.add_type id (Path.Pdot (identity, name)) substitution)
+                in
+                let bindings = Subst.signature Keep substitution bindings in
+                let bindings =
+                  match
+                    Mtype.strengthen ~aliasable:true env (Mty_signature bindings) identity
+                  with
+                  | Mty_signature bindings -> bindings
+                  | Mty_ident _ | Mty_functor _ | Mty_alias _ -> bindings
+                in
+                begin match chain with
+                | (root_name, Some root_id, _) :: rest ->
+                    begin match Env.find_module_by_name (Lident root_name) env with
+                    | Pident found, declaration when Ident.same found root_id ->
+                        begin match declaration.md_type with
+                        | Mty_signature signature ->
+                            Env.add_module_declaration ~check:false root_id Mp_present
+                              {
+                                declaration with
+                                md_type =
+                                  Mty_signature (extend_signature signature rest bindings);
+                              }
+                              env
+                        | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
+                        end
+                    | _ -> env
+                    end
+                | _ -> env
+                end
+            | _ -> env
+            end
+        end)
   in
   let qualified_env =
     List.fold aliases ~init:qualified_env ~f:(fun env (alias, _) ->

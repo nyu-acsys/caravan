@@ -33,8 +33,10 @@ Module signatures expose abstract resource contracts while hiding their definiti
 and implementation lemmas. Aliases preserve resource identity. AU facades can be
 scoped to source modules, with qualified operation and token names. State records,
 views and actions also support static module scopes. Supported named single-parameter
-functors can contain predicates and lemmas used by manual scopes and clients of
-applied result modules; these proofs are verified once in a shared Raven functor.
+functors can contain logical datatypes, pure functions, predicates and lemmas used
+by manual scopes and clients of applied result modules. Their definitions and proofs
+are translated once in a shared Raven functor, with shared result layouts for
+applicative model types.
 Aliases preserve proof member identity, while result signatures expose declared
 predicates opaquely and hide implementation lemmas. Other functor-owned proof
 declarations are not supported yet.

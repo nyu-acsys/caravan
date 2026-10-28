@@ -22,3 +22,9 @@
  (name proof_scopes)
  (modules proof_scopes)
  (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
+ (name annotation_env)
+ (modules annotation_env)
+ (libraries base caravan_core compiler-libs.common)
+ (deps annotation_env_fixture.ml annotation_env_fixture.proof))

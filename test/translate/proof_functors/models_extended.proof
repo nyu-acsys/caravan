@@ -1,0 +1,38 @@
+module Make (Cell : CELL) = struct
+  type model = Empty | Item of Cell.t
+  type chain = End | Link of Cell.t * chain
+
+  let singleton (cell : Cell.t) : model = Item cell
+
+  let head_or (fallback : Cell.t) (value : chain) : Cell.t =
+    match value with End -> fallback | Link (cell, _) -> cell
+
+  lemma head_link (cell : Cell.t)
+    ensures (head_or cell (Link (cell, End)) === cell) = ()
+end
+
+type packed = Pack of First.model
+
+let unpack (value : packed) : First.model =
+  match value with Pack model -> model
+
+lemma first_alias (cell : First.t)
+  ensures (unpack (Pack (Alias.singleton cell)) = First.singleton cell) = ()
+
+lemma repeated_alias (cell : First.t)
+  ensures (Repeated.singleton cell = Via_alias.singleton cell) = ()
+
+lemma nested_application (cell : First.t)
+  ensures (Group.Nested.singleton cell = First.singleton cell) = ()
+
+lemma recursive_model (cell : First.t)
+  ensures (First.head_or cell (First.Link (cell, First.End)) === cell) =
+  First.head_link cell
+
+lemma nested_chain (cell : First.t)
+  ensures (Group.Nested.head_or cell (Group.Nested.Link (cell, Group.Nested.End)) === cell) =
+  Group.Nested.head_link cell
+
+lemma second_model (cell : Second.t)
+  ensures (Second.head_or cell (Second.Link (cell, Second.End)) === cell) =
+  Second.head_link cell

@@ -95,7 +95,7 @@ let eligible (source : Module_inventory.specialization) =
   in
   (not (List.is_empty source.members)) && abstract_types && body
 
-let plan ~fresh sources =
+let plan ?(proof_layout = fun _ -> false) ~fresh sources =
   let application source =
     { source; name = fresh "Applied"; world = fresh "Selected"; layout = fresh "Layout" }
   in
@@ -119,7 +119,11 @@ let plan ~fresh sources =
               in
               (member, fresh (label ^ "_" ^ stem)))
         in
-        let world = Option.some_if (has_layout source) (fresh ("World_" ^ prefix)) in
+        let world =
+          Option.some_if
+            (has_layout source || proof_layout source)
+            (fresh ("World_" ^ prefix))
+        in
         let qualify leaf =
           Option.value_map world ~default:leaf ~f:(fun world -> world ^ "." ^ leaf)
         in
