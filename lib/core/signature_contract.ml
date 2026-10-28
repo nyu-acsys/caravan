@@ -334,14 +334,7 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
           match (expected, arguments, types) with
           | _, [], [] -> Ok ()
           | expected :: rest, argument :: arguments, actual :: types ->
-              let* contextual =
-                if list_literal argument then sequence_list expected else Ok None
-              in
-              let* () =
-                require ~at:argument.S.term_loc
-                  (Option.value contextual ~default:expected)
-                  actual
-              in
+              let* () = check_expected variables expected argument actual in
               consume rest arguments types
           | [], _ :: _, _ :: _ ->
               Error
@@ -486,6 +479,24 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
               in
               Ok (Some typ)
             else Ok result)
+  and check_expected variables expected (term : S.term) actual =
+    let* contextual = sequence_list expected in
+    match (contextual, (S.chain term).term_desc) with
+    | Some list_type, _ when list_literal term ->
+        require ~at:term.term_loc list_type actual
+    | ( Some _,
+        Tapply
+          ( {
+              term_desc =
+                Tapply ({ term_desc = Tvar (Qid { pid_str = "++"; _ }); _ }, left);
+              _;
+            },
+            right ) ) ->
+        let* left_type = walk variables left in
+        let* () = check_expected variables expected left left_type in
+        let* right_type = walk variables right in
+        check_expected variables expected right right_type
+    | _ -> require ~at:term.term_loc expected actual
   and walk variables (term : S.term) =
     match term.term_desc with
     | Ttrue | Tfalse -> Ok (Some Predef.type_bool)
@@ -610,18 +621,29 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                         (None, Option.value typ ~default:(Ctype.newvar ())))))))
     | Tattr (_, value) | Told value -> walk variables value
   in
+  let* variables =
+    List.fold_result
+      (Spec_arguments.predicate_parameters ~lookup:predicates
+         ~bound:(List.map variables ~f:fst) terms)
+      ~init:variables
+      ~f:(fun variables (id, typ) ->
+        match List.Assoc.find variables id.S.pid_str ~equal:String.equal with
+        | Some known ->
+            let* () = compatible ~at:id.pid_loc known typ in
+            Ok variables
+        | None
+          when Option.is_some (Source.value_path environment (S.Qid id))
+               || Source.logical_constructor (S.Qid id) ->
+            Ok variables
+        | None -> Ok ((id.pid_str, typ) :: variables))
+  in
   let variables = List.map variables ~f:(fun (name, typ) -> (name, Some typ)) in
   Result.map
     (Result.all
        (List.map terms ~f:(fun term ->
             let* typ = walk variables term in
             Option.value_map expected ~default:(Ok ()) ~f:(fun expected ->
-                let* contextual =
-                  if list_literal term then sequence_list expected else Ok None
-                in
-                require ~at:term.S.term_loc
-                  (Option.value contextual ~default:expected)
-                  typ))))
+                check_expected variables expected term typ))))
     ~f:(fun _ -> ())
 
 let expression ?(logical_types = []) ?predicates ~environment ~variables term =

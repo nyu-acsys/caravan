@@ -1,0 +1,6 @@
+module Impl = struct
+  let items : (int Atomic.t, int sequence) Ghost.field = Ghost.field ()
+
+  predicate contents (cell : int Atomic.t) (xs : int sequence) =
+    own (Ghost.at items cell) xs
+end

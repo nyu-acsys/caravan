@@ -1276,35 +1276,14 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     | None, (Tattr (_, t) | Tcast (t, _)) -> owned t
     | None, _ -> []
   in
-  (* The parameter types of the predicates that [t] passes names to. *)
-  let rec passed (t : S.term) =
-    let head, args = spine t [] in
-    let here =
-      match head.term_desc with
-      | Tvar q ->
-          begin match
-            List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal
-          with
-          | Some (_, types) when List.length args <= List.length types ->
-              List.filter_map
-                (List.zip_exn args (List.take types (List.length args)))
-                ~f:(fun ((a : S.term), t) ->
-                  match a.term_desc with
-                  | Tvar (Qid { pid_str = v; _ }) -> Some (v, t)
-                  | _ -> None)
-          | _ -> []
-          end
-      | _ -> []
-    in
-    here
-    @
-    match t.term_desc with
-    | Tapply (a, b) | Tinfix (a, _, b) -> passed a @ passed b
-    | Tif (a, b, c) -> passed a @ passed b @ passed c
-    | Tattr (_, t) | Tcast (t, _) -> passed t
-    | _ -> []
+  let passed =
+    Spec_arguments.predicate_parameters ~bound:[] terms ~lookup:(fun q ->
+        Option.map
+          (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+          ~f:snd)
+    |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
   in
-  let owned = List.concat_map terms ~f:owned @ List.concat_map terms ~f:passed in
+  let owned = List.concat_map terms ~f:owned @ passed in
   let* typed =
     all free ~f:(fun x ->
         match List.Assoc.find owned x ~equal:String.equal with
@@ -1940,14 +1919,30 @@ and typed_arguments env ~at inputs args =
     error at (Printf.sprintf "Expected %d arguments" (List.length inputs))
   else
     all (List.zip_exn inputs args) ~f:(fun (ty, value) ->
+        let sequence =
+          match Datatypes.desc env.data ty with
+          | Tconstr (path, [ _ ], _) ->
+              Option.exists (Datatypes.find env.data path) ~f:Datatypes.is_sequence
+          | _ -> false
+        in
         let* () =
-          Source.check_logical_expression ~is_list env.ctx.env
-            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
-            value
+          if sequence then
+            Signature_contract.terms ~expected:ty ~logical_types:env.data
+              ~predicates:(fun q ->
+                Option.map
+                  (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+                  ~f:snd)
+              ~environment:env.ctx.env ~variables:env.var_types [ value ]
+          else
+            Source.check_logical_expression ~is_list env.ctx.env
+              ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
+              value
         in
         let* () =
           match term_type env value with
-          | Some actual when not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
+          | Some actual
+            when (not sequence)
+                 && not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
               error value.term_loc
                 (Stdlib.Format.asprintf "Expected logical type %a but found %a"
                    Printtyp.type_expr ty Printtyp.type_expr actual)
@@ -8399,7 +8394,13 @@ let view_bindings ctx (f : func) =
   in
   List.filter_map (List.concat_map atomic_requires ~f:conjuncts) ~f:(fun t ->
       match spine t [] with
-      | { term_desc = Tvar (Qid { pid_str = v; _ }); _ }, args ->
+      | { term_desc = Tvar q; _ }, args ->
+          let key = logical_key (scope_env ctx) q in
+          let v =
+            Option.value_map
+              (List.Assoc.find ctx.preds key ~equal:String.equal)
+              ~default:key ~f:fst
+          in
           begin match
             (List.Assoc.find ctx.shared.views v ~equal:String.equal, List.last args)
           with
@@ -8415,8 +8416,9 @@ let rec without_predicates ctx (t : S.term) : S.term =
   | ({ term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ } as op), [ a; b ] ->
       let a = without_predicates ctx a and b = without_predicates ctx b in
       S.mk_term (Tapply (S.mk_term (Tapply (op, a)) t.term_loc, b)) t.term_loc
-  | { term_desc = Tvar (Qid { pid_str = p; _ }); _ }, _
-    when List.Assoc.mem ctx.preds p ~equal:String.equal || String.equal p "own" ->
+  | { term_desc = Tvar q; _ }, _
+    when List.Assoc.mem ctx.preds (logical_key (scope_env ctx) q) ~equal:String.equal
+         || String.equal (qualid_key q) "own" ->
       S.mk_term Ttrue t.term_loc
   | _ -> t
 
@@ -10060,7 +10062,13 @@ let signature_has_refs ~types ~environment ~substitution typ =
           let seen = path :: seen in
           match (Env.find_type path environment).type_kind with
           | Type_abstract _ ->
-              (match path with Pident id when Ident.is_predef id -> false | _ -> true)
+              let logical =
+                Option.exists (Datatypes.find types path) ~f:(fun descriptor ->
+                    Option.is_some descriptor.collection
+                    || descriptor.mathematical_integer)
+              in
+              ((not logical)
+              && match path with Pident id when Ident.is_predef id -> false | _ -> true)
               || fallback ()
           | Type_record (fields, _) ->
               List.exists fields ~f:(fun field ->

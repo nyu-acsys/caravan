@@ -498,6 +498,8 @@ The proof uses algebraic lists, heap segments, and monotone fact snapshots.
 It retains explicit witnesses and resource updates as a reference for future
 automation. The original sequence/history queue remains a separate case study in
 [test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
+The [module-wrapped history queue](test/examples/module_ms_queue/) reuses that
+implementation and proof behind a static signature, with clients through an alias.
 
 The additional `swing_tail` operation has no Saturn counterpart. Its history and
 segment proofs live in the separate [queue tail advancement example](test/examples/queue_tail_advance/),
