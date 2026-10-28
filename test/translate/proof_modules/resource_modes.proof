@@ -1,0 +1,3 @@
+module Checked = struct
+  predicate owned (x : t) (n : int) = own x.count n
+end

@@ -118,10 +118,10 @@
   [1]
 
   $ caravan --shh signature_predicate_fail.ml
-  [Error] File "signature_predicate_fail.ml", line 1, column 19 to line 7, column 3:
-  1 | module Container : sig
-                         ^^^
-  Unsupported Error: A resource declaration on an inline module structure is not supported yet.
+  [Error] File "signature_predicate_fail.ml", line 4, columns 2-36:
+  4 |   (*@ predicate holds (value : t) *)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: The module resource holds has no proof definition.
   [1]
 
   $ caravan --shh orphan_contract_fail.ml

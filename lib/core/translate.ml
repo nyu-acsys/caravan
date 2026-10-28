@@ -406,6 +406,8 @@ type proof_support = {
   mathematical_types : Datatypes.t list;
   predicate_inputs : (string * int) list;
       (** Explicit overrides of the type-based predicate output convention. *)
+  proof_key : Env.t -> S.qualid -> string option;
+  opaque_predicates : string list;
 }
 
 let empty_proof_support =
@@ -421,6 +423,8 @@ let empty_proof_support =
     logical_functions = [];
     mathematical_types = [];
     predicate_inputs = [];
+    proof_key = (fun _ _ -> None);
+    opaque_predicates = [];
   }
 
 let implicit_parameter_count ~kind parameters =
@@ -435,7 +439,7 @@ let implicit_parameter_count ~kind parameters =
   in
   check false 0 parameters
 
-let predicate_output_count data (predicate : S.predicate) types =
+let predicate_output_count ?has_refs data (predicate : S.predicate) types =
   let* explicit = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
   match explicit with
   | Some _ when predicate.pred_persistent ->
@@ -444,12 +448,17 @@ let predicate_output_count data (predicate : S.predicate) types =
   | Some count -> Ok count
   | None when predicate.pred_persistent -> Ok 0
   | None ->
+      let has_refs = Option.value has_refs ~default:(Datatypes.has_refs data) in
       let count =
-        List.length
-          (List.take_while (List.rev types) ~f:(fun typ ->
-               not (Datatypes.has_refs data typ)))
+        List.length (List.take_while (List.rev types) ~f:(fun typ -> not (has_refs typ)))
       in
       Ok (if count = List.length types then 0 else count)
+
+type predicate_body = {
+  definition : S.term;
+  environment : Env.t;
+  project_type : Types.type_expr -> Types.type_expr;
+}
 
 type context = {
   types : Datatypes.t list;
@@ -494,7 +503,7 @@ type context = {
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   proof_lemmas : (string * lemma_signature) list;
   proof_support : proof_support;
-  predicate_bodies : (string * S.term) list;
+  predicate_bodies : (string * predicate_body) list;
       (** Explicit predicate bodies, for the types of named unfold witnesses. *)
   spec_funcs : (string * string) list;
       (** The functions contracts can call, by their OCaml names, with their Raven ones.
@@ -918,25 +927,29 @@ let runtime_spec env q =
       Path_bindings.find env.ctx.proof_support.runtime_functions path)
 
 let logical_key env q =
-  match q with
-  | S.Qid _ -> qualid_key q
-  | Qdot (parent, id) ->
-      let view =
-        Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
-            Path_bindings.find env.ctx.proof_support.predicate_views
-              (Path.Pdot (path, id.pid_str)))
-      in
-      begin match view with
-      | Some key -> key
-      | None ->
-          begin match
-            Option.bind
-              (Source.module_path env.ctx.env parent)
-              ~f:(Path_bindings.find env.ctx.proof_support.library_paths)
-          with
-          | None -> qualid_key q
-          | Some path ->
-              Qualified_name.to_string Qualified_name.{ path; name = id.pid_str }
+  match env.ctx.proof_support.proof_key env.ctx.env q with
+  | Some key -> key
+  | None ->
+      begin match q with
+      | S.Qid _ -> qualid_key q
+      | Qdot (parent, id) ->
+          let view =
+            Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+                Path_bindings.find env.ctx.proof_support.predicate_views
+                  (Path.Pdot (path, id.pid_str)))
+          in
+          begin match view with
+          | Some key -> key
+          | None ->
+              begin match
+                Option.bind
+                  (Source.module_path env.ctx.env parent)
+                  ~f:(Path_bindings.find env.ctx.proof_support.library_paths)
+              with
+              | None -> qualid_key q
+              | Some path ->
+                  Qualified_name.to_string Qualified_name.{ path; name = id.pid_str }
+              end
           end
       end
 
@@ -1023,7 +1036,7 @@ let logical_signature env q =
       begin match resource_operation env q with
       | Some _ as signature -> signature
       | None ->
-          List.Assoc.find env.ctx.proof_support.logical_functions (qualid_key q)
+          List.Assoc.find env.ctx.proof_support.logical_functions (logical_key env q)
             ~equal:String.equal
       end
 
@@ -1169,9 +1182,23 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     && String.for_all x ~f:(fun c ->
         Char.is_alphanum c || Char.equal c '_' || Char.equal c '\'')
   in
+  let logical_names =
+    List.concat_map terms ~f:(term_references [])
+    |> List.filter_map ~f:(function
+      | S.Qid id as q ->
+          let key = logical_key env q in
+          Option.some_if
+            (List.Assoc.mem env.ctx.preds key ~equal:String.equal
+            || List.Assoc.mem env.ctx.proof_support.logical_functions key
+                 ~equal:String.equal
+            || List.Assoc.mem env.ctx.proof_lemmas key ~equal:String.equal)
+            id.pid_str
+      | Qdot _ -> None)
+  in
   let known x =
     List.Assoc.mem env.vars x ~equal:String.equal
     || List.Assoc.mem env.funcs x ~equal:String.equal
+    || List.mem logical_names x ~equal:String.equal
     || List.exists env.ctx.proof_support.ghost_fields ~f:(fun f ->
         String.equal f.Source.field_name x)
     || List.mem
@@ -2255,9 +2282,12 @@ let lemma_call env (t : S.term) =
   match head.term_desc with
   | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       error id.pid_loc "A local proof value cannot be called as a lemma"
-  | Tvar (Qid id) ->
-      begin match List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal with
-      | None -> error id.pid_loc (Printf.sprintf "Unknown lemma %s" id.pid_str)
+  | Tvar q ->
+      let display = qualid_key q in
+      begin match
+        List.Assoc.find env.ctx.proof_lemmas (logical_key env q) ~equal:String.equal
+      with
+      | None -> error head.term_loc (Printf.sprintf "Unknown lemma %s" display)
       | Some signature ->
           let maximum = List.length signature.lemma_inputs in
           let minimum = maximum - signature.lemma_implicit_count in
@@ -2265,9 +2295,9 @@ let lemma_call env (t : S.term) =
           if arity < minimum || arity > maximum then
             error t.term_loc
               (if minimum = maximum then
-                 Printf.sprintf "Lemma %s expects %d arguments" id.pid_str maximum
+                 Printf.sprintf "Lemma %s expects %d arguments" display maximum
                else
-                 Printf.sprintf "Lemma %s expects between %d and %d arguments" id.pid_str
+                 Printf.sprintf "Lemma %s expects between %d and %d arguments" display
                    minimum maximum)
           else
             let* args =
@@ -2286,10 +2316,18 @@ let lemma_call env (t : S.term) =
 let predicate_use env ~unfold t witnesses make =
   let head, args = spine t [] in
   match head.term_desc with
-  | Tvar (Qid { pid_str = p; _ }) when List.Assoc.mem env.ctx.preds p ~equal:String.equal
-    ->
-      let raven, types = List.Assoc.find_exn env.ctx.preds p ~equal:String.equal in
-      let* args = predicate_arguments env ~at:t.term_loc p types args in
+  | Tvar q when List.Assoc.mem env.ctx.preds (logical_key env q) ~equal:String.equal ->
+      let key = logical_key env q in
+      let* () =
+        if List.mem env.ctx.proof_support.opaque_predicates key ~equal:String.equal then
+          error head.term_loc
+            "The definition of this predicate is hidden by its module signature"
+        else Ok ()
+      in
+      let raven, types = List.Assoc.find_exn env.ctx.preds key ~equal:String.equal in
+      let* args =
+        predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
+      in
       let* witnesses =
         all witnesses ~f:(fun (id, t) ->
             if unfold then
@@ -2384,8 +2422,9 @@ let proof_signature env (t : S.term) =
   | Some _ as signature -> signature
   | None ->
       begin match head.term_desc with
-      | Tvar (Qid id) when not (List.Assoc.mem env.vars id.pid_str ~equal:String.equal) ->
-          List.Assoc.find env.ctx.proof_lemmas id.pid_str ~equal:String.equal
+      | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
+      | Tvar q ->
+          List.Assoc.find env.ctx.proof_lemmas (logical_key env q) ~equal:String.equal
       | _ -> None
       end
 
@@ -2662,14 +2701,19 @@ let rec predicate_existentials (t : S.term) =
 let unfold_result_types env (t : S.term) witnesses =
   let head, _ = spine t [] in
   match head.term_desc with
-  | Tvar (Qid predicate)
-    when List.Assoc.mem env.ctx.preds predicate.pid_str ~equal:String.equal ->
-      begin match
-        List.Assoc.find env.ctx.predicate_bodies predicate.pid_str ~equal:String.equal
-      with
+  | Tvar q when List.Assoc.mem env.ctx.preds (logical_key env q) ~equal:String.equal ->
+      let key = logical_key env q in
+      let display = qualid_key q in
+      let* () =
+        if List.mem env.ctx.proof_support.opaque_predicates key ~equal:String.equal then
+          error head.term_loc
+            "The definition of this predicate is hidden by its module signature"
+        else Ok ()
+      in
+      begin match List.Assoc.find env.ctx.predicate_bodies key ~equal:String.equal with
       | None -> Ok None
       | Some body ->
-          let bindings = predicate_existentials body in
+          let bindings = predicate_existentials body.definition in
           let* types =
             all witnesses ~f:(fun (witness : S.id) ->
                 match
@@ -2678,17 +2722,17 @@ let unfold_result_types env (t : S.term) witnesses =
                 with
                 | [] ->
                     error witness.pid_loc
-                      (Printf.sprintf "Predicate %s has no existential named %s"
-                         predicate.pid_str witness.pid_str)
+                      (Printf.sprintf "Predicate %s has no existential named %s" display
+                         witness.pid_str)
                 | [ (_, Some ty) ] ->
-                    let* ty = Source.ocaml_type env.ctx.env ~at:witness.pid_loc ty in
-                    Ok (Some ty)
+                    let* ty = Source.ocaml_type body.environment ~at:witness.pid_loc ty in
+                    Ok (Some (body.project_type ty))
                 | [ (_, None) ] ->
                     error witness.pid_loc "An existential variable needs a type"
                 | _ ->
                     error witness.pid_loc
                       (Printf.sprintf "Existential name %s is ambiguous in predicate %s"
-                         witness.pid_str predicate.pid_str))
+                         witness.pid_str display))
           in
           Ok (Some types)
       end
@@ -6335,11 +6379,17 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
       let* a = uses ctx env ~at make a in
       let* b = uses ctx env ~at make b in
       Ok (a @ b)
-  | Tvar (Qid { pid_str = p; _ }), _, _
-    when List.Assoc.mem ctx.preds p ~equal:String.equal ->
-      let raven, types = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
-      let* args = predicate_arguments env ~at:t.term_loc p types args in
-      Ok (make ~loc:l ~pred:p (name ~loc:l raven) args)
+  | Tvar q, _, _
+    when List.mem ctx.proof_support.opaque_predicates (logical_key env q)
+           ~equal:String.equal ->
+      Ok []
+  | Tvar q, _, _ when List.Assoc.mem ctx.preds (logical_key env q) ~equal:String.equal ->
+      let key = logical_key env q in
+      let raven, types = List.Assoc.find_exn ctx.preds key ~equal:String.equal in
+      let* args =
+        predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
+      in
+      Ok (make ~loc:l ~pred:key (name ~loc:l raven) args)
   | _, _, Tif (c, a, b) ->
       let* c = formula env c in
       let* a = uses ctx env ~at make a in
@@ -6586,9 +6636,17 @@ let invariant_apps ctx env (terms : S.term list) =
     match spine t [] with
     | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
         apps a @ apps b
-    | { term_desc = Tvar (Qid { pid_str = p; _ }); _ }, args
-      when List.Assoc.mem ctx.shared.persistent p ~equal:String.equal ->
-        [ (p, args) ]
+    | { term_desc = Tvar q; _ }, args ->
+        let key = logical_key env q in
+        begin match List.Assoc.find ctx.preds key ~equal:String.equal with
+        | Some (raven, _)
+          when List.Assoc.mem ctx.shared.persistent raven ~equal:String.equal
+               && not
+                    (List.mem ctx.proof_support.opaque_predicates key ~equal:String.equal)
+          ->
+            [ (key, args) ]
+        | _ -> []
+        end
     | _ -> []
   in
   all (List.concat_map terms ~f:apps) ~f:(fun (p, args) ->
@@ -7449,6 +7507,23 @@ let interface_contracts (interface : Source.interface) =
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
 let items source ~fresh (inventory : Module_inventory.t) =
+  let* signature_predicates =
+    all
+      (List.filter inventory.constraints ~f:(fun constraint_ ->
+           Option.is_some constraint_.Module_inventory.owner))
+      ~f:(fun constraint_ ->
+        all constraint_.Module_inventory.signature.signature_resources
+          ~f:(fun (name, resource) ->
+            let environment = Source.annotation_env source resource.site.environment in
+            let* parameters =
+              all resource.declaration.pred_params ~f:(fun (id, ty) ->
+                  Source.ocaml_type environment ~at:id.S.pid_loc ty)
+            in
+            Ok
+              (List.map constraint_.signature.signature_values ~f:(fun (_, value) ->
+                   (value.declaration.val_id, name, parameters)))))
+  in
+  let signature_predicates = List.concat (List.concat signature_predicates) in
   let* data =
     all inventory.types ~f:(fun (entry : Module_inventory.type_definition) ->
         let* data = Datatypes.of_declaration entry.declaration in
@@ -7495,6 +7570,15 @@ let items source ~fresh (inventory : Module_inventory.t) =
                             contract
                         in
                         Signature_contract.check
+                          ~predicates:(function
+                            | S.Qid id ->
+                                List.find_map signature_predicates
+                                  ~f:(fun (value, name, parameters) ->
+                                    Option.some_if
+                                      (Ident.same value view.declaration.val_id
+                                      && String.equal name id.pid_str)
+                                      parameters)
+                            | Qdot _ -> None)
                           ~restricted:(not (List.is_empty entry.namespace))
                           ~logical_types:source.Source.logical_types source view contract
                   in
@@ -8974,23 +9058,23 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
   }
 
 (** Recursive proof calls need checked well-founded descent, including mutual calls. *)
-let check_lemma_recursion declarations =
-  let rec calls bound (body : S.proof_expr) =
+let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
+  let rec calls at bound (body : S.proof_expr) =
     match body.proof_desc with
     | Proof_value t ->
         let head, _ = spine t [] in
         begin match head.term_desc with
-        | Tvar (Qid id) when not (List.mem bound id.pid_str ~equal:String.equal) ->
-            [ id.pid_str ]
+        | Tvar (Qid id) when List.mem bound id.pid_str ~equal:String.equal -> []
+        | Tvar q -> [ resolve at q ]
         | _ -> []
         end
     | Proof_let (pattern, rhs, body) ->
-        calls bound rhs @ calls (pat_names pattern @ bound) body
-    | Proof_seq (rhs, body) -> calls bound rhs @ calls bound body
-    | Proof_if (_, yes, no) -> calls bound yes @ calls bound no
+        calls at bound rhs @ calls at (pat_names pattern @ bound) body
+    | Proof_seq (rhs, body) -> calls at bound rhs @ calls at bound body
+    | Proof_if (_, yes, no) -> calls at bound yes @ calls at bound no
     | Proof_match (_, cases) ->
         List.concat_map cases ~f:(fun (pattern, body) ->
-            calls (pat_names pattern @ bound) body)
+            calls at (pat_names pattern @ bound) body)
     | Proof_fold _ | Proof_unfold _ | Proof_assert _ -> []
   in
   let graph =
@@ -8998,7 +9082,9 @@ let check_lemma_recursion declarations =
       | S.Proof_lemma { lemma_name; lemma_params; lemma_body; _ } ->
           Some
             ( lemma_name.pid_str,
-              calls (List.map lemma_params ~f:(fun (id, _) -> id.S.pid_str)) lemma_body )
+              calls lemma_name.pid_loc
+                (List.map lemma_params ~f:(fun (id, _) -> id.S.pid_str))
+                lemma_body )
       | _ -> None)
   in
   let cyclic start =
@@ -9847,16 +9933,151 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
                  || List.exists group.applications ~f:(fun member ->
                      phys_equal member.source other)))))
 
-let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
-  let* () =
-    match
-      List.find source.proof_scopes.declarations ~f:(fun entry ->
-          not (List.is_empty entry.Proof_scopes.scope.namespace))
-    with
-    | None -> Ok ()
-    | Some entry ->
-        unsupported entry.name.pid_loc "A proof declaration inside a source module"
+let scoped_predicate (binding : Proof_bindings.binding) =
+  match binding.kind with
+  | Lemma _ -> None
+  | Predicate (p, body) ->
+      let p = { p with S.pred_name = { p.pred_name with pid_str = binding.backend } } in
+      let definition = if p.pred_persistent then Direct_invariant body else Body body in
+      Some (p.pred_name.pid_loc, p, definition, binding.private_types)
+
+let scoped_lemma (binding : Proof_bindings.binding) =
+  match binding.kind with
+  | Predicate _ -> None
+  | Lemma (S.Proof_lemma lemma) ->
+      Some
+        (S.Proof_lemma
+           { lemma with lemma_name = { lemma.lemma_name with pid_str = binding.backend } })
+  | Lemma _ -> None
+
+let signature_has_refs ~types ~environment ~substitution typ =
+  let rec contains seen typ =
+    let fallback () = Datatypes.has_refs types (Subst.type_expr substitution typ) in
+    match Types.get_desc (Ctype.expand_head environment typ) with
+    | Tconstr (path, args, _) -> (
+        List.exists args ~f:(contains seen)
+        ||
+        if List.mem seen path ~equal:Path.same then fallback ()
+        else
+          let seen = path :: seen in
+          match (Env.find_type path environment).type_kind with
+          | Type_abstract _ ->
+              (match path with Pident id when Ident.is_predef id -> false | _ -> true)
+              || fallback ()
+          | Type_record (fields, _) ->
+              List.exists fields ~f:(fun field ->
+                  Poly.equal field.Types.ld_mutable Asttypes.Mutable
+                  || contains seen field.ld_type)
+          | Type_variant (constructors, _) ->
+              List.exists constructors ~f:(fun constructor ->
+                  match constructor.Types.cd_args with
+                  | Cstr_tuple args -> List.exists args ~f:(contains seen)
+                  | Cstr_record fields ->
+                      List.exists fields ~f:(fun field -> contains seen field.ld_type))
+          | Type_open | Type_external _ -> fallback ())
+    | Ttuple fields -> List.exists fields ~f:(fun (_, typ) -> contains seen typ)
+    | Tpoly (typ, []) -> contains seen typ
+    | _ -> fallback ()
   in
+  contains [] typ
+
+let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
+  Result.all_unit
+    (List.map inventory.Module_inventory.constraints ~f:(fun constraint_ ->
+         match constraint_.owner with
+         | None -> Ok ()
+         | Some owner ->
+             Result.all_unit
+               (List.map constraint_.Module_inventory.signature.signature_resources
+                  ~f:(fun (name, formal) ->
+                    let* binding =
+                      match
+                        List.find proofs.bindings ~f:(fun binding ->
+                            Option.equal Path.same binding.entry.scope.owner (Some owner)
+                            && String.equal binding.entry.name.pid_str name)
+                      with
+                      | Some binding -> Ok binding
+                      | None ->
+                          error formal.site.item_loc
+                            (Printf.sprintf
+                               "The module resource %s has no proof definition" name)
+                    in
+                    let* actual =
+                      match binding.kind with
+                      | Predicate (p, _) -> Ok p
+                      | Lemma _ ->
+                          error binding.entry.name.pid_loc
+                            "A module resource must be defined as a predicate or \
+                             invariant"
+                    in
+                    let declared = formal.declaration in
+                    let* () =
+                      if Option.is_none declared.pred_body then Ok ()
+                      else
+                        unsupported declared.pred_name.pid_loc
+                          "A resource definition in a module signature"
+                    in
+                    let at = binding.entry.name.pid_loc in
+                    let related =
+                      [ (declared.pred_name.pid_loc, "Its signature declaration") ]
+                    in
+                    let* () =
+                      if Bool.equal declared.pred_persistent actual.pred_persistent then
+                        Ok ()
+                      else
+                        error at ~related
+                          "The module resource has a different predicate or invariant \
+                           kind"
+                    in
+                    let environment =
+                      Source.annotation_env source formal.site.environment
+                    in
+                    let* raw =
+                      all declared.pred_params ~f:(fun (id, ty) ->
+                          Source.ocaml_type environment ~at:id.S.pid_loc ty)
+                    in
+                    let expected =
+                      List.map raw ~f:(Subst.type_expr constraint_.substitution)
+                    in
+                    let* equal =
+                      Signature_contract.compiler ~at (fun () ->
+                          List.length expected = List.length binding.private_types
+                          && Ctype.is_equal binding.environment false expected
+                               binding.private_types)
+                    in
+                    let* () =
+                      if equal then Ok ()
+                      else
+                        error at ~related
+                          "The module resource has different parameter types"
+                    in
+                    let* expected_modes =
+                      implicit_parameter_count ~kind:"predicate" declared.pred_params
+                    in
+                    let* actual_modes =
+                      implicit_parameter_count ~kind:"predicate" actual.pred_params
+                    in
+                    let* expected_outputs =
+                      Signature_contract.compiler ~at (fun () ->
+                          predicate_output_count
+                            ~has_refs:
+                              (signature_has_refs ~types ~environment
+                                 ~substitution:constraint_.substitution)
+                            types declared raw)
+                      |> Result.join
+                    in
+                    let* actual_outputs =
+                      predicate_output_count types actual binding.private_types
+                    in
+                    if
+                      Poly.equal expected_modes actual_modes
+                      && Int.equal expected_outputs actual_outputs
+                    then Ok ()
+                    else
+                      error at ~related
+                        "The module resource has different implicit parameter modes"))))
+
+let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
   (* Each annotation on an atomic step, by the end of the code it follows. *)
   let linearizations =
@@ -9933,6 +10154,17 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Set.union backend_names.used (Set.of_list (module String) reserved);
   let fresh = Names.fresh backend_names in
   let* inventory = Module_inventory.build source typed in
+  let* scoped_proofs = Proof_bindings.build ~fresh source inventory in
+  let scoped_binding name =
+    List.find scoped_proofs.bindings ~f:(fun binding -> String.equal binding.backend name)
+  in
+  let declaration_scope name =
+    Option.map (scoped_binding name) ~f:(fun binding -> binding.entry.scope)
+  in
+  let declaration_environment name =
+    Option.value_map (scoped_binding name) ~default:source.env ~f:(fun binding ->
+        binding.environment)
+  in
   let typed = inventory.structure in
   let* libraries = Library_modules.flatten ~fresh source.libraries in
 
@@ -10147,6 +10379,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))))
   in
   let* generics = generic_modules source ~fresh ~types ~functions:funcs inventory in
+  let generics =
+    List.filter generics ~f:(fun group ->
+        not
+          (List.exists funcs ~f:(fun f ->
+               Option.is_some (Generic_modules.member [ group ] f.id)
+               && not
+                    (List.is_empty
+                       (Proof_bindings.private_bindings scoped_proofs
+                          ~scope:(Proof_bindings.scope_for_location scoped_proofs f.loc))))))
+  in
   let layouts = Result_layouts.plan types generics in
   let* types = Result_layouts.concrete layouts types in
   let schema binding =
@@ -10459,6 +10701,19 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
   let* predicates = predicates ~data:types source in
+  let* () = check_scoped_resources ~types source inventory scoped_proofs in
+  let* scoped_predicates =
+    all (List.filter_map scoped_proofs.bindings ~f:scoped_predicate)
+      ~f:(fun ((_, p, _, ts) as declaration) ->
+        let* _ = predicate_output_count types p ts in
+        Ok declaration)
+  in
+  let* scoped_inputs =
+    all scoped_predicates ~f:(fun (_, p, _, ts) ->
+        let* outputs = predicate_output_count types p ts in
+        Ok (p.pred_name.pid_str, List.length ts - outputs))
+  in
+  let predicates = predicates @ scoped_predicates in
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
@@ -10515,6 +10770,36 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           resource_types = ts;
           resource_raw_types = ts;
         })
+    @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+        match (binding.Proof_bindings.kind, binding.entry.scope.owner) with
+        | Predicate (p, _), Some owner when binding.exported ->
+            let declaration =
+              Proof_bindings.constraints_for scoped_proofs binding
+              |> List.filter ~f:(fun constraint_ ->
+                  constraint_.Module_inventory.restricts_visibility)
+              |> List.rev
+              |> List.find_map ~f:(fun constraint_ ->
+                  List.Assoc.find
+                    constraint_.Module_inventory.signature.signature_resources
+                    binding.entry.name.pid_str ~equal:String.equal)
+              |> Option.value_map ~default:p ~f:(fun formal ->
+                  formal.Module_inventory.declaration)
+            in
+            let original = Path.Pdot (owner, binding.entry.name.pid_str) in
+            let paths =
+              List.fold inventory.aliases ~init:[ original ]
+                ~f:(fun paths (alias, target) ->
+                  paths @ List.filter_map paths ~f:(alias_path ~alias ~target))
+            in
+            Some
+              {
+                resource_paths = paths;
+                resource_declaration = declaration;
+                resource_backend = binding.backend;
+                resource_types = binding.public_types;
+                resource_raw_types = binding.public_types;
+              }
+        | _ -> None)
   in
   let* checked_views, _ =
     List.fold_result inventory.bindings ~init:([], resource_signatures)
@@ -10689,7 +10974,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           implicit_parameter_count ~kind:"predicate"
             resource.resource_declaration.pred_params
         in
-        Ok (Option.map count ~f:(fun count -> (key, List.length ts - count))))
+        Ok
+          (Option.map
+             (Option.first_some
+                (Option.map count ~f:(fun count -> List.length ts - count))
+                (List.Assoc.find scoped_inputs resource.resource_backend
+                   ~equal:String.equal))
+             ~f:(fun count -> (key, count))))
   in
   let predicate_inputs = List.filter_opt checked_inputs @ predicate_inputs in
   let preds =
@@ -10706,6 +10997,27 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         else Some (target, (target, types)))
   in
   let preds = checked_preds @ preds in
+  let scoped_keys = List.map scoped_proofs.bindings ~f:(fun binding -> binding.backend) in
+  let private_scoped_inputs = scoped_inputs in
+  let predicate_inputs =
+    List.filter predicate_inputs ~f:(fun (key, _) ->
+        not (List.mem scoped_keys key ~equal:String.equal))
+    @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+        if binding.exported then
+          Option.map
+            (List.Assoc.find private_scoped_inputs binding.backend ~equal:String.equal)
+            ~f:(fun count -> (binding.public_key, count))
+        else None)
+  in
+  let preds =
+    List.filter preds ~f:(fun (key, _) ->
+        not (List.mem scoped_keys key ~equal:String.equal))
+    @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+        match binding.kind with
+        | Predicate _ when binding.exported ->
+            Some (binding.public_key, (binding.backend, binding.public_types))
+        | _ -> None)
+  in
   let* logical_functions =
     all
       (List.filter source.proof ~f:(function S.Proof_function _ -> true | _ -> false))
@@ -10750,6 +11062,17 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       mathematical_types =
         source.proof_types @ source.logical_types @ resource_types @ token_types;
       predicate_inputs;
+      proof_key =
+        (fun environment q ->
+          Proof_bindings.resolve scoped_proofs ~scope:None ~environment q);
+      opaque_predicates =
+        Proof_bindings.opaque_keys scoped_proofs
+        @ List.map checked_resource_entries ~f:(fun (_, key, _, _) -> key)
+        @ List.concat_map library_preds ~f:(fun (library, p, _) ->
+            [
+              library.Library_modules.source_name ^ "." ^ p.pred_name.pid_str;
+              library.library_name ^ "." ^ p.pred_name.pid_str;
+            ]);
     }
   in
   let spec_funcs =
@@ -10758,8 +11081,37 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
+  let proof_context scope preds spec_funcs proof_support =
+    let bindings = Proof_bindings.private_bindings scoped_proofs ~scope in
+    let private_preds =
+      List.filter_map bindings ~f:(fun binding ->
+          match binding.kind with
+          | Predicate _ -> Some (binding.backend, (binding.backend, binding.private_types))
+          | Lemma _ -> None)
+    in
+    let inputs =
+      List.filter_map bindings ~f:(fun binding ->
+          Option.map
+            (List.Assoc.find private_scoped_inputs binding.backend ~equal:String.equal)
+            ~f:(fun count -> (binding.backend, count)))
+    in
+    ( private_preds @ preds,
+      List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend)) @ spec_funcs,
+      {
+        proof_support with
+        proof_key =
+          (fun environment q ->
+            Proof_bindings.resolve scoped_proofs ~scope ~environment q);
+        predicate_inputs = inputs @ proof_support.predicate_inputs;
+      } )
+  in
   let* atomic_updates =
     all atomic_operations ~f:(fun (au_source, f) ->
+        let preds, spec_funcs, proof_support =
+          proof_context
+            (Proof_bindings.scope_for_location scoped_proofs f.loc)
+            preds spec_funcs proof_support
+        in
         let ctx =
           spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env ~preds
             ~spec_funcs ~proof_support origins
@@ -10800,11 +11152,30 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let lemma_declarations =
     List.filter source.proof ~f:(function S.Proof_lemma _ -> true | _ -> false)
+    @ List.filter_map scoped_proofs.bindings ~f:scoped_lemma
   in
-  let* () = check_lemma_recursion lemma_declarations in
-  let* proof_lemmas =
+  let* () =
+    check_lemma_recursion lemma_declarations ~resolve:(fun at q ->
+        let binding =
+          List.find scoped_proofs.bindings ~f:(fun binding ->
+              Poly.equal binding.entry.name.pid_loc at)
+        in
+        let scope = Option.map binding ~f:(fun binding -> binding.entry.scope) in
+        let environment =
+          Option.value_map binding ~default:source.env ~f:(fun binding ->
+              binding.environment)
+        in
+        let key =
+          Option.value
+            (Proof_bindings.resolve scoped_proofs ~scope ~environment q)
+            ~default:(qualid_key q)
+        in
+        Option.value (Proof_bindings.canonical_key scoped_proofs key) ~default:key)
+  in
+  let* all_proof_lemmas =
     all lemma_declarations ~f:(function
       | S.Proof_lemma { lemma_name; lemma_params; lemma_returns; _ } ->
+          let ocaml_env = declaration_environment lemma_name.pid_str in
           let types_of ps =
             all ps ~f:(fun (id, ty) -> Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
           in
@@ -10831,9 +11202,32 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       | _ -> error Location.none "Expected a lemma declaration")
   in
   let* () =
-    match List.find_a_dup (List.map proof_lemmas ~f:fst) ~compare:String.compare with
+    match List.find_a_dup (List.map all_proof_lemmas ~f:fst) ~compare:String.compare with
     | None -> Ok ()
     | Some x -> error Location.none (Printf.sprintf "Duplicate lemma %s" x)
+  in
+  let proof_lemmas =
+    List.filter all_proof_lemmas ~f:(fun (key, _) -> Option.is_none (scoped_binding key))
+    @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+        match binding.kind with
+        | Lemma (S.Proof_lemma declaration) when binding.exported ->
+            let inputs, outputs =
+              List.split_n binding.public_types (List.length declaration.lemma_params)
+            in
+            let signature =
+              List.Assoc.find_exn all_proof_lemmas binding.backend ~equal:String.equal
+            in
+            Some
+              ( binding.public_key,
+                { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
+        | _ -> None)
+  in
+  let lemma_context scope =
+    List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
+      ~f:(fun binding ->
+        Option.map (List.Assoc.find all_proof_lemmas binding.backend ~equal:String.equal)
+          ~f:(fun signature -> (binding.backend, signature)))
+    @ proof_lemmas
   in
   (* The views, with their values, and their ghost fields, on the structures. *)
   let views =
@@ -11281,6 +11675,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                     List.mem f.paths actual_path ~equal:Path.same)
               with
               | Some f ->
+                  let preds, spec_funcs, proof_support =
+                    proof_context
+                      (Proof_bindings.scope_for_location scoped_proofs f.loc)
+                      preds spec_funcs proof_support
+                  in
                   let* () = check_adapter_shape ~at:f.loc f.contract in
                   let* () =
                     if
@@ -11704,22 +12103,65 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let* pred_members =
     all predicates ~f:(fun (at, p, def, param_types) ->
-        predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-          ~proof_support origins ~at
+        let scope = declaration_scope p.pred_name.pid_str in
+        let preds, spec_funcs, proof_support =
+          proof_context scope preds spec_funcs proof_support
+        in
+        predicate types ~refs ~primitives ~shared
+          ~ocaml_env:(declaration_environment p.pred_name.pid_str)
+          ~preds ~spec_funcs ~proof_support origins ~at
           ~views:(List.map views ~f:(fun (p, value, _) -> (p, value)))
           ~structures p def param_types)
   in
   let predicate_bodies =
     List.filter_map predicates ~f:(fun (_, p, definition, _) ->
         match definition with
-        | Body body | Direct_invariant body -> Some (p.S.pred_name.pid_str, body)
+        | (Body body | Direct_invariant body)
+          when Option.is_none (scoped_binding p.pred_name.pid_str) ->
+            Some
+              ( p.S.pred_name.pid_str,
+                { definition = body; environment = ocaml_env; project_type = Fn.id } )
+        | Body _ | Direct_invariant _ -> None
         | Invariant _ | View _ -> None)
+    @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+        match binding.kind with
+        | Predicate (_, body)
+          when binding.exported && not (Proof_bindings.opaque scoped_proofs binding) ->
+            Some
+              ( binding.public_key,
+                {
+                  definition = body;
+                  environment = binding.environment;
+                  project_type = Proof_bindings.public_type scoped_proofs;
+                } )
+        | _ -> None)
+  in
+  let body_contexts scope =
+    List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
+      ~f:(fun binding ->
+        match binding.kind with
+        | Predicate (_, body) ->
+            Some
+              ( binding.backend,
+                {
+                  definition = body;
+                  environment = binding.environment;
+                  project_type = Fn.id;
+                } )
+        | _ -> None)
+    @ predicate_bodies
   in
   let* lemma_members =
-    all lemma_declarations
-      ~f:
-        (proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-           ~proof_lemmas ~proof_support ~predicate_bodies origins)
+    all lemma_declarations ~f:(fun declaration ->
+        let declaration_name = (Proof_scopes.name declaration).pid_str in
+        let scope = declaration_scope declaration_name in
+        let preds, spec_funcs, proof_support =
+          proof_context scope preds spec_funcs proof_support
+        in
+        proof_lemma types ~refs ~primitives ~shared
+          ~ocaml_env:(declaration_environment declaration_name)
+          ~preds ~spec_funcs ~proof_lemmas:(lemma_context scope) ~proof_support
+          ~predicate_bodies:(body_contexts scope) origins declaration)
   in
   let* logical_members =
     all
@@ -11760,6 +12202,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         Ok (group.name, layout_types))
   in
   let body_context f =
+    let preds, spec_funcs, proof_support =
+      proof_context
+        (Proof_bindings.scope_for_location scoped_proofs f.loc)
+        preds spec_funcs proof_support
+    in
     match body_owner f with
     | None -> (types, preds, functions, pure_functions, spec_funcs, proof_support)
     | Some (group, _) ->
@@ -11882,11 +12329,15 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               proc data ~refs ~primitives ~shared ~ocaml_env:f.environment
                 ~preds:predicates ~funcs:spec_funcs ~annotations ~access_proofs
                 ~return_proofs ~initializations ~linearizations ~lifted ~pasts
-                ~past_returns ~ghost_args ~procedure_signatures ~proof_lemmas
-                ~proof_support ~predicate_bodies ~libraries:(library_paths libraries)
-                functions origins ~proc_name:(body_proc_name f) ~pure:(is_pure f)
-                ?declaration_name ~primitive_namespace ~pure_name:(body_pure_reference f)
-                f
+                ~past_returns ~ghost_args ~procedure_signatures
+                ~proof_lemmas:
+                  (lemma_context (Proof_bindings.scope_for_location scoped_proofs f.loc))
+                ~proof_support
+                ~predicate_bodies:
+                  (body_contexts (Proof_bindings.scope_for_location scoped_proofs f.loc))
+                ~libraries:(library_paths libraries) functions origins
+                ~proc_name:(body_proc_name f) ~pure:(is_pure f) ?declaration_name
+                ~primitive_namespace ~pure_name:(body_pure_reference f) f
             in
             Ok (Some (f, member)))
   in

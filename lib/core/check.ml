@@ -79,10 +79,13 @@ let file ~(include_dirs : string list) ~(emit_rav : bool) ~(smt_timeout : int)
       | Ok (program, origins) ->
           let result = R.verify ~options:{ R.default_options with smt_timeout } program in
           let explicit_proof_files =
-            List.filter_map source.proof ~f:(function
-              | Caravan_spec.Spec_ast.Proof_lemma { lemma_name; _ } ->
-                  Some lemma_name.pid_loc.loc_start.pos_fname
-              | _ -> None)
+            List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+                match entry.Proof_scopes.declaration with
+                | Caravan_spec.Spec_ast.Proof_lemma _ ->
+                    Some entry.name.pid_loc.loc_start.pos_fname
+                | _ when Option.is_some entry.scope.owner ->
+                    Some entry.name.pid_loc.loc_start.pos_fname
+                | _ -> None)
           in
           List.iter result.diagnostics ~f:(fun d ->
               Report.print_diagnostic (blame ~explicit_proof_files (explain origins d)));

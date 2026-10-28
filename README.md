@@ -26,6 +26,12 @@ Named signatures and `.mli` files restrict the members available to callers;
 place exported function contracts in the signature. Private function bodies are
 also verified.
 
+Static source modules can have mirrored blocks in their companion `.proof` file,
+containing predicates, invariants and lemmas. Inside a block, proofs can use private
+implementation types. Module signatures expose abstract resource contracts while
+hiding their definitions and implementation lemmas. Aliases preserve resource
+identity. Other scoped declarations and functor proof bodies are not supported yet.
+
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.
 
@@ -259,8 +265,7 @@ let facts : (int Atomic.t, Authority.t) Ghost.field = Ghost.field ()
 
 Each instance has a distinct resource type. Resource operations are qualified,
 such as `Facts.set`, `Authority.auth`, `Authority.frag`, `Authority.auth_frag`,
-and `Authority.full`. These declarations support these library instances;
-general proof-module definitions are not supported yet.
+and `Authority.full`. These declarations support these library instances.
 
 `Ghost.at facts cell` names a ghost location attached to an owner of the declared
 type. Use it through `own`, for example

@@ -41,14 +41,10 @@ Ordinary preconditions cannot be borrowed from an open invariant across the call
   [Error] File "ordinary_invariant.ml", line 1, columns 16-37:
   1 | let read cell = Atomic_cell.read cell
                       ^^^^^^^^^^^^^^^^^^^^^
-  Verification Error: An invariant open around this atomic call may not be closable if the call aborts.
-  File "ordinary_invariant.ml", line 3, columns 13-27:
-  3 |       unfold protected cell;
-                   ^^^^^^^^^^^^^^
-  Related Location: This invariant may not be closable again if the call aborts.
-  File "ordinary_invariant.proof", line 2, columns 30-55:
-  2 |   Atomic_cell.holds cell 0 && Atomic_cell.ticket cell 0
-                                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  Verification Error: A precondition may not hold for this call.
+  File "./atomic_cell.mli", line 13, columns 28-45:
+  13 |     requires shared cell && ticket cell count
+                                   ^^^^^^^^^^^^^^^^^
   Related Location: This predicate may not hold.
   [1]
 

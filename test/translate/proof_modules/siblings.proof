@@ -1,0 +1,39 @@
+module Left = struct
+  predicate owned (x : t) (n [@implicit] : int) = own x.count n
+
+  lemma initialize (x : t) (n : int)
+    requires (own x.count n)
+    ensures (owned x n) =
+    fold owned x n
+
+  lemma roundtrip (x : t) (n : int)
+    requires (owned x n)
+    ensures (owned x n) =
+    unfold owned x;
+    fold owned x n
+end
+
+module Right = struct
+  predicate owned (x : t) (n [@implicit] : int) = own x.count n
+
+  lemma initialize (x : t) (n : int)
+    requires (own x.count n)
+    ensures (owned x n) =
+    fold owned x n
+
+  lemma roundtrip (x : t) (n : int)
+    requires (owned x n)
+    ensures (owned x n) =
+    unfold owned x;
+    fold owned x n
+end
+
+lemma preserve_left (x : Left.t) (n : int)
+  requires (Left.owned x n)
+  ensures (Left.owned x n) =
+  Left.roundtrip x n
+
+lemma preserve_right (x : Right.t) (n : int)
+  requires (Right.owned x n)
+  ensures (Right.owned x n) =
+  Right.roundtrip x n

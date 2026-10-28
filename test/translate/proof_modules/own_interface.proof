@@ -1,0 +1,14 @@
+module Nested = struct
+  invariant zero (x : t) = own x 0
+
+  lemma private_roundtrip (x : t)
+    requires (zero x)
+    ensures (zero x) =
+    unfold zero x;
+    fold zero x
+end
+
+lemma use_nested_private (x : Nested.t)
+  requires (Nested.zero x)
+  ensures (Nested.zero x) =
+  Nested.private_roundtrip x

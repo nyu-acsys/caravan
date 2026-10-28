@@ -71,6 +71,14 @@ type specialization = {
   declarations : Typedtree.type_declaration list;
 }
 
+type resource_constraint = {
+  owner : Path.t option;
+  signature : signature_view;
+  substitution : Subst.t;
+  at : Location.t;
+  restricts_visibility : bool;
+}
+
 type t = {
   structure : Typedtree.structure;
   values : value list;
@@ -78,6 +86,7 @@ type t = {
   aliases : (Path.t * Path.t) list;
   bindings : checked_binding list;
   specializations : specialization list;
+  constraints : resource_constraint list;
 }
 
 type module_view = {
@@ -154,6 +163,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let aliases = ref [] in
   let bindings = ref [] in
   let specializations = ref [] in
+  let constraints = ref [] in
   let expansions = ref [] in
   let stage_identities = ref [] in
   let parameter_substitution = ref Subst.identity in
@@ -556,7 +566,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | Some id, Some path -> Subst.add_module id path substitution
               | _ -> substitution))
   in
-  let rec constrain substitution signature view =
+  let rec constrain ~restricts_visibility at substitution signature view =
     if Option.is_some view.checked then
       begin match (signature.signature_resources, signature.signature_values) with
       | (_, resource) :: _, _ ->
@@ -569,6 +579,15 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       end
     else
       let* substitution = substitutions substitution signature view in
+      constraints :=
+        {
+          owner = Option.first_some view.application_identity view.identity;
+          signature;
+          substitution;
+          at;
+          restricts_visibility;
+        }
+        :: !constraints;
       let* values =
         List.map signature.signature_values ~f:(fun (name, signature_value) ->
             match member view.values name with
@@ -595,7 +614,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 begin match signature.signature_alias with
                 | Some _ -> Ok (name, view)
                 | None ->
-                    let* view = constrain substitution signature.signature_body view in
+                    let* view =
+                      constrain ~restricts_visibility at substitution
+                        signature.signature_body view
+                    in
                     Ok (name, view)
                 end)
         |> Result.all
@@ -609,7 +631,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           modtypes = signature.signature_modtypes;
         }
   in
-  let apply_signature signature view = constrain Subst.identity signature view in
+  let apply_signature ~restricts_visibility at signature view =
+    constrain ~restricts_visibility at Subst.identity signature view
+  in
   let seal_application_identity path signature view =
     let rec identities substitution path signature =
       let substitution = signature_module_substitution substitution path signature in
@@ -780,13 +804,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           begin match annotation with
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
-              let* () =
-                if List.is_empty signature.signature_resources then Ok ()
-                else
-                  unavailable mty.mty_loc
-                    "A resource declaration on an inline module structure"
+              let* view =
+                apply_signature ~restricts_visibility:true mty.mty_loc signature view
               in
-              let* view = apply_signature signature view in
               Ok
                 (Option.value_map identity ~default:view ~f:(fun path ->
                      seal_application_identity path signature view))
@@ -1248,7 +1268,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 (Annotation.of_comments interface.interface_comments)
                 interface.scope typed
             in
-            let* _ = apply_signature signature view in
+            let* _ =
+              apply_signature ~restricts_visibility:false interface.scope.location
+                signature view
+            in
             Ok ()
         end
   in
@@ -1278,6 +1301,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
       bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
+      constraints = List.rev !constraints;
       specializations =
         List.rev_map !specializations
           ~f:(fun (template, parameter, argument, values, identity, declarations) ->

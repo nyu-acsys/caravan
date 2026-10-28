@@ -1,0 +1,3 @@
+module Worker = struct
+  lemma loop (n : int) = loop n
+end

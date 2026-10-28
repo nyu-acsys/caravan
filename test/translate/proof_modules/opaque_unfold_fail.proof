@@ -1,0 +1,9 @@
+module Box = struct
+  predicate held (x : t) = own x 0
+end
+
+lemma leak (x : Box.t)
+  requires (Box.held x)
+  ensures (Box.held x) =
+  unfold Box.held x;
+  fold Box.held x

@@ -1,0 +1,20 @@
+module Cells = struct
+  predicate held (box : holder) = exists value : cell. own box.next value
+
+  lemma roundtrip (box : holder)
+    requires (held box)
+    ensures (held box) =
+    let value = unfold held box {value} in
+    fold held box {value = value}
+end
+
+lemma outside (box : Alias.holder)
+  requires (Alias.held box)
+  ensures (Cells.held box) =
+  let value = unfold Alias.held box {value} in
+  fold Cells.held box {value = value}
+
+lemma alias_roundtrip (box : Alias.holder)
+  requires (Alias.held box)
+  ensures (Cells.held box) =
+  Alias.roundtrip box

@@ -1,0 +1,5 @@
+module Secret = struct
+  lemma hidden = ()
+end
+
+lemma leak = Alias.hidden

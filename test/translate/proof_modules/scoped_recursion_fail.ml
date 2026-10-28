@@ -1,0 +1,1 @@
+module Worker = struct end

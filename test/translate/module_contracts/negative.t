@@ -2,7 +2,7 @@
   [Error] File "abort_restoration_fail.ml", line 1, column 15 to line 11, column 14:
   1 | module Checked : sig
                      ^^^^^
-  Verification Error: This view's atomic update may not be restorable if the actual operation aborts.
+  Verification Error: The module argument's precondition is not provided by this view.
   File "abort_restoration_fail.ml", line 6, columns 2-21:
   6 |   val read : t -> int
         ^^^^^^^^^^^^^^^^^^^
