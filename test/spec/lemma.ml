@@ -152,6 +152,12 @@ let () =
       assert (empty.pid_str = "Empty")
   | _ -> failwith "unexpected logical type or state declarations"
   end;
+  begin match parse_proof "module Authority = Auth (Owner.Facts)" with
+  | [ Proof_resource { resource_kind = Resource_auth (Qdot (Qid owner, facts)); _ } ] ->
+      assert (owner.pid_str = "Owner");
+      assert (facts.pid_str = "Facts")
+  | _ -> failwith "qualified resource argument was not parsed"
+  end;
   begin match
     parse_proof
       {|type fact = Seen of int
@@ -167,7 +173,8 @@ let () =
   | [
    Proof_type _;
    Proof_resource { resource_name = facts; resource_kind = Resource_set _ };
-   Proof_resource { resource_name = authority; resource_kind = Resource_auth argument };
+   Proof_resource
+     { resource_name = authority; resource_kind = Resource_auth (Qid argument) };
    Proof_field { field_name; field_type = PTtyapp (_, [ _; _ ]) };
    Proof_function fn;
    Proof_lemma use;

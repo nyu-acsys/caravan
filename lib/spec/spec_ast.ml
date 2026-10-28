@@ -172,7 +172,7 @@ type return_adapter = {
   returns_body : proof_expr;
 }
 
-type resource_kind = Resource_set of pty | Resource_auth of id
+type resource_kind = Resource_set of pty | Resource_auth of qualid
 
 type proof_module_parameter =
   | Proof_named_parameter of id * qualid

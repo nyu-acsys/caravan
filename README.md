@@ -27,11 +27,11 @@ place exported function contracts in the signature. Private function bodies are
 also verified.
 
 Static source modules can have mirrored blocks in their companion `.proof` file,
-containing logical types and functions, predicates, invariants and lemmas. Proofs
-can use private implementation types. Module signatures expose abstract resource contracts while
-hiding their definitions and implementation lemmas. Aliases preserve resource
-identity. Scoped resource-algebra instances, ghost fields, AU facades, state/action
-declarations and functor proof bodies are not supported yet.
+containing logical types and functions, resource-algebra instances, ghost fields,
+predicates, invariants and lemmas. Proofs can use private implementation types.
+Module signatures expose abstract resource contracts while hiding their definitions
+and implementation lemmas. Aliases preserve resource identity. Scoped AU facades, state/action declarations and functor proof bodies are
+not supported yet.
 
 A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.
@@ -271,6 +271,8 @@ and `Authority.full`. These declarations support these library instances.
 `Ghost.at facts cell` names a ghost location attached to an owner of the declared
 type. Use it through `own`, for example
 `own (Ghost.at facts cell) (Authority.auth (Facts.set known))`.
+Qualified descriptors such as `Ghost.at Counter.facts cell` follow module aliases
+and visibility. `Auth (Counter.Facts)` can likewise use a qualified resource module.
 Declaring a field grants no ownership and performs no allocation. In a lemma
 body, `Ghost.fpu location before after` checks a frame-preserving resource update,
 consuming ownership of `before` and producing ownership of `after`. It must preserve

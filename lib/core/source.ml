@@ -19,6 +19,11 @@ type library = { library_name : string; library_id : Ident.t; library : interfac
 
 type proof_resource = {
   resource_name : string;
+  resource_backend : string;
+  resource_scope : Path.t option;
+  resource_path : Path.t;
+  resource_environment : Env.t;
+  resource_auth_path : Path.t option;
   resource_kind : S.resource_kind;
   resource_type : Types.type_expr;
   resource_id : Ident.t;
@@ -30,6 +35,11 @@ type proof_resource = {
 
 type proof_field = {
   field_name : string;
+  field_backend : string;
+  field_scope : Path.t option;
+  field_id : Ident.t;
+  field_path : Path.t;
+  field_environment : Env.t;
   field_owner : Types.type_expr;
   field_value : Types.type_expr;
   field_at : Location.t;
@@ -165,10 +175,33 @@ let add_spec_bindings ?(source_modules = []) spec_bindings lexical_env =
         end
     | Sig_typext _ | Sig_class _ | Sig_class_type _ -> env)
 
-let annotation_env source lexical_env =
-  add_spec_bindings
-    ~source_modules:(source_module_ids source.typed)
-    source.spec_bindings lexical_env
+let annotation_env ?at source lexical_env =
+  let source_modules =
+    source_module_ids source.typed
+    @ List.concat_map source.proof_scopes.scopes ~f:(fun scope ->
+        source_module_ids scope.Proof_scopes.structure)
+  in
+  let env = add_spec_bindings ~source_modules source.spec_bindings lexical_env in
+  let contains (outer : Location.t) (inner : Location.t) =
+    outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
+    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+  in
+  match at with
+  | None -> env
+  | Some at ->
+      let scope =
+        List.filter source.proof_scopes.scopes ~f:(fun scope ->
+            contains scope.Proof_scopes.source_location at)
+        |> List.max_elt ~compare:(fun a b ->
+            Int.compare
+              (List.length a.Proof_scopes.namespace)
+              (List.length b.Proof_scopes.namespace))
+      in
+      Option.value_map scope ~default:env ~f:(fun scope ->
+          let bindings =
+            specification_bindings scope.structure.str_final_env scope.environment
+          in
+          add_spec_bindings ~source_modules bindings env)
 
 (** The file next to [file] with the extension [ext] instead of its own, if it exists. *)
 let sibling file ext =
@@ -444,8 +477,8 @@ let proof_constructor_collision env interface proof =
 (** Type-checks the algebraic types of [proof] in [env], after the implementation, and
     returns their descriptors and the environment for the rest of the proof. *)
 let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
-    ?complete_proof (env : Env.t) (interface : interface option)
-    (proof : S.proof_decl list) :
+    ?complete_proof ?(canonical_owner = Fn.id) (env : Env.t)
+    (interface : interface option) (proof : S.proof_decl list) :
     ( Env.t * Datatypes.t list * proof_resource list * proof_field list * proof_au list,
       Report.error )
     Result.t =
@@ -690,6 +723,35 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
             in
             let t = named "t" in
             let arrow a b = Ast_helper.Typ.arrow ~loc:at Nolabel a b in
+            let* auth_base =
+              match resource_kind with
+              | Resource_set _ -> Ok None
+              | Resource_auth underlying ->
+                  let resolved =
+                    try
+                      let path, _ = Env.find_module_by_name (longident underlying) env in
+                      Some (Env.normalize_module_path None env path |> canonical_owner)
+                    with Stdlib.Not_found -> None
+                  in
+                  begin match resolved with
+                  | None ->
+                      Error
+                        (Report.error Type (S.qualid_loc underlying)
+                           "Auth requires a previously declared resource module")
+                  | Some path ->
+                      begin match
+                        List.find resources ~f:(fun resource ->
+                            Path.same path resource.resource_path
+                            || Path.same path (Pident resource.resource_id))
+                      with
+                      | Some resource -> Ok (Some (path, resource))
+                      | None ->
+                          Error
+                            (Report.error Type (S.qualid_loc underlying)
+                               "Auth requires a previously declared resource module")
+                      end
+                  end
+            in
             let* extra_types, extra =
               match resource_kind with
               | Resource_set elt ->
@@ -709,21 +771,14 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
                       ],
                       [ ("set", arrow set t) ] )
               | Resource_auth underlying ->
-                  begin match
-                    List.find resources ~f:(fun r ->
-                        String.equal r.resource_name underlying.pid_str)
-                  with
-                  | None ->
-                      Error
-                        (Report.error Type underlying.pid_loc
-                           "Auth requires a previously declared resource module")
+                  begin match auth_base with
                   | Some _ ->
                       let base =
                         Ast_helper.Typ.constr ~loc:at
                           {
                             txt =
                               Ldot
-                                ( { txt = Lident underlying.pid_str; loc = at },
+                                ( { txt = longident underlying; loc = at },
                                   { txt = "t"; loc = at } );
                             loc = at;
                           }
@@ -734,6 +789,10 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
                           ("auth_frag", arrow base (arrow base t))
                           :: List.map [ "auth"; "frag"; "full" ] ~f:(fun n ->
                               (n, arrow base t)) )
+                  | None ->
+                      Error
+                        (Report.error Type (S.qualid_loc underlying)
+                           "Auth requires a previously declared resource module")
                   end
             in
             let values =
@@ -792,20 +851,19 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
                   let path, _ = Env.find_type_by_name (Lident "set") env in
                   Ok [ ("set", [ Ctype.newconstr path [ element ] ], resource_type) ]
               | Resource_auth underlying, _ ->
-                  begin match
-                    List.find resources ~f:(fun r ->
-                        String.equal r.resource_name underlying.pid_str)
-                  with
-                  | Some base ->
+                  begin match auth_base with
+                  | Some _ ->
+                      let base_type =
+                        checked_type env at
+                          (PTtyapp (Qdot (underlying, S.mk_id ~loc:at "t"), []))
+                      in
                       Ok
-                        (( "auth_frag",
-                           [ base.resource_type; base.resource_type ],
-                           resource_type )
+                        (("auth_frag", [ base_type; base_type ], resource_type)
                         :: List.map [ "auth"; "frag"; "full" ] ~f:(fun operation ->
-                            (operation, [ base.resource_type ], resource_type)))
+                            (operation, [ base_type ], resource_type)))
                   | None ->
                       Error
-                        (Report.error Type underlying.pid_loc
+                        (Report.error Type (S.qualid_loc underlying)
                            "Auth requires a previously declared resource module")
                   end
               | Resource_set _, None ->
@@ -825,6 +883,11 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
             let resource =
               {
                 resource_name = name.pid_str;
+                resource_backend = name.pid_str;
+                resource_scope = None;
+                resource_path = Pident resource_id;
+                resource_environment = env;
+                resource_auth_path = Option.map auth_base ~f:fst;
                 resource_kind;
                 resource_type;
                 resource_id;
@@ -873,12 +936,23 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
                   (Report.error Type at "A ghost field owner must be a heap reference")
             in
             let* env = value env name (core_type ~at field_type) in
+            let field_path, _ = Env.find_value_by_name (Lident name.pid_str) env in
+            let* field_id =
+              match field_path with
+              | Pident id -> Ok id
+              | _ -> Error (Report.error Type at "A ghost field must be a local value")
+            in
             Ok
               ( env,
                 descriptors,
                 resources,
                 {
                   field_name = name.pid_str;
+                  field_backend = name.pid_str;
+                  field_scope = None;
+                  field_id;
+                  field_path;
+                  field_environment = env;
                   field_owner = owner;
                   field_value = content;
                   field_at = at;
@@ -897,7 +971,8 @@ let elaborate_proof_types ?(add_standard = true) ?(previous = ([], [], [], []))
   in
   Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
 
-let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
+let scoped_proof_types ?only ?(previous_resources = []) runtime_env root_env
+    (scopes : Proof_scopes.t) =
   let root_bindings = specification_bindings runtime_env root_env in
   let aliases =
     List.concat_map scopes.scopes ~f:(fun scope ->
@@ -985,7 +1060,8 @@ let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
         let proof =
           List.filter_map declarations ~f:(fun entry ->
               match entry.declaration with
-              | S.Proof_type _ | Proof_function _ -> Some entry.declaration
+              | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _ ->
+                  Some entry.declaration
               | _ -> None)
         in
         let under_functor =
@@ -998,21 +1074,29 @@ let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
           else
             Report.unsupported
               (Option.value scope.proof_location ~default:scope.source_location)
-              "A logical type or function inside a functor proof"
+              "A type, function, resource, or field inside a functor proof"
         in
         let inherited =
           List.filter previous ~f:(fun (ancestor, _, _) ->
               prefix ancestor.Proof_scopes.namespace scope.namespace)
         in
+        let known_resources =
+          previous_resources
+          @ List.concat_map previous ~f:(fun (_, (_, _, resources, _), _) -> resources)
+        in
         let own_names =
           List.filter_map proof ~f:(function
             | S.Proof_type { type_name; _ } -> Some type_name.pid_str
             | Proof_function { function_name; _ } -> Some function_name.pid_str
+            | Proof_resource { resource_name; _ } -> Some resource_name.pid_str
+            | Proof_field { field_name; _ } -> Some field_name.pid_str
             | _ -> None)
         in
         let without_shadowed bindings =
           List.filter bindings ~f:(function
-            | Types.Sig_type (id, _, _, _) | Sig_value (id, _, _) ->
+            | Types.Sig_type (id, _, _, _)
+            | Sig_value (id, _, _)
+            | Sig_module (id, _, _, _, _) ->
                 not (List.mem own_names (Ident.name id) ~equal:String.equal)
             | _ -> true)
         in
@@ -1035,8 +1119,59 @@ let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
                     refresh_aliases env owner)
               else env)
         in
-        let* env, types, _, _, _ =
-          elaborate_proof_types ~add_standard:false base None proof
+        let* env, types, resources, fields, _ =
+          elaborate_proof_types ~add_standard:false ~previous:([], known_resources, [], [])
+            ~canonical_owner:(Proof_scopes.canonical_owner scopes)
+            base None proof
+        in
+        let resources =
+          List.filter resources ~f:(fun resource ->
+              not
+                (List.exists known_resources ~f:(fun known ->
+                     Ident.same known.resource_id resource.resource_id)))
+          |> List.map ~f:(fun resource ->
+              let path =
+                Option.value_map scope.owner ~default:(Path.Pident resource.resource_id)
+                  ~f:(fun owner -> Path.Pdot (owner, resource.resource_name))
+              in
+              let module_paths =
+                path
+                :: Option.to_list
+                     (Option.map scope.declaration_id ~f:(fun id ->
+                          Path.Pdot (Path.Pident id, resource.resource_name)))
+                @ List.filter_map aliases ~f:(fun (alias, target) ->
+                    Option.bind scope.owner ~f:(fun owner ->
+                        Option.some_if (Path.same target owner)
+                          (Path.Pdot (alias, resource.resource_name))))
+              in
+              let descriptor =
+                Datatypes.with_paths resource.resource_descriptor
+                  (List.map module_paths ~f:(fun path -> Path.Pdot (path, "t")))
+              in
+              let aliases =
+                List.map resource.resource_aliases ~f:(fun alias ->
+                    Datatypes.with_paths alias
+                      (List.map module_paths ~f:(fun path -> Path.Pdot (path, "element"))))
+              in
+              {
+                resource with
+                resource_scope = scope.owner;
+                resource_path = path;
+                resource_environment = env;
+                resource_descriptor = descriptor;
+                resource_aliases = aliases;
+              })
+        in
+        let fields =
+          List.map fields ~f:(fun field ->
+              {
+                field with
+                field_scope = scope.owner;
+                field_path =
+                  Option.value_map scope.owner ~default:field.field_path ~f:(fun owner ->
+                      Path.Pdot (owner, field.field_name));
+                field_environment = env;
+              })
         in
         let namespaced =
           List.map types ~f:(fun data ->
@@ -1060,7 +1195,7 @@ let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
               | _ -> data)
         in
         let bindings = specification_bindings base env in
-        Ok (previous @ [ (scope, (env, namespaced), bindings) ]))
+        Ok (previous @ [ (scope, (env, namespaced, resources, fields), bindings) ]))
   in
   let module_chain scope =
     List.mapi scope.Proof_scopes.namespace ~f:(fun index name ->
@@ -1128,11 +1263,15 @@ let scoped_proof_types ?only runtime_env root_env (scopes : Proof_scopes.t) =
           List.find typed ~f:(fun (candidate, _, _) ->
               Option.equal Ident.same candidate.declaration_id scope.declaration_id)
         with
-        | Some (_, (env, _), _) -> env
+        | Some (_, (env, _, _, _), _) -> env
         | None -> if Option.is_none scope.owner then qualified_env else scope.environment)
   in
-  let types = List.concat_map typed ~f:(fun (_, (_, types), _) -> types) in
-  Ok (qualified_env, scopes, types)
+  let types = List.concat_map typed ~f:(fun (_, (_, types, _, _), _) -> types) in
+  let resources =
+    List.concat_map typed ~f:(fun (_, (_, _, resources, _), _) -> resources)
+  in
+  let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields), _) -> fields) in
+  Ok (qualified_env, scopes, types, resources, fields)
 
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
@@ -1276,16 +1415,16 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                ->
                match declaration with
                | S.Proof_module { module_name; _ } ->
-                   let* env, proof_scopes, types =
-                     scoped_proof_types ~only:[ module_name.pid_str ] runtime_env env
-                       proof_scopes
+                   let* env, proof_scopes, types, module_resources, module_fields =
+                     scoped_proof_types ~only:[ module_name.pid_str ]
+                       ~previous_resources:resources runtime_env env proof_scopes
                    in
                    Ok
                      ( env,
                        root_types,
                        scoped_types @ types,
-                       resources,
-                       fields,
+                       resources @ module_resources,
+                       fields @ module_fields,
                        aus,
                        proof_scopes )
                | declaration ->

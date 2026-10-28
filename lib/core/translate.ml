@@ -402,6 +402,7 @@ type proof_support = {
   atomic_updates : atomic_signature list;
   resources : Source.proof_resource list;
   ghost_fields : Source.proof_field list;
+  canonical_path : Path.t -> Path.t;
   logical_functions : (string * lemma_signature) list;
   mathematical_types : Datatypes.t list;
   predicate_inputs : (string * int) list;
@@ -420,6 +421,7 @@ let empty_proof_support =
     atomic_updates = [];
     resources = [];
     ghost_fields = [];
+    canonical_path = Fn.id;
     logical_functions = [];
     mathematical_types = [];
     predicate_inputs = [];
@@ -1014,20 +1016,24 @@ let atomic_arguments ~loc:l signature method_ values =
       else [ token; inputs ]
 
 let resource_operation env = function
-  | S.Qdot (Qid m, f) ->
-      Option.bind
-        (List.find env.ctx.proof_support.resources ~f:(fun r ->
-             String.equal r.Source.resource_name m.pid_str))
-        ~f:(fun resource ->
-          List.find_map resource.resource_operations ~f:(fun (op, inputs, result) ->
-              Option.some_if (String.equal op f.pid_str)
-                {
-                  lemma_raven = m.pid_str ^ "." ^ op;
-                  lemma_inputs = inputs;
-                  lemma_implicit_count = 0;
-                  lemma_outputs = [ result ];
-                }))
-  | _ -> None
+  | S.Qdot (parent, operation) ->
+      Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+          let path = env.ctx.proof_support.canonical_path path in
+          Option.bind
+            (List.find env.ctx.proof_support.resources ~f:(fun resource ->
+                 Path.same path resource.Source.resource_path
+                 || Path.same path (Pident resource.resource_id)))
+            ~f:(fun resource ->
+              List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
+                  Option.some_if
+                    (String.equal name operation.pid_str)
+                    {
+                      lemma_raven = resource.resource_backend ^ "." ^ name;
+                      lemma_inputs = inputs;
+                      lemma_implicit_count = 0;
+                      lemma_outputs = [ result ];
+                    })))
+  | Qid _ -> None
 
 let logical_signature env q =
   match q with
@@ -1040,21 +1046,26 @@ let logical_signature env q =
             ~equal:String.equal
       end
 
+let ghost_descriptor env q =
+  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
+      let path = env.ctx.proof_support.canonical_path path in
+      List.find env.ctx.proof_support.ghost_fields ~f:(fun field ->
+          Path.same path field.Source.field_path || Path.same path (Pident field.field_id)))
+
+let shadowed_ghost_descriptor env = function
+  | S.Qid id -> List.Assoc.mem env.vars id.pid_str ~equal:String.equal
+  | Qdot _ -> false
+
 let ghost_projection env t =
   match spine t [] with
-  | ( { S.term_desc = Tvar (Qdot (Qid m, op)); _ },
-      [ { term_desc = Tvar (Qid field); _ }; owner ] )
-    when String.equal m.pid_str "Ghost" && String.equal op.pid_str "at" ->
-      Option.bind
-        (List.find env.ctx.proof_support.ghost_fields ~f:(fun f ->
-             String.equal f.Source.field_name field.pid_str))
-        ~f:(fun descriptor ->
-          Option.some_if
-            (not (List.Assoc.mem env.vars field.pid_str ~equal:String.equal))
-            (descriptor, owner))
+  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, [ { term_desc = Tvar field; _ }; owner ]
+    when String.equal m.pid_str "Ghost"
+         && String.equal op.pid_str "at"
+         && not (shadowed_ghost_descriptor env field) ->
+      Option.map (ghost_descriptor env field) ~f:(fun descriptor -> (descriptor, owner))
   | _ -> None
 
-let ghost_field_name (field : Source.proof_field) = "proof$" ^ field.field_name
+let ghost_field_name (field : Source.proof_field) = "proof$" ^ field.field_backend
 
 let ghost_operation t =
   match spine t [] with
@@ -1199,8 +1210,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     List.Assoc.mem env.vars x ~equal:String.equal
     || List.Assoc.mem env.funcs x ~equal:String.equal
     || List.mem logical_names x ~equal:String.equal
-    || List.exists env.ctx.proof_support.ghost_fields ~f:(fun f ->
-        String.equal f.Source.field_name x)
+    || Option.is_some (ghost_descriptor env (S.Qid (S.mk_id ~loc:at x)))
     || List.mem
          [
            "own";
@@ -2041,6 +2051,14 @@ and location_of env (t : S.term) =
       let* owner = formula env owner in
       Ok (R.Expr.field ~loc:l owner (qualified_name ~loc:l (ghost_field_name field)))
   | None -> (
+      let* () =
+        match spine t [] with
+        | ( { term_desc = Tvar (Qdot (Qid m, operation)); _ },
+            [ { term_desc = Tvar field; _ }; _ ] )
+          when String.equal m.pid_str "Ghost" && String.equal operation.pid_str "at" ->
+            error (S.qualid_loc field) "Unknown or inaccessible ghost field"
+        | _ -> Ok ()
+      in
       match t.term_desc with
       | Tfield
           ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
@@ -2471,21 +2489,18 @@ let ghost_initializers env ~owner t =
   let* fields =
     all entries ~f:(fun entry ->
         match spine entry [] with
-        | ( { term_desc = Tvar (Qdot (Qid m, op)); _ },
-            [ { term_desc = Tvar (Qid id); _ }; value ] )
+        | { term_desc = Tvar (Qdot (Qid m, op)); _ }, [ { term_desc = Tvar q; _ }; value ]
           when String.equal m.pid_str "Ghost" && String.equal op.pid_str "init" ->
-            begin match
-              List.find env.ctx.proof_support.ghost_fields ~f:(fun field ->
-                  String.equal field.Source.field_name id.pid_str)
-            with
-            | None -> error id.pid_loc "Unknown ghost field"
-            | Some field when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
-                error id.pid_loc "This name shadows a ghost field descriptor"
+            let at = S.qualid_loc q in
+            begin match ghost_descriptor env q with
+            | None -> error at "Unknown ghost field"
+            | Some _ when shadowed_ghost_descriptor env q ->
+                error at "This name shadows a ghost field descriptor"
             | Some field ->
                 let* () =
                   if Ctype.is_equal env.ctx.env false [ owner ] [ field.field_owner ] then
                     Ok ()
-                  else error id.pid_loc "This ghost field has a different owner type"
+                  else error at "This ghost field has a different owner type"
                 in
                 let* () =
                   Source.check_logical_expression env.ctx.env
@@ -7639,7 +7654,8 @@ let items source ~fresh (inventory : Module_inventory.t) =
                 id;
                 namespace = entry.namespace;
                 paths = entry.paths;
-                environment = Source.annotation_env source site.environment;
+                environment =
+                  Source.annotation_env source ~at:site.item_loc site.environment;
                 signature_sites = entry.signatures;
                 raven_name = fresh base;
                 params;
@@ -7845,7 +7861,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           id;
           namespace = outer.namespace;
           paths = [ Path.Pident id ];
-          environment = Source.annotation_env source rest.exp_env;
+          environment = Source.annotation_env source ~at:rest.exp_loc rest.exp_env;
           signature_sites = [];
           raven_name =
             (if List.is_empty outer.namespace then Ident.name id
@@ -9920,7 +9936,7 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
 
 let scoped_predicate (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Lemma _ | Function _ -> None
+  | Lemma _ | Function _ | Resource _ | Field _ -> None
   | Predicate (p, body) ->
       let p = { p with S.pred_name = { p.pred_name with pid_str = binding.backend } } in
       let definition = if p.pred_persistent then Direct_invariant body else Body body in
@@ -9928,7 +9944,7 @@ let scoped_predicate (binding : Proof_bindings.binding) =
 
 let scoped_lemma (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Predicate _ | Function _ -> None
+  | Predicate _ | Function _ | Resource _ | Field _ -> None
   | Lemma (S.Proof_lemma lemma) ->
       Some
         (S.Proof_lemma
@@ -9944,7 +9960,7 @@ let scoped_function (binding : Proof_bindings.binding) =
              declaration with
              function_name = { declaration.function_name with pid_str = binding.backend };
            })
-  | Predicate _ | Lemma _ | Function _ -> None
+  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ -> None
 
 let signature_has_refs ~types ~environment ~substitution typ =
   let rec contains seen typ =
@@ -10001,7 +10017,7 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let* actual =
                       match binding.kind with
                       | Predicate (p, _) -> Ok p
-                      | Lemma _ | Function _ ->
+                      | Lemma _ | Function _ | Resource _ | Field _ ->
                           error binding.entry.name.pid_loc
                             "A module resource must be defined as a predicate or \
                              invariant"
@@ -10159,6 +10175,42 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     in
     {
       source with
+      proof_resources =
+        List.map source.proof_resources ~f:(fun resource ->
+            match resource.Source.resource_scope with
+            | None -> resource
+            | Some owner ->
+                let namespace =
+                  Option.value_map
+                    (Proof_scopes.find_owner source.proof_scopes (Some owner)) ~default:[]
+                    ~f:(fun scope -> scope.namespace)
+                in
+                let backend =
+                  fresh (String.concat ~sep:"_" (namespace @ [ resource.resource_name ]))
+                in
+                {
+                  resource with
+                  resource_backend = backend;
+                  resource_descriptor =
+                    Datatypes.with_name resource.resource_descriptor backend;
+                });
+      proof_fields =
+        List.map source.proof_fields ~f:(fun field ->
+            match field.Source.field_scope with
+            | None -> field
+            | Some owner ->
+                let namespace =
+                  Option.value_map
+                    (Proof_scopes.find_owner source.proof_scopes (Some owner)) ~default:[]
+                    ~f:(fun scope -> scope.namespace)
+                in
+                {
+                  field with
+                  field_backend =
+                    fresh
+                      (String.uncapitalize
+                         (String.concat ~sep:"_" (namespace @ [ field.field_name ])));
+                });
       proof_types =
         List.map source.proof_types ~f:(fun data ->
             if List.mem scoped_types data.Datatypes.at ~equal:Poly.equal then
@@ -10177,6 +10229,71 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let declaration_environment name =
     Option.value_map (scoped_binding name) ~default:source.env ~f:(fun binding ->
         binding.environment)
+  in
+  let proof_assets scope =
+    let environment =
+      Option.value_map scope ~default:source.env ~f:(fun scope ->
+          Source.annotation_env source scope.Proof_scopes.environment)
+    in
+    let rebase = Proof_bindings.context_type scoped_proofs ~environment in
+    let private_owner owner =
+      match (owner, scope) with
+      | None, _ -> true
+      | Some owner, Some caller ->
+          Option.exists (Proof_scopes.find_owner source.proof_scopes (Some owner))
+            ~f:(fun owner ->
+              Option.is_some
+                (Proof_bindings.drop_prefix owner.namespace caller.Proof_scopes.namespace))
+      | Some _, None -> false
+    in
+    let project owner typ =
+      if private_owner owner then typ
+      else rebase (Proof_bindings.public_type scoped_proofs typ)
+    in
+    let visible entry =
+      Option.value_map entry ~default:true
+        ~f:(Proof_bindings.visible scoped_proofs ~scope)
+    in
+    let resources =
+      List.filter_map source.proof_resources ~f:(fun resource ->
+          let binding =
+            List.find scoped_proofs.bindings ~f:(fun binding ->
+                match binding.kind with
+                | Resource actual ->
+                    Ident.same actual.resource_id resource.Source.resource_id
+                | _ -> false)
+          in
+          if not (visible binding) then None
+          else
+            let project = project resource.resource_scope in
+            Some
+              {
+                resource with
+                resource_type = project resource.resource_type;
+                resource_operations =
+                  List.map resource.resource_operations ~f:(fun (name, inputs, output) ->
+                      (name, List.map inputs ~f:project, project output));
+              })
+    in
+    let fields =
+      List.filter_map source.proof_fields ~f:(fun field ->
+          let binding =
+            List.find scoped_proofs.bindings ~f:(fun binding ->
+                match binding.kind with
+                | Field actual -> Ident.same actual.field_id field.Source.field_id
+                | _ -> false)
+          in
+          if not (visible binding) then None
+          else
+            let project = project field.field_scope in
+            Some
+              {
+                field with
+                field_owner = project field.field_owner;
+                field_value = project field.field_value;
+              })
+    in
+    (resources, fields)
   in
   let typed = inventory.structure in
   let* libraries = Library_modules.flatten ~fresh source.libraries in
@@ -10602,52 +10719,75 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let* library, arguments =
           match resource.resource_kind with
           | S.Resource_set elt ->
-              let* elt = Source.ocaml_type source.env ~at elt in
+              let* elt = Source.ocaml_type resource.resource_environment ~at elt in
               let* elt = Datatypes.typ types ~at elt in
               Ok ("SetRA", [ elt ])
-          | Resource_auth base ->
-              Ok ("Auth", [ R.Type.named ~loc:l (name ~loc:l base.pid_str) [] ])
+          | Resource_auth _ ->
+              begin match
+                List.find source.proof_resources ~f:(fun base ->
+                    Option.exists resource.resource_auth_path ~f:(fun path ->
+                        Path.same path base.Source.resource_path
+                        || Path.same path (Pident base.resource_id)))
+              with
+              | Some base ->
+                  Ok
+                    ( "Auth",
+                      [ R.Type.named ~loc:l (name ~loc:l base.resource_backend) [] ] )
+              | None -> error at "Auth requires a previously declared resource module"
+              end
         in
         let library = R.Name.make ~loc:l ~path:[ "Library" ] library in
         Ok
-          ( resource.resource_name,
+          ( resource.resource_backend,
             R.Member.instance ~loc:l ~def:(library, arguments)
-              (ident ~loc:l resource.resource_name)
+              (ident ~loc:l resource.resource_backend)
               library ))
   in
   let proof_module_names =
-    List.filter_map source.proof ~f:(function
-      | S.Proof_type { type_name; _ } -> Some (String.capitalize type_name.pid_str)
-      | _ -> None)
+    List.map source.proof_types ~f:(fun data -> data.Datatypes.module_name)
   in
   let runtime_modules =
-    List.filter_map modules ~f:(fun (n, m) ->
-        Option.some_if (not (List.mem proof_module_names n ~equal:String.equal)) m)
+    List.filter_map modules ~f:(fun (name, member) ->
+        Option.some_if (not (List.mem proof_module_names name ~equal:String.equal)) member)
   in
   let proof_modules =
-    List.filter_map source.proof ~f:(function
-      | S.Proof_type { type_name; _ } ->
-          List.Assoc.find modules
-            (String.capitalize type_name.pid_str)
-            ~equal:String.equal
-      | Proof_resource { resource_name; _ } ->
-          List.Assoc.find resource_members resource_name.pid_str ~equal:String.equal
-      | _ -> None)
+    List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+        match entry.Proof_scopes.declaration with
+        | S.Proof_type _ ->
+            Option.bind
+              (List.find source.proof_types ~f:(fun data ->
+                   Poly.equal data.Datatypes.at entry.name.pid_loc))
+              ~f:(fun data ->
+                List.Assoc.find modules data.module_name ~equal:String.equal)
+        | Proof_resource _ ->
+            Option.bind
+              (List.find source.proof_resources ~f:(fun resource ->
+                   Poly.equal resource.Source.resource_at entry.name.pid_loc))
+              ~f:(fun resource ->
+                List.Assoc.find resource_members resource.resource_backend
+                  ~equal:String.equal)
+        | _ -> None)
   in
   let rec resource_dependencies seen resource =
     match resource.Source.resource_kind with
     | S.Resource_set elt ->
-        let* t = Source.ocaml_type source.env ~at:resource.resource_at elt in
+        let* t =
+          Source.ocaml_type resource.resource_environment ~at:resource.resource_at elt
+        in
         Ok (Result_layouts.type_dependencies layouts types t)
-    | Resource_auth base -> (
-        if List.mem seen base.pid_str ~equal:String.equal then Ok []
+    | Resource_auth _ -> (
+        if List.mem seen resource.resource_id ~equal:Ident.same then Ok []
         else
           match
-            List.find source.proof_resources ~f:(fun r ->
-                String.equal r.Source.resource_name base.pid_str)
+            List.find source.proof_resources ~f:(fun base ->
+                Option.exists resource.resource_auth_path ~f:(fun path ->
+                    Path.same path base.Source.resource_path
+                    || Path.same path (Pident base.resource_id)))
           with
-          | None -> Ok []
-          | Some resource -> resource_dependencies (base.pid_str :: seen) resource)
+          | None ->
+              error resource.resource_at
+                "Auth requires a previously declared resource module"
+          | Some base -> resource_dependencies (resource.resource_id :: seen) base)
   in
   let* module_declarations =
     all (runtime_modules @ proof_modules) ~f:(fun member ->
@@ -10669,7 +10809,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               in
               let resource =
                 List.find_exn source.proof_resources ~f:(fun r ->
-                    String.equal r.Source.resource_name resource_name)
+                    String.equal r.Source.resource_backend resource_name)
               in
               resource_dependencies [] resource
         in
@@ -11084,6 +11224,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
         | _ -> None)
   in
+  let resources, ghost_fields = proof_assets None in
   let proof_support =
     {
       runtime_functions =
@@ -11100,8 +11241,9 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       strict_source_types = false;
       library_paths = library_paths libraries;
       atomic_updates = [];
-      resources = source.proof_resources;
-      ghost_fields = source.proof_fields;
+      resources;
+      ghost_fields;
+      canonical_path = Proof_bindings.canonical_owner scoped_proofs;
       logical_functions;
       mathematical_types =
         source.proof_types @ source.logical_types @ resource_types @ token_types;
@@ -11126,6 +11268,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
   let proof_context scope preds spec_funcs proof_support =
+    let resources, ghost_fields = proof_assets scope in
+    let proof_support = { proof_support with resources; ghost_fields } in
     let environment =
       Option.value_map scope ~default:source.env ~f:(fun scope ->
           Source.annotation_env source scope.Proof_scopes.environment)
@@ -11137,7 +11281,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           match binding.kind with
           | Predicate _ ->
               Some (binding.public_key, (binding.backend, binding.public_types))
-          | Lemma _ | Function _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ -> None)
       @ preds
     in
     let predicate_inputs =
@@ -11202,7 +11346,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Predicate _ -> Some (binding.backend, (binding.backend, binding.private_types))
-          | Lemma _ | Function _ -> None)
+          | Lemma _ | Function _ | Resource _ | Field _ -> None)
     in
     let inputs =
       List.filter_map bindings ~f:(fun binding ->
@@ -11220,7 +11364,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       List.filter_map bindings ~f:(fun binding ->
           match binding.kind with
           | Function _ -> Some (binding.entry.name.pid_str, binding.backend)
-          | Predicate _ | Lemma _ -> None)
+          | Predicate _ | Lemma _ | Resource _ | Field _ -> None)
       @ List.map private_functions ~f:(fun (key, signature) ->
           (key, signature.lemma_raven))
       @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
@@ -11242,8 +11386,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             preds spec_funcs proof_support
         in
         let ctx =
-          spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env ~preds
-            ~spec_funcs ~proof_support origins
+          spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env:f.environment
+            ~preds ~spec_funcs ~proof_support origins
         in
         let* formals = formals ctx f in
         let* _, _, implicit, _ =

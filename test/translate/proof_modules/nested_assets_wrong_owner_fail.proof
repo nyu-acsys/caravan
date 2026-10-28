@@ -1,0 +1,42 @@
+module Outer = struct
+  module A = struct
+    type fact = Seen of int
+    module Facts = SetRA (struct type t = fact end)
+    module Authority = Auth (Facts)
+    let tag : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+    lemma wrong_owner (cell : int Atomic.t)
+      requires (own (Ghost.at tag cell)
+        (Authority.full (Facts.set Set.empty))) =
+      ()
+
+    lemma allocate returns (cell : Ghost.t)
+      ensures (own (Ghost.at tag cell) (Authority.full (Facts.set Set.empty))) =
+      Ghost.alloc [Ghost.init tag (Authority.full (Facts.set Set.empty))]
+
+    lemma grow (cell : Ghost.t)
+      requires (own (Ghost.at tag cell) (Authority.full (Facts.set Set.empty)))
+      ensures (own (Ghost.at tag cell)
+        (Authority.full (Facts.set (Set.singleton (Seen 1))))) =
+      Ghost.fpu (Ghost.at tag cell)
+        (Authority.full (Facts.set Set.empty))
+        (Authority.full (Facts.set (Set.singleton (Seen 1))))
+  end
+
+  module B = struct
+    type witness = Witness of A.fact
+    module Qualified = Auth (A.Facts)
+    module Alias_qualified = Auth (Alias.Facts)
+
+    lemma through_ancestor (cell : Ghost.t)
+      requires (own (Ghost.at A.tag cell)
+        (A.Authority.full (A.Facts.set Set.empty)))
+      ensures (own (Ghost.at Alias.tag cell)
+        (A.Authority.full (A.Facts.set (Set.singleton (A.Seen 1))))) =
+      A.grow cell
+
+    lemma through_alias =
+      let cell = A.allocate in
+      through_ancestor cell
+  end
+end

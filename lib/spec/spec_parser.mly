@@ -237,7 +237,7 @@ proof_decl:
       if t.pid_str <> "t" then
         raise (Syntax_error (t.pid_loc, "A SetRA argument must define type t"));
       Proof_resource { resource_name = n; resource_kind = Resource_set ty } }
-| MODULE n = uident EQUAL f = uident LEFTPAR a = uident RIGHTPAR
+| MODULE n = uident EQUAL f = uident LEFTPAR a = uqualid RIGHTPAR
     { if f.pid_str <> "Auth" then
         raise (Syntax_error (f.pid_loc, "Unsupported resource functor: " ^ f.pid_str));
       Proof_resource { resource_name = n; resource_kind = Resource_auth a } }

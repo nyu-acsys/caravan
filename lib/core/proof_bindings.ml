@@ -9,6 +9,8 @@ type kind =
   | Predicate of S.predicate * S.term
   | Lemma of S.proof_decl
   | Function of S.proof_decl
+  | Resource of Source.proof_resource
+  | Field of Source.proof_field
 
 type binding = {
   entry : Proof_scopes.entry;
@@ -103,7 +105,7 @@ let exported inventory source scope name kind =
       scope
   in
   match kind with
-  | Lemma _ | Function _ -> List.is_empty relevant
+  | Lemma _ | Function _ | Resource _ | Field _ -> List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint scope name ancestor constraint_)
@@ -124,7 +126,7 @@ let remaining_constraints t ~scope binding =
 let visible t ~scope binding =
   let relevant = remaining_constraints t ~scope binding in
   match binding.kind with
-  | Lemma _ | Function _ -> List.is_empty relevant
+  | Lemma _ | Function _ | Resource _ | Field _ -> List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
           visible_in_constraint binding.entry.scope binding.entry.name.pid_str ancestor
@@ -132,7 +134,7 @@ let visible t ~scope binding =
 
 let opaque_at t ~scope binding =
   match binding.kind with
-  | Lemma _ | Function _ -> false
+  | Lemma _ | Function _ | Resource _ | Field _ -> false
   | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
 
 let opaque t binding = binding.exported && opaque_at t ~scope:None binding
@@ -190,7 +192,7 @@ let parameter_types environment parameters =
       Source.ocaml_type environment ~at:id.S.pid_loc pty)
   |> Result.all
 
-let supported entry =
+let supported (source : Source.t) entry =
   match entry.Proof_scopes.declaration with
   | S.Proof_predicate predicate ->
       begin match predicate.pred_body with
@@ -215,8 +217,30 @@ let supported entry =
       Ok
         ( Function entry.declaration,
           function_params @ [ (function_name, function_result) ] )
-  | Proof_module _ | Proof_type _ | Proof_resource _ | Proof_au _ | Proof_field _
-  | Proof_state _ | Proof_view _ | Proof_action _ ->
+  | Proof_resource _ ->
+      begin match
+        List.find source.proof_resources ~f:(fun resource ->
+            Poly.equal resource.resource_at entry.name.pid_loc)
+      with
+      | Some resource -> Ok (Resource resource, [])
+      | None ->
+          Error
+            (Report.error Type entry.name.pid_loc
+               "Missing elaborated resource declaration")
+      end
+  | Proof_field _ ->
+      begin match
+        List.find source.proof_fields ~f:(fun field ->
+            Poly.equal field.field_at entry.name.pid_loc)
+      with
+      | Some field -> Ok (Field field, [])
+      | None ->
+          Error
+            (Report.error Type entry.name.pid_loc
+               "Missing elaborated ghost field declaration")
+      end
+  | Proof_module _ | Proof_type _ | Proof_au _ | Proof_state _ | Proof_view _
+  | Proof_action _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -247,6 +271,10 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
         with
         | Some id, Some path -> Subst.add_type id path projection
         | _ -> projection)
+  in
+  let projection =
+    List.fold source.proof_resources ~init:projection ~f:(fun projection resource ->
+        Subst.add_module resource.Source.resource_id resource.resource_path projection)
   in
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
@@ -280,7 +308,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
                 (Printf.sprintf "A proof declaration inside functor %s"
                    (String.concat ~sep:"." ancestor.namespace))
         in
-        let* kind, parameters = supported entry in
+        let* kind, parameters = supported source entry in
         let* () =
           match
             List.find inventory.values ~f:(fun value ->
@@ -304,7 +332,7 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
         let* public_types =
           let declared =
             match kind with
-            | Lemma _ | Function _ -> None
+            | Lemma _ | Function _ | Resource _ | Field _ -> None
             | Predicate _ ->
                 Option.bind
                   (List.last (restricting_constraints inventory.constraints scope))
