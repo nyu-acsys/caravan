@@ -73,6 +73,7 @@ type specialization = {
 
 type resource_constraint = {
   owner : Path.t option;
+  result_owner : Path.t option;  (** Source view, distinct from applicative identity. *)
   boundary : Path.t option;
   signature : signature_view;
   substitution : Subst.t;
@@ -567,7 +568,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | Some id, Some path -> Subst.add_module id path substitution
               | _ -> substitution))
   in
-  let rec constrain ~restricts_visibility ~boundary at substitution signature view =
+  let root_module_path name =
+    List.find_map (List.rev structure.str_items) ~f:(fun item ->
+        match item.Typedtree.str_desc with
+        | Tstr_module { mb_id = Some id; mb_name = { txt = Some member; _ }; _ }
+          when String.equal member name ->
+            Some (Path.Pident id)
+        | _ -> None)
+  in
+  let rec constrain ~restricts_visibility ~boundary ~result_owner at substitution
+      signature view =
     if Option.is_some view.checked then
       begin match (signature.signature_resources, signature.signature_values) with
       | (_, resource) :: _, _ ->
@@ -583,6 +593,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       constraints :=
         {
           owner = Option.first_some view.application_identity view.identity;
+          result_owner;
           boundary;
           signature;
           substitution;
@@ -616,9 +627,18 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 begin match signature.signature_alias with
                 | Some _ -> Ok (name, view)
                 | None ->
+                    let* result_owner =
+                      match result_owner with
+                      | Some parent -> Ok (Some (Path.Pdot (parent, name)))
+                      | None ->
+                          begin match root_module_path name with
+                          | Some path -> Ok (Some path)
+                          | None -> missing at name
+                          end
+                    in
                     let* view =
-                      constrain ~restricts_visibility ~boundary at substitution
-                        signature.signature_body view
+                      constrain ~restricts_visibility ~boundary ~result_owner at
+                        substitution signature.signature_body view
                     in
                     Ok (name, view)
                 end)
@@ -633,9 +653,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           modtypes = signature.signature_modtypes;
         }
   in
-  let apply_signature ~restricts_visibility at signature view =
-    let boundary = Option.first_some view.application_identity view.identity in
-    constrain ~restricts_visibility ~boundary at Subst.identity signature view
+  let apply_signature ~restricts_visibility ~result_owner at signature view =
+    constrain ~restricts_visibility ~boundary:result_owner ~result_owner at Subst.identity
+      signature view
   in
   let seal_application_identity path signature view =
     let rec identities substitution path signature =
@@ -808,7 +828,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
               let* view =
-                apply_signature ~restricts_visibility:true mty.mty_loc signature view
+                apply_signature ~restricts_visibility:true ~result_owner:identity
+                  mty.mty_loc signature view
               in
               Ok
                 (Option.value_map identity ~default:view ~f:(fun path ->
@@ -1272,8 +1293,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 interface.scope typed
             in
             let* _ =
-              apply_signature ~restricts_visibility:false interface.scope.location
-                signature view
+              apply_signature ~restricts_visibility:false ~result_owner:None
+                interface.scope.location signature view
             in
             Ok ()
         end

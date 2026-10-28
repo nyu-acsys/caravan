@@ -37,12 +37,26 @@ type binding = {
   exported : bool;
 }
 
+type application = {
+  source : binding;
+  path : Path.t;
+  key : string;
+  backend : string;
+  types : Types.type_expr list;
+  project_type : Types.type_expr -> Types.type_expr;
+  implementation_types : Types.type_expr list;
+  environment : Env.t;
+  check_projection : Subst.t;
+  constraints : Module_inventory.resource_constraint list;
+}
+
 type t = {
   scopes : Proof_scopes.t;
   bindings : binding list;
   values : Module_inventory.value list;
   constraints : Module_inventory.resource_constraint list;
   projection : Subst.t;
+  applications : application list;
 }
 
 let public_type t typ = Subst.type_expr t.projection typ
@@ -589,7 +603,38 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
       values = inventory.values;
       constraints = inventory.constraints;
       projection;
+      applications = [];
     }
+
+let with_applications t applications = { t with applications }
+
+let application_constraints ?(owners = []) (t : t) ~scope (view : application) =
+  let rec lexical scope =
+    Option.to_list scope.Proof_scopes.owner
+    @ Option.to_list (Option.map scope.declaration_id ~f:(fun id -> Path.Pident id))
+    @ Option.value_map scope.parent ~default:[] ~f:(fun parent ->
+        Option.value_map
+          (Proof_scopes.find_owner t.scopes (Some parent))
+          ~default:[ parent ] ~f:lexical)
+  in
+  let local = Option.value_map scope ~default:[] ~f:lexical @ owners in
+  List.filter view.constraints ~f:(fun constraint_ ->
+      constraint_.Module_inventory.restricts_visibility
+      && not
+           (List.exists local ~f:(fun owner ->
+                Option.exists constraint_.Module_inventory.boundary ~f:(Path.same owner))))
+
+let application_visible ?owners t ~scope (view : application) =
+  let constraints = application_constraints ?owners t ~scope view in
+  match view.source.kind with
+  | Predicate _ ->
+      List.for_all constraints ~f:(fun constraint_ ->
+          List.Assoc.mem constraint_.Module_inventory.signature.signature_resources
+            view.source.entry.name.pid_str ~equal:String.equal)
+  | _ -> List.is_empty constraints
+
+let application_opaque ?owners t ~scope (view : application) =
+  not (List.is_empty (application_constraints ?owners t ~scope view))
 
 let private_bindings t ~(scope : Proof_scopes.scope option) =
   match scope with
@@ -603,12 +648,15 @@ let private_bindings t ~(scope : Proof_scopes.scope option) =
             (List.length a.entry.scope.namespace))
 
 let canonical_key t key =
-  List.find_map t.bindings ~f:(fun binding ->
-      if
-        term_binding binding
-        && (String.equal key binding.backend || String.equal key binding.public_key)
-      then Some binding.backend
-      else None)
+  Option.first_some
+    (List.find_map t.bindings ~f:(fun binding ->
+         if
+           term_binding binding
+           && (String.equal key binding.backend || String.equal key binding.public_key)
+         then Some binding.backend
+         else None))
+    (List.find_map t.applications ~f:(fun view ->
+         Option.some_if (String.equal key view.key) view.source.backend))
 
 let canonical_owner t path = Proof_scopes.canonical_owner t.scopes path
 
@@ -656,7 +704,17 @@ let action_key t ~scope (id : S.id) =
           Some binding.backend
       | _ -> None)
 
-let resolve t ~scope ~environment (q : S.qualid) =
+let application ?owners t ~scope ~environment (q : S.qualid) =
+  match q with
+  | Qid _ -> None
+  | Qdot (parent, id) ->
+      Option.bind (Source.module_path environment parent) ~f:(fun path ->
+          List.find t.applications ~f:(fun view ->
+              Path.same view.path path
+              && String.equal view.source.entry.name.pid_str id.pid_str
+              && application_visible ?owners t ~scope view))
+
+let resolve ?owners t ~scope ~environment (q : S.qualid) =
   match q with
   | Qid id ->
       let candidate =
@@ -683,12 +741,16 @@ let resolve t ~scope ~environment (q : S.qualid) =
             (Option.value_map runtime ~default:binding.backend ~f:(fun id ->
                  "$runtime$" ^ Ident.unique_name id)))
   | Qdot (parent, id) ->
-      Option.bind (Source.module_path environment parent) ~f:(fun owner ->
-          let owner = canonical_owner t owner in
-          List.find_map t.bindings ~f:(fun binding ->
-              if
-                term_binding binding && visible t ~scope binding
-                && same_owner binding.entry.scope.owner (Some owner)
-                && String.equal binding.entry.name.pid_str id.pid_str
-              then Some binding.public_key
-              else None))
+      begin match application ?owners t ~scope ~environment q with
+      | Some view -> Some view.key
+      | None ->
+          Option.bind (Source.module_path environment parent) ~f:(fun owner ->
+              let owner = canonical_owner t owner in
+              List.find_map t.bindings ~f:(fun binding ->
+                  if
+                    term_binding binding && visible t ~scope binding
+                    && same_owner binding.entry.scope.owner (Some owner)
+                    && String.equal binding.entry.name.pid_str id.pid_str
+                  then Some binding.public_key
+                  else None))
+      end

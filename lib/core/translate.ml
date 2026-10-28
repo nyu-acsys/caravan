@@ -10098,17 +10098,38 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
              Result.all_unit
                (List.map constraint_.Module_inventory.signature.signature_resources
                   ~f:(fun (name, formal) ->
-                    let* binding =
+                    let* ( binding,
+                           implementation_types,
+                           implementation_environment,
+                           check_projection ) =
                       match
                         List.find proofs.bindings ~f:(fun binding ->
                             Option.equal Path.same binding.entry.scope.owner (Some owner)
                             && String.equal binding.entry.name.pid_str name)
                       with
-                      | Some binding -> Ok binding
+                      | Some binding ->
+                          Ok
+                            ( binding,
+                              binding.private_types,
+                              binding.environment,
+                              Subst.identity )
                       | None ->
-                          error formal.site.item_loc
-                            (Printf.sprintf
-                               "The module resource %s has no proof definition" name)
+                          begin match
+                            List.find proofs.applications ~f:(fun view ->
+                                List.exists view.constraints ~f:(phys_equal constraint_)
+                                && String.equal view.source.entry.name.pid_str name)
+                          with
+                          | Some view ->
+                              Ok
+                                ( view.source,
+                                  view.implementation_types,
+                                  view.environment,
+                                  view.check_projection )
+                          | None ->
+                              error formal.site.item_loc
+                                (Printf.sprintf
+                                   "The module resource %s has no proof definition" name)
+                          end
                     in
                     let* actual =
                       match binding.kind with
@@ -10146,13 +10167,15 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                           Source.ocaml_type environment ~at:id.S.pid_loc ty)
                     in
                     let expected =
-                      List.map raw ~f:(Subst.type_expr constraint_.substitution)
+                      List.map raw ~f:(fun typ ->
+                          Subst.type_expr check_projection
+                            (Subst.type_expr constraint_.substitution typ))
                     in
                     let* equal =
                       Signature_contract.compiler ~at (fun () ->
-                          List.length expected = List.length binding.private_types
-                          && Ctype.is_equal binding.environment false expected
-                               binding.private_types)
+                          List.length expected = List.length implementation_types
+                          && Ctype.is_equal implementation_environment false expected
+                               implementation_types)
                     in
                     let* () =
                       if equal then Ok ()
@@ -10176,7 +10199,7 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                       |> Result.join
                     in
                     let* actual_outputs =
-                      predicate_output_count types actual binding.private_types
+                      predicate_output_count types actual implementation_types
                     in
                     if
                       Poly.equal expected_modes actual_modes
@@ -10639,6 +10662,10 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Option.bind (scoped_binding name) ~f:(fun binding ->
         Generic_proofs.owner generic_proofs (Some binding.entry.scope))
   in
+  let* applications =
+    Generic_proofs.applications ~fresh source inventory scoped_proofs generic_proofs
+  in
+  let scoped_proofs = Proof_bindings.with_applications scoped_proofs applications in
   let layouts = Result_layouts.plan types generics in
   let* types = Result_layouts.concrete layouts types in
   let schema binding =
@@ -10980,6 +11007,30 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
   let* predicates = predicates ~data:types source in
   let* () = check_scoped_resources ~types source inventory scoped_proofs in
+  let* applications =
+    all scoped_proofs.applications ~f:(fun view ->
+        let formal =
+          List.find_map (List.rev view.constraints) ~f:(fun constraint_ ->
+              List.Assoc.find constraint_.Module_inventory.signature.signature_resources
+                view.source.entry.name.pid_str ~equal:String.equal
+              |> Option.map ~f:(fun formal -> (constraint_, formal)))
+        in
+        match (formal, view.source.kind) with
+        | Some (constraint_, formal), Predicate _ ->
+            let environment =
+              Source.annotation_env source formal.Module_inventory.site.environment
+            in
+            let* raw =
+              Proof_bindings.parameter_types environment formal.declaration.pred_params
+            in
+            let projection =
+              Proof_bindings.signature_type_projection Subst.identity view.path
+                constraint_.signature
+            in
+            Ok { view with types = List.map raw ~f:(Subst.type_expr projection) }
+        | _ -> Ok view)
+  in
+  let scoped_proofs = Proof_bindings.with_applications scoped_proofs applications in
   let* scoped_predicates =
     all (List.filter_map scoped_proofs.bindings ~f:scoped_predicate)
       ~f:(fun ((_, p, _, ts) as declaration) ->
@@ -11076,6 +11127,22 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 resource_backend = binding.backend;
                 resource_types = binding.public_types;
                 resource_raw_types = binding.public_types;
+              }
+        | _ -> None)
+  in
+  let resource_signatures =
+    resource_signatures
+    @ List.filter_map scoped_proofs.applications ~f:(fun view ->
+        match view.Proof_bindings.source.kind with
+        | Predicate (p, _)
+          when Proof_bindings.application_visible scoped_proofs ~scope:None view ->
+            Some
+              {
+                resource_paths = [ Path.Pdot (view.path, view.source.entry.name.pid_str) ];
+                resource_declaration = p;
+                resource_backend = view.backend;
+                resource_types = view.types;
+                resource_raw_types = view.types;
               }
         | _ -> None)
   in
@@ -11452,7 +11519,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               au_implicit = List.map signature.au_private.implicit ~f:project;
             })
   in
-  let proof_context ?current_procedure scope preds spec_funcs proof_support =
+  let context_owners at =
+    Option.value_map at ~default:[] ~f:(Proof_scopes.owners_at source.proof_scopes)
+  in
+  let proof_context ?current_procedure ?at scope preds spec_funcs proof_support =
+    let owners = context_owners at in
     let atomic_updates =
       context_atomic ?current_procedure scope proof_support.atomic_updates
     in
@@ -11543,6 +11614,39 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             } ))
     in
     let proof_support = { proof_support with logical_functions } in
+    let application_views =
+      List.filter scoped_proofs.applications
+        ~f:(Proof_bindings.application_visible ~owners scoped_proofs ~scope)
+    in
+    let application_preds =
+      List.filter_map application_views ~f:(fun view ->
+          match view.source.kind with
+          | Predicate _ -> Some (view.key, (view.backend, List.map view.types ~f:project))
+          | _ -> None)
+    in
+    let application_inputs =
+      List.filter_map application_views ~f:(fun view ->
+          Option.map
+            (List.Assoc.find scoped_inputs view.source.backend ~equal:String.equal)
+            ~f:(fun count -> (view.key, count)))
+    in
+    let preds = application_preds @ preds in
+    let spec_funcs =
+      List.map application_preds ~f:(fun (key, (backend, _)) -> (key, backend))
+      @ spec_funcs
+    in
+    let proof_support =
+      {
+        proof_support with
+        predicate_inputs = application_inputs @ proof_support.predicate_inputs;
+        opaque_predicates =
+          List.filter_map application_views ~f:(fun view ->
+              Option.some_if
+                (Proof_bindings.application_opaque ~owners scoped_proofs ~scope view)
+                view.key)
+          @ proof_support.opaque_predicates;
+      }
+    in
     let bindings = Proof_bindings.private_bindings scoped_proofs ~scope in
     let private_preds =
       List.filter_map bindings ~f:(fun binding ->
@@ -11578,7 +11682,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         proof_support with
         proof_key =
           (fun environment q ->
-            Proof_bindings.resolve scoped_proofs ~scope ~environment q);
+            Proof_bindings.resolve ~owners scoped_proofs ~scope ~environment q);
         predicate_inputs = inputs @ proof_support.predicate_inputs;
         logical_functions = private_functions @ proof_support.logical_functions;
       } )
@@ -11665,7 +11769,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let* atomic_updates =
     all atomic_operations ~f:(fun (au_source, f) ->
         let preds, spec_funcs, proof_support =
-          proof_context ~current_procedure:(proc_name f)
+          proof_context ~current_procedure:(proc_name f) ~at:f.loc
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
             preds spec_funcs proof_support
         in
@@ -11803,7 +11907,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
         | _ -> None)
   in
-  let lemma_context scope =
+  let lemma_context ?at scope =
+    let owners = context_owners at in
     let environment =
       Option.value_map scope ~default:source.env ~f:(fun scope ->
           Source.annotation_env source scope.Proof_scopes.environment)
@@ -11834,6 +11939,26 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               lemma_inputs = List.map signature.lemma_inputs ~f:project;
               lemma_outputs = List.map signature.lemma_outputs ~f:project;
             } ))
+    in
+    let proof_lemmas =
+      List.filter_map scoped_proofs.applications ~f:(fun view ->
+          if not (Proof_bindings.application_visible ~owners scoped_proofs ~scope view)
+          then None
+          else
+            Option.map
+              (List.Assoc.find all_proof_lemmas view.source.backend ~equal:String.equal)
+              ~f:(fun signature ->
+                let inputs, outputs =
+                  List.split_n view.types (List.length signature.lemma_inputs)
+                in
+                ( view.key,
+                  {
+                    signature with
+                    lemma_raven = view.backend;
+                    lemma_inputs = List.map inputs ~f:project;
+                    lemma_outputs = List.map outputs ~f:project;
+                  } )))
+      @ proof_lemmas
     in
     List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
       ~f:(fun binding ->
@@ -12945,7 +13070,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 } )
         | _ -> None)
   in
-  let body_contexts scope =
+  let body_contexts ?at scope =
+    let owners = context_owners at in
     let environment =
       Option.value_map scope ~default:source.env ~f:(fun scope ->
           Source.annotation_env source scope.Proof_scopes.environment)
@@ -12970,6 +13096,24 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     let predicate_bodies =
       List.map predicate_bodies ~f:(fun (key, body) ->
           (key, { body with project_type = (fun ty -> project (body.project_type ty)) }))
+    in
+    let predicate_bodies =
+      List.filter_map scoped_proofs.applications ~f:(fun view ->
+          match view.source.kind with
+          | Predicate (_, Plain body)
+            when Proof_bindings.application_visible ~owners scoped_proofs ~scope view
+                 && not
+                      (Proof_bindings.application_opaque ~owners scoped_proofs ~scope view)
+            ->
+              Some
+                ( view.key,
+                  {
+                    definition = body;
+                    environment = view.source.environment;
+                    project_type = (fun ty -> project (view.project_type ty));
+                  } )
+          | _ -> None)
+      @ predicate_bodies
     in
     List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
       ~f:(fun binding ->
@@ -13094,7 +13238,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   in
   let body_context f =
     let preds, spec_funcs, proof_support =
-      proof_context ~current_procedure:(proc_name f)
+      proof_context ~current_procedure:(proc_name f) ~at:f.loc
         (Proof_bindings.scope_for_location scoped_proofs f.loc)
         preds spec_funcs proof_support
     in
@@ -13235,7 +13379,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 ~procedure_signatures
                 ~proof_lemmas:
                   (let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
-                   let lemmas = lemma_context scope in
+                   let lemmas = lemma_context ~at:f.loc scope in
                    match Generic_proofs.owner generic_proofs scope with
                    | None -> lemmas
                    | Some plan ->
@@ -13245,7 +13389,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 ~proof_support
                 ~predicate_bodies:
                   (let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
-                   let bodies = body_contexts scope in
+                   let bodies = body_contexts ~at:f.loc scope in
                    match Generic_proofs.owner generic_proofs scope with
                    | None -> bodies
                    | Some plan ->

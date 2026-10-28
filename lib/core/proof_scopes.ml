@@ -250,3 +250,35 @@ let resolve ?(location = Location.none) ~environment (structure : Typedtree.stru
   in
   let* scopes, declarations = collect root [ root ] [] declarations in
   Ok { root; scopes = List.rev scopes; declarations = List.rev declarations }
+
+(** Module owners containing a source annotation, including scopes without proof blocks.
+*)
+let owner_paths_at inventory (location : Location.t) =
+  let inside outer =
+    outer.Location.loc_start.pos_cnum <= location.loc_start.pos_cnum
+    && location.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+  in
+  let rec structure parent (body : Typedtree.structure) =
+    List.concat_map body.str_items ~f:(fun item ->
+        match item.Typedtree.str_desc with
+        | Tstr_module
+            { mb_id = Some id; mb_name = { txt = Some name; _ }; mb_expr; mb_loc; _ }
+          when inside mb_loc ->
+            let path =
+              Option.value_map parent ~default:(Path.Pident id) ~f:(fun parent ->
+                  Path.Pdot (parent, name))
+            in
+            [ Path.Pident id; path ] :: expression (Some path) mb_expr
+        | _ -> [])
+  and expression parent (body : Typedtree.module_expr) =
+    match body.mod_desc with
+    | Tmod_structure body -> structure parent body
+    | Tmod_functor (_, body) | Tmod_constraint (body, _, _, _) -> expression parent body
+    | _ -> []
+  in
+  structure None inventory.root.structure
+
+let owners_at inventory location = List.concat (owner_paths_at inventory location)
+
+let innermost_owners_at inventory location =
+  Option.value (List.last (owner_paths_at inventory location)) ~default:[]
