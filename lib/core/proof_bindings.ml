@@ -76,10 +76,7 @@ let functor_ancestor scopes scope =
       Option.is_some (drop_prefix ancestor.namespace scope.Proof_scopes.namespace)
       && not (List.is_empty ancestor.parameters))
 
-let contains (outer : Location.t) (inner : Location.t) =
-  String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
-  && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
-  && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
+let contains = Declaration_scope.contains
 
 let scope_for_namespace t namespace =
   List.filter t.scopes.scopes ~f:(fun scope ->

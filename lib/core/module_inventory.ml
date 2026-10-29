@@ -119,7 +119,7 @@ let proof_scope_matches (application : specialization) (scope : Proof_scopes.sco
       Option.exists (body application.template) ~f:(fun structure ->
           List.equal
             (fun (left : Typedtree.structure_item) (right : Typedtree.structure_item) ->
-              Functor_context.same_location left.str_loc right.str_loc)
+              Declaration_scope.same_place left.str_loc right.str_loc)
             scope.structure.str_items structure.str_items)
 
 type resource_constraint = {
@@ -206,14 +206,12 @@ let member bindings name = List.Assoc.find bindings name ~equal:String.equal
 let add_path paths path =
   if List.mem paths path ~equal:Path.same then paths else paths @ [ path ]
 
-let within (outer : Location.t) (inner : Location.t) =
-  inner.loc_start.pos_cnum >= outer.loc_start.pos_cnum
-  && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-
 let annotations_in scope children annotations =
   List.filter annotations ~f:(fun (annotation : Annotation.t) ->
-      within scope.Declaration_scope.location annotation.loc
-      && not (List.exists children ~f:(fun child -> within child annotation.loc)))
+      Declaration_scope.contains_in_input scope.Declaration_scope.location annotation.loc
+      && not
+           (List.exists children ~f:(fun child ->
+                Declaration_scope.contains_in_input child annotation.loc)))
 
 let scope location : Declaration_scope.t = { location }
 
@@ -487,7 +485,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                           let* () =
                             if
                               List.exists all_annotations ~f:(fun annotation ->
-                                  within declaration.md_loc annotation.Annotation.loc)
+                                  Declaration_scope.contains_in_input declaration.md_loc
+                                    annotation.Annotation.loc)
                             then
                               unavailable declaration.md_loc
                                 "An annotated signature alias"
@@ -1172,17 +1171,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 unavailable callee.mod_loc
                   "A functor application without a result binding"
             | Some enclosing ->
-                let start = callee.mod_loc.loc_start.pos_cnum in
-                let finish = callee.mod_loc.loc_end.pos_cnum in
                 begin match
-                  List.find !stage_identities ~f:(fun (root, first, last, _) ->
-                      Path.same root enclosing && first = start && last = finish)
+                  List.find !stage_identities ~f:(fun (root, at, _) ->
+                      Path.same root enclosing
+                      && Declaration_scope.same_in_input at callee.mod_loc)
                 with
-                | Some (_, _, _, identity) -> Ok identity
+                | Some (_, _, identity) -> Ok identity
                 | None ->
                     let identity = Path.Pident (Ident.create_local "functor_stage") in
                     stage_identities :=
-                      (enclosing, start, finish, identity) :: !stage_identities;
+                      (enclosing, callee.mod_loc, identity) :: !stage_identities;
                     Ok identity
                 end
           in
@@ -1395,7 +1393,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                           Declaration_scope.following ~scope:declaration_scope
                             ~item_loc:item.str_loc ~next annotation.loc
                           || List.exists bindings ~f:(fun binding ->
-                              within binding.Typedtree.vb_expr.exp_loc annotation.loc)
+                              Declaration_scope.contains_in_input
+                                binding.Typedtree.vb_expr.exp_loc annotation.loc)
                       | _ -> false)
                     || attached rest
               in

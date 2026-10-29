@@ -247,11 +247,7 @@ let annotation_env ?at source lexical_env =
         source_module_ids scope.Proof_scopes.structure)
   in
   let env = add_spec_bindings ~source_modules source.spec_bindings lexical_env in
-  let contains (outer : Location.t) (inner : Location.t) =
-    String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
-    && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
-    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-  in
+  let contains = Declaration_scope.contains in
   let same_declaration a b = (not (Poly.equal a Location.none)) && Poly.equal a b in
   let previous_summary = function
     | Env.Env_empty -> None
@@ -1577,11 +1573,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
   Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
 
 let signature_ghost_modules ~comments (scope : Proof_scopes.scope) =
-  let within (outer : Location.t) (inner : Location.t) =
-    String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
-    && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
-    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-  in
+  let within = Declaration_scope.contains in
   let parameter (parameter : Typedtree.functor_parameter) =
     match parameter with
     | Named
@@ -1734,11 +1726,7 @@ let public_ghost_occurrences ?public_interface ~comments scopes
   | None -> Ok []
   | Some typ ->
       let location = signature_location typ in
-      let within (outer : Location.t) (inner : Location.t) =
-        String.equal outer.loc_start.pos_fname inner.loc_start.pos_fname
-        && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
-        && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-      in
+      let within = Declaration_scope.contains in
       let annotations = Annotation.of_comments comments in
       let rec collect names location signature =
         let children =
@@ -3401,9 +3389,7 @@ let signature_resource source (declaration : S.ghost_module) =
   let at = declaration.ghost_module_name.pid_loc in
   match
     List.find source.signature_resources ~f:(fun (location, _) ->
-        String.equal location.loc_start.pos_fname at.loc_start.pos_fname
-        && location.loc_start.pos_cnum = at.loc_start.pos_cnum
-        && location.loc_end.pos_cnum = at.loc_end.pos_cnum)
+        Declaration_scope.same_place location at)
   with
   | Some (_, resource) -> Ok resource
   | None -> Error (Report.error Type at "The signature resource is not declared")
@@ -3481,11 +3467,7 @@ let realize_signature_ghost_environment source ~substitution declarations env =
              env))
 
 let imported_proof_resources env libraries =
-  let within (outer : Location.t) (inner : Location.t) =
-    String.equal outer.Location.loc_start.pos_fname inner.loc_start.pos_fname
-    && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
-    && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-  in
+  let within = Declaration_scope.contains in
   let children signature =
     List.filter_map signature ~f:(function
       | Types.Sig_module (_, _, declaration, _, _) -> Some declaration.md_loc

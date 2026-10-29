@@ -28,14 +28,9 @@ type partial = {
   sealed : bool;
 }
 
-let same_location (a : Location.t) (b : Location.t) =
-  String.equal a.Location.loc_start.pos_fname b.loc_start.pos_fname
-  && a.loc_start.pos_cnum = b.loc_start.pos_cnum
-  && a.loc_end.pos_cnum = b.loc_end.pos_cnum
-
 let find_at applications location =
   List.find applications ~f:(fun application ->
-      same_location application.location location)
+      Declaration_scope.same_place application.location location)
 
 let find_result applications result =
   List.find applications ~f:(fun application -> Path.same application.result result)
@@ -48,7 +43,8 @@ let result_paths application =
 
 let find_stage_at applications location =
   List.find_map applications ~f:(fun application ->
-      List.find application.stages ~f:(fun stage -> same_location stage.location location))
+      List.find application.stages ~f:(fun stage ->
+          Declaration_scope.same_place stage.location location))
 
 let same_scope left right =
   Option.equal Path.same left.Proof_scopes.owner right.Proof_scopes.owner

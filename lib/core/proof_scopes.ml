@@ -333,11 +333,7 @@ let resolve ?location ~environment structure declarations =
 (** Module owners containing a source annotation, including scopes without proof blocks.
 *)
 let owner_paths_at inventory (location : Location.t) =
-  let inside outer =
-    String.equal outer.Location.loc_start.pos_fname location.loc_start.pos_fname
-    && outer.loc_start.pos_cnum <= location.loc_start.pos_cnum
-    && location.loc_end.pos_cnum <= outer.loc_end.pos_cnum
-  in
+  let inside outer = Declaration_scope.contains outer location in
   let rec structure parent (body : Typedtree.structure) =
     List.concat_map body.str_items ~f:(fun item ->
         match item.Typedtree.str_desc with
