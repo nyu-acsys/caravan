@@ -4401,31 +4401,46 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             in
             let primitives, primitive_namespace = body_primitives f in
             let* member =
-              proc data ~refs ~primitives ~shared:(body_shared f) ~ocaml_env:f.environment
-                ~preds:predicates ~funcs:spec_funcs ~annotations ~access_proofs
-                ~return_proofs ~initializations ~linearizations ~lifted ~pasts
+              let given =
+                {
+                  (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
+                     ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace ())
+                  with
+                  functions;
+                  lifted;
+                  pasts;
+                  past_returns;
+                  ghost_args;
+                  procedure_signatures;
+                  libraries = library_paths libraries;
+                  annotations;
+                  proof_lemmas =
+                    (let context = body_module_context f in
+                     module_lemmas context
+                       ~project:(Module_context.project_type context)
+                       (lemma_context ~at:f.loc (Some context.scope)));
+                  predicate_bodies =
+                    (let context = body_module_context f in
+                     List.map (body_contexts ~at:f.loc (Some context.scope))
+                       ~f:(fun (key, body) ->
+                         ( key,
+                           {
+                             body with
+                             project_type =
+                               (fun typ ->
+                                 Module_context.project_type context
+                                   (body.project_type typ));
+                           } )));
+                  access_proofs;
+                  return_proofs;
+                  initializations;
+                  linearizations;
+                }
+              in
+              proc ~given ~collected:{ refs; primitives; origins }
                 ~past_structures:(past_structures ~symbolic:true f)
-                ~past_returns ~ghost_args ~procedure_signatures
-                ~proof_lemmas:
-                  (let context = body_module_context f in
-                   module_lemmas context
-                     ~project:(Module_context.project_type context)
-                     (lemma_context ~at:f.loc (Some context.scope)))
-                ~proof_support
-                ~predicate_bodies:
-                  (let context = body_module_context f in
-                   List.map (body_contexts ~at:f.loc (Some context.scope))
-                     ~f:(fun (key, body) ->
-                       ( key,
-                         {
-                           body with
-                           project_type =
-                             (fun typ ->
-                               Module_context.project_type context (body.project_type typ));
-                         } )))
-                ~libraries:(library_paths libraries) functions origins
                 ~proc_name:(body_proc_name f) ~pure:(is_pure f) ~declaration_name
-                ~primitive_namespace ~pure_name:(body_pure_reference f) f
+                ~pure_name:(body_pure_reference f) f
             in
             Ok (Some (f, member)))
   in

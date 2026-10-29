@@ -151,46 +151,8 @@ let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     ?(proof_support = empty_proof_support) origins =
   {
     given =
-      {
-        types;
-        primitive_namespace = [];
-        functions = Path_bindings.empty;
-        lifted = [];
-        pasts = [];
-        past_returns = [];
-        annotations = [];
-        spec_funcs;
-        proof_lemmas = [];
-        proof_support;
-        predicate_bodies = [];
-        env = ocaml_env;
-        preds;
-        current_procedure = None;
-        manual = false;
-        access_proofs = [];
-        return_proofs = [];
-        procedure_signatures = [];
-        initializations = [];
-        linearizations = [];
-        shared;
-        ghost_args = [];
-        libraries = Path_bindings.empty;
-      };
-    procedure =
-      {
-        names = Names.create ();
-        facts = [];
-        au = None;
-        ghost_returns = [];
-        proof_state = None;
-        return_covered = false;
-        invariants = [];
-        opened = [];
-        snapshots = [];
-        positions = [];
-        formals = [];
-        fields_of = [];
-      };
+      declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support ();
+    procedure = initial_procedure ();
     collected = { refs; primitives; origins };
   }
 

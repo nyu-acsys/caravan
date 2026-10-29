@@ -413,46 +413,9 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
   let ctx =
     {
       given =
-        {
-          types;
-          primitive_namespace;
-          functions = Path_bindings.empty;
-          lifted = [];
-          pasts = [];
-          past_returns = [];
-          annotations = [];
-          spec_funcs;
-          proof_lemmas = [];
-          proof_support;
-          predicate_bodies = [];
-          env = ocaml_env;
-          preds;
-          current_procedure = None;
-          manual = false;
-          access_proofs = [];
-          return_proofs = [];
-          procedure_signatures = [];
-          initializations = [];
-          linearizations = [];
-          shared;
-          ghost_args = [];
-          libraries = Path_bindings.empty;
-        };
-      procedure =
-        {
-          names = Names.create ();
-          facts = [];
-          au = None;
-          ghost_returns = [];
-          proof_state = None;
-          return_covered = false;
-          invariants = [];
-          opened = [];
-          snapshots = [];
-          positions = [];
-          formals = [];
-          fields_of = [];
-        };
+        declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
+          ~primitive_namespace ();
+      procedure = initial_procedure ();
       collected = { refs; primitives; origins };
     }
   in
@@ -971,57 +934,15 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
-    ~access_proofs ~return_proofs ~initializations ~linearizations ~lifted ~pasts
-    ~past_structures ~past_returns ~ghost_args ~procedure_signatures ~libraries
-    ~proof_lemmas ~proof_support ~predicate_bodies (functions : string Path_bindings.t)
-    origins ~proc_name ~pure ?declaration_name ?pure_name ?(primitive_namespace = [])
+let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?pure_name
     (f : func) : (R.Callable.t, error) Result.t =
-  let names = Names.create () in
+  let procedure = initial_procedure () in
+  let names = procedure.names in
   let ctx =
     {
-      given =
-        {
-          types;
-          primitive_namespace;
-          functions;
-          lifted;
-          pasts;
-          past_returns;
-          ghost_args;
-          procedure_signatures;
-          libraries;
-          annotations;
-          spec_funcs = funcs;
-          proof_lemmas;
-          proof_support;
-          predicate_bodies;
-          env = ocaml_env;
-          preds;
-          current_procedure = Some proc_name;
-          manual = f.manual;
-          access_proofs;
-          return_proofs;
-          initializations;
-          linearizations;
-          shared;
-        };
-      procedure =
-        {
-          names;
-          ghost_returns = [];
-          proof_state = None;
-          return_covered = false;
-          facts = [];
-          au = None;
-          invariants = [];
-          opened = [];
-          snapshots = [];
-          positions = [];
-          formals = [];
-          fields_of = [];
-        };
-      collected = { refs; primitives; origins };
+      given = { given with current_procedure = Some proc_name; manual = f.manual };
+      procedure;
+      collected;
     }
   in
   let l = loc f.loc in
@@ -1065,7 +986,9 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       let* typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
       Ok [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
-  let* _, env, implicit, ghosts = contract_env ctx ~spec_funcs:funcs f formals ~result in
+  let* _, env, implicit, ghosts =
+    contract_env ctx ~spec_funcs:ctx.given.spec_funcs f formals ~result
+  in
   let* ghost_returns =
     all (ghost_results f) ~f:(fun (id, _) ->
         match
@@ -1128,7 +1051,8 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let witnesses (p : past) =
     let* st =
       match
-        List.find shared.structures ~f:(fun st -> String.equal st.invariant p.inv)
+        List.find ctx.given.shared.structures ~f:(fun st ->
+            String.equal st.invariant p.inv)
       with
       | Some st -> Ok st
       | None -> error p.element.term_loc "A fact about an earlier state without a state"
@@ -1137,7 +1061,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       match List.Assoc.find history_invariants p.inv ~equal:String.equal with
       | Some (x :: _) ->
           let anchored =
-            match anchor types st.structure_type with
+            match anchor ctx.given.types st.structure_type with
             | Some (_, at) -> at ~loc:l x
             | None -> x
           in

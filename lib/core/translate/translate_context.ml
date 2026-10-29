@@ -599,6 +599,53 @@ type outputs = {
 
 type context = { given : inputs; procedure : procedure_state; collected : outputs }
 
+(** The inputs of a context outside a procedure, which has none of a procedure's tables.
+*)
+let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
+    ?(primitive_namespace = []) () =
+  {
+    types;
+    primitive_namespace;
+    functions = Path_bindings.empty;
+    lifted = [];
+    pasts = [];
+    past_returns = [];
+    annotations = [];
+    spec_funcs;
+    proof_lemmas = [];
+    proof_support;
+    predicate_bodies = [];
+    env;
+    preds;
+    current_procedure = None;
+    manual = false;
+    access_proofs = [];
+    return_proofs = [];
+    procedure_signatures = [];
+    initializations = [];
+    linearizations = [];
+    shared;
+    ghost_args = [];
+    libraries = Path_bindings.empty;
+  }
+
+(** The state of a translation before it starts. *)
+let initial_procedure () =
+  {
+    names = Names.create ();
+    ghost_returns = [];
+    proof_state = None;
+    return_covered = false;
+    fields_of = [];
+    formals = [];
+    facts = [];
+    au = None;
+    invariants = [];
+    opened = [];
+    snapshots = [];
+    positions = [];
+  }
+
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
 (** Declares [field], with values of type [elt], unless it is already. *)
