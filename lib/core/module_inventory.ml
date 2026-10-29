@@ -748,7 +748,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                in
                Subst.add_type id path substitution)))
   in
-  let substitutions substitution signature view =
+  let substitutions ~at substitution signature view =
     let* substitution =
       List.fold_result signature.signature_types ~init:substitution
         ~f:(fun substitution (name, declaration) ->
@@ -763,7 +763,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       List.fold_result signature.signature_modules ~init:substitution
         ~f:(fun substitution (name, nested) ->
           match member view.modules name with
-          | None -> missing source.scope.location name
+          | None -> missing at name
           | Some view ->
               Ok
                 (match (nested.signature_id, view.identity) with
@@ -800,7 +800,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       | [], [], [] -> Ok view
       end
     else
-      let* substitution = substitutions substitution signature view in
+      let* substitution = substitutions ~at substitution signature view in
       constraints :=
         {
           owner = Option.first_some view.application_identity view.identity;
@@ -847,7 +847,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       let* nested_modules =
         List.map signature.signature_modules ~f:(fun (name, signature) ->
             match member view.modules name with
-            | None -> missing source.scope.location name
+            | None -> missing at name
             | Some view ->
                 begin match signature.signature_alias with
                 | Some _ -> Ok (name, view)

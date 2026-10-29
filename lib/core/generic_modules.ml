@@ -154,7 +154,12 @@ let eligible (source : Module_inventory.specialization) =
             | _ -> false)
     | None -> false
   in
-  (not (List.is_empty source.members)) && abstract_types && body
+  (* The shared functor exports only the body's function bindings. *)
+  let functions =
+    List.for_all source.members ~f:(fun (_, id) ->
+        List.exists source.body_members ~f:(fun (_, member) -> Ident.same id member))
+  in
+  (not (List.is_empty source.members)) && functions && abstract_types && body
 
 let plan ?(proof_layout = fun _ -> false) ~fresh sources =
   let make_application source =
