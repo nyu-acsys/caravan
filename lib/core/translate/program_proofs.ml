@@ -13,51 +13,408 @@ type t = {
     (Path.t * string * Program_items.resource_signature * Types.type_expr list) list;
   logical_declarations : S.proof_decl list;
   all_logical_functions : (string * lemma_signature) list;
-  context_owners : Location.t option -> Path.t list;
-  proof_context :
-    ?current_procedure:string ->
-    ?at:Location.t ->
-    Proof_scopes.scope option ->
-    (string * (string * Types.type_expr list)) list ->
-    (string * string) list ->
-    proof_support ->
-    (string * (string * Types.type_expr list)) list
-    * (string * string) list
-    * proof_support;
-  module_context :
-    Module_context.t ->
-    projection:Subst.t ->
-    (string * (string * Types.type_expr list)) list
-    * (string * string) list
-    * proof_support ->
-    (string * (string * Types.type_expr list)) list
-    * (string * string) list
-    * proof_support;
-  proof_context_for :
-    preds:(string * (string * Types.type_expr list)) list ->
-    spec_funcs:(string * string) list ->
-    proof_support:proof_support ->
-    string ->
-    (string * (string * Types.type_expr list)) list
-    * (string * string) list
-    * proof_support;
   proof_support : proof_support;
   preds : (string * (string * Types.type_expr list)) list;
   spec_funcs : (string * string) list;
   lemma_declarations : Source.S.proof_decl list;
   lemma_context :
     ?at:Location.t -> Proof_scopes.scope option -> (string * lemma_signature) list;
+  module_parameters :
+    (Module_context.t
+    * ((string * Ident.t list) * string * Types.type_expr list * int) list)
+    list;
+  private_scoped_inputs : (string * int) list;
 }
+
+let atomic_predicates_of signatures =
+  List.concat_map signatures ~f:(fun signature ->
+      List.map [ "pending"; "committed" ] ~f:(fun method_ ->
+          let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
+          let key = signature.au_key ^ "." ^ method_ in
+          (key, (key, inputs))))
+
+let context_atomic ~(source : Source.t) ~(scoped_proofs : Proof_bindings.t)
+    ~(au_application_view : Source.proof_au -> Proof_bindings.application option)
+    ?current_procedure scope signatures =
+  let environment =
+    Option.value_map scope ~default:source.env ~f:(fun scope ->
+        Source.annotation_env source scope.Proof_scopes.environment)
+  in
+  let public = Proof_bindings.public_type scoped_proofs in
+  let rebase = Proof_bindings.context_type scoped_proofs ~environment in
+  let inside owner =
+    match (owner, scope) with
+    | None, _ -> true
+    | Some owner, Some caller ->
+        Option.exists (Proof_scopes.find_owner source.proof_scopes (Some owner))
+          ~f:(fun parent ->
+            Option.is_some
+              (Proof_bindings.drop_prefix parent.namespace caller.Proof_scopes.namespace))
+    | Some _, None -> false
+  in
+  List.filter_map signatures ~f:(fun signature ->
+      let au = signature.au_source in
+      let binding =
+        List.find scoped_proofs.bindings ~f:(fun binding ->
+            match binding.kind with
+            | Atomic actual -> Ident.same actual.au_id au.au_id
+            | _ -> false)
+      in
+      if
+        match au.au_application with
+        | None ->
+            Option.exists binding ~f:(fun binding ->
+                not (Proof_bindings.visible scoped_proofs ~scope binding))
+        | Some _ ->
+            not
+              (Option.exists (au_application_view au)
+                 ~f:(Proof_bindings.application_visible scoped_proofs ~scope))
+      then None
+      else
+        let private_operation =
+          Option.equal String.equal current_procedure (Some signature.au_procedure)
+          || inside signature.au_owner
+        in
+        let project = if private_operation then Fn.id else fun ty -> rebase (public ty) in
+        let token =
+          if inside au.au_scope then au.au_token else rebase (public au.au_token)
+        in
+        Some
+          {
+            signature with
+            au_token = token;
+            au_inputs = List.map signature.au_private.inputs ~f:project;
+            au_result = project signature.au_private.result;
+            au_ghost_outputs = List.map signature.au_private.ghost_outputs ~f:project;
+            au_implicit = List.map signature.au_private.implicit ~f:project;
+          })
+
+let context_owners ~(source : Source.t) at =
+  Option.value_map at ~default:[] ~f:(Proof_scopes.owners_at source.proof_scopes)
+
+let proof_context ~(definition_target : Proof_bindings.binding -> string option)
+    ~(source : Source.t)
+    ~(proof_assets :
+       Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list)
+    ~(types : Datatypes.t list) ~(scoped_proofs : Proof_bindings.t)
+    ~(scoped_inputs : (string * int) list) ~(private_scoped_inputs : (string * int) list)
+    ~(all_logical_functions : (string * lemma_signature) list)
+    ~(au_application_view : Source.proof_au -> Proof_bindings.application option)
+    ?current_procedure ?at scope preds spec_funcs proof_support =
+  let context_atomic = context_atomic ~source ~scoped_proofs ~au_application_view in
+  let context_owners = context_owners ~source in
+  let owners = context_owners at in
+  let atomic_updates =
+    context_atomic ?current_procedure scope proof_support.atomic_updates
+  in
+  let atomic_keys = List.map (atomic_predicates_of proof_support.atomic_updates) ~f:fst in
+  let atomic_preds = atomic_predicates_of atomic_updates in
+  let preds =
+    List.filter preds ~f:(fun (key, _) ->
+        not (List.mem atomic_keys key ~equal:String.equal))
+    @ atomic_preds
+  in
+  let spec_funcs =
+    List.filter spec_funcs ~f:(fun (key, _) ->
+        not (List.mem atomic_keys key ~equal:String.equal))
+    @ List.map atomic_preds ~f:(fun (key, _) -> (key, key))
+  in
+  let proof_support = { proof_support with atomic_updates } in
+  let resources, ghost_fields = proof_assets scope in
+  let proof_support = { proof_support with resources; ghost_fields } in
+  let environment =
+    Option.value_map scope ~default:source.env ~f:(fun scope ->
+        Source.annotation_env source scope.Proof_scopes.environment)
+  in
+  let project = Proof_bindings.context_type scoped_proofs ~environment in
+  let local_exports = Proof_bindings.local_exports scoped_proofs ~scope in
+  let preds =
+    List.filter_map local_exports ~f:(fun binding ->
+        match binding.kind with
+        | Predicate _ -> Some (binding.public_key, (binding.backend, binding.public_types))
+        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+            None)
+    @ preds
+  in
+  let predicate_inputs =
+    List.filter_map local_exports ~f:(fun binding ->
+        Option.map (List.Assoc.find scoped_inputs binding.backend ~equal:String.equal)
+          ~f:(fun count -> (binding.public_key, count)))
+    @ proof_support.predicate_inputs
+  in
+  let logical_functions =
+    List.filter_map local_exports ~f:(fun binding ->
+        match binding.kind with
+        | Function (S.Proof_function declaration) ->
+            let inputs, outputs =
+              List.split_n binding.public_types (List.length declaration.function_params)
+            in
+            let signature =
+              List.Assoc.find_exn all_logical_functions binding.backend
+                ~equal:String.equal
+            in
+            Some
+              ( binding.public_key,
+                { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
+        | _ -> None)
+    @ proof_support.logical_functions
+  in
+  let opaque_predicates =
+    List.filter proof_support.opaque_predicates ~f:(fun key ->
+        not
+          (List.exists scoped_proofs.bindings ~f:(fun binding ->
+               String.equal binding.public_key key
+               && not (Proof_bindings.opaque_at scoped_proofs ~scope binding))))
+    @ List.filter_map local_exports ~f:(fun binding ->
+        Option.some_if
+          (Proof_bindings.opaque_at scoped_proofs ~scope binding)
+          binding.public_key)
+  in
+  let proof_support =
+    { proof_support with predicate_inputs; logical_functions; opaque_predicates }
+  in
+  let spec_funcs =
+    List.map logical_functions ~f:(fun (key, signature) -> (key, signature.lemma_raven))
+    @ List.map preds ~f:(fun (key, (backend, _)) -> (key, backend))
+    @ spec_funcs
+  in
+  let preds =
+    List.map preds ~f:(fun (key, (backend, types)) ->
+        (key, (backend, List.map types ~f:project)))
+  in
+  let logical_functions =
+    List.map proof_support.logical_functions ~f:(fun (key, signature) ->
+        ( key,
+          {
+            signature with
+            lemma_inputs = List.map signature.lemma_inputs ~f:project;
+            lemma_outputs = List.map signature.lemma_outputs ~f:project;
+          } ))
+  in
+  let proof_support = { proof_support with logical_functions } in
+  let application_views =
+    List.filter scoped_proofs.applications
+      ~f:(Proof_bindings.application_visible ~owners scoped_proofs ~scope)
+  in
+  let application_preds =
+    List.filter_map application_views ~f:(fun view ->
+        match view.source.kind with
+        | Predicate _ -> Some (view.key, (view.backend, List.map view.types ~f:project))
+        | _ -> None)
+  in
+  let application_inputs =
+    List.filter_map application_views ~f:(fun view ->
+        Option.map (List.Assoc.find scoped_inputs view.source.backend ~equal:String.equal)
+          ~f:(fun count -> (view.key, count)))
+  in
+  let application_functions =
+    List.filter_map application_views ~f:(fun view ->
+        match view.source.kind with
+        | Function _ ->
+            Option.map
+              (List.Assoc.find all_logical_functions view.source.backend
+                 ~equal:String.equal) ~f:(fun signature ->
+                let inputs, outputs =
+                  List.split_n view.types (List.length signature.lemma_inputs)
+                in
+                ( view.key,
+                  {
+                    signature with
+                    lemma_raven = view.backend;
+                    lemma_inputs = List.map inputs ~f:project;
+                    lemma_outputs = List.map outputs ~f:project;
+                  } ))
+        | _ -> None)
+  in
+  let proof_support =
+    {
+      proof_support with
+      logical_functions = application_functions @ proof_support.logical_functions;
+    }
+  in
+  let spec_funcs =
+    List.map application_functions ~f:(fun (key, signature) ->
+        (key, signature.lemma_raven))
+    @ spec_funcs
+  in
+  let preds = application_preds @ preds in
+  let spec_funcs =
+    List.map application_preds ~f:(fun (key, (backend, _)) -> (key, backend)) @ spec_funcs
+  in
+  let proof_support =
+    {
+      proof_support with
+      predicate_inputs = application_inputs @ proof_support.predicate_inputs;
+      opaque_predicates =
+        List.filter_map application_views ~f:(fun view ->
+            Option.some_if
+              (Proof_bindings.application_opaque ~owners scoped_proofs ~scope view)
+              view.key)
+        @ proof_support.opaque_predicates;
+    }
+  in
+  let bindings = Proof_bindings.private_bindings scoped_proofs ~scope in
+  let private_preds =
+    List.filter_map bindings ~f:(fun binding ->
+        match binding.kind with
+        | Predicate _ ->
+            Some
+              ( binding.backend,
+                ( Option.value (definition_target binding) ~default:binding.backend,
+                  binding.private_types ) )
+        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+            None)
+  in
+  let inputs =
+    List.filter_map bindings ~f:(fun binding ->
+        Option.map
+          (List.Assoc.find private_scoped_inputs binding.backend ~equal:String.equal)
+          ~f:(fun count -> (binding.backend, count)))
+  in
+  let private_functions =
+    List.filter_map bindings ~f:(fun binding ->
+        Option.map
+          (List.Assoc.find all_logical_functions binding.backend ~equal:String.equal)
+          ~f:(fun signature ->
+            ( binding.backend,
+              {
+                signature with
+                lemma_raven =
+                  Option.value (definition_target binding) ~default:signature.lemma_raven;
+              } )))
+  in
+  ( private_preds @ preds,
+    List.filter_map bindings ~f:(fun binding ->
+        match binding.kind with
+        | Function _ ->
+            Some
+              ( binding.entry.name.pid_str,
+                Option.value (definition_target binding) ~default:binding.backend )
+        | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+            None)
+    @ List.map private_functions ~f:(fun (key, signature) -> (key, signature.lemma_raven))
+    @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
+    @ spec_funcs,
+    {
+      proof_support with
+      proof_key =
+        (fun environment q ->
+          Proof_bindings.resolve ~owners scoped_proofs ~scope ~environment q);
+      predicate_inputs = inputs @ proof_support.predicate_inputs;
+      logical_functions = private_functions @ proof_support.logical_functions;
+    } )
+
+let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
+    ~(module_parameters :
+       (Module_context.t
+       * ((string * Ident.t list) * string * Types.type_expr list * int) list)
+       list) context ~projection (preds, spec_funcs, support) =
+  let project =
+    if List.is_empty context.Module_context.parameters then Fn.id
+    else Subst.type_expr projection
+  in
+  let target backend =
+    match scoped_binding backend with
+    | Some binding when Module_context.contains context binding ->
+        Module_context.member context backend
+    | _ -> backend
+  in
+  let parameters = List.Assoc.find_exn module_parameters context ~equal:phys_equal in
+  let preds =
+    List.map preds ~f:(fun (key, (backend, ts)) ->
+        (key, (target backend, List.map ts ~f:project)))
+  in
+  let preds =
+    List.map parameters ~f:(fun (_, key, ts, _) -> (key, (key, List.map ts ~f:project)))
+    @ preds
+  in
+  let spec_funcs =
+    List.map parameters ~f:(fun (_, key, _, _) -> (key, key))
+    @ List.map spec_funcs ~f:(fun (key, backend) -> (key, target backend))
+  in
+  let predicate_views =
+    List.fold parameters ~init:support.predicate_views
+      ~f:(fun views ((name, parameters), key, _, _) ->
+        List.fold parameters ~init:views ~f:(fun views parameter ->
+            Path_bindings.add views (Path.Pdot (Path.Pident parameter, name)) key))
+  in
+  ( preds,
+    spec_funcs,
+    {
+      support with
+      predicate_views;
+      resources =
+        List.map support.resources ~f:(fun resource ->
+            {
+              resource with
+              resource_type = project resource.Source.resource_type;
+              resource_path = Subst.module_path projection resource.resource_path;
+              resource_operations =
+                List.map resource.resource_operations ~f:(fun (name, inputs, output) ->
+                    (name, List.map inputs ~f:project, project output));
+            });
+      ghost_fields =
+        List.map support.ghost_fields ~f:(fun field ->
+            {
+              field with
+              field_owner = project field.Source.field_owner;
+              field_value = project field.field_value;
+              field_resource =
+                Option.map field.field_resource ~f:(Subst.module_path projection);
+            });
+      atomic_updates =
+        List.map support.atomic_updates ~f:(fun signature ->
+            {
+              signature with
+              au_token = project signature.au_token;
+              au_inputs = List.map signature.au_inputs ~f:project;
+              au_result = project signature.au_result;
+              au_ghost_outputs = List.map signature.au_ghost_outputs ~f:project;
+              au_implicit = List.map signature.au_implicit ~f:project;
+            });
+      logical_functions =
+        List.map support.logical_functions ~f:(fun (key, signature) ->
+            ( key,
+              {
+                signature with
+                lemma_raven = target signature.lemma_raven;
+                lemma_inputs = List.map signature.lemma_inputs ~f:project;
+                lemma_outputs = List.map signature.lemma_outputs ~f:project;
+              } ));
+      predicate_inputs =
+        List.map parameters ~f:(fun (_, key, _, inputs) -> (key, inputs))
+        @ support.predicate_inputs;
+      opaque_predicates =
+        List.map parameters ~f:(fun (_, key, _, _) -> key) @ support.opaque_predicates;
+    } )
+
+let proof_context_for ~(declaration_context : string -> Module_context.t)
+    ~(declaration_scope : string -> Proof_scopes.scope option)
+    ~(definition_target : Proof_bindings.binding -> string option) ~(source : Source.t)
+    ~(proof_assets :
+       Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list)
+    ~(types : Datatypes.t list) ~(scoped_proofs : Proof_bindings.t)
+    ~(scoped_inputs : (string * int) list) ~(private_scoped_inputs : (string * int) list)
+    ~(all_logical_functions : (string * lemma_signature) list)
+    ~(au_application_view : Source.proof_au -> Proof_bindings.application option)
+    ~(scoped_binding : string -> Proof_bindings.binding option)
+    ~(module_parameters :
+       (Module_context.t
+       * ((string * Ident.t list) * string * Types.type_expr list * int) list)
+       list) ~preds ~spec_funcs ~proof_support name =
+  let proof_context =
+    proof_context ~definition_target ~source ~proof_assets ~types ~scoped_proofs
+      ~scoped_inputs ~private_scoped_inputs ~all_logical_functions ~au_application_view
+  in
+  let module_context = module_context ~scoped_binding ~module_parameters in
+  let context = declaration_context name in
+  module_context context ~projection:Subst.identity
+    (proof_context (declaration_scope name) preds spec_funcs proof_support)
 
 let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error) Result.t
     =
   let {
-    Program_scopes.alias_path;
-    asset_context;
-    declaration_context;
-    declaration_environment;
-    declaration_scope;
-    definition_target;
+    Program_scopes.definition_target;
     fresh;
     funcs;
     generics;
@@ -65,27 +422,31 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
     libraries;
     module_contexts;
     public_types;
-    scoped_binding;
     _;
   } =
     scopes
   in
+  let alias_path = Program_scopes.alias_path in
+  let asset_context =
+    Program_scopes.asset_context ~module_contexts:scopes.module_contexts
+  in
+  let declaration_environment =
+    Program_scopes.declaration_environment ~source:scopes.source
+      ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let scoped_binding =
+    Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs
+  in
   let {
     Program_declarations.atomic_operations;
-    au_application_view;
-    au_plan;
-    au_procedure;
     generic_models;
     library_preds;
     origins;
     predicates;
     primitives;
-    proc_name;
     procedure_signatures;
     proof_assets;
     pure;
-    pure_name;
-    pure_reference;
     refs;
     resource_types;
     scoped_inputs;
@@ -97,6 +458,23 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
   } =
     decls
   in
+  let au_application_view =
+    Program_declarations.au_application_view ~untyped_scoped_proofs:scopes.scoped_proofs
+  in
+  let au_plan =
+    Program_declarations.au_plan
+      ~asset_context:
+        (Program_scopes.asset_context ~module_contexts:scopes.module_contexts)
+  in
+  let au_procedure =
+    Program_declarations.au_procedure ~procedures:decls.procedures
+      ~generics:scopes.generics ~generic_procedures:decls.generic_procedures
+      ~asset_context:
+        (Program_scopes.asset_context ~module_contexts:scopes.module_contexts)
+  in
+  let proc_name = Program_declarations.proc_name ~procedures:decls.procedures in
+  let pure_name = Program_declarations.pure_name ~generics:scopes.generics in
+  let pure_reference = Program_declarations.pure_reference ~generics:scopes.generics in
   let resource_signatures =
     List.map library_preds ~f:(fun (lib, p, ts) ->
         {
@@ -472,280 +850,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
     @ List.map preds ~f:(fun (p, (raven, _)) -> (p, raven))
     @ List.map logical_functions ~f:(fun (n, s) -> (n, s.lemma_raven))
   in
-  let atomic_predicates signatures =
-    List.concat_map signatures ~f:(fun signature ->
-        List.map [ "pending"; "committed" ] ~f:(fun method_ ->
-            let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
-            let key = signature.au_key ^ "." ^ method_ in
-            (key, (key, inputs))))
-  in
-  let context_atomic ?current_procedure scope signatures =
-    let environment =
-      Option.value_map scope ~default:source.env ~f:(fun scope ->
-          Source.annotation_env source scope.Proof_scopes.environment)
-    in
-    let public = Proof_bindings.public_type scoped_proofs in
-    let rebase = Proof_bindings.context_type scoped_proofs ~environment in
-    let inside owner =
-      match (owner, scope) with
-      | None, _ -> true
-      | Some owner, Some caller ->
-          Option.exists (Proof_scopes.find_owner source.proof_scopes (Some owner))
-            ~f:(fun parent ->
-              Option.is_some
-                (Proof_bindings.drop_prefix parent.namespace caller.Proof_scopes.namespace))
-      | Some _, None -> false
-    in
-    List.filter_map signatures ~f:(fun signature ->
-        let au = signature.au_source in
-        let binding =
-          List.find scoped_proofs.bindings ~f:(fun binding ->
-              match binding.kind with
-              | Atomic actual -> Ident.same actual.au_id au.au_id
-              | _ -> false)
-        in
-        if
-          match au.au_application with
-          | None ->
-              Option.exists binding ~f:(fun binding ->
-                  not (Proof_bindings.visible scoped_proofs ~scope binding))
-          | Some _ ->
-              not
-                (Option.exists (au_application_view au)
-                   ~f:(Proof_bindings.application_visible scoped_proofs ~scope))
-        then None
-        else
-          let private_operation =
-            Option.equal String.equal current_procedure (Some signature.au_procedure)
-            || inside signature.au_owner
-          in
-          let project =
-            if private_operation then Fn.id else fun ty -> rebase (public ty)
-          in
-          let token =
-            if inside au.au_scope then au.au_token else rebase (public au.au_token)
-          in
-          Some
-            {
-              signature with
-              au_token = token;
-              au_inputs = List.map signature.au_private.inputs ~f:project;
-              au_result = project signature.au_private.result;
-              au_ghost_outputs = List.map signature.au_private.ghost_outputs ~f:project;
-              au_implicit = List.map signature.au_private.implicit ~f:project;
-            })
-  in
-  let context_owners at =
-    Option.value_map at ~default:[] ~f:(Proof_scopes.owners_at source.proof_scopes)
-  in
-  let proof_context ?current_procedure ?at scope preds spec_funcs proof_support =
-    let owners = context_owners at in
-    let atomic_updates =
-      context_atomic ?current_procedure scope proof_support.atomic_updates
-    in
-    let atomic_keys = List.map (atomic_predicates proof_support.atomic_updates) ~f:fst in
-    let atomic_preds = atomic_predicates atomic_updates in
-    let preds =
-      List.filter preds ~f:(fun (key, _) ->
-          not (List.mem atomic_keys key ~equal:String.equal))
-      @ atomic_preds
-    in
-    let spec_funcs =
-      List.filter spec_funcs ~f:(fun (key, _) ->
-          not (List.mem atomic_keys key ~equal:String.equal))
-      @ List.map atomic_preds ~f:(fun (key, _) -> (key, key))
-    in
-    let proof_support = { proof_support with atomic_updates } in
-    let resources, ghost_fields = proof_assets scope in
-    let proof_support = { proof_support with resources; ghost_fields } in
-    let environment =
-      Option.value_map scope ~default:source.env ~f:(fun scope ->
-          Source.annotation_env source scope.Proof_scopes.environment)
-    in
-    let project = Proof_bindings.context_type scoped_proofs ~environment in
-    let local_exports = Proof_bindings.local_exports scoped_proofs ~scope in
-    let preds =
-      List.filter_map local_exports ~f:(fun binding ->
-          match binding.kind with
-          | Predicate _ ->
-              Some (binding.public_key, (binding.backend, binding.public_types))
-          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
-              None)
-      @ preds
-    in
-    let predicate_inputs =
-      List.filter_map local_exports ~f:(fun binding ->
-          Option.map (List.Assoc.find scoped_inputs binding.backend ~equal:String.equal)
-            ~f:(fun count -> (binding.public_key, count)))
-      @ proof_support.predicate_inputs
-    in
-    let logical_functions =
-      List.filter_map local_exports ~f:(fun binding ->
-          match binding.kind with
-          | Function (S.Proof_function declaration) ->
-              let inputs, outputs =
-                List.split_n binding.public_types
-                  (List.length declaration.function_params)
-              in
-              let signature =
-                List.Assoc.find_exn all_logical_functions binding.backend
-                  ~equal:String.equal
-              in
-              Some
-                ( binding.public_key,
-                  { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
-          | _ -> None)
-      @ proof_support.logical_functions
-    in
-    let opaque_predicates =
-      List.filter proof_support.opaque_predicates ~f:(fun key ->
-          not
-            (List.exists scoped_proofs.bindings ~f:(fun binding ->
-                 String.equal binding.public_key key
-                 && not (Proof_bindings.opaque_at scoped_proofs ~scope binding))))
-      @ List.filter_map local_exports ~f:(fun binding ->
-          Option.some_if
-            (Proof_bindings.opaque_at scoped_proofs ~scope binding)
-            binding.public_key)
-    in
-    let proof_support =
-      { proof_support with predicate_inputs; logical_functions; opaque_predicates }
-    in
-    let spec_funcs =
-      List.map logical_functions ~f:(fun (key, signature) -> (key, signature.lemma_raven))
-      @ List.map preds ~f:(fun (key, (backend, _)) -> (key, backend))
-      @ spec_funcs
-    in
-    let preds =
-      List.map preds ~f:(fun (key, (backend, types)) ->
-          (key, (backend, List.map types ~f:project)))
-    in
-    let logical_functions =
-      List.map proof_support.logical_functions ~f:(fun (key, signature) ->
-          ( key,
-            {
-              signature with
-              lemma_inputs = List.map signature.lemma_inputs ~f:project;
-              lemma_outputs = List.map signature.lemma_outputs ~f:project;
-            } ))
-    in
-    let proof_support = { proof_support with logical_functions } in
-    let application_views =
-      List.filter scoped_proofs.applications
-        ~f:(Proof_bindings.application_visible ~owners scoped_proofs ~scope)
-    in
-    let application_preds =
-      List.filter_map application_views ~f:(fun view ->
-          match view.source.kind with
-          | Predicate _ -> Some (view.key, (view.backend, List.map view.types ~f:project))
-          | _ -> None)
-    in
-    let application_inputs =
-      List.filter_map application_views ~f:(fun view ->
-          Option.map
-            (List.Assoc.find scoped_inputs view.source.backend ~equal:String.equal)
-            ~f:(fun count -> (view.key, count)))
-    in
-    let application_functions =
-      List.filter_map application_views ~f:(fun view ->
-          match view.source.kind with
-          | Function _ ->
-              Option.map
-                (List.Assoc.find all_logical_functions view.source.backend
-                   ~equal:String.equal) ~f:(fun signature ->
-                  let inputs, outputs =
-                    List.split_n view.types (List.length signature.lemma_inputs)
-                  in
-                  ( view.key,
-                    {
-                      signature with
-                      lemma_raven = view.backend;
-                      lemma_inputs = List.map inputs ~f:project;
-                      lemma_outputs = List.map outputs ~f:project;
-                    } ))
-          | _ -> None)
-    in
-    let proof_support =
-      {
-        proof_support with
-        logical_functions = application_functions @ proof_support.logical_functions;
-      }
-    in
-    let spec_funcs =
-      List.map application_functions ~f:(fun (key, signature) ->
-          (key, signature.lemma_raven))
-      @ spec_funcs
-    in
-    let preds = application_preds @ preds in
-    let spec_funcs =
-      List.map application_preds ~f:(fun (key, (backend, _)) -> (key, backend))
-      @ spec_funcs
-    in
-    let proof_support =
-      {
-        proof_support with
-        predicate_inputs = application_inputs @ proof_support.predicate_inputs;
-        opaque_predicates =
-          List.filter_map application_views ~f:(fun view ->
-              Option.some_if
-                (Proof_bindings.application_opaque ~owners scoped_proofs ~scope view)
-                view.key)
-          @ proof_support.opaque_predicates;
-      }
-    in
-    let bindings = Proof_bindings.private_bindings scoped_proofs ~scope in
-    let private_preds =
-      List.filter_map bindings ~f:(fun binding ->
-          match binding.kind with
-          | Predicate _ ->
-              Some
-                ( binding.backend,
-                  ( Option.value (definition_target binding) ~default:binding.backend,
-                    binding.private_types ) )
-          | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
-              None)
-    in
-    let inputs =
-      List.filter_map bindings ~f:(fun binding ->
-          Option.map
-            (List.Assoc.find private_scoped_inputs binding.backend ~equal:String.equal)
-            ~f:(fun count -> (binding.backend, count)))
-    in
-    let private_functions =
-      List.filter_map bindings ~f:(fun binding ->
-          Option.map
-            (List.Assoc.find all_logical_functions binding.backend ~equal:String.equal)
-            ~f:(fun signature ->
-              ( binding.backend,
-                {
-                  signature with
-                  lemma_raven =
-                    Option.value (definition_target binding)
-                      ~default:signature.lemma_raven;
-                } )))
-    in
-    ( private_preds @ preds,
-      List.filter_map bindings ~f:(fun binding ->
-          match binding.kind with
-          | Function _ ->
-              Some
-                ( binding.entry.name.pid_str,
-                  Option.value (definition_target binding) ~default:binding.backend )
-          | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | State _ | Action _
-            ->
-              None)
-      @ List.map private_functions ~f:(fun (key, signature) ->
-          (key, signature.lemma_raven))
-      @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
-      @ spec_funcs,
-      {
-        proof_support with
-        proof_key =
-          (fun environment q ->
-            Proof_bindings.resolve ~owners scoped_proofs ~scope ~environment q);
-        predicate_inputs = inputs @ proof_support.predicate_inputs;
-        logical_functions = private_functions @ proof_support.logical_functions;
-      } )
+  let context_atomic = context_atomic ~source ~scoped_proofs ~au_application_view in
+  let context_owners = context_owners ~source in
+  let proof_context =
+    proof_context ~definition_target ~source ~proof_assets ~types ~scoped_proofs
+      ~scoped_inputs ~private_scoped_inputs ~all_logical_functions ~au_application_view
   in
   let* module_parameters =
     all module_contexts.contexts ~f:(fun context ->
@@ -805,91 +914,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
         in
         Ok (context, List.concat resources))
   in
-  let module_context context ~projection (preds, spec_funcs, support) =
-    let project =
-      if List.is_empty context.Module_context.parameters then Fn.id
-      else Subst.type_expr projection
-    in
-    let target backend =
-      match scoped_binding backend with
-      | Some binding when Module_context.contains context binding ->
-          Module_context.member context backend
-      | _ -> backend
-    in
-    let parameters = List.Assoc.find_exn module_parameters context ~equal:phys_equal in
-    let preds =
-      List.map preds ~f:(fun (key, (backend, ts)) ->
-          (key, (target backend, List.map ts ~f:project)))
-    in
-    let preds =
-      List.map parameters ~f:(fun (_, key, ts, _) -> (key, (key, List.map ts ~f:project)))
-      @ preds
-    in
-    let spec_funcs =
-      List.map parameters ~f:(fun (_, key, _, _) -> (key, key))
-      @ List.map spec_funcs ~f:(fun (key, backend) -> (key, target backend))
-    in
-    let predicate_views =
-      List.fold parameters ~init:support.predicate_views
-        ~f:(fun views ((name, parameters), key, _, _) ->
-          List.fold parameters ~init:views ~f:(fun views parameter ->
-              Path_bindings.add views (Path.Pdot (Path.Pident parameter, name)) key))
-    in
-    ( preds,
-      spec_funcs,
-      {
-        support with
-        predicate_views;
-        resources =
-          List.map support.resources ~f:(fun resource ->
-              {
-                resource with
-                resource_type = project resource.Source.resource_type;
-                resource_path = Subst.module_path projection resource.resource_path;
-                resource_operations =
-                  List.map resource.resource_operations ~f:(fun (name, inputs, output) ->
-                      (name, List.map inputs ~f:project, project output));
-              });
-        ghost_fields =
-          List.map support.ghost_fields ~f:(fun field ->
-              {
-                field with
-                field_owner = project field.Source.field_owner;
-                field_value = project field.field_value;
-                field_resource =
-                  Option.map field.field_resource ~f:(Subst.module_path projection);
-              });
-        atomic_updates =
-          List.map support.atomic_updates ~f:(fun signature ->
-              {
-                signature with
-                au_token = project signature.au_token;
-                au_inputs = List.map signature.au_inputs ~f:project;
-                au_result = project signature.au_result;
-                au_ghost_outputs = List.map signature.au_ghost_outputs ~f:project;
-                au_implicit = List.map signature.au_implicit ~f:project;
-              });
-        logical_functions =
-          List.map support.logical_functions ~f:(fun (key, signature) ->
-              ( key,
-                {
-                  signature with
-                  lemma_raven = target signature.lemma_raven;
-                  lemma_inputs = List.map signature.lemma_inputs ~f:project;
-                  lemma_outputs = List.map signature.lemma_outputs ~f:project;
-                } ));
-        predicate_inputs =
-          List.map parameters ~f:(fun (_, key, _, inputs) -> (key, inputs))
-          @ support.predicate_inputs;
-        opaque_predicates =
-          List.map parameters ~f:(fun (_, key, _, _) -> key) @ support.opaque_predicates;
-      } )
-  in
-  let proof_context_for ~preds ~spec_funcs ~proof_support name =
-    let context = declaration_context name in
-    module_context context ~projection:Subst.identity
-      (proof_context (declaration_scope name) preds spec_funcs proof_support)
-  in
+  let module_context = module_context ~scoped_binding ~module_parameters in
   let* atomic_updates =
     all atomic_operations ~f:(fun (au_source, f) ->
         let preds, spec_funcs, proof_support =
@@ -982,7 +1007,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
           })
   in
   let proof_support = { proof_support with atomic_updates } in
-  let atomic_predicates = atomic_predicates (context_atomic None atomic_updates) in
+  let atomic_predicates = atomic_predicates_of (context_atomic None atomic_updates) in
   let preds = preds @ atomic_predicates in
   let spec_funcs =
     spec_funcs @ List.map atomic_predicates ~f:(fun (key, _) -> (key, key))
@@ -1131,13 +1156,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
       checked_resource_entries;
       logical_declarations;
       all_logical_functions;
-      context_owners;
-      proof_context;
-      module_context;
-      proof_context_for;
       proof_support;
       preds;
       spec_funcs;
       lemma_declarations;
       lemma_context;
+      module_parameters;
+      private_scoped_inputs;
     }

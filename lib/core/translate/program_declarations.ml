@@ -11,8 +11,6 @@ type t = {
   source : Source.t;
   all_resources : Source.proof_resource list;
   all_resource_views : Source.proof_resource list;
-  resource_view :
-    scope:Proof_scopes.scope option -> Source.proof_resource -> Source.proof_resource;
   private_ra_types : (Generic_proofs.t * Datatypes.t) list;
   proof_assets :
     Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list;
@@ -20,22 +18,8 @@ type t = {
   checked_modules : Checked_modules.t list;
   checked_operations : Program_items.checked_operation list;
   pure : Procedures.func list;
-  is_pure : Procedures.func -> bool;
-  pure_name : Procedures.func -> Base.string;
-  pure_reference : Procedures.func -> Qualified_name.t;
-  proc_name : Procedures.func -> Base.string;
-  body_proc_name : Procedures.func -> Base.string;
-  body_pure_name : Procedures.func -> Base.string;
-  body_pure_reference : Procedures.func -> Qualified_name.t;
-  body_owner : Procedures.func -> (Generic_modules.t * bool) option;
-  body_module_context : Procedures.func -> Module_context.t;
-  body_destination : Procedures.func -> Module_context.destination;
   runtime_destinations : Module_context.destination list;
-  with_body_names : 'a. (string * 'a) list -> (string * 'a) list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
-  au_plan : Source.proof_au -> Generic_proofs.t option;
-  au_procedure : Source.proof_au -> Procedures.func -> Base.string;
-  au_application_view : Source.proof_au -> Proof_bindings.application option;
   atomic_operations : (Source.proof_au * Procedures.func) list;
   token_types : Datatypes.t list;
   generic_models : Datatypes.t list;
@@ -47,7 +31,6 @@ type t = {
   deferred_native_resource_members : Translate_context.R.Member.t list;
   pending_declarations : (Base.string list * Datatypes.R.Member.t list) list Base.ref;
   available_layouts : Base.string list Base.ref;
-  take_declarations : unit -> Datatypes.R.Member.t list;
   modules : Datatypes.R.Member.t list;
   refs : Translate_context.cell_field list Base.ref;
   primitives : (Base.string * Translate_context.R.Member.t) list Base.ref;
@@ -65,13 +48,158 @@ type t = {
     list;
   library_preds :
     (Library_modules.t * Caravan_spec.Spec_ast.predicate * Types.type_expr list) list;
+  procedures : (Ident.t * string) list;
+  generic_procedures : (string * string) list;
 }
+
+let asset_worker ~(asset_context : Path.t option -> Module_context.t) owner =
+  (asset_context owner).worker
+
+let resource_binding ~(untyped_scoped_proofs : Proof_bindings.t) resource =
+  List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
+      match binding.Proof_bindings.kind with
+      | Resource actual -> Ident.same actual.resource_id resource.Source.resource_id
+      | _ -> false)
+
+let resource_view ~(untyped_scoped_proofs : Proof_bindings.t) ~scope resource =
+  let resource_binding = resource_binding ~untyped_scoped_proofs in
+  match resource_binding resource with
+  | Some binding when Proof_bindings.opaque_at untyped_scoped_proofs ~scope binding ->
+      Option.value resource.resource_public ~default:resource
+  | None ->
+      begin match
+        List.find untyped_scoped_proofs.applications ~f:(fun view ->
+            Path.same
+              (Path.Pdot (view.Proof_bindings.path, view.source.entry.name.pid_str))
+              resource.Source.resource_path)
+      with
+      | Some view when Proof_bindings.application_opaque untyped_scoped_proofs ~scope view
+        ->
+          Option.value resource.resource_public ~default:resource
+      | Some _ | None -> resource
+      end
+  | Some _ -> resource
+
+let is_pure ~(pure : Procedures.func list) (f : func) =
+  List.exists pure ~f:(fun g -> Ident.same g.id f.id)
+
+let procedure_stem ~(generic_procedures : (string * string) list) group stem =
+  List.Assoc.find_exn generic_procedures
+    (group.Generic_modules.name ^ "." ^ stem)
+    ~equal:String.equal
+
+let pure_name ~(generics : Generic_modules.t list) f =
+  match Generic_modules.member generics f.id with
+  | None -> f.raven_name
+  | Some (_, application, stem) -> application.name ^ "." ^ stem
+
+let pure_reference ~(generics : Generic_modules.t list) f =
+  let pure_name = pure_name ~generics in
+  match Generic_modules.member generics f.id with
+  | None -> Qualified_name.{ path = []; name = f.raven_name }
+  | Some _ -> Qualified_name.of_string (pure_name f)
+
+let proc_name ~(procedures : (Ident.t * string) list) (f : func) =
+  List.Assoc.find_exn procedures f.id ~equal:Ident.same
+
+let body_proc_name ~(generics : Generic_modules.t list)
+    ~(generic_procedures : (string * string) list) ~(procedures : (Ident.t * string) list)
+    f =
+  let procedure_stem = procedure_stem ~generic_procedures in
+  let proc_name = proc_name ~procedures in
+  match Generic_modules.member generics f.id with
+  | None -> proc_name f
+  | Some (group, _, stem) -> group.name ^ "." ^ procedure_stem group stem
+
+let body_pure_name ~(generics : Generic_modules.t list) f =
+  let pure_name = pure_name ~generics in
+  match Generic_modules.member generics f.id with
+  | None -> pure_name f
+  | Some (group, _, stem) -> group.name ^ "." ^ stem
+
+let body_pure_reference ~(generics : Generic_modules.t list) f =
+  let pure_reference = pure_reference ~generics in
+  let body_pure_name = body_pure_name ~generics in
+  match Generic_modules.member generics f.id with
+  | None -> pure_reference f
+  | Some _ -> Qualified_name.of_string (body_pure_name f)
+
+let body_owner ~(generics : Generic_modules.t list) f =
+  match Generic_modules.member generics f.id with
+  | None -> None
+  | Some (group, application, _) ->
+      Some (group, phys_equal application.source group.representative)
+
+let body_module_context ~(module_contexts : Module_context.registry)
+    ~(context_for_group : Generic_modules.t -> Module_context.t)
+    ~(generics : Generic_modules.t list) f =
+  let body_owner = body_owner ~generics in
+  match body_owner f with
+  | Some (group, _) -> context_for_group group
+  | None -> Module_context.for_location module_contexts f.loc
+
+let body_destination ~(generics : Generic_modules.t list)
+    ~(module_contexts : Module_context.registry)
+    ~(context_for_group : Generic_modules.t -> Module_context.t) f =
+  let body_owner = body_owner ~generics in
+  let body_module_context =
+    body_module_context ~module_contexts ~context_for_group ~generics
+  in
+  match body_owner f with
+  | None -> (body_module_context f).destination
+  | Some (group, _) -> Module_context.Worker group
+
+let with_body_names ~(funcs : Procedures.func list)
+    ~(procedures : (Ident.t * string) list) ~(generics : Generic_modules.t list)
+    ~(generic_procedures : (string * string) list) entries =
+  let proc_name = proc_name ~procedures in
+  let body_proc_name = body_proc_name ~generics ~generic_procedures ~procedures in
+  let body_owner = body_owner ~generics in
+  entries
+  @ List.filter_map funcs ~f:(fun f ->
+      match body_owner f with
+      | Some (_, true) ->
+          Option.map
+            (List.Assoc.find entries (proc_name f) ~equal:String.equal)
+            ~f:(fun value -> (body_proc_name f, value))
+      | Some (_, false) | None -> None)
+
+let au_plan ~(asset_context : Path.t option -> Module_context.t) (au : Source.proof_au) =
+  let asset_worker = asset_worker ~asset_context in
+  if Option.is_none au.au_application then asset_worker au.au_scope else None
+
+let au_procedure ~(procedures : (Ident.t * string) list)
+    ~(generics : Generic_modules.t list) ~(generic_procedures : (string * string) list)
+    ~(asset_context : Path.t option -> Module_context.t) au f =
+  let proc_name = proc_name ~procedures in
+  let body_proc_name = body_proc_name ~generics ~generic_procedures ~procedures in
+  let au_plan = au_plan ~asset_context in
+  match au_plan au with Some _ -> body_proc_name f | None -> proc_name f
+
+let au_application_view ~(untyped_scoped_proofs : Proof_bindings.t) (au : Source.proof_au)
+    =
+  Option.bind au.au_application ~f:(fun (_, template) ->
+      List.find untyped_scoped_proofs.applications ~f:(fun view ->
+          match view.source.kind with
+          | Atomic original ->
+              Ident.same original.au_id template
+              && Path.same au.au_path (Path.Pdot (view.path, au.au_name))
+          | _ -> false))
+
+let take_declarations
+    ~(pending_declarations : (Base.string list * Datatypes.R.Member.t list) list Base.ref)
+    ~(available_layouts : Base.string list Base.ref) () =
+  let ready, pending =
+    List.partition_tf !pending_declarations ~f:(fun (dependencies, _) ->
+        List.for_all dependencies ~f:(fun name ->
+            List.mem !available_layouts name ~equal:String.equal))
+  in
+  pending_declarations := pending;
+  List.concat_map ready ~f:snd
 
 let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let {
-    Program_scopes.asset_context;
-    context_for_group;
-    fresh;
+    Program_scopes.fresh;
     funcs;
     generic_proof_types;
     generic_proofs;
@@ -80,14 +208,16 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     inventory;
     libraries;
     module_contexts;
-    scoped_proofs;
-    source;
-    types;
+    scoped_proofs = untyped_scoped_proofs;
+    source = unprojected_source;
+    types = source_types;
     _;
   } =
     scopes
   in
-  let asset_worker owner = (asset_context owner).worker in
+  let asset_context =
+    Program_scopes.asset_context ~module_contexts:scopes.module_contexts
+  in
   let source =
     let project_descriptor context backend abstract_member descriptor =
       if List.is_empty context.Module_context.namespace then descriptor
@@ -110,9 +240,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         }
     in
     {
-      source with
+      unprojected_source with
       proof_resources =
-        List.map source.proof_resources ~f:(fun resource ->
+        List.map unprojected_source.proof_resources ~f:(fun resource ->
             let context = asset_context resource.Source.resource_scope in
             let parameter =
               if resource.resource_abstract then
@@ -153,7 +283,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                     });
             });
       proof_fields =
-        List.map source.proof_fields ~f:(fun field ->
+        List.map unprojected_source.proof_fields ~f:(fun field ->
             let context = asset_context field.Source.field_scope in
             {
               field with
@@ -190,29 +320,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         Option.is_none r.Source.resource_application)
   in
   let all_resource_views = List.concat_map all_resources ~f:resource_views in
-  let resource_binding resource =
-    List.find scoped_proofs.bindings ~f:(fun binding ->
-        match binding.Proof_bindings.kind with
-        | Resource actual -> Ident.same actual.resource_id resource.Source.resource_id
-        | _ -> false)
-  in
-  let resource_view ~scope resource =
-    match resource_binding resource with
-    | Some binding when Proof_bindings.opaque_at scoped_proofs ~scope binding ->
-        Option.value resource.resource_public ~default:resource
-    | None ->
-        begin match
-          List.find scoped_proofs.applications ~f:(fun view ->
-              Path.same
-                (Path.Pdot (view.Proof_bindings.path, view.source.entry.name.pid_str))
-                resource.Source.resource_path)
-        with
-        | Some view when Proof_bindings.application_opaque scoped_proofs ~scope view ->
-            Option.value resource.resource_public ~default:resource
-        | Some _ | None -> resource
-        end
-    | Some _ -> resource
-  in
+  let resource_view = resource_view ~untyped_scoped_proofs in
   let private_ra_types =
     List.filter_map source.proof_types ~f:(fun data ->
         Option.bind (Generic_proofs.model_owner source data) ~f:(fun scope ->
@@ -236,7 +344,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       Option.value_map scope ~default:source.env ~f:(fun scope ->
           Source.annotation_env source scope.Proof_scopes.environment)
     in
-    let rebase = Proof_bindings.context_type scoped_proofs ~environment in
+    let rebase = Proof_bindings.context_type untyped_scoped_proofs ~environment in
     let private_owner owner =
       match (owner, scope) with
       | None, _ -> true
@@ -249,11 +357,11 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     in
     let project owner typ =
       if private_owner owner then typ
-      else rebase (Proof_bindings.public_type scoped_proofs typ)
+      else rebase (Proof_bindings.public_type untyped_scoped_proofs typ)
     in
     let visible entry =
       Option.value_map entry ~default:true
-        ~f:(Proof_bindings.visible scoped_proofs ~scope)
+        ~f:(Proof_bindings.visible untyped_scoped_proofs ~scope)
     in
     let resources =
       List.filter_map
@@ -261,7 +369,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
              Option.is_none resource.Source.resource_application))
         ~f:(fun resource ->
           let binding =
-            List.find scoped_proofs.bindings ~f:(fun binding ->
+            List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
                 match binding.kind with
                 | Resource actual ->
                     Ident.same actual.resource_id resource.Source.resource_id
@@ -283,7 +391,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     let fields =
       List.filter_map source.proof_fields ~f:(fun field ->
           let binding =
-            List.find scoped_proofs.bindings ~f:(fun binding ->
+            List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
                 match binding.kind with
                 | Field actual -> Ident.same actual.field_id field.Source.field_id
                 | _ -> false)
@@ -301,24 +409,25 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     let application_resources =
       List.filter_map application_resources ~f:(fun resource ->
           let view =
-            List.find scoped_proofs.applications ~f:(fun view ->
+            List.find untyped_scoped_proofs.applications ~f:(fun view ->
                 Path.same
                   (Path.Pdot (view.Proof_bindings.path, view.source.entry.name.pid_str))
                   resource.Source.resource_path)
           in
           match view with
-          | Some view when Proof_bindings.application_visible scoped_proofs ~scope view ->
+          | Some view
+            when Proof_bindings.application_visible untyped_scoped_proofs ~scope view ->
               Some
-                (if Proof_bindings.application_opaque scoped_proofs ~scope view then
-                   Option.value resource.resource_public ~default:resource
+                (if Proof_bindings.application_opaque untyped_scoped_proofs ~scope view
+                 then Option.value resource.resource_public ~default:resource
                  else resource)
           | Some _ | None -> None)
     in
     let application_fields =
-      List.filter_map scoped_proofs.applications ~f:(fun view ->
+      List.filter_map untyped_scoped_proofs.applications ~f:(fun view ->
           match view.Proof_bindings.source.kind with
           | Field original
-            when Proof_bindings.application_visible scoped_proofs ~scope view ->
+            when Proof_bindings.application_visible untyped_scoped_proofs ~scope view ->
               Option.map
                 (List.find source.proof_fields ~f:(fun field ->
                      Ident.same field.Source.field_id original.field_id))
@@ -345,8 +454,8 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     in
     (resources @ application_resources, fields @ application_fields)
   in
-  let layouts = Result_layouts.plan types generics in
-  let* types = Result_layouts.concrete layouts types in
+  let layouts = Result_layouts.plan source_types generics in
+  let* types = Result_layouts.concrete layouts source_types in
   let schema binding =
     Option.map (Generic_modules.application_for_binding generics binding)
       ~f:(fun (group, application) ->
@@ -407,7 +516,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                          stem
                        && inferred id))))
   in
-  let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
+  let is_pure = is_pure ~pure in
   let generic_procedures =
     List.concat_map generics ~f:(fun group ->
         List.map group.body_members ~f:(fun (source, stem) ->
@@ -418,21 +527,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             let f = List.find_exn funcs ~f:(fun f -> Ident.same f.id id) in
             (group.name ^ "." ^ stem, if is_pure f then fresh (stem ^ "_impl") else stem)))
   in
-  let procedure_stem group stem =
-    List.Assoc.find_exn generic_procedures
-      (group.Generic_modules.name ^ "." ^ stem)
-      ~equal:String.equal
-  in
-  let pure_name f =
-    match Generic_modules.member generics f.id with
-    | None -> f.raven_name
-    | Some (_, application, stem) -> application.name ^ "." ^ stem
-  in
-  let pure_reference f =
-    match Generic_modules.member generics f.id with
-    | None -> Qualified_name.{ path = []; name = f.raven_name }
-    | Some _ -> Qualified_name.of_string (pure_name f)
-  in
+  let procedure_stem = procedure_stem ~generic_procedures in
   let procedures =
     List.map funcs ~f:(fun f ->
         let name =
@@ -443,50 +538,12 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         in
         (f.id, name))
   in
-  let proc_name (f : func) = List.Assoc.find_exn procedures f.id ~equal:Ident.same in
-  let body_proc_name f =
-    match Generic_modules.member generics f.id with
-    | None -> proc_name f
-    | Some (group, _, stem) -> group.name ^ "." ^ procedure_stem group stem
-  in
-  let body_pure_name f =
-    match Generic_modules.member generics f.id with
-    | None -> pure_name f
-    | Some (group, _, stem) -> group.name ^ "." ^ stem
-  in
-  let body_pure_reference f =
-    match Generic_modules.member generics f.id with
-    | None -> pure_reference f
-    | Some _ -> Qualified_name.of_string (body_pure_name f)
-  in
-  let body_owner f =
-    match Generic_modules.member generics f.id with
-    | None -> None
-    | Some (group, application, _) ->
-        Some (group, phys_equal application.source group.representative)
-  in
-  let body_module_context f =
-    match body_owner f with
-    | Some (group, _) -> context_for_group group
-    | None -> Module_context.for_location module_contexts f.loc
-  in
-  let body_destination f =
-    match body_owner f with
-    | None -> (body_module_context f).destination
-    | Some (group, _) -> Module_context.Worker group
-  in
+  let proc_name = proc_name ~procedures in
   let runtime_destinations =
     Module_context.Flat :: List.map generics ~f:(fun group -> Module_context.Worker group)
   in
-  let with_body_names entries =
-    entries
-    @ List.filter_map funcs ~f:(fun f ->
-        match body_owner f with
-        | Some (_, true) ->
-            Option.map
-              (List.Assoc.find entries (proc_name f) ~equal:String.equal)
-              ~f:(fun value -> (body_proc_name f, value))
-        | Some (_, false) | None -> None)
+  let with_body_names lifted_argument =
+    with_body_names ~funcs ~procedures ~generics ~generic_procedures lifted_argument
   in
   let* procedure_signatures =
     all funcs ~f:(fun f ->
@@ -511,26 +568,15 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             { procedure_inputs; procedure_outputs; procedure_result = f.body.exp_type } ))
   in
   let procedure_signatures = with_body_names procedure_signatures in
-  let au_plan (au : Source.proof_au) =
-    if Option.is_none au.au_application then asset_worker au.au_scope else None
-  in
-  let au_procedure au f =
-    match au_plan au with Some _ -> body_proc_name f | None -> proc_name f
-  in
-  let au_application_view (au : Source.proof_au) =
-    Option.bind au.au_application ~f:(fun (_, template) ->
-        List.find scoped_proofs.applications ~f:(fun view ->
-            match view.source.kind with
-            | Atomic original ->
-                Ident.same original.au_id template
-                && Path.same au.au_path (Path.Pdot (view.path, au.au_name))
-            | _ -> false))
+  let au_plan = au_plan ~asset_context in
+  let au_procedure =
+    au_procedure ~procedures ~generics ~generic_procedures ~asset_context
   in
   let applied_atomic_operation (au : Source.proof_au) =
     let ( let* ) value f = Option.bind value ~f in
     let* identity, template = au.au_application in
     let* binding =
-      List.find scoped_proofs.bindings ~f:(fun binding ->
+      List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
           match binding.Proof_bindings.kind with
           | Atomic original -> Ident.same original.au_id template
           | _ -> false)
@@ -861,15 +907,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   in
   let pending_declarations = ref (module_declarations @ field_declarations) in
   let available_layouts = ref [] in
-  let take_declarations () =
-    let ready, pending =
-      List.partition_tf !pending_declarations ~f:(fun (dependencies, _) ->
-          List.for_all dependencies ~f:(fun name ->
-              List.mem !available_layouts name ~equal:String.equal))
-    in
-    pending_declarations := pending;
-    List.concat_map ready ~f:snd
-  in
+  let take_declarations = take_declarations ~pending_declarations ~available_layouts in
   let modules = take_declarations () in
   let refs = ref [] in
   let primitives = ref [] in
@@ -894,9 +932,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
   let* predicates = predicates ~data:types source in
-  let* () = check_scoped_resources ~types source inventory scoped_proofs in
+  let* () = check_scoped_resources ~types source inventory untyped_scoped_proofs in
   let* applications =
-    all scoped_proofs.applications ~f:(fun view ->
+    all untyped_scoped_proofs.applications ~f:(fun view ->
         let formal =
           List.find_map (List.rev view.constraints) ~f:(fun constraint_ ->
               List.Assoc.find constraint_.Module_inventory.signature.signature_resources
@@ -918,7 +956,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             Ok { view with types = List.map raw ~f:(Subst.type_expr projection) }
         | _ -> Ok view)
   in
-  let scoped_proofs = Proof_bindings.with_applications scoped_proofs applications in
+  let scoped_proofs =
+    Proof_bindings.with_applications untyped_scoped_proofs applications
+  in
   let* scoped_predicates =
     all (List.filter_map scoped_proofs.bindings ~f:scoped_predicate)
       ~f:(fun ((_, p, _, ts) as declaration) ->
@@ -959,29 +999,14 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       source;
       all_resources;
       all_resource_views;
-      resource_view;
       private_ra_types;
       proof_assets;
       layouts;
       checked_modules;
       checked_operations;
       pure;
-      is_pure;
-      pure_name;
-      pure_reference;
-      proc_name;
-      body_proc_name;
-      body_pure_name;
-      body_pure_reference;
-      body_owner;
-      body_module_context;
-      body_destination;
       runtime_destinations;
-      with_body_names;
       procedure_signatures;
-      au_plan;
-      au_procedure;
-      au_application_view;
       atomic_operations;
       token_types;
       generic_models;
@@ -993,7 +1018,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       deferred_native_resource_members;
       pending_declarations;
       available_layouts;
-      take_declarations;
       modules;
       refs;
       primitives;
@@ -1005,4 +1029,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       scoped_inputs;
       predicates;
       library_preds;
+      procedures;
+      generic_procedures;
     }

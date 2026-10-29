@@ -29,9 +29,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let {
     Program_scopes.access_proofs;
     annotations;
-    declaration_context;
-    declaration_environment;
-    declaration_scope;
     definition_member_name;
     definition_target;
     fresh;
@@ -41,26 +38,35 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     inventory;
     libraries;
     linearizations;
-    proof_worker;
     return_proofs;
-    scoped_binding;
     _;
   } =
     scopes
   in
+  let declaration_context =
+    Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+      ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let declaration_environment =
+    Program_scopes.declaration_environment ~source:scopes.source
+      ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let declaration_scope =
+    Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let proof_worker =
+    Program_scopes.proof_worker ~module_contexts:scopes.module_contexts
+      ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let scoped_binding =
+    Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs
+  in
   let {
     Program_declarations.all_resource_views;
     all_resources;
-    body_destination;
-    body_module_context;
-    body_owner;
-    body_proc_name;
-    body_pure_name;
-    body_pure_reference;
     checked_modules;
     checked_operations;
     functions;
-    is_pure;
     layouts;
     library_preds;
     lifted;
@@ -68,12 +74,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     origins;
     predicates;
     primitives;
-    proc_name;
     procedure_signatures;
     pure;
-    pure_name;
     refs;
-    resource_view;
     runtime_destinations;
     scoped_proofs;
     source;
@@ -82,37 +85,115 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   } =
     decls
   in
+  let body_destination =
+    Program_declarations.body_destination ~generics:scopes.generics
+      ~module_contexts:scopes.module_contexts
+      ~context_for_group:
+        (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+  in
+  let body_module_context =
+    Program_declarations.body_module_context ~module_contexts:scopes.module_contexts
+      ~context_for_group:
+        (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+      ~generics:scopes.generics
+  in
+  let body_owner = Program_declarations.body_owner ~generics:scopes.generics in
+  let body_proc_name =
+    Program_declarations.body_proc_name ~generics:scopes.generics
+      ~generic_procedures:decls.generic_procedures ~procedures:decls.procedures
+  in
+  let body_pure_name = Program_declarations.body_pure_name ~generics:scopes.generics in
+  let body_pure_reference =
+    Program_declarations.body_pure_reference ~generics:scopes.generics
+  in
+  let is_pure = Program_declarations.is_pure ~pure:decls.pure in
+  let proc_name = Program_declarations.proc_name ~procedures:decls.procedures in
+  let pure_name = Program_declarations.pure_name ~generics:scopes.generics in
+  let resource_view =
+    Program_declarations.resource_view ~untyped_scoped_proofs:scopes.scoped_proofs
+  in
   let {
     Program_proofs.all_logical_functions;
     checked_resource_entries;
     checked_views;
-    context_owners;
     lemma_context;
     lemma_declarations;
     logical_declarations;
-    module_context;
     preds;
-    proof_context;
-    proof_context_for;
     proof_support;
     spec_funcs;
     _;
   } =
     proofs
   in
+  let context_owners = Program_proofs.context_owners ~source:decls.source in
+  let module_context =
+    Program_proofs.module_context
+      ~scoped_binding:
+        (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
+      ~module_parameters:proofs.module_parameters
+  in
+  let proof_context =
+    Program_proofs.proof_context ~definition_target:scopes.definition_target
+      ~source:decls.source ~proof_assets:decls.proof_assets ~types:decls.types
+      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
+      ~private_scoped_inputs:proofs.private_scoped_inputs
+      ~all_logical_functions:proofs.all_logical_functions
+      ~au_application_view:
+        (Program_declarations.au_application_view
+           ~untyped_scoped_proofs:scopes.scoped_proofs)
+  in
+  let proof_context_for =
+    Program_proofs.proof_context_for
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
+      ~declaration_scope:
+        (Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs)
+      ~definition_target:scopes.definition_target ~source:decls.source
+      ~proof_assets:decls.proof_assets ~types:decls.types
+      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
+      ~private_scoped_inputs:proofs.private_scoped_inputs
+      ~all_logical_functions:proofs.all_logical_functions
+      ~au_application_view:
+        (Program_declarations.au_application_view
+           ~untyped_scoped_proofs:scopes.scoped_proofs)
+      ~scoped_binding:
+        (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
+      ~module_parameters:proofs.module_parameters
+  in
   let {
-    Program_structures.body_shared;
-    ghost_args;
-    owner_destination;
+    Program_structures.ghost_args;
     past_returns;
     past_structures;
     pasts;
     shared;
-    shared_for_proof;
     structures;
     _;
   } =
     shaped
+  in
+  let body_shared =
+    Program_structures.body_shared
+      ~body_module_context:
+        (Program_declarations.body_module_context ~module_contexts:scopes.module_contexts
+           ~context_for_group:
+             (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+           ~generics:scopes.generics)
+      ~shared:shaped.shared ~generic_shared:shaped.generic_shared
+  in
+  let owner_destination =
+    Program_structures.owner_destination
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
+  in
+  let shared_for_proof =
+    Program_structures.shared_for_proof
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
+      ~shared:shaped.shared ~generic_shared:shaped.generic_shared
   in
   (* Each library's module, trusted: its abstract predicates, and its values, as functions
      without arguments, and functions, as procedures with their contracts. *)

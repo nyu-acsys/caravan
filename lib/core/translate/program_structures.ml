@@ -11,14 +11,8 @@ type t = {
   structures : structure list;
   structure_member_lists : (structure * R.Member.t list) list;
   view_fields : (string * (string * R.Type.t * R.Expr.t option)) list;
-  owner_destination : string -> Module_context.destination;
-  same_group : Generic_modules.t option -> Generic_modules.t option -> bool;
-  field_group : string -> Generic_modules.t option;
   shared : shared;
   generic_shared : (string * shared) list;
-  shared_for_proof : string -> shared;
-  body_shared : Procedures.func -> shared;
-  state_members : 'a. Generic_modules.t option -> (structure * 'a list) list -> 'a list;
   past_structures : ?symbolic:bool -> Procedures.func -> structure list;
   pasts : (string * (string * string * int) list) list;
   past_returns :
@@ -26,44 +20,118 @@ type t = {
   ghost_args : (string * (int * string) option list) list;
 }
 
+let destination_of_group = function
+  | None -> Module_context.Flat
+  | Some group -> Module_context.Worker group
+
+let owner_destination ~(declaration_context : string -> Module_context.t) name =
+  (declaration_context name).destination
+
+let same_group left right =
+  Module_context.same_destination (destination_of_group left) (destination_of_group right)
+
+let field_group ~(generics : Generic_modules.t list) field =
+  List.find generics ~f:(fun group ->
+      String.is_prefix field ~prefix:(group.Generic_modules.name ^ "."))
+
+let shared_for_destination ~(shared : shared) ~(generic_shared : (string * shared) list) =
+  function
+  | Module_context.Flat -> shared
+  | Module_context.Worker group ->
+      List.Assoc.find_exn generic_shared group.Generic_modules.name ~equal:String.equal
+
+let shared_for_proof ~(declaration_context : string -> Module_context.t)
+    ~(shared : shared) ~(generic_shared : (string * shared) list) name =
+  let owner_destination = owner_destination ~declaration_context in
+  let shared_for_destination = shared_for_destination ~shared ~generic_shared in
+  shared_for_destination (owner_destination name)
+
+let body_shared ~(body_module_context : Procedures.func -> Module_context.t)
+    ~(shared : shared) ~(generic_shared : (string * shared) list) f =
+  let shared_for_destination = shared_for_destination ~shared ~generic_shared in
+  shared_for_destination (body_module_context f).destination
+
+let state_members ~(declaration_context : string -> Module_context.t) group lists =
+  let owner_destination = owner_destination ~declaration_context in
+  List.concat_map lists ~f:(fun (st, members) ->
+      Option.some_if
+        (Module_context.same_destination
+           (owner_destination st.invariant)
+           (destination_of_group group))
+        members
+      |> Option.value ~default:[])
+
 let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     (proofs : Program_proofs.t) : (t, error) Result.t =
-  let {
-    Program_scopes.declaration_context;
-    declaration_environment;
-    declaration_scope;
-    funcs;
-    generic_proofs;
-    generics;
-    proof_worker;
-    _;
-  } =
-    scopes
+  let { Program_scopes.funcs; generic_proofs; generics; _ } = scopes in
+  let declaration_context =
+    Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+      ~unapplied_proofs:scopes.unapplied_proofs
   in
-  let {
-    Program_declarations.body_module_context;
-    body_owner;
-    body_proc_name;
-    predicates;
-    proc_name;
-    scoped_proofs;
-    source;
-    types;
-    with_body_names;
-    _;
-  } =
-    decls
+  let declaration_environment =
+    Program_scopes.declaration_environment ~source:scopes.source
+      ~unapplied_proofs:scopes.unapplied_proofs
   in
-  let {
-    Program_proofs.module_context;
-    preds;
-    proof_context;
-    proof_context_for;
-    proof_support;
-    spec_funcs;
-    _;
-  } =
-    proofs
+  let declaration_scope =
+    Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let proof_worker =
+    Program_scopes.proof_worker ~module_contexts:scopes.module_contexts
+      ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let { Program_declarations.predicates; scoped_proofs; source; types; _ } = decls in
+  let body_module_context =
+    Program_declarations.body_module_context ~module_contexts:scopes.module_contexts
+      ~context_for_group:
+        (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+      ~generics:scopes.generics
+  in
+  let body_owner = Program_declarations.body_owner ~generics:scopes.generics in
+  let body_proc_name =
+    Program_declarations.body_proc_name ~generics:scopes.generics
+      ~generic_procedures:decls.generic_procedures ~procedures:decls.procedures
+  in
+  let proc_name = Program_declarations.proc_name ~procedures:decls.procedures in
+  let with_body_names lifted_argument =
+    Program_declarations.with_body_names ~funcs:scopes.funcs ~procedures:decls.procedures
+      ~generics:scopes.generics ~generic_procedures:decls.generic_procedures
+      lifted_argument
+  in
+  let { Program_proofs.preds; proof_support; spec_funcs; _ } = proofs in
+  let module_context =
+    Program_proofs.module_context
+      ~scoped_binding:
+        (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
+      ~module_parameters:proofs.module_parameters
+  in
+  let proof_context =
+    Program_proofs.proof_context ~definition_target:scopes.definition_target
+      ~source:decls.source ~proof_assets:decls.proof_assets ~types:decls.types
+      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
+      ~private_scoped_inputs:proofs.private_scoped_inputs
+      ~all_logical_functions:proofs.all_logical_functions
+      ~au_application_view:
+        (Program_declarations.au_application_view
+           ~untyped_scoped_proofs:scopes.scoped_proofs)
+  in
+  let proof_context_for =
+    Program_proofs.proof_context_for
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
+      ~declaration_scope:
+        (Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs)
+      ~definition_target:scopes.definition_target ~source:decls.source
+      ~proof_assets:decls.proof_assets ~types:decls.types
+      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
+      ~private_scoped_inputs:proofs.private_scoped_inputs
+      ~all_logical_functions:proofs.all_logical_functions
+      ~au_application_view:
+        (Program_declarations.au_application_view
+           ~untyped_scoped_proofs:scopes.scoped_proofs)
+      ~scoped_binding:
+        (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
+      ~module_parameters:proofs.module_parameters
   in
   (* The views, with their values, and their ghost fields, on the structures. *)
   let views =
@@ -653,25 +721,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     ]) ) )))
   in
   let view_fields = view_fields @ history_fields in
-  let destination_of_group = function
-    | None -> Module_context.Flat
-    | Some group -> Module_context.Worker group
-  in
-  let owner_destination name = (declaration_context name).destination in
-  let same_group left right =
-    Module_context.same_destination (destination_of_group left)
-      (destination_of_group right)
-  in
+  let owner_destination = owner_destination ~declaration_context in
   let visible_state group name =
     match owner_destination name with
     | Module_context.Flat -> true
     | destination ->
         Module_context.same_destination destination (destination_of_group group)
   in
-  let field_group field =
-    List.find generics ~f:(fun group ->
-        String.is_prefix field ~prefix:(group.Generic_modules.name ^ "."))
-  in
+  let field_group = field_group ~generics in
   let make_shared group =
     let persistent =
       List.filter_map predicates ~f:(fun (at, p, def, _) ->
@@ -745,22 +802,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     List.map generics ~f:(fun group ->
         (group.Generic_modules.name, make_shared (Some group)))
   in
-  let shared_for_destination = function
-    | Module_context.Flat -> shared
-    | Module_context.Worker group ->
-        List.Assoc.find_exn generic_shared group.Generic_modules.name ~equal:String.equal
-  in
-  let shared_for_proof name = shared_for_destination (owner_destination name) in
-  let body_shared f = shared_for_destination (body_module_context f).destination in
-  let state_members group lists =
-    List.concat_map lists ~f:(fun (st, members) ->
-        Option.some_if
-          (Module_context.same_destination
-             (owner_destination st.invariant)
-             (destination_of_group group))
-          members
-        |> Option.value ~default:[])
-  in
+  let body_shared = body_shared ~body_module_context ~shared ~generic_shared in
   let past_structures ?(symbolic = false) (f : func) =
     let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
     let context = proof_context scope preds spec_funcs proof_support in
@@ -943,14 +985,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
       structures;
       structure_member_lists;
       view_fields;
-      owner_destination;
-      same_group;
-      field_group;
       shared;
       generic_shared;
-      shared_for_proof;
-      body_shared;
-      state_members;
       past_structures;
       pasts;
       past_returns;

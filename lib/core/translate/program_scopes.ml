@@ -16,30 +16,79 @@ type t = {
   source : Source.t;
   implementation : Source.proof_resource -> string option;
   proof_implementation : Source.proof_resource -> string option;
-  definition_resource : Proof_scopes.scope -> Source.proof_resource option;
   definition_target : Proof_bindings.binding -> string option;
   inventory : Module_inventory.t;
-  scoped_binding : string -> Proof_bindings.binding option;
-  declaration_scope : string -> Proof_scopes.scope option;
-  declaration_environment : string -> Env.t;
   definition_member_name : string -> string option;
   libraries : Library_modules.t list;
   funcs : Procedures.func list;
   access_proofs : ((int * int) * Annotation.t) list;
   return_proofs : ((int * int) * Annotation.t) list;
-  alias_path : target:Path.t -> alias:Path.t -> Path.t -> Path.t option;
   types : Datatypes.t list;
   public_types : Path.t list;
   generics : Generic_modules.t list;
   generic_proofs : Generic_proofs.t list;
   module_contexts : Module_context.registry;
-  declaration_context : string -> Module_context.t;
-  asset_context : Path.t option -> Module_context.t;
-  context_for_group : Generic_modules.t -> Module_context.t;
   generic_proof_types : Datatypes.t list;
-  proof_worker : string -> Generic_proofs.t option;
   scoped_proofs : Proof_bindings.t;
+  unapplied_proofs : Proof_bindings.t;
 }
+
+let definition_resource ~(source : Source.t) scope =
+  Option.bind scope.Proof_scopes.owner ~f:(fun owner ->
+      List.find source.proof_resources ~f:(fun resource ->
+          resource.resource_definition
+          && (Path.same owner resource.resource_path
+             || Path.same owner (Path.Pident resource.resource_id))))
+
+let scoped_binding ~(unapplied_proofs : Proof_bindings.t) name =
+  List.find unapplied_proofs.bindings ~f:(fun binding ->
+      String.equal binding.backend name)
+
+let declaration_scope ~(unapplied_proofs : Proof_bindings.t) name =
+  let scoped_binding = scoped_binding ~unapplied_proofs in
+  Option.map (scoped_binding name) ~f:(fun binding -> binding.entry.scope)
+
+let declaration_environment ~(source : Source.t) ~(unapplied_proofs : Proof_bindings.t)
+    name =
+  let scoped_binding = scoped_binding ~unapplied_proofs in
+  Option.value_map (scoped_binding name) ~default:source.env ~f:(fun binding ->
+      binding.environment)
+
+let rec alias_path ~target ~alias path =
+  if Path.same target path then Some alias
+  else
+    match path with
+    | Path.Pdot (parent, name) ->
+        Option.map (alias_path ~target ~alias parent) ~f:(fun parent ->
+            Path.Pdot (parent, name))
+    | Papply (head, argument) ->
+        let head_alias = alias_path ~target ~alias head in
+        let argument_alias = alias_path ~target ~alias argument in
+        if Option.is_none head_alias && Option.is_none argument_alias then None
+        else
+          Some
+            (Path.Papply
+               ( Option.value head_alias ~default:head,
+                 Option.value argument_alias ~default:argument ))
+    | Pident _ | Pextra_ty _ -> None
+
+let declaration_context ~(module_contexts : Module_context.registry)
+    ~(unapplied_proofs : Proof_bindings.t) name =
+  let declaration_scope = declaration_scope ~unapplied_proofs in
+  Module_context.for_scope module_contexts (declaration_scope name)
+
+let asset_context ~(module_contexts : Module_context.registry) owner =
+  Module_context.for_owner module_contexts owner
+
+let context_for_group ~(module_contexts : Module_context.registry) group =
+  Option.value
+    (Module_context.for_group module_contexts group)
+    ~default:module_contexts.root
+
+let proof_worker ~(module_contexts : Module_context.registry)
+    ~(unapplied_proofs : Proof_bindings.t) name =
+  let declaration_context = declaration_context ~module_contexts ~unapplied_proofs in
+  (declaration_context name).worker
 
 let run (source : Source.t) : (t, error) Result.t =
   let annotations = Annotation.of_comments source.comments in
@@ -207,13 +256,7 @@ let run (source : Source.t) : (t, error) Result.t =
   let proof_implementation resource =
     List.Assoc.find proof_implementations resource.Source.resource_id ~equal:Ident.same
   in
-  let definition_resource scope =
-    Option.bind scope.Proof_scopes.owner ~f:(fun owner ->
-        List.find source.proof_resources ~f:(fun resource ->
-            resource.resource_definition
-            && (Path.same owner resource.resource_path
-               || Path.same owner (Path.Pident resource.resource_id))))
-  in
+  let definition_resource = definition_resource ~source in
   let definition_target (binding : Proof_bindings.binding) =
     Option.bind (definition_resource binding.entry.scope) ~f:(fun resource ->
         let backend =
@@ -225,17 +268,8 @@ let run (source : Source.t) : (t, error) Result.t =
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))
   in
   let* inventory = Module_inventory.build source typed in
-  let* scoped_proofs = Proof_bindings.build ~fresh source inventory in
-  let scoped_binding name =
-    List.find scoped_proofs.bindings ~f:(fun binding -> String.equal binding.backend name)
-  in
-  let declaration_scope name =
-    Option.map (scoped_binding name) ~f:(fun binding -> binding.entry.scope)
-  in
-  let declaration_environment name =
-    Option.value_map (scoped_binding name) ~default:source.env ~f:(fun binding ->
-        binding.environment)
-  in
+  let* unapplied_proofs = Proof_bindings.build ~fresh source inventory in
+  let scoped_binding = scoped_binding ~unapplied_proofs in
   let definition_member_name name =
     Option.bind (scoped_binding name) ~f:(fun binding ->
         Option.map (definition_target binding) ~f:(fun _ -> binding.entry.name.pid_str))
@@ -393,24 +427,6 @@ let run (source : Source.t) : (t, error) Result.t =
             | _ -> Ok []))
   in
   let types = List.concat (List.concat library_types) @ types @ source.proof_types in
-  let rec alias_path ~target ~alias path =
-    if Path.same target path then Some alias
-    else
-      match path with
-      | Path.Pdot (parent, name) ->
-          Option.map (alias_path ~target ~alias parent) ~f:(fun parent ->
-              Path.Pdot (parent, name))
-      | Papply (head, argument) ->
-          let head_alias = alias_path ~target ~alias head in
-          let argument_alias = alias_path ~target ~alias argument in
-          if Option.is_none head_alias && Option.is_none argument_alias then None
-          else
-            Some
-              (Path.Papply
-                 ( Option.value head_alias ~default:head,
-                   Option.value argument_alias ~default:argument ))
-      | Pident _ | Pextra_ty _ -> None
-  in
   let types =
     List.map types ~f:(fun data ->
         let declared =
@@ -457,20 +473,11 @@ let run (source : Source.t) : (t, error) Result.t =
   let* module_scopes = Module_context.collect_scopes source.proof_scopes in
   let* generic_proofs = Generic_proofs.plan generics module_scopes in
   let module_contexts = Module_context.plan ~scopes:module_scopes generic_proofs in
-  let declaration_context name =
-    Module_context.for_scope module_contexts (declaration_scope name)
-  in
-  let asset_context owner = Module_context.for_owner module_contexts owner in
-  let context_for_group group =
-    Option.value
-      (Module_context.for_group module_contexts group)
-      ~default:module_contexts.root
-  in
   let* generic_proof_types =
     all generic_proofs ~f:Generic_proofs.types |> Result.map ~f:List.concat
   in
   let* _ =
-    all scoped_proofs.bindings ~f:(fun binding ->
+    all unapplied_proofs.bindings ~f:(fun binding ->
         if
           Option.is_none
             (Proof_bindings.functor_ancestor source.proof_scopes binding.entry.scope)
@@ -491,11 +498,10 @@ let run (source : Source.t) : (t, error) Result.t =
               "A functor proof without a supported generic runtime body and application"
         | Some _ | None -> Ok ())
   in
-  let proof_worker name = (declaration_context name).worker in
   let* applications =
-    Generic_proofs.applications ~fresh source inventory scoped_proofs generic_proofs
+    Generic_proofs.applications ~fresh source inventory unapplied_proofs generic_proofs
   in
-  let scoped_proofs = Proof_bindings.with_applications scoped_proofs applications in
+  let scoped_proofs = Proof_bindings.with_applications unapplied_proofs applications in
   Ok
     {
       annotations;
@@ -505,27 +511,19 @@ let run (source : Source.t) : (t, error) Result.t =
       source;
       implementation;
       proof_implementation;
-      definition_resource;
       definition_target;
       inventory;
-      scoped_binding;
-      declaration_scope;
-      declaration_environment;
       definition_member_name;
       libraries;
       funcs;
       access_proofs;
       return_proofs;
-      alias_path;
       types;
       public_types;
       generics;
       generic_proofs;
       module_contexts;
-      declaration_context;
-      asset_context;
-      context_for_group;
       generic_proof_types;
-      proof_worker;
       scoped_proofs;
+      unapplied_proofs;
     }

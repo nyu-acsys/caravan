@@ -20,60 +20,41 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     source;
     implementation;
     proof_implementation;
-    definition_resource;
     definition_target;
     inventory;
-    scoped_binding;
-    declaration_scope;
-    declaration_environment;
     definition_member_name;
     libraries;
     funcs;
     access_proofs;
     return_proofs;
-    alias_path;
     types;
     public_types;
     generics;
     generic_proofs;
     module_contexts;
-    declaration_context;
-    asset_context;
-    context_for_group;
     generic_proof_types;
-    proof_worker;
     scoped_proofs;
+    unapplied_proofs;
   } =
     scopes
+  in
+  let definition_resource = Program_scopes.definition_resource ~source:scopes.source in
+  let scoped_binding =
+    Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs
   in
   let* decls = Program_declarations.run scopes in
   let {
     Program_declarations.source;
     all_resources;
     all_resource_views;
-    resource_view;
     private_ra_types;
     proof_assets;
     layouts;
     checked_modules;
     checked_operations;
     pure;
-    is_pure;
-    pure_name;
-    pure_reference;
-    proc_name;
-    body_proc_name;
-    body_pure_name;
-    body_pure_reference;
-    body_owner;
-    body_module_context;
-    body_destination;
     runtime_destinations;
-    with_body_names;
     procedure_signatures;
-    au_plan;
-    au_procedure;
-    au_application_view;
     atomic_operations;
     token_types;
     generic_models;
@@ -85,7 +66,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     deferred_native_resource_members;
     pending_declarations;
     available_layouts;
-    take_declarations;
     modules;
     refs;
     primitives;
@@ -97,8 +77,21 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     scoped_inputs;
     predicates;
     library_preds;
+    procedures;
+    generic_procedures;
   } =
     decls
+  in
+  let body_destination =
+    Program_declarations.body_destination ~generics:scopes.generics
+      ~module_contexts:scopes.module_contexts
+      ~context_for_group:
+        (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+  in
+  let take_declarations =
+    Program_declarations.take_declarations
+      ~pending_declarations:decls.pending_declarations
+      ~available_layouts:decls.available_layouts
   in
   let* proofs = Program_proofs.run scopes decls in
   let {
@@ -106,15 +99,13 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     checked_resource_entries;
     logical_declarations;
     all_logical_functions;
-    context_owners;
-    proof_context;
-    module_context;
-    proof_context_for;
     proof_support;
     preds;
     spec_funcs;
     lemma_declarations;
     lemma_context;
+    module_parameters;
+    private_scoped_inputs;
   } =
     proofs
   in
@@ -123,20 +114,28 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Program_structures.structures;
     structure_member_lists;
     view_fields;
-    owner_destination;
-    same_group;
-    field_group;
     shared;
     generic_shared;
-    shared_for_proof;
-    body_shared;
-    state_members;
     past_structures;
     pasts;
     past_returns;
     ghost_args;
   } =
     shaped
+  in
+  let owner_destination =
+    Program_structures.owner_destination
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
+  in
+  let same_group = Program_structures.same_group in
+  let field_group = Program_structures.field_group ~generics:scopes.generics in
+  let state_members =
+    Program_structures.state_members
+      ~declaration_context:
+        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+           ~unapplied_proofs:scopes.unapplied_proofs)
   in
   let* translated = Program_members.run scopes decls proofs shaped in
   let {
