@@ -845,7 +845,7 @@ let view_bindings ctx (f : func) =
           let key = logical_key (scope_env ctx) q in
           let v = key in
           begin match
-            (List.Assoc.find ctx.shared.views v ~equal:String.equal, List.last args)
+            (List.Assoc.find ctx.given.shared.views v ~equal:String.equal, List.last args)
           with
           | Some field, Some { term_desc = Tvar (Qid { pid_str = x; _ }); _ } ->
               Some (x, v, field)
@@ -860,7 +860,9 @@ let rec without_predicates ctx (t : S.term) : S.term =
       let a = without_predicates ctx a and b = without_predicates ctx b in
       S.mk_term (Tapply (S.mk_term (Tapply (op, a)) t.term_loc, b)) t.term_loc
   | { term_desc = Tvar q; _ }, _
-    when List.Assoc.mem ctx.preds (logical_key (scope_env ctx) q) ~equal:String.equal
+    when List.Assoc.mem ctx.given.preds
+           (logical_key (scope_env ctx) q)
+           ~equal:String.equal
          || String.equal (qualid_key q) "own" ->
       S.mk_term Ttrue t.term_loc
   | _ -> t
@@ -903,8 +905,8 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       ctx;
       var_types = List.map params ~f:(fun (x, t, _) -> (x, t));
       logical_definition = false;
-      data = ctx.types;
-      funcs = ctx.spec_funcs;
+      data = ctx.given.types;
+      funcs = ctx.given.spec_funcs;
       vars = List.map params ~f:(fun (x, _, _) -> (x, Raven x));
     }
   in
@@ -961,16 +963,16 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
     all st.views ~f:(fun ((v : S.predicate), _) ->
         let v = v.pred_name.pid_str in
         let* t =
-          match List.Assoc.find ctx.preds v ~equal:String.equal with
+          match List.Assoc.find ctx.given.preds v ~equal:String.equal with
           | Some (_, types) when not (List.is_empty types) -> Ok (List.last_exn types)
           | _ -> error at (Printf.sprintf "The view %s has no value" v)
         in
         let* typ = typ ctx ~at t in
-        let view_field = view_field_in ctx.shared v in
+        let view_field = view_field_in ctx.given.shared v in
         Ok ("view_" ^ v, v, view_field, t, typ))
   in
   let anchored e =
-    match anchor ctx.types st.structure_type with
+    match anchor ctx.given.types st.structure_type with
     | Some (_, at) -> at ~loc:l e
     | None -> e
   in
@@ -1030,7 +1032,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let opened_values = List.map bound ~f:(fun (x, _, _, _, _) -> var (x ^ "_1")) in
   let view_uses use =
     List.map bound ~f:(fun (x, v, _, _, _) ->
-        let raven, _ = List.Assoc.find_exn ctx.preds v ~equal:String.equal in
+        let raven, _ = List.Assoc.find_exn ctx.given.preds v ~equal:String.equal in
         use ~loc:l (qualified_name ~loc:l raven) (args @ [ var (x ^ "_1") ]))
   in
   let commit =
@@ -1128,7 +1130,7 @@ let pred_params ctx ~at (p : S.predicate) param_types =
   let* params =
     all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
         let* typ = typ ctx ~at t in
-        let raven = Names.fresh ctx.names id.S.pid_str in
+        let raven = Names.fresh ctx.procedure.names id.S.pid_str in
         Ok
           (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
   in
@@ -1137,8 +1139,8 @@ let pred_params ctx ~at (p : S.predicate) param_types =
       ctx;
       var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
       logical_definition = false;
-      data = ctx.types;
-      funcs = ctx.spec_funcs;
+      data = ctx.given.types;
+      funcs = ctx.given.spec_funcs;
       vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
     }
   in
@@ -1228,7 +1230,7 @@ type prepared_callable = {
 let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
     (contract : S.contract option) =
   let l = loc at in
-  ctx.names.used <- Set.add ctx.names.used "r";
+  ctx.procedure.names.used <- Set.add ctx.procedure.names.used "r";
   let* result_typ = typ ctx ~at result in
   let header = Option.bind contract ~f:(fun c -> c.header) in
   let* result_name, names =
@@ -1256,7 +1258,7 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   in
   let* params =
     all (List.zip_exn names args) ~f:(fun (n, t) ->
-        let raven = Names.fresh ctx.names (Option.value n ~default:"x") in
+        let raven = Names.fresh ctx.procedure.names (Option.value n ~default:"x") in
         let* typ = typ ctx ~at t in
         Ok (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
@@ -1273,8 +1275,8 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
       ctx;
       var_types = List.map named ~f:(fun (n, _, t) -> (n, t));
       logical_definition = false;
-      data = ctx.types;
-      funcs = ctx.spec_funcs;
+      data = ctx.given.types;
+      funcs = ctx.given.spec_funcs;
       vars = List.map named ~f:(fun (n, raven, _) -> (n, Raven raven));
     }
   in
@@ -1302,15 +1304,15 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
     else
       let predicates q =
         Option.map
-          (List.Assoc.find ctx.preds (logical_key env q) ~equal:String.equal)
+          (List.Assoc.find ctx.given.preds (logical_key env q) ~equal:String.equal)
           ~f:snd
       in
       let clauses =
         Option.value_map contract ~default:[] ~f:(fun c ->
             c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures)
       in
-      Signature_contract.terms ~expected:Predef.type_bool ~logical_types:ctx.types
-        ~predicates ~environment:ctx.env ~variables:env.var_types clauses
+      Signature_contract.terms ~expected:Predef.type_bool ~logical_types:ctx.given.types
+        ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
   let clauses ?atomic terms =
     all terms ~f:(fun t -> Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
@@ -1359,7 +1361,7 @@ let forwarding_body ctx ~at ~self ~target ~result ~atomic prepared =
     if not atomic then []
     else
       List.map prepared.prepared_implicit ~f:(fun (_, _, _, typ, _) ->
-          let x = Names.fresh ctx.names "opened" in
+          let x = Names.fresh ctx.procedure.names "opened" in
           (R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x), var x))
   in
   let implicit_args =
@@ -1377,7 +1379,7 @@ let forwarding_body ctx ~at ~self ~target ~result ~atomic prepared =
   in
   if not atomic then [ call_statement ]
   else
-    let token = Names.fresh ctx.names "token" in
+    let token = Names.fresh ctx.procedure.names "token" in
     let bind =
       R.Stmt.local ~loc:l ~ghost:true
         ~typ:(R.Type.atomic_token ~loc:l (qualified_name ~loc:l self))

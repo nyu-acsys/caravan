@@ -10,10 +10,10 @@ open Atomic_proofs
 let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
     (ctx : context) (e : Typedtree.expression) :
     (R.Stmt.t list * R.Expr.t, error) Result.t =
-  let incoming = ctx.proof_state and covered = ctx.return_covered in
-  let incoming_names = ctx.names.scope in
+  let incoming = ctx.procedure.proof_state and covered = ctx.procedure.return_covered in
+  let incoming_names = ctx.procedure.names.scope in
   let key = (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) in
-  let adapter = List.Assoc.find ctx.return_proofs key ~equal:Poly.equal in
+  let adapter = List.Assoc.find ctx.given.return_proofs key ~equal:Poly.equal in
   let* () =
     match adapter with
     | Some a when not tail ->
@@ -22,7 +22,7 @@ let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
         error a.loc "This return path has more than one Ghost.returns annotation"
     | _ -> Ok ()
   in
-  ctx.return_covered <- covered || Option.is_some adapter;
+  ctx.procedure.return_covered <- covered || Option.is_some adapter;
   let tail_container =
     match e.exp_desc with
     | Texp_let _ | Texp_sequence _ | Texp_match _ -> true
@@ -31,8 +31,10 @@ let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
   in
   let* () =
     if
-      tail && (not ctx.return_covered) && (not tail_container)
-      && not (List.is_empty ctx.ghost_returns)
+      tail
+      && (not ctx.procedure.return_covered)
+      && (not tail_container)
+      && not (List.is_empty ctx.procedure.ghost_returns)
     then error e.exp_loc "A normal return with ghost results needs Ghost.returns"
     else Ok ()
   in
@@ -42,10 +44,10 @@ let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
     | None -> Ok []
     | Some a -> return_proof ctx a ~result_type:e.exp_type ~result:value
   in
-  let* stateful = stateful_access ctx.access_proofs e in
-  if not (continue_state && stateful) then ctx.proof_state <- incoming;
-  if not keep_scope then ctx.names.scope <- incoming_names;
-  ctx.return_covered <- covered;
+  let* stateful = stateful_access ctx.given.access_proofs e in
+  if not (continue_state && stateful) then ctx.procedure.proof_state <- incoming;
+  if not keep_scope then ctx.procedure.names.scope <- incoming_names;
+  ctx.procedure.return_covered <- covered;
   Ok (statements @ finish, value)
 
 and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
@@ -54,12 +56,12 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   let l = loc at in
   match e.exp_desc with
   | Texp_ident (Pident id, _, _) -> (
-      match Names.find ctx.names id with
+      match Names.find ctx.procedure.names id with
       | Some x -> Ok ([], R.Expr.var ~loc:l (name ~loc:l x))
       | None -> unsupported at "A function used as a value")
   | Texp_ident (path, _, _) -> (
       let* path = Source.normalize_value_path e.exp_env ~at path in
-      match Path_bindings.member ctx.libraries path with
+      match Path_bindings.member ctx.given.libraries path with
       | Some member -> Ok ([], R.Expr.call ~loc:l (Qualified_name.raven ~loc:l member) [])
       | None ->
           begin match stdlib_name path with
@@ -74,7 +76,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       Ok ([], R.Expr.bool ~loc:l false)
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) -> Ok ([], unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match Datatypes.find_cstr ctx.types cstr with
+      begin match Datatypes.find_cstr ctx.given.types cstr with
       | None -> unsupported at "This constructor"
       | Some (d, c) ->
           let* stmts, args = operands ctx args in
@@ -93,7 +95,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let* stmts, args = operands ctx (List.map values ~f:snd) in
       let label, _ = List.hd_exn fields in
-      begin match Datatypes.find_label ctx.types label with
+      begin match Datatypes.find_label ctx.given.types label with
       | Some { heap = Some _; _ } ->
           let* typ = typ ctx ~at e.exp_type in
           let* fields =
@@ -101,7 +103,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                 let* field = field_of_label ctx ~at label in
                 Ok (fst (Option.value_exn field)))
           in
-          let x = Names.fresh ctx.names "tmp" in
+          let x = Names.fresh ctx.procedure.names "tmp" in
           let views, view_args = view_allocation ctx ~loc:l fields in
           let* explicit = allocation_initializers ctx e in
           let init =
@@ -127,7 +129,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | Some (field, false) ->
           let value = R.Expr.field ~loc:l v (qualified_name ~loc:l field) in
           if is_int e.exp_type then
-            let x = Names.fresh ctx.names "tmp" in
+            let x = Names.fresh ctx.procedure.names "tmp" in
             Ok
               ( stmts
                 @ R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l)
@@ -156,7 +158,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
         | Texp_ident (Pident _, _, _) -> Ok ([], v)
         | _ ->
             let* typ = typ ctx ~at:scrutinee.exp_loc scrutinee.exp_type in
-            let x = Names.fresh ctx.names "scrutinee" in
+            let x = Names.fresh ctx.procedure.names "scrutinee" in
             Ok
               ( R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs v) (ident ~loc:l x),
                 R.Expr.var ~loc:l (name ~loc:l x) )
@@ -193,7 +195,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       Ok (c_stmts @ fst stmts, snd stmts)
   | Texp_let (_, [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; _ } ], rest)
-    when Path_bindings.mem ctx.functions (Path.Pident id) ->
+    when Path_bindings.mem ctx.given.functions (Path.Pident id) ->
       (* A local function, lifted to the top level. *)
       expr ~tail ~keep_scope ctx rest
   | Texp_let (Nonrecursive, bindings, body) ->
@@ -205,7 +207,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
             let* stmts, v =
               expr ~continue_state:(List.length bindings = 1) ctx vb.vb_expr
             in
-            begin match (ctx.au, polarity, vb.vb_pat.pat_desc) with
+            begin match (ctx.procedure.au, polarity, vb.vb_pat.pat_desc) with
             | Some au, Some p, Tpat_var (id, _, _) ->
                 au.cas_results <- (Ident.unique_name id, p) :: au.cas_results
             | Some au, None, Tpat_var (id, _, _) when read ->
@@ -224,7 +226,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                 let* defs =
                   all binds ~f:(fun (id, value, t) ->
                       let* typ = typ ctx ~at t in
-                      let x = Names.bind ~typ:t ctx.names id in
+                      let x = Names.bind ~typ:t ctx.procedure.names id in
                       Ok
                         (R.Stmt.local ~loc:l ~const:true ~typ
                            ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
@@ -251,7 +253,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* () = no_loop_before_linearizing ctx ~at in
       let* spec = loop_spec ctx ~after:cond.exp_loc body in
       let* c_stmts, c = expr ctx cond in
-      let x = Names.fresh ctx.names "continue" in
+      let x = Names.fresh ctx.procedure.names "continue" in
       (* A condition that needs statements, as reads, is evaluated before the loop and at the
          end of each iteration, into [x]; the invariant relates [x] to the values it owns,
          if the condition can be expressed in them. *)
@@ -289,7 +291,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       (* A bound, evaluated once into a variable, which the invariant says it equals, as the
          value is an expression of immutable variables. *)
       let bound base v =
-        let x = Names.fresh ctx.names base in
+        let x = Names.fresh ctx.procedure.names base in
         let var = R.Expr.var ~loc:l (name ~loc:l x) in
         ( R.Stmt.local ~loc:l ~typ:int ~init:(R.Stmt.expr_rhs v) (ident ~loc:l x),
           var,
@@ -297,7 +299,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let lo_def, lo, lo_value = bound "first" lo in
       let hi_def, hi, hi_value = bound "last" hi in
-      let i = Names.bind ~typ:Predef.type_int ctx.names id in
+      let i = Names.bind ~typ:Predef.type_int ctx.procedure.names id in
       let iv = R.Expr.var ~loc:l (name ~loc:l i) in
       let* invariants =
         loop_invariants ~counter:i ctx ~at spec ~relation:(fun _ -> Ok None)
@@ -338,7 +340,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
   let at = e.exp_loc in
   let l = loc at in
   let contents (r : Typedtree.expression) =
-    match Datatypes.desc ctx.types r.exp_type with
+    match Datatypes.desc ctx.given.types r.exp_type with
     | Tconstr (_, [ elt ], _) -> ref_field ctx ~at elt
     | _ -> unsupported at "This reference"
   in
@@ -350,7 +352,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
   | Some "ref", [ v ] ->
       let* field = ref_field ctx ~at v.exp_type in
       let* stmts, v = expr ctx v in
-      let x = Names.fresh ctx.names "tmp" in
+      let x = Names.fresh ctx.procedure.names "tmp" in
       let views, view_args = view_allocation ctx ~loc:l [ field ] in
       let* explicit = allocation_initializers ctx e in
       let init =
@@ -389,7 +391,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   let at = e.exp_loc in
   let l = loc at in
   let element (t : Types.type_expr) =
-    match Datatypes.desc ctx.types t with
+    match Datatypes.desc ctx.given.types t with
     | Tconstr (_, [ elt ], _) -> Ok elt
     | _ -> unsupported at "This atomic"
   in
@@ -401,7 +403,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | Some (S.Performs a), _ ->
         begin match named_action ctx a with
         | Some performed ->
-            Option.iter ctx.au ~f:(fun au ->
+            Option.iter ctx.procedure.au ~f:(fun au ->
                 au.performing <- Some ({ performed; bindings = [] }, None));
             Ok default
         | None -> error a.pid_loc (Printf.sprintf "There is no action %s" a.pid_str)
@@ -419,7 +421,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
      linearizes the function by default as [default] says. *)
   let result ?(default = `Commit) ?op f atomic args =
     let* typ = typ ctx ~at e.exp_type in
-    let x = Names.fresh ctx.names "tmp" in
+    let x = Names.fresh ctx.procedure.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let init =
       R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l f) (atomic :: args))
@@ -438,7 +440,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | _ -> element e.exp_type
   in
   let* field = atomic_field ctx ~at elt in
-  let* nested = nested_stateful_read ctx.access_proofs e in
+  let* nested = nested_stateful_read ctx.given.access_proofs e in
   let* stmts, values =
     match nested with
     | Some argument ->
@@ -449,7 +451,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   let primitive op = primitive ctx ~at elt op in
   match (op, values) with
   | ("make" | "make_contended"), [ v ] ->
-      let x = Names.fresh ctx.names "tmp" in
+      let x = Names.fresh ctx.procedure.names "tmp" in
       let views, view_args = view_allocation ctx ~loc:l [ field ] in
       let* explicit = allocation_initializers ctx e in
       let init =
@@ -461,7 +463,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
           R.Expr.var ~loc:l (name ~loc:l x) )
   | "get", [ a ] ->
       let* typ = typ ctx ~at e.exp_type in
-      let x = Names.fresh ctx.names "tmp" in
+      let x = Names.fresh ctx.procedure.names "tmp" in
       let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (qualified_name ~loc:l field)) in
       let* how = how `Abort in
       let value = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -494,7 +496,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       Ok (stmts @ reading, r)
   | (("incr" | "decr") as op), [ a ] ->
       let* f = primitive Fetch_and_add in
-      let x = Names.fresh ctx.names "tmp" in
+      let x = Names.fresh ctx.procedure.names "tmp" in
       let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
       let* how = how `Commit in
@@ -516,11 +518,12 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
   | Some ((And | Or) as op), _, [ a; b ] ->
       (* The right operand is evaluated only if the left one does not decide. *)
       let* a_stmts, a = expr ctx a in
-      let before = ctx.snapshots and before_positions = ctx.positions in
+      let before = ctx.procedure.snapshots
+      and before_positions = ctx.procedure.positions in
       let* b_stmts, b = expr ctx b in
       (* The snapshots that the right operand takes are on one path only. *)
-      ctx.snapshots <- common_snapshots [ before; ctx.snapshots ];
-      ctx.positions <- before_positions;
+      ctx.procedure.snapshots <- common_snapshots [ before; ctx.procedure.snapshots ];
+      ctx.procedure.positions <- before_positions;
       if List.is_empty b_stmts then Ok (a_stmts, R.Expr.binary ~loc:l op a b)
       else
         let then_, else_ =
@@ -537,10 +540,10 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
         in
         Ok (a_stmts @ stmts, v)
   | Some ((Eq | Neq) as op), _, [ a; b ]
-    when is_physical path && not (exact_physical ctx.types a b) ->
+    when is_physical path && not (exact_physical ctx.given.types a b) ->
       let* b_stmts, b = expr ctx b in
       let* a_stmts, a = expr ctx a in
-      let x = Names.fresh ctx.names "same" in
+      let x = Names.fresh ctx.procedure.names "same" in
       let same = R.Expr.var ~loc:l (name ~loc:l x) in
       Ok
         ( b_stmts @ a_stmts
@@ -584,7 +587,7 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
           Ok (stmts @ [ no_overflow ctx ~at "negation" v ], v))
   | None, None, _ -> (
       let* path = Source.normalize_value_path e.exp_env ~at path in
-      match resolved_call ctx.functions ctx.libraries path with
+      match resolved_call ctx.given.functions ctx.given.libraries path with
       | Some f -> call ctx e f args
       | None -> (
           match path with
@@ -596,7 +599,7 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
     is kept in a variable unless it is unit. *)
 and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression list) =
   let* arguments, args = operands ctx ocaml_args in
-  let signature = List.Assoc.find ctx.procedure_signatures f ~equal:String.equal in
+  let signature = List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal in
   let inputs = Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_inputs) in
   let outputs =
     Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_outputs)
@@ -605,7 +608,7 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
     call_prepared ctx e f ocaml_args args ~explicit ~signature_outputs:outputs
   in
   let annotation =
-    List.Assoc.find ctx.access_proofs
+    List.Assoc.find ctx.given.access_proofs
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
       ~equal:Poly.equal
   in
@@ -634,15 +637,18 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
   let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
   let prefix, captured, role =
-    Option.value (List.Assoc.find ctx.lifted f ~equal:String.equal) ~default:(0, [], None)
+    Option.value
+      (List.Assoc.find ctx.given.lifted f ~equal:String.equal)
+      ~default:(0, [], None)
   in
   let* prefix =
-    if List.length ctx.formals >= prefix then Ok (List.take ctx.formals prefix)
+    if List.length ctx.procedure.formals >= prefix then
+      Ok (List.take ctx.procedure.formals prefix)
     else error e.exp_loc "This call needs the parameters of the function it continues"
   in
   let* captured =
     all captured ~f:(fun x ->
-        match Names.find ctx.names x with
+        match Names.find ctx.procedure.names x with
         | Some y -> Ok (R.Expr.var ~loc:l (name ~loc:l y))
         | None ->
             error e.exp_loc (Printf.sprintf "%s is not in scope here" (Ident.name x)))
@@ -656,15 +662,15 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
     | None ->
         all
           (Option.value
-             (List.Assoc.find ctx.ghost_args f ~equal:String.equal)
+             (List.Assoc.find ctx.given.ghost_args f ~equal:String.equal)
              ~default:[])
           ~f:(fun equation ->
             let known =
               Option.bind equation ~f:(fun (i, field) ->
                   match List.nth ocaml_args (i - List.length prefix) with
                   | Some { exp_desc = Texp_ident (Pident id, _, _); _ } ->
-                      Option.bind (Names.find ctx.names id) ~f:(fun x ->
-                          List.find_map ctx.fields_of ~f:(fun (y, (g, value)) ->
+                      Option.bind (Names.find ctx.procedure.names id) ~f:(fun x ->
+                          List.find_map ctx.procedure.fields_of ~f:(fun (y, (g, value)) ->
                               Option.some_if
                                 (String.equal x y && String.equal g field)
                                 value))
@@ -689,7 +695,7 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
      its place, with the atomic update's values of the implicit parameters, as does a call
      of a function that continues the update. *)
   let* retry =
-    match ctx.au with
+    match ctx.procedure.au with
     | Some au
       when String.equal au.self f || Option.exists role ~f:(fun r -> Ident.same r au.role)
       ->
@@ -719,12 +725,15 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
      requires, with the arguments' positions in it. *)
   let* witnesses =
     all
-      (Option.value (List.Assoc.find ctx.pasts f ~equal:String.equal) ~default:[])
+      (Option.value (List.Assoc.find ctx.given.pasts f ~equal:String.equal) ~default:[])
       ~f:(fun (inv, field, i) ->
         let structure =
-          List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+          List.find ctx.given.shared.structures ~f:(fun st ->
+              String.equal st.invariant inv)
         in
-        match (structure, List.Assoc.find ctx.snapshots inv ~equal:String.equal) with
+        match
+          (structure, List.Assoc.find ctx.procedure.snapshots inv ~equal:String.equal)
+        with
         | _ when Option.is_some (known_position ctx inv field (List.nth_exn args i)) ->
             let p =
               Option.value_exn (known_position ctx inv field (List.nth_exn args i))
@@ -748,7 +757,9 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
   (* The ghost results witnessing facts about the state after the call: the caller's own,
      if the callee continues its update with the same ones. *)
   let ghost_facts =
-    Option.value (List.Assoc.find ctx.past_returns f ~equal:String.equal) ~default:[]
+    Option.value
+      (List.Assoc.find ctx.given.past_returns f ~equal:String.equal)
+      ~default:[]
   in
   let ghost_count = 2 * List.length ghost_facts in
   let ghost_decls, ghosts =
@@ -760,15 +771,15 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
         let fresh =
           List.concat_map ghost_facts ~f:(fun (inv, _, _) ->
               let st =
-                List.find_exn ctx.shared.structures ~f:(fun st ->
+                List.find_exn ctx.given.shared.structures ~f:(fun st ->
                     String.equal st.invariant inv)
               in
               [
-                ( Names.fresh ctx.names "snapshot",
+                ( Names.fresh ctx.procedure.names "snapshot",
                   R.Type.named ~loc:l
                     (generated_module_member ~loc:l (module_name st "state") "T")
                     [] );
-                (Names.fresh ctx.names "position", R.Type.int ~loc:l);
+                (Names.fresh ctx.procedure.names "position", R.Type.int ~loc:l);
               ])
         in
         ( List.concat_map fresh ~f:(fun (x, typ) ->
@@ -794,10 +805,10 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
         end
     | _ -> []
   in
-  ctx.positions <- witnessed ghost_facts ghosts @ ctx.positions;
+  ctx.procedure.positions <- witnessed ghost_facts ghosts @ ctx.procedure.positions;
   let* public =
     all signature_outputs ~f:(fun (_, ty) ->
-        let raven = Names.fresh ctx.names "ghost_result" in
+        let raven = Names.fresh ctx.procedure.names "ghost_result" in
         let* raven_type = typ ctx ~at:e.exp_loc ty in
         Ok
           ( R.Expr.var ~loc:l (name ~loc:l raven),
@@ -816,7 +827,7 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
     Ok (stmts @ opening @ call @ closing, unit_value ~loc:l, public_values)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
-    let x = Names.fresh ctx.names "tmp" in
+    let x = Names.fresh ctx.procedure.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let def =
       match ghosts with
@@ -885,7 +896,7 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
           [] )
   | Tpat_construct (_, { cstr_name = "()"; _ }, [], _) -> Ok ([], None, [])
   | Tpat_construct (_, cstr, ps, _) ->
-      begin match Datatypes.find_cstr ctx.types cstr with
+      begin match Datatypes.find_cstr ctx.given.types cstr with
       | None -> unsupported at "This constructor"
       | Some (_, c) ->
           let is_c = R.Expr.is_ ~loc:l v (ident ~loc:l c.raven) in
@@ -916,12 +927,12 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 and match_cases ?commits ~tail ctx ~at v
     (cases : (Typedtree.pattern * Typedtree.expression) list) ~total target =
   let l = loc at in
-  let enclosing_names = ctx.names.scope in
+  let enclosing_names = ctx.procedure.names.scope in
   (* Each case starts in the state of the atomic update before the match. *)
   let start = au_snapshot ctx in
   let ends = ref [] in
   let snapshot_ends = ref [] in
-  let start_positions = ctx.positions in
+  let start_positions = ctx.procedure.positions in
   let join = new_join () in
   let position_ends = ref [] in
   let commits =
@@ -934,7 +945,7 @@ and match_cases ?commits ~tail ctx ~at v
   let case_commits = List.zip_exn (List.map cases ~f:snd) commits in
   (* The body of a case, after defining the variables of its pattern. *)
   let case_body ?(names = enclosing_names) binds (rhs : Typedtree.expression) =
-    ctx.names.scope <- names;
+    ctx.procedure.names.scope <- names;
     restore_au ctx start;
     let commits =
       Option.join
@@ -945,7 +956,7 @@ and match_cases ?commits ~tail ctx ~at v
     let* defs =
       all binds ~f:(fun (id, value, t) ->
           let* typ = typ ctx ~at t in
-          let x = Names.bind ~typ:t ctx.names id in
+          let x = Names.bind ~typ:t ctx.procedure.names id in
           Ok
             (R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
             @ assume_in_range ~loc:l t x))
@@ -956,8 +967,8 @@ and match_cases ?commits ~tail ctx ~at v
       Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
     in
     ends := au_state ctx :: !ends;
-    snapshot_ends := ctx.snapshots :: !snapshot_ends;
-    position_ends := ctx.positions :: !position_ends;
+    snapshot_ends := ctx.procedure.snapshots :: !snapshot_ends;
+    position_ends := ctx.procedure.positions :: !position_ends;
     let assigned = end_arm ctx join ~start:start_positions in
     Ok (entry @ List.concat defs @ stmts @ finish @ assignment @ assigned)
   in
@@ -1006,15 +1017,15 @@ and match_cases ?commits ~tail ctx ~at v
           (let au, _, _ = start in
            au)
           ~f:(fun (state, _, _, _) -> state)));
-  ctx.snapshots <- common_snapshots !snapshot_ends;
-  ctx.positions <- join_positions join ~start:start_positions !position_ends;
+  ctx.procedure.snapshots <- common_snapshots !snapshot_ends;
+  ctx.procedure.positions <- join_positions join ~start:start_positions !position_ends;
   Ok (join.decls @ stmts)
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
     constructors with variables or [_] as arguments, possibly followed by a variable or
     [_] matching anything else. *)
 and flat_cases ctx v cases =
-  let enclosing_names = ctx.names.scope in
+  let enclosing_names = ctx.procedure.names.scope in
   let flat_arg (p : Typedtree.pattern) =
     match p.pat_desc with
     | Tpat_any -> Some None
@@ -1029,7 +1040,8 @@ and flat_cases ctx v cases =
         begin match p.pat_desc with
         | Tpat_construct (_, cstr, ps, _) ->
             begin match
-              (Datatypes.find_cstr ctx.types cstr, Option.all (List.map ps ~f:flat_arg))
+              ( Datatypes.find_cstr ctx.given.types cstr,
+                Option.all (List.map ps ~f:flat_arg) )
             with
             | Some (_, c), Some args when not (List.mem seen c.raven ~equal:String.equal)
               ->
@@ -1042,19 +1054,19 @@ and flat_cases ctx v cases =
         end
   in
   let case item =
-    ctx.names.scope <- enclosing_names;
+    ctx.procedure.names.scope <- enclosing_names;
     match item with
     | `Any (id, (p : Typedtree.pattern)), rhs ->
         let binds =
           Option.value_map id ~default:[] ~f:(fun id -> [ (id, v, p.pat_type) ])
         in
-        (R.Expr.Default, binds, [], rhs, ctx.names.scope)
+        (R.Expr.Default, binds, [], rhs, ctx.procedure.names.scope)
     | `Ctor ((c : Datatypes.ctor), args, (p : Typedtree.pattern)), rhs ->
         let l = loc p.pat_loc in
         let var = function
           | None -> (ident ~loc:l "_", [])
           | Some (id, t) ->
-              let x = Names.bind ~typ:t ctx.names id in
+              let x = Names.bind ~typ:t ctx.procedure.names id in
               (ident ~loc:l x, assume_in_range ~loc:l t x)
         in
         let vars = List.map args ~f:var in
@@ -1062,10 +1074,10 @@ and flat_cases ctx v cases =
           [],
           List.concat_map vars ~f:snd,
           rhs,
-          ctx.names.scope )
+          ctx.procedure.names.scope )
   in
   let result = Option.map (flat [] cases) ~f:(List.map ~f:case) in
-  ctx.names.scope <- enclosing_names;
+  ctx.procedure.names.scope <- enclosing_names;
   result
 
 (** [if c then e1 else e2], with its value assigned to [target] if there is one. *)
@@ -1075,7 +1087,7 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
   (* Each arm starts in the state of the atomic update before the branch; if [c] is the
      result of the [compare_and_set] that left the update open, the arms close it. *)
   let start = au_snapshot ctx in
-  let start_positions = ctx.positions in
+  let start_positions = ctx.procedure.positions in
   let join = new_join () in
   let arm taken e =
     restore_au ctx start;
@@ -1094,13 +1106,15 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
           Ok (stmts @ finish @ assignment)
     in
     let assigned = end_arm ctx join ~start:start_positions in
-    Ok (entry @ stmts @ assigned, (au_state ctx, ctx.snapshots, ctx.positions))
+    Ok
+      ( entry @ stmts @ assigned,
+        (au_state ctx, ctx.procedure.snapshots, ctx.procedure.positions) )
   in
   let* then_, (then_state, then_snapshots, then_positions) = arm true (Some e1) in
   let* else_, (else_state, else_snapshots, else_positions) = arm false e2 in
   set_au_state ctx (Option.map2 then_state else_state ~f:join_au);
-  ctx.snapshots <- common_snapshots [ then_snapshots; else_snapshots ];
-  ctx.positions <-
+  ctx.procedure.snapshots <- common_snapshots [ then_snapshots; else_snapshots ];
+  ctx.procedure.positions <-
     join_positions join ~start:start_positions [ then_positions; else_positions ];
   Ok (join.decls @ [ R.Stmt.if_ ~loc:l c then_ else_ ])
 
@@ -1113,7 +1127,7 @@ and branch ctx (e : Typedtree.expression) make =
     Ok (stmts, unit_value ~loc:l)
   else
     let* typ = typ ctx ~at:e.exp_loc e.exp_type in
-    let x = Names.fresh ctx.names "tmp" in
+    let x = Names.fresh ctx.procedure.names "tmp" in
     let* stmts = make (Some (x, l)) in
     Ok
       ( R.Stmt.local ~loc:l ~const:false ~typ (ident ~loc:l x) @ stmts,
@@ -1137,7 +1151,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
   | Texp_ident (Pident id, _, _) ->
       begin match
         ( List.Assoc.find values (Ident.unique_name id) ~equal:String.equal,
-          Names.find ctx.names id )
+          Names.find ctx.procedure.names id )
       with
       | Some v, _ -> Ok v
       | None, Some x -> Ok (R.Expr.var ~loc:l (name ~loc:l x))
@@ -1154,7 +1168,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       Ok (R.Expr.bool ~loc:l (String.equal b "true"))
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) -> Ok (unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match Datatypes.find_cstr ctx.types cstr with
+      begin match Datatypes.find_cstr ctx.given.types cstr with
       | None -> not_pure "This constructor"
       | Some (d, c) ->
           let* args = all args ~f:(pure_in values) in
@@ -1167,7 +1181,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       ( { exp_desc = Texp_ident (path, _, _); _ },
         [ (Nolabel, Arg ({ exp_desc = Texp_ident (Pident r, _, _); _ } as cell)) ] )
     when Option.equal String.equal (stdlib_name path) (Some "!") ->
-      begin match (Names.find ctx.names r, Datatypes.desc ctx.types cell.exp_type) with
+      begin match
+        (Names.find ctx.procedure.names r, Datatypes.desc ctx.given.types cell.exp_type)
+      with
       | Some x, Tconstr (_, [ elt ], _) -> begin
           let* field = ref_field ctx ~at elt in
           match List.Assoc.find reads (x, field) ~equal:Poly.equal with
@@ -1177,9 +1193,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       | _ -> not_pure "A read of a reference"
       end
   | Texp_field ({ exp_desc = Texp_ident (Pident r, _, _); _ }, _, label)
-    when Option.is_some (Names.find ctx.names r) -> begin
+    when Option.is_some (Names.find ctx.procedure.names r) -> begin
       let* field = field_of_label ctx ~at label in
-      let x = Option.value_exn (Names.find ctx.names r) in
+      let x = Option.value_exn (Names.find ctx.procedure.names r) in
       match field with
       | Some (field, true) ->
           begin match List.Assoc.find reads (x, field) ~equal:Poly.equal with
@@ -1197,7 +1213,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
     when runtime_structural_equality_unsafe ctx path a b ->
       error at "Structural equality on values containing references is unsupported"
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
-    when is_physical path && not (exact_physical ctx.types a b) ->
+    when is_physical path && not (exact_physical ctx.given.types a b) ->
       not_pure "Physical equality on values that are not immediate"
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) -> begin
       let* args = plain_args ~at args in

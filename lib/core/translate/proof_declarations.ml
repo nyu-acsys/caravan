@@ -20,13 +20,13 @@ let action_checks ctx (st : structure) =
         let at = a.action_at in
         let l = loc at in
         let var x = R.Expr.var ~loc:l (name ~loc:l x) in
-        let fresh x = Names.fresh ctx.names x in
+        let fresh x = Names.fresh ctx.procedure.names x in
         let fields =
           List.map st.fields ~f:(fun (f, _, typ, t, _) -> (f, fresh f, typ, t))
         in
         let indices =
           List.map st.chains ~f:(fun (field, _) ->
-              (field, fresh (field ^ "_index"), chain_index_type ctx.types st field))
+              (field, fresh (field ^ "_index"), chain_index_type ctx.given.types st field))
         in
         let* params =
           all st.params ~f:(fun (x, t) ->
@@ -70,7 +70,7 @@ let action_checks ctx (st : structure) =
           match a.step with
           | Some (_, Some location :: patterns) ->
               begin match
-                Option.map (term_type env location) ~f:(Datatypes.desc ctx.types)
+                Option.map (term_type env location) ~f:(Datatypes.desc ctx.given.types)
               with
               | Some (Tconstr (p, [ contents ], _)) when Datatypes.is_atomic p ->
                   List.concat_map patterns ~f:(function
@@ -112,7 +112,7 @@ let action_checks ctx (st : structure) =
             let state values = state_of ~loc:l st (grown st values) in
             (* Reported at the return point of the lemma, at the end of the action's
                name. *)
-            ctx.origins :=
+            ctx.collected.origins :=
               {
                 at = { at with loc_start = at.loc_end };
                 code = Postcondition;
@@ -121,7 +121,7 @@ let action_checks ctx (st : structure) =
                     a.action;
                 related = [];
               }
-              :: !(ctx.origins);
+              :: !(ctx.collected.origins);
             Ok
               [
                 R.Member.callable
@@ -150,44 +150,48 @@ let action_checks ctx (st : structure) =
 let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
     ?(proof_support = empty_proof_support) origins =
   {
-    types;
-    refs;
-    primitives;
-    primitive_namespace = [];
-    names = Names.create ();
-    functions = Path_bindings.empty;
-    lifted = [];
-    pasts = [];
-    past_returns = [];
-    origins;
-    annotations = [];
-    spec_funcs;
-    proof_lemmas = [];
-    proof_support;
-    predicate_bodies = [];
-    env = ocaml_env;
-    preds;
-    facts = [];
-    au = None;
-    current_procedure = None;
-    manual = false;
-    access_proofs = [];
-    return_proofs = [];
-    procedure_signatures = [];
-    ghost_returns = [];
-    proof_state = None;
-    return_covered = false;
-    initializations = [];
-    linearizations = [];
-    shared;
-    invariants = [];
-    opened = [];
-    snapshots = [];
-    positions = [];
-    formals = [];
-    ghost_args = [];
-    fields_of = [];
-    libraries = Path_bindings.empty;
+    given =
+      {
+        types;
+        primitive_namespace = [];
+        functions = Path_bindings.empty;
+        lifted = [];
+        pasts = [];
+        past_returns = [];
+        annotations = [];
+        spec_funcs;
+        proof_lemmas = [];
+        proof_support;
+        predicate_bodies = [];
+        env = ocaml_env;
+        preds;
+        current_procedure = None;
+        manual = false;
+        access_proofs = [];
+        return_proofs = [];
+        procedure_signatures = [];
+        initializations = [];
+        linearizations = [];
+        shared;
+        ghost_args = [];
+        libraries = Path_bindings.empty;
+      };
+    procedure =
+      {
+        names = Names.create ();
+        facts = [];
+        au = None;
+        ghost_returns = [];
+        proof_state = None;
+        return_covered = false;
+        invariants = [];
+        opened = [];
+        snapshots = [];
+        positions = [];
+        formals = [];
+        fields_of = [];
+      };
+    collected = { refs; primitives; origins };
   }
 
 (** Recursive proof calls need checked well-founded descent, including mutual calls. *)
@@ -255,13 +259,13 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         lemma_body;
       } ->
       let ctx =
+        let base =
+          spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
+            origins
+        in
         {
-          (spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-             origins)
-          with
-          proof_lemmas;
-          proof_support;
-          predicate_bodies;
+          base with
+          given = { base.given with proof_lemmas; proof_support; predicate_bodies };
         }
       in
       let l = loc lemma_name.pid_loc in
@@ -270,7 +274,7 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       in
       let declare ?(implicit = false) (id, _) ty =
         let* raven_type = typ ctx ~at:id.S.pid_loc ty in
-        let raven = Names.fresh ctx.names id.pid_str in
+        let raven = Names.fresh ctx.procedure.names id.pid_str in
         Ok
           ( id.pid_str,
             raven,
@@ -379,7 +383,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
       let _, raven, _, _ = List.hd_exn value in
       let field =
         R.Expr.field ~loc:l structure
-          (qualified_name ~loc:l (view_field_in ctx.shared p.pred_name.pid_str))
+          (qualified_name ~loc:l (view_field_in ctx.given.shared p.pred_name.pid_str))
       in
       Ok
         (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value)
@@ -430,7 +434,8 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
               Ok (elt, elt_typ)
           | _ -> error at "A sequence owned by index"
         in
-        let j = Names.fresh ctx.names "i" and c = Names.fresh ctx.names "c" in
+        let j = Names.fresh ctx.procedure.names "i"
+        and c = Names.fresh ctx.procedure.names "c" in
         let wf =
           R.Expr.forall ~loc:l
             ~triggers:[ [ R.Expr.index ~loc:l entries (var j) ] ]
@@ -576,7 +581,8 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
             let field =
               R.Expr.field ~loc:l
                 (anchored (var structure))
-                (qualified_name ~loc:l (view_field_in ctx.shared v.pred_name.pid_str))
+                (qualified_name ~loc:l
+                   (view_field_in ctx.given.shared v.pred_name.pid_str))
             in
             Ok (R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ]))
       in
@@ -849,7 +855,7 @@ let pure_logical_body env (t : S.term) =
     (List.map (term_references bound t) ~f:(fun q ->
          if
            String.equal (qualid_key q) "own"
-           || List.Assoc.mem env.ctx.preds (logical_key env q) ~equal:String.equal
+           || List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
          then
            error (S.qualid_loc q)
              "A pure logical function cannot use ownership or predicates"
@@ -869,7 +875,7 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         all function_params ~f:(fun (id, ty) ->
             let* ty = Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty in
             let* raven_type = typ ctx ~at:id.pid_loc ty in
-            let raven = Names.fresh ctx.names id.pid_str in
+            let raven = Names.fresh ctx.procedure.names id.pid_str in
             Ok (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
       in
       let* result_type =
@@ -892,7 +898,7 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
           declaration
       in
       let* body = formula env function_body in
-      let result = Names.fresh ctx.names "result" in
+      let result = Names.fresh ctx.procedure.names "result" in
       let member =
         ident ~loc:l (Option.value member_name ~default:function_name.pid_str)
       in

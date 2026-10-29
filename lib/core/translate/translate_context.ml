@@ -511,15 +511,9 @@ type cell_field = {
   cell_declaration : R.Member.t;
 }
 
-type context = {
+type inputs = {
   types : Datatypes.t list;
-  refs : cell_field list ref;
-      (** The fields of the ref cells and atomics used so far, by their names, with their
-          declarations. *)
-  primitives : (string * R.Member.t) list ref;
-      (** The atomic operations used so far, by their names (see {!Primitives}). *)
   primitive_namespace : string list;
-  names : Names.t;
   functions : string Path_bindings.t;
       (** Checked functions, indexed by their compiler paths. *)
   pasts : (string * (string * string * int) list) list;
@@ -539,18 +533,8 @@ type context = {
           parameter that a precondition makes a field of it, with the field, as [tail] in
           [requires tail = q.tail], by which calls find the ghost argument. *)
   procedure_signatures : (string * procedure_signature) list;
-  mutable ghost_returns : (string * string * Types.type_expr) list;
-  mutable proof_state : (R.Expr.t * Types.type_expr) option;
-  mutable return_covered : bool;
-  mutable fields_of : (string * (string * R.Expr.t)) list;
-      (** The variables known to be fields of values, by their Raven names: the field and
-          the value, as [tail] of [q] after [let push { tail; _ } value]. *)
   libraries : string list Path_bindings.t;
       (** The modules of the libraries, with their names: trusted Raven modules. *)
-  mutable formals : R.Expr.t list;
-      (** The procedure's parameters, of which a lifted local function that continues it,
-          or that it continues too, takes the first. *)
-  origins : origin list ref;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   proof_lemmas : (string * lemma_signature) list;
   proof_support : proof_support;
@@ -563,11 +547,6 @@ type context = {
   preds : (string * (string * Types.type_expr list)) list;
       (** The predicates, by their OCaml names, with their Raven names and parameter
           types. *)
-  mutable facts : R.Spec.t list;
-      (** Facts that hold throughout the function: its preconditions without [own], which
-          only mention variables, all immutable. *)
-  mutable au : au option;
-      (** The atomic update, for a function with an atomic contract. *)
   current_procedure : string option;
   manual : bool;
   access_proofs : ((int * int) * Annotation.t) list;
@@ -577,6 +556,25 @@ type context = {
       (** The annotations on atomic steps, by the offset of the end of the step they
           follow. *)
   shared : shared;
+}
+(** What a context is given when it is made: the same throughout its translation. *)
+
+type procedure_state = {
+  names : Names.t;
+  mutable ghost_returns : (string * string * Types.type_expr) list;
+  mutable proof_state : (R.Expr.t * Types.type_expr) option;
+  mutable return_covered : bool;
+  mutable fields_of : (string * (string * R.Expr.t)) list;
+      (** The variables known to be fields of values, by their Raven names: the field and
+          the value, as [tail] of [q] after [let push { tail; _ } value]. *)
+  mutable formals : R.Expr.t list;
+      (** The procedure's parameters, of which a lifted local function that continues it,
+          or that it continues too, takes the first. *)
+  mutable facts : R.Spec.t list;
+      (** Facts that hold throughout the function: its preconditions without [own], which
+          only mention variables, all immutable. *)
+  mutable au : au option;
+      (** The atomic update, for a function with an atomic contract. *)
   mutable invariants : (string * R.Expr.t list) list;
       (** The invariants that the function's precondition holds, opened around each of its
           atomic steps, with their arguments. *)
@@ -587,31 +585,48 @@ type context = {
   mutable positions : position list;
       (** The positions of entries in snapshots known on the current path. *)
 }
+(** The state of the translation of one procedure, or of a specification outside one. *)
 
-let typ ctx ~at t = Datatypes.typ ctx.types ~at t
+type outputs = {
+  refs : cell_field list ref;
+      (** The fields of the ref cells and atomics used so far, by their names, with their
+          declarations. *)
+  primitives : (string * R.Member.t) list ref;
+      (** The atomic operations used so far, by their names (see {!Primitives}). *)
+  origins : origin list ref;
+}
+(** What the translation collects across contexts. *)
+
+type context = { given : inputs; procedure : procedure_state; collected : outputs }
+
+let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
 (** Declares [field], with values of type [elt], unless it is already. *)
 let declare_field ctx ~at field elt =
   let* t = typ ctx ~at elt in
-  if not (List.exists !(ctx.refs) ~f:(fun cell -> String.equal cell.cell_name field)) then begin
+  if
+    not
+      (List.exists !(ctx.collected.refs) ~f:(fun cell ->
+           String.equal cell.cell_name field))
+  then begin
     let file = { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname } in
     let loc = R.Loc.make file file in
-    ctx.refs :=
-      !(ctx.refs)
+    ctx.collected.refs :=
+      !(ctx.collected.refs)
       @ [
           {
             cell_name = field;
             cell_type = elt;
             cell_declaration =
-              Datatypes.field_member ctx.types ~loc (Qualified_name.of_string field).name
-                t elt;
+              Datatypes.field_member ctx.given.types ~loc
+                (Qualified_name.of_string field).name t elt;
           };
         ]
   end;
   Ok ()
 
 let cell_field ctx ~at elt ~prefix ~suffix =
-  match Datatypes.cell_name ~prefix ~suffix ctx.types elt with
+  match Datatypes.cell_name ~prefix ~suffix ctx.given.types elt with
   | None -> unsupported at "A cell payload combining distinct result layouts"
   | Some field ->
       let* () = declare_field ctx ~at field elt in
@@ -628,16 +643,18 @@ let primitive ctx ~at elt op =
   let* field = atomic_field ctx ~at elt in
   let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
   let declaration_name = Primitives.name ~field:stem op in
-  let name = String.concat ~sep:"." (ctx.primitive_namespace @ [ declaration_name ]) in
+  let name =
+    String.concat ~sep:"." (ctx.given.primitive_namespace @ [ declaration_name ])
+  in
   let* typ = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.primitives) name ~equal:String.equal) then
-    ctx.primitives :=
-      !(ctx.primitives)
+  if not (List.Assoc.mem !(ctx.collected.primitives) name ~equal:String.equal) then
+    ctx.collected.primitives :=
+      !(ctx.collected.primitives)
       @ [
           ( name,
             Primitives.proc ~declaration_name ~field ~typ
-              ~exact:(Datatypes.immediate ctx.types elt)
-              ~int:(Datatypes.is_int ctx.types elt)
+              ~exact:(Datatypes.immediate ctx.given.types elt)
+              ~int:(Datatypes.is_int ctx.given.types elt)
               op );
         ];
   Ok name
@@ -647,16 +664,16 @@ let ordinary_primitive ctx ~at ~field elt op =
   let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
   let declaration_name = Primitives.ordinary_name ~field:stem op in
   let procedure =
-    String.concat ~sep:"." (ctx.primitive_namespace @ [ declaration_name ])
+    String.concat ~sep:"." (ctx.given.primitive_namespace @ [ declaration_name ])
   in
   let* typ = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.primitives) procedure ~equal:String.equal) then
-    ctx.primitives :=
-      !(ctx.primitives)
+  if not (List.Assoc.mem !(ctx.collected.primitives) procedure ~equal:String.equal) then
+    ctx.collected.primitives :=
+      !(ctx.collected.primitives)
       @ [
           ( procedure,
             Primitives.ordinary_proc ~declaration_name ~field ~typ
-              ~int:(Datatypes.is_int ctx.types elt)
+              ~int:(Datatypes.is_int ctx.given.types elt)
               op );
         ];
   Ok procedure
@@ -664,7 +681,7 @@ let ordinary_primitive ctx ~at ~field elt op =
 (** The Raven field named [label] of the values of type [t] that are references; an
     atomic's contents have the empty label, as in [own a v]. *)
 let field_of_type ctx ~at (t : Types.type_expr) label =
-  match Datatypes.desc ctx.types t with
+  match Datatypes.desc ctx.given.types t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
       let* field = ref_field ctx ~at elt in
       Ok (Some field)
@@ -672,7 +689,7 @@ let field_of_type ctx ~at (t : Types.type_expr) label =
       let* field = atomic_field ctx ~at elt in
       Ok (Some field)
   | Tconstr (p, [], _) ->
-      begin match Datatypes.find ctx.types p with
+      begin match Datatypes.find ctx.given.types p with
       | Some { heap = Some fields; _ } ->
           Ok
             (Option.map
@@ -685,12 +702,12 @@ let field_of_type ctx ~at (t : Types.type_expr) label =
 (** The atomic that the field [label] of a value of the immutable record type [t] holds:
     its type, if it is one. *)
 let atomic_in_record ctx (t : Types.type_expr) label =
-  match Datatypes.desc ctx.types t with
+  match Datatypes.desc ctx.given.types t with
   | Tconstr (p, [], _) ->
-      begin match Datatypes.find ctx.types p with
+      begin match Datatypes.find ctx.given.types p with
       | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
           List.find_map (List.zip_exn fields args) ~f:(fun (f, a) ->
-              match Datatypes.desc ctx.types a with
+              match Datatypes.desc ctx.given.types a with
               | Tconstr (q, [ _ ], _) when String.equal f label && Datatypes.is_atomic q
                 ->
                   Some a
@@ -704,19 +721,19 @@ let atomic_in_record ctx (t : Types.type_expr) label =
 let backend_field_type ctx (t : Types.type_expr) label =
   match atomic_in_record ctx t label with
   | Some atomic ->
-      begin match Datatypes.desc ctx.types atomic with
+      begin match Datatypes.desc ctx.given.types atomic with
       | Tconstr (_, [ elt ], _) -> Some elt
       | _ -> None
       end
   | None -> (
-      match Datatypes.desc ctx.types t with
+      match Datatypes.desc ctx.given.types t with
       | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents"
         ->
           Some elt
       | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
           Some elt
       | Tconstr (p, [], _) ->
-          begin match Datatypes.find ctx.types p with
+          begin match Datatypes.find ctx.given.types p with
           | Some { heap = Some fields; _ } ->
               Option.map
                 (List.find fields ~f:(fun f -> String.equal f.label label))
@@ -728,19 +745,19 @@ let backend_field_type ctx (t : Types.type_expr) label =
 (** Uses the source declaration before expanding implementation aliases. *)
 let source_field_type ctx t label =
   try
-    match Types.get_desc (Ctype.expand_head ctx.env t) with
+    match Types.get_desc (Ctype.expand_head ctx.given.env t) with
     | Tconstr (path, [ element ], _)
       when Datatypes.is_atomic path && String.is_empty label ->
         Some element
     | Tconstr (path, args, _) -> (
-        let declaration = Env.find_type path ctx.env in
+        let declaration = Env.find_type path ctx.given.env in
         match declaration.type_kind with
         | Type_record (fields, _) ->
             Option.map
               (List.find fields ~f:(fun field ->
                    String.equal (Ident.name field.Types.ld_id) label))
               ~f:(fun field ->
-                Ctype.apply ctx.env declaration.type_params field.ld_type args)
+                Ctype.apply ctx.given.env declaration.type_params field.ld_type args)
         | _ -> None)
     | _ -> None
   with Stdlib.Not_found -> None
@@ -751,7 +768,7 @@ let field_type ctx t label =
       | None -> fallback
       | Some source ->
           if Option.is_some (atomic_in_record ctx t label) then
-            match Types.get_desc (Ctype.expand_head ctx.env source) with
+            match Types.get_desc (Ctype.expand_head ctx.given.env source) with
             | Tconstr (path, [ element ], _) when Datatypes.is_atomic path -> element
             | _ -> fallback
           else source)
@@ -764,7 +781,7 @@ let field_of_label ctx ~at (label : Data_types.label_description) =
       let* field = ref_field ctx ~at elt in
       Ok (Some (field, true))
   | _ ->
-      begin match Datatypes.find_label ctx.types label with
+      begin match Datatypes.find_label ctx.given.types label with
       | Some { heap = Some fields; _ } ->
           let field =
             List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
@@ -776,7 +793,8 @@ let field_of_label ctx ~at (label : Data_types.label_description) =
 
 (** The assertion [c] checking, at [at], what [message] says may fail. *)
 let check ctx ~(at : Location.t) message c =
-  ctx.origins := { at; code = Assertion; message; related = [] } :: !(ctx.origins);
+  ctx.collected.origins :=
+    { at; code = Assertion; message; related = [] } :: !(ctx.collected.origins);
   R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
 (** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
@@ -799,7 +817,7 @@ let ordinary_read ?guard ctx ~at ~field ~elt r =
   let l = loc at in
   let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Read in
   let* typ = typ ctx ~at elt in
-  let x = Names.fresh ctx.names "tmp" in
+  let x = Names.fresh ctx.procedure.names "tmp" in
   let value = R.Expr.var ~loc:l (name ~loc:l x) in
   let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r ]) in
   let access =
@@ -880,15 +898,15 @@ let runtime_structural_equality_unsafe ctx path a b =
   match stdlib_name path with
   | Some ("=" | "<>") ->
       (not (runtime_nullary_constructor a || runtime_nullary_constructor b))
-      && (potentially_contains_refs ctx.types a.exp_type
-         || potentially_contains_refs ctx.types b.exp_type)
+      && (potentially_contains_refs ctx.given.types a.exp_type
+         || potentially_contains_refs ctx.given.types b.exp_type)
   | _ -> false
 
 let mathematical_type ctx (t : Types.type_expr) =
-  match Datatypes.desc ctx.types t with
+  match Datatypes.desc ctx.given.types t with
   | Tconstr (p, _, _) ->
-      Option.is_some (Datatypes.collection_kind ctx.types p)
-      || List.exists ctx.proof_support.mathematical_types ~f:(fun d ->
+      Option.is_some (Datatypes.collection_kind ctx.given.types p)
+      || List.exists ctx.given.proof_support.mathematical_types ~f:(fun d ->
           Datatypes.declares d p)
   | _ -> false
 
@@ -896,13 +914,13 @@ let spec_contains_runtime_refs ctx ty =
   let rec go seen ty =
     if mathematical_type ctx ty then false
     else
-      match Datatypes.desc ctx.types ty with
+      match Datatypes.desc ctx.given.types ty with
       | Tvar _ | Tunivar _ -> true
       | Tconstr (p, [ _ ], _) when Datatypes.is_ref p || Datatypes.is_atomic p -> true
       | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
       | Tconstr (p, args, _) ->
           List.exists args ~f:(go seen)
-          || begin match Datatypes.find ctx.types p with
+          || begin match Datatypes.find ctx.given.types p with
           | Some { heap = Some _; _ } -> true
           | Some { library = Some _; _ } -> true
           | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same)
@@ -986,15 +1004,15 @@ let library_paths libraries =
          (lib.library_path, [ lib.library_name ])))
 
 let runtime_spec env q =
-  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
-      Path_bindings.find env.ctx.proof_support.runtime_functions path)
+  Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+      Path_bindings.find env.ctx.given.proof_support.runtime_functions path)
 
 let atomic_method env = function
   | S.Qdot (parent, method_) ->
-      Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
-          let path = env.ctx.proof_support.canonical_path path in
+      Option.bind (Source.module_path env.ctx.given.env parent) ~f:(fun path ->
+          let path = env.ctx.given.proof_support.canonical_path path in
           Option.map
-            (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
+            (List.find env.ctx.given.proof_support.atomic_updates ~f:(fun signature ->
                  Source.au_has_path signature.au_source path))
             ~f:(fun signature -> (signature, method_.pid_str)))
   | Qid _ -> None
@@ -1006,15 +1024,18 @@ let logical_key env q =
           (List.mem [ "pending"; "committed" ] method_ ~equal:String.equal)
           (signature.au_key ^ "." ^ method_))
   in
-  match Option.first_some atomic_key (env.ctx.proof_support.proof_key env.ctx.env q) with
+  match
+    Option.first_some atomic_key
+      (env.ctx.given.proof_support.proof_key env.ctx.given.env q)
+  with
   | Some key -> key
   | None ->
       begin match q with
       | S.Qid _ -> qualid_key q
       | Qdot (parent, id) ->
           let view =
-            Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
-                Path_bindings.find env.ctx.proof_support.predicate_views
+            Option.bind (Source.module_path env.ctx.given.env parent) ~f:(fun path ->
+                Path_bindings.find env.ctx.given.proof_support.predicate_views
                   (Path.Pdot (path, id.pid_str)))
           in
           begin match view with
@@ -1022,8 +1043,8 @@ let logical_key env q =
           | None ->
               begin match
                 Option.bind
-                  (Source.module_path env.ctx.env parent)
-                  ~f:(Path_bindings.find env.ctx.proof_support.library_paths)
+                  (Source.module_path env.ctx.given.env parent)
+                  ~f:(Path_bindings.find env.ctx.given.proof_support.library_paths)
               with
               | None -> qualid_key q
               | Some path ->
@@ -1033,7 +1054,7 @@ let logical_key env q =
       end
 
 let find_constructor env q =
-  Option.bind (Source.constructor env.ctx.env q) ~f:(Datatypes.find_cstr env.data)
+  Option.bind (Source.constructor env.ctx.given.env q) ~f:(Datatypes.find_cstr env.data)
 
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)
@@ -1085,9 +1106,9 @@ let atomic_arguments ~loc:l signature method_ values =
       else [ token; inputs ]
 
 let resource_module env parent =
-  Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
-      let path = env.ctx.proof_support.canonical_path path in
-      List.find env.ctx.proof_support.resources ~f:(fun resource ->
+  Option.bind (Source.module_path env.ctx.given.env parent) ~f:(fun path ->
+      let path = env.ctx.given.proof_support.canonical_path path in
+      List.find env.ctx.given.proof_support.resources ~f:(fun resource ->
           Source.resource_has_path resource path))
 
 let resource_operation env = function
@@ -1113,14 +1134,14 @@ let logical_signature env q =
       begin match resource_operation env q with
       | Some _ as signature -> signature
       | None ->
-          List.Assoc.find env.ctx.proof_support.logical_functions (logical_key env q)
-            ~equal:String.equal
+          List.Assoc.find env.ctx.given.proof_support.logical_functions
+            (logical_key env q) ~equal:String.equal
       end
 
 let ghost_descriptor env q =
-  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
-      let path = env.ctx.proof_support.canonical_path path in
-      List.find env.ctx.proof_support.ghost_fields ~f:(fun field ->
+  Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+      let path = env.ctx.given.proof_support.canonical_path path in
+      List.find env.ctx.given.proof_support.ghost_fields ~f:(fun field ->
           Path.same path field.Source.field_path || Path.same path (Pident field.field_id)))
 
 let shadowed_ghost_descriptor env = function
@@ -1155,9 +1176,9 @@ let same_named_type left right =
 
 let resource_field env (field : Source.proof_field) =
   Option.exists field.field_resource ~f:(fun owner ->
-      List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+      List.exists env.ctx.given.proof_support.resources ~f:(fun resource ->
           resource.resource_is_ra && Source.resource_has_path resource owner))
-  || List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+  || List.exists env.ctx.given.proof_support.resources ~f:(fun resource ->
       resource.resource_is_ra && same_named_type field.field_value resource.resource_type)
 
 (** The variable, field and name of [own x.label v], with the empty label for [own x v].
@@ -1280,10 +1301,10 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
       | S.Qid id as q ->
           let key = logical_key env q in
           Option.some_if
-            (List.Assoc.mem env.ctx.preds key ~equal:String.equal
-            || List.Assoc.mem env.ctx.proof_support.logical_functions key
+            (List.Assoc.mem env.ctx.given.preds key ~equal:String.equal
+            || List.Assoc.mem env.ctx.given.proof_support.logical_functions key
                  ~equal:String.equal
-            || List.Assoc.mem env.ctx.proof_lemmas key ~equal:String.equal)
+            || List.Assoc.mem env.ctx.given.proof_lemmas key ~equal:String.equal)
             id.pid_str
       | Qdot _ -> None)
   in
@@ -1328,7 +1349,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
   let passed =
     Spec_arguments.predicate_parameters ~bound:[] terms ~lookup:(fun q ->
         Option.map
-          (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+          (List.Assoc.find env.ctx.given.preds (logical_key env q) ~equal:String.equal)
           ~f:snd)
     |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
   in
@@ -1342,7 +1363,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
         | Some t ->
             let l = loc at in
             let* typ = typ env.ctx ~at t in
-            let raven = Names.fresh env.ctx.names x in
+            let raven = Names.fresh env.ctx.procedure.names x in
             Ok (Some (x, raven, t, typ, l)))
   in
   Ok (List.filter_opt typed)
@@ -1357,12 +1378,12 @@ let state_fields env x =
 let opaque_module_path env path =
   match path with
   | Path.Pdot _ ->
-      Option.exists (Datatypes.find env.ctx.types path) ~f:(fun data ->
+      Option.exists (Datatypes.find env.ctx.given.types path) ~f:(fun data ->
           (Option.is_some data.id
-          || List.mem env.ctx.proof_support.public_types path ~equal:Path.same)
+          || List.mem env.ctx.given.proof_support.public_types path ~equal:Path.same)
           &&
             try
-              let declaration = Env.find_type path env.ctx.env in
+              let declaration = Env.find_type path env.ctx.given.env in
               (match declaration.type_kind with
                 | Types.Type_abstract _ -> true
                 | _ -> false)
@@ -1372,6 +1393,6 @@ let opaque_module_path env path =
   | Pident _ | Papply _ | Pextra_ty _ -> false
 
 let opaque_module_types env =
-  env.ctx.proof_support.strict_source_types
-  || List.exists env.ctx.types ~f:(fun data ->
+  env.ctx.given.proof_support.strict_source_types
+  || List.exists env.ctx.given.types ~f:(fun data ->
       List.exists data.Datatypes.paths ~f:(opaque_module_path env))

@@ -7,10 +7,10 @@ open Translate_context
 let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   let* () =
     if opaque_module_types env then
-      Signature_contract.expression ~logical_types:env.data ~environment:env.ctx.env
+      Signature_contract.expression ~logical_types:env.data ~environment:env.ctx.given.env
         ~predicates:(fun q ->
           Option.map
-            (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+            (List.Assoc.find env.ctx.given.preds (logical_key env q) ~equal:String.equal)
             ~f:snd)
         ~variables:env.var_types t
     else Ok ()
@@ -27,7 +27,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
   | Tvar q when Option.is_some (logical_signature env q) ->
       logical_application env ~at (Option.value_exn (logical_signature env q)) []
   | Tvar (Qid { pid_str = x; _ })
-    when List.Assoc.mem env.ctx.proof_support.predicate_inputs x ~equal:String.equal
+    when List.Assoc.mem env.ctx.given.proof_support.predicate_inputs x ~equal:String.equal
          && not (List.Assoc.mem env.vars x ~equal:String.equal) ->
       application env t
   | Tvar (Qid { pid_str = x; _ }) ->
@@ -64,11 +64,12 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
             match ty with
             | None -> error id.pid_loc "A bound variable needs a type, as in x: int"
             | Some ty ->
-                let* t = Source.ocaml_type env.ctx.env ~at:id.pid_loc ty in
+                let* t = Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty in
                 let* ty = typ env.ctx ~at:id.pid_loc t in
                 let l = loc id.pid_loc in
                 let raven =
-                  if env.logical_definition then Names.fresh env.ctx.names id.pid_str
+                  if env.logical_definition then
+                    Names.fresh env.ctx.procedure.names id.pid_str
                   else id.pid_str
                 in
                 Ok (id.pid_str, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty))
@@ -95,9 +96,9 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
         | Texists, None -> R.Expr.exists ~loc:l vars body
         | Texists, Some g -> R.Expr.exists ~loc:l vars (R.Expr.binary ~loc:l And g body))
   | Tcomprehension ((id, ty), body) ->
-      let* ty = Source.ocaml_type env.ctx.env ~at:id.pid_loc ty in
+      let* ty = Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty in
       let* raven_type = typ env.ctx ~at:id.pid_loc ty in
-      let raven = Names.fresh env.ctx.names id.pid_str in
+      let raven = Names.fresh env.ctx.procedure.names id.pid_str in
       let env =
         {
           (bind env id.pid_str (Raven raven)) with
@@ -129,7 +130,7 @@ let rec formula (env : env) (t : S.term) : (R.Expr.t, error) Result.t =
       spec_match env ~at ?scrutinee_type v cases
   | Tattr (_, t) -> formula env t
   | Tcast (t, ty) ->
-      let* ty = Source.ocaml_type env.ctx.env ~at ty in
+      let* ty = Source.ocaml_type env.ctx.given.env ~at ty in
       let* raven_type = typ env.ctx ~at ty in
       let* value = expected_formula env (Some ty) t in
       Ok (R.Expr.annotated value raven_type)
@@ -207,9 +208,9 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
         Signature_contract.terms ~expected ~logical_types:env.data
           ~predicates:(fun q ->
             Option.map
-              (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+              (List.Assoc.find env.ctx.given.preds (logical_key env q) ~equal:String.equal)
               ~f:snd)
-          ~environment:env.ctx.env ~variables:env.var_types [ t ]
+          ~environment:env.ctx.given.env ~variables:env.var_types [ t ]
     | Some _ | None -> Ok ()
   in
   let literal = list_literal in
@@ -230,7 +231,7 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
              && not (List.Assoc.mem env.vars "to_sequence" ~equal:String.equal)
          | _ -> false ->
       let* () =
-        Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.env
+        Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected t
       in
       let* value = formula env t in
@@ -242,7 +243,7 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
     concatenation. *)
 and term_type env (t : S.term) =
   match (t.term_desc, spine (S.chain t) []) with
-  | Tcast (_, ty), _ -> Result.ok (Source.ocaml_type env.ctx.env ~at:t.term_loc ty)
+  | Tcast (_, ty), _ -> Result.ok (Source.ocaml_type env.ctx.given.env ~at:t.term_loc ty)
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
   | ( _,
@@ -266,7 +267,7 @@ and term_type env (t : S.term) =
       Option.first_some (term_type env a) (term_type env b)
   | Tcomprehension ((_, ty), _), _ ->
       Result.ok
-        (Source.ocaml_type env.ctx.env ~at:t.term_loc
+        (Source.ocaml_type env.ctx.given.env ~at:t.term_loc
            (S.PTtyapp (Qid (S.mk_id ~loc:t.term_loc "set"), [ ty ])))
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
@@ -276,11 +277,11 @@ and term_type env (t : S.term) =
       List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
       Result.ok
-        (Source.infer_logical_expression env.ctx.env
+        (Source.infer_logical_expression env.ctx.given.env
            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, [ _ ]) ->
       Result.ok
-        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.env
+        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
            ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "length"; _ }); _ }, [ _ ]) ->
       Some Predef.type_int
@@ -359,8 +360,8 @@ and equality_term_type env (t : S.term) =
   match term_type env t with
   | Some ty -> Ok ty
   | None ->
-      Source.infer_logical_expression env.ctx.env ~functions:(List.map env.funcs ~f:fst)
-        ~variables:env.var_types t
+      Source.infer_logical_expression env.ctx.given.env
+        ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t
 
 (** Equality operands share a type, so a known operand supplies its context. *)
 and equality_operand_types env a b =
@@ -397,10 +398,12 @@ and application env (t : S.term) =
       | _ -> error at "An AU operation is only allowed in a proof expression"
       end
   | Tvar q, _
-    when List.Assoc.mem env.ctx.proof_support.predicate_inputs (logical_key env q)
+    when List.Assoc.mem env.ctx.given.proof_support.predicate_inputs (logical_key env q)
            ~equal:String.equal ->
       let key = logical_key env q in
-      let raven, types = List.Assoc.find_exn env.ctx.preds key ~equal:String.equal in
+      let raven, types =
+        List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal
+      in
       let* args = predicate_arguments env ~at ~display:(qualid_key q) key types args in
       Ok (R.Expr.call ~loc:l (qualified_name ~loc:l raven) args)
   | Tvar q, args when Option.is_some (logical_signature env q) ->
@@ -423,7 +426,7 @@ and application env (t : S.term) =
       let* () =
         match (ghost_projection env location, expected) with
         | Some _, Some expected ->
-            Source.check_logical_expression env.ctx.env
+            Source.check_logical_expression env.ctx.given.env
               ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected v
         | _ -> Ok ()
       in
@@ -439,12 +442,12 @@ and application env (t : S.term) =
               | _ -> Ok ()
             in
             let* permission_type =
-              Source.ocaml_type env.ctx.env ~at
+              Source.ocaml_type env.ctx.given.env ~at
                 (S.PTtyapp
                    (Qdot (Qid (S.mk_id ~loc:at "Permission"), S.mk_id ~loc:at "t"), []))
             in
             let* () =
-              Source.check_logical_expression env.ctx.env
+              Source.check_logical_expression env.ctx.given.env
                 ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
                 ~expected:permission_type fraction
             in
@@ -485,7 +488,7 @@ and application env (t : S.term) =
             | "===" | "=/=" ->
                 begin match (term_type env a, term_type env b) with
                 | Some left, Some right
-                  when not (Ctype.is_equal env.ctx.env false [ left ] [ right ]) ->
+                  when not (Ctype.is_equal env.ctx.given.env false [ left ] [ right ]) ->
                     error id.pid_loc
                       "Logical equality requires operands of the same OCaml type"
                 | _ -> Ok ()
@@ -497,8 +500,8 @@ and application env (t : S.term) =
                   || spec_contains_runtime_refs env.ctx b_type
                 then
                   let direct =
-                    Datatypes.is_heap_ref env.ctx.types a_type
-                    || Datatypes.is_heap_ref env.ctx.types b_type
+                    Datatypes.is_heap_ref env.ctx.given.types a_type
+                    || Datatypes.is_heap_ref env.ctx.given.types b_type
                   in
                   error id.pid_loc
                     (if direct then
@@ -518,8 +521,8 @@ and application env (t : S.term) =
                     error id.pid_loc
                       "Physical equality on logical values is unsupported; use = or <>"
                   else if
-                    Datatypes.immediate env.ctx.types a_type
-                    || Datatypes.immediate env.ctx.types b_type
+                    Datatypes.immediate env.ctx.given.types a_type
+                    || Datatypes.immediate env.ctx.given.types b_type
                   then Ok ()
                   else
                     error id.pid_loc
@@ -540,7 +543,7 @@ and application env (t : S.term) =
   | Tvar q, _ :: _
     when List.Assoc.mem env.funcs (logical_key env q) ~equal:String.equal
          && not
-              (List.exists env.ctx.proof_support.runtime_functions.entries
+              (List.exists env.ctx.given.proof_support.runtime_functions.entries
                  ~f:(fun (_, target) ->
                    String.equal
                      (Qualified_name.to_string target)
@@ -549,7 +552,7 @@ and application env (t : S.term) =
       let f = logical_key env q in
       (* A predicate's arguments have its parameters' types. *)
       let expected =
-        match List.Assoc.find env.ctx.preds f ~equal:String.equal with
+        match List.Assoc.find env.ctx.given.preds f ~equal:String.equal with
         | Some (_, types) when List.length types = List.length args ->
             List.map types ~f:Option.some
         | _ -> List.map args ~f:(fun _ -> None)
@@ -564,7 +567,7 @@ and application env (t : S.term) =
       if List.length args <> 1 then error at "to_sequence expects a list"
       else
         let* _ =
-          Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.env
+          Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
             ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t
         in
         let* args = all args ~f:(formula env) in
@@ -612,11 +615,12 @@ and typed_arguments env ~at inputs args =
             Signature_contract.terms ~expected:ty ~logical_types:env.data
               ~predicates:(fun q ->
                 Option.map
-                  (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+                  (List.Assoc.find env.ctx.given.preds (logical_key env q)
+                     ~equal:String.equal)
                   ~f:snd)
-              ~environment:env.ctx.env ~variables:env.var_types [ value ]
+              ~environment:env.ctx.given.env ~variables:env.var_types [ value ]
           else
-            Source.check_logical_expression ~is_list env.ctx.env
+            Source.check_logical_expression ~is_list env.ctx.given.env
               ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
               value
         in
@@ -624,7 +628,7 @@ and typed_arguments env ~at inputs args =
           match term_type env value with
           | Some actual
             when (not sequence)
-                 && not (Ctype.is_equal env.ctx.env false [ ty ] [ actual ]) ->
+                 && not (Ctype.is_equal env.ctx.given.env false [ ty ] [ actual ]) ->
               error value.term_loc
                 (Stdlib.Format.asprintf "Expected logical type %a but found %a"
                    Printtyp.type_expr ty Printtyp.type_expr actual)
@@ -636,7 +640,7 @@ and typed_arguments env ~at inputs args =
 
 and predicate_arguments env ~at ?display key types args =
   match
-    List.Assoc.find env.ctx.proof_support.predicate_inputs key ~equal:String.equal
+    List.Assoc.find env.ctx.given.proof_support.predicate_inputs key ~equal:String.equal
   with
   | None ->
       if List.length types = List.length args then
@@ -736,7 +740,7 @@ and location_of env (t : S.term) =
     let owner = match t.term_desc with Tfield (owner, _) -> owner | _ -> t in
     match term_type env owner with
     | Some typ -> (
-        match Types.get_desc (Ctype.expand_head env.ctx.env typ) with
+        match Types.get_desc (Ctype.expand_head env.ctx.given.env typ) with
         | Tconstr (path, _, _) when opaque_module_path env path ->
             error at
               "Ownership of an abstract module type must be exposed through a predicate"
@@ -749,13 +753,14 @@ and location_of env (t : S.term) =
         match term_type env owner with
         | None -> Ok ()
         | Some actual
-          when Ctype.is_equal env.ctx.env false [ field.field_owner ] [ actual ] ->
+          when Ctype.is_equal env.ctx.given.env false [ field.field_owner ] [ actual ] ->
             Ok ()
         | Some _ -> error owner.term_loc "This ghost field has a different owner type"
       in
       let* () =
-        Source.check_logical_expression env.ctx.env ~functions:(List.map env.funcs ~f:fst)
-          ~variables:env.var_types ~expected:field.field_owner owner
+        Source.check_logical_expression env.ctx.given.env
+          ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+          ~expected:field.field_owner owner
       in
       let* owner = formula env owner in
       Ok (R.Expr.field ~loc:l owner (qualified_name ~loc:l (ghost_field_name field)))

@@ -3355,15 +3355,15 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       let env =
         {
           ctx;
-          data = ctx.types;
-          funcs = ctx.spec_funcs;
+          data = ctx.given.types;
+          funcs = ctx.given.spec_funcs;
           vars = [];
           var_types = [];
           logical_definition = false;
         }
       in
       Option.map
-        (List.Assoc.find ctx.preds (logical_key env q) ~equal:String.equal)
+        (List.Assoc.find ctx.given.preds (logical_key env q) ~equal:String.equal)
         ~f:snd
     in
     let* () =

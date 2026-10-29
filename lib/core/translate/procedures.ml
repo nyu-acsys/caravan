@@ -148,21 +148,23 @@ let formals ?(names = []) ctx (f : func) =
       | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = typ ctx ~at:pat_loc pat_type in
-          let x = Names.bind ~typ:pat_type ctx.names id in
+          let x = Names.bind ~typ:pat_type ctx.procedure.names id in
           Ok
             ( Some (Ident.name id, x),
               range_spec ~loc:(loc pat_loc) pat_type x,
               R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
       | Tparam_pat
           { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ } ->
-          let x = Names.fresh ctx.names "unit" in
+          let x = Names.fresh ctx.procedure.names "unit" in
           let l = loc pat_loc in
           Ok (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
       | Tparam_pat { pat_desc = Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = typ ctx ~at:pat_loc pat_type in
           let contract_name = Option.join (List.nth names i) in
-          let x = Names.fresh ctx.names (Option.value contract_name ~default:"arg") in
+          let x =
+            Names.fresh ctx.procedure.names (Option.value contract_name ~default:"arg")
+          in
           let l = loc pat_loc in
           Ok
             ( Some (Option.value contract_name ~default:"", x),
@@ -188,7 +190,7 @@ let pattern_params ctx (f : func) formals =
                 let* stmts =
                   all binds ~f:(fun (id, value, t) ->
                       let* typ = typ ctx ~at:pat_loc t in
-                      let y = Names.bind ~typ:t ctx.names id in
+                      let y = Names.bind ~typ:t ctx.procedure.names id in
                       Ok
                         (R.Stmt.local ~loc:l ~const:true ~typ
                            ~init:(R.Stmt.expr_rhs value) (ident ~loc:l y)
@@ -200,9 +202,9 @@ let pattern_params ctx (f : func) formals =
                     List.iter fields ~f:(fun (_, label, p) ->
                         match p.pat_desc with
                         | Tpat_var (id, _, _) ->
-                            Option.iter (Names.find ctx.names id) ~f:(fun y ->
-                                ctx.fields_of <-
-                                  (y, (label.lbl_name, value)) :: ctx.fields_of)
+                            Option.iter (Names.find ctx.procedure.names id) ~f:(fun y ->
+                                ctx.procedure.fields_of <-
+                                  (y, (label.lbl_name, value)) :: ctx.procedure.fields_of)
                         | _ -> ())
                 | _ -> ()
                 end;
@@ -237,7 +239,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
       ctx;
       var_types = types;
       logical_definition = false;
-      data = ctx.types;
+      data = ctx.given.types;
       funcs = spec_funcs;
       vars =
         ( result_name,
@@ -263,8 +265,8 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                  id.pid_str)
           else Ok ()
         in
-        let* t = Source.ocaml_type ctx.env ~at:id.pid_loc pty in
-        Ok (id.pid_str, Names.fresh ctx.names id.pid_str, t))
+        let* t = Source.ocaml_type ctx.given.env ~at:id.pid_loc pty in
+        Ok (id.pid_str, Names.fresh ctx.procedure.names id.pid_str, t))
   in
   let env =
     List.fold ghosts ~init:env ~f:(fun env (x, raven, t) ->
@@ -286,8 +288,8 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                  id.pid_str)
           else Ok ()
         in
-        let* t = Source.ocaml_type ctx.env ~at:id.pid_loc pty in
-        Ok (id.pid_str, Names.fresh ctx.names id.pid_str, t))
+        let* t = Source.ocaml_type ctx.given.env ~at:id.pid_loc pty in
+        Ok (id.pid_str, Names.fresh ctx.procedure.names id.pid_str, t))
   in
   let* () =
     let preconditions =
@@ -410,44 +412,48 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
     (R.Callable.t, error) Result.t =
   let ctx =
     {
-      types;
-      refs;
-      primitives;
-      primitive_namespace;
-      names = Names.create ();
-      functions = Path_bindings.empty;
-      lifted = [];
-      pasts = [];
-      past_returns = [];
-      origins;
-      annotations = [];
-      spec_funcs;
-      proof_lemmas = [];
-      proof_support;
-      predicate_bodies = [];
-      env = ocaml_env;
-      preds;
-      facts = [];
-      au = None;
-      current_procedure = None;
-      manual = false;
-      access_proofs = [];
-      return_proofs = [];
-      procedure_signatures = [];
-      ghost_returns = [];
-      proof_state = None;
-      return_covered = false;
-      initializations = [];
-      linearizations = [];
-      shared;
-      invariants = [];
-      opened = [];
-      snapshots = [];
-      positions = [];
-      formals = [];
-      ghost_args = [];
-      fields_of = [];
-      libraries = Path_bindings.empty;
+      given =
+        {
+          types;
+          primitive_namespace;
+          functions = Path_bindings.empty;
+          lifted = [];
+          pasts = [];
+          past_returns = [];
+          annotations = [];
+          spec_funcs;
+          proof_lemmas = [];
+          proof_support;
+          predicate_bodies = [];
+          env = ocaml_env;
+          preds;
+          current_procedure = None;
+          manual = false;
+          access_proofs = [];
+          return_proofs = [];
+          procedure_signatures = [];
+          initializations = [];
+          linearizations = [];
+          shared;
+          ghost_args = [];
+          libraries = Path_bindings.empty;
+        };
+      procedure =
+        {
+          names = Names.create ();
+          facts = [];
+          au = None;
+          ghost_returns = [];
+          proof_state = None;
+          return_covered = false;
+          invariants = [];
+          opened = [];
+          snapshots = [];
+          positions = [];
+          formals = [];
+          fields_of = [];
+        };
+      collected = { refs; primitives; origins };
     }
   in
   let l = loc f.loc in
@@ -456,7 +462,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
     else Ok ()
   in
   let* formals = formals ctx f in
-  let result = Names.fresh ctx.names "result" in
+  let result = Names.fresh ctx.procedure.names "result" in
   let* _, env, implicit, ghosts = contract_env ctx ~spec_funcs f formals ~result in
   let* () =
     match ghosts with
@@ -505,12 +511,13 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
       let* b = uses ctx env ~at make b in
       Ok (a @ b)
   | Tvar q, _, _
-    when List.mem ctx.proof_support.opaque_predicates (logical_key env q)
+    when List.mem ctx.given.proof_support.opaque_predicates (logical_key env q)
            ~equal:String.equal ->
       Ok []
-  | Tvar q, _, _ when List.Assoc.mem ctx.preds (logical_key env q) ~equal:String.equal ->
+  | Tvar q, _, _
+    when List.Assoc.mem ctx.given.preds (logical_key env q) ~equal:String.equal ->
       let key = logical_key env q in
-      let raven, types = List.Assoc.find_exn ctx.preds key ~equal:String.equal in
+      let raven, types = List.Assoc.find_exn ctx.given.preds key ~equal:String.equal in
       let* args =
         predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
       in
@@ -548,10 +555,10 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
 (** The statements binding the atomic update of the function [self], whose atomic contract
     has the preconditions [pres] and postconditions [posts], and whose implicit parameters
     are [implicit]; [result] is the contract's name for the result, if there is one. Sets
-    [ctx.au]. A step inside the update unfolds the predicates of [pres], and folds those
-    of [posts] if it commits, and those of [pres] if it aborts. *)
+    [ctx.procedure.au]. A step inside the update unfolds the predicates of [pres], and
+    folds those of [posts] if it commits, and those of [pres] if it aborts. *)
 let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_results =
-  let phi = Names.fresh ctx.names "phi" in
+  let phi = Names.fresh ctx.procedure.names "phi" in
   let au_call ~l f args =
     R.Expr.call ~loc:l (name ~loc:l f) (R.Expr.var ~loc:l (name ~loc:l phi) :: args)
   in
@@ -575,7 +582,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     let* decls =
       all implicit ~f:(fun (x, _, t, _) ->
           let* typ = typ ctx ~at t in
-          let v = Names.fresh ctx.names x in
+          let v = Names.fresh ctx.procedure.names x in
           Ok
             ( R.Stmt.local ~loc:l ~ghost:true ~const:false ~typ (ident ~loc:l v),
               R.Expr.var ~loc:l (name ~loc:l v) ))
@@ -613,7 +620,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     let* decls =
       all implicit ~f:(fun (x, _, t, _) ->
           let* typ = typ ctx ~at t in
-          let v = Names.fresh ctx.names x in
+          let v = Names.fresh ctx.procedure.names x in
           Ok
             ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l v),
               R.Expr.var ~loc:l (name ~loc:l v) ))
@@ -626,7 +633,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     in
     let* unfolds = each pres ~at unfold (opened values) in
     let* folds = each posts ~at (with_views ctx fold) (opened ~value values) in
-    ctx.origins :=
+    ctx.collected.origins :=
       {
         at;
         code = Commit;
@@ -636,7 +643,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
         related =
           List.map posts ~f:(fun (t : S.term) -> (t.term_loc, "The atomic postcondition"));
       }
-      :: !(ctx.origins);
+      :: !(ctx.collected.origins);
     Ok
       (List.concat_map decls ~f:fst @ [ opening ] @ unfolds @ folds
       @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ])
@@ -654,8 +661,8 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
       all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
           match
             ( performs,
-              List.Assoc.find ctx.opened p.inv ~equal:String.equal,
-              List.Assoc.find ctx.invariants p.inv ~equal:String.equal )
+              List.Assoc.find ctx.procedure.opened p.inv ~equal:String.equal,
+              List.Assoc.find ctx.procedure.invariants p.inv ~equal:String.equal )
           with
           | Some performed, Some opened, Some args ->
               let next, indices, _ =
@@ -690,7 +697,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
           "The atomic postcondition may not hold after this step, which linearizes the \
            function"
         in
-        ctx.origins :=
+        ctx.collected.origins :=
           {
             at;
             code = Fold;
@@ -707,14 +714,14 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                  List.map posts ~f:(fun (t : S.term) ->
                      (t.term_loc, "The atomic postcondition"));
              }
-          :: !(ctx.origins);
+          :: !(ctx.collected.origins);
         let* folds =
           match au.performing with
           | Some (a, _) ->
               (* The views follow from the action; the postcondition's other predicates
                  are folded as usual. *)
               let others ~loc ~pred p args =
-                if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then []
+                if List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal then []
                 else fold ~loc ~pred p args
               in
               let* views = perform_views ctx ~at a in
@@ -747,7 +754,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
           @ use_invariants ctx ~at ~fold:true)
     | Commit_call -> Ok [ commit ]
   in
-  ctx.au <- Some au;
+  ctx.procedure.au <- Some au;
   let l = loc at in
   Ok
     (R.Stmt.local ~loc:l ~ghost:true ~const:true
@@ -763,14 +770,14 @@ let invariant_apps ?(include_opaque = false) ctx env (terms : S.term list) =
         apps a @ apps b
     | { term_desc = Tvar q; _ }, args ->
         let key = logical_key env q in
-        begin match List.Assoc.find ctx.preds key ~equal:String.equal with
+        begin match List.Assoc.find ctx.given.preds key ~equal:String.equal with
         | Some (raven, _)
-          when List.Assoc.mem ctx.shared.persistent
-                 (canonical_member ctx.shared raven)
+          when List.Assoc.mem ctx.given.shared.persistent
+                 (canonical_member ctx.given.shared raven)
                  ~equal:String.equal
                && (include_opaque
                   || not
-                       (List.mem ctx.proof_support.opaque_predicates key
+                       (List.mem ctx.given.proof_support.opaque_predicates key
                           ~equal:String.equal)) ->
             [ (key, args) ]
         | _ -> []
@@ -778,9 +785,9 @@ let invariant_apps ?(include_opaque = false) ctx env (terms : S.term list) =
     | _ -> []
   in
   all (List.concat_map terms ~f:apps) ~f:(fun (p, args) ->
-      let raven, _ = List.Assoc.find_exn ctx.preds p ~equal:String.equal in
+      let raven, _ = List.Assoc.find_exn ctx.given.preds p ~equal:String.equal in
       let* args = all args ~f:(formula env) in
-      Ok (canonical_member ctx.shared raven, args))
+      Ok (canonical_member ctx.given.shared raven, args))
 
 (** Initializer bindings are local to the state record and its establishment. *)
 let rec initial_bindings env initialization continuation =
@@ -797,14 +804,14 @@ let initializer_annotation ctx (f : func) =
         a.loc.loc_end.pos_cnum <= next.loc_start.pos_cnum)
     && Poly.equal (Annotation.kind a) Annotation.Initially
   in
-  match List.filter ctx.annotations ~f:window with
+  match List.filter ctx.given.annotations ~f:window with
   | [] -> Ok None
   | [ a ] -> Result.map (Annotation.initially a) ~f:(fun initial -> Some (a, initial))
   | _ :: a :: _ -> error a.loc "A constructor has at most one initially annotation"
 
 let check_initial_fields ctx established fields =
   let known =
-    List.concat_map ctx.shared.structures ~f:(fun st ->
+    List.concat_map ctx.given.shared.structures ~f:(fun st ->
         if List.exists established ~f:(fun (inv, _) -> String.equal inv st.invariant) then
           List.map st.fields ~f:(fun (field, _, _, _, _) -> field)
         else [])
@@ -831,7 +838,9 @@ let check_initial_fields ctx established fields =
     its fields owned by index. *)
 let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
   let l = loc at in
-  match List.find ctx.shared.structures ~f:(fun st -> String.equal st.invariant inv) with
+  match
+    List.find ctx.given.shared.structures ~f:(fun st -> String.equal st.invariant inv)
+  with
   | None -> Ok [ R.Stmt.fold ~loc:l (qualified_name ~loc:l inv) args ]
   | Some st ->
       begin match initial with
@@ -885,20 +894,20 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                             (List.mapi es ~f:(fun i e -> (e, R.Expr.int ~loc:l i)))
                             (R.Expr.int ~loc:l 0) ) )
                 | None ->
-                    ctx.shared.dynamic_indices <- true;
+                    ctx.given.shared.dynamic_indices <- true;
                     let l = loc term.term_loc in
-                    let target = Names.fresh ctx.names "initial_index" in
+                    let target = Names.fresh ctx.procedure.names "initial_index" in
                     let index_type =
                       R.Type.map ~loc:l (R.Type.ref ~loc:l) (R.Type.int ~loc:l)
                     in
-                    ctx.origins :=
+                    ctx.collected.origins :=
                       {
                         at = term.term_loc;
                         code = Precondition;
                         message = "The cells of this indexed field may not be distinct";
                         related = [];
                       }
-                      :: !(ctx.origins);
+                      :: !(ctx.collected.origins);
                     Ok
                       ( R.Stmt.local ~loc:l ~ghost:true ~typ:index_type
                           ~init:
@@ -928,7 +937,7 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                   (grown st (List.map values ~f:(fun (_, v, _) -> v)))
               in
               let location =
-                match anchor ctx.types st.structure_type with
+                match anchor ctx.given.types st.structure_type with
                 | Some (_, at) ->
                     R.Expr.field ~loc:l
                       (at ~loc:l (List.hd_exn args))
@@ -971,44 +980,48 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let names = Names.create () in
   let ctx =
     {
-      types;
-      refs;
-      primitives;
-      primitive_namespace;
-      names;
-      functions;
-      lifted;
-      pasts;
-      past_returns;
-      ghost_args;
-      procedure_signatures;
-      ghost_returns = [];
-      proof_state = None;
-      return_covered = false;
-      libraries;
-      origins;
-      annotations;
-      spec_funcs = funcs;
-      proof_lemmas;
-      proof_support;
-      predicate_bodies;
-      env = ocaml_env;
-      preds;
-      facts = [];
-      au = None;
-      current_procedure = Some proc_name;
-      manual = f.manual;
-      access_proofs;
-      return_proofs;
-      initializations;
-      linearizations;
-      shared;
-      invariants = [];
-      opened = [];
-      snapshots = [];
-      positions = [];
-      formals = [];
-      fields_of = [];
+      given =
+        {
+          types;
+          primitive_namespace;
+          functions;
+          lifted;
+          pasts;
+          past_returns;
+          ghost_args;
+          procedure_signatures;
+          libraries;
+          annotations;
+          spec_funcs = funcs;
+          proof_lemmas;
+          proof_support;
+          predicate_bodies;
+          env = ocaml_env;
+          preds;
+          current_procedure = Some proc_name;
+          manual = f.manual;
+          access_proofs;
+          return_proofs;
+          initializations;
+          linearizations;
+          shared;
+        };
+      procedure =
+        {
+          names;
+          ghost_returns = [];
+          proof_state = None;
+          return_covered = false;
+          facts = [];
+          au = None;
+          invariants = [];
+          opened = [];
+          snapshots = [];
+          positions = [];
+          formals = [];
+          fields_of = [];
+        };
+      collected = { refs; primitives; origins };
     }
   in
   let l = loc f.loc in
@@ -1036,10 +1049,11 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       | ( Tparam_pat { pat_desc = Tpat_var _ | Tpat_record _ | Tpat_tuple _; pat_type; _ },
           Some source,
           Some (_, raven) )
-        when not (List.Assoc.mem ctx.names.scope source ~equal:String.equal) ->
-          ctx.names.scope <- (source, (raven, Some pat_type)) :: ctx.names.scope
+        when not (List.Assoc.mem ctx.procedure.names.scope source ~equal:String.equal) ->
+          ctx.procedure.names.scope <-
+            (source, (raven, Some pat_type)) :: ctx.procedure.names.scope
       | _ -> ());
-  ctx.formals <-
+  ctx.procedure.formals <-
     List.map formals ~f:(fun (ocaml, _, _) ->
         match ocaml with
         | Some (_, x) -> R.Expr.var ~loc:l (name ~loc:l x)
@@ -1061,7 +1075,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
         | Some (Raven raven), Some t -> Ok (id.pid_str, raven, t)
         | _ -> error id.pid_loc "Cannot resolve this ghost result")
   in
-  ctx.ghost_returns <- ghost_returns;
+  ctx.procedure.ghost_returns <- ghost_returns;
   let* ghost_return_vars =
     all ghost_returns ~f:(fun (_, raven, t) ->
         let* typ = typ ctx ~at:f.loc t in
@@ -1083,16 +1097,17 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       | Some (_, ghost, _), Some (i, _) ->
           begin match List.nth formals i with
           | Some (Some (_, raven), _, _) ->
-              ctx.fields_of <-
-                (raven, (field, R.Expr.var ~loc:l (name ~loc:l ghost))) :: ctx.fields_of
+              ctx.procedure.fields_of <-
+                (raven, (field, R.Expr.var ~loc:l (name ~loc:l ghost)))
+                :: ctx.procedure.fields_of
           | _ -> ()
           end
       | _ -> ());
   (* Ghost statements and invariants in the code can use ghost parameters. *)
   List.iter ghosts ~f:(fun (x, raven, t) ->
-      ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
+      ctx.procedure.names.scope <- (x, (raven, Some t)) :: ctx.procedure.names.scope);
   List.iter implicit ~f:(fun (x, raven, t, _) ->
-      ctx.names.scope <- (x, (raven, Some t)) :: ctx.names.scope);
+      ctx.procedure.names.scope <- (x, (raven, Some t)) :: ctx.procedure.names.scope);
   let implicit_decls = implicit in
   let implicit = List.map implicit ~f:(fun (_, _, _, var) -> var) in
   let specs fs =
@@ -1107,7 +1122,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* requires = specs pres in
   (* The invariants of the precondition are opened around each atomic step. *)
   let* invariants = invariant_apps ctx env pres in
-  ctx.invariants <- (if f.manual then [] else invariants);
+  ctx.procedure.invariants <- (if f.manual then [] else invariants);
   (* A snapshot and a position witnessing each fact about an earlier state. *)
   let* history_invariants = invariant_apps ~include_opaque:true ctx env pres in
   let witnesses (p : past) =
@@ -1159,7 +1174,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
   let* past_results = all past_posts ~f:witnesses in
   let past_formals = List.concat_map past_params ~f:(fun ((_, _, _, d, _), _) -> d) in
   let past_returns = List.concat_map past_results ~f:(fun ((_, _, _, d, _), _) -> d) in
-  ctx.positions <-
+  ctx.procedure.positions <-
     List.map past_params ~f:(fun ((p, _, e, _, (snapshot, k)), _) ->
         {
           pos_inv = p.inv;
@@ -1187,7 +1202,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
       (List.filter pres ~f:(fun t ->
            not (List.mem (term_names t) "own" ~equal:String.equal)))
   in
-  ctx.facts <- facts;
+  ctx.procedure.facts <- facts;
   (* Names free in the postconditions are existentially quantified, as [j] in
      [ensures own c.count j]. *)
   let postconditions = contract_postconditions env ~at:f.loc in
@@ -1270,7 +1285,8 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
     in
     (* The ghost statements after the body follow the result's assignment, and can use its
      name. *)
-    ctx.names.scope <- (result_name, (result, Some f.body.exp_type)) :: ctx.names.scope;
+    ctx.procedure.names.scope <-
+      (result_name, (result, Some f.body.exp_type)) :: ctx.procedure.names.scope;
     let* last =
       ghost ctx ~after:f.body.exp_loc.loc_end
         ~before:
@@ -1311,7 +1327,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
         if List.is_empty established then Ok []
         else
           let only_views ~loc ~pred p args =
-            if List.Assoc.mem ctx.shared.views pred ~equal:String.equal then
+            if List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal then
               [ R.Stmt.fold ~loc p args ]
             else []
           in
@@ -1321,7 +1337,7 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
           (* Reported at the end of the function. *)
           let at = { f.loc with loc_start = f.loc.loc_end } in
           List.iter established ~f:(fun (inv, _) ->
-              ctx.origins :=
+              ctx.collected.origins :=
                 {
                   at;
                   code = Fold;
@@ -1331,10 +1347,10 @@ let proc types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~annotations
                   related =
                     Option.to_list
                       (Option.map
-                         (List.Assoc.find ctx.shared.persistent inv ~equal:String.equal)
-                         ~f:(fun def -> (def, "The invariant")));
+                         (List.Assoc.find ctx.given.shared.persistent inv
+                            ~equal:String.equal) ~f:(fun def -> (def, "The invariant")));
                 }
-                :: !(ctx.origins));
+                :: !(ctx.collected.origins));
           let establish initial_env initial =
             let* folds =
               all established ~f:(fun (inv, args) ->
