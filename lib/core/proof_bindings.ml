@@ -318,12 +318,118 @@ let state_visible constraints scopes ~scope entry =
       Option.is_some (drop_prefix boundary.namespace scope.Proof_scopes.namespace))
 
 let view_declaration inventory scope name =
-  List.find_map
-    (List.rev (own_constraints inventory.Module_inventory.constraints scope))
-    ~f:(fun constraint_ ->
+  let constraints =
+    let own = own_constraints inventory.Module_inventory.constraints scope in
+    if not (List.is_empty own) then own
+    else
+      match scope.Proof_scopes.parameters with
+      | [ Named (Some parameter, _, _) ] ->
+          let applications =
+            List.filter inventory.specializations ~f:(fun application ->
+                match application.Module_inventory.template.mod_desc with
+                | Tmod_functor (Named (Some original, _, _), _) ->
+                    Ident.same original parameter
+                | _ -> false)
+          in
+          List.filter inventory.constraints ~f:(fun constraint_ ->
+              Option.exists constraint_.owner ~f:(fun owner ->
+                  List.exists applications ~f:(fun application ->
+                      Path.same application.identity owner)))
+      | _ -> []
+  in
+  List.find_map (List.rev constraints) ~f:(fun constraint_ ->
       Option.map
         (List.Assoc.find constraint_.Module_inventory.signature.signature_resources name
            ~equal:String.equal) ~f:(fun formal -> (constraint_, formal)))
+
+let private_view_substitution (source : Source.t) inventory scope constraint_ =
+  match scope.Proof_scopes.parameters with
+  | [ Named (Some original_parameter, _, _) ] ->
+      let application =
+        List.find inventory.Module_inventory.specializations ~f:(fun application ->
+            Option.exists constraint_.Module_inventory.owner ~f:(fun owner ->
+                Path.same owner application.identity)
+            &&
+            match application.template.mod_desc with
+            | Tmod_functor (Named (Some parameter, _, _), _) ->
+                Ident.same parameter original_parameter
+            | _ -> false)
+      in
+      Option.bind application ~f:(fun application ->
+          let declarations =
+            List.concat_map scope.structure.str_items ~f:(fun item ->
+                match item.Typedtree.str_desc with
+                | Tstr_type (_, declarations) -> declarations
+                | _ -> [])
+          in
+          let original cloned =
+            List.find declarations ~f:(fun declaration ->
+                String.equal declaration.typ_name.txt cloned.Typedtree.typ_name.txt
+                && Poly.equal declaration.typ_loc cloned.typ_loc)
+          in
+          let clone_pairs =
+            List.filter_map application.declarations ~f:(fun cloned ->
+                Option.map (original cloned) ~f:(fun declaration -> (cloned, declaration)))
+          in
+          let substitution =
+            List.fold clone_pairs
+              ~init:
+                (Subst.add_module application.parameter (Path.Pident original_parameter)
+                   Subst.identity) ~f:(fun substitution (cloned, declaration) ->
+                Subst.add_type cloned.typ_id (Path.Pident declaration.typ_id) substitution)
+          in
+          let signature = constraint_.Module_inventory.signature in
+          let types =
+            List.fold signature.signature_types ~init:(Some substitution)
+              ~f:(fun substitution (_, declaration) ->
+                Option.bind substitution ~f:(fun substitution ->
+                    let formal =
+                      Btype.newgenty
+                        (Tconstr (Path.Pident declaration.typ_id, [], ref Types.Mnil))
+                    in
+                    let concrete = Subst.type_expr constraint_.substitution formal in
+                    match Types.get_desc concrete with
+                    | Tconstr (Path.Pident id, [], _) ->
+                        Option.map
+                          (List.find clone_pairs ~f:(fun (cloned, _) ->
+                               Ident.same cloned.typ_id id))
+                          ~f:(fun (_, original) ->
+                            Subst.add_type declaration.typ_id
+                              (Path.Pident original.typ_id) substitution)
+                    | _ -> None))
+          in
+          let resources =
+            List.fold signature.signature_ghost_modules ~init:types
+              ~f:(fun substitution (name, ghost) ->
+                Option.bind substitution ~f:(fun substitution ->
+                    Option.map
+                      (List.find source.proof_resources ~f:(fun resource ->
+                           String.equal resource.resource_name name
+                           && Option.equal Path.same resource.resource_scope scope.owner
+                           && not resource.resource_abstract))
+                      ~f:(fun resource ->
+                        let substitution =
+                          Subst.add_module ghost.ghost_resource.resource_id
+                            (Path.Pident resource.resource_id) substitution
+                        in
+                        let carrier =
+                          match Types.get_desc resource.resource_type with
+                          | Tconstr (path, [], _) -> path
+                          | _ -> Path.Pdot (Path.Pident resource.resource_id, "t")
+                        in
+                        List.fold ghost.ghost_resource.resource_type_members
+                          ~init:substitution ~f:(fun substitution (member, id, _) ->
+                            let path =
+                              if String.equal member "T" then carrier
+                              else
+                                Path.Pdot
+                                  ( Path.Pident resource.resource_id,
+                                    String.uncapitalize member )
+                            in
+                            Subst.add_type id path substitution))))
+          in
+          resources)
+  | _ -> None
 
 let supported (source : Source.t) (inventory : Module_inventory.t) entry =
   let scope = entry.Proof_scopes.scope in
@@ -531,8 +637,10 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
           | Some ancestor ->
               begin match (ancestor.parameters, entry.declaration) with
               | ( [ Named (Some _, _, _) ],
-                  ( S.Proof_predicate _ | Proof_lemma _ | Proof_function _
-                  | Proof_resource _ | Proof_definition _ | Proof_field _ | Proof_au _ ) )
+                  ( S.Proof_predicate _ | Proof_invariant _ | Proof_lemma _
+                  | Proof_function _ | Proof_resource _ | Proof_definition _
+                  | Proof_field _ | Proof_au _ | Proof_state _ | Proof_view _
+                  | Proof_action _ ) )
                 when same_owner ancestor.owner scope.owner
                      || Option.is_some scope.definition
                         && same_owner ancestor.owner scope.parent ->
@@ -579,9 +687,12 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
                     Source.annotation_env source formal.site.environment
                   in
                   let* output = parameter_types signature_environment [ value ] in
-                  Ok
-                    (inputs
-                    @ List.map output ~f:(Subst.type_expr constraint_.substitution))
+                  let substitution =
+                    Option.value
+                      (private_view_substitution source inventory scope constraint_)
+                      ~default:constraint_.substitution
+                  in
+                  Ok (inputs @ List.map output ~f:(Subst.type_expr substitution))
               end
           | _ -> parameter_types environment parameters
         in

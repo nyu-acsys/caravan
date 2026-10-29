@@ -530,7 +530,12 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
           | _ -> (term, arguments)
         in
         let callee, arguments = split [] term in
-        apply variables term callee arguments
+        begin match S.past_membership term with
+        | Some (element, _, _) ->
+            let* _ = walk variables element in
+            Ok (Some Predef.type_bool)
+        | None -> apply variables term callee arguments
+        end
     | Tinfix _ -> walk variables (S.chain term)
     | Tfield (base, field) ->
         let* typ = walk variables base in

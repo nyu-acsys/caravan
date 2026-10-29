@@ -1,0 +1,9 @@
+module Make (X : INPUT) = struct
+  type state = { value : int }
+
+  invariant is_counter (c : t) (s : state) = own c s.value
+
+  lemma private_helper ensures (0 = 0) = ()
+end
+
+lemma hidden = One.private_helper

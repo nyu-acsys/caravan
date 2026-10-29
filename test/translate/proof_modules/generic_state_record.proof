@@ -1,0 +1,7 @@
+module Make (X : INPUT) = struct
+  type state = { value : int }
+
+  invariant is_counter (c : t) (s : state) = own c.value s.value
+
+  view counter (c : t) = s.value
+end

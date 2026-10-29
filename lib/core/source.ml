@@ -2823,8 +2823,14 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     && Option.equal Path.same resource.resource_scope scope.owner)
                 |> List.map ~f:(fun resource ->
                     let view_path = Path.Pdot (view_owner, resource.resource_name) in
-                    let project original =
-                      let id = Ident.create_local original.resource_name in
+                    let project ~private_resource original =
+                      let id =
+                        Ident.create_local
+                          (if private_resource then
+                             Compiler_types.internal_name ~at:original.resource_at
+                               (original.resource_name ^ "_app")
+                           else original.resource_name)
+                      in
                       let path = Path.Pdot (view_owner, original.resource_name) in
                       let substitution =
                         Subst.add_module parameter argument_path Subst.identity
@@ -2899,15 +2905,74 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                           Some (carrier_identity, original.resource_id);
                       }
                     in
-                    let projected = project resource in
+                    let projected = project ~private_resource:true resource in
                     let public =
                       Option.map resource.resource_public ~f:(fun public ->
-                          { (project public) with resource_path = view_path })
+                          {
+                            (project ~private_resource:false public) with
+                            resource_path = view_path;
+                          })
                     in
                     { projected with resource_public = public })
             | _ -> []
             end
         | _ -> [])
+  in
+  let qualified_env =
+    List.fold application_resources ~init:qualified_env ~f:(fun env resource ->
+        match resource.resource_application with
+        | None -> env
+        | Some (identity, template_id) ->
+            let template =
+              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _), _) ->
+                  Option.map
+                    (List.find resources ~f:(fun original ->
+                         Ident.same original.resource_id template_id))
+                    ~f:(fun original -> (scope, original)))
+            in
+            begin match (identity, template) with
+            | Path.Papply (_, argument), Some (scope, original) ->
+                begin match scope.parameters with
+                | [ Named (Some parameter, _, _) ] ->
+                    let substitution =
+                      Subst.add_module parameter argument Subst.identity
+                    in
+                    let substitution =
+                      List.fold (source_type_ids scope.structure) ~init:substitution
+                        ~f:(fun substitution (id, name) ->
+                          Subst.add_type id (Path.Pdot (identity, name)) substitution)
+                    in
+                    let substitution =
+                      List.fold !application_carriers ~init:substitution
+                        ~f:(fun substitution (key, hidden, anchor) ->
+                          if Path.same key identity then
+                            Subst.add_type hidden (Path.Pident anchor) substitution
+                          else substitution)
+                    in
+                    let substitution =
+                      Subst.add_module original.resource_id
+                        (Path.Pident resource.resource_id) substitution
+                    in
+                    let declaration =
+                      Env.find_module (Path.Pident original.resource_id)
+                        original.resource_environment
+                      |> Subst.module_declaration Keep substitution
+                    in
+                    let declaration =
+                      match original.resource_alias_of with
+                      | Some alias_of ->
+                          {
+                            declaration with
+                            md_type = Mty_alias (Subst.module_path substitution alias_of);
+                          }
+                      | None -> declaration
+                    in
+                    Env.add_module_declaration ~check:false resource.resource_id
+                      Mp_present declaration env
+                | _ -> env
+                end
+            | (Pident _ | Pdot _ | Pextra_ty _), _ | Papply _, None -> env
+            end)
   in
   let qualified_env =
     List.fold application_resources ~init:qualified_env ~f:(fun env resource ->

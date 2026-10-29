@@ -289,3 +289,23 @@ let rec chain t =
   | _ -> t
 
 let chain_desc t = (chain { term_desc = t; term_loc = Location.none }).term_desc
+
+(** The element, state binder and field of [past (mem element state.field)]. *)
+let past_membership term =
+  let rec split arguments term =
+    match (chain term).term_desc with
+    | Tapply (callee, argument) -> split (argument :: arguments) callee
+    | _ -> (term, arguments)
+  in
+  match split [] term with
+  | { term_desc = Tvar (Qid { pid_str = "past"; _ }); _ }, [ fact ] ->
+      begin match split [] fact with
+      | ( { term_desc = Tvar (Qid { pid_str = "mem"; _ }); _ },
+          [
+            element;
+            { term_desc = Tfield ({ term_desc = Tvar (Qid state); _ }, Qid field); _ };
+          ] ) ->
+          Some (element, state, field)
+      | _ -> None
+      end
+  | _ -> None

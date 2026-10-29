@@ -57,13 +57,36 @@ let eligible (source : Module_inventory.specialization) =
               | Tpat_var (id, _, _) -> Some (Ident.name id)
               | _ -> None)
         in
-        let rec heap_type t =
+        let expanded_type t =
           let expanded =
             Signature_contract.compiler ~at:source.template.mod_loc (fun () ->
                 Ctype.expand_head body.str_final_env t)
           in
-          match Result.map expanded ~f:Types.get_desc with
+          Result.map expanded ~f:Types.get_desc
+        in
+        let rec closed_heap_value_type t =
+          match expanded_type t with
+          | Ok (Tconstr (path, [], _)) ->
+              Path.same path Predef.path_int
+              || Path.same path Predef.path_bool
+              || Path.same path Predef.path_unit
+          | Ok (Tconstr (path, [ element ], _))
+            when Path.same path Predef.path_list
+                 || Path.same path Predef.path_option
+                 || Datatypes.is_ref path || Datatypes.is_atomic path ->
+              closed_heap_value_type element
+          | Ok (Ttuple elements) ->
+              List.for_all elements ~f:(fun (_, element) ->
+                  closed_heap_value_type element)
+          | Ok (Tpoly (element, [])) -> closed_heap_value_type element
+          | Ok _ | Error _ -> false
+        in
+        let rec heap_type t =
+          match expanded_type t with
           | Error _ -> true
+          | Ok (Tconstr (path, [ element ], _))
+            when Datatypes.is_ref path || Datatypes.is_atomic path ->
+              not (closed_heap_value_type element)
           | Ok (Tconstr (path, args, _)) ->
               Datatypes.is_ref path || Datatypes.is_atomic path
               || List.exists args ~f:heap_type
@@ -72,14 +95,25 @@ let eligible (source : Module_inventory.specialization) =
           | Ok (Tpoly (t, _)) -> heap_type t
           | _ -> false
         in
-        let expr iterator expression =
-          if heap_type expression.Typedtree.exp_type then heap_access := true;
+        let expr (iterator : Tast_iterator.iterator) (expression : Typedtree.expression) =
+          if heap_type expression.exp_type then heap_access := true;
           begin match expression.exp_desc with
           | Texp_function _ when not (List.exists roots ~f:(phys_equal expression)) ->
               heap_access := true
           | _ -> ()
           end;
-          Tast_iterator.default_iterator.expr iterator expression
+          match expression.exp_desc with
+          | Texp_apply (({ Typedtree.exp_desc = Texp_ident _; _ } as callee), _) ->
+              let scoped =
+                {
+                  iterator with
+                  expr =
+                    (fun _ child ->
+                      if not (phys_equal child callee) then iterator.expr iterator child);
+                }
+              in
+              Tast_iterator.default_iterator.expr scoped expression
+          | _ -> Tast_iterator.default_iterator.expr iterator expression
         in
         let iterator = { Tast_iterator.default_iterator with expr } in
         iterator.structure iterator body;

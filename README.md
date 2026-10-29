@@ -41,8 +41,10 @@ Aliases preserve proof member identity, while result signatures expose declared
 predicates opaquely and hide implementation lemmas. Functor proofs can also
 instantiate resource algebras, declare ghost fields, and use AU facades for their
 own operations. Tokens retain their application identities through aliases;
-Raven checks their lifecycle and atomicity. Functor-owned state/action declarations
-remain unsupported.
+Raven checks their lifecycle and atomicity. State records, invariant views and
+actions in these functors reuse the automatic proof machinery, with initialization
+and history facts scoped to each application. Repeated applications to the same
+argument, including aliases, share proof identity.
 
 Proofs can instantiate Raven library modules using OCaml-style module applications.
 Their types, constructors, operations and parameter requirements come from Raven's
@@ -144,7 +146,8 @@ See the separate
 
 Type aliases in results are supported; higher-order or
 imported functors, anonymous arguments, nested parameter
-modules, and shared-state initializers inside functors remain unsupported.
+modules, and parameter-dependent heap representations remain unsupported by the
+shared generic translation.
 
 Proof files also support checked lemmas and monomorphic logical variant types.
 A lemma has typed parameters and an expression body after `=`. Optional

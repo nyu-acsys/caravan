@@ -1075,17 +1075,6 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           iterator.module_expr iterator body;
           !valid
         in
-        let* () =
-          List.fold_result annotations ~init:() ~f:(fun () annotation ->
-              if
-                within body.mod_loc annotation.Annotation.loc
-                && List.mem
-                     [ Annotation.Initially; Initializes ]
-                     (Annotation.kind annotation) ~equal:Poly.equal
-              then
-                unavailable annotation.loc "A shared-state initializer in a functor body"
-              else Ok ())
-        in
         Ok
           {
             empty_module with

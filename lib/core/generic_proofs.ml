@@ -11,6 +11,17 @@ type t = {
   aliases : (Typedtree.type_declaration * Typedtree.type_declaration) list;
 }
 
+let runtime_types plan =
+  List.concat_map plan.scope.structure.str_items ~f:(fun item ->
+      match item.Typedtree.str_desc with
+      | Tstr_type (_, declarations) -> declarations
+      | _ -> [])
+
+let matching_type declaration declarations =
+  List.find declarations ~f:(fun actual ->
+      String.equal declaration.Typedtree.typ_name.txt actual.Typedtree.typ_name.txt
+      && Poly.equal declaration.typ_loc actual.typ_loc)
+
 let model_owner (source : Source.t) (data : Datatypes.t) =
   List.find_map source.proof_scopes.declarations ~f:(fun entry ->
       match entry.Proof_scopes.declaration with
@@ -26,6 +37,27 @@ let resources source plan =
   List.filter source.Source.proof_resources ~f:(fun resource ->
       (not resource.Source.resource_abstract)
       && Option.equal Path.same resource.resource_scope plan.scope.owner)
+
+let rec expand_type_head environment typ =
+  let expanded = Ctype.expand_head environment typ in
+  match Types.get_desc expanded with
+  | Tconstr (path, arguments, _) ->
+      Ctype.newconstr path (List.map arguments ~f:(expand_type_head environment))
+  | Ttuple fields ->
+      Btype.newgenty
+        (Ttuple
+           (List.map fields ~f:(fun (label, field) ->
+                (label, expand_type_head environment field))))
+  | Tarrow (label, argument, result, mode) ->
+      Btype.newgenty
+        (Tarrow
+           ( label,
+             expand_type_head environment argument,
+             expand_type_head environment result,
+             mode ))
+  | Tpoly (body, variables) ->
+      Btype.newgenty (Tpoly (expand_type_head environment body, variables))
+  | _ -> expanded
 
 let has_models source (specialization : Module_inventory.specialization) =
   match specialization.template.mod_desc with
@@ -158,20 +190,24 @@ let owner plans scope =
              && Option.equal Path.same plan.scope.owner scope.parent))
 
 let projection plan =
-  List.fold plan.aliases
+  List.fold (runtime_types plan)
     ~init:
       (Subst.add_module plan.parameter (Path.Pident plan.group.representative.parameter)
-         Subst.identity) ~f:(fun substitution (source, target) ->
-      Subst.add_type source.Typedtree.typ_id (Path.Pident target.Typedtree.typ_id)
-        substitution)
+         Subst.identity) ~f:(fun substitution source ->
+      Option.value_map (matching_type source plan.group.representative.declarations)
+        ~default:substitution ~f:(fun target ->
+          Subst.add_type source.Typedtree.typ_id (Path.Pident target.Typedtree.typ_id)
+            substitution))
 
 let source_projection plan =
-  List.fold plan.aliases
+  List.fold (runtime_types plan)
     ~init:
       (Subst.add_module plan.group.representative.parameter (Path.Pident plan.parameter)
-         Subst.identity) ~f:(fun substitution (source, target) ->
-      Subst.add_type target.Typedtree.typ_id (Path.Pident source.Typedtree.typ_id)
-        substitution)
+         Subst.identity) ~f:(fun substitution source ->
+      Option.value_map (matching_type source plan.group.representative.declarations)
+        ~default:substitution ~f:(fun target ->
+          Subst.add_type target.Typedtree.typ_id (Path.Pident source.Typedtree.typ_id)
+            substitution))
 
 let types plan =
   let parameters =
@@ -228,9 +264,9 @@ let application_projection source plan (application : Module_inventory.specializ
     | _ -> application.argument.actual_path
   in
   let projection =
-    List.fold plan.aliases
+    List.fold (runtime_types plan)
       ~init:(Subst.add_module plan.parameter actual_parameter Subst.identity)
-      ~f:(fun substitution (original, _) ->
+      ~f:(fun substitution original ->
         Subst.add_type original.Typedtree.typ_id
           (Path.Pdot (path, original.typ_name.txt))
           substitution)
@@ -265,23 +301,17 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
     in
     let paths = application_paths source inventory application_source in
     let* private_projection =
-      List.fold_result plan.aliases
+      List.fold_result (runtime_types plan)
         ~init:
           (Subst.add_module plan.parameter (Path.Pident application_source.parameter)
-             Subst.identity) ~f:(fun substitution (original, _) ->
-          match
-            List.find application_source.declarations ~f:(fun actual ->
-                String.equal actual.Typedtree.typ_name.txt original.Typedtree.typ_name.txt)
-          with
+             Subst.identity) ~f:(fun substitution original ->
+          match matching_type original application_source.declarations with
           | Some actual ->
               Ok (Subst.add_type original.typ_id (Path.Pident actual.typ_id) substitution)
           | None ->
               Error
                 (Report.error Type original.typ_loc
                    "The application has no typed declaration for this proof type alias"))
-    in
-    let private_projection =
-      asset_projection source plan application_source.identity private_projection
     in
     let* environment =
       match members with
@@ -290,6 +320,53 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
           Error
             (Report.error Type application_source.argument.site.item_loc
                "The application has no typed runtime member for its proof")
+    in
+    let private_projection =
+      asset_projection source plan application_source.identity private_projection
+    in
+    let* private_projection =
+      List.fold_result (resources source plan) ~init:private_projection
+        ~f:(fun projection template ->
+          let application =
+            List.find source.proof_resources ~f:(fun resource ->
+                Option.exists resource.Source.resource_application
+                  ~f:(fun (identity, member) ->
+                    Path.same identity application_source.identity
+                    && Ident.same member template.resource_id))
+          in
+          match application with
+          | None -> Ok projection
+          | Some application ->
+              let* carrier =
+                Signature_contract.compiler ~at:template.resource_at (fun () ->
+                    Ctype.expand_head application.resource_environment
+                      (Ctype.newconstr
+                         (Path.Pdot (Path.Pident application.resource_id, "t"))
+                         []))
+              in
+              begin match Types.get_desc carrier with
+              | Tconstr (carrier, [], _) ->
+                  Ok
+                    (List.fold template.resource_type_members ~init:projection
+                       ~f:(fun projection (member, id, _) ->
+                         if String.equal member "T" then
+                           Subst.add_type id carrier projection
+                         else projection))
+              | _ -> Ok projection
+              end)
+    in
+    let* private_types =
+      List.map proofs.Proof_bindings.bindings ~f:(fun binding ->
+          if not (contains plan binding) then Ok (binding.backend, [])
+          else
+            let* types =
+              List.map binding.private_types ~f:(fun typ ->
+                  Signature_contract.compiler ~at:binding.entry.name.pid_loc (fun () ->
+                      expand_type_head binding.environment typ))
+              |> Result.all
+            in
+            Ok (binding.backend, types))
+      |> Result.all
     in
     (* Canonical result declarations are shared; agreement uses this typed instance. *)
     let check_projection =
@@ -313,7 +390,8 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
           let constraints =
             List.filter inventory.constraints ~f:(fun constraint_ ->
                 Option.exists constraint_.result_owner ~f:(fun owner ->
-                    List.exists paths ~f:(Path.same owner)))
+                    Path.same application_source.identity owner
+                    || List.exists paths ~f:(Path.same owner)))
           in
           List.filter_map proofs.Proof_bindings.bindings ~f:(fun binding ->
               if not (contains plan binding) then None
@@ -328,7 +406,9 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
                       types = List.map binding.private_types ~f:project_type;
                       project_type;
                       implementation_types =
-                        List.map binding.private_types
+                        List.map
+                          (List.Assoc.find_exn private_types binding.backend
+                             ~equal:String.equal)
                           ~f:(Subst.type_expr private_projection);
                       environment;
                       check_projection;
