@@ -112,7 +112,7 @@ let action_checks ctx (st : structure) =
             let state values = state_of ~loc:l st (grown st values) in
             (* Reported at the return point of the lemma, at the end of the action's
                name. *)
-            ctx.collected.origins :=
+            record_origin ctx
               {
                 at = { at with loc_start = at.loc_end };
                 code = Postcondition;
@@ -120,8 +120,7 @@ let action_checks ctx (st : structure) =
                   Printf.sprintf "The action %s may make a field marked [@grows] shrink"
                     a.action;
                 related = [];
-              }
-              :: !(ctx.collected.origins);
+              };
             Ok
               [
                 R.Member.callable

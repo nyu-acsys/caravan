@@ -337,18 +337,17 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                  (List.Assoc.find ctx.given.shared.persistent inv ~equal:String.equal)
                  ~f:(fun def -> (def, "The invariant")))
           in
-          ctx.collected.origins :=
+          record_origin ctx
             {
               at = after;
               code = Fold;
               message = Printf.sprintf "The invariant %s may not hold after this step" inv;
               related = definition;
-            }
-            :: !(ctx.collected.origins);
+            };
           (* A step that performs none of the actions whose step it may be keeps the state
              as it is: its fold is at the step, with a message of its own. *)
           if no_action then
-            ctx.collected.origins :=
+            record_origin ctx
               {
                 at;
                 code = Fold;
@@ -358,8 +357,7 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                      allows; if it performs one, say so, as (*@ performs a *)"
                     inv;
                 related = definition;
-              }
-              :: !(ctx.collected.origins);
+              };
           let fold ?(witnesses = []) () =
             let l = if no_action then l else la in
             [ R.Stmt.fold ~loc:l ~witnesses (qualified_name ~loc:l inv) args ]
@@ -965,14 +963,13 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         let state values = state_of ~loc:l st (grown st values) in
         let inv = st.invariant in
         let after = { at with loc_start = at.loc_end } in
-        ctx.collected.origins :=
+        record_origin ctx
           {
             at = after;
             code = Fold;
             message = Printf.sprintf "The invariant %s may not hold after this step" inv;
             related = [];
-          }
-          :: !(ctx.collected.origins);
+          };
         let _, raven_field, _, _, _ = List.nth_exn st.fields i in
         Ok
           ([

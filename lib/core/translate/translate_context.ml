@@ -648,36 +648,276 @@ let initial_procedure () =
 
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
+(** The state of a translation, threaded explicitly: what each arm of a branch starts
+    from, what carries on from arm to arm within a procedure, the supply of fresh names,
+    the fields and primitives used, and the checks generated. *)
+module State = struct
+  type au_path = {
+    au_state : au_state;
+    au_step : Location.t;
+    au_values : R.Expr.t list;
+    au_performing : (performing * R.Expr.t option) option;
+  }
+  (** The part of an atomic update that each arm of a branch starts from. *)
+
+  type path = {
+    opened : (string * opened) list;
+    snapshots : (string * opened list) list;
+    positions : position list;
+    au : au_path option;
+  }
+  (** What each arm of a branch starts from. *)
+
+  type carried = {
+    ghost_returns : (string * string * Types.type_expr) list;
+    proof_state : (R.Expr.t * Types.type_expr) option;
+    return_covered : bool;
+    fields_of : (string * (string * R.Expr.t)) list;
+    formals : R.Expr.t list;
+    facts : R.Spec.t list;
+    invariants : (string * R.Expr.t list) list;
+    au_results : ((string * bool) list * string list) option;
+        (** The variables bound to the results of an atomic update's [compare_and_set]s
+            and reads. *)
+  }
+  (** What carries on from arm to arm within a procedure. *)
+
+  type names = {
+    used : Set.M(String).t;
+    bound : (string * string) list;
+    scope : (string * (string * Types.type_expr option)) list;
+  }
+
+  type tables = { cells : cell_field list; primitives : (string * R.Member.t) list }
+
+  type state = {
+    path : path;
+    carried : carried;
+    names : names;
+    tables : tables;
+    origins : origin list;  (** The checks generated so far, latest first. *)
+  }
+
+  type 'a t = state -> ('a, error) Result.t * state
+  (** A computation on the state: its result, and its state at the end, which on an error
+      is the state when it failed, as with mutable state. *)
+
+  let return a s = (Ok a, s)
+  let fail e s = (Error e, s)
+  let bind m ~f s = match m s with Ok a, s -> f a s | (Error _ as error), s -> (error, s)
+
+  let map m ~f s =
+    let r, s = m s in
+    (Result.map r ~f, s)
+
+  let of_result r s = (r, s)
+
+  (** [m]'s result as a value, an error included, with the state it ends in. *)
+  let attempt m s =
+    let r, s = m s in
+    (Ok r, s)
+
+  let get s = (Ok s, s)
+  let put s _ = (Ok (), s)
+  let modify f s = (Ok (), f s)
+  let gets f s = (Ok (f s), s)
+
+  module Syntax = struct
+    let ( let* ) m f = bind m ~f
+    let ( let+ ) m f = map m ~f
+  end
+
+  (** Runs each of [arms] from the path before them, the rest of the state carrying on
+      from arm to arm: their results with the path each ends in. The path is then the last
+      arm's. *)
+  let arms (arms : 'a t list) : ('a * path) list t =
+   fun s ->
+    let start = s.path in
+    let rec go s ended = function
+      | [] -> (Ok (List.rev ended), s)
+      | arm :: rest ->
+          begin match arm { s with path = start } with
+          | Ok a, s -> go s ((a, s.path) :: ended) rest
+          | (Error _ as error), s -> (error, s)
+          end
+    in
+    go s [] arms
+
+  (** The state that [ctx] holds. *)
+  let capture (ctx : context) : state =
+    let p = ctx.procedure in
+    {
+      path =
+        {
+          opened = p.opened;
+          snapshots = p.snapshots;
+          positions = p.positions;
+          au =
+            Option.map p.au ~f:(fun au ->
+                {
+                  au_state = au.state;
+                  au_step = au.step;
+                  au_values = au.values;
+                  au_performing = au.performing;
+                });
+        };
+      carried =
+        {
+          ghost_returns = p.ghost_returns;
+          proof_state = p.proof_state;
+          return_covered = p.return_covered;
+          fields_of = p.fields_of;
+          formals = p.formals;
+          facts = p.facts;
+          invariants = p.invariants;
+          au_results = Option.map p.au ~f:(fun au -> (au.cas_results, au.read_results));
+        };
+      names = { used = p.names.used; bound = p.names.bound; scope = p.names.scope };
+      tables = { cells = !(ctx.collected.refs); primitives = !(ctx.collected.primitives) };
+      origins = !(ctx.collected.origins);
+    }
+
+  (** Makes [ctx] hold the state [s]. *)
+  let restore (ctx : context) (s : state) =
+    let p = ctx.procedure in
+    p.opened <- s.path.opened;
+    p.snapshots <- s.path.snapshots;
+    p.positions <- s.path.positions;
+    Option.iter p.au ~f:(fun au ->
+        Option.iter s.path.au ~f:(fun path ->
+            au.state <- path.au_state;
+            au.step <- path.au_step;
+            au.values <- path.au_values;
+            au.performing <- path.au_performing);
+        Option.iter s.carried.au_results ~f:(fun (cas_results, read_results) ->
+            au.cas_results <- cas_results;
+            au.read_results <- read_results));
+    p.ghost_returns <- s.carried.ghost_returns;
+    p.proof_state <- s.carried.proof_state;
+    p.return_covered <- s.carried.return_covered;
+    p.fields_of <- s.carried.fields_of;
+    p.formals <- s.carried.formals;
+    p.facts <- s.carried.facts;
+    p.invariants <- s.carried.invariants;
+    p.names.used <- s.names.used;
+    p.names.bound <- s.names.bound;
+    p.names.scope <- s.names.scope;
+    ctx.collected.refs := s.tables.cells;
+    ctx.collected.primitives := s.tables.primitives;
+    ctx.collected.origins := s.origins
+
+  (** Runs [m] on the state that [ctx] holds, which then holds the state [m] ends in. *)
+  let run (ctx : context) (m : 'a t) : ('a, error) Result.t =
+    let r, s = m (capture ctx) in
+    restore ctx s;
+    r
+
+  (** Makes [ctx] hold the state [f] gives its state. *)
+  let update (ctx : context) f = restore ctx (f (capture ctx))
+
+  let with_origin origin s = { s with origins = origin :: s.origins }
+
+  (** Records a check the translation generates. *)
+  let record_origin origin = modify (with_origin origin)
+
+  open Syntax
+
+  let declare_field (given : inputs) ~at field elt =
+    let* t = of_result (Datatypes.typ given.types ~at elt) in
+    modify (fun s ->
+        if List.exists s.tables.cells ~f:(fun cell -> String.equal cell.cell_name field)
+        then s
+        else
+          let file =
+            { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname }
+          in
+          let loc = R.Loc.make file file in
+          let cell =
+            {
+              cell_name = field;
+              cell_type = elt;
+              cell_declaration =
+                Datatypes.field_member given.types ~loc
+                  (Qualified_name.of_string field).name t elt;
+            }
+          in
+          { s with tables = { s.tables with cells = s.tables.cells @ [ cell ] } })
+
+  let cell_field (given : inputs) ~at elt ~prefix ~suffix =
+    match Datatypes.cell_name ~prefix ~suffix given.types elt with
+    | None ->
+        of_result (unsupported at "A cell payload combining distinct result layouts")
+    | Some field ->
+        let* () = declare_field given ~at field elt in
+        return field
+
+  (** The field of the ref cells with contents of type [elt]. *)
+  let ref_field given ~at elt =
+    cell_field given ~at elt ~prefix:"ref_" ~suffix:"_contents"
+
+  (** The field of the atomics with contents of type [elt]. *)
+  let atomic_field given ~at elt = cell_field given ~at elt ~prefix:"atomic_" ~suffix:""
+
+  let add_primitive name proc =
+    modify (fun s ->
+        if List.Assoc.mem s.tables.primitives name ~equal:String.equal then s
+        else
+          {
+            s with
+            tables =
+              { s.tables with primitives = s.tables.primitives @ [ (name, proc ()) ] };
+          })
+
+  (** The procedure performing [op] on the atomics with contents of type [elt]. *)
+  let primitive (given : inputs) ~at elt op =
+    let* field = atomic_field given ~at elt in
+    let stem =
+      String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.'))
+    in
+    let declaration_name = Primitives.name ~field:stem op in
+    let name =
+      String.concat ~sep:"." (given.primitive_namespace @ [ declaration_name ])
+    in
+    let* typ = of_result (Datatypes.typ given.types ~at elt) in
+    let+ () =
+      add_primitive name (fun () ->
+          Primitives.proc ~declaration_name ~field ~typ
+            ~exact:(Datatypes.immediate given.types elt)
+            ~int:(Datatypes.is_int given.types elt)
+            op)
+    in
+    name
+
+  (** The ordinary read or write of a mutable field. *)
+  let ordinary_primitive (given : inputs) ~at ~field elt op =
+    let stem =
+      String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.'))
+    in
+    let declaration_name = Primitives.ordinary_name ~field:stem op in
+    let procedure =
+      String.concat ~sep:"." (given.primitive_namespace @ [ declaration_name ])
+    in
+    let* typ = of_result (Datatypes.typ given.types ~at elt) in
+    let+ () =
+      add_primitive procedure (fun () ->
+          Primitives.ordinary_proc ~declaration_name ~field ~typ
+            ~int:(Datatypes.is_int given.types elt)
+            op)
+    in
+    procedure
+
+  (** The assertion [c] checking, at [at], what [message] says may fail. *)
+  let check ~(at : Location.t) message c =
+    let+ () = record_origin { at; code = Assertion; message; related = [] } in
+    R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
+end
+
 (** Declares [field], with values of type [elt], unless it is already. *)
 let declare_field ctx ~at field elt =
-  let* t = typ ctx ~at elt in
-  if
-    not
-      (List.exists !(ctx.collected.refs) ~f:(fun cell ->
-           String.equal cell.cell_name field))
-  then begin
-    let file = { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname } in
-    let loc = R.Loc.make file file in
-    ctx.collected.refs :=
-      !(ctx.collected.refs)
-      @ [
-          {
-            cell_name = field;
-            cell_type = elt;
-            cell_declaration =
-              Datatypes.field_member ctx.given.types ~loc
-                (Qualified_name.of_string field).name t elt;
-          };
-        ]
-  end;
-  Ok ()
+  State.run ctx (State.declare_field ctx.given ~at field elt)
 
 let cell_field ctx ~at elt ~prefix ~suffix =
-  match Datatypes.cell_name ~prefix ~suffix ctx.given.types elt with
-  | None -> unsupported at "A cell payload combining distinct result layouts"
-  | Some field ->
-      let* () = declare_field ctx ~at field elt in
-      Ok field
+  State.run ctx (State.cell_field ctx.given ~at elt ~prefix ~suffix)
 
 (** The field of the ref cells with contents of type [elt]. *)
 let ref_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"ref_" ~suffix:"_contents"
@@ -686,44 +926,11 @@ let ref_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"ref_" ~suffix:"_cont
 let atomic_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"atomic_" ~suffix:""
 
 (** The procedure performing [op] on the atomics with contents of type [elt]. *)
-let primitive ctx ~at elt op =
-  let* field = atomic_field ctx ~at elt in
-  let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
-  let declaration_name = Primitives.name ~field:stem op in
-  let name =
-    String.concat ~sep:"." (ctx.given.primitive_namespace @ [ declaration_name ])
-  in
-  let* typ = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.collected.primitives) name ~equal:String.equal) then
-    ctx.collected.primitives :=
-      !(ctx.collected.primitives)
-      @ [
-          ( name,
-            Primitives.proc ~declaration_name ~field ~typ
-              ~exact:(Datatypes.immediate ctx.given.types elt)
-              ~int:(Datatypes.is_int ctx.given.types elt)
-              op );
-        ];
-  Ok name
+let primitive ctx ~at elt op = State.run ctx (State.primitive ctx.given ~at elt op)
 
 (** The ordinary read or write of a mutable field. *)
 let ordinary_primitive ctx ~at ~field elt op =
-  let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
-  let declaration_name = Primitives.ordinary_name ~field:stem op in
-  let procedure =
-    String.concat ~sep:"." (ctx.given.primitive_namespace @ [ declaration_name ])
-  in
-  let* typ = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.collected.primitives) procedure ~equal:String.equal) then
-    ctx.collected.primitives :=
-      !(ctx.collected.primitives)
-      @ [
-          ( procedure,
-            Primitives.ordinary_proc ~declaration_name ~field ~typ
-              ~int:(Datatypes.is_int ctx.given.types elt)
-              op );
-        ];
-  Ok procedure
+  State.run ctx (State.ordinary_primitive ctx.given ~at ~field elt op)
 
 (** The Raven field named [label] of the values of type [t] that are references; an
     atomic's contents have the empty label, as in [own a v]. *)
@@ -838,10 +1045,12 @@ let field_of_label ctx ~at (label : Data_types.label_description) =
       | None -> Ok None
       end
 
+(** Records a check the translation generates. *)
+let record_origin ctx origin = State.update ctx (State.with_origin origin)
+
 (** The assertion [c] checking, at [at], what [message] says may fail. *)
 let check ctx ~(at : Location.t) message c =
-  ctx.collected.origins :=
-    { at; code = Assertion; message; related = [] } :: !(ctx.collected.origins);
+  record_origin ctx { at; code = Assertion; message; related = [] };
   R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
 (** The check that the value [v] of an [int] operation, at [at], does not overflow. *)

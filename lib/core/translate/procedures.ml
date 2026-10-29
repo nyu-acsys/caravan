@@ -596,7 +596,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     in
     let* unfolds = each pres ~at unfold (opened values) in
     let* folds = each posts ~at (with_views ctx fold) (opened ~value values) in
-    ctx.collected.origins :=
+    record_origin ctx
       {
         at;
         code = Commit;
@@ -605,8 +605,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
            function";
         related =
           List.map posts ~f:(fun (t : S.term) -> (t.term_loc, "The atomic postcondition"));
-      }
-      :: !(ctx.collected.origins);
+      };
     Ok
       (List.concat_map decls ~f:fst @ [ opening ] @ unfolds @ folds
       @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ])
@@ -660,7 +659,16 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
           "The atomic postcondition may not hold after this step, which linearizes the \
            function"
         in
-        ctx.collected.origins :=
+        record_origin ctx
+          {
+            at;
+            code = Commit;
+            message;
+            related =
+              List.map posts ~f:(fun (t : S.term) ->
+                  (t.term_loc, "The atomic postcondition"));
+          };
+        record_origin ctx
           {
             at;
             code = Fold;
@@ -668,16 +676,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
             related =
               List.map posts ~f:(fun (t : S.term) ->
                   (t.term_loc, "This part of the atomic postcondition may not hold"));
-          }
-          :: {
-               at;
-               code = Commit;
-               message;
-               related =
-                 List.map posts ~f:(fun (t : S.term) ->
-                     (t.term_loc, "The atomic postcondition"));
-             }
-          :: !(ctx.collected.origins);
+          };
         let* folds =
           match au.performing with
           | Some (a, _) ->
@@ -863,14 +862,13 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                     let index_type =
                       R.Type.map ~loc:l (R.Type.ref ~loc:l) (R.Type.int ~loc:l)
                     in
-                    ctx.collected.origins :=
+                    record_origin ctx
                       {
                         at = term.term_loc;
                         code = Precondition;
                         message = "The cells of this indexed field may not be distinct";
                         related = [];
-                      }
-                      :: !(ctx.collected.origins);
+                      };
                     Ok
                       ( R.Stmt.local ~loc:l ~ghost:true ~typ:index_type
                           ~init:
@@ -1261,7 +1259,7 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
           (* Reported at the end of the function. *)
           let at = { f.loc with loc_start = f.loc.loc_end } in
           List.iter established ~f:(fun (inv, _) ->
-              ctx.collected.origins :=
+              record_origin ctx
                 {
                   at;
                   code = Fold;
@@ -1273,8 +1271,7 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
                       (Option.map
                          (List.Assoc.find ctx.given.shared.persistent inv
                             ~equal:String.equal) ~f:(fun def -> (def, "The invariant")));
-                }
-                :: !(ctx.collected.origins));
+                });
           let establish initial_env initial =
             let* folds =
               all established ~f:(fun (inv, args) ->
