@@ -509,9 +509,15 @@ type predicate_body = {
   project_type : Types.type_expr -> Types.type_expr;
 }
 
+type cell_field = {
+  cell_name : string;
+  cell_type : Types.type_expr;
+  cell_declaration : R.Member.t;
+}
+
 type context = {
   types : Datatypes.t list;
-  refs : (string * R.Member.t) list ref;
+  refs : cell_field list ref;
       (** The fields of the ref cells and atomics used so far, by their names, with their
           declarations. *)
   primitives : (string * R.Member.t) list ref;
@@ -591,37 +597,49 @@ let typ ctx ~at t = Datatypes.typ ctx.types ~at t
 (** Declares [field], with values of type [elt], unless it is already. *)
 let declare_field ctx ~at field elt =
   let* t = typ ctx ~at elt in
-  if not (List.Assoc.mem !(ctx.refs) field ~equal:String.equal) then begin
+  if not (List.exists !(ctx.refs) ~f:(fun cell -> String.equal cell.cell_name field)) then begin
     let file = { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname } in
     let loc = R.Loc.make file file in
     ctx.refs :=
-      !(ctx.refs) @ [ (field, Datatypes.field_member ctx.types ~loc field t elt) ]
+      !(ctx.refs)
+      @ [
+          {
+            cell_name = field;
+            cell_type = elt;
+            cell_declaration =
+              Datatypes.field_member ctx.types ~loc (Qualified_name.of_string field).name
+                t elt;
+          };
+        ]
   end;
   Ok ()
 
+let cell_field ctx ~at elt ~prefix ~suffix =
+  match Datatypes.cell_name ~prefix ~suffix ctx.types elt with
+  | None -> unsupported at "A cell payload combining distinct result layouts"
+  | Some field ->
+      let* () = declare_field ctx ~at field elt in
+      Ok field
+
 (** The field of the ref cells with contents of type [elt]. *)
-let ref_field ctx ~at elt =
-  let field = "ref_" ^ Datatypes.tag ctx.types elt ^ "_contents" in
-  let* () = declare_field ctx ~at field elt in
-  Ok field
+let ref_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"ref_" ~suffix:"_contents"
 
 (** The field of the atomics with contents of type [elt]. *)
-let atomic_field ctx ~at elt =
-  let field = "atomic_" ^ Datatypes.tag ctx.types elt in
-  let* () = declare_field ctx ~at field elt in
-  Ok field
+let atomic_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"atomic_" ~suffix:""
 
 (** The procedure performing [op] on the atomics with contents of type [elt]. *)
 let primitive ctx ~at elt op =
   let* field = atomic_field ctx ~at elt in
-  let name = Primitives.name ~field op in
+  let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
+  let declaration_name = Primitives.name ~field:stem op in
+  let name = String.concat ~sep:"." (ctx.primitive_namespace @ [ declaration_name ]) in
   let* typ = typ ctx ~at elt in
   if not (List.Assoc.mem !(ctx.primitives) name ~equal:String.equal) then
     ctx.primitives :=
       !(ctx.primitives)
       @ [
           ( name,
-            Primitives.proc ~field ~typ
+            Primitives.proc ~declaration_name ~field ~typ
               ~exact:(Datatypes.immediate ctx.types elt)
               ~int:(Datatypes.is_int ctx.types elt)
               op );
@@ -3508,9 +3526,11 @@ let anchor (types : Datatypes.t list) (t : Types.type_expr) :
   let itself ~loc:_ e = e in
   match Datatypes.desc types t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p ->
-      Some ("atomic_" ^ Datatypes.tag types elt, itself)
+      Option.map (Datatypes.cell_name ~prefix:"atomic_" ~suffix:"" types elt)
+        ~f:(fun field -> (field, itself))
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
-      Some ("ref_" ^ Datatypes.tag types elt ^ "_contents", itself)
+      Option.map (Datatypes.cell_name ~prefix:"ref_" ~suffix:"_contents" types elt)
+        ~f:(fun field -> (field, itself))
   | Tconstr (p, [], _) ->
       begin match Datatypes.find types p with
       | Some { heap = Some (f :: _); _ } -> Some (f.raven_field, itself)
@@ -3518,9 +3538,10 @@ let anchor (types : Datatypes.t list) (t : Types.type_expr) :
           List.find_map (List.zip_exn fields args) ~f:(fun (label, a) ->
               match Datatypes.desc types a with
               | Tconstr (q, [ elt ], _) when Datatypes.is_atomic q ->
-                  Some
-                    ( "atomic_" ^ Datatypes.tag types elt,
-                      fun ~loc e -> R.Expr.field ~loc e (qualified_name ~loc label) )
+                  Option.map (Datatypes.cell_name ~prefix:"atomic_" ~suffix:"" types elt)
+                    ~f:(fun field ->
+                      ( field,
+                        fun ~loc e -> R.Expr.field ~loc e (qualified_name ~loc label) ))
               | _ -> None)
       | _ -> None
       end
@@ -5138,7 +5159,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     let* typ = typ ctx ~at e.exp_type in
     let x = Names.fresh ctx.names "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
-    let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) (atomic :: args)) in
+    let init =
+      R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l f) (atomic :: args))
+    in
     let* how = how default in
     let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
     let* step =
@@ -10065,31 +10088,30 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
         in
         let same_signature_sites application (function_ : func) =
           List.is_empty function_.signature_sites
-          || List.exists group.representative.members ~f:(fun (name, representative_id) ->
-              Option.exists
-                (List.Assoc.find application.Generic_modules.source.members name
-                   ~equal:String.equal)
-                ~f:(Ident.same function_.id)
-              && Option.exists
-                   (List.find functions ~f:(fun representative ->
-                        Ident.same representative.id representative_id))
-                   ~f:(fun representative ->
-                     List.equal
-                       (fun (left : Module_inventory.signature_value)
-                            (right : Module_inventory.signature_value) ->
-                         Poly.equal left.declaration.val_loc right.declaration.val_loc)
-                       function_.signature_sites representative.signature_sites))
+          || List.exists group.representative.body_members
+               ~f:(fun (name, representative_id) ->
+                 Option.exists
+                   (List.Assoc.find application.Generic_modules.source.body_members name
+                      ~equal:String.equal)
+                   ~f:(Ident.same function_.id)
+                 && Option.exists
+                      (List.find functions ~f:(fun representative ->
+                           Ident.same representative.id representative_id))
+                      ~f:(fun representative ->
+                        List.equal
+                          (fun (left : Module_inventory.signature_value)
+                               (right : Module_inventory.signature_value) ->
+                            Poly.equal left.declaration.val_loc right.declaration.val_loc)
+                          function_.signature_sites representative.signature_sites))
         in
         let supported_functions =
           List.for_all group.applications ~f:(fun application ->
-              List.for_all application.source.members ~f:(fun (_, id) ->
+              List.for_all application.source.body_members ~f:(fun (_, id) ->
                   Option.exists
                     (List.find functions ~f:(fun f -> Ident.same f.id id))
                     ~f:(fun f ->
-                      List.is_empty f.captured && List.is_empty f.prefix
-                      && same_signature_sites application f
-                      && (Option.is_some group.world || not (field_contract f.contract))
-                      && Option.is_none f.role)))
+                      same_signature_sites application f
+                      && (Option.is_some group.world || not (field_contract f.contract)))))
         in
         let* parameter_contracts =
           all
@@ -10097,11 +10119,12 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
                  instance.Module_inventory.argument.expected.signature_values))
             ~f:(fun (_, signature) -> signature_contract signature)
         in
-        let body =
-          match group.representative.template.mod_desc with
-          | Tmod_functor (_, body) -> body.mod_loc
-          | _ -> group.representative.template.mod_loc
+        let rec body_location (expression : Typedtree.module_expr) =
+          match expression.mod_desc with
+          | Tmod_functor (_, body) | Tmod_constraint (body, _, _, _) -> body_location body
+          | _ -> expression.mod_loc
         in
+        let body = body_location group.representative.template in
         let explicit_proofs =
           List.exists annotations ~f:(fun annotation ->
               let at = annotation.Annotation.loc in
@@ -10109,7 +10132,8 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
               && at.loc_end.pos_cnum <= body.loc_end.pos_cnum
               &&
               match Annotation.kind annotation with
-              | Contract | Manual | Scope | Initially | Initializes | Linearization ->
+              | Contract | Manual | Scope | Ghost | Returns | Proof | Initially
+              | Initializes | Linearization ->
                   false
               | _ -> true)
         in
@@ -11119,18 +11143,20 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         && Option.exists (Generic_modules.member generics f.id)
              ~f:(fun (group, _, stem) ->
                List.exists group.applications ~f:(fun application ->
-                   List.exists application.source.members ~f:(fun (source, id) ->
+                   List.exists application.source.body_members ~f:(fun (source, id) ->
                        String.equal
-                         (List.Assoc.find_exn group.members source ~equal:String.equal)
+                         (List.Assoc.find_exn group.body_members source
+                            ~equal:String.equal)
                          stem
                        && inferred id))))
   in
   let is_pure (f : func) = List.exists pure ~f:(fun g -> Ident.same g.id f.id) in
   let generic_procedures =
     List.concat_map generics ~f:(fun group ->
-        List.map group.members ~f:(fun (source, stem) ->
+        List.map group.body_members ~f:(fun (source, stem) ->
             let id =
-              List.Assoc.find_exn group.representative.members source ~equal:String.equal
+              List.Assoc.find_exn group.representative.body_members source
+                ~equal:String.equal
             in
             let f = List.find_exn funcs ~f:(fun f -> Ident.same f.id id) in
             (group.name ^ "." ^ stem, if is_pure f then fresh (stem ^ "_impl") else stem)))
@@ -11253,16 +11279,16 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           | _ -> false)
     in
     let* plan = Generic_proofs.owner generic_proofs (Some binding.entry.scope) in
-    let* member =
+    let* operation =
       match binding.kind with
-      | Atomic original -> Source.scoped_value_name plan.scope original.au_operation_path
+      | Atomic original -> Some original.au_operation_path
       | _ -> None
     in
     let* application =
       List.find plan.group.applications ~f:(fun application ->
           Path.same application.source.identity identity)
     in
-    let* id = List.Assoc.find application.source.members member ~equal:String.equal in
+    let* id = Generic_proofs.function_id plan ~instance:application.source operation in
     List.find funcs ~f:(fun f -> Ident.same f.id id)
   in
   let* atomic_operations =
@@ -11275,12 +11301,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                      List.mem f.paths au.au_operation_path ~equal:Path.same))
                 (applied_atomic_operation au)
           | Some plan ->
-              Option.bind (Source.scoped_value_name plan.scope au.au_operation_path)
-                ~f:(fun member ->
-                  Option.bind
-                    (List.Assoc.find plan.group.representative.members member
-                       ~equal:String.equal) ~f:(fun id ->
-                      List.find funcs ~f:(fun f -> Ident.same f.id id)))
+              Option.bind (Generic_proofs.function_id plan au.au_operation_path)
+                ~f:(fun id -> List.find funcs ~f:(fun f -> Ident.same f.id id))
         in
         match operation with
         | None ->
@@ -11610,6 +11632,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
           || Option.is_some f.role)
           (proc_name f, (f.prefix_count, f.captured, f.role)))
   in
+  let lifted = with_body_names lifted in
   let origins = ref [] in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
@@ -12740,10 +12763,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         | None ->
             begin match
               List.find_map generic_proofs ~f:(fun plan ->
-                  Option.bind (Source.scoped_value_name plan.Generic_proofs.scope path)
-                    ~f:(fun member ->
-                      List.Assoc.find plan.group.representative.members member
-                        ~equal:String.equal))
+                  Generic_proofs.function_id plan path)
             with
             | Some id -> Ok id
             | None ->
@@ -13213,12 +13233,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         in
         let member_id id =
           Option.value_map
-            (List.find plan.group.representative.members ~f:(fun (_, original) ->
+            (List.find plan.group.representative.body_members ~f:(fun (_, original) ->
                  Ident.same original id))
             ~default:id
             ~f:(fun (name, _) ->
               Option.value
-                (List.Assoc.find instance.source.members name ~equal:String.equal)
+                (List.Assoc.find instance.source.body_members name ~equal:String.equal)
                 ~default:id)
         in
         let application_substitution =
@@ -14598,7 +14618,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         let representatives =
           List.filter funcs ~f:(fun f ->
               List.exists groups ~f:(fun group ->
-                  List.exists group.representative.members ~f:(fun (_, id) ->
+                  List.exists group.representative.body_members ~f:(fun (_, id) ->
                       Ident.same id f.id)))
         in
         let map_functions ?(only_pure = false) initial target =
@@ -15100,9 +15120,74 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                   let leaf = (Qualified_name.of_string field.raven_field).name in
                   Ok (Datatypes.field_member environment ~loc:l leaf typ field.typ))
             in
+            let projection =
+              Option.value_map proof_plan ~default:Subst.identity
+                ~f:Generic_proofs.projection
+            in
+            let field_contexts =
+              (String.split group.name ~on:'.' @ [ "Layout" ], projection)
+              :: List.map group.applications ~f:(fun application ->
+                  let substitution =
+                    List.fold application.source.declarations ~init:projection
+                      ~f:(fun substitution declaration ->
+                        match
+                          Generic_proofs.matching_type declaration
+                            group.representative.declarations
+                        with
+                        | Some target
+                          when not (Ident.same declaration.typ_id target.typ_id) ->
+                            Subst.add_type declaration.typ_id (Path.Pident target.typ_id)
+                              substitution
+                        | Some _ | None -> substitution)
+                  in
+                  ([ application.layout ], substitution))
+            in
+            let cell_environment =
+              List.map layout_types ~f:(fun data ->
+                  let aliases =
+                    List.concat_map types ~f:(fun candidate ->
+                        let same_namespace =
+                          Option.exists candidate.Datatypes.cell_namespace
+                            ~f:(fun owner ->
+                              List.Assoc.mem field_contexts owner
+                                ~equal:(List.equal String.equal))
+                        in
+                        let same_name =
+                          Option.exists candidate.module_path ~f:(fun path ->
+                              Option.equal String.equal (List.last path)
+                                (Some data.Datatypes.module_name))
+                        in
+                        if same_namespace && same_name then
+                          candidate.paths
+                          @ Option.to_list
+                              (Option.map candidate.id ~f:(fun id -> Path.Pident id))
+                        else [])
+                  in
+                  Datatypes.with_paths data aliases)
+              @ environment
+            in
+            let cell_fields =
+              List.filter_map !refs ~f:(fun cell ->
+                  let name = Qualified_name.of_string cell.cell_name in
+                  Option.map
+                    (List.Assoc.find field_contexts name.path
+                       ~equal:(List.equal String.equal))
+                    ~f:(fun substitution ->
+                      (name.name, Subst.type_expr substitution cell.cell_type)))
+              |> List.dedup_and_sort ~compare:(fun (left, _) (right, _) ->
+                  String.compare left right)
+            in
+            let* cell_fields =
+              all cell_fields ~f:(fun (field, elt) ->
+                  let* typ =
+                    Datatypes.typ cell_environment
+                      ~at:group.representative.template.mod_loc elt
+                  in
+                  Ok (Datatypes.field_member cell_environment ~loc:l field typ elt))
+            in
             let shape =
               R.Member.module_ ~loc:l ~interface:true (ident ~loc:l "Shape")
-                (data_members @ fields)
+                (data_members @ fields @ cell_fields)
             in
             let factory =
               R.Member.unit_factory ~loc:l
@@ -15301,7 +15386,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
-  let ref_fields = List.map !refs ~f:snd in
+  let ref_fields =
+    List.filter_map !refs ~f:(fun cell ->
+        Option.some_if
+          (List.is_empty (Qualified_name.of_string cell.cell_name).path)
+          cell.cell_declaration)
+  in
   let root_members =
     emit_context_members Module_context.Flat ~at:start ~representations:[]
       ~native_resources:deferred_native_resource_members ~applications:native_modules

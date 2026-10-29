@@ -107,10 +107,10 @@
   Verification successful.
 
   $ caravan --shh --emit-rav generic_shadowed.ml > shadowed.rav
-  $ grep -c '^proc first_read' shadowed.rav
-  2
-  $ grep -c '^proc second_read' shadowed.rav
-  2
+  $ grep -c '^[[:space:]]*proc method_read(' shadowed.rav
+  1
+  $ grep -c '^[[:space:]]*proc method_read_1(' shadowed.rav
+  1
   $ raven --shh shadowed.rav
   Verification successful.
 

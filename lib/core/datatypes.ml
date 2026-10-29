@@ -30,6 +30,7 @@ type t = {
   paths : Path.t list;  (** Other paths naming the same implementation type. *)
   module_name : string;
   module_path : string list option;
+  cell_namespace : string list option;
   ctors : ctor list;
   heap : field list option;  (** The fields of a record type with a mutable field. *)
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
@@ -60,6 +61,7 @@ let list =
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
+    cell_namespace = None;
     library = None;
     at = Location.none;
   }
@@ -81,6 +83,7 @@ let option =
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
+    cell_namespace = None;
     library = None;
     at = Location.none;
   }
@@ -117,6 +120,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
+          cell_namespace = None;
           library = None;
           at;
         }
@@ -161,6 +165,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
+          cell_namespace = None;
           library = None;
           at;
         }
@@ -179,6 +184,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
+          cell_namespace = None;
           library = None;
           at;
         }
@@ -227,6 +233,7 @@ let library_type ~library ~library_id ~at name =
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
+    cell_namespace = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
   }
@@ -274,6 +281,7 @@ let collection id kind =
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
+    cell_namespace = None;
     library = None;
     at = Location.none;
   }
@@ -355,6 +363,29 @@ let is_heap_ref (types : t list) (t : Types.type_expr) =
   | Tconstr (p, [], _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
   | _ -> false
 
+(** Owners of generic data layouts retained in a value's Raven type. *)
+let cell_namespaces (data : t list) (typ : Types.type_expr) =
+  let rec collect typ =
+    match desc data typ with
+    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
+    | Tconstr (path, [ element ], _)
+      when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+        collect element
+    | Tconstr (path, arguments, _) when Option.is_some (collection_kind data path) ->
+        List.concat_map arguments ~f:collect
+    | Tconstr (path, [], _) ->
+        begin match find data path with
+        | Some { heap = None; cell_namespace = Some owner; _ } -> [ owner ]
+        | Some _ | None -> []
+        end
+    | Ttuple components ->
+        List.concat_map components ~f:(fun (_, element) -> collect element)
+    | _ -> []
+  in
+  List.fold (collect typ) ~init:[] ~f:(fun owners owner ->
+      if List.mem owners owner ~equal:(List.equal String.equal) then owners
+      else owners @ [ owner ])
+
 (** The data type and constructor named [ocaml] in a contract: the latest such
     constructor, as in OCaml, where those of lists and options come first. *)
 let find_ctor (types : t list) (ocaml : string) =
@@ -431,30 +462,50 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
 
 (** A name for the type [t], unique among those of [types], for the names of the fields of
     ref cells, as [IntList] for [int list]. *)
-let rec tag (types : t list) (t : Types.type_expr) : string =
+let rec tag ?(qualified = false) (types : t list) (t : Types.type_expr) : string =
   match desc types t with
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> "Int"
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> "Bool"
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> "Unit"
   | Tconstr (p, [], _) when is_ghost p -> "Ghost"
   | Tconstr (p, [], _) when is_permission p -> "Permission"
-  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list -> tag types elt ^ "List"
+  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list ->
+      tag ~qualified types elt ^ "List"
   | Tconstr (p, [ elt ], _) when Path.same p Predef.path_option ->
-      tag types elt ^ "Option"
-  | Tconstr (p, [ elt ], _) when is_ref p -> tag types elt ^ "Ref"
-  | Tconstr (p, [ elt ], _) when is_atomic p -> tag types elt ^ "Atomic"
+      tag ~qualified types elt ^ "Option"
+  | Tconstr (p, [ elt ], _) when is_ref p -> tag ~qualified types elt ^ "Ref"
+  | Tconstr (p, [ elt ], _) when is_atomic p -> tag ~qualified types elt ^ "Atomic"
   | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
-      tag types elt ^ "Seq"
-  | Tconstr (p, [ elt ], _) when is_collection types p FinSet -> tag types elt ^ "FinSet"
-  | Tconstr (p, [ elt ], _) when is_collection types p Set -> tag types elt ^ "Set"
+      tag ~qualified types elt ^ "Seq"
+  | Tconstr (p, [ elt ], _) when is_collection types p FinSet ->
+      tag ~qualified types elt ^ "FinSet"
+  | Tconstr (p, [ elt ], _) when is_collection types p Set ->
+      tag ~qualified types elt ^ "Set"
   | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
-      tag types key ^ "To" ^ tag types value ^ "Map"
+      tag ~qualified types key ^ "To" ^ tag ~qualified types value ^ "Map"
   | Tconstr (p, [], _) when Option.is_some (find types p) ->
-      (Option.value_exn (find types p)).module_name
+      let data = Option.value_exn (find types p) in
+      begin match (data.cell_namespace, data.module_path) with
+      | Some owner, Some path ->
+          let leaf = Option.value (List.last path) ~default:data.module_name in
+          if qualified then String.concat ~sep:"_" (owner @ [ leaf ]) else leaf
+      | _ -> data.module_name
+      end
   | Ttuple components ->
-      String.concat (List.map components ~f:(fun (_, t) -> tag types t)) ^ "Tuple"
-  | Tpoly (t, []) -> tag types t
+      String.concat (List.map components ~f:(fun (_, t) -> tag ~qualified types t))
+      ^ "Tuple"
+  | Tpoly (t, []) -> tag ~qualified types t
   | _ -> "Other"
+
+let cell_name ~prefix ~suffix data typ =
+  let leaf = prefix ^ tag data typ ^ suffix in
+  match cell_namespaces data typ with
+  | [] -> Some leaf
+  | [ owner ] -> Some (String.concat ~sep:"." (owner @ [ leaf ]))
+  | owners when List.for_all owners ~f:(fun owner -> List.length owner = 1) ->
+      (* Concrete layout selections are top-level modules. *)
+      Some (prefix ^ tag ~qualified:true data typ ^ suffix)
+  | _ -> None
 
 let rec is_int types t =
   match Types.get_desc t with

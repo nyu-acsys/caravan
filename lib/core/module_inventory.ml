@@ -83,9 +83,28 @@ type specialization = {
   parameter : Ident.t;
   argument : checked_binding;
   members : (string * Ident.t) list;
+  body_members : (string * Ident.t) list;
   identity : Path.t;
   declarations : Typedtree.type_declaration list;
 }
+
+let function_members (body : Typedtree.structure) =
+  let found = ref [] in
+  let value_binding iterator (binding : Typedtree.value_binding) =
+    (match (binding.vb_pat.pat_desc, binding.vb_expr.exp_desc) with
+    | Tpat_var (id, _, _), Texp_function _ ->
+        let at = binding.vb_loc in
+        let key =
+          Printf.sprintf "%s:%d:%d" (Ident.name id) at.loc_start.pos_cnum
+            at.loc_end.pos_cnum
+        in
+        found := (key, id) :: !found
+    | _ -> ());
+    Tast_iterator.default_iterator.value_binding iterator binding
+  in
+  let iterator = { Tast_iterator.default_iterator with value_binding } in
+  iterator.structure iterator body;
+  List.rev !found
 
 let proof_scope_matches (application : specialization) (scope : Proof_scopes.scope) =
   match application.context with
@@ -1098,7 +1117,13 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   Result.map (Datatypes.of_declaration declaration) ~f:(fun _ -> ()));
             Tast_iterator.default_iterator.type_declaration iterator declaration
           in
-          let iterator = { Tast_iterator.default_iterator with type_declaration } in
+          let iterator =
+            {
+              Tast_iterator.default_iterator with
+              type_declaration;
+              module_type = (fun _ _ -> ());
+            }
+          in
           iterator.module_expr iterator body;
           !valid
         in
@@ -1318,14 +1343,15 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       publish_type_paths application_identity view;
       expansions := (expression, body) :: !expansions;
       Option.iter argument_binding ~f:(fun (parameter, binding) ->
-          let declarations =
+          let declarations, body_members =
             match direct_body body with
             | Some body ->
-                List.concat_map body.str_items ~f:(fun item ->
-                    match item.Typedtree.str_desc with
-                    | Tstr_type (_, declarations) -> declarations
-                    | _ -> [])
-            | None -> []
+                ( List.concat_map body.str_items ~f:(fun item ->
+                      match item.Typedtree.str_desc with
+                      | Tstr_type (_, declarations) -> declarations
+                      | _ -> []),
+                  function_members body )
+            | None -> ([], [])
           in
           specializations :=
             ( definition.template,
@@ -1334,6 +1360,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               view.values,
               application_identity,
               declarations,
+              body_members,
               instances,
               definition.origin,
               Functor_context.find_at source.proof_applications expression.mod_loc )
@@ -1568,6 +1595,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 values,
                 identity,
                 declarations,
+                body_members,
                 instances,
                 origin,
                 context )
@@ -1583,6 +1611,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               argument = !argument;
               identity;
               declarations;
+              body_members;
               members =
                 List.filter_map values ~f:(fun (member, value) ->
                     match !value.binding.vb_pat.pat_desc with

@@ -19,6 +19,7 @@ type t = {
   resources : (string * string) list;
   operations : (string * string) list;
   members : (string * string) list;
+  body_members : (string * string) list;
   world : string option;
   captures : t list;
 }
@@ -78,11 +79,12 @@ let eligible (source : Module_inventory.specialization) =
               | _ -> [])
         in
         let roots = List.map bindings ~f:(fun binding -> binding.Typedtree.vb_expr) in
-        let names =
-          List.filter_map bindings ~f:(fun binding ->
-              match binding.Typedtree.vb_pat.pat_desc with
-              | Tpat_var (id, _, _) -> Some (Ident.name id)
-              | _ -> None)
+        let parameters =
+          List.map source.parameters ~f:(fun stage -> stage.Module_inventory.parameter)
+        in
+        let closed_heap_value_type =
+          Closed_layout.is_closed ~environment:body.str_final_env ~parameters
+            ~at:source.template.mod_loc
         in
         let expanded_type t =
           let expanded =
@@ -91,23 +93,16 @@ let eligible (source : Module_inventory.specialization) =
           in
           Result.map expanded ~f:Types.get_desc
         in
-        let rec closed_heap_value_type t =
-          match expanded_type t with
-          | Ok (Tconstr (path, [], _)) ->
-              Path.same path Predef.path_int
-              || Path.same path Predef.path_bool
-              || Path.same path Predef.path_unit
-          | Ok (Tconstr (path, [ element ], _))
-            when Path.same path Predef.path_list
-                 || Path.same path Predef.path_option
-                 || Datatypes.is_ref path || Datatypes.is_atomic path ->
-              closed_heap_value_type element
-          | Ok (Ttuple elements) ->
-              List.for_all elements ~f:(fun (_, element) ->
-                  closed_heap_value_type element)
-          | Ok (Tpoly (element, [])) -> closed_heap_value_type element
-          | Ok _ | Error _ -> false
+        let function_roots = ref roots in
+        let value_binding iterator (binding : Typedtree.value_binding) =
+          (match (binding.vb_pat.pat_desc, binding.vb_expr.exp_desc) with
+          | Tpat_var _, Texp_function _ ->
+              function_roots := binding.vb_expr :: !function_roots
+          | _ -> ());
+          Tast_iterator.default_iterator.value_binding iterator binding
         in
+        let functions = { Tast_iterator.default_iterator with value_binding } in
+        functions.structure functions body;
         let rec heap_type t =
           match expanded_type t with
           | Error _ -> true
@@ -125,7 +120,8 @@ let eligible (source : Module_inventory.specialization) =
         let expr (iterator : Tast_iterator.iterator) (expression : Typedtree.expression) =
           if heap_type expression.exp_type then heap_access := true;
           begin match expression.exp_desc with
-          | Texp_function _ when not (List.exists roots ~f:(phys_equal expression)) ->
+          | Texp_function _
+            when not (List.exists !function_roots ~f:(phys_equal expression)) ->
               heap_access := true
           | _ -> ()
           end;
@@ -145,7 +141,6 @@ let eligible (source : Module_inventory.specialization) =
         let iterator = { Tast_iterator.default_iterator with expr } in
         iterator.structure iterator body;
         (not !heap_access)
-        && (not (List.contains_dup names ~compare:String.compare))
         && List.for_all body.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
             | Tstr_value _ | Tstr_attribute _ -> true
@@ -212,7 +207,22 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
           Option.value_map world ~default:leaf ~f:(fun world -> world ^ "." ^ leaf)
         in
         let name = qualify (fresh ("Generic_" ^ prefix)) in
-        let member_names = members source.members "method" in
+        let body_member_names =
+          List.map source.body_members ~f:(fun (key, id) ->
+              let stem =
+                String.map (Ident.name id) ~f:(fun c ->
+                    if Char.is_alphanum c || Char.equal c '_' then c else '_')
+              in
+              (key, fresh ("method_" ^ stem)))
+        in
+        let member_names =
+          List.map source.members ~f:(fun (name, id) ->
+              let key, _ =
+                List.find_exn source.body_members ~f:(fun (_, candidate) ->
+                    Ident.same id candidate)
+              in
+              (name, List.Assoc.find_exn body_member_names key ~equal:String.equal))
+        in
         let capture (stage : Module_inventory.parameter_instance) index =
           let stage_source = stage_source source stage in
           {
@@ -225,6 +235,7 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
             resources = members stage.argument.expected.signature_resources "resource";
             operations = members stage.argument.expected.signature_values "operation";
             members = member_names;
+            body_members = body_member_names;
             world;
             captures = [];
           }
@@ -245,6 +256,7 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
               resources = members source.argument.expected.signature_resources "resource";
               operations = members source.argument.expected.signature_values "operation";
               members = member_names;
+              body_members = body_member_names;
               world;
               captures;
             };
@@ -269,10 +281,12 @@ let member groups id =
   List.find_map groups ~f:(fun group ->
       List.find_map group.applications ~f:(fun application ->
           Option.map
-            (List.find application.source.members ~f:(fun (_, candidate) ->
+            (List.find application.source.body_members ~f:(fun (_, candidate) ->
                  Ident.same candidate id))
             ~f:(fun (source, _) ->
-              let stem = List.Assoc.find_exn group.members source ~equal:String.equal in
+              let stem =
+                List.Assoc.find_exn group.body_members source ~equal:String.equal
+              in
               (group, application, stem))))
 
 let types group ~owner =

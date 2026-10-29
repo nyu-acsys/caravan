@@ -78,6 +78,7 @@ let model_descriptor data ~owner =
   {
     data with
     module_path = Some path;
+    cell_namespace = Some owner;
     backend_type = Some Qualified_name.{ path; name = "T" };
   }
 
@@ -330,6 +331,32 @@ let implementation_projection (application : Module_inventory.specialization) pa
         (Path.Pdot (path, declaration.typ_name.txt))
         substitution)
 
+let function_id plan ?(instance = plan.group.Generic_modules.representative) path =
+  let originals = Module_inventory.function_members plan.scope.structure in
+  let original =
+    match path with
+    | Path.Pident id ->
+        List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)
+    | _ ->
+        Option.bind (Source.scoped_value_name plan.scope path) ~f:(fun name ->
+            let bindings =
+              List.concat_map plan.scope.structure.str_items ~f:(fun item ->
+                  match item.Typedtree.str_desc with
+                  | Tstr_value (_, bindings) -> bindings
+                  | _ -> [])
+            in
+            let id =
+              List.find_map (List.rev bindings) ~f:(fun binding ->
+                  match binding.Typedtree.vb_pat.pat_desc with
+                  | Tpat_var (id, _, _) when String.equal name (Ident.name id) -> Some id
+                  | _ -> None)
+            in
+            Option.bind id ~f:(fun id ->
+                List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)))
+  in
+  Option.bind original ~f:(fun (key, _) ->
+      List.Assoc.find instance.body_members key ~equal:String.equal)
+
 let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
     (proofs : Proof_bindings.t) plans =
   let build plan instance =
@@ -339,7 +366,7 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
         ~f:(fun (value : Module_inventory.value) ->
           match value.binding.Typedtree.vb_pat.pat_desc with
           | Tpat_var (id, _, _) ->
-              List.exists application_source.members ~f:(fun (_, member) ->
+              List.exists application_source.body_members ~f:(fun (_, member) ->
                   Ident.same id member)
           | _ -> false)
     in

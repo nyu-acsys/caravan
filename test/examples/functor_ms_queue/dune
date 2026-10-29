@@ -1,0 +1,98 @@
+(rule
+ (target history_queue.ml)
+ (deps
+  ../../saturn/michael_scott_queue/michael_scott_queue.ml
+  ../../saturn/michael_scott_queue/michael_scott_queue.mli
+  ../module_ms_queue/client.ml
+  clients.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Make () : sig\n")
+    (cat ../../saturn/michael_scott_queue/michael_scott_queue.mli)
+    (echo "\nend = struct\n")
+    (cat ../../saturn/michael_scott_queue/michael_scott_queue.ml)
+    (echo
+     "\nend\n\nmodule First = Make ()\nmodule Second = Make ()\nmodule Alias = First\n\n")
+    (cat ../module_ms_queue/client.ml)
+    (echo "\n")
+    (cat clients.ml)))))
+
+(rule
+ (target history_queue.proof)
+ (deps ../../saturn/michael_scott_queue/michael_scott_queue.proof)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Make () = struct\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(rule
+ (target history_api.mli)
+ (deps ../../saturn/michael_scott_queue/michael_scott_queue.mli)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Queue : sig\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(rule
+ (target segment_queue.ml)
+ (deps
+  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
+  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
+  ../module_ms_queue/client.ml
+  clients.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Make () : sig\n")
+    (cat ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli)
+    (echo "\nend = struct\n")
+    (cat ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml)
+    (echo
+     "\nend\n\nmodule First = Make ()\nmodule Second = Make ()\nmodule Alias = First\n\n")
+    (cat ../module_ms_queue/client.ml)
+    (echo "\n")
+    (cat clients.ml)))))
+
+(rule
+ (target segment_queue.proof)
+ (deps ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.proof)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Make () = struct\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(rule
+ (target segment_api.mli)
+ (deps ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Queue : sig\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  history_queue.ml
+  history_queue.proof
+  history_api.mli
+  segment_queue.ml
+  segment_queue.proof
+  segment_api.mli
+  ../module_ms_queue/client.ml
+  ../../saturn/backoff/backoff.mli))

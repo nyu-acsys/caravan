@@ -132,7 +132,8 @@ Curried applications and partial applications such as `module With_A = Make (A)`
 and `module Client = With_A (B)` preserve the same result types as `Make (A) (B)`.
 Each application checks the complete argument against the parameter signature.
 Eligible bodies share one generic proof across applications, including parameters
-with invariant resources, explicit proofs and captured static proof declarations.
+with invariant resources, explicit proofs, captured static proof declarations,
+lifted local helpers and closed recursive heap layouts.
 Bodies outside the supported generic representation and runtime subset retain
 separate verified specializations. Parameter calls use the signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
@@ -526,6 +527,8 @@ automation. The original sequence/history queue remains a separate case study in
 [test/saturn/michael_scott_queue/](test/saturn/michael_scott_queue/).
 The [module-wrapped history queue](test/examples/module_ms_queue/) reuses that
 implementation and proof behind a static signature, with clients through an alias.
+The [functor-wrapped queues](test/examples/functor_ms_queue/) reuse both complete queue
+proofs across fresh applications without additional queue annotations.
 
 The additional `swing_tail` operation has no Saturn counterpart. Its history and
 segment proofs live in the separate [queue tail advancement example](test/examples/queue_tail_advance/),

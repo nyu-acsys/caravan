@@ -10,6 +10,8 @@ proofs, and positive and negative checks together.
   functor client, checked against its parameter's contract.
 - [Module-wrapped history queue](module_ms_queue/): the complete queue proof
   behind a static signature, with alias-based clients.
+- [Functor-wrapped queues](functor_ms_queue/): the complete history and segment
+  queue proofs shared across fresh applications, with aliases and FIFO clients.
 - [Queue tail advancement](queue_tail_advance/): an additional `swing_tail`
   operation checked with both the history and segment queue invariants.
 

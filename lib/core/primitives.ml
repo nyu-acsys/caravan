@@ -68,7 +68,7 @@ let ordinary_proc ?declaration_name ~field ~(typ : R.Type.t) ~int op : R.Member.
 (** The procedure performing [op] on [field], whose values have type [typ]; [exact] if
     they are immediate, [int] if they are OCaml's [int]s, which the values written are
     then required to be. *)
-let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
+let proc ?declaration_name ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
   let x = var "x" and v = var "v" and q = var "q" in
   let content =
     R.Expr.field ~loc x (Qualified_name.raven ~loc (Qualified_name.of_string field))
@@ -144,5 +144,5 @@ let proc ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
            else [])
          @ [ R.Spec.make (bin And (own v) pre) ])
        ~ensures:[ R.Spec.make post ]
-       (ident (name ~field op))
+       (ident (Option.value declaration_name ~default:(name ~field op)))
        (Some update))

@@ -1,0 +1,7 @@
+module Make () = struct
+  type state = { value : node }
+
+  invariant is_cell (cell : t) (s : state) = own cell s.value
+
+  view contents (cell : t) = s.value
+end

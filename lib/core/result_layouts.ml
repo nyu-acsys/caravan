@@ -52,6 +52,7 @@ let descriptor entry ~owner =
         source with
         module_name;
         module_path = Some module_path;
+        cell_namespace = Some owner;
         backend_type =
           Option.some_if (Option.is_none source.heap)
             Qualified_name.{ path = module_path; name = "T" };
@@ -80,6 +81,7 @@ let concrete layouts types =
               {
                 data with
                 module_path = representation.module_path;
+                cell_namespace = representation.cell_namespace;
                 backend_type = representation.backend_type;
                 ctors = representation.ctors;
                 heap = representation.heap;
