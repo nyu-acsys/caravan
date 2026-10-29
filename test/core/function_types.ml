@@ -2,7 +2,7 @@ open Base
 open Types
 
 let value_type t =
-  match Caravan_core.Translate.argument_value_type t with
+  match Caravan_core.Procedures.argument_value_type t with
   | Some t -> t
   | None -> failwith "expected an unquantified argument scheme"
 
@@ -32,7 +32,7 @@ let () =
 let () =
   let variable = Btype.newgenty (Tunivar (Some "a")) in
   let quantified = Btype.newgenty (Tpoly (variable, [ variable ])) in
-  assert (Option.is_none (Caravan_core.Translate.argument_value_type quantified));
+  assert (Option.is_none (Caravan_core.Procedures.argument_value_type quantified));
   begin match Types.get_desc quantified with
   | Tpoly (body, [ bound ]) ->
       assert (Types.eq_type body variable);

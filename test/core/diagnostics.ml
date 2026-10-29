@@ -6,7 +6,7 @@ let () =
   let at = { Location.loc_start = position; loc_end = position; loc_ghost = false } in
   let loc = R.Loc.make position position in
   let message = "The invariant is_queue may not hold after this step" in
-  let origin : C.Translate.origin =
+  let origin : C.Translate_context.origin =
     { at; code = Fold; message; related = [ (at, "The invariant") ] }
   in
   let diagnostic : R.Diagnostic.t =

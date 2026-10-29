@@ -20,7 +20,7 @@ let () =
       let name = C.Qualified_name.of_spec q in
       assert (String.equal (C.Qualified_name.to_string name) spelling);
       assert (Poly.equal name (C.Qualified_name.of_string spelling));
-      assert (String.equal (C.Translate.qualid_key q) spelling);
+      assert (String.equal (C.Translate_context.qualid_key q) spelling);
       let rec longident_components = function
         | Longident.Lident name -> [ name ]
         | Ldot (parent, name) -> longident_components parent.txt @ [ name.txt ]
@@ -32,11 +32,14 @@ let () =
         String.equal (printed (C.Qualified_name.raven ~loc:R.Loc.none name)) spelling);
       assert (
         String.equal
-          (printed (C.Translate.qualified_name ~loc:R.Loc.none spelling))
+          (printed (C.Translate_context.qualified_name ~loc:R.Loc.none spelling))
           spelling));
-  assert (Option.is_none (C.Translate.list_function (qualid [ "A"; "List"; "length" ])));
   assert (
-    Poly.equal (C.Translate.list_function (qualid [ "List"; "length" ])) (Some "len"))
+    Option.is_none (C.Translate_context.list_function (qualid [ "A"; "List"; "length" ])));
+  assert (
+    Poly.equal
+      (C.Translate_context.list_function (qualid [ "List"; "length" ]))
+      (Some "len"))
 
 let () =
   let first = Path.Pident (Ident.create_local "f") in
@@ -54,7 +57,7 @@ let () =
   let other_root = Path.Pident (Ident.create_local "M") in
   let nested = Path.Pdot (root, "N") in
   let libraries = C.Path_bindings.of_list [ (root, [ "M" ]); (nested, [ "M"; "N" ]) ] in
-  let resolve = C.Translate.resolved_call functions libraries in
+  let resolve = C.Translate_context.resolved_call functions libraries in
   assert (Poly.equal (resolve first) (Some "first"));
   assert (Poly.equal (resolve second) (Some "second"));
   assert (Poly.equal (resolve (Path.Pdot (root, "f"))) (Some "M.f"));
@@ -69,19 +72,23 @@ let () =
 let () =
   let standard = Path.Pident (Ident.create_persistent "Stdlib") in
   let shadow = Path.Pident (Ident.create_local "Stdlib") in
-  assert (Poly.equal (C.Translate.stdlib_name (Path.Pdot (standard, "+"))) (Some "+"));
-  assert (Option.is_none (C.Translate.stdlib_name (Path.Pdot (shadow, "+"))));
+  assert (
+    Poly.equal (C.Translate_context.stdlib_name (Path.Pdot (standard, "+"))) (Some "+"));
+  assert (Option.is_none (C.Translate_context.stdlib_name (Path.Pdot (shadow, "+"))));
   assert (
     Poly.equal
-      (C.Translate.atomic_name (Path.Pdot (Path.Pdot (standard, "Atomic"), "get")))
+      (C.Translate_context.atomic_name
+         (Path.Pdot (Path.Pdot (standard, "Atomic"), "get")))
       (Some "get"));
   assert (
     Option.is_none
-      (C.Translate.atomic_name (Path.Pdot (Path.Pdot (shadow, "Atomic"), "get"))));
+      (C.Translate_context.atomic_name (Path.Pdot (Path.Pdot (shadow, "Atomic"), "get"))));
   let atomic = Path.Pident (Ident.create_persistent "Stdlib__Atomic") in
   let shadow_atomic = Path.Pident (Ident.create_local "Stdlib__Atomic") in
-  assert (Poly.equal (C.Translate.atomic_name (Path.Pdot (atomic, "get"))) (Some "get"));
-  assert (Option.is_none (C.Translate.atomic_name (Path.Pdot (shadow_atomic, "get"))))
+  assert (
+    Poly.equal (C.Translate_context.atomic_name (Path.Pdot (atomic, "get"))) (Some "get"));
+  assert (
+    Option.is_none (C.Translate_context.atomic_name (Path.Pdot (shadow_atomic, "get"))))
 
 let location ?(file = "scope.ml") start stop =
   let position offset = { Lexing.dummy_pos with pos_fname = file; pos_cnum = offset } in
@@ -105,7 +112,7 @@ let () =
   let inside = location 40 100 in
   let outside = location 101 120 in
   let found annotations =
-    match C.Translate.contract_after ~scope annotations ~item_loc ~next:None with
+    match C.Procedures.contract_after ~scope annotations ~item_loc ~next:None with
     | Ok contract -> Option.is_some contract
     | Error _ -> failwith "expected one well-formed contract"
   in
@@ -115,8 +122,8 @@ let () =
   List.iter [ "manual"; "trusted" ] ~f:(fun text ->
       let marked annotations =
         if String.equal text "manual" then
-          C.Translate.manual_after ~scope annotations ~item_loc ~next:None
-        else C.Translate.trusted_after ~scope annotations ~item_loc ~next:None
+          C.Procedures.manual_after ~scope annotations ~item_loc ~next:None
+        else C.Procedures.trusted_after ~scope annotations ~item_loc ~next:None
       in
       assert (marked [ annotation text inside ]);
       assert (not (marked [ annotation text outside ])))

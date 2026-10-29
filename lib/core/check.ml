@@ -10,7 +10,8 @@ let same_place (at : Location.t) (l : R.Loc.t) =
   same at.loc_start (R.Loc.start l) && same at.loc_end (R.Loc.stop l)
 
 (** [d], saying what failed if it is the failure of a check the translation generated. *)
-let explain (origins : Translate.origin list) (d : R.Diagnostic.t) : R.Diagnostic.t =
+let explain (origins : Translate_context.origin list) (d : R.Diagnostic.t) :
+    R.Diagnostic.t =
   let explain_message message =
     let timeout = ". The solver timed out (see --smt-timeout)" in
     if String.is_suffix d.message ~suffix:timeout then message ^ timeout else message

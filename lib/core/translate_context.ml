@@ -1,0 +1,1377 @@
+(** The translation's shared state and helpers: the contexts of contracts and procedures,
+    Raven names, fields and primitives, and generated checks. *)
+
+open Base
+module R = Raven_api
+
+type error = Report.error
+
+module S = Caravan_spec.Spec_ast
+
+(** The head of the application [t] and its arguments. *)
+let rec spine (t : S.term) args =
+  match t.term_desc with Tapply (f, a) -> spine f (a :: args) | _ -> (t, args)
+
+(** The conjuncts of [t]. *)
+let rec conjuncts (t : S.term) =
+  let t = S.chain t in
+  match spine t [] with
+  | { term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ }, [ a; b ] ->
+      conjuncts a @ conjuncts b
+  | _ -> [ t ]
+
+(** The conjuncts of [terms] that make a variable a field of a value, [x == g.f] or
+    [g.f == x]: the variable, the field and the value's name. *)
+let field_equations (terms : S.term list) =
+  List.filter_map (List.concat_map terms ~f:conjuncts) ~f:(fun t ->
+      match spine t [] with
+      | { term_desc = Tvar (Qid { pid_str = "=" | "==" | "==="; _ }); _ }, [ a; b ] ->
+          begin match (a.term_desc, b.term_desc) with
+          | ( Tvar (Qid { pid_str = x; _ }),
+              Tfield
+                ({ term_desc = Tvar (Qid { pid_str = g; _ }); _ }, Qid { pid_str = f; _ })
+            )
+          | ( Tfield
+                ({ term_desc = Tvar (Qid { pid_str = g; _ }); _ }, Qid { pid_str = f; _ }),
+              Tvar (Qid { pid_str = x; _ }) ) ->
+              Some (x, f, g)
+          | _ -> None
+          end
+      | _ -> None)
+
+(** The elements of the list literal [t], if it is one. *)
+let rec list_literal (t : S.term) =
+  match spine t [] with
+  | { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ }, [] -> Some []
+  | { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, [ h; rest ] ->
+      Option.map (list_literal rest) ~f:(fun rest -> h :: rest)
+  | _ -> None
+
+let ( let* ) = Result.( >>= )
+let error ?related loc message = Error (Report.error ?related Type loc message)
+let unsupported = Report.unsupported
+let loc (l : Location.t) = R.Loc.make l.loc_start l.loc_end
+let ident ~loc name = R.Ident.make ~loc name
+let name ~loc n = R.Name.make ~loc n
+let qualified_name ~loc text = Qualified_name.raven ~loc (Qualified_name.of_string text)
+
+(** [f] mapped over [xs], stopping at the first error. *)
+let all (xs : 'a list) ~(f : 'a -> ('b, error) Result.t) : ('b list, error) Result.t =
+  Result.all (List.map xs ~f)
+
+let is_unit (t : Types.type_expr) =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) -> Path.same p Predef.path_unit
+  | _ -> false
+
+let is_int (t : Types.type_expr) =
+  match Types.get_desc t with
+  | Tconstr (p, [], _) -> Path.same p Predef.path_int
+  | _ -> false
+
+(** That the value of [x] is in the range of OCaml's [int], if its type is [int]. *)
+let range_spec ~loc:l (t : Types.type_expr) x =
+  Option.some_if (is_int t)
+    (R.Spec.make
+       (R.Expr.call ~loc:l
+          (R.Name.make ~loc:l Prelude.in_range)
+          [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+
+(** That [x] is in the range of OCaml's [int], if its type [t] is [int]: true of every
+    value, since every [int] the translation creates is checked to be. *)
+let assume_in_range ~loc:l (t : Types.type_expr) x =
+  Option.value_map (range_spec ~loc:l t x) ~default:[] ~f:(fun spec ->
+      [ R.Stmt.assume ~loc:l spec ])
+
+(** The names of a function's variables in Raven: OCaml's, made distinct where a name is
+    bound twice. *)
+module Names = struct
+  type t = {
+    mutable used : Set.M(String).t;
+    mutable bound : (string * string) list;
+    mutable scope : (string * (string * Types.type_expr option)) list;
+        (** The variables bound so far, by their OCaml names, latest first, with their
+            Raven names and types. *)
+  }
+
+  let create () = { used = Set.empty (module String); bound = []; scope = [] }
+
+  (** A name for [base] not used yet. *)
+  let fresh names base =
+    let rec go n =
+      let candidate = if n = 0 then base else Printf.sprintf "%s_%d" base n in
+      if Set.mem names.used candidate then go (n + 1) else candidate
+    in
+    let name = go 0 in
+    names.used <- Set.add names.used name;
+    name
+
+  (** The Raven name of the OCaml variable [id] of type [typ], bound now. *)
+  let bind ?typ names (id : Ident.t) =
+    let name = fresh names (Ident.name id) in
+    names.bound <- (Ident.unique_name id, name) :: names.bound;
+    names.scope <- (Ident.name id, (name, typ)) :: names.scope;
+    name
+
+  let find names (id : Ident.t) =
+    List.Assoc.find names.bound (Ident.unique_name id) ~equal:String.equal
+end
+
+type origin = {
+  at : Location.t;
+  code : R.Diagnostic.code;
+  message : string;
+  related : (Location.t * string) list;
+}
+(** A check the translation generates, with the code of its failure, and what it checks,
+    as the message and related locations to report when it fails. *)
+
+type action = {
+  action : string;
+  params : string list;
+  step : (string * S.term option list) option;
+      (** The operation performing it, with its arguments: the location, then the others,
+          [None] for any. *)
+  state : string;
+  update : (string * S.term) list;  (** The fields it changes. *)
+  linearizes : Ident.t list;
+  helps : (string * S.term * S.term) option;
+      (** The pending field whose calls it helps, the key and the result. *)
+  action_at : Location.t;
+}
+(** An action of a structure (see {!S.Proof_action}). *)
+
+type performing = { performed : action; bindings : (string * R.Expr.t) list }
+(** An action that a step performs, with the values of its parameters. *)
+
+type pending = {
+  pending_field : string;
+  pending_on : string;  (** The existential of the keys of the registrations. *)
+  key_type : Types.type_expr;
+  helped : Ident.t;  (** The function whose calls wait. *)
+  helping : string * S.term * S.term;
+      (** The key whose calls the action that helps commits, and the result, in terms of
+          the state before the action, named as the action names it. *)
+}
+(** A field of calls of [helped] waiting to be helped, each registered on a key: a finite
+    set of registrations, ghost cells holding the calls' updates. *)
+
+(** Whether a function with an atomic contract has linearized, as far as the translation
+    knows. Raven needs the atomic update in the same state after both arms of a branch, so
+    a step whose effect depends on its result leaves the update open, and the arms of the
+    branch on that result close it. *)
+type au_state =
+  | Pending  (** Not linearized, the update closed. *)
+  | Committed
+  | Committing
+      (** Linearized, the update open until the function's result is known, at the end of
+          the arm whose value it is. *)
+  | On_cas  (** The update open, linearized if the last [compare_and_set] succeeded. *)
+  | On_read of string
+      (** The update open, linearized if the value of the last read has this constructor.
+      *)
+  | Partly  (** Linearized on some paths, the update closed. *)
+  | Registered of registered
+      (** Linearized, or left to be helped if [registered] says so: given away in a
+          registration on a pending field, whose result a later step collects. *)
+  | Unknown
+
+and registered = {
+  registration : R.Expr.t;  (** The ghost cell of the registration. *)
+  registered : R.Expr.t;  (** Whether the call registered rather than linearized. *)
+  pending_inv : string;
+  pending : pending;
+}
+
+(** How the atomic update closes. *)
+type au_close =
+  | Commit  (** The step linearized the function. *)
+  | Abort  (** The step did not change the abstract state. *)
+  | Commit_call  (** The step is a call, which linearized the function in its place. *)
+
+type au = {
+  mutable state : au_state;
+  mutable cas_results : (string * bool) list;
+      (** Variables bound to the result of a [compare_and_set], or its negation if
+          [false], by their unique names. *)
+  mutable read_results : string list;
+      (** Variables bound to the value of the last read, by their unique names. *)
+  mutable values : R.Expr.t list;
+      (** The values of the implicit parameters in the open update. *)
+  mutable step : Location.t;  (** The step that opened the update. *)
+  mutable performing : (performing * R.Expr.t option) option;
+      (** The action that the step performs if it commits, as [(*@ performs pop *)] or by
+          its step, with the condition, if any, under which the step is the action's. *)
+  self : string;  (** The procedure's name. *)
+  role : Ident.t;
+      (** The function that the update is of: [self], or the one it continues. *)
+  ghost_results : R.Expr.t list;
+      (** The ghost results witnessing facts about earlier states, which the update
+          commits with. *)
+  has_result : bool;
+  open_ :
+    at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list, Report.error) Result.t;
+      (** Opens the atomic update for the step at [at]: the statements, unfolding the
+          atomic precondition's predicates if [unfold], and the values of the implicit
+          parameters. *)
+  close : au_close -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+      (** Closes the open update, committing with the function's result [value]. *)
+  token : R.Expr.t;  (** The update's token. *)
+  commit_only : at:Location.t -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+      (** Opens the update and commits it with [value] at once, at the step at [at], the
+          invariants left as they are. *)
+}
+(** The atomic update of a function with an atomic contract. *)
+
+type lemma_signature = {
+  lemma_raven : string;
+  lemma_constant : bool;
+  lemma_inputs : Types.type_expr list;
+  lemma_implicit_count : int;
+  lemma_outputs : Types.type_expr list;
+}
+
+type procedure_signature = {
+  procedure_inputs : (string * Types.type_expr) list;
+  procedure_outputs : (string * Types.type_expr) list;
+  procedure_result : Types.type_expr;
+}
+
+type atomic_shape = {
+  inputs : Types.type_expr list;
+  result : Types.type_expr;
+  ghost_outputs : Types.type_expr list;
+  implicit : Types.type_expr list;
+}
+
+type atomic_signature = {
+  au_key : string;
+  au_owner : Path.t option;
+  au_private : atomic_shape;
+  au_token : Types.type_expr;
+  au_source : Source.proof_au;
+  au_procedure : string;
+  au_inputs : Types.type_expr list;
+  au_result : Types.type_expr;
+  au_ghost_outputs : Types.type_expr list;
+  au_implicit : Types.type_expr list;
+}
+
+type proof_support = {
+  runtime_functions : Qualified_name.t Path_bindings.t;
+  predicate_views : string Path_bindings.t;
+  public_types : Path.t list;
+  strict_source_types : bool;
+  library_paths : string list Path_bindings.t;
+  atomic_updates : atomic_signature list;
+  resources : Source.proof_resource list;
+  ghost_fields : Source.proof_field list;
+  canonical_path : Path.t -> Path.t;
+  logical_functions : (string * lemma_signature) list;
+  mathematical_types : Datatypes.t list;
+  predicate_inputs : (string * int) list;
+      (** Explicit overrides of the type-based predicate output convention. *)
+  proof_key : Env.t -> S.qualid -> string option;
+  action_key : S.id -> string option;
+  opaque_predicates : string list;
+}
+
+let empty_proof_support =
+  {
+    runtime_functions = Path_bindings.empty;
+    predicate_views = Path_bindings.empty;
+    public_types = [];
+    strict_source_types = false;
+    library_paths = Path_bindings.empty;
+    atomic_updates = [];
+    resources = [];
+    ghost_fields = [];
+    canonical_path = Fn.id;
+    logical_functions = [];
+    mathematical_types = [];
+    predicate_inputs = [];
+    proof_key = (fun _ _ -> None);
+    action_key = (fun _ -> None);
+    opaque_predicates = [];
+  }
+
+type declaration_context = {
+  declaration_predicates : (string * (string * Types.type_expr list)) list;
+  declaration_functions : (string * string) list;
+  declaration_support : proof_support;
+}
+
+type structure = {
+  context : declaration_context;
+  scope : Proof_scopes.scope option;
+  environment : Env.t;
+  invariant : string;
+  backend : string;
+  state : string;
+  fields : (string * string * R.Type.t * Types.type_expr * bool) list;
+  chains : (string * string) list;
+  actions : action list;
+  pendings : pending list;
+  held : (S.term * string * S.term) list;
+      (** The atomics that the invariant owns holding an entry of a field owned by index,
+          [own q.head s.cells.(s.head)]: the atomic, the field and the position. *)
+  params : (string * Types.type_expr) list;
+      (** The invariant's parameters but the state, with their types. *)
+  structure_type : Types.type_expr;
+  views : (S.predicate * S.term) list;  (** The views, with their values. *)
+  at : Location.t;  (** The invariant's definition. *)
+}
+(** A structure whose invariant has a ghost state: the invariant, its state variable, the
+    state's fields with their existentials, Raven and OCaml types and whether they grow,
+    the fields indexing ownership, with the existentials of their index maps, the actions,
+    and the type of the structure, the invariant's first parameter. *)
+
+let has_history st = List.exists st.fields ~f:(fun (_, _, _, _, grows) -> grows)
+
+(** The type of the index map of [field] of [st], owned by index: from its entries to
+    their positions. *)
+let chain_index_type types st field =
+  let l = R.Loc.none in
+  let elt =
+    match List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field) with
+    | Some (_, _, _, t, _) ->
+        begin match Datatypes.desc types t with
+        | Tconstr (_, [ elt ], _) -> Result.ok (Datatypes.typ types ~at:Location.none elt)
+        | _ -> None
+        end
+    | None -> None
+  in
+  R.Type.map ~loc:l (Option.value elt ~default:(R.Type.ref ~loc:l)) (R.Type.int ~loc:l)
+
+(** The values of the fields of [st] that grow, among [values], those of all its fields:
+    the history's state. *)
+let grown st values =
+  List.filter_map (List.zip_exn st.fields values) ~f:(fun ((_, _, _, _, grows), v) ->
+      Option.some_if grows v)
+
+(** The names of the members generated for [st]: functions, lemmas and fields, and
+    modules. *)
+let member_name st suffix =
+  let backend = Qualified_name.of_string st.backend in
+  Qualified_name.to_string { backend with name = backend.name ^ "_" ^ suffix }
+
+let module_name st suffix =
+  let backend = Qualified_name.of_string st.backend in
+  Qualified_name.to_string
+    { backend with name = String.capitalize backend.name ^ "_" ^ suffix }
+
+let generated_ident ~loc text = ident ~loc (Qualified_name.of_string text).name
+
+let generated_module_member ~loc module_name member =
+  let module_name = Qualified_name.of_string module_name in
+  R.Name.make ~loc ~path:(module_name.path @ [ module_name.name ]) member
+
+(** The names of the members generated for the pending field [p] of [st]. *)
+let pending_name st (p : pending) suffix = member_name st (p.pending_field ^ "_" ^ suffix)
+
+type past = { inv : string; field : string; element : S.term }
+(** A fact about an earlier state of a structure, [past (mem e s.f)]: [e] was in the field
+    [f], owned by index, of a state of the invariant [inv], which a snapshot of its
+    history and a position in [f] witness. *)
+
+(** [t] as a fact about an earlier state, if it is one, of the structures [structures]. *)
+let past_of structures (t : S.term) =
+  Option.bind (S.past_membership t) ~f:(fun (element, state, field) ->
+      match
+        List.filter structures ~f:(fun st ->
+            String.equal st.state state.pid_str
+            && List.Assoc.mem st.chains field.pid_str ~equal:String.equal)
+      with
+      | [ st ] -> Some { inv = st.invariant; field = field.pid_str; element }
+      | [] | _ :: _ :: _ -> None)
+
+(** The state of the growing fields [values] of [st], as the history holds it. *)
+let state_of ~loc:l st values =
+  R.Expr.call ~loc:l
+    (generated_module_member ~loc:l (module_name st "state") "state")
+    values
+
+(** That the snapshot [snapshot] of [st]'s history, on the structure [structure], has the
+    value [e] at the position [k] of its field [field]. *)
+let past_fact ~loc:l st ~structure ~field ~snapshot ~k e =
+  let qn m x = generated_module_member ~loc:l m x in
+  let entries = R.Expr.field ~loc:l snapshot (qualified_name ~loc:l field) in
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  List.reduce_exn ~f:(bin And)
+    [
+      R.Expr.own ~loc:l
+        [
+          structure;
+          R.Expr.call ~loc:l
+            (qn (module_name st "history") "frag")
+            [
+              R.Expr.call ~loc:l
+                (qn (module_name st "states") "set")
+                [ R.Expr.set ~loc:l [ snapshot ] ];
+            ];
+        ];
+      bin Leq (R.Expr.int ~loc:l 0) k;
+      bin Lt k (R.Expr.call ~loc:l (qn "Seq" "length") [ entries ]);
+      bin Eq (R.Expr.index ~loc:l entries k) e;
+    ]
+
+type shared = {
+  persistent : (string * Location.t) list;
+      (** The invariants, by their names, with their definitions. *)
+  views : (string * string) list;
+      (** The views, by their names, with their ghost fields, which hold a client's view
+          of the state, half in the view and half in the invariant. *)
+  structures : structure list;
+  member_aliases : (string * string) list;
+  mutable dynamic_indices : bool;
+  anchors : (string * (string * R.Type.t * R.Expr.t option) list) list;
+      (** The ghost fields of the views and histories, by the field whose allocation
+          allocates them, the field of the structure's reference, with their initial
+          values: arbitrary for views. *)
+}
+(** The shared structures of a program: invariants and views. *)
+
+(** The ghost field holding the client's view [v] of a state. *)
+
+let view_field key = "view_" ^ key
+
+let view_field_in shared key =
+  Option.value
+    (List.Assoc.find shared.views key ~equal:String.equal)
+    ~default:(view_field key)
+
+let canonical_member shared member =
+  Option.value
+    (List.find_map shared.member_aliases ~f:(fun (alias, target) ->
+         Option.map
+           (String.chop_prefix member ~prefix:(alias ^ "."))
+           ~f:(fun suffix -> target ^ "." ^ suffix)))
+    ~default:member
+
+let no_shared =
+  {
+    persistent = [];
+    views = [];
+    structures = [];
+    member_aliases = [];
+    anchors = [];
+    dynamic_indices = false;
+  }
+
+type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
+(** The state of an open invariant: the variables of its fields and of the index maps of
+    the fields owned by index. *)
+
+type position = {
+  pos_inv : string;
+  pos_field : string;
+  pos_element : R.Expr.t;
+  pos_snapshot : R.Expr.t;
+  pos_k : R.Expr.t;
+}
+(** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
+    index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
+
+let implicit_parameter_count ~kind parameters =
+  let rec check seen count = function
+    | [] -> Ok (if seen then Some count else None)
+    | (id, _) :: rest ->
+        let implicit = List.mem id.S.pid_attrs "implicit" ~equal:String.equal in
+        if seen && not implicit then
+          error id.pid_loc
+            (Printf.sprintf "Implicit %s parameters must follow explicit parameters" kind)
+        else check (seen || implicit) (if implicit then count + 1 else count) rest
+  in
+  check false 0 parameters
+
+let predicate_output_count ?has_refs data (predicate : S.predicate) types =
+  let* explicit = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
+  match explicit with
+  | Some _ when predicate.pred_persistent ->
+      error predicate.pred_name.pid_loc
+        "Implicit parameter annotations require an ordinary predicate"
+  | Some count -> Ok count
+  | None when predicate.pred_persistent -> Ok 0
+  | None ->
+      let has_refs = Option.value has_refs ~default:(Datatypes.has_refs data) in
+      let count =
+        List.length (List.take_while (List.rev types) ~f:(fun typ -> not (has_refs typ)))
+      in
+      Ok (if count = List.length types then 0 else count)
+
+type predicate_body = {
+  definition : S.term;
+  environment : Env.t;
+  project_type : Types.type_expr -> Types.type_expr;
+}
+
+type cell_field = {
+  cell_name : string;
+  cell_type : Types.type_expr;
+  cell_declaration : R.Member.t;
+}
+
+type context = {
+  types : Datatypes.t list;
+  refs : cell_field list ref;
+      (** The fields of the ref cells and atomics used so far, by their names, with their
+          declarations. *)
+  primitives : (string * R.Member.t) list ref;
+      (** The atomic operations used so far, by their names (see {!Primitives}). *)
+  primitive_namespace : string list;
+  names : Names.t;
+  functions : string Path_bindings.t;
+      (** Checked functions, indexed by their compiler paths. *)
+  pasts : (string * (string * string * int) list) list;
+      (** The facts about earlier states that procedures require, by their names: the
+          invariant, the field, and the position of the parameter that was in it. *)
+  past_returns :
+    (string * (string * string * (R.Expr.t list -> R.Expr.t option)) list) list;
+      (** The facts about earlier states that procedures ensure, by their names, each
+          witnessed by two ghost results: the invariant, the field, and the entry, given
+          the arguments, if it is known. *)
+  lifted : (string * (int * Ident.t list * Ident.t option)) list;
+      (** The lifted local functions, by their procedures' names, with the number of
+          parameters of the function they continue, which they take first, the variables
+          of their context they use, which they take next, and the function's identity. *)
+  ghost_args : (string * (int * string) option list) list;
+      (** The ghost parameters of procedures, by their names: for each, the position of a
+          parameter that a precondition makes a field of it, with the field, as [tail] in
+          [requires tail = q.tail], by which calls find the ghost argument. *)
+  procedure_signatures : (string * procedure_signature) list;
+  mutable ghost_returns : (string * string * Types.type_expr) list;
+  mutable proof_state : (R.Expr.t * Types.type_expr) option;
+  mutable return_covered : bool;
+  mutable fields_of : (string * (string * R.Expr.t)) list;
+      (** The variables known to be fields of values, by their Raven names: the field and
+          the value, as [tail] of [q] after [let push { tail; _ } value]. *)
+  libraries : string list Path_bindings.t;
+      (** The modules of the libraries, with their names: trusted Raven modules. *)
+  mutable formals : R.Expr.t list;
+      (** The procedure's parameters, of which a lifted local function that continues it,
+          or that it continues too, takes the first. *)
+  origins : origin list ref;
+  annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
+  proof_lemmas : (string * lemma_signature) list;
+  proof_support : proof_support;
+  predicate_bodies : (string * predicate_body) list;
+      (** Explicit predicate bodies, for the types of named unfold witnesses. *)
+  spec_funcs : (string * string) list;
+      (** The functions contracts can call, by their OCaml names, with their Raven ones.
+      *)
+  env : Env.t;  (** OCaml's, for the types in annotations. *)
+  preds : (string * (string * Types.type_expr list)) list;
+      (** The predicates, by their OCaml names, with their Raven names and parameter
+          types. *)
+  mutable facts : R.Spec.t list;
+      (** Facts that hold throughout the function: its preconditions without [own], which
+          only mention variables, all immutable. *)
+  mutable au : au option;
+      (** The atomic update, for a function with an atomic contract. *)
+  current_procedure : string option;
+  manual : bool;
+  access_proofs : ((int * int) * Annotation.t) list;
+  return_proofs : ((int * int) * Annotation.t) list;
+  initializations : ((int * int) * Annotation.t) list;
+  linearizations : (int * Annotation.t) list;
+      (** The annotations on atomic steps, by the offset of the end of the step they
+          follow. *)
+  shared : shared;
+  mutable invariants : (string * R.Expr.t list) list;
+      (** The invariants that the function's precondition holds, opened around each of its
+          atomic steps, with their arguments. *)
+  mutable opened : (string * opened) list;  (** The states of the open invariants. *)
+  mutable snapshots : (string * opened list) list;
+      (** The snapshots of the states of the invariants taken on the current path, latest
+          first. *)
+  mutable positions : position list;
+      (** The positions of entries in snapshots known on the current path. *)
+}
+
+let typ ctx ~at t = Datatypes.typ ctx.types ~at t
+
+(** Declares [field], with values of type [elt], unless it is already. *)
+let declare_field ctx ~at field elt =
+  let* t = typ ctx ~at elt in
+  if not (List.exists !(ctx.refs) ~f:(fun cell -> String.equal cell.cell_name field)) then begin
+    let file = { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname } in
+    let loc = R.Loc.make file file in
+    ctx.refs :=
+      !(ctx.refs)
+      @ [
+          {
+            cell_name = field;
+            cell_type = elt;
+            cell_declaration =
+              Datatypes.field_member ctx.types ~loc (Qualified_name.of_string field).name
+                t elt;
+          };
+        ]
+  end;
+  Ok ()
+
+let cell_field ctx ~at elt ~prefix ~suffix =
+  match Datatypes.cell_name ~prefix ~suffix ctx.types elt with
+  | None -> unsupported at "A cell payload combining distinct result layouts"
+  | Some field ->
+      let* () = declare_field ctx ~at field elt in
+      Ok field
+
+(** The field of the ref cells with contents of type [elt]. *)
+let ref_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"ref_" ~suffix:"_contents"
+
+(** The field of the atomics with contents of type [elt]. *)
+let atomic_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"atomic_" ~suffix:""
+
+(** The procedure performing [op] on the atomics with contents of type [elt]. *)
+let primitive ctx ~at elt op =
+  let* field = atomic_field ctx ~at elt in
+  let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
+  let declaration_name = Primitives.name ~field:stem op in
+  let name = String.concat ~sep:"." (ctx.primitive_namespace @ [ declaration_name ]) in
+  let* typ = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.primitives) name ~equal:String.equal) then
+    ctx.primitives :=
+      !(ctx.primitives)
+      @ [
+          ( name,
+            Primitives.proc ~declaration_name ~field ~typ
+              ~exact:(Datatypes.immediate ctx.types elt)
+              ~int:(Datatypes.is_int ctx.types elt)
+              op );
+        ];
+  Ok name
+
+(** The ordinary read or write of a mutable field. *)
+let ordinary_primitive ctx ~at ~field elt op =
+  let stem = String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.')) in
+  let declaration_name = Primitives.ordinary_name ~field:stem op in
+  let procedure =
+    String.concat ~sep:"." (ctx.primitive_namespace @ [ declaration_name ])
+  in
+  let* typ = typ ctx ~at elt in
+  if not (List.Assoc.mem !(ctx.primitives) procedure ~equal:String.equal) then
+    ctx.primitives :=
+      !(ctx.primitives)
+      @ [
+          ( procedure,
+            Primitives.ordinary_proc ~declaration_name ~field ~typ
+              ~int:(Datatypes.is_int ctx.types elt)
+              op );
+        ];
+  Ok procedure
+
+(** The Raven field named [label] of the values of type [t] that are references; an
+    atomic's contents have the empty label, as in [own a v]. *)
+let field_of_type ctx ~at (t : Types.type_expr) label =
+  match Datatypes.desc ctx.types t with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
+      let* field = ref_field ctx ~at elt in
+      Ok (Some field)
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+      let* field = atomic_field ctx ~at elt in
+      Ok (Some field)
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find ctx.types p with
+      | Some { heap = Some fields; _ } ->
+          Ok
+            (Option.map
+               (List.find fields ~f:(fun f -> String.equal f.label label))
+               ~f:(fun f -> f.raven_field))
+      | _ -> Ok None
+      end
+  | _ -> Ok None
+
+(** The atomic that the field [label] of a value of the immutable record type [t] holds:
+    its type, if it is one. *)
+let atomic_in_record ctx (t : Types.type_expr) label =
+  match Datatypes.desc ctx.types t with
+  | Tconstr (p, [], _) ->
+      begin match Datatypes.find ctx.types p with
+      | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
+          List.find_map (List.zip_exn fields args) ~f:(fun (f, a) ->
+              match Datatypes.desc ctx.types a with
+              | Tconstr (q, [ _ ], _) when String.equal f label && Datatypes.is_atomic q
+                ->
+                  Some a
+              | _ -> None)
+      | _ -> None
+      end
+  | _ -> None
+
+(** The OCaml type of the field [label] of values of type [t] that are references, or of
+    the contents of an atomic an immutable record holds. *)
+let backend_field_type ctx (t : Types.type_expr) label =
+  match atomic_in_record ctx t label with
+  | Some atomic ->
+      begin match Datatypes.desc ctx.types atomic with
+      | Tconstr (_, [ elt ], _) -> Some elt
+      | _ -> None
+      end
+  | None -> (
+      match Datatypes.desc ctx.types t with
+      | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents"
+        ->
+          Some elt
+      | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+          Some elt
+      | Tconstr (p, [], _) ->
+          begin match Datatypes.find ctx.types p with
+          | Some { heap = Some fields; _ } ->
+              Option.map
+                (List.find fields ~f:(fun f -> String.equal f.label label))
+                ~f:(fun f -> f.typ)
+          | _ -> None
+          end
+      | _ -> None)
+
+(** Uses the source declaration before expanding implementation aliases. *)
+let source_field_type ctx t label =
+  try
+    match Types.get_desc (Ctype.expand_head ctx.env t) with
+    | Tconstr (path, [ element ], _)
+      when Datatypes.is_atomic path && String.is_empty label ->
+        Some element
+    | Tconstr (path, args, _) -> (
+        let declaration = Env.find_type path ctx.env in
+        match declaration.type_kind with
+        | Type_record (fields, _) ->
+            Option.map
+              (List.find fields ~f:(fun field ->
+                   String.equal (Ident.name field.Types.ld_id) label))
+              ~f:(fun field ->
+                Ctype.apply ctx.env declaration.type_params field.ld_type args)
+        | _ -> None)
+    | _ -> None
+  with Stdlib.Not_found -> None
+
+let field_type ctx t label =
+  Option.map (backend_field_type ctx t label) ~f:(fun fallback ->
+      match source_field_type ctx t label with
+      | None -> fallback
+      | Some source ->
+          if Option.is_some (atomic_in_record ctx t label) then
+            match Types.get_desc (Ctype.expand_head ctx.env source) with
+            | Tconstr (path, [ element ], _) when Datatypes.is_atomic path -> element
+            | _ -> fallback
+          else source)
+
+(** The Raven field of the record field [label], and whether its record is a reference;
+    [None] if it is unknown. *)
+let field_of_label ctx ~at (label : Data_types.label_description) =
+  match Types.get_desc label.lbl_res with
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
+      let* field = ref_field ctx ~at elt in
+      Ok (Some (field, true))
+  | _ ->
+      begin match Datatypes.find_label ctx.types label with
+      | Some { heap = Some fields; _ } ->
+          let field =
+            List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
+          in
+          Ok (Some (field.raven_field, true))
+      | Some _ -> Ok (Some (label.lbl_name, false))
+      | None -> Ok None
+      end
+
+(** The assertion [c] checking, at [at], what [message] says may fail. *)
+let check ctx ~(at : Location.t) message c =
+  ctx.origins := { at; code = Assertion; message; related = [] } :: !(ctx.origins);
+  R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
+
+(** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
+let no_overflow ctx ~at what v =
+  let l = loc at in
+  let bound op n = R.Expr.binary ~loc:l op v (R.Expr.int ~loc:l n) in
+  check ctx ~at
+    (Printf.sprintf "This %s may overflow" what)
+    (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
+
+let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
+
+(** The write of [v] to the field [field] of the reference [r]. *)
+let write ~loc:l r field v =
+  R.Stmt.assign ~loc:l
+    [ R.Expr.field ~loc:l r (qualified_name ~loc:l field) ]
+    (R.Stmt.expr_rhs v)
+
+let ordinary_read ?guard ctx ~at ~field ~elt r =
+  let l = loc at in
+  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Read in
+  let* typ = typ ctx ~at elt in
+  let x = Names.fresh ctx.names "tmp" in
+  let value = R.Expr.var ~loc:l (name ~loc:l x) in
+  let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r ]) in
+  let access =
+    match guard with
+    | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
+    | Some condition ->
+        R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+        @ [ R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [] ]
+  in
+  Ok (access, value)
+
+let ordinary_write ctx ~at ~field ~elt r v =
+  let l = loc at in
+  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Write in
+  Ok (R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r; v ]))
+
+(** The name of [p] if it is a value of the standard library's toplevel. *)
+let stdlib_name (p : Path.t) =
+  match p with
+  | Pdot (Pident m, x) when Ident.persistent m && String.equal (Ident.name m) "Stdlib" ->
+      Some x
+  | _ -> None
+
+(** The name of [p] if it is a value of [Stdlib.Atomic]. *)
+let atomic_name (p : Path.t) =
+  match p with
+  | Pdot (Pdot (Pident m, "Atomic"), x)
+    when Ident.persistent m && String.equal (Ident.name m) "Stdlib" ->
+      Some x
+  | Pdot (Pident m, x)
+    when Ident.persistent m && String.equal (Ident.name m) "Stdlib__Atomic" ->
+      Some x
+  | _ -> None
+
+(** The operators of the standard library that Raven has, by their paths. *)
+let binop_of_path (p : Path.t) : R.Expr.binop option =
+  match stdlib_name p with
+  | Some "+" -> Some Plus
+  | Some "-" -> Some Minus
+  | Some "*" -> Some Mult
+  | Some "/" -> Some Div
+  | Some "mod" -> Some Mod
+  | Some ("=" | "==") -> Some Eq
+  | Some ("<>" | "!=") -> Some Neq
+  | Some "<" -> Some Lt
+  | Some "<=" -> Some Leq
+  | Some ">" -> Some Gt
+  | Some ">=" -> Some Geq
+  | Some "&&" -> Some And
+  | Some "||" -> Some Or
+  | _ -> None
+
+(** Whether [==] or [!=] on [a] and [b] is equality or its negation: on immediate values,
+    and with a constant constructor, which is immediate. Otherwise, physical equality
+    implies equality, but not conversely. *)
+let exact_physical types (a : Typedtree.expression) (b : Typedtree.expression) =
+  let constant (e : Typedtree.expression) =
+    match e.exp_desc with Texp_construct (_, _, []) -> true | _ -> false
+  in
+  Datatypes.immediate types a.exp_type || constant a || constant b
+
+let runtime_nullary_constructor (e : Typedtree.expression) =
+  match e.exp_desc with Texp_construct (_, _, []) -> true | _ -> false
+
+let rec unresolved_equality_type types ty =
+  match Datatypes.desc types ty with
+  | Tvar _ | Tunivar _ -> true
+  | Tconstr (_, args, _) -> List.exists args ~f:(unresolved_equality_type types)
+  | Ttuple components ->
+      List.exists components ~f:(fun (_, ty) -> unresolved_equality_type types ty)
+  | Tpoly (ty, []) -> unresolved_equality_type types ty
+  | _ -> false
+
+let potentially_contains_refs types ty =
+  Datatypes.has_refs types ty || unresolved_equality_type types ty
+
+let runtime_structural_equality_unsafe ctx path a b =
+  match stdlib_name path with
+  | Some ("=" | "<>") ->
+      (not (runtime_nullary_constructor a || runtime_nullary_constructor b))
+      && (potentially_contains_refs ctx.types a.exp_type
+         || potentially_contains_refs ctx.types b.exp_type)
+  | _ -> false
+
+let mathematical_type ctx (t : Types.type_expr) =
+  match Datatypes.desc ctx.types t with
+  | Tconstr (p, _, _) ->
+      Option.is_some (Datatypes.collection_kind ctx.types p)
+      || List.exists ctx.proof_support.mathematical_types ~f:(fun d ->
+          Datatypes.declares d p)
+  | _ -> false
+
+let spec_contains_runtime_refs ctx ty =
+  let rec go seen ty =
+    if mathematical_type ctx ty then false
+    else
+      match Datatypes.desc ctx.types ty with
+      | Tvar _ | Tunivar _ -> true
+      | Tconstr (p, [ _ ], _) when Datatypes.is_ref p || Datatypes.is_atomic p -> true
+      | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
+      | Tconstr (p, args, _) ->
+          List.exists args ~f:(go seen)
+          || begin match Datatypes.find ctx.types p with
+          | Some { heap = Some _; _ } -> true
+          | Some { library = Some _; _ } -> true
+          | Some ({ id = Some id; _ } as d) when not (List.mem seen id ~equal:Ident.same)
+            ->
+              List.exists d.ctors ~f:(fun c -> List.exists c.args ~f:(go (id :: seen)))
+          | _ -> false
+          end
+      | Ttuple components -> List.exists components ~f:(fun (_, ty) -> go seen ty)
+      | Tpoly (ty, []) -> go seen ty
+      | _ -> false
+  in
+  go [] ty
+
+let is_physical (p : Path.t) =
+  match stdlib_name p with Some ("==" | "!=") -> true | _ -> false
+
+let unop_of_path (p : Path.t) =
+  match stdlib_name p with Some "not" -> Some `Not | Some "~-" -> Some `Neg | _ -> None
+
+let unit_value ~loc = R.Expr.tuple ~loc []
+
+(** The arguments of an application, if all are given and unlabelled. *)
+let plain_args ~at (args : (Asttypes.arg_label * Typedtree.apply_arg) list) =
+  all args ~f:(function
+    | Nolabel, Arg e -> Ok e
+    | _ -> unsupported at "A labelled, optional or omitted argument")
+
+(** What a name in a contract stands for: a Raven variable, or a value, such as the field
+    of a matched value that a pattern names. *)
+type bound =
+  | Raven of string
+  | Value of R.Expr.t
+  | State of (string * (R.Expr.t * Types.type_expr)) list
+      (** The state of an invariant, by the values and types of its fields. *)
+
+type env = {
+  ctx : context;  (** For the data types, and the fields of ref cells. *)
+  var_types : (string * Types.type_expr) list;
+      (** The OCaml types of variables, if known. *)
+  data : Datatypes.t list;
+  funcs : (string * string) list;
+      (** The functions contracts can call, by their OCaml names, with their Raven ones.
+      *)
+  vars : (string * bound) list;
+  logical_definition : bool;
+}
+
+let bind env x b = { env with vars = (x, b) :: env.vars }
+
+(** The operators of contracts that Raven has. *)
+let spec_binop (op : string) : R.Expr.binop option =
+  match op with
+  | "+" -> Some Plus
+  | "-" -> Some Minus
+  | "*" -> Some Mult
+  | "/" -> Some Div
+  | "mod" -> Some Mod
+  | "=" | "==" | "===" -> Some Eq
+  | "<>" | "!=" | "=/=" -> Some Neq
+  | "<" -> Some Lt
+  | "<=" -> Some Leq
+  | ">" -> Some Gt
+  | ">=" -> Some Geq
+  | "&&" | "/\\" -> Some And
+  | "||" | "\\/" -> Some Or
+  | "->" -> Some Impl
+  | "<->" -> Some Iff
+  | _ -> None
+
+(** The complete source spelling of a specification identifier. *)
+let qualid_key q = Qualified_name.to_string (Qualified_name.of_spec q)
+
+let resolved_call functions libraries path =
+  match Path_bindings.find functions path with
+  | Some name -> Some name
+  | None -> Option.map (Path_bindings.member libraries path) ~f:Qualified_name.to_string
+
+let library_paths libraries =
+  Path_bindings.of_list
+    (List.map libraries ~f:(fun (lib : Library_modules.t) ->
+         (lib.library_path, [ lib.library_name ])))
+
+let runtime_spec env q =
+  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
+      Path_bindings.find env.ctx.proof_support.runtime_functions path)
+
+let atomic_method env = function
+  | S.Qdot (parent, method_) ->
+      Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+          let path = env.ctx.proof_support.canonical_path path in
+          Option.map
+            (List.find env.ctx.proof_support.atomic_updates ~f:(fun signature ->
+                 Source.au_has_path signature.au_source path))
+            ~f:(fun signature -> (signature, method_.pid_str)))
+  | Qid _ -> None
+
+let logical_key env q =
+  let atomic_key =
+    Option.bind (atomic_method env q) ~f:(fun (signature, method_) ->
+        Option.some_if
+          (List.mem [ "pending"; "committed" ] method_ ~equal:String.equal)
+          (signature.au_key ^ "." ^ method_))
+  in
+  match Option.first_some atomic_key (env.ctx.proof_support.proof_key env.ctx.env q) with
+  | Some key -> key
+  | None ->
+      begin match q with
+      | S.Qid _ -> qualid_key q
+      | Qdot (parent, id) ->
+          let view =
+            Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+                Path_bindings.find env.ctx.proof_support.predicate_views
+                  (Path.Pdot (path, id.pid_str)))
+          in
+          begin match view with
+          | Some key -> key
+          | None ->
+              begin match
+                Option.bind
+                  (Source.module_path env.ctx.env parent)
+                  ~f:(Path_bindings.find env.ctx.proof_support.library_paths)
+              with
+              | None -> qualid_key q
+              | Some path ->
+                  Qualified_name.to_string Qualified_name.{ path; name = id.pid_str }
+              end
+          end
+      end
+
+let find_constructor env q =
+  Option.bind (Source.constructor env.ctx.env q) ~f:(Datatypes.find_cstr env.data)
+
+(** The functions of OCaml's standard library on lists that contracts can use, as Raven's
+    [List]'s. *)
+let list_function : S.qualid -> string option = function
+  | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "length"; _ }) -> Some "len"
+  | Qdot (Qid { pid_str = "List"; _ }, { pid_str = "mem"; _ }) -> Some "in"
+  | _ -> None
+
+(** Logical collections have no runtime module or OCaml representation. *)
+let collection_builtin env (q : S.qualid) =
+  match q with
+  | Qdot (Qid m, f)
+    when List.mem [ "Finset"; "Set"; "Map" ] m.pid_str ~equal:String.equal
+         && not (List.Assoc.mem env.funcs (qualid_key q) ~equal:String.equal) ->
+      Some (m.pid_str, f.pid_str)
+  | _ -> None
+
+let atomic_inputs signature method_ =
+  let token = signature.au_token in
+  match method_ with
+  | "bind" -> Some ([ Predef.type_unit ], [ token ])
+  | "access" -> Some (token :: signature.au_inputs, signature.au_implicit)
+  | "abort" -> Some (token :: signature.au_inputs, [])
+  | "commit" ->
+      Some
+        ( (token :: signature.au_inputs)
+          @ (signature.au_result :: signature.au_ghost_outputs),
+          [] )
+  | "pending" -> Some (token :: signature.au_inputs, [ Predef.type_bool ])
+  | "committed" ->
+      Some
+        ( (token :: signature.au_inputs)
+          @ (signature.au_result :: signature.au_ghost_outputs),
+          [ Predef.type_bool ] )
+  | _ -> None
+
+(** Raven takes the concrete inputs and outputs as tuples, including empty ones. *)
+let atomic_arguments ~loc:l signature method_ values =
+  match values with
+  | [] -> []
+  | token :: rest ->
+      let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
+      let inputs = R.Expr.tuple ~loc:l inputs in
+      if List.mem [ "commit"; "committed" ] method_ ~equal:String.equal then
+        let outputs =
+          if is_unit signature.au_result then List.drop outputs 1 else outputs
+        in
+        [ token; inputs; R.Expr.tuple ~loc:l outputs ]
+      else [ token; inputs ]
+
+let resource_module env parent =
+  Option.bind (Source.module_path env.ctx.env parent) ~f:(fun path ->
+      let path = env.ctx.proof_support.canonical_path path in
+      List.find env.ctx.proof_support.resources ~f:(fun resource ->
+          Source.resource_has_path resource path))
+
+let resource_operation env = function
+  | S.Qdot (parent, operation) ->
+      Option.bind (resource_module env parent) ~f:(fun resource ->
+          List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
+              Option.some_if
+                (String.equal name operation.pid_str)
+                {
+                  lemma_raven = resource.resource_backend ^ "." ^ name;
+                  lemma_constant =
+                    List.mem resource.resource_constants name ~equal:String.equal;
+                  lemma_inputs = inputs;
+                  lemma_implicit_count = 0;
+                  lemma_outputs = [ result ];
+                }))
+  | Qid _ -> None
+
+let logical_signature env q =
+  match q with
+  | S.Qid id when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
+  | _ ->
+      begin match resource_operation env q with
+      | Some _ as signature -> signature
+      | None ->
+          List.Assoc.find env.ctx.proof_support.logical_functions (logical_key env q)
+            ~equal:String.equal
+      end
+
+let ghost_descriptor env q =
+  Option.bind (Source.value_path env.ctx.env q) ~f:(fun path ->
+      let path = env.ctx.proof_support.canonical_path path in
+      List.find env.ctx.proof_support.ghost_fields ~f:(fun field ->
+          Path.same path field.Source.field_path || Path.same path (Pident field.field_id)))
+
+let shadowed_ghost_descriptor env = function
+  | S.Qid id -> List.Assoc.mem env.vars id.pid_str ~equal:String.equal
+  | Qdot _ -> false
+
+let ghost_projection env t =
+  match spine t [] with
+  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, [ { term_desc = Tvar field; _ }; owner ]
+    when String.equal m.pid_str "Ghost"
+         && String.equal op.pid_str "at"
+         && not (shadowed_ghost_descriptor env field) ->
+      Option.map (ghost_descriptor env field) ~f:(fun descriptor -> (descriptor, owner))
+  | _ -> None
+
+let ghost_field_name (field : Source.proof_field) =
+  let name = Qualified_name.of_string field.field_backend in
+  Qualified_name.to_string { name with name = "proof$" ^ name.name }
+
+let ghost_operation t =
+  match spine t [] with
+  | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, _ when String.equal m.pid_str "Ghost" ->
+      Some op.pid_str
+  | _ -> None
+
+let is_ghost_fpu t = Option.equal String.equal (ghost_operation t) (Some "fpu")
+
+let same_named_type left right =
+  match (Types.get_desc left, Types.get_desc right) with
+  | Tconstr (left, [], _), Tconstr (right, [], _) -> Path.same left right
+  | _ -> false
+
+let resource_field env (field : Source.proof_field) =
+  Option.exists field.field_resource ~f:(fun owner ->
+      List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+          resource.resource_is_ra && Source.resource_has_path resource owner))
+  || List.exists env.ctx.proof_support.resources ~f:(fun resource ->
+      resource.resource_is_ra && same_named_type field.field_value resource.resource_type)
+
+(** The variable, field and name of [own x.label v], with the empty label for [own x v].
+*)
+let owned_location (t : S.term) =
+  match spine t [] with
+  | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+      [ location; { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ] ) ->
+      begin match location.term_desc with
+      | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid label) ->
+          Some (x, label.pid_str, v)
+      | Tvar (Qid { pid_str = x; _ }) -> Some (x, "", v)
+      | _ -> None
+      end
+  | _ -> None
+
+let is_constructor x =
+  String.equal x "[]" || String.equal x "::"
+  || ((not (String.is_empty x)) && Char.is_uppercase x.[0])
+
+let nullary_constructor (t : S.term) =
+  let head, args = spine t [] in
+  match (head.term_desc, args) with
+  | Tvar (Qid { pid_str = constructor; _ }), [] -> is_constructor constructor
+  | _ -> false
+
+(** The arguments of a constructor of [arity], given as [args]: a tuple for several. *)
+let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
+  match (arity, args) with
+  | n, args when List.length args = n -> Ok args
+  | n, [ a ] when n > 1 ->
+      begin match tuple a with
+      | Some components when List.length components = n -> Ok components
+      | _ -> error at (Printf.sprintf "This constructor expects %d arguments" n)
+      end
+  | n, _ -> error at (Printf.sprintf "This constructor expects %d arguments" n)
+
+(** The variables bound by a specification pattern. *)
+let rec pat_names (p : S.pat) =
+  match p.pat_desc with
+  | Pwild | Pconst _ | Pconstr (_, None) -> []
+  | Pid id -> [ id.pid_str ]
+  | Ptuple ps -> List.concat_map ps ~f:pat_names
+  | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+
+(** The names that the contract term [t] uses free. *)
+let rec term_names (t : S.term) : string list =
+  let without bound names =
+    List.filter names ~f:(fun x -> not (List.mem bound x ~equal:String.equal))
+  in
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar (Qdot _) -> []
+  | Tvar (Qid id) -> [ id.pid_str ]
+  | Tapply (a, b) | Tinfix (a, _, b) -> term_names a @ term_names b
+  | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
+  | Tquant (_, binders, body) ->
+      without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
+  | Tcomprehension ((id, _), body) -> without [ id.pid_str ] (term_names body)
+  | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
+  | Tmatch (t, cases) ->
+      term_names t
+      @ List.concat_map cases ~f:(fun (p, body) ->
+          without (pat_names p) (term_names body))
+  | Ttuple ts -> List.concat_map ts ~f:term_names
+  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
+
+let rec term_references bound (t : S.term) =
+  let refs = term_references bound in
+  match t.term_desc with
+  | Tvar (Qid id) when List.mem bound id.pid_str ~equal:String.equal -> []
+  | Tvar q -> [ q ]
+  | Ttrue | Tfalse | Tconst _ -> []
+  | Tapply (a, b) | Tinfix (a, _, b) -> refs a @ refs b
+  | Tif (a, b, c) -> refs a @ refs b @ refs c
+  | Tquant (_, binders, body) ->
+      term_references (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+  | Tcomprehension ((id, _), body) -> term_references (id.pid_str :: bound) body
+  | Tlet (p, a, b) -> refs a @ term_references (pat_names p @ bound) b
+  | Tmatch (t, cases) ->
+      refs t
+      @ List.concat_map cases ~f:(fun (p, b) -> term_references (pat_names p @ bound) b)
+  | Ttuple ts -> List.concat_map ts ~f:refs
+  | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> refs t
+
+(** The location of the first occurrence of the name [x] in [terms]. *)
+let name_loc (terms : S.term list) x ~default =
+  let rec find (t : S.term) =
+    match t.term_desc with
+    | Tvar (Qid id) when String.equal id.pid_str x -> Some id.pid_loc
+    | Tapply (a, b) | Tinfix (a, _, b) -> Option.first_some (find a) (find b)
+    | Tif (a, b, c) -> List.find_map [ a; b; c ] ~f:find
+    | Tquant (_, _, t)
+    | Tcomprehension (_, t)
+    | Tattr (_, t)
+    | Tcast (t, _)
+    | Told t
+    | Tfield (t, _) ->
+        find t
+    | Tlet (_, a, b) -> Option.first_some (find a) (find b)
+    | Tmatch (t, cases) ->
+        Option.first_some (find t) (List.find_map cases ~f:(fun (_, b) -> find b))
+    | Ttuple ts -> List.find_map ts ~f:find
+    | _ -> None
+  in
+  Option.value (List.find_map terms ~f:find) ~default
+
+(** The names free in [terms] that [env] does not bind, with Raven names for them, and
+    their OCaml and Raven types: a name owned as the value of a field has that field's
+    type, as [n] in [own c.count n]. *)
+let free_typed ?(lenient = false) env (terms : S.term list) ~at =
+  let is_name x =
+    (not (String.is_empty x))
+    && (Char.is_lowercase x.[0] || Char.equal x.[0] '_')
+    && String.for_all x ~f:(fun c ->
+        Char.is_alphanum c || Char.equal c '_' || Char.equal c '\'')
+  in
+  let logical_names =
+    List.concat_map terms ~f:(term_references [])
+    |> List.filter_map ~f:(function
+      | S.Qid id as q ->
+          let key = logical_key env q in
+          Option.some_if
+            (List.Assoc.mem env.ctx.preds key ~equal:String.equal
+            || List.Assoc.mem env.ctx.proof_support.logical_functions key
+                 ~equal:String.equal
+            || List.Assoc.mem env.ctx.proof_lemmas key ~equal:String.equal)
+            id.pid_str
+      | Qdot _ -> None)
+  in
+  let known x =
+    List.Assoc.mem env.vars x ~equal:String.equal
+    || List.Assoc.mem env.funcs x ~equal:String.equal
+    || List.mem logical_names x ~equal:String.equal
+    || Option.is_some (ghost_descriptor env (S.Qid (S.mk_id ~loc:at x)))
+    || List.mem
+         [
+           "own";
+           "not";
+           "max_int";
+           "min_int";
+           "mod";
+           "length";
+           "last";
+           "drop";
+           "take";
+           "to_sequence";
+         ]
+         x ~equal:String.equal
+  in
+  let free =
+    List.concat_map terms ~f:term_names
+    |> List.filter ~f:(fun x -> is_name x && not (known x))
+    |> List.dedup_and_sort ~compare:String.compare
+  in
+  (* The types of the values of fields that [t] owns; and of names passed to predicates. *)
+  let rec owned (t : S.term) =
+    match (owned_location t, S.(t.term_desc)) with
+    | Some (x, label, v), _ ->
+        Option.to_list
+          (Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
+             ~f:(fun typ ->
+               Option.map (field_type env.ctx typ label) ~f:(fun t -> (v, t))))
+    | None, (Tapply (a, b) | Tinfix (a, _, b)) -> owned a @ owned b
+    | None, Tif (a, b, c) -> owned a @ owned b @ owned c
+    | None, (Tattr (_, t) | Tcast (t, _)) -> owned t
+    | None, _ -> []
+  in
+  let passed =
+    Spec_arguments.predicate_parameters ~bound:[] terms ~lookup:(fun q ->
+        Option.map
+          (List.Assoc.find env.ctx.preds (logical_key env q) ~equal:String.equal)
+          ~f:snd)
+    |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
+  in
+  let owned = List.concat_map terms ~f:owned @ passed in
+  let* typed =
+    all free ~f:(fun x ->
+        match List.Assoc.find owned x ~equal:String.equal with
+        | None when lenient -> Ok None
+        | None ->
+            error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x)
+        | Some t ->
+            let l = loc at in
+            let* typ = typ env.ctx ~at t in
+            let raven = Names.fresh env.ctx.names x in
+            Ok (Some (x, raven, t, typ, l)))
+  in
+  Ok (List.filter_opt typed)
+
+(** The fields of the state [x], if [x] is one. *)
+let state_fields env x =
+  match List.Assoc.find env.vars x ~equal:String.equal with
+  | Some (State fields) -> Some fields
+  | _ -> None
+
+(** Whether a local module has a hidden representation in this lexical environment. *)
+let opaque_module_path env path =
+  match path with
+  | Path.Pdot _ ->
+      Option.exists (Datatypes.find env.ctx.types path) ~f:(fun data ->
+          (Option.is_some data.id
+          || List.mem env.ctx.proof_support.public_types path ~equal:Path.same)
+          &&
+            try
+              let declaration = Env.find_type path env.ctx.env in
+              (match declaration.type_kind with
+                | Types.Type_abstract _ -> true
+                | _ -> false)
+              && Option.is_none declaration.type_manifest
+              || Poly.equal declaration.type_private Asttypes.Private
+            with Stdlib.Not_found -> false)
+  | Pident _ | Papply _ | Pextra_ty _ -> false
+
+let opaque_module_types env =
+  env.ctx.proof_support.strict_source_types
+  || List.exists env.ctx.types ~f:(fun data ->
+      List.exists data.Datatypes.paths ~f:(opaque_module_path env))
