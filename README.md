@@ -32,7 +32,7 @@ predicates, invariants and lemmas. Proofs can use private implementation types.
 Module signatures expose abstract resource contracts while hiding their definitions
 and implementation lemmas. Aliases preserve resource identity. AU facades can be
 scoped to source modules, with qualified operation and token names. State records,
-views and actions also support static module scopes. Supported named single-parameter
+views and actions also support static module scopes. Supported named, unit and curried
 functors can contain logical datatypes, pure functions, predicates and lemmas used
 by manual scopes and clients of applied result modules. Their definitions and proofs
 are translated once in a shared Raven functor, with shared result layouts for
@@ -43,8 +43,9 @@ instantiate resource algebras, declare ghost fields, and use AU facades for thei
 own operations. Tokens retain their application identities through aliases;
 Raven checks their lifecycle and atomicity. State records, invariant views and
 actions in these functors reuse the automatic proof machinery, with initialization
-and history facts scoped to each application. Repeated applications to the same
-argument, including aliases, share proof identity.
+and history facts scoped to each application. Partial applications retain their
+parameter bindings. Applicative applications share proof identity through aliases;
+unit applications introduce fresh identities, which their aliases preserve.
 
 Proofs can instantiate Raven library modules using OCaml-style module applications.
 Their types, constructors, operations and parameter requirements come from Raven's
@@ -131,8 +132,9 @@ Curried applications and partial applications such as `module With_A = Make (A)`
 and `module Client = With_A (B)` preserve the same result types as `Make (A) (B)`.
 Each application checks the complete argument against the parameter signature.
 Eligible bodies share one generic proof across applications, including parameters
-with invariant resources. Manual proofs and other unsupported generic encodings
-retain separate verified specializations. Parameter calls use the signature's
+with invariant resources, explicit proofs and captured static proof declarations.
+Bodies outside the supported generic representation and runtime subset retain
+separate verified specializations. Parameter calls use the signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
 names retain their definition-time scope. Unused functor bodies are not verified.
 Result variants and records share their types and mutable fields across repeated

@@ -215,13 +215,6 @@ let child_scope ?(check_header = true) parent (name : S.id) parameters location 
 
 let definition_scope parent (name : S.id) interface location =
   let at = name.pid_loc in
-  let* () =
-    match parent.parameters with
-    | [] | [ Named (Some _, _, _) ] -> Ok ()
-    | _ ->
-        Report.unsupported at
-          "A proof-defined module inside a multi-parameter or unit functor"
-  in
   let* id, public_type =
     match Env.find_module_by_name (Longident.Lident name.pid_str) parent.environment with
     | Pident id, declaration -> Ok (id, declaration.md_type)

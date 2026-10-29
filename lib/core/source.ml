@@ -108,6 +108,7 @@ type t = {
   signature_resources : (Location.t * proof_resource) list;
   proof_fields : proof_field list;
   proof_aus : proof_au list;
+  proof_applications : Functor_context.application list;
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be
           helped, each on a key. *)
@@ -301,28 +302,32 @@ let annotation_env ?at source lexical_env =
             specification_bindings scope.structure.str_final_env scope.environment
           in
           let parameter_projection =
-            match scope.parameters with
-            | [ Named (Some parameter, _, _) ] ->
-                begin try
-                  let original =
-                    Env.find_module (Pident parameter) scope.structure.str_final_env
-                  in
-                  Option.bind
-                    (matching_module (Ident.name parameter) original.md_loc
-                       (Env.summary lexical_env))
-                    ~f:(fun path ->
-                      Option.some_if
-                        (not (Path.same path (Pident parameter)))
-                        (parameter, path))
-                with Stdlib.Not_found -> None
-                end
-            | _ -> None
+            List.filter_map scope.parameters ~f:(function
+              | Named (Some parameter, _, _) ->
+                  begin try
+                    let original =
+                      Env.find_module (Pident parameter) scope.structure.str_final_env
+                    in
+                    Option.bind
+                      (matching_module (Ident.name parameter) original.md_loc
+                         (Env.summary lexical_env))
+                      ~f:(fun path ->
+                        Option.some_if
+                          (not (Path.same path (Pident parameter)))
+                          (parameter, path))
+                  with Stdlib.Not_found -> None
+                  end
+              | Unit | Named (None, _, _) -> None)
           in
           let substitution, changed =
             match parameter_projection with
-            | None -> (Subst.identity, false)
-            | Some (parameter, path) ->
-                let substitution = Subst.add_module parameter path Subst.identity in
+            | [] -> (Subst.identity, false)
+            | _ :: _ ->
+                let substitution =
+                  List.fold parameter_projection ~init:Subst.identity
+                    ~f:(fun substitution (parameter, path) ->
+                      Subst.add_module parameter path substitution)
+                in
                 List.fold (source_type_ids scope.structure) ~init:(substitution, true)
                   ~f:(fun (substitution, changed) (id, name) ->
                     try
@@ -1577,48 +1582,52 @@ let signature_ghost_modules ~comments (scope : Proof_scopes.scope) =
     && outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
     && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
   in
-  match scope.parameters with
-  | [
-   Named
-     ( Some parameter,
-       _,
-       ({ mty_desc = Tmty_ident (path, _); mty_env; mty_loc; _ } : Typedtree.module_type)
-     );
-  ] ->
-      let rec declared seen path =
-        let path = Env.normalize_modtype_path mty_env path in
-        if List.mem seen path ~equal:Path.same then
-          Error (Report.error Type mty_loc "A cyclic module type alias")
-        else
-          let declaration = Env.find_modtype path mty_env in
+  let parameter (parameter : Typedtree.functor_parameter) =
+    match parameter with
+    | Named
+        ( Some parameter,
+          _,
+          ({ mty_desc = Tmty_ident (path, _); mty_env; mty_loc; _ } :
+            Typedtree.module_type) ) ->
+        let rec declared seen path =
+          let path = Env.normalize_modtype_path mty_env path in
+          if List.mem seen path ~equal:Path.same then
+            Error (Report.error Type mty_loc "A cyclic module type alias")
+          else
+            let declaration = Env.find_modtype path mty_env in
+            match declaration.mtd_type with
+            | Some (Mty_ident next) -> declared (path :: seen) next
+            | Some (Mty_signature _ | Mty_functor _ | Mty_alias _) | None ->
+                Ok declaration
+        in
+        let* declaration = declared [] path in
+        let nested =
           match declaration.mtd_type with
-          | Some (Mty_ident next) -> declared (path :: seen) next
-          | Some (Mty_signature _ | Mty_functor _ | Mty_alias _) | None -> Ok declaration
-      in
-      let* declaration = declared [] path in
-      let nested =
-        match declaration.mtd_type with
-        | Some module_type ->
-            begin match Mtype.scrape mty_env module_type with
-            | Mty_signature members ->
-                List.filter_map members ~f:(function
-                  | Types.Sig_module (_, _, declaration, _, _) -> Some declaration.md_loc
-                  | Sig_modtype (_, declaration, _) -> Some declaration.mtd_loc
-                  | _ -> None)
-            | Mty_ident _ | Mty_functor _ | Mty_alias _ -> []
-            end
-        | None -> []
-      in
-      let annotations =
-        Annotation.of_comments comments
-        |> List.filter ~f:(fun annotation ->
-            Poly.equal (Annotation.kind annotation) Annotation.Ghost_module
-            && within declaration.mtd_loc annotation.loc
-            && not (List.exists nested ~f:(fun loc -> within loc annotation.loc)))
-      in
-      let* modules = Result.all (List.map annotations ~f:Annotation.ghost_module) in
-      Ok (Some (parameter, modules))
-  | [ Named _ ] | [ Unit ] | _ -> Ok None
+          | Some module_type ->
+              begin match Mtype.scrape mty_env module_type with
+              | Mty_signature members ->
+                  List.filter_map members ~f:(function
+                    | Types.Sig_module (_, _, declaration, _, _) ->
+                        Some declaration.md_loc
+                    | Sig_modtype (_, declaration, _) -> Some declaration.mtd_loc
+                    | _ -> None)
+              | Mty_ident _ | Mty_functor _ | Mty_alias _ -> []
+              end
+          | None -> []
+        in
+        let annotations =
+          Annotation.of_comments comments
+          |> List.filter ~f:(fun annotation ->
+              Poly.equal (Annotation.kind annotation) Annotation.Ghost_module
+              && within declaration.mtd_loc annotation.loc
+              && not (List.exists nested ~f:(fun loc -> within loc annotation.loc)))
+        in
+        let* modules = Result.all (List.map annotations ~f:Annotation.ghost_module) in
+        Ok (Some (parameter, modules))
+    | Named _ | Unit -> Ok None
+  in
+  let* found = Result.all (List.map scope.parameters ~f:parameter) in
+  Ok (List.filter_opt found)
 
 let implicit_ghost_scopes ~comments (scopes : Proof_scopes.t) =
   let has_body (expression : Typedtree.module_expr) =
@@ -1651,12 +1660,12 @@ let implicit_ghost_scopes ~comments (scopes : Proof_scopes.t) =
               let current = Option.value existing ~default:candidate in
               let* abstract =
                 match current.parameters with
-                | [ Named (Some _, _, { mty_desc = Tmty_ident _; _ }) ] ->
+                | _ :: _ ->
                     let* declared = signature_ghost_modules ~comments current in
                     Ok
-                      (Option.exists declared ~f:(fun (_, modules) ->
+                      (List.exists declared ~f:(fun (_, modules) ->
                            not (List.is_empty modules)))
-                | _ -> Ok false
+                | [] -> Ok false
               in
               let found =
                 if abstract && Option.is_none existing then found @ [ candidate ]
@@ -1776,7 +1785,11 @@ let public_ghost_modules ?public_interface ~comments scopes scope =
       | _ :: _, _ -> None))
 
 let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = [])
-    ~comments runtime_env root_env (scopes : Proof_scopes.t) =
+    ~applications ~comments runtime_env root_env (scopes : Proof_scopes.t) =
+  let applications =
+    List.filter applications ~f:(fun (application : Functor_context.application) ->
+        not application.sealed)
+  in
   let root_bindings = specification_bindings runtime_env root_env in
   let aliases =
     List.concat_map scopes.scopes ~f:(fun scope ->
@@ -1863,10 +1876,10 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
   in
   let abstract_resources scope base =
     let* declared = signature_ghost_modules ~comments scope in
-    match declared with
-    | None -> Ok (base, [])
-    | Some (parameter, modules) ->
-        List.fold_result modules ~init:(base, []) ~f:(fun (base, resources) declaration ->
+    List.fold_result declared ~init:(base, [])
+      ~f:(fun (base, resources) (parameter, modules) ->
+        List.fold_result modules ~init:(base, resources)
+          ~f:(fun (base, resources) declaration ->
             let name = declaration.S.ghost_module_name in
             let interface = declaration.ghost_module_interface in
             let at = name.pid_loc in
@@ -2002,7 +2015,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 resource_at = at;
               }
             in
-            Ok (env, resources @ [ resource ]))
+            Ok (env, resources @ [ resource ])))
   in
   let public_functor_result scope =
     let rec result (expression : Typedtree.module_expr) =
@@ -2048,13 +2061,13 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                  || Option.is_some scope.definition
                     && Option.equal Path.same scope.parent ancestor.owner ->
               begin match ancestor.parameters with
-              | [ Named (Some _, _, _) ] ->
+              | _ :: _ ->
                   List.for_all proof ~f:(function
                     | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
                     | Proof_au _ ->
                         true
                     | _ -> false)
-              | _ -> false
+              | [] -> false
               end
           | Some _ | None -> false
         in
@@ -2519,6 +2532,14 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             (name, member.declaration_id, member.sealed)))
     |> Option.all
   in
+  let rec extend_functor_result env typ bindings =
+    match Mtype.scrape env typ with
+    | Mty_signature signature -> Some (Types.Mty_signature (signature @ bindings))
+    | Mty_functor (parameter, result) ->
+        Option.map (extend_functor_result env result bindings) ~f:(fun result ->
+            Types.Mty_functor (parameter, result))
+    | Mty_ident _ | Mty_alias _ -> None
+  in
   let rec extend_signature env signature chain bindings =
     match chain with
     | [] -> signature @ bindings
@@ -2547,11 +2568,11 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                       declaration with
                       md_type = Mty_signature (extend_signature env body rest bindings);
                     }
-                | Mty_functor (parameter, Mty_signature body) when List.is_empty rest ->
-                    {
-                      declaration with
-                      md_type = Mty_functor (parameter, Mty_signature (body @ bindings));
-                    }
+                | Mty_functor _ when List.is_empty rest ->
+                    Option.value_map
+                      (extend_functor_result env declaration.md_type bindings)
+                      ~default:declaration ~f:(fun md_type ->
+                        { declaration with md_type })
                 | Mty_ident _ | Mty_functor _ | Mty_alias _ -> declaration
               in
               Types.Sig_module (found, presence, declaration, rec_status, visibility)
@@ -2573,13 +2594,12 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     Env.add_module_declaration ~check:false id Mp_present
                       { declaration with md_type = Mty_signature signature }
                       env
-                | Mty_functor (parameter, Mty_signature body) when List.is_empty rest ->
-                    Env.add_module_declaration ~check:false id Mp_present
-                      {
-                        declaration with
-                        md_type = Mty_functor (parameter, Mty_signature (body @ bindings));
-                      }
-                      env
+                | Mty_functor _ when List.is_empty rest ->
+                    Option.value_map
+                      (extend_functor_result env declaration.md_type bindings)
+                      ~default:env ~f:(fun md_type ->
+                        Env.add_module_declaration ~check:false id Mp_present
+                          { declaration with md_type } env)
                 | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
                 end
             | _ -> env
@@ -2611,14 +2631,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                               Some
                                 (Types.Mty_signature
                                    (extend_signature env signature rest [ member ]))
-                          | Mty_functor (parameter, result) when List.is_empty rest ->
-                              begin match Mtype.scrape env result with
-                              | Mty_signature body ->
-                                  Some
-                                    (Types.Mty_functor
-                                       (parameter, Types.Mty_signature (body @ [ member ])))
-                              | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
-                              end
+                          | Mty_functor _ when List.is_empty rest ->
+                              extend_functor_result env root.md_type [ member ]
                           | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
                         in
                         Option.value_map patched ~default:env ~f:(fun md_type ->
@@ -2628,150 +2642,91 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     end)
         | _ -> env)
   in
-  let module_path expression =
-    let rec path (expression : Typedtree.module_expr) =
-      match expression.mod_desc with
-      | Tmod_ident (path, _) -> Some path
-      | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> path inner
-      | Tmod_structure _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _
-      | Tmod_unpack _
-      | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
-          None
-    in
-    path expression
-  in
-  let application expression =
-    let rec applied (expression : Typedtree.module_expr) =
-      match expression.mod_desc with
-      | Tmod_apply (functor_expression, argument_expression, _) ->
-          Option.both (module_path functor_expression) (module_path argument_expression)
-      | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> applied inner
-      | Tmod_ident _ | Tmod_structure _ | Tmod_functor _ | Tmod_apply_unit _
-      | Tmod_unpack _
-      | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
-          None
-    in
-    applied expression
-  in
-  let rec applications chain (structure : Typedtree.structure) =
-    List.concat_map structure.str_items ~f:(fun item ->
-        match item.str_desc with
-        | Tstr_module { mb_id = Some id; mb_name = { txt = Some name; _ }; mb_expr; _ } ->
-            let chain = chain @ [ (name, Some id, false) ] in
-            let own =
-              Option.to_list
-                (Option.map (application mb_expr) ~f:(fun app -> (chain, app)))
-            in
-            let rec nested (expression : Typedtree.module_expr) =
-              match expression.mod_desc with
-              | Tmod_structure structure -> applications chain structure
-              | Tmod_constraint (inner, _, Tmodtype_implicit, _) -> nested inner
-              | Tmod_ident _ | Tmod_functor _ | Tmod_apply _ | Tmod_apply_unit _
-              | Tmod_unpack _
-              | Tmod_constraint (_, _, Tmodtype_explicit _, _) ->
-                  []
-            in
-            own @ nested mb_expr
-        | _ -> [])
-  in
   let application_carriers = ref [] in
-  let qualified_env =
-    List.fold (applications [] scopes.root.structure) ~init:qualified_env
-      ~f:(fun env (chain, (functor_path, argument_path)) ->
-        let normalized =
-          Env.normalize_module_path None env functor_path
-          |> Proof_scopes.canonical_owner scopes
-        in
+  let qualified_env, projected_applications =
+    List.fold applications ~init:(qualified_env, [])
+      ~f:(fun (env, projected) (application : Functor_context.application) ->
         let template =
           List.find typed ~f:(fun (scope, _, bindings) ->
               (not (List.is_empty bindings))
-              && Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
-              && public_functor_result scope
-              &&
-              match scope.parameters with
-              | [ Named (Some _, _, _) ] -> true
-              | _ -> false)
+              && Functor_context.same_scope scope application.scope
+              && public_functor_result scope)
         in
         begin match template with
-        | None -> env
+        | None -> (env, projected)
         | Some (scope, (_, _, resources, _, _), bindings) ->
-            begin match scope.parameters with
-            | [ Named (Some parameter, _, _) ] ->
-                let identity = Path.Papply (functor_path, argument_path) in
-                let carrier_identity =
-                  Path.Papply
-                    ( Env.normalize_module_path None env functor_path,
-                      Env.normalize_module_path None env argument_path )
-                in
-                let env =
-                  List.fold resources ~init:env ~f:(fun env resource ->
-                      List.fold resource.resource_type_members ~init:env
-                        ~f:(fun env (_, hidden, declaration) ->
-                          let existing =
-                            List.find !application_carriers
-                              ~f:(fun (identity, member, _) ->
-                                Path.same identity carrier_identity
-                                && Ident.same member hidden)
+            let identity = application.applicative_identity in
+            let carrier_identity = Env.normalize_module_path None env identity in
+            let env =
+              List.fold resources ~init:env ~f:(fun env resource ->
+                  List.fold resource.resource_type_members ~init:env
+                    ~f:(fun env (_, hidden, declaration) ->
+                      let existing =
+                        List.find !application_carriers ~f:(fun (identity, member, _) ->
+                            Path.same identity carrier_identity
+                            && Ident.same member hidden)
+                      in
+                      match existing with
+                      | Some _ -> env
+                      | None ->
+                          let anchor =
+                            Ident.create_local
+                              (Compiler_types.internal_name ~at:resource.resource_at
+                                 (resource.resource_name ^ "_app"))
                           in
-                          match existing with
-                          | Some _ -> env
-                          | None ->
-                              let anchor =
-                                Ident.create_local
-                                  (Compiler_types.internal_name ~at:resource.resource_at
-                                     (resource.resource_name ^ "_app"))
-                              in
-                              application_carriers :=
-                                (carrier_identity, hidden, anchor)
-                                :: !application_carriers;
-                              Env.add_type ~check:false anchor declaration env))
-                in
-                let substitution =
-                  Subst.add_module parameter argument_path Subst.identity
-                in
-                let substitution =
-                  List.fold (source_type_ids scope.structure) ~init:substitution
-                    ~f:(fun substitution (id, name) ->
-                      Subst.add_type id (Path.Pdot (identity, name)) substitution)
-                in
-                let substitution =
-                  List.fold !application_carriers ~init:substitution
-                    ~f:(fun substitution (key, hidden, anchor) ->
-                      if Path.same key carrier_identity then
-                        Subst.add_type hidden (Path.Pident anchor) substitution
-                      else substitution)
-                in
-                let bindings = Subst.signature Keep substitution bindings in
-                let bindings =
-                  match
-                    Mtype.strengthen ~aliasable:true env (Mty_signature bindings)
-                      carrier_identity
-                  with
-                  | Mty_signature bindings -> bindings
-                  | Mty_ident _ | Mty_functor _ | Mty_alias _ -> bindings
-                in
-                begin match chain with
-                | (root_name, Some root_id, _) :: rest ->
-                    begin match Env.find_module_by_name (Lident root_name) env with
-                    | Pident found, declaration when Ident.same found root_id ->
-                        begin match Mtype.scrape env declaration.md_type with
-                        | Mty_signature signature ->
-                            Env.add_module_declaration ~check:false root_id Mp_present
-                              {
-                                declaration with
-                                md_type =
-                                  Mty_signature
-                                    (extend_signature env signature rest bindings);
-                              }
-                              env
-                        | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
-                        end
-                    | _ -> env
-                    end
-                | _ -> env
-                end
-            | _ -> env
-            end
+                          application_carriers :=
+                            (carrier_identity, hidden, anchor) :: !application_carriers;
+                          Env.add_type ~check:false anchor declaration env))
+            in
+            let substitution = Functor_context.substitution application in
+            let substitution =
+              List.fold (source_type_ids scope.structure) ~init:substitution
+                ~f:(fun substitution (id, name) ->
+                  Subst.add_type id (Path.Pdot (identity, name)) substitution)
+            in
+            let substitution =
+              List.fold !application_carriers ~init:substitution
+                ~f:(fun substitution (key, hidden, anchor) ->
+                  if Path.same key carrier_identity then
+                    Subst.add_type hidden (Path.Pident anchor) substitution
+                  else substitution)
+            in
+            let bindings = Subst.signature Keep substitution bindings in
+            let bindings =
+              if Path.same carrier_identity application.result then bindings
+              else
+                match
+                  Mtype.strengthen ~aliasable:true env (Mty_signature bindings)
+                    carrier_identity
+                with
+                | Mty_signature bindings -> bindings
+                | Mty_ident _ | Mty_functor _ | Mty_alias _ -> bindings
+            in
+            let env =
+              match application.chain with
+              | (root_name, root_id) :: rest ->
+                  let rest =
+                    List.map rest ~f:(fun (name, id) -> (name, Some id, false))
+                  in
+                  begin match Env.find_module_by_name (Lident root_name) env with
+                  | Pident found, declaration when Ident.same found root_id ->
+                      begin match Mtype.scrape env declaration.md_type with
+                      | Mty_signature signature ->
+                          Env.add_module_declaration ~check:false root_id Mp_present
+                            {
+                              declaration with
+                              md_type =
+                                Mty_signature
+                                  (extend_signature env signature rest bindings);
+                            }
+                            env
+                      | Mty_ident _ | Mty_functor _ | Mty_alias _ -> env
+                      end
+                  | _ -> env
+                  end
+              | [] -> env
+            in
+            (env, (application, bindings) :: projected)
         end)
   in
   let qualified_env =
@@ -2788,134 +2743,127 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         | Pdot _ | Papply _ | Pextra_ty _ -> env)
   in
   let application_resources =
-    List.concat_map (applications [] scopes.root.structure)
-      ~f:(fun (chain, (functor_path, argument_path)) ->
-        let normalized =
-          Env.normalize_module_path None qualified_env functor_path
-          |> Proof_scopes.canonical_owner scopes
-        in
+    List.concat_map applications ~f:(fun (application : Functor_context.application) ->
         let template =
           List.find typed ~f:(fun (scope, _, _) ->
-              Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
-              &&
-              match scope.parameters with
-              | [ Named (Some _, _, _) ] -> true
-              | _ -> false)
+              Functor_context.same_scope scope application.scope)
         in
-        let view_owner =
-          List.fold chain ~init:None ~f:(fun path (name, id, _) ->
-              match (path, id) with
-              | None, Some id -> Some (Path.Pident id)
-              | Some path, Some _ -> Some (Path.Pdot (path, name))
-              | _, None -> path)
-        in
-        match (template, view_owner) with
-        | Some (scope, (_, _, resources, _, _), _), Some view_owner ->
-            begin match scope.parameters with
-            | [ Named (Some parameter, _, _) ] ->
-                let carrier_identity =
-                  Path.Papply
-                    ( Env.normalize_module_path None qualified_env functor_path,
-                      Env.normalize_module_path None qualified_env argument_path )
-                in
-                List.filter resources ~f:(fun resource ->
-                    (not resource.resource_abstract)
-                    && Option.equal Path.same resource.resource_scope scope.owner)
-                |> List.map ~f:(fun resource ->
-                    let view_path = Path.Pdot (view_owner, resource.resource_name) in
-                    let project ~private_resource original =
-                      let id =
-                        Ident.create_local
-                          (if private_resource then
-                             Compiler_types.internal_name ~at:original.resource_at
-                               (original.resource_name ^ "_app")
-                           else original.resource_name)
+        match template with
+        | Some (scope, (_, _, resources, _, _), _) ->
+            let view_owner = application.result in
+            let carrier_identity =
+              Env.normalize_module_path None qualified_env
+                application.applicative_identity
+            in
+            List.filter resources ~f:(fun resource ->
+                (not resource.resource_abstract)
+                && Option.equal Path.same resource.resource_scope scope.owner)
+            |> List.map ~f:(fun resource ->
+                let view_path = Path.Pdot (view_owner, resource.resource_name) in
+                let project ~private_resource original =
+                  let id =
+                    Ident.create_local
+                      (if private_resource then
+                         Compiler_types.internal_name ~at:original.resource_at
+                           (original.resource_name ^ "_app")
+                       else original.resource_name)
+                  in
+                  let path = Path.Pdot (view_owner, original.resource_name) in
+                  let substitution =
+                    Functor_context.substitution application
+                    |> Subst.add_module original.resource_id path
+                  in
+                  let substitution =
+                    List.fold original.resource_type_members ~init:substitution
+                      ~f:(fun substitution (_, hidden, _) ->
+                        let anchor =
+                          List.find_map !application_carriers
+                            ~f:(fun (key, member, anchor) ->
+                              Option.some_if
+                                (Path.same key carrier_identity
+                                && Ident.same member hidden)
+                                anchor)
+                        in
+                        let target =
+                          Option.value_map anchor
+                            ~default:(Path.Pdot (path, "t"))
+                            ~f:(fun anchor -> Path.Pident anchor)
+                        in
+                        Subst.add_type hidden target substitution)
+                  in
+                  let descriptor =
+                    Datatypes.resource_type ~name:original.resource_name ~module_id:id
+                      ~at:original.resource_at
+                  in
+                  let descriptor =
+                    if Option.is_some original.resource_public then descriptor
+                    else
+                      let owners =
+                        Functor_context.result_paths application
+                        @ List.filter_map aliases ~f:(fun (alias, target) ->
+                            Option.some_if
+                              (Path.same target carrier_identity
+                              || List.exists
+                                   (Functor_context.result_paths application)
+                                   ~f:(Path.same target))
+                              alias)
+                        |> List.dedup_and_sort ~compare:Path.compare
                       in
-                      let path = Path.Pdot (view_owner, original.resource_name) in
-                      let substitution =
-                        Subst.add_module parameter argument_path Subst.identity
-                        |> Subst.add_module original.resource_id path
-                      in
-                      let substitution =
-                        List.fold original.resource_type_members ~init:substitution
-                          ~f:(fun substitution (_, hidden, _) ->
-                            let anchor =
-                              List.find_map !application_carriers
-                                ~f:(fun (key, member, anchor) ->
-                                  Option.some_if
-                                    (Path.same key carrier_identity
-                                    && Ident.same member hidden)
-                                    anchor)
-                            in
-                            let target =
-                              Option.value_map anchor
-                                ~default:(Path.Pdot (path, "t"))
-                                ~f:(fun anchor -> Path.Pident anchor)
-                            in
-                            Subst.add_type hidden target substitution)
-                      in
-                      let descriptor =
-                        Datatypes.resource_type ~name:original.resource_name ~module_id:id
-                          ~at:original.resource_at
-                      in
-                      let descriptor =
-                        if Option.is_some original.resource_public then descriptor
-                        else Datatypes.with_paths descriptor [ Path.Pdot (path, "t") ]
-                      in
-                      {
-                        original with
-                        resource_scope = None;
-                        resource_path = path;
-                        resource_environment = qualified_env;
-                        resource_arguments =
-                          List.map original.resource_arguments ~f:(function
-                            | Type_argument typ ->
-                                Type_argument (Subst.type_expr substitution typ)
-                            | Module_argument path ->
-                                Module_argument (Subst.module_path substitution path));
-                        resource_alias_of =
-                          Option.map original.resource_alias_of
-                            ~f:(Subst.module_path substitution);
-                        resource_type_members = [];
-                        resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
-                        resource_id = id;
-                        resource_operations =
-                          List.map original.resource_operations
-                            ~f:(fun (name, inputs, output) ->
-                              ( name,
-                                List.map inputs ~f:(Subst.type_expr substitution),
-                                Subst.type_expr substitution output ));
-                        resource_descriptor = descriptor;
-                        resource_aliases =
-                          List.map original.resource_aliases ~f:(fun alias ->
-                              let member =
-                                match alias.Datatypes.library with
-                                | Some (Pdot (_, member)) -> member
-                                | _ -> "element"
-                              in
-                              {
-                                (Datatypes.library_type ~library:original.resource_name
-                                   ~library_id:id ~at:original.resource_at member)
-                                with
-                                alias =
-                                  Option.map alias.alias ~f:(Subst.type_expr substitution);
-                              });
-                        resource_public = None;
-                        resource_application =
-                          Some (carrier_identity, original.resource_id);
-                      }
-                    in
-                    let projected = project ~private_resource:true resource in
-                    let public =
-                      Option.map resource.resource_public ~f:(fun public ->
+                      Datatypes.with_paths descriptor
+                        (List.map owners ~f:(fun owner ->
+                             Path.Pdot (Path.Pdot (owner, original.resource_name), "t")))
+                  in
+                  {
+                    original with
+                    resource_scope = None;
+                    resource_path = path;
+                    resource_environment = qualified_env;
+                    resource_arguments =
+                      List.map original.resource_arguments ~f:(function
+                        | Type_argument typ ->
+                            Type_argument (Subst.type_expr substitution typ)
+                        | Module_argument path ->
+                            Module_argument (Subst.module_path substitution path));
+                    resource_alias_of =
+                      Option.map original.resource_alias_of
+                        ~f:(Subst.module_path substitution);
+                    resource_type_members = [];
+                    resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
+                    resource_id = id;
+                    resource_operations =
+                      List.map original.resource_operations
+                        ~f:(fun (name, inputs, output) ->
+                          ( name,
+                            List.map inputs ~f:(Subst.type_expr substitution),
+                            Subst.type_expr substitution output ));
+                    resource_descriptor = descriptor;
+                    resource_aliases =
+                      List.map original.resource_aliases ~f:(fun alias ->
+                          let member =
+                            match alias.Datatypes.library with
+                            | Some (Pdot (_, member)) -> member
+                            | _ -> "element"
+                          in
                           {
-                            (project ~private_resource:false public) with
-                            resource_path = view_path;
-                          })
-                    in
-                    { projected with resource_public = public })
-            | _ -> []
-            end
+                            (Datatypes.library_type ~library:original.resource_name
+                               ~library_id:id ~at:original.resource_at member)
+                            with
+                            alias =
+                              Option.map alias.alias ~f:(Subst.type_expr substitution);
+                          });
+                    resource_public = None;
+                    resource_application = Some (carrier_identity, original.resource_id);
+                  }
+                in
+                let projected = project ~private_resource:true resource in
+                let public =
+                  Option.map resource.resource_public ~f:(fun public ->
+                      {
+                        (project ~private_resource:false public) with
+                        resource_path = view_path;
+                      })
+                in
+                { projected with resource_public = public })
         | _ -> [])
   in
   let qualified_env =
@@ -2930,48 +2878,49 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                          Ident.same original.resource_id template_id))
                     ~f:(fun original -> (scope, original)))
             in
-            begin match (identity, template) with
-            | Path.Papply (_, argument), Some (scope, original) ->
-                begin match scope.parameters with
-                | [ Named (Some parameter, _, _) ] ->
-                    let substitution =
-                      Subst.add_module parameter argument Subst.identity
-                    in
-                    let substitution =
-                      List.fold (source_type_ids scope.structure) ~init:substitution
-                        ~f:(fun substitution (id, name) ->
-                          Subst.add_type id (Path.Pdot (identity, name)) substitution)
-                    in
-                    let substitution =
-                      List.fold !application_carriers ~init:substitution
-                        ~f:(fun substitution (key, hidden, anchor) ->
-                          if Path.same key identity then
-                            Subst.add_type hidden (Path.Pident anchor) substitution
-                          else substitution)
-                    in
-                    let substitution =
-                      Subst.add_module original.resource_id
-                        (Path.Pident resource.resource_id) substitution
-                    in
-                    let declaration =
-                      Env.find_module (Path.Pident original.resource_id)
-                        original.resource_environment
-                      |> Subst.module_declaration Keep substitution
-                    in
-                    let declaration =
-                      match original.resource_alias_of with
-                      | Some alias_of ->
-                          {
-                            declaration with
-                            md_type = Mty_alias (Subst.module_path substitution alias_of);
-                          }
-                      | None -> declaration
-                    in
-                    Env.add_module_declaration ~check:false resource.resource_id
-                      Mp_present declaration env
-                | _ -> env
-                end
-            | (Pident _ | Pdot _ | Pextra_ty _), _ | Papply _, None -> env
+            let application =
+              List.find applications
+                ~f:(fun (application : Functor_context.application) ->
+                  Path.same identity
+                    (Env.normalize_module_path None env application.applicative_identity))
+            in
+            begin match (application, template) with
+            | Some application, Some (scope, original)
+              when Functor_context.same_scope scope application.scope ->
+                let substitution = Functor_context.substitution application in
+                let substitution =
+                  List.fold (source_type_ids scope.structure) ~init:substitution
+                    ~f:(fun substitution (id, name) ->
+                      Subst.add_type id (Path.Pdot (identity, name)) substitution)
+                in
+                let substitution =
+                  List.fold !application_carriers ~init:substitution
+                    ~f:(fun substitution (key, hidden, anchor) ->
+                      if Path.same key identity then
+                        Subst.add_type hidden (Path.Pident anchor) substitution
+                      else substitution)
+                in
+                let substitution =
+                  Subst.add_module original.resource_id (Path.Pident resource.resource_id)
+                    substitution
+                in
+                let declaration =
+                  Env.find_module (Path.Pident original.resource_id)
+                    original.resource_environment
+                  |> Subst.module_declaration Keep substitution
+                in
+                let declaration =
+                  match original.resource_alias_of with
+                  | Some alias_of ->
+                      {
+                        declaration with
+                        md_type = Mty_alias (Subst.module_path substitution alias_of);
+                      }
+                  | None -> declaration
+                in
+                Env.add_module_declaration ~check:false resource.resource_id Mp_present
+                  declaration env
+            | _ -> env
             end)
   in
   let qualified_env =
@@ -2993,14 +2942,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             | None -> env
             | Some (scope, _) when public_functor_result scope -> env
             | Some (scope, template_public) ->
-                let carrier_identity =
-                  match identity with
-                  | Path.Papply (fn, argument) ->
-                      Path.Papply
-                        ( Env.normalize_module_path None env fn,
-                          Env.normalize_module_path None env argument )
-                  | Pident _ | Pdot _ | Pextra_ty _ -> identity
-                in
+                let carrier_identity = identity in
                 let declaration =
                   Env.find_module (Path.Pident template_public.resource_id)
                     template_public.resource_environment
@@ -3107,91 +3049,183 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         | Pdot _ | Papply _ | Pextra_ty _ -> env)
   in
   let application_aus =
-    List.concat_map (applications [] scopes.root.structure)
-      ~f:(fun (chain, (functor_path, argument_path)) ->
-        let normalized =
-          Env.normalize_module_path None qualified_env functor_path
-          |> Proof_scopes.canonical_owner scopes
-        in
+    List.concat_map applications ~f:(fun (application : Functor_context.application) ->
         let template =
           List.find typed ~f:(fun (scope, _, _) ->
-              Option.exists scope.Proof_scopes.owner ~f:(Path.same normalized)
-              &&
-              match scope.parameters with
-              | [ Named (Some _, _, _) ] -> true
-              | _ -> false)
+              Functor_context.same_scope scope application.scope)
         in
-        let view_owner =
-          List.fold chain ~init:None ~f:(fun path (name, id, _) ->
-              match (path, id) with
-              | None, Some id -> Some (Path.Pident id)
-              | Some path, Some _ -> Some (Path.Pdot (path, name))
-              | _, None -> path)
-        in
-        match (template, view_owner) with
-        | Some (scope, (_, _, _, _, aus), _), Some view_owner ->
-            begin match scope.parameters with
-            | [ Named (Some parameter, _, _) ] ->
-                let identity = Path.Papply (functor_path, argument_path) in
-                let carrier_identity =
-                  Path.Papply
-                    ( Env.normalize_module_path None qualified_env functor_path,
-                      Env.normalize_module_path None qualified_env argument_path )
+        match template with
+        | Some (scope, (_, _, _, _, aus), _) ->
+            let view_owner = application.result in
+            let identity = application.applicative_identity in
+            let carrier_identity =
+              Env.normalize_module_path None qualified_env identity
+            in
+            let substitution = Functor_context.substitution application in
+            let substitution =
+              List.fold (source_type_ids scope.structure) ~init:substitution
+                ~f:(fun substitution (id, name) ->
+                  Subst.add_type id (Path.Pdot (identity, name)) substitution)
+            in
+            List.filter aus ~f:(fun au -> Option.equal Path.same au.au_scope scope.owner)
+            |> List.map ~f:(fun au ->
+                let path = Path.Pdot (view_owner, au.au_name) in
+                let token_path = Path.Pdot (path, "token") in
+                let identity_path = Path.Pdot (carrier_identity, au.au_name) in
+                let token_paths =
+                  List.map (Functor_context.result_paths application) ~f:(fun owner ->
+                      Path.Pdot (Path.Pdot (owner, au.au_name), "token"))
+                  @ [ Path.Pdot (identity_path, "token") ]
+                  @ List.filter_map aliases ~f:(fun (alias, target) ->
+                      Option.some_if
+                        (Path.same target carrier_identity
+                        || List.exists
+                             (Functor_context.result_paths application)
+                             ~f:(Path.same target))
+                        (Path.Pdot (Path.Pdot (alias, au.au_name), "token")))
+                  |> List.dedup_and_sort ~compare:Path.compare
                 in
-                let substitution =
-                  Subst.add_module parameter argument_path Subst.identity
+                let operation_path =
+                  Option.value_map (scoped_value_name scope au.au_operation_path)
+                    ~default:(Subst.module_path substitution au.au_operation_path)
+                    ~f:(fun name -> Path.Pdot (view_owner, name))
                 in
-                let substitution =
-                  List.fold (source_type_ids scope.structure) ~init:substitution
-                    ~f:(fun substitution (id, name) ->
-                      Subst.add_type id (Path.Pdot (identity, name)) substitution)
-                in
-                List.filter aus ~f:(fun au ->
-                    Option.equal Path.same au.au_scope scope.owner)
-                |> List.map ~f:(fun au ->
-                    let path = Path.Pdot (view_owner, au.au_name) in
-                    let token_path = Path.Pdot (path, "token") in
-                    let identity_path = Path.Pdot (carrier_identity, au.au_name) in
-                    let token_paths =
-                      [ token_path; Path.Pdot (identity_path, "token") ]
-                      @ List.filter_map aliases ~f:(fun (alias, target) ->
-                          Option.some_if
-                            (Path.same target view_owner
-                            || Path.same target carrier_identity)
-                            (Path.Pdot (Path.Pdot (alias, au.au_name), "token")))
-                      |> List.dedup_and_sort ~compare:Path.compare
-                    in
-                    let operation_path =
-                      Option.value_map (scoped_value_name scope au.au_operation_path)
-                        ~default:(Subst.module_path substitution au.au_operation_path)
-                        ~f:(fun name -> Path.Pdot (view_owner, name))
-                    in
-                    {
-                      au with
-                      au_scope = None;
-                      au_id = Ident.create_local au.au_name;
-                      au_path = path;
-                      au_environment = qualified_env;
-                      au_operation_path = operation_path;
-                      au_operation_type =
-                        Subst.type_expr substitution au.au_operation_type;
-                      au_token = Ctype.newconstr token_path [];
-                      au_token_path = token_path;
-                      au_token_paths = token_paths;
-                      au_application = Some (carrier_identity, au.au_id);
-                    })
-            | _ -> []
-            end
+                {
+                  au with
+                  au_scope = None;
+                  au_id = Ident.create_local au.au_name;
+                  au_path = path;
+                  au_environment = qualified_env;
+                  au_operation_path = operation_path;
+                  au_operation_type = Subst.type_expr substitution au.au_operation_type;
+                  au_token = Ctype.newconstr token_path [];
+                  au_token_path = token_path;
+                  au_token_paths = token_paths;
+                  au_application = Some (carrier_identity, au.au_id);
+                })
         | _ -> [])
+  in
+  let private_root env caller root_id =
+    let root = Env.find_module (Pident root_id) qualified_env in
+    let ancestors =
+      List.init (List.length caller.Proof_scopes.namespace) ~f:(fun index ->
+          Proof_scopes.find_namespace scopes (List.take caller.namespace (index + 1)))
+      |> Option.all
+    in
+    let own scope =
+      List.find_map typed ~f:(fun (candidate, _, bindings) ->
+          Option.some_if
+            (Option.equal Ident.same candidate.declaration_id
+               scope.Proof_scopes.declaration_id)
+            bindings)
+      |> Option.value ~default:[]
+    in
+    let direct_applications signature =
+      List.fold projected_applications ~init:signature
+        ~f:(fun signature (application, bindings) ->
+          match List.rev application.Functor_context.chain with
+          | (name, id) :: reversed_parent ->
+              let parent = List.rev_map reversed_parent ~f:(fun (name, _) -> name) in
+              if List.equal String.equal parent caller.namespace then
+                extend_signature env signature [ (name, Some id, false) ] bindings
+              else signature
+          | [] -> signature)
+    in
+    let rec private_type (scopes : Proof_scopes.scope list) =
+      match scopes with
+      | [] -> None
+      | [ scope ] ->
+          Some
+            (Types.Mty_signature
+               (direct_applications (scope.structure.str_type @ own scope)))
+      | scope :: (child :: _ as rest) ->
+          Option.map (private_type rest) ~f:(fun child_type ->
+              let signature = scope.structure.str_type @ own scope in
+              let signature =
+                List.map signature ~f:(function
+                  | Types.Sig_module (id, presence, declaration, rec_status, visibility)
+                    when Option.exists child.declaration_id ~f:(Ident.same id) ->
+                      Types.Sig_module
+                        ( id,
+                          presence,
+                          { declaration with md_type = child_type },
+                          rec_status,
+                          visibility )
+                  | item -> item)
+              in
+              Types.Mty_signature signature)
+    in
+    match ancestors with
+    | Some (first :: _ as ancestors)
+      when Option.exists first.declaration_id ~f:(Ident.same root_id)
+           && List.for_all ancestors ~f:(fun scope ->
+               List.is_empty scope.Proof_scopes.parameters) ->
+        Option.value_map (private_type ancestors) ~default:root ~f:(fun md_type ->
+            { root with md_type })
+    | Some [] | Some (_ :: _) | None -> root
   in
   let scopes =
     Proof_scopes.map_environments scopes ~f:(fun scope ->
-        match
-          List.find typed ~f:(fun (candidate, _, _) ->
-              Option.equal Ident.same candidate.declaration_id scope.declaration_id)
-        with
-        | Some (_, (env, _, _, _, _), _) -> env
-        | None -> if Option.is_none scope.owner then qualified_env else scope.environment)
+        let env =
+          match
+            List.find typed ~f:(fun (candidate, _, _) ->
+                Option.equal Ident.same candidate.declaration_id scope.declaration_id)
+          with
+          | Some (_, (env, _, _, _, _), _) -> env
+          | None ->
+              if Option.is_none scope.owner then qualified_env else scope.environment
+        in
+        List.fold applications ~init:env
+          ~f:(fun env (application : Functor_context.application) ->
+            match List.rev application.chain with
+            | (_, id) :: parent ->
+                let namespace = List.rev_map parent ~f:(fun (name, _) -> name) in
+                if List.equal String.equal scope.namespace namespace then
+                  begin try
+                    let env =
+                      match application.chain with
+                      | (_, root_id) :: _ when not (List.is_empty parent) ->
+                          let root = private_root env scope root_id in
+                          Env.add_module_declaration ~check:false root_id Mp_present root
+                            env
+                      | _ -> env
+                    in
+                    let local = Env.find_module (Pident id) env in
+                    let md_type =
+                      if Path.same application.result (Pident id) then
+                        (Env.find_module application.result qualified_env).md_type
+                      else Types.Mty_alias application.result
+                    in
+                    let env =
+                      Env.add_module_declaration ~check:false id Mp_present
+                        { local with md_type } env
+                    in
+                    List.fold aliases ~init:env ~f:(fun env (alias, target) ->
+                        match alias with
+                        | Pident alias_id
+                          when List.exists
+                                 (Functor_context.result_paths application)
+                                 ~f:(Path.same target)
+                               && List.exists scope.structure.str_items ~f:(fun item ->
+                                   match item.Typedtree.str_desc with
+                                   | Tstr_module { mb_id = Some id; _ } ->
+                                       Ident.same id alias_id
+                                   | _ -> false) ->
+                            begin try
+                              let declaration = Env.find_module (Pident alias_id) env in
+                              Env.add_module_declaration ~check:false alias_id Mp_present
+                                {
+                                  declaration with
+                                  md_type = Types.Mty_alias application.result;
+                                }
+                                env
+                            with Stdlib.Not_found -> env
+                            end
+                        | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> env)
+                  with Stdlib.Not_found -> env
+                  end
+                else env
+            | [] -> env))
   in
   let types = List.concat_map typed ~f:(fun (_, (_, types, _, _, _), _) -> types) in
   let resources =
@@ -3882,6 +3916,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
           Proof_scopes.resolve_prepared ~location:scope.location ~environment:env
             ~state:(env, imported_resources) ~prepare_definition typed proof
         in
+        let applications = Functor_context.collect proof_scopes in
         let merge_resources existing additions =
           List.fold additions ~init:existing ~f:(fun existing added ->
               if
@@ -3908,7 +3943,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                           module_resources,
                           module_fields,
                           module_aus ) =
-                     scoped_proof_types ~only:[ module_name.pid_str ]
+                     scoped_proof_types ~applications ~only:[ module_name.pid_str ]
                        ?public_interface:interface ~comments:signature_comments
                        ~previous_resources:resources runtime_env env proof_scopes
                    in
@@ -3927,7 +3962,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                           module_resources,
                           module_fields,
                           module_aus ) =
-                     scoped_proof_types ~only:[ module_name.pid_str ]
+                     scoped_proof_types ~applications ~only:[ module_name.pid_str ]
                        ?public_interface:interface ~comments:signature_comments
                        ~previous_resources:resources runtime_env env proof_scopes
                    in
@@ -3967,7 +4002,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
               match implicit with
               | [] -> Ok (env, proof_scopes, [], [], [], [])
               | _ ->
-                  scoped_proof_types
+                  scoped_proof_types ~applications
                     ~only_ids:
                       (List.filter_map implicit ~f:(fun scope ->
                            scope.Proof_scopes.declaration_id))
@@ -3979,6 +4014,13 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                   if Option.is_none scope.owner then env else scope.environment)
             in
             let proof_types = root_types @ scoped_types @ implicit_types in
+            let proof_applications =
+              applications
+              @ List.filter (Functor_context.collect proof_scopes)
+                  ~f:(fun (application : Functor_context.application) ->
+                    Option.is_none
+                      (Functor_context.find_at applications application.location))
+            in
             let* proof_resources =
               Result.all
                 (List.map (proof_resources @ implicit_resources) ~f:(fun resource ->
@@ -4052,6 +4094,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                 signature_resources;
                 proof_fields = proof_fields @ implicit_fields;
                 proof_aus = proof_aus @ implicit_aus;
+                proof_applications;
                 pending;
                 interface;
                 proof;

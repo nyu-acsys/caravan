@@ -4,10 +4,16 @@ open Base
 
 let ( let* ) = Result.( >>= )
 
+type parameter = {
+  original : Ident.t option;
+  instance : Module_inventory.parameter_instance;
+  generic : Generic_modules.t;
+}
+
 type t = {
   group : Generic_modules.t;
   scope : Proof_scopes.scope;
-  parameter : Ident.t;
+  parameters : parameter list;
   aliases : (Typedtree.type_declaration * Typedtree.type_declaration) list;
 }
 
@@ -59,15 +65,13 @@ let rec expand_type_head environment typ =
       Btype.newgenty (Tpoly (expand_type_head environment body, variables))
   | _ -> expanded
 
-let has_models source (specialization : Module_inventory.specialization) =
-  match specialization.template.mod_desc with
-  | Tmod_functor (Named (Some parameter, _, _), _) ->
-      List.exists source.Source.proof_types ~f:(fun data ->
-          Option.exists (model_owner source data) ~f:(fun scope ->
-              match scope.parameters with
-              | [ Named (Some id, _, _) ] -> Ident.same id parameter
-              | _ -> false))
-  | _ -> false
+let scope_matches scope application =
+  Module_inventory.proof_scope_matches application scope
+
+let has_models source specialization =
+  List.exists source.Source.proof_types ~f:(fun data ->
+      Option.exists (model_owner source data) ~f:(fun scope ->
+          scope_matches scope specialization))
 
 let model_descriptor data ~owner =
   let path = owner @ [ data.Datatypes.module_name ] in
@@ -80,23 +84,59 @@ let model_descriptor data ~owner =
 let symbolic_models source plan ~owner =
   List.map (models source plan) ~f:(fun data -> model_descriptor data ~owner)
 
-let parameter_types plan ~owner =
-  let descriptors = Generic_modules.types plan.group ~owner in
-  let formal_types, ghost_types =
-    List.split_n descriptors (List.length plan.group.types)
-  in
-  let formal_types =
-    List.map2_exn plan.group.types formal_types ~f:(fun (name, _) descriptor ->
-        let path = Path.Pdot (Path.Pident plan.parameter, name) in
-        { descriptor with Datatypes.id = None; library = Some path; paths = [ path ] })
-  in
-  let ghost_types =
-    List.map2_exn plan.group.representative.argument.expected.signature_ghost_modules
-      ghost_types ~f:(fun (name, _) descriptor ->
-        Datatypes.with_paths descriptor
-          [ Path.Pdot (Path.Pdot (Path.Pident plan.parameter, name), "t") ])
-  in
-  formal_types @ ghost_types
+let parameter_pairs plan =
+  List.filter_map plan.parameters ~f:(fun parameter ->
+      Option.map parameter.original ~f:(fun original ->
+          (original, parameter.instance.parameter)))
+
+let source_parameters plan = List.map (parameter_pairs plan) ~f:fst
+
+let parameter_types ?(world = false) plan ~owner =
+  List.concat_map plan.parameters ~f:(fun parameter ->
+      let generic = parameter.generic in
+      let descriptors =
+        (if world then Generic_modules.world_types else Generic_modules.types)
+          generic ~owner:(owner generic)
+      in
+      match parameter.original with
+      | None -> descriptors
+      | Some original ->
+          let formal_types, ghost_types =
+            List.split_n descriptors (List.length generic.types)
+          in
+          let formal_types =
+            List.map2_exn generic.types formal_types ~f:(fun (name, _) descriptor ->
+                let path = Path.Pdot (Path.Pident original, name) in
+                {
+                  descriptor with
+                  Datatypes.id = None;
+                  library = Some path;
+                  paths = [ path ];
+                })
+          in
+          let ghost_types =
+            List.map2_exn generic.representative.argument.expected.signature_ghost_modules
+              ghost_types ~f:(fun (name, _) descriptor ->
+                Datatypes.with_paths descriptor
+                  [ Path.Pdot (Path.Pdot (Path.Pident original, name), "t") ])
+          in
+          formal_types @ ghost_types)
+
+let parameter_substitution plan target =
+  List.foldi plan.parameters ~init:Subst.identity ~f:(fun index substitution parameter ->
+      Option.value_map parameter.original ~default:substitution ~f:(fun original ->
+          Subst.add_module original (target index parameter) substitution))
+
+let application_substitution plan (application : Module_inventory.specialization) =
+  match application.context with
+  | Some context -> Functor_context.substitution context
+  | None ->
+      parameter_substitution plan (fun index _ ->
+          (List.nth_exn application.parameters index).argument.actual_path)
+
+let private_substitution plan (application : Module_inventory.specialization) =
+  parameter_substitution plan (fun index _ ->
+      Path.Pident (List.nth_exn application.parameters index).parameter)
 
 let model_projection source plan path substitution =
   List.fold (models source plan) ~init:substitution ~f:(fun substitution data ->
@@ -142,18 +182,26 @@ let nullary_alias (declaration : Typedtree.type_declaration) =
 let plan groups scopes =
   let candidates =
     List.filter_map scopes.Proof_scopes.scopes ~f:(fun scope ->
-        match scope.parameters with
-        | [ Named (Some parameter, _, _) ] ->
-            Option.map
-              (List.find groups ~f:(fun group ->
-                   match group.Generic_modules.representative.template.mod_desc with
-                   | Tmod_functor (Named (Some source, _, _), _) ->
-                       Ident.same source parameter
-                   | _ -> false))
-              ~f:(fun group -> (group, scope, parameter))
-        | _ -> None)
+        if List.is_empty scope.parameters then None
+        else
+          Option.map
+            (List.find groups ~f:(fun group ->
+                 scope_matches scope group.Generic_modules.representative))
+            ~f:(fun group -> (group, scope)))
   in
-  List.map candidates ~f:(fun (group, scope, parameter) ->
+  List.map candidates ~f:(fun (group, scope) ->
+      let parameters =
+        List.map2_exn scope.parameters
+          (List.zip_exn group.Generic_modules.representative.parameters
+             (Generic_modules.parameter_groups group))
+          ~f:(fun original (instance, generic) ->
+            let original =
+              match original with
+              | Typedtree.Named (Some id, _, _) -> Some id
+              | Unit | Named (None, _, _) -> None
+            in
+            { original; instance; generic })
+      in
       let declarations =
         List.concat_map scope.Proof_scopes.structure.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
@@ -179,7 +227,7 @@ let plan groups scopes =
             | _ -> Report.unsupported declaration.typ_loc "This generic proof type alias")
         |> Result.all
       in
-      Ok { group; scope; parameter; aliases })
+      Ok { group; scope; parameters; aliases })
   |> Result.all
 
 let owner plans scope =
@@ -192,8 +240,9 @@ let owner plans scope =
 let projection plan =
   List.fold (runtime_types plan)
     ~init:
-      (Subst.add_module plan.parameter (Path.Pident plan.group.representative.parameter)
-         Subst.identity) ~f:(fun substitution source ->
+      (parameter_substitution plan (fun _ parameter ->
+           Path.Pident parameter.instance.parameter))
+    ~f:(fun substitution source ->
       Option.value_map (matching_type source plan.group.representative.declarations)
         ~default:substitution ~f:(fun target ->
           Subst.add_type source.Typedtree.typ_id (Path.Pident target.Typedtree.typ_id)
@@ -202,8 +251,10 @@ let projection plan =
 let source_projection plan =
   List.fold (runtime_types plan)
     ~init:
-      (Subst.add_module plan.group.representative.parameter (Path.Pident plan.parameter)
-         Subst.identity) ~f:(fun substitution source ->
+      (List.fold (parameter_pairs plan) ~init:Subst.identity
+         ~f:(fun substitution (original, target) ->
+           Subst.add_module target (Path.Pident original) substitution))
+    ~f:(fun substitution source ->
       Option.value_map (matching_type source plan.group.representative.declarations)
         ~default:substitution ~f:(fun target ->
           Subst.add_type target.Typedtree.typ_id (Path.Pident source.Typedtree.typ_id)
@@ -211,8 +262,8 @@ let source_projection plan =
 
 let types plan =
   let parameters =
-    parameter_types plan
-      ~owner:(String.split plan.group.name ~on:'.' @ [ plan.group.parameter ])
+    parameter_types plan ~owner:(fun generic ->
+        String.split plan.group.name ~on:'.' @ [ generic.Generic_modules.parameter ])
   in
   let* aliases =
     List.map plan.aliases ~f:(fun (source, _) ->
@@ -258,14 +309,8 @@ let application_paths (source : Source.t) (inventory : Module_inventory.t)
 
 let application_projection source plan (application : Module_inventory.specialization)
     path =
-  let actual_parameter =
-    match application.identity with
-    | Path.Papply (_, argument) -> argument
-    | _ -> application.argument.actual_path
-  in
   let projection =
-    List.fold (runtime_types plan)
-      ~init:(Subst.add_module plan.parameter actual_parameter Subst.identity)
+    List.fold (runtime_types plan) ~init:(application_substitution plan application)
       ~f:(fun substitution original ->
         Subst.add_type original.Typedtree.typ_id
           (Path.Pdot (path, original.typ_name.txt))
@@ -274,13 +319,12 @@ let application_projection source plan (application : Module_inventory.specializ
   model_projection source plan path projection |> asset_projection source plan path
 
 let implementation_projection (application : Module_inventory.specialization) path =
-  let argument =
-    match application.identity with
-    | Path.Papply (_, argument) -> argument
-    | _ -> application.argument.actual_path
+  let substitution =
+    List.fold application.Module_inventory.parameters ~init:Subst.identity
+      ~f:(fun substitution parameter ->
+        Subst.add_module parameter.parameter parameter.argument.actual_path substitution)
   in
-  List.fold application.declarations
-    ~init:(Subst.add_module application.parameter argument Subst.identity)
+  List.fold application.declarations ~init:substitution
     ~f:(fun substitution declaration ->
       Subst.add_type declaration.Typedtree.typ_id
         (Path.Pdot (path, declaration.typ_name.txt))
@@ -302,9 +346,8 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
     let paths = application_paths source inventory application_source in
     let* private_projection =
       List.fold_result (runtime_types plan)
-        ~init:
-          (Subst.add_module plan.parameter (Path.Pident application_source.parameter)
-             Subst.identity) ~f:(fun substitution original ->
+        ~init:(private_substitution plan application_source)
+        ~f:(fun substitution original ->
           match matching_type original application_source.declarations with
           | Some actual ->
               Ok (Subst.add_type original.typ_id (Path.Pident actual.typ_id) substitution)

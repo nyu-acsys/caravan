@@ -1,0 +1,26 @@
+module World = struct
+  module Inner = struct
+    module Helper = struct
+      type model = Item of int
+
+      let slot : (Ghost.t, int) Ghost.field = Ghost.field ()
+      predicate held (cell : Ghost.t) = own (Ghost.at slot cell) 0
+
+      lemma allocate returns (cell : Ghost.t)
+        ensures (held cell) =
+        let cell = Ghost.alloc [Ghost.init slot 0] in
+        fold held cell;
+        cell
+
+      lemma preserve (cell : Ghost.t)
+        requires (held cell)
+        ensures (held cell) = ()
+    end
+
+    lemma private_use =
+      let cell = Helper.allocate in
+      unfold Alias.held cell;
+      fold Helper.held cell;
+      Helper.preserve cell
+  end
+end

@@ -69,7 +69,16 @@ type checked_binding = {
   paths : Path.t list;
 }
 
+type parameter_instance = {
+  template : Typedtree.module_expr;
+  parameter : Ident.t;
+  argument : checked_binding;
+}
+
 type specialization = {
+  origin : Path.t option;
+  parameters : parameter_instance list;
+  context : Functor_context.application option;
   template : Typedtree.module_expr;
   parameter : Ident.t;
   argument : checked_binding;
@@ -77,6 +86,22 @@ type specialization = {
   identity : Path.t;
   declarations : Typedtree.type_declaration list;
 }
+
+let proof_scope_matches (application : specialization) (scope : Proof_scopes.scope) =
+  match application.context with
+  | Some context -> Functor_context.same_scope scope context.scope
+  | None ->
+      let rec body expression =
+        match expression.Typedtree.mod_desc with
+        | Tmod_functor (_, nested) | Tmod_constraint (nested, _, _, _) -> body nested
+        | Tmod_structure structure -> Some structure
+        | _ -> None
+      in
+      Option.exists (body application.template) ~f:(fun structure ->
+          List.equal
+            (fun (left : Typedtree.structure_item) (right : Typedtree.structure_item) ->
+              Functor_context.same_location left.str_loc right.str_loc)
+            scope.structure.str_items structure.str_items)
 
 type resource_constraint = {
   owner : Path.t option;
@@ -112,6 +137,8 @@ type module_view = {
 }
 
 and functor_definition = {
+  origin : Path.t option;
+  instances : (Typedtree.module_expr * Ident.t * checked_binding ref) list;
   parameter_name : string option;  (** [None] for a unit parameter. *)
   template : Typedtree.module_expr;
   environment : Env.t;
@@ -1082,6 +1109,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             functor_definition =
               Some
                 {
+                  origin = identity;
+                  instances = [];
                   parameter_name;
                   template = expression;
                   environment = expression.mod_env;
@@ -1153,20 +1182,31 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           in
           Ok (Some (actual, actual_path))
     in
+    let registered_stage =
+      List.find_map source.proof_applications ~f:(fun application ->
+          List.find application.Functor_context.stages ~f:(fun stage ->
+              Poly.equal stage.Functor_context.location expression.mod_loc))
+    in
     let* application_identity =
-      match (definition.parameter_name, actual, identity) with
-      | None, None, Some identity -> Ok identity
-      | Some _, Some (actual, _), _ ->
-          begin match (template.application_identity, actual.application_identity) with
-          | Some head, Some argument -> Ok (Path.Papply (head, argument))
-          | _ ->
-              unavailable expression.mod_loc "A functor application without an identity"
-          end
-      | None, None, None ->
-          unavailable expression.mod_loc "A unit application without a result binding"
-      | None, Some _, _ | Some _, None, _ ->
-          unavailable expression.mod_loc
-            "A functor application with the wrong parameter shape"
+      match registered_stage with
+      | Some stage -> Ok stage.identity
+      | None -> (
+          match (definition.parameter_name, actual, identity) with
+          | None, None, Some identity -> Ok identity
+          | Some _, Some (actual, _), _ ->
+              begin match
+                (template.application_identity, actual.application_identity)
+              with
+              | Some head, Some argument -> Ok (Path.Papply (head, argument))
+              | _ ->
+                  unavailable expression.mod_loc
+                    "A functor application without an identity"
+              end
+          | None, None, None ->
+              unavailable expression.mod_loc "A unit application without a result binding"
+          | None, Some _, _ | Some _, None, _ ->
+              unavailable expression.mod_loc
+                "A functor application with the wrong parameter shape")
     in
     let* parameter, body =
       try
@@ -1260,6 +1300,20 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       module_expression definition.annotations namespace
         ~identity:(Some application_identity) body
     in
+    let instances =
+      definition.instances
+      @ Option.to_list
+          (Option.map argument_binding ~f:(fun (parameter, binding) ->
+               (definition.template, parameter, binding)))
+    in
+    let view =
+      {
+        view with
+        functor_definition =
+          Option.map view.functor_definition ~f:(fun inner ->
+              { inner with instances; origin = definition.origin });
+      }
+    in
     if Option.is_none view.functor_definition then begin
       publish_type_paths application_identity view;
       expansions := (expression, body) :: !expansions;
@@ -1279,7 +1333,10 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               binding,
               view.values,
               application_identity,
-              declarations )
+              declarations,
+              instances,
+              definition.origin,
+              Functor_context.find_at source.proof_applications expression.mod_loc )
             :: !specializations)
     end;
     Ok view
@@ -1504,8 +1561,23 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       constraints = List.rev !constraints;
       specializations =
         List.rev_map !specializations
-          ~f:(fun (template, parameter, argument, values, identity, declarations) ->
+          ~f:(fun
+              ( template,
+                parameter,
+                argument,
+                values,
+                identity,
+                declarations,
+                instances,
+                origin,
+                context )
+            ->
             {
+              origin;
+              parameters =
+                List.map instances ~f:(fun (template, parameter, argument) ->
+                    { template; parameter; argument = !argument });
+              context;
               template;
               parameter;
               argument = !argument;

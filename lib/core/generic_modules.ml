@@ -20,7 +20,31 @@ type t = {
   operations : (string * string) list;
   members : (string * string) list;
   world : string option;
+  captures : t list;
 }
+
+let parameter_groups group = group.captures @ [ { group with captures = [] } ]
+
+let stage_source (source : Module_inventory.specialization)
+    (stage : Module_inventory.parameter_instance) =
+  {
+    source with
+    template = stage.template;
+    parameter = stage.parameter;
+    argument = stage.argument;
+  }
+
+let same_template left right = Poly.equal left.Typedtree.mod_loc right.Typedtree.mod_loc
+
+let same_stages (left : Module_inventory.specialization)
+    (right : Module_inventory.specialization) =
+  Option.equal Path.same left.origin right.origin
+  && same_template left.Module_inventory.template right.template
+  && List.equal
+       (fun (first : Module_inventory.parameter_instance)
+            (second : Module_inventory.parameter_instance) ->
+         same_template first.template second.template)
+       left.parameters right.parameters
 
 let has_layout source =
   List.exists source.Module_inventory.declarations ~f:(fun declaration ->
@@ -29,10 +53,13 @@ let has_layout source =
       | _ -> false)
 
 let eligible (source : Module_inventory.specialization) =
-  let signature = source.argument.expected in
   let abstract_types =
-    List.for_all signature.signature_types ~f:(fun (_, declaration) ->
-        match declaration.Typedtree.typ_kind with Ttype_abstract -> true | _ -> false)
+    List.for_all source.parameters
+      ~f:(fun (stage : Module_inventory.parameter_instance) ->
+        List.for_all stage.argument.expected.signature_types ~f:(fun (_, declaration) ->
+            match declaration.Typedtree.typ_kind with
+            | Ttype_abstract -> true
+            | _ -> false))
   in
   let body =
     let direct_body =
@@ -135,18 +162,28 @@ let eligible (source : Module_inventory.specialization) =
   (not (List.is_empty source.members)) && abstract_types && body
 
 let plan ?(proof_layout = fun _ -> false) ~fresh sources =
-  let application source =
+  let make_application source =
     { source; name = fresh "Applied"; world = fresh "Selected"; layout = fresh "Layout" }
   in
   let add groups (source : Module_inventory.specialization) =
-    match
-      List.find groups ~f:(fun group ->
-          phys_equal group.representative.template source.template)
-    with
+    let application = make_application source in
+    match List.find groups ~f:(fun group -> same_stages group.representative source) with
     | Some group ->
         List.map groups ~f:(fun other ->
             if phys_equal group other then
-              { other with applications = other.applications @ [ application source ] }
+              {
+                other with
+                applications = other.applications @ [ application ];
+                captures =
+                  List.map2_exn other.captures (List.drop_last_exn source.parameters)
+                    ~f:(fun capture stage ->
+                      {
+                        capture with
+                        applications =
+                          capture.applications
+                          @ [ { application with source = stage_source source stage } ];
+                      });
+              }
             else other)
     | None ->
         let prefix = String.concat ~sep:"_" source.argument.namespace in
@@ -160,25 +197,56 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
         in
         let world =
           Option.some_if
-            (has_layout source || proof_layout source)
+            (has_layout source || proof_layout source
+            || List.length source.parameters > 1
+               && List.exists source.parameters ~f:(fun parameter ->
+                   (not
+                      (List.is_empty
+                         parameter.Module_inventory.argument.expected.signature_types))
+                   || not
+                        (List.is_empty parameter.argument.expected.signature_ghost_modules))
+            )
             (fresh ("World_" ^ prefix))
         in
         let qualify leaf =
           Option.value_map world ~default:leaf ~f:(fun world -> world ^ "." ^ leaf)
         in
+        let name = qualify (fresh ("Generic_" ^ prefix)) in
+        let member_names = members source.members "method" in
+        let capture (stage : Module_inventory.parameter_instance) index =
+          let stage_source = stage_source source stage in
+          {
+            name;
+            interface = qualify (fresh ("Argument_" ^ prefix ^ "_stage"));
+            parameter = "Parameter_" ^ Int.to_string index;
+            representative = stage_source;
+            applications = [ { application with source = stage_source } ];
+            types = members stage.argument.expected.signature_types "Type";
+            resources = members stage.argument.expected.signature_resources "resource";
+            operations = members stage.argument.expected.signature_values "operation";
+            members = member_names;
+            world;
+            captures = [];
+          }
+        in
+        let captures =
+          List.mapi (List.drop_last_exn source.parameters) ~f:(fun index stage ->
+              capture stage index)
+        in
         groups
         @ [
             {
-              name = qualify (fresh ("Generic_" ^ prefix));
+              name;
               interface = qualify (fresh ("Argument_" ^ prefix));
               parameter = "Parameter";
               representative = source;
-              applications = [ application source ];
+              applications = [ application ];
               types = members source.argument.expected.signature_types "Type";
               resources = members source.argument.expected.signature_resources "resource";
               operations = members source.argument.expected.signature_values "operation";
-              members = members source.members "method";
+              members = member_names;
               world;
+              captures;
             };
           ]
   in
@@ -191,10 +259,11 @@ let interface (group : t) (application : application) =
 
 let application_for_binding groups binding =
   List.find_map groups ~f:(fun group ->
-      Option.map
-        (List.find group.applications ~f:(fun application ->
-             phys_equal application.source.argument binding))
-        ~f:(fun application -> (group, application)))
+      List.find_map (parameter_groups group) ~f:(fun stage ->
+          Option.map
+            (List.find stage.applications ~f:(fun application ->
+                 phys_equal application.source.argument binding))
+            ~f:(fun application -> (stage, application))))
 
 let member groups id =
   List.find_map groups ~f:(fun group ->
@@ -236,3 +305,28 @@ let types group ~owner =
         })
   in
   formal_types @ ghost_types
+
+let worker_types group ~owner =
+  List.concat_map (parameter_groups group) ~f:(fun stage ->
+      types stage ~owner:(owner @ [ stage.parameter ]))
+
+let carrier_name group member = "Carrier_" ^ group.parameter ^ "_" ^ member
+let algebra_name group member = "Algebra_" ^ group.parameter ^ "_" ^ member
+
+let world_types group ~owner =
+  let ordinary, ghosts = List.split_n (types group ~owner) (List.length group.types) in
+  ordinary
+  @ List.map2_exn group.representative.argument.expected.signature_ghost_modules ghosts
+      ~f:(fun (member, _) descriptor ->
+        let stem = carrier_name group member in
+        {
+          descriptor with
+          Datatypes.module_path = Some (owner @ [ stem ]);
+          backend_type = Some Qualified_name.{ path = owner; name = stem };
+        })
+
+let type_slots group =
+  List.concat_map (parameter_groups group) ~f:(fun stage ->
+      List.map stage.types ~f:snd
+      @ List.map stage.representative.argument.expected.signature_ghost_modules
+          ~f:(fun (member, _) -> carrier_name stage member))

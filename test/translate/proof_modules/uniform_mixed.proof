@@ -1,0 +1,33 @@
+module A = struct
+  predicate ready (value : int) = value >= 0
+end
+
+module Unit_first () (X : INPUT) = struct
+  type model = Item of int
+  let payload (value : model) : int = match value with Item value -> value
+
+  lemma preserve (value : int)
+    requires (X.ready value)
+    ensures (X.ready value) = ()
+end
+
+module Named_first (X : INPUT) () = struct
+  lemma preserve (value : int)
+    requires (X.ready value)
+    ensures (X.ready value) = ()
+end
+
+lemma both (value : int)
+  requires (A.ready value)
+  ensures (A.ready value) =
+  Left_alias.preserve value;
+  Right_alias.preserve value
+
+let reuse (value : Left.model) : Left_repeat.model = value
+let reuse_alias (value : Left.model) : Left_via_alias.model = value
+
+lemma models ensures
+  (Left_repeat.payload (Left.Item 1) = 1
+  && Left_via_alias.payload (Left.Item 2) = 2
+  && Other.payload (Other.Item 3) = 3
+  && Direct.payload (Direct.Item 4) = 4) = ()

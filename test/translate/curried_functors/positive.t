@@ -49,7 +49,7 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' trailing_unit.rav
-  2
+  1
 
   $ caravan --shh --emit-rav intermediate_unit.ml > intermediate_unit.rav
   $ raven --shh --typeonly intermediate_unit.rav
@@ -73,4 +73,4 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' inline_unit.rav
-  2
+  1
