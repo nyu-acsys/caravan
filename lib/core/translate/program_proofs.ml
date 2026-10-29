@@ -7,6 +7,22 @@ open Procedures
 open Program_items
 open Proof_declarations
 
+(** What the proof contexts of declarations and procedures are computed from. *)
+module Proof_env = struct
+  type t = {
+    definition_target : Proof_bindings.binding -> string option;
+    source : Source.t;
+    proof_assets :
+      Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list;
+    types : Datatypes.t list;
+    scoped_proofs : Proof_bindings.t;
+    scoped_inputs : (string * int) list;
+    private_scoped_inputs : (string * int) list;
+    all_logical_functions : (string * lemma_signature) list;
+    au_application_view : Source.proof_au -> Proof_bindings.application option;
+  }
+end
+
 type t = {
   checked_views : Program_items.checked_view list;
   checked_resource_entries :
@@ -24,6 +40,7 @@ type t = {
     * ((string * Ident.t list) * string * Types.type_expr list * int) list)
     list;
   private_scoped_inputs : (string * int) list;
+  proof_env : Proof_env.t;
 }
 
 let atomic_predicates_of signatures =
@@ -92,15 +109,21 @@ let context_atomic ~(source : Source.t) ~(scoped_proofs : Proof_bindings.t)
 let context_owners ~(source : Source.t) at =
   Option.value_map at ~default:[] ~f:(Proof_scopes.owners_at source.proof_scopes)
 
-let proof_context ~(definition_target : Proof_bindings.binding -> string option)
-    ~(source : Source.t)
-    ~(proof_assets :
-       Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list)
-    ~(types : Datatypes.t list) ~(scoped_proofs : Proof_bindings.t)
-    ~(scoped_inputs : (string * int) list) ~(private_scoped_inputs : (string * int) list)
-    ~(all_logical_functions : (string * lemma_signature) list)
-    ~(au_application_view : Source.proof_au -> Proof_bindings.application option)
-    ?current_procedure ?at scope preds spec_funcs proof_support =
+let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds spec_funcs
+    proof_support =
+  let {
+    Proof_env.definition_target;
+    source;
+    proof_assets;
+    types;
+    scoped_proofs;
+    scoped_inputs;
+    private_scoped_inputs;
+    all_logical_functions;
+    au_application_view;
+  } =
+    proof_env
+  in
   let context_atomic = context_atomic ~source ~scoped_proofs ~au_application_view in
   let context_owners = context_owners ~source in
   let owners = context_owners at in
@@ -388,24 +411,15 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
         List.map parameters ~f:(fun (_, key, _, _) -> key) @ support.opaque_predicates;
     } )
 
-let proof_context_for ~(declaration_context : string -> Module_context.t)
+let proof_context_for (proof_env : Proof_env.t)
+    ~(declaration_context : string -> Module_context.t)
     ~(declaration_scope : string -> Proof_scopes.scope option)
-    ~(definition_target : Proof_bindings.binding -> string option) ~(source : Source.t)
-    ~(proof_assets :
-       Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list)
-    ~(types : Datatypes.t list) ~(scoped_proofs : Proof_bindings.t)
-    ~(scoped_inputs : (string * int) list) ~(private_scoped_inputs : (string * int) list)
-    ~(all_logical_functions : (string * lemma_signature) list)
-    ~(au_application_view : Source.proof_au -> Proof_bindings.application option)
     ~(scoped_binding : string -> Proof_bindings.binding option)
     ~(module_parameters :
        (Module_context.t
        * ((string * Ident.t list) * string * Types.type_expr list * int) list)
        list) ~preds ~spec_funcs ~proof_support name =
-  let proof_context =
-    proof_context ~definition_target ~source ~proof_assets ~types ~scoped_proofs
-      ~scoped_inputs ~private_scoped_inputs ~all_logical_functions ~au_application_view
-  in
+  let proof_context = proof_context proof_env in
   let module_context = module_context ~scoped_binding ~module_parameters in
   let context = declaration_context name in
   module_context context ~projection:Subst.identity
@@ -852,10 +866,20 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
   in
   let context_atomic = context_atomic ~source ~scoped_proofs ~au_application_view in
   let context_owners = context_owners ~source in
-  let proof_context =
-    proof_context ~definition_target ~source ~proof_assets ~types ~scoped_proofs
-      ~scoped_inputs ~private_scoped_inputs ~all_logical_functions ~au_application_view
+  let proof_env =
+    {
+      Proof_env.definition_target;
+      source;
+      proof_assets;
+      types;
+      scoped_proofs;
+      scoped_inputs;
+      private_scoped_inputs;
+      all_logical_functions;
+      au_application_view;
+    }
   in
+  let proof_context = proof_context proof_env in
   let* module_parameters =
     all module_contexts.contexts ~f:(fun context ->
         let* resources =
@@ -1163,4 +1187,5 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
       lemma_context;
       module_parameters;
       private_scoped_inputs;
+      proof_env;
     }

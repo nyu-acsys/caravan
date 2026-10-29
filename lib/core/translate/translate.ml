@@ -106,6 +106,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     lemma_context;
     module_parameters;
     private_scoped_inputs;
+    proof_env;
   } =
     proofs
   in

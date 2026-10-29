@@ -133,31 +133,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
       ~module_parameters:proofs.module_parameters
   in
-  let proof_context =
-    Program_proofs.proof_context ~definition_target:scopes.definition_target
-      ~source:decls.source ~proof_assets:decls.proof_assets ~types:decls.types
-      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
-      ~private_scoped_inputs:proofs.private_scoped_inputs
-      ~all_logical_functions:proofs.all_logical_functions
-      ~au_application_view:
-        (Program_declarations.au_application_view
-           ~untyped_scoped_proofs:scopes.scoped_proofs)
-  in
+  let proof_context = Program_proofs.proof_context proofs.proof_env in
   let proof_context_for =
-    Program_proofs.proof_context_for
+    Program_proofs.proof_context_for proofs.proof_env
       ~declaration_context:
         (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
            ~unapplied_proofs:scopes.unapplied_proofs)
       ~declaration_scope:
         (Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs)
-      ~definition_target:scopes.definition_target ~source:decls.source
-      ~proof_assets:decls.proof_assets ~types:decls.types
-      ~scoped_proofs:decls.scoped_proofs ~scoped_inputs:decls.scoped_inputs
-      ~private_scoped_inputs:proofs.private_scoped_inputs
-      ~all_logical_functions:proofs.all_logical_functions
-      ~au_application_view:
-        (Program_declarations.au_application_view
-           ~untyped_scoped_proofs:scopes.scoped_proofs)
       ~scoped_binding:
         (Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs)
       ~module_parameters:proofs.module_parameters
