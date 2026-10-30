@@ -5,7 +5,7 @@ open Base
 open Translate_context
 open Spec_terms
 open Spec_terms.On_context
-open Proof_terms
+open Proof_terms.On_context
 open Atomic_proofs
 open Expressions
 

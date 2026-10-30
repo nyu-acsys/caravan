@@ -46,9 +46,7 @@ let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
   let* finish =
     match adapter with
     | None -> State.return []
-    | Some a ->
-        State.imperative ctx (fun () ->
-            return_proof ctx a ~result_type:e.exp_type ~result:value)
+    | Some a -> return_proof ctx a ~result_type:e.exp_type ~result:value
   in
   let* stateful = State.of_result (stateful_access ctx.given.access_proofs e) in
   let* () =
@@ -255,8 +253,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let last = List.last_exn bindings in
       let* ghost =
-        State.imperative ctx (fun () ->
-            ghost ctx ~after:last.vb_expr.exp_loc.loc_end ~before:body.exp_loc.loc_start)
+        ghost ctx ~after:last.vb_expr.exp_loc.loc_end ~before:body.exp_loc.loc_start
       in
       let+ body_stmts, body = expr ~tail ~keep_scope ctx body in
       ( List.concat_map evaluated ~f:(fun (_, stmts, _) -> stmts)
@@ -266,10 +263,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       State.of_result (unsupported at "A local recursive function")
   | Texp_sequence (e1, e2) ->
       let* stmts1, _ = expr ~continue_state:true ctx e1 in
-      let* ghost =
-        State.imperative ctx (fun () ->
-            ghost ctx ~after:e1.exp_loc.loc_end ~before:e2.exp_loc.loc_start)
-      in
+      let* ghost = ghost ctx ~after:e1.exp_loc.loc_end ~before:e2.exp_loc.loc_start in
       let+ stmts2, v = expr ~tail ~keep_scope ctx e2 in
       (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
@@ -648,18 +642,15 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
   | Some annotation ->
       (* The scope's proof runs the call, whose value it does not return. *)
       let* statements, value =
-        State.imperative ctx (fun () ->
-            let result = ref None in
-            Result.map
-              (access_proof ctx annotation ~result_type:e.exp_type
-                 ~input_types:(List.map inputs ~f:snd)
-                 ~output_types:(List.map outputs ~f:snd) (fun values ->
-                   Result.map
-                     (State.run ctx (run (Some values)))
-                     ~f:(fun (statements, value, outputs) ->
-                       result := Some value;
-                       (statements, value, outputs))))
-              ~f:(fun statements -> (statements, !result)))
+        let result = ref None in
+        State.map
+          (access_proof ctx annotation ~result_type:e.exp_type
+             ~input_types:(List.map inputs ~f:snd) ~output_types:(List.map outputs ~f:snd)
+             (fun values ->
+               State.map (run (Some values)) ~f:(fun (statements, value, outputs) ->
+                   result := Some value;
+                   (statements, value, outputs))))
+          ~f:(fun statements -> (statements, !result))
       in
       begin match value with
       | Some value -> State.return (arguments @ statements, value)

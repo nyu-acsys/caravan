@@ -906,13 +906,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let preds, spec_funcs, proof_support =
           proof_context_for ~preds ~spec_funcs ~proof_support st.invariant
         in
-        let* members =
-          action_checks
-            (spec_context types ~refs ~primitives
-               ~shared:(shared_for_proof st.invariant)
-               ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support origins)
-            st
+        let ctx =
+          spec_context types ~refs ~primitives
+            ~shared:(shared_for_proof st.invariant)
+            ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support origins
         in
+        let* members = State.run ctx (action_checks ctx st) in
         Ok (st, members))
   in
   let* pending_member_lists =

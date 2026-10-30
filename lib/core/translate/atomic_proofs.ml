@@ -38,18 +38,13 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
       | v :: _ -> unsupported v.term_loc "A variant"
       end
   in
-  let* scope, env = State.imperative ctx (fun () -> Ok (scope ctx, scope_env ctx)) in
-  let* proof_state = State.gets (fun (s : State.state) -> s.carried.proof_state) in
+  let* scope = scope in
+  let* env = scope_env ctx in
   let* env, state_invariants =
     State.fold spec.state_invariants ~init:(env, [])
       ~f:(fun (env, terms) (pattern, body) ->
-        let value, ty =
-          Option.value proof_state
-            ~default:(unit_value ~loc:(loc pattern.S.pat_loc), Predef.type_unit)
-        in
-        let* _ =
-          State.imperative ctx (fun () -> bind_proof_pattern env pattern ty value)
-        in
+        let* value, ty = proof_state ~at:pattern.S.pat_loc in
+        let* _ = State.of_result (bind_proof_pattern env pattern ty value) in
         let+ source = State.fresh "caravan$loop_state" in
         let id = S.mk_id ~loc:pattern.pat_loc source in
         let variable = S.mk_term (Tvar (Qid id)) pattern.pat_loc in
@@ -168,23 +163,23 @@ let action_env ctx st inv_params args values bindings =
           spec_funcs = st.context.declaration_functions;
           proof_support = st.context.declaration_support;
         };
-      (* A copy of the state, which mutations through this context do not share. *)
-      procedure = { ctx.procedure with names = ctx.procedure.names };
     }
   in
-  let env = { (scope_env ctx) with vars = []; var_types = [] } in
-  let env =
-    bind env st.state
-      (State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
-  in
-  let env =
-    List.fold
-      (List.zip_exn inv_params (List.take args (List.length inv_params)))
-      ~init:env
-      ~f:(fun env ((x, t), e) ->
-        { (bind env x (Value e)) with var_types = (x, t) :: env.var_types })
-  in
-  List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e))
+  State.map (scope_env ctx) ~f:(fun env ->
+      let env = { env with vars = []; var_types = [] } in
+      let env =
+        bind env st.state
+          (State
+             (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
+      in
+      let env =
+        List.fold
+          (List.zip_exn inv_params (List.take args (List.length inv_params)))
+          ~init:env
+          ~f:(fun env ((x, t), e) ->
+            { (bind env x (Value e)) with var_types = (x, t) :: env.var_types })
+      in
+      List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e)))
 
 (** The state after [p] of [st] from [opened], whose invariant has the parameters
     [inv_params] and the arguments [args]: each field's value, whether it changes, the
@@ -192,10 +187,7 @@ let action_env ctx st inv_params args values bindings =
     entry to, and the entries appended, with their fields and positions. *)
 let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
   let open State.Syntax in
-  let* env =
-    State.imperative ctx (fun () ->
-        Ok (action_env ctx st inv_params args opened.values p.bindings))
-  in
+  let* env = action_env ctx st inv_params args opened.values p.bindings in
   let* next =
     State.all (List.zip_exn st.fields opened.values) ~f:(fun ((f, _, _, t, _), v) ->
         match List.Assoc.find p.performed.update f ~equal:String.equal with
@@ -257,9 +249,7 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
     each view, its inputs and its value. *)
 let views_after ctx st args values =
   let open State.Syntax in
-  let* env =
-    State.imperative ctx (fun () -> Ok (action_env ctx st st.params args values []))
-  in
+  let* env = action_env ctx st st.params args values [] in
   State.all st.views ~f:(fun ((v : S.predicate), value) ->
       let inputs = List.take args (List.length v.pred_params - 1) in
       let env =
@@ -310,10 +300,7 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
   let open State.Syntax in
   match p.performed.helps with
   | Some (field, key, _) -> begin
-      let* env =
-        State.imperative ctx (fun () ->
-            Ok (action_env ctx st st.params args opened.values p.bindings))
-      in
+      let* env = action_env ctx st st.params args opened.values p.bindings in
       let* views = State.attempt (views_after ctx st args values) in
       let+ c = State.attempt (formula env key) in
       match
@@ -782,10 +769,7 @@ let record_read ctx ~atomic value =
           List.Assoc.find path.snapshots inv ~equal:String.equal )
       with
       | Some st, Some args, Some (latest :: _) when has_history st ->
-          let* env =
-            State.imperative ctx (fun () ->
-                Ok (action_env ctx st st.params args opened.values []))
-          in
+          let* env = action_env ctx st st.params args opened.values [] in
           State.iter st.held ~f:(fun (location, field, position) ->
               let* k = State.attempt (formula env position) in
               let* held = State.attempt (atomic_of env location) in
@@ -873,9 +857,7 @@ let step_performings ctx ~at ~op ~field ~location args =
                   | Some (o, Some loc_pattern :: patterns)
                     when String.equal o op && List.length patterns = List.length args ->
                       let env bindings =
-                        State.imperative ctx (fun () ->
-                            Ok
-                              (action_env ctx st st.params inv_args opened.values bindings))
+                        action_env ctx st st.params inv_args opened.values bindings
                       in
                       let* unbound = env [] in
                       let bindings =
@@ -1011,19 +993,23 @@ let open_pending_structure ctx ~(at : Location.t) message =
 (** The environment of a decision at a step whose result [value] matches [p], in the state
     [opened] of [st]. *)
 let decision_env ?value_type ctx st (opened : opened) (p : S.pat) value =
+  let open State.Syntax in
+  let* env = scope_env ctx in
   let env =
-    bind (scope_env ctx) st.state
+    bind env st.state
       (State
          (List.map2_exn st.fields opened.values ~f:(fun (f, _, _, t, _) v -> (f, (v, t)))))
   in
   match p.pat_desc with
   | Pid x ->
       let env = bind env x.pid_str (Value value) in
-      Ok
+      State.return
         (Option.value_map value_type ~default:env ~f:(fun ty ->
              { env with var_types = (x.pid_str, ty) :: env.var_types }))
-  | Pwild -> Ok env
-  | _ -> unsupported p.pat_loc "A pattern other than a variable, before a choice,"
+  | Pwild -> State.return env
+  | _ ->
+      State.of_result
+        (unsupported p.pat_loc "A pattern other than a variable, before a choice,")
 
 (** The statements of the step at [at] of the function with the update [au], whose result
     [value] matches [p]: the invariants are open, and [outcome] linearizes the function or
@@ -1037,9 +1023,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
     open_pending_structure ctx ~at
       "A step that may wait without a structure with pending calls"
   in
-  let* env =
-    State.imperative ctx (fun () -> decision_env ?value_type ctx st opened p value)
-  in
+  let* env = decision_env ?value_type ctx st opened p value in
   let* start = get_path in
   let snapshots = start.snapshots in
   let* hc = State.fresh "registration" in
@@ -1198,7 +1182,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
 (** Whether a step's result [value] matches [p], and [result], in the scope of [ctx]. *)
 let collected_terms ctx (p : S.pat) value result =
   let open State.Syntax in
-  let* env = State.imperative ctx (fun () -> Ok (scope_env ctx)) in
+  let* env = scope_env ctx in
   let* matches, _ = State.of_result (spec_pattern env p value) in
   let+ result = formula env result in
   (matches, result)
@@ -1268,8 +1252,8 @@ let linearize ?step ?value ?access_type ctx ~at
     match (annotation, value, access_type) with
     | None, _, _ -> State.return access
     | Some annotation, Some result, Some result_type ->
-        State.imperative ctx (fun () ->
-            access_proof ctx annotation ~result_type (fun _ -> Ok (access, result, [])))
+        access_proof ctx annotation ~result_type (fun _ ->
+            State.return (access, result, []))
     | Some annotation, _, _ ->
         State.of_result
           (error annotation.loc "This operation does not support an access proof")
@@ -1566,16 +1550,15 @@ let view_allocation ctx ~loc:l (fields : string list) =
   (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
 
 (** The ghost initializers that the annotation on the allocation [e] gives, if any. *)
-let annotated_initializers ctx (e : Typedtree.expression) =
+let allocation_initializers ctx (e : Typedtree.expression) =
+  let open State.Syntax in
   match
     List.Assoc.find ctx.given.initializations
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
       ~equal:Poly.equal
   with
-  | None -> Ok []
+  | None -> State.return []
   | Some annotation ->
-      let* initializers = Annotation.initializes annotation in
-      ghost_initializers (scope_env ctx) ~owner:e.exp_type initializers
-
-let allocation_initializers ctx e =
-  State.imperative ctx (fun () -> annotated_initializers ctx e)
+      let* initializers = State.of_result (Annotation.initializes annotation) in
+      let* env = scope_env ctx in
+      ghost_initializers env ~owner:e.exp_type initializers

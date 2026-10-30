@@ -4,7 +4,7 @@
 open Base
 open Translate_context
 open Spec_terms.On_context
-open Proof_terms
+open Proof_terms.On_context
 open Atomic_proofs
 open Procedures
 
@@ -1126,13 +1126,13 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
 (** The parameters of [p], with the OCaml types [param_types], and the environment of the
     predicate's body. *)
 let pred_params ctx ~at (p : S.predicate) param_types =
+  let open State.Syntax in
   let l = loc at in
-  let* params =
-    all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
-        let* typ = typ ctx ~at t in
-        let raven = Names.fresh ctx.procedure.names id.S.pid_str in
-        Ok
-          (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
+  let+ params =
+    State.all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
+        let* typ = State.of_result (typ ctx ~at t) in
+        let+ raven = State.fresh id.S.pid_str in
+        (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
   in
   let env =
     {
@@ -1144,7 +1144,7 @@ let pred_params ctx ~at (p : S.predicate) param_types =
       vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));
     }
   in
-  Ok (params, env)
+  (params, env)
 
 type checked_operation = {
   operation_binding : Module_inventory.checked_binding;

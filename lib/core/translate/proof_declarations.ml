@@ -4,7 +4,6 @@
 open Base
 open Translate_context
 open Spec_terms
-open Spec_terms.On_context
 open Proof_terms
 open Atomic_proofs
 open Procedures
@@ -15,29 +14,35 @@ open Program_items
     step's arguments give them; an action whose parameters are not all typed so is not
     checked. *)
 let action_checks ctx (st : structure) =
-  if not (has_history st) then Ok []
+  let open State.Syntax in
+  if not (has_history st) then State.return []
   else
-    all st.actions ~f:(fun a ->
+    State.map ~f:List.concat
+    @@ State.all st.actions ~f:(fun a ->
         let at = a.action_at in
         let l = loc at in
         let var x = R.Expr.var ~loc:l (name ~loc:l x) in
-        let fresh x = Names.fresh ctx.procedure.names x in
-        let fields =
-          List.map st.fields ~f:(fun (f, _, typ, t, _) -> (f, fresh f, typ, t))
+        let* fields =
+          State.all st.fields ~f:(fun (f, _, typ, t, _) ->
+              let+ raven = State.fresh f in
+              (f, raven, typ, t))
         in
-        let indices =
-          List.map st.chains ~f:(fun (field, _) ->
-              (field, fresh (field ^ "_index"), chain_index_type ctx.given.types st field))
+        let* indices =
+          State.all st.chains ~f:(fun (field, _) ->
+              let+ raven = State.fresh (field ^ "_index") in
+              (field, raven, chain_index_type ctx.given.types st field))
         in
         let* params =
-          all st.params ~f:(fun (x, t) ->
-              let* typ = typ ctx ~at t in
-              Ok (x, fresh x, t, typ))
+          State.all st.params ~f:(fun (x, t) ->
+              let* typ = State.of_result (typ ctx ~at t) in
+              let+ raven = State.fresh x in
+              (x, raven, t, typ))
         in
         let args = List.map params ~f:(fun (_, raven, _, _) -> var raven) in
+        let* scope_env = scope_env ctx in
         let env =
           let env =
-            bind (scope_env ctx) st.state
+            bind scope_env st.state
               (State (List.map fields ~f:(fun (f, raven, _, t) -> (f, (var raven, t)))))
           in
           List.fold params ~init:env ~f:(fun env (x, raven, t, _) ->
@@ -81,18 +86,21 @@ let action_checks ctx (st : structure) =
               end
           | _ -> []
         in
-        match
-          Option.all
-            (List.map a.params ~f:(fun x ->
-                 Option.map (List.Assoc.find param_types x ~equal:String.equal)
-                   ~f:(fun t -> (x, fresh x, t))))
-        with
-        | None -> Ok []
+        let* typed_params =
+          State.all a.params ~f:(fun x ->
+              match List.Assoc.find param_types x ~equal:String.equal with
+              | Some t ->
+                  let+ raven = State.fresh x in
+                  Some (x, raven, t)
+              | None -> State.return None)
+        in
+        match Option.all typed_params with
+        | None -> State.return []
         | Some action_params ->
             let* action_vars =
-              all action_params ~f:(fun (_, raven, t) ->
-                  let* typ = typ ctx ~at t in
-                  Ok (R.Var.make ~loc:l (ident ~loc:l raven) typ))
+              State.all action_params ~f:(fun (_, raven, t) ->
+                  let+ typ = State.of_result (typ ctx ~at t) in
+                  R.Var.make ~loc:l (ident ~loc:l raven) typ)
             in
             let opened =
               {
@@ -108,44 +116,43 @@ let action_checks ctx (st : structure) =
               }
             in
             let* next, _, _ =
-              State.run ctx
-                (next_state ctx st ~inv_params:st.params args opened performing)
+              next_state ctx st ~inv_params:st.params args opened performing
             in
             let state values = state_of ~loc:l st (grown st values) in
             (* Reported at the return point of the lemma, at the end of the action's
                name. *)
-            record_origin ctx
-              {
-                at = { at with loc_start = at.loc_end };
-                code = Postcondition;
-                message =
-                  Printf.sprintf "The action %s may make a field marked [@grows] shrink"
-                    a.action;
-                related = [];
-              };
-            Ok
-              [
-                R.Member.callable
-                  (R.Callable.proc ~loc:l ~kind:Lemma
-                     ~formals:
-                       (List.map params ~f:(fun (_, raven, _, typ) ->
-                            R.Var.make ~loc:l (ident ~loc:l raven) typ)
-                       @ List.map fields ~f:(fun (_, raven, typ, _) ->
-                           R.Var.make ~loc:l (ident ~loc:l raven) typ)
-                       @ List.map indices ~f:(fun (_, raven, typ) ->
-                           R.Var.make ~loc:l (ident ~loc:l raven) typ)
-                       @ action_vars)
-                     ~ensures:
-                       [
-                         R.Spec.make
-                           (R.Expr.call ~loc:l
-                              (qualified_name ~loc:l (member_name st "extends"))
-                              [ state opened.values; state (List.map next ~f:fst) ]);
-                       ]
-                     (generated_ident ~loc:l (member_name st (a.action ^ "_grows")))
-                     (Some []));
-              ])
-    |> Result.map ~f:List.concat
+            let+ () =
+              State.record_origin
+                {
+                  at = { at with loc_start = at.loc_end };
+                  code = Postcondition;
+                  message =
+                    Printf.sprintf "The action %s may make a field marked [@grows] shrink"
+                      a.action;
+                  related = [];
+                }
+            in
+            [
+              R.Member.callable
+                (R.Callable.proc ~loc:l ~kind:Lemma
+                   ~formals:
+                     (List.map params ~f:(fun (_, raven, _, typ) ->
+                          R.Var.make ~loc:l (ident ~loc:l raven) typ)
+                     @ List.map fields ~f:(fun (_, raven, typ, _) ->
+                         R.Var.make ~loc:l (ident ~loc:l raven) typ)
+                     @ List.map indices ~f:(fun (_, raven, typ) ->
+                         R.Var.make ~loc:l (ident ~loc:l raven) typ)
+                     @ action_vars)
+                   ~ensures:
+                     [
+                       R.Spec.make
+                         (R.Expr.call ~loc:l
+                            (qualified_name ~loc:l (member_name st "extends"))
+                            [ state opened.values; state (List.map next ~f:fst) ]);
+                     ]
+                   (generated_ident ~loc:l (member_name st (a.action ^ "_grows")))
+                   (Some []));
+            ])
 
 (** The context translating the specifications of declarations, outside functions. *)
 let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
@@ -231,29 +238,32 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
           given = { base.given with proof_lemmas; proof_support; predicate_bodies };
         }
       in
+      State.run ctx
+      @@
+      let open State.Syntax in
       let l = loc lemma_name.pid_loc in
       let signature =
         List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
       in
       let declare ?(implicit = false) (id, _) ty =
-        let* raven_type = typ ctx ~at:id.S.pid_loc ty in
-        let raven = Names.fresh ctx.procedure.names id.pid_str in
-        Ok
-          ( id.pid_str,
-            raven,
-            ty,
-            R.Var.make ~loc:(loc id.pid_loc) ~ghost:true ~implicit (ident ~loc:l raven)
-              raven_type )
+        let* raven_type = State.of_result (typ ctx ~at:id.S.pid_loc ty) in
+        let+ raven = State.fresh id.pid_str in
+        ( id.pid_str,
+          raven,
+          ty,
+          R.Var.make ~loc:(loc id.pid_loc) ~ghost:true ~implicit (ident ~loc:l raven)
+            raven_type )
       in
       let* inputs =
-        all (List.zip_exn lemma_params signature.lemma_inputs) ~f:(fun (parameter, ty) ->
+        State.all (List.zip_exn lemma_params signature.lemma_inputs)
+          ~f:(fun (parameter, ty) ->
             declare
               ~implicit:
                 (List.mem (fst parameter).S.pid_attrs "implicit" ~equal:String.equal)
               parameter ty)
       in
       let* outputs =
-        all (List.zip_exn lemma_returns signature.lemma_outputs)
+        State.all (List.zip_exn lemma_returns signature.lemma_outputs)
           ~f:(fun (parameter, ty) -> declare parameter ty)
       in
       let parameters = inputs @ outputs in
@@ -263,9 +273,10 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
             (List.map parameters ~f:(fun (x, _, _, _) -> x))
             ~compare:String.compare
         with
-        | None -> Ok ()
+        | None -> State.return ()
         | Some x ->
-            error lemma_name.pid_loc (Printf.sprintf "Duplicate proof variable %s" x)
+            State.of_result
+              (error lemma_name.pid_loc (Printf.sprintf "Duplicate proof variable %s" x))
       in
       let env =
         {
@@ -278,13 +289,13 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         }
       in
       let specs terms =
-        all terms ~f:(fun t ->
-            let* value = formula env t in
-            Ok (R.Spec.make value))
+        State.all terms ~f:(fun t ->
+            let+ value = formula env t in
+            R.Spec.make value)
       in
       let* requires = specs lemma_requires in
       let* ensures = specs lemma_ensures in
-      let* decreases = all lemma_variant ~f:(formula env) in
+      let* decreases = State.all lemma_variant ~f:(formula env) in
       let body_env =
         {
           env with
@@ -296,14 +307,13 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         List.map outputs ~f:(fun (_, raven, ty, _) ->
             { target_name = raven; target_type = ty })
       in
-      let* body = proof_expression body_env targets lemma_body in
-      Ok
-        (R.Callable.proc ~loc:l ~kind:Lemma
-           ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
-           ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
-           ~requires ~ensures ~decreases
-           (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
-           (Some body))
+      let+ body = proof_expression body_env targets lemma_body in
+      R.Callable.proc ~loc:l ~kind:Lemma
+        ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
+        ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
+        ~requires ~ensures ~decreases
+        (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
+        (Some body)
   | _ -> error Location.none "Expected a lemma declaration"
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
@@ -315,27 +325,29 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
     spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
       ~proof_support origins
   in
+  State.run ctx
+  @@
+  let open State.Syntax in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
   let name = ident ~loc:l (Option.value declaration_name ~default:p.pred_name.pid_str) in
   match def with
   | Direct_invariant body ->
-      let* body = quantified env body in
-      Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
+      let+ body = quantified env body in
+      R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body)
   | Body body ->
       let* body = quantified env body in
       (* Explicit output attributes override the trailing reference-free convention. *)
-      let* outputs = predicate_output_count types p param_types in
+      let+ outputs = State.of_result (predicate_output_count types p param_types) in
       let inputs, outputs = List.split_n params (List.length params - outputs) in
-      Ok
-        (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
-           name (Some body))
+      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
+        name (Some body)
   | View _ ->
       (* Half of the view's ghost field, on the structure, its first parameter. *)
       let inputs, value = List.split_n params (List.length params - 1) in
       let structure, _, structure_type, _ = List.hd_exn params in
-      let* structure =
+      let+ structure =
         formula env (S.mk_term (Tvar (Qid (S.mk_id ~loc:at structure))) at)
       in
       let structure =
@@ -348,16 +360,14 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
         R.Expr.field ~loc:l structure
           (qualified_name ~loc:l (view_field_in ctx.given.shared p.pred_name.pid_str))
       in
-      Ok
-        (R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value)
-           name
-           (Some
-              (R.Expr.own ~loc:l
-                 [
-                   field;
-                   R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
-                   R.Expr.real ~loc:l 0.5;
-                 ])))
+      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value) name
+        (Some
+           (R.Expr.own ~loc:l
+              [
+                field;
+                R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
+                R.Expr.real ~loc:l 0.5;
+              ]))
   | Invariant { state; body; _ } ->
       (* The state's fields are existentials, as are the index maps of the fields owned by
          index; its views hold the other halves of their ghost fields, and its history
@@ -367,8 +377,8 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
           List.find structures ~f:(fun st ->
               String.equal st.invariant p.pred_name.pid_str)
         with
-        | Some st -> Ok st
-        | None -> error at "An invariant without a state"
+        | Some st -> State.return st
+        | None -> State.of_result (error at "An invariant without a state")
       in
       let views = st.views in
       let var x = R.Expr.var ~loc:l (R.Name.make ~loc:l x) in
@@ -393,12 +403,12 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
         let* elt, elt_typ =
           match Datatypes.desc types otyp with
           | Tconstr (_, [ elt ], _) ->
-              let* elt_typ = typ ctx ~at elt in
-              Ok (elt, elt_typ)
-          | _ -> error at "A sequence owned by index"
+              let+ elt_typ = State.of_result (typ ctx ~at elt) in
+              (elt, elt_typ)
+          | _ -> State.of_result (error at "A sequence owned by index")
         in
-        let j = Names.fresh ctx.procedure.names "i"
-        and c = Names.fresh ctx.procedure.names "c" in
+        let* j = State.fresh "i" in
+        let* c = State.fresh "c" in
         let wf =
           R.Expr.forall ~loc:l
             ~triggers:[ [ R.Expr.index ~loc:l entries (var j) ] ]
@@ -419,17 +429,17 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
           }
         in
         let* guard = formula entry_env guard in
-        let* contents =
+        let contents =
           match Datatypes.desc types elt with
-          | Tconstr (_, [ contents ], _) -> Ok (Some contents)
-          | _ -> Ok None
+          | Tconstr (_, [ contents ], _) -> Some contents
+          | _ -> None
         in
         let* value = expected_formula entry_env contents value in
-        let* field = field_of_type ctx ~at elt "" in
-        let* field =
+        let* field = State.field_of_type ctx.given ~at elt "" in
+        let+ field =
           match field with
-          | Some f -> Ok f
-          | None -> error at "Entries owned by index are atomics"
+          | Some f -> State.return f
+          | None -> State.of_result (error at "Entries owned by index are atomics")
         in
         let owned =
           (* No trigger: one on the index map loops with the positions' trigger, through
@@ -447,10 +457,10 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
                (R.Expr.own ~loc:l
                   [ R.Expr.field ~loc:l (var c) (qualified_name ~loc:l field); value ]))
         in
-        Ok (bin And wf owned)
+        bin And wf owned
       in
       let* body =
-        all (conjuncts body) ~f:(fun t ->
+        State.all (conjuncts body) ~f:(fun t ->
             match chain_of ~state t with
             | Some ((_, _, field, _) as owned)
               when List.Assoc.mem st.chains field ~equal:String.equal ->
@@ -460,13 +470,13 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
       (* The registered calls, each waiting on a key, helped once the key is not the one
          that the helping action helps any more, and their registrations. *)
       let* waiting =
-        all st.pendings ~f:(fun p ->
+        State.all st.pendings ~f:(fun p ->
             let registrations = var (st.state ^ "_" ^ p.pending_field) in
             let on = var p.pending_on in
             let hc = R.Expr.var ~loc:l (R.Name.make ~loc:l "hc") in
             let key = R.Expr.index ~loc:l on hc in
             let helping_state, helping_key, _ = p.helping in
-            let* helped_key =
+            let+ helped_key =
               formula
                 (bind state_env helping_state
                    (Option.value_exn
@@ -512,13 +522,12 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
                 (qualified_name ~loc:l (pending_name st p "registration"))
                 (hc :: List.map params ~f:(fun (_, raven, _, _) -> var raven))
             in
-            Ok
-              (R.Expr.forall ~loc:l
-                 [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
-                 (bin Impl (bin In hc registrations)
-                    (List.reduce_exn ~f:(bin And)
-                       ((half "watched" key :: membership)
-                       @ [ half "linked" (bin Neq key helped_key); registered ])))))
+            R.Expr.forall ~loc:l
+              [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+              (bin Impl (bin In hc registrations)
+                 (List.reduce_exn ~f:(bin And)
+                    ((half "watched" key :: membership)
+                    @ [ half "linked" (bin Neq key helped_key); registered ]))))
       in
       let body = List.reduce_exn (body @ waiting) ~f:(bin And) in
       let _, structure, _, _ = List.hd_exn params in
@@ -528,7 +537,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
         | None -> e
       in
       let* halves =
-        all views ~f:(fun ((v : S.predicate), value) ->
+        State.all views ~f:(fun ((v : S.predicate), value) ->
             (* The view's parameters are the invariant's, but for its value. *)
             let view_env =
               List.fold
@@ -540,14 +549,14 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
                     var_types = (id.pid_str, t) :: env.var_types;
                   })
             in
-            let* value = formula view_env value in
+            let+ value = formula view_env value in
             let field =
               R.Expr.field ~loc:l
                 (anchored (var structure))
                 (qualified_name ~loc:l
                    (view_field_in ctx.given.shared v.pred_name.pid_str))
             in
-            Ok (R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ]))
+            R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ])
       in
       let history =
         if has_history st then
@@ -579,12 +588,11 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
         else []
       in
       let body = List.fold (halves @ history) ~init:body ~f:(bin And) in
-      let* ons =
-        all st.pendings ~f:(fun p ->
-            let* key = typ ctx ~at p.key_type in
-            Ok
-              (R.Var.make ~loc:l (ident ~loc:l p.pending_on)
-                 (R.Type.map ~loc:l (R.Type.ref ~loc:l) key)))
+      let+ ons =
+        State.all st.pendings ~f:(fun p ->
+            let+ key = State.of_result (typ ctx ~at p.key_type) in
+            R.Var.make ~loc:l (ident ~loc:l p.pending_on)
+              (R.Type.map ~loc:l (R.Type.ref ~loc:l) key))
       in
       let existentials =
         List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
@@ -610,7 +618,7 @@ let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~pro
       let body =
         match existentials with [] -> body | _ -> R.Expr.exists ~loc:l existentials body
       in
-      Ok (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body))
+      R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body)
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A
@@ -834,17 +842,23 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
           ~proof_support origins
       in
+      State.run ctx
+      @@
+      let open State.Syntax in
       let* params =
-        all function_params ~f:(fun (id, ty) ->
-            let* ty = Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty in
-            let* raven_type = typ ctx ~at:id.pid_loc ty in
-            let raven = Names.fresh ctx.procedure.names id.pid_str in
-            Ok (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
+        State.all function_params ~f:(fun (id, ty) ->
+            let* ty = State.of_result (Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty) in
+            let* raven_type = State.of_result (typ ctx ~at:id.pid_loc ty) in
+            let+ raven = State.fresh id.pid_str in
+            (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
       in
       let* result_type =
-        Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result
+        State.of_result
+          (Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result)
       in
-      let* result_type = typ ctx ~at:function_name.pid_loc result_type in
+      let* result_type =
+        State.of_result (typ ctx ~at:function_name.pid_loc result_type)
+      in
       let env =
         {
           ctx;
@@ -855,25 +869,25 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
           var_types = List.map params ~f:(fun (x, _, t, _) -> (x, t));
         }
       in
-      let* () = pure_logical_body env function_body in
+      let* () = State.of_result (pure_logical_body env function_body) in
       let* () =
-        Source.check_logical_function ocaml_env ~functions:(List.map spec_funcs ~f:fst)
-          declaration
+        State.of_result
+          (Source.check_logical_function ocaml_env ~functions:(List.map spec_funcs ~f:fst)
+             declaration)
       in
       let* body = formula env function_body in
-      let result = Names.fresh ctx.procedure.names "result" in
+      let+ result = State.fresh "result" in
       let member =
         ident ~loc:l (Option.value member_name ~default:function_name.pid_str)
       in
       let body = R.Expr.annotated body result_type in
-      if as_value then Ok (R.Member.value ~loc:l ~typ:result_type member (Some body))
+      if as_value then R.Member.value ~loc:l ~typ:result_type member (Some body)
       else
-        Ok
-          (R.Member.callable
-             (R.Callable.func ~loc:l
-                ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
-                ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
-                member (Some body)))
+        R.Member.callable
+          (R.Callable.func ~loc:l
+             ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
+             ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
+             member (Some body))
   | _ -> error Location.none "Expected a logical function declaration"
 
 let scoped_contract_context types ~refs ~primitives ~shared ~environment ~proof_support
