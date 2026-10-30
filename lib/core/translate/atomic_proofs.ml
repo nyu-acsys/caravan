@@ -28,24 +28,29 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
     as the value of the loop's condition. *)
 let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
-    ~(relation : ((string * string) * R.Expr.t) list -> (R.Expr.t option, error) Result.t)
-    =
+    ~(relation : ((string * string) * R.Expr.t) list -> R.Expr.t option State.t) =
+  let open State.Syntax in
   let l = loc at in
   let* () =
-    match spec.loop_variant with
-    | [] -> Ok ()
-    | v :: _ -> unsupported v.term_loc "A variant"
+    State.of_result
+      begin match spec.loop_variant with
+      | [] -> Ok ()
+      | v :: _ -> unsupported v.term_loc "A variant"
+      end
   in
-  let scope = scope ctx in
-  let env = scope_env ctx in
+  let* scope, env = State.imperative ctx (fun () -> Ok (scope ctx, scope_env ctx)) in
+  let* proof_state = State.gets (fun (s : State.state) -> s.carried.proof_state) in
   let* env, state_invariants =
-    List.fold spec.state_invariants
-      ~init:(Ok (env, []))
-      ~f:(fun acc (pattern, body) ->
-        let* env, terms = acc in
-        let value, ty = proof_state ctx ~at:pattern.S.pat_loc in
-        let* _ = bind_proof_pattern env pattern ty value in
-        let source = Names.fresh ctx.procedure.names "caravan$loop_state" in
+    State.fold spec.state_invariants ~init:(env, [])
+      ~f:(fun (env, terms) (pattern, body) ->
+        let value, ty =
+          Option.value proof_state
+            ~default:(unit_value ~loc:(loc pattern.S.pat_loc), Predef.type_unit)
+        in
+        let* _ =
+          State.imperative ctx (fun () -> bind_proof_pattern env pattern ty value)
+        in
+        let+ source = State.fresh "caravan$loop_state" in
         let id = S.mk_id ~loc:pattern.pat_loc source in
         let variable = S.mk_term (Tvar (Qid id)) pattern.pat_loc in
         let term = S.mk_term (Tlet (pattern, variable, body)) body.term_loc in
@@ -55,32 +60,32 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
             var_types = (source, ty) :: env.var_types;
           }
         in
-        Ok (env, terms @ [ term ]))
+        (env, terms @ [ term ]))
   in
   let terms = spec.invariants @ state_invariants in
-  let* free = free_typed env terms ~at in
+  let* free = State.imperative ctx (fun () -> free_typed env terms ~at) in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
-  let* invariants = all terms ~f:(formula env) in
+  let* invariants = State.imperative ctx (fun () -> all terms ~f:(formula env)) in
   (* The values that the invariants own, by the Raven names of their references and
      fields. *)
   let* reads =
-    all (List.concat_map terms ~f:owned_names) ~f:(fun (x, label, v) ->
+    State.all (List.concat_map terms ~f:owned_names) ~f:(fun (x, label, v) ->
         match
           ( List.Assoc.find env.vars x ~equal:String.equal,
             List.Assoc.find env.var_types x ~equal:String.equal,
             List.Assoc.find env.vars v ~equal:String.equal )
         with
         | Some (Raven r), Some t, Some (Raven v) ->
-            let* field = field_of_type ctx ~at t label in
-            Ok
-              (Option.map field ~f:(fun field ->
-                   ((r, field), R.Expr.var ~loc:l (name ~loc:l v))))
-        | _ -> Ok None)
+            let+ field = State.field_of_type ctx.given ~at t label in
+            Option.map field ~f:(fun field ->
+                ((r, field), R.Expr.var ~loc:l (name ~loc:l v)))
+        | _ -> State.return None)
   in
   let* related = relation (List.filter_opt reads) in
+  let+ facts = State.gets (fun (s : State.state) -> s.carried.facts) in
   let invariants = invariants @ Option.to_list related in
   let user =
     match (free, invariants) with
@@ -99,7 +104,7 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
         if String.equal raven counter then None
         else Option.bind t ~f:(fun t -> range_spec ~loc:l t raven))
   in
-  Ok (ranges @ ctx.procedure.facts @ user)
+  ranges @ facts @ user
 
 (** The names that [t] owns the values of fields of variables as, as [k] for [i.contents]
     in [own i.contents k]: the variable, the field and the name. *)
@@ -1529,24 +1534,26 @@ let no_loop_before_linearizing ~at =
     allocation of [fields] allocates, and these fields with their values: a view's value
     is set when the structure's invariant is established. *)
 let view_allocation ctx ~loc:l (fields : string list) =
+  let open State.Syntax in
   let views =
     List.concat_map fields ~f:(fun field ->
         Option.value
           (List.Assoc.find ctx.given.shared.anchors field ~equal:String.equal)
           ~default:[])
   in
-  let allocated =
-    List.map views ~f:(fun (view, typ, init) ->
+  let+ allocated =
+    State.all views ~f:(fun (view, typ, init) ->
         match init with
-        | Some init -> ([], (qualified_name ~loc:l view, Some init))
+        | Some init -> State.return ([], (qualified_name ~loc:l view, Some init))
         | None ->
-            let x = Names.fresh ctx.procedure.names "view" in
+            let+ x = State.fresh "view" in
             ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x),
               (qualified_name ~loc:l view, Some (R.Expr.var ~loc:l (name ~loc:l x))) ))
   in
   (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
 
-let allocation_initializers ctx (e : Typedtree.expression) =
+(** The ghost initializers that the annotation on the allocation [e] gives, if any. *)
+let annotated_initializers ctx (e : Typedtree.expression) =
   match
     List.Assoc.find ctx.given.initializations
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
@@ -1556,3 +1563,6 @@ let allocation_initializers ctx (e : Typedtree.expression) =
   | Some annotation ->
       let* initializers = Annotation.initializes annotation in
       ghost_initializers (scope_env ctx) ~owner:e.exp_type initializers
+
+let allocation_initializers ctx e =
+  State.imperative ctx (fun () -> annotated_initializers ctx e)

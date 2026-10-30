@@ -183,7 +183,7 @@ let pattern_params ctx (f : func) formals =
             Some (_, x) ) ->
             let l = loc pat_loc in
             let value = R.Expr.var ~loc:l (name ~loc:l x) in
-            let* access, cond, binds = pattern ctx pat value in
+            let* access, cond, binds = State.run ctx (pattern ctx pat value) in
             begin match cond with
             | Some _ -> unsupported pat_loc "A refutable pattern as a parameter"
             | None ->
@@ -452,7 +452,7 @@ let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
                R.Expr.binary ~loc:l Impl pre post)))
   in
   let* result_typ = typ ctx ~at:f.body.exp_loc f.body.exp_type in
-  let* body = pure ctx ~funcs [] f.body in
+  let* body = State.run ctx (pure ctx ~funcs [] f.body) in
   Ok
     (R.Callable.func ~loc:l
        ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
@@ -1219,8 +1219,13 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
   end
   else
     let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
-    let* stmts, v = expr ~tail:true ~keep_scope:true ctx f.body in
-    let* finish = State.run ctx (finish_arm ctx ~tail:true v) in
+    let* stmts, v, finish =
+      State.run ctx
+        (let open State.Syntax in
+         let* stmts, v = expr ~tail:true ~keep_scope:true ctx f.body in
+         let+ finish = finish_arm ctx ~tail:true v in
+         (stmts, v, finish))
+    in
     let stmts = stmts @ finish in
     let assignment =
       if List.is_empty returns then []

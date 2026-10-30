@@ -332,21 +332,40 @@ module State_monad = struct
         let* acc = f init x in
         fold rest ~init:acc ~f
 
-  (** Runs each of [arms] from the path before them, the rest of the state carrying on
-      from arm to arm: their results with the path each ends in. The path is then the last
-      arm's. *)
-  let arms (arms : 'a t list) : ('a * path) list t =
-   fun s ->
-    let start = s.path in
-    let rec go s ended = function
-      | [] -> (Ok (List.rev ended), s)
-      | arm :: rest ->
-          begin match arm { s with path = start } with
-          | Ok a, s -> go s ((a, s.path) :: ended) rest
-          | (Error _ as error), s -> (error, s)
-          end
-    in
-    go s [] arms
+  (** Runs [m] from the path [start], the rest of the state carrying on: its result, with
+      the path it ends in, which the state then has. *)
+  let arm start m s =
+    match m { s with path = start } with
+    | Ok a, s -> (Ok (a, s.path), s)
+    | Error e, s -> (Error e, s)
+
+  let modify_carried f = modify (fun s -> { s with carried = f s.carried })
+
+  (** The Raven name of the OCaml variable [id] among [names], if it is bound. *)
+  let name_in (names : names) (id : Ident.t) =
+    List.Assoc.find names.bound (Ident.unique_name id) ~equal:String.equal
+
+  let find_name id = gets (fun s -> name_in s.names id)
+
+  (** The Raven name of the OCaml variable [id] of type [typ], bound now. *)
+  let bind_name ?typ (id : Ident.t) s =
+    let name = Names.unused s.names.used (Ident.name id) in
+    ( Ok name,
+      {
+        s with
+        names =
+          {
+            used = Set.add s.names.used name;
+            bound = (Ident.unique_name id, name) :: s.names.bound;
+            scope = (Ident.name id, (name, typ)) :: s.names.scope;
+          };
+      } )
+
+  (** The variables bound so far, by their OCaml names, latest first, with their Raven
+      names and types. *)
+  let get_scope = gets (fun s -> s.names.scope)
+
+  let set_scope scope = modify (fun s -> { s with names = { s.names with scope } })
 end
 
 type au = {
@@ -944,6 +963,74 @@ module State = struct
   let check ~(at : Location.t) message c =
     let+ () = record_origin { at; code = Assertion; message; related = [] } in
     R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
+
+  (** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
+  let no_overflow ~at what v =
+    let l = loc at in
+    let bound op n = R.Expr.binary ~loc:l op v (R.Expr.int ~loc:l n) in
+    check ~at
+      (Printf.sprintf "This %s may overflow" what)
+      (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
+
+  (** The Raven field named [label] of the values of type [t] that are references; an
+      atomic's contents have the empty label, as in [own a v]. *)
+  let field_of_type (given : inputs) ~at (t : Types.type_expr) label =
+    match Datatypes.desc given.types t with
+    | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
+        let+ field = ref_field given ~at elt in
+        Some field
+    | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+        let+ field = atomic_field given ~at elt in
+        Some field
+    | Tconstr (p, [], _) ->
+        begin match Datatypes.find given.types p with
+        | Some { heap = Some fields; _ } ->
+            return
+              (Option.map
+                 (List.find fields ~f:(fun f -> String.equal f.label label))
+                 ~f:(fun f -> f.raven_field))
+        | _ -> return None
+        end
+    | _ -> return None
+
+  (** The Raven field of the record field [label], and whether its record is a reference;
+      [None] if it is unknown. *)
+  let field_of_label (given : inputs) ~at (label : Data_types.label_description) =
+    match Types.get_desc label.lbl_res with
+    | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
+        let+ field = ref_field given ~at elt in
+        Some (field, true)
+    | _ ->
+        begin match Datatypes.find_label given.types label with
+        | Some { heap = Some fields; _ } ->
+            let field =
+              List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
+            in
+            return (Some (field.raven_field, true))
+        | Some _ -> return (Some (label.lbl_name, false))
+        | None -> return None
+        end
+
+  let ordinary_read ?guard (given : inputs) ~at ~field ~elt r =
+    let l = loc at in
+    let* proc = ordinary_primitive given ~at ~field elt Primitives.Read in
+    let* typ = of_result (Datatypes.typ given.types ~at elt) in
+    let+ x = fresh "tmp" in
+    let value = R.Expr.var ~loc:l (name ~loc:l x) in
+    let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r ]) in
+    let access =
+      match guard with
+      | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
+      | Some condition ->
+          R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+          @ [ R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [] ]
+    in
+    (access, value)
+
+  let ordinary_write (given : inputs) ~at ~field ~elt r v =
+    let l = loc at in
+    let+ proc = ordinary_primitive given ~at ~field elt Primitives.Write in
+    R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r; v ])
 end
 
 (** Declares [field], with values of type [elt], unless it is already. *)
@@ -968,24 +1055,8 @@ let ordinary_primitive ctx ~at ~field elt op =
 
 (** The Raven field named [label] of the values of type [t] that are references; an
     atomic's contents have the empty label, as in [own a v]. *)
-let field_of_type ctx ~at (t : Types.type_expr) label =
-  match Datatypes.desc ctx.given.types t with
-  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
-      let* field = ref_field ctx ~at elt in
-      Ok (Some field)
-  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
-      let* field = atomic_field ctx ~at elt in
-      Ok (Some field)
-  | Tconstr (p, [], _) ->
-      begin match Datatypes.find ctx.given.types p with
-      | Some { heap = Some fields; _ } ->
-          Ok
-            (Option.map
-               (List.find fields ~f:(fun f -> String.equal f.label label))
-               ~f:(fun f -> f.raven_field))
-      | _ -> Ok None
-      end
-  | _ -> Ok None
+let field_of_type ctx ~at t label =
+  State.run ctx (State.field_of_type ctx.given ~at t label)
 
 (** The atomic that the field [label] of a value of the immutable record type [t] holds:
     its type, if it is one. *)
@@ -1061,24 +1132,6 @@ let field_type ctx t label =
             | _ -> fallback
           else source)
 
-(** The Raven field of the record field [label], and whether its record is a reference;
-    [None] if it is unknown. *)
-let field_of_label ctx ~at (label : Data_types.label_description) =
-  match Types.get_desc label.lbl_res with
-  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
-      let* field = ref_field ctx ~at elt in
-      Ok (Some (field, true))
-  | _ ->
-      begin match Datatypes.find_label ctx.given.types label with
-      | Some { heap = Some fields; _ } ->
-          let field =
-            List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
-          in
-          Ok (Some (field.raven_field, true))
-      | Some _ -> Ok (Some (label.lbl_name, false))
-      | None -> Ok None
-      end
-
 (** Records a check the translation generates. *)
 let record_origin ctx origin = State.update ctx (State.with_origin origin)
 
@@ -1087,14 +1140,6 @@ let check ctx ~(at : Location.t) message c =
   record_origin ctx { at; code = Assertion; message; related = [] };
   R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
-(** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
-let no_overflow ctx ~at what v =
-  let l = loc at in
-  let bound op n = R.Expr.binary ~loc:l op v (R.Expr.int ~loc:l n) in
-  check ctx ~at
-    (Printf.sprintf "This %s may overflow" what)
-    (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
-
 let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
 
 (** The write of [v] to the field [field] of the reference [r]. *)
@@ -1102,27 +1147,6 @@ let write ~loc:l r field v =
   R.Stmt.assign ~loc:l
     [ R.Expr.field ~loc:l r (qualified_name ~loc:l field) ]
     (R.Stmt.expr_rhs v)
-
-let ordinary_read ?guard ctx ~at ~field ~elt r =
-  let l = loc at in
-  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Read in
-  let* typ = typ ctx ~at elt in
-  let x = Names.fresh ctx.procedure.names "tmp" in
-  let value = R.Expr.var ~loc:l (name ~loc:l x) in
-  let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r ]) in
-  let access =
-    match guard with
-    | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
-    | Some condition ->
-        R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
-        @ [ R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [] ]
-  in
-  Ok (access, value)
-
-let ordinary_write ctx ~at ~field ~elt r v =
-  let l = loc at in
-  let* proc = ordinary_primitive ctx ~at ~field elt Primitives.Write in
-  Ok (R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r; v ]))
 
 (** The name of [p] if it is a value of the standard library's toplevel. *)
 let stdlib_name (p : Path.t) =
