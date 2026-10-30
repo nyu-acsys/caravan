@@ -161,9 +161,14 @@ let eligible (source : Module_inventory.specialization) =
   in
   (not (List.is_empty source.members)) && functions && abstract_types && body
 
-let plan ?(proof_layout = fun _ -> false) ~fresh sources =
+let plan ?(proof_layout = fun _ -> false) sources =
   let make_application source =
-    { source; name = fresh "Applied"; world = fresh "Selected"; layout = fresh "Layout" }
+    {
+      source;
+      name = Fresh_names.fresh "Applied";
+      world = Fresh_names.fresh "Selected";
+      layout = Fresh_names.fresh "Layout";
+    }
   in
   let add groups (source : Module_inventory.specialization) =
     let application = make_application source in
@@ -193,7 +198,7 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
                 String.map member ~f:(fun c ->
                     if Char.is_alphanum c || Char.equal c '_' then c else '_')
               in
-              (member, fresh (label ^ "_" ^ stem)))
+              (member, Fresh_names.fresh (label ^ "_" ^ stem)))
         in
         let world =
           Option.some_if
@@ -206,19 +211,19 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
                    || not
                         (List.is_empty parameter.argument.expected.signature_ghost_modules))
             )
-            (fresh ("World_" ^ prefix))
+            (Fresh_names.fresh ("World_" ^ prefix))
         in
         let qualify leaf =
           Option.value_map world ~default:leaf ~f:(fun world -> world ^ "." ^ leaf)
         in
-        let name = qualify (fresh ("Generic_" ^ prefix)) in
+        let name = qualify (Fresh_names.fresh ("Generic_" ^ prefix)) in
         let body_member_names =
           List.map source.body_members ~f:(fun (key, id) ->
               let stem =
                 String.map (Ident.name id) ~f:(fun c ->
                     if Char.is_alphanum c || Char.equal c '_' then c else '_')
               in
-              (key, fresh ("method_" ^ stem)))
+              (key, Fresh_names.fresh ("method_" ^ stem)))
         in
         let member_names =
           List.map source.members ~f:(fun (name, id) ->
@@ -232,7 +237,7 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
           let stage_source = stage_source source stage in
           {
             name;
-            interface = qualify (fresh ("Argument_" ^ prefix ^ "_stage"));
+            interface = qualify (Fresh_names.fresh ("Argument_" ^ prefix ^ "_stage"));
             parameter = "Parameter_" ^ Int.to_string index;
             representative = stage_source;
             applications = [ { application with source = stage_source } ];
@@ -253,7 +258,7 @@ let plan ?(proof_layout = fun _ -> false) ~fresh sources =
         @ [
             {
               name;
-              interface = qualify (fresh ("Argument_" ^ prefix));
+              interface = qualify (Fresh_names.fresh ("Argument_" ^ prefix));
               parameter = "Parameter";
               representative = source;
               applications = [ application ];

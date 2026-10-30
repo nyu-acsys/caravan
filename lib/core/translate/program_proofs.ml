@@ -429,7 +429,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
     (t * State.state, error) Result.t =
   let {
     Program_scopes.definition_target;
-    fresh;
     funcs;
     generics;
     inventory;
@@ -643,7 +642,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
           {
             view_binding = binding;
             view_key =
-              fresh
+              Fresh_names.fresh
                 ("view$" ^ String.uncapitalize (String.concat ~sep:"_" binding.namespace));
             view_resources;
             view_source_substitution = source_substitution;

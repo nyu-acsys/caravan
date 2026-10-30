@@ -574,7 +574,7 @@ let declaration_namespace = function
 let term_binding binding =
   match binding.kind with State _ | Action _ -> false | _ -> true
 
-let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
+let build (source : Source.t) (inventory : Module_inventory.t) =
   let scopes = source.proof_scopes in
   let projection = public_projection inventory scopes in
   let projection =
@@ -732,8 +732,8 @@ let build ~fresh (source : Source.t) (inventory : Module_inventory.t) =
           String.uncapitalize
             (String.concat ~sep:"_" (scope.namespace @ [ entry.name.pid_str ]))
         in
-        let backend = fresh base in
-        let public_key = fresh (base ^ "_public") in
+        let backend = Fresh_names.fresh base in
+        let public_key = Fresh_names.fresh (base ^ "_public") in
         Ok
           {
             entry;

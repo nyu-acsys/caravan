@@ -10,7 +10,7 @@ open Procedures
 
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
-let items source ~fresh (inventory : Module_inventory.t) =
+let items source (inventory : Module_inventory.t) =
   let* signature_predicates =
     all
       (List.filter inventory.constraints ~f:(fun constraint_ ->
@@ -33,12 +33,12 @@ let items source ~fresh (inventory : Module_inventory.t) =
         let* data = Datatypes.of_declaration entry.declaration in
         let data = Datatypes.with_paths data entry.paths in
         let base = String.concat ~sep:"_" (entry.namespace @ [ data.module_name ]) in
-        let data = Datatypes.with_name data (fresh base) in
+        let data = Datatypes.with_name data (Fresh_names.fresh base) in
         let heap =
           Option.map data.heap
             ~f:
               (List.map ~f:(fun (field : Datatypes.field) ->
-                   { field with raven_field = fresh field.raven_field }))
+                   { field with raven_field = Fresh_names.fresh field.raven_field }))
         in
         Ok { data with heap })
   in
@@ -146,7 +146,7 @@ let items source ~fresh (inventory : Module_inventory.t) =
                 environment =
                   Source.annotation_env source ~at:site.item_loc site.environment;
                 signature_sites = entry.signatures;
-                raven_name = fresh base;
+                raven_name = Fresh_names.fresh base;
                 params;
                 body;
                 loc = vb.vb_loc;

@@ -357,7 +357,7 @@ let function_id plan ?(instance = plan.group.Generic_modules.representative) pat
   Option.bind original ~f:(fun (key, _) ->
       List.Assoc.find instance.body_members key ~equal:String.equal)
 
-let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
+let applications (source : Source.t) (inventory : Module_inventory.t)
     (proofs : Proof_bindings.t) plans =
   let build plan instance =
     let application_source = instance.Generic_modules.source in
@@ -471,7 +471,7 @@ let applications ~fresh (source : Source.t) (inventory : Module_inventory.t)
                     {
                       source = binding;
                       path;
-                      key = fresh (binding.backend ^ "_application");
+                      key = Fresh_names.fresh (binding.backend ^ "_application");
                       backend = instance.name ^ "." ^ binding.backend;
                       types = List.map binding.private_types ~f:project_type;
                       project_type;

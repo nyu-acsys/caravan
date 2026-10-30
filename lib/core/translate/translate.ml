@@ -16,7 +16,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Program_scopes.annotations;
     linearizations;
     initializations;
-    fresh;
     source;
     implementation;
     proof_implementation;

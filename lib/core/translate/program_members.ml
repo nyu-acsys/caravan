@@ -32,7 +32,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     annotations;
     definition_member_name;
     definition_target;
-    fresh;
     funcs;
     generics;
     initializations;
@@ -440,7 +439,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          | Some publication ->
                              State.return (publication, publications, publication_members)
                          | None ->
-                             let publication = fresh ("published_" ^ f.raven_name) in
+                             let publication =
+                               Fresh_names.fresh ("published_" ^ f.raven_name)
+                             in
                              let+ body =
                                forwarding_body ~at ~self:publication ~target:(proc_name f)
                                  ~result:f.body.exp_type ~atomic:false prepared

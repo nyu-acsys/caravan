@@ -196,8 +196,7 @@ let take_declarations
 
 let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let {
-    Program_scopes.fresh;
-    funcs;
+    Program_scopes.funcs;
     generic_proof_types;
     generic_proofs;
     generics;
@@ -462,7 +461,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             members = group.operations;
           })
   in
-  let checked_modules = Checked_modules.plan ~schema ~fresh inventory.bindings in
+  let checked_modules = Checked_modules.plan ~schema inventory.bindings in
   let* checked_operations =
     all checked_modules ~f:(fun view ->
         let binding = view.Checked_modules.binding in
@@ -522,14 +521,17 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                 ~equal:String.equal
             in
             let f = List.find_exn funcs ~f:(fun f -> Ident.same f.id id) in
-            (group.name ^ "." ^ stem, if is_pure f then fresh (stem ^ "_impl") else stem)))
+            ( group.name ^ "." ^ stem,
+              if is_pure f then Fresh_names.fresh (stem ^ "_impl") else stem )))
   in
   let procedure_stem = procedure_stem ~generic_procedures in
   let procedures =
     List.map funcs ~f:(fun f ->
         let name =
           match Generic_modules.member generics f.id with
-          | None -> if is_pure f then fresh (f.raven_name ^ "_impl") else f.raven_name
+          | None ->
+              if is_pure f then Fresh_names.fresh (f.raven_name ^ "_impl")
+              else f.raven_name
           | Some (group, application, stem) ->
               application.name ^ "." ^ procedure_stem group stem
         in

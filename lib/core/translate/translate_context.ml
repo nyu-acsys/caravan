@@ -83,27 +83,6 @@ let assume_in_range ~loc:l (t : Types.type_expr) x =
   Option.value_map (range_spec ~loc:l t x) ~default:[] ~f:(fun spec ->
       [ R.Stmt.assume ~loc:l spec ])
 
-(** Distinct names, as Raven needs them. *)
-module Names = struct
-  type t = { mutable used : Set.M(String).t }
-
-  let create () = { used = Set.empty (module String) }
-
-  (** A name for [base] not in [used]. *)
-  let unused used base =
-    let rec go n =
-      let candidate = if n = 0 then base else Printf.sprintf "%s_%d" base n in
-      if Set.mem used candidate then go (n + 1) else candidate
-    in
-    go 0
-
-  (** A name for [base] not used yet. *)
-  let fresh names base =
-    let name = unused names.used base in
-    names.used <- Set.add names.used name;
-    name
-end
-
 type origin = {
   at : Location.t;
   code : R.Diagnostic.code;
@@ -298,7 +277,7 @@ module State_monad = struct
 
   (** A name for [base] not used yet. *)
   let fresh base s =
-    let name = Names.unused s.names.used base in
+    let name = Fresh_names.unused s.names.used base in
     (Ok name, { s with names = { s.names with used = Set.add s.names.used name } })
 
   (** [f] on each of [xs] in turn: their results. *)
@@ -410,7 +389,7 @@ module State_monad = struct
 
   (** The Raven name of the OCaml variable [id] of type [typ], bound now. *)
   let bind_name ?typ (id : Ident.t) s =
-    let name = Names.unused s.names.used (Ident.name id) in
+    let name = Fresh_names.unused s.names.used (Ident.name id) in
     ( Ok name,
       {
         s with

@@ -916,7 +916,7 @@ let logical_contract = function
   | Some (c : S.contract) ->
       c.atomic || not (List.is_empty (c.atomic_requires @ c.atomic_ensures))
 
-let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
+let generic_modules (source : Source.t) ~types ~functions inventory =
   let types =
     List.concat_map source.proof_resources ~f:(fun resource ->
         List.concat_map (resource :: Option.to_list resource.Source.resource_public)
@@ -927,7 +927,7 @@ let generic_modules (source : Source.t) ~fresh ~types ~functions inventory =
   let groups =
     Generic_modules.plan
       ~proof_layout:(Generic_proofs.has_models source)
-      ~fresh inventory.Module_inventory.specializations
+      inventory.Module_inventory.specializations
   in
   let annotations = Annotation.of_comments source.comments in
   let rec field_term (term : S.term) =

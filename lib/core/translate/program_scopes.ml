@@ -12,7 +12,6 @@ type t = {
   annotations : Annotation.t list;
   linearizations : (int * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
-  fresh : string -> string;
   source : Source.t;
   implementation : Source.proof_resource -> string option;
   proof_implementation : Source.proof_resource -> string option;
@@ -115,26 +114,24 @@ let run (source : Source.t) : (t, error) Result.t =
         error a.loc "This annotation does not follow an atomic step, as Atomic.get t"
     | None -> Ok ()
   in
-  let backend_names = Names.create () in
-  backend_names.used <-
-    Set.of_list
-      (module String)
-      [
-        "Library";
-        "List";
-        "Option";
-        "Seq";
-        "FinSet";
-        "Set";
-        "Map";
-        "Int";
-        "Real";
-        "Bool";
-        Prelude.div;
-        Prelude.mod_;
-        Prelude.in_range;
-        Prelude.wrap;
-      ];
+  Fresh_names.reset ();
+  Fresh_names.reserve
+    [
+      "Library";
+      "List";
+      "Option";
+      "Seq";
+      "FinSet";
+      "Set";
+      "Map";
+      "Int";
+      "Real";
+      "Bool";
+      Prelude.div;
+      Prelude.mod_;
+      Prelude.in_range;
+      Prelude.wrap;
+    ];
   let reserved =
     List.map source.libraries ~f:(fun lib -> lib.Source.library_name)
     @ List.map source.proof_types ~f:(fun data -> data.Datatypes.module_name)
@@ -163,9 +160,7 @@ let run (source : Source.t) : (t, error) Result.t =
   let reserved =
     reserved @ List.map declared_predicates ~f:(fun p -> p.S.pred_name.pid_str)
   in
-  backend_names.used <-
-    Set.union backend_names.used (Set.of_list (module String) reserved);
-  let fresh = Names.fresh backend_names in
+  Fresh_names.reserve reserved;
   let source =
     let scoped_types =
       List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
@@ -180,7 +175,7 @@ let run (source : Source.t) : (t, error) Result.t =
         List.map source.proof_resources ~f:(fun resource ->
             match resource.Source.resource_scope with
             | None when resource.resource_abstract ->
-                let backend = fresh resource.resource_backend in
+                let backend = Fresh_names.fresh resource.resource_backend in
                 {
                   resource with
                   resource_backend = backend;
@@ -195,7 +190,8 @@ let run (source : Source.t) : (t, error) Result.t =
                     ~f:(fun scope -> scope.namespace)
                 in
                 let backend =
-                  fresh (String.concat ~sep:"_" (namespace @ [ resource.resource_name ]))
+                  Fresh_names.fresh
+                    (String.concat ~sep:"_" (namespace @ [ resource.resource_name ]))
                 in
                 {
                   resource with
@@ -204,7 +200,7 @@ let run (source : Source.t) : (t, error) Result.t =
                     Datatypes.with_name resource.resource_descriptor backend;
                   resource_public =
                     Option.map resource.resource_public ~f:(fun public ->
-                        let backend = fresh ("Export_" ^ backend) in
+                        let backend = Fresh_names.fresh ("Export_" ^ backend) in
                         {
                           public with
                           resource_backend = backend;
@@ -225,14 +221,14 @@ let run (source : Source.t) : (t, error) Result.t =
                 {
                   field with
                   field_backend =
-                    fresh
+                    Fresh_names.fresh
                       (String.uncapitalize
                          (String.concat ~sep:"_" (namespace @ [ field.field_name ])));
                 });
       proof_types =
         List.map source.proof_types ~f:(fun data ->
             if List.mem scoped_types data.Datatypes.at ~equal:Poly.equal then
-              Datatypes.with_name data (fresh data.module_name)
+              Datatypes.with_name data (Fresh_names.fresh data.module_name)
             else data);
     }
   in
@@ -241,14 +237,15 @@ let run (source : Source.t) : (t, error) Result.t =
         Option.some_if
           (resource.Source.resource_definition
           && Option.is_none resource.resource_application)
-          (resource.resource_id, fresh ("Implementation_" ^ resource.resource_backend)))
+          ( resource.resource_id,
+            Fresh_names.fresh ("Implementation_" ^ resource.resource_backend) ))
   in
   let proof_implementations =
     List.filter_map source.proof_resources ~f:(fun resource ->
         Option.some_if
           (resource.Source.resource_definition
           && Option.is_none resource.resource_application)
-          (resource.resource_id, fresh ("Proofs_" ^ resource.resource_backend)))
+          (resource.resource_id, Fresh_names.fresh ("Proofs_" ^ resource.resource_backend)))
   in
   let implementation resource =
     List.Assoc.find resource_implementations resource.Source.resource_id ~equal:Ident.same
@@ -268,28 +265,28 @@ let run (source : Source.t) : (t, error) Result.t =
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))
   in
   let* inventory = Module_inventory.build source typed in
-  let* unapplied_proofs = Proof_bindings.build ~fresh source inventory in
+  let* unapplied_proofs = Proof_bindings.build source inventory in
   let scoped_binding = scoped_binding ~unapplied_proofs in
   let definition_member_name name =
     Option.bind (scoped_binding name) ~f:(fun binding ->
         Option.map (definition_target binding) ~f:(fun _ -> binding.entry.name.pid_str))
   in
   let typed = inventory.structure in
-  let* libraries = Library_modules.flatten ~fresh source.libraries in
+  let* libraries = Library_modules.flatten source.libraries in
 
   List.iter libraries ~f:(fun lib ->
       List.iter lib.Library_modules.library.signature ~f:(fun item ->
           match item.Parsetree.psig_desc with
           | Psig_type (_, decls) ->
               List.iter decls ~f:(fun decl ->
-                  backend_names.used <-
-                    Set.add backend_names.used
-                      (lib.library_name ^ "_" ^ decl.Parsetree.ptype_name.txt))
+                  Fresh_names.reserve
+                    [ lib.library_name ^ "_" ^ decl.Parsetree.ptype_name.txt ])
           | _ -> ()));
-  let* types, funcs = items source ~fresh inventory in
+  let* types, funcs = items source inventory in
   let* lifted = all funcs ~f:(fun f -> local_functions ~source f annotations) in
   let lifted =
-    List.map (List.concat lifted) ~f:(fun f -> { f with raven_name = fresh f.raven_name })
+    List.map (List.concat lifted) ~f:(fun f ->
+        { f with raven_name = Fresh_names.fresh f.raven_name })
   in
   let funcs = inherit_contracts (funcs @ lifted) in
   let* access_proofs =
@@ -469,7 +466,7 @@ let run (source : Source.t) : (t, error) Result.t =
           ~f:(fun (member, _) ->
             List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))))
   in
-  let* generics = generic_modules source ~fresh ~types ~functions:funcs inventory in
+  let* generics = generic_modules source ~types ~functions:funcs inventory in
   let* module_scopes = Module_context.collect_scopes source.proof_scopes in
   let* generic_proofs = Generic_proofs.plan generics module_scopes in
   let module_contexts = Module_context.plan ~scopes:module_scopes generic_proofs in
@@ -499,7 +496,7 @@ let run (source : Source.t) : (t, error) Result.t =
         | Some _ | None -> Ok ())
   in
   let* applications =
-    Generic_proofs.applications ~fresh source inventory unapplied_proofs generic_proofs
+    Generic_proofs.applications source inventory unapplied_proofs generic_proofs
   in
   let scoped_proofs = Proof_bindings.with_applications unapplied_proofs applications in
   Ok
@@ -507,7 +504,6 @@ let run (source : Source.t) : (t, error) Result.t =
       annotations;
       linearizations;
       initializations;
-      fresh;
       source;
       implementation;
       proof_implementation;

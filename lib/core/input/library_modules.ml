@@ -69,7 +69,7 @@ let direct_comments (interface : Source.interface) (signature : Typedtree.signat
   in
   Ok comments
 
-let flatten ~fresh libraries =
+let flatten libraries =
   let rec collect_signature interface signature =
     List.fold_result signature.Typedtree.sig_items ~init:[] ~f:(fun names item ->
         let* added =
@@ -205,7 +205,7 @@ let flatten ~fresh libraries =
               | Some (interface, signature, scope) ->
                   let source_name = source_name ^ "." ^ name in
                   let library_name =
-                    fresh (String.tr source_name ~target:'.' ~replacement:'_')
+                    Fresh_names.fresh (String.tr source_name ~target:'.' ~replacement:'_')
                   in
                   let library_id = Ident.create_local library_name in
                   let library_path = Path.Pdot (library_path, name) in

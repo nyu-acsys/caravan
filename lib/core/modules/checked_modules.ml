@@ -14,7 +14,7 @@ type t = {
 
 type schema = { interface : string; members : (string * string) list }
 
-let plan ?(schema = fun _ -> None) ~fresh bindings =
+let plan ?(schema = fun _ -> None) bindings =
   let same_context (left : Module_inventory.checked_binding) right =
     (* The shared schema and immutable substitution snapshot retain lexical captures. *)
     phys_equal left.expected right.Module_inventory.expected
@@ -22,7 +22,7 @@ let plan ?(schema = fun _ -> None) ~fresh bindings =
   in
   let add previous (binding : Module_inventory.checked_binding) =
     let base = String.uncapitalize (String.concat ~sep:"_" binding.namespace) in
-    let name = fresh ("Checked_" ^ base) in
+    let name = Fresh_names.fresh ("Checked_" ^ base) in
     let requested = schema binding in
     let known =
       List.find previous ~f:(fun (view : t) ->
@@ -49,7 +49,7 @@ let plan ?(schema = fun _ -> None) ~fresh bindings =
             name;
             interface =
               Option.value_map requested
-                ~default:(fresh ("Checked_contract_" ^ base))
+                ~default:(Fresh_names.fresh ("Checked_contract_" ^ base))
                 ~f:(fun schema -> schema.interface);
             target = None;
             members =
@@ -57,7 +57,7 @@ let plan ?(schema = fun _ -> None) ~fresh bindings =
               | Some schema -> schema.members
               | None ->
                   List.map binding.expected.signature_values ~f:(fun (member, _) ->
-                      (member, fresh ("checked_" ^ base ^ "_" ^ member))));
+                      (member, Fresh_names.fresh ("checked_" ^ base ^ "_" ^ member))));
             grouped = Option.is_some requested;
           }
     in
