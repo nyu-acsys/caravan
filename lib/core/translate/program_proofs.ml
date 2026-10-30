@@ -955,9 +955,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
           spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env:f.environment
             ~preds ~spec_funcs ~proof_support origins
         in
-        let* formals = formals ctx f in
         let* _, _, implicit, _ =
-          contract_env ctx ~spec_funcs f formals ~result:"result"
+          State.run ctx
+            (State.bind (formals ctx f) ~f:(fun formals ->
+                 contract_env ctx ~spec_funcs f formals ~result:"result"))
         in
         let signature =
           List.Assoc.find_exn procedure_signatures (proc_name f) ~equal:String.equal

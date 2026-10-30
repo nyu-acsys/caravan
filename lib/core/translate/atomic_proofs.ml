@@ -266,6 +266,9 @@ let get_path = State.gets (fun (s : State.state) -> s.path)
 let set_path path = State.modify (fun (s : State.state) -> { s with path })
 let modify_path f = State.modify (fun (s : State.state) -> { s with path = f s.path })
 
+(** That the function has an atomic update, whose part of the path is [au]. *)
+let set_path_au au = modify_path (fun path -> { path with au = Some au })
+
 (** The invariants that the function's precondition holds, with their arguments. *)
 let held_invariants = State.gets (fun (s : State.state) -> s.carried.invariants)
 

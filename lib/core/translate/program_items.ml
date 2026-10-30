@@ -1320,12 +1320,14 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   let* requires = clauses requires in
   let* atomic_requires = clauses ~atomic:true atomic_requires in
   let* ensures =
-    contract_postconditions env ~at
-      (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
+    State.run env.ctx
+      (contract_postconditions env ~at
+         (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures)))
   in
   let* atomic_ensures =
-    contract_postconditions env ~at ~atomic:true
-      (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
+    State.run env.ctx
+      (contract_postconditions env ~at ~atomic:true
+         (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures)))
   in
   let in_range =
     List.filter_map params ~f:(fun (_, raven, typ, _) -> range_spec ~loc:l typ raven)
