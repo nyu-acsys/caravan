@@ -64,7 +64,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     public_resource_members;
     deferred_native_resource_members;
     pending_declarations;
-    available_layouts;
     modules;
     functions;
     lifted;
@@ -83,11 +82,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~module_contexts:scopes.module_contexts
       ~context_for_group:
         (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
-  in
-  let take_declarations =
-    Program_declarations.take_declarations
-      ~pending_declarations:decls.pending_declarations
-      ~available_layouts:decls.available_layouts
   in
   let* proofs, state = Program_proofs.run scopes decls State.initial in
   let {
@@ -640,9 +634,12 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                   (q worker) )))
   in
   let generic_instances = List.concat generic_instances in
-  let _, native_blocks =
-    List.fold (List.zip_exn checked_modules checked_module_members) ~init:([], [])
-      ~f:(fun (emitted, blocks) (view, members) ->
+  (* The modules of the checked bindings, each followed by the declarations that the layouts
+     it makes available let through. *)
+  let _, native_blocks, pending_declarations, _ =
+    List.fold (List.zip_exn checked_modules checked_module_members)
+      ~init:([], [], pending_declarations, [])
+      ~f:(fun (emitted, blocks, pending, available) (view, members) ->
         let binding = view.Checked_modules.binding in
         let captured =
           List.exists generics ~f:(fun group ->
@@ -655,7 +652,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               List.exists group.Generic_modules.applications ~f:(fun application ->
                   phys_equal application.source.argument binding))
         in
-        if captured && not final then (emitted, blocks)
+        if captured && not final then (emitted, blocks, pending, available)
         else
           let attached =
             List.concat_map generics ~f:(fun group ->
@@ -721,22 +718,38 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
             List.concat_map generic_instances ~f:(fun (argument, setup, _) ->
                 if phys_equal argument binding then setup else [])
           in
-          List.iter generics ~f:(fun group ->
-              List.iter group.Generic_modules.applications ~f:(fun application ->
-                  if
-                    phys_equal application.source.argument binding
-                    && Option.is_some group.world
-                  then available_layouts := application.layout :: !available_layouts));
-          let declarations = take_declarations () in
-          List.iter generics ~f:(fun group ->
-              List.iter group.Generic_modules.applications ~f:(fun application ->
-                  if phys_equal application.source.argument binding then
-                    available_layouts := application.name :: !available_layouts));
-          let after_instances = take_declarations () in
+          let make_available available select =
+            List.fold generics ~init:available ~f:(fun available group ->
+                List.fold group.Generic_modules.applications ~init:available
+                  ~f:(fun available application ->
+                    Option.value_map (select group application) ~default:available
+                      ~f:(fun layout -> layout :: available)))
+          in
+          let available =
+            make_available available (fun group application ->
+                Option.some_if
+                  (phys_equal application.source.argument binding
+                  && Option.is_some group.world)
+                  application.layout)
+          in
+          let declarations, pending =
+            Program_declarations.take_declarations ~available pending
+          in
+          let available =
+            make_available available (fun _ application ->
+                Option.some_if
+                  (phys_equal application.source.argument binding)
+                  application.name)
+          in
+          let after_instances, pending =
+            Program_declarations.take_declarations ~available pending
+          in
           ( (binding :: attached) @ emitted,
             (prefix @ setup @ declarations @ publications @ attached_members @ members
            @ instances @ after_instances)
-            :: blocks ))
+            :: blocks,
+            pending,
+            available ))
   in
   let native_modules = List.concat (List.rev native_blocks) in
 
@@ -751,7 +764,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let root_members =
     emit_context_members Module_context.Flat ~at:start ~representations:[]
       ~native_resources:deferred_native_resource_members ~applications:native_modules
-      ~late_members:(List.concat_map !pending_declarations ~f:snd @ ref_fields)
+      ~late_members:(List.concat_map pending_declarations ~f:snd @ ref_fields)
   in
   Ok
     ( R.Program.make ~loc:start

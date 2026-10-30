@@ -29,8 +29,8 @@ type t = {
   imported_resource_members : Translate_context.R.Member.t list;
   public_resource_members : (Source.proof_resource * Translate_context.R.Member.t) list;
   deferred_native_resource_members : Translate_context.R.Member.t list;
-  pending_declarations : (Base.string list * Datatypes.R.Member.t list) list Base.ref;
-  available_layouts : Base.string list Base.ref;
+  pending_declarations : (Base.string list * Datatypes.R.Member.t list) list;
+      (** The declarations not emitted yet, each with the layouts it needs. *)
   modules : Datatypes.R.Member.t list;
   functions : Base.string Path_bindings.t;
   lifted : (string * (int * Ident.t list * Ident.t option)) list;
@@ -183,16 +183,15 @@ let au_application_view ~(untyped_scoped_proofs : Proof_bindings.t) (au : Source
               && Path.same au.au_path (Path.Pdot (view.path, au.au_name))
           | _ -> false))
 
-let take_declarations
-    ~(pending_declarations : (Base.string list * Datatypes.R.Member.t list) list Base.ref)
-    ~(available_layouts : Base.string list Base.ref) () =
+(** The declarations of [pending] whose layouts are all [available], with those still
+    pending. *)
+let take_declarations ~available pending =
   let ready, pending =
-    List.partition_tf !pending_declarations ~f:(fun (dependencies, _) ->
+    List.partition_tf pending ~f:(fun (dependencies, _) ->
         List.for_all dependencies ~f:(fun name ->
-            List.mem !available_layouts name ~equal:String.equal))
+            List.mem available name ~equal:String.equal))
   in
-  pending_declarations := pending;
-  List.concat_map ready ~f:snd
+  (List.concat_map ready ~f:snd, pending)
 
 let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let {
@@ -904,10 +903,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
               layouts types d,
             fields ))
   in
-  let pending_declarations = ref (module_declarations @ field_declarations) in
-  let available_layouts = ref [] in
-  let take_declarations = take_declarations ~pending_declarations ~available_layouts in
-  let modules = take_declarations () in
+  let modules, pending_declarations =
+    take_declarations ~available:[] (module_declarations @ field_declarations)
+  in
   let functions =
     Path_bindings.of_list
       (List.concat_map funcs ~f:(fun f ->
@@ -1013,7 +1011,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       public_resource_members;
       deferred_native_resource_members;
       pending_declarations;
-      available_layouts;
       modules;
       functions;
       lifted;
