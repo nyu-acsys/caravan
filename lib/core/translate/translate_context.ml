@@ -1668,19 +1668,21 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
   in
   let owned = List.concat_map terms ~f:owned @ passed in
-  let* typed =
-    all free ~f:(fun x ->
+  let open State.Syntax in
+  let+ typed =
+    State.all free ~f:(fun x ->
         match List.Assoc.find owned x ~equal:String.equal with
-        | None when lenient -> Ok None
+        | None when lenient -> State.return None
         | None ->
-            error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x)
+            State.of_result
+              (error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x))
         | Some t ->
             let l = loc at in
-            let* typ = typ env.ctx ~at t in
-            let raven = Names.fresh env.ctx.procedure.names x in
-            Ok (Some (x, raven, t, typ, l)))
+            let* typ = State.of_result (typ env.ctx ~at t) in
+            let+ raven = State.fresh x in
+            Some (x, raven, t, typ, l))
   in
-  Ok (List.filter_opt typed)
+  List.filter_opt typed
 
 (** The fields of the state [x], if [x] is one. *)
 let state_fields env x =

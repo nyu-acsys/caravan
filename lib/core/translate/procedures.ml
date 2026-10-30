@@ -4,6 +4,7 @@
 open Base
 open Translate_context
 open Spec_terms
+open Spec_terms.On_context
 open Proof_terms
 open Atomic_proofs
 open Expressions
@@ -372,7 +373,7 @@ and implicit_vars env (f : func) =
   let requires =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires @ c.atomic_requires)
   in
-  let* free = free_typed env requires ~at:f.loc in
+  let* free = State.run env.ctx (free_typed env requires ~at:f.loc) in
   Ok
     (List.map free ~f:(fun (x, raven, t, typ, l) ->
          ( x,
@@ -383,7 +384,7 @@ and implicit_vars env (f : func) =
 (** Translates each contract channel, quantifying its postcondition-only names. *)
 let contract_postconditions env ~at ?atomic posts =
   let l = loc at in
-  let* free = free_typed env posts ~at in
+  let* free = State.run env.ctx (free_typed env posts ~at) in
   match (free, posts) with
   | [], _ | _, [] ->
       all posts ~f:(fun t ->
@@ -628,16 +629,17 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
               R.Expr.tuple ~loc:l ((if au.has_result then [ value ] else []) @ ghosts)
         in
         let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
+        let open State.Syntax in
         (* The facts that the function ensures about the state after the action. *)
         let established performs =
-          all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
+          State.all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
               match
                 ( performs,
                   List.Assoc.find s.path.opened p.inv ~equal:String.equal,
                   List.Assoc.find s.carried.invariants p.inv ~equal:String.equal )
               with
               | Some performed, Some opened, Some args ->
-                  let next, indices, _ =
+                  let* next, indices, _ =
                     next_state ctx st ~inv_params:st.params args opened performed
                   in
                   let index =
@@ -650,21 +652,20 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                     | None ->
                         List.Assoc.find_exn opened.indices p.field ~equal:String.equal
                   in
-                  let* e = formula env p.element in
-                  Ok
-                    [
-                      R.Stmt.assign ~loc:l [ snapshot ]
-                        (R.Stmt.expr_rhs
-                           (state_of ~loc:l st (grown st (List.map next ~f:fst))));
-                      R.Stmt.assign ~loc:l [ k ]
-                        (R.Stmt.expr_rhs (R.Expr.index ~loc:l index e));
-                    ]
+                  let+ e = Spec_terms.formula env p.element in
+                  [
+                    R.Stmt.assign ~loc:l [ snapshot ]
+                      (R.Stmt.expr_rhs
+                         (state_of ~loc:l st (grown st (List.map next ~f:fst))));
+                    R.Stmt.assign ~loc:l [ k ]
+                      (R.Stmt.expr_rhs (R.Expr.index ~loc:l index e));
+                  ]
               | _ ->
-                  error at
-                    "This step linearizes the function, which ensures a fact about the \
-                     state after it, but performs no action")
+                  State.of_result
+                    (error at
+                       "This step linearizes the function, which ensures a fact about \
+                        the state after it, but performs no action"))
         in
-        let open State.Syntax in
         match c with
         | Commit ->
             let message =
@@ -728,7 +729,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                   [ check ]
               | _ -> State.return []
             in
-            let* established = State.imperative ctx (fun () -> established performs) in
+            let* established = established performs in
             let+ closing = use_invariants ?performs ctx ~at ~fold:true in
             checked @ folds @ List.concat established @ [ commit ] @ closing
         | Abort ->

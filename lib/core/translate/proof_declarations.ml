@@ -4,6 +4,7 @@
 open Base
 open Translate_context
 open Spec_terms
+open Spec_terms.On_context
 open Proof_terms
 open Atomic_proofs
 open Procedures
@@ -106,8 +107,9 @@ let action_checks ctx (st : structure) =
                 bindings = List.map action_params ~f:(fun (x, raven, _) -> (x, var raven));
               }
             in
-            let next, _, _ =
-              next_state ctx st ~inv_params:st.params args opened performing
+            let* next, _, _ =
+              State.run ctx
+                (next_state ctx st ~inv_params:st.params args opened performing)
             in
             let state values = state_of ~loc:l st (grown st values) in
             (* Reported at the return point of the lemma, at the end of the action's

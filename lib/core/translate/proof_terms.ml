@@ -4,6 +4,7 @@
 open Base
 open Translate_context
 open Spec_terms
+open Spec_terms.On_context
 
 (** The latest binding of each variable in scope. *)
 let scope ctx =

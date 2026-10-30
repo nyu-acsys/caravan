@@ -3,7 +3,7 @@
 
 open Base
 open Translate_context
-open Spec_terms
+open Spec_terms.On_context
 open Proof_terms
 open Atomic_proofs
 open Procedures
@@ -1287,7 +1287,7 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   let atomic_requires =
     Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_requires)
   in
-  let* implicit = free_typed env (requires @ atomic_requires) ~at in
+  let* implicit = State.run env.ctx (free_typed env (requires @ atomic_requires) ~at) in
   let roles =
     List.map implicit ~f:(fun (x, _, _, _, _) ->
         ( List.exists requires ~f:(fun term ->

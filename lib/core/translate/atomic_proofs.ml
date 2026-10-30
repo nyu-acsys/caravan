@@ -63,12 +63,12 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
         (env, terms @ [ term ]))
   in
   let terms = spec.invariants @ state_invariants in
-  let* free = State.imperative ctx (fun () -> free_typed env terms ~at) in
+  let* free = free_typed env terms ~at in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
-  let* invariants = State.imperative ctx (fun () -> all terms ~f:(formula env)) in
+  let* invariants = State.all terms ~f:(formula env) in
   (* The values that the invariants own, by the Raven names of their references and
      fields. *)
   let* reads =
@@ -191,21 +191,24 @@ let action_env ctx st inv_params args values bindings =
     index map of each field owned by index that it changes, as a list that it appends an
     entry to, and the entries appended, with their fields and positions. *)
 let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
-  let env = action_env ctx st inv_params args opened.values p.bindings in
-  let next =
-    List.map2_exn st.fields opened.values ~f:(fun (f, _, _, t, _) v ->
+  let open State.Syntax in
+  let* env =
+    State.imperative ctx (fun () ->
+        Ok (action_env ctx st inv_params args opened.values p.bindings))
+  in
+  let* next =
+    State.all (List.zip_exn st.fields opened.values) ~f:(fun ((f, _, _, t, _), v) ->
         match List.Assoc.find p.performed.update f ~equal:String.equal with
         | Some term ->
-            begin match expected_formula env (Some t) term with
-            | Ok e -> (e, true)
-            | Error _ -> (v, false)
+            let+ e = State.attempt (expected_formula env (Some t) term) in
+            begin match e with Ok e -> (e, true) | Error _ -> (v, false)
             end
-        | None -> (v, false))
+        | None -> State.return (v, false))
   in
   (* An entry appended to a field owned by index, at the field's length. *)
   let appended field =
     match List.Assoc.find p.performed.update field ~equal:String.equal with
-    | None -> None
+    | None -> State.return None
     | Some term ->
         begin match spine (S.chain term) [] with
         | ( { term_desc = Tvar (Qid { pid_str = "++"; _ }); _ },
@@ -217,18 +220,19 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
             begin match spine added [] with
             | ( { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ },
                 [ e; { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ } ] ) ->
-                Result.ok (formula env e)
-            | _ -> None
+                State.map (State.attempt (formula env e)) ~f:Result.ok
+            | _ -> State.return None
             end
-        | _ -> None
+        | _ -> State.return None
         end
   in
-  let appended =
-    List.filter_map st.chains ~f:(fun (field, index) ->
+  let+ appended =
+    State.all st.chains ~f:(fun (field, index) ->
         let i, _ =
           List.findi_exn st.fields ~f:(fun _ (f, _, _, _, _) -> String.equal f field)
         in
-        Option.map (appended field) ~f:(fun e ->
+        let+ e = appended field in
+        Option.map e ~f:(fun e ->
             let l = R.Loc.none in
             ( field,
               index,
@@ -237,6 +241,7 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
                 (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
                 [ List.nth_exn opened.values i ] )))
   in
+  let appended = List.filter_opt appended in
   let indices =
     List.map appended ~f:(fun (field, index, e, position) ->
         ( index,
@@ -251,15 +256,18 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
 (** The views of [st], whose invariant has the arguments [args], in the state [values]:
     each view, its inputs and its value. *)
 let views_after ctx st args values =
-  let env = action_env ctx st st.params args values [] in
-  all st.views ~f:(fun ((v : S.predicate), value) ->
+  let open State.Syntax in
+  let* env =
+    State.imperative ctx (fun () -> Ok (action_env ctx st st.params args values []))
+  in
+  State.all st.views ~f:(fun ((v : S.predicate), value) ->
       let inputs = List.take args (List.length v.pred_params - 1) in
       let env =
         List.fold2_exn (List.drop_last_exn v.pred_params) inputs ~init:env
           ~f:(fun env (id, _) e -> bind env id.S.pid_str (Value e))
       in
-      let* value = formula env value in
-      Ok (v.pred_name.pid_str, inputs, value))
+      let+ value = formula env value in
+      (v.pred_name.pid_str, inputs, value))
 
 (** What each arm of a branch starts from: the open invariants, the snapshots, the
     positions, and the atomic update's part. *)
@@ -299,13 +307,19 @@ let push_snapshot snapshots inv (state : opened) =
     has the arguments [args] and is open in [opened], helps the calls waiting in a pending
     field, committed in the state [values] after it. *)
 let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
+  let open State.Syntax in
   match p.performed.helps with
   | Some (field, key, _) -> begin
-      let env = action_env ctx st st.params args opened.values p.bindings in
+      let* env =
+        State.imperative ctx (fun () ->
+            Ok (action_env ctx st st.params args opened.values p.bindings))
+      in
+      let* views = State.attempt (views_after ctx st args values) in
+      let+ c = State.attempt (formula env key) in
       match
         ( List.find st.pendings ~f:(fun q -> String.equal q.pending_field field),
-          formula env key,
-          views_after ctx st args values,
+          c,
+          views,
           List.findi st.fields ~f:(fun _ (f, _, _, _, _) -> String.equal f field) )
       with
       | Some pending, Ok c, Ok views, Some (i, _) ->
@@ -325,7 +339,7 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
           ]
       | _ -> []
     end
-  | None -> []
+  | None -> State.return []
 
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
@@ -488,8 +502,7 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                     (* The action's state, which the history learns if a growing field
                        changes, supplies the fold witnesses. *)
                     let* next, indices, appended =
-                      State.imperative ctx (fun () ->
-                          Ok (next_state ctx st ~inv_params:st.params args opened p))
+                      next_state ctx st ~inv_params:st.params args opened p
                     in
                     let values = List.map next ~f:fst in
                     let grows =
@@ -542,10 +555,7 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                           })
                     in
                     (* The calls the action helps, committed in the state after it. *)
-                    let* helping =
-                      State.imperative ctx (fun () ->
-                          Ok (helping ctx st args opened p values ~la ~lemma))
-                    in
+                    let* helping = helping ctx st args opened p values ~la ~lemma in
                     if has_history st then
                       let+ snapshot = snapshot st state in
                       helping @ learn @ (snapshot :: fold ~witnesses ())
@@ -714,37 +724,34 @@ let with_views ctx make ~loc ~pred p args =
       :: make ~loc ~pred p args
   | None -> make ~loc ~pred p args
 
-(** The views of the invariants open in [opened], whose arguments [invariants] gives, set
-    to their values in the states after [p], and folded. *)
-let views_performed ctx ~(at : Location.t) opened invariants (p : performing) =
-  let l = loc at in
-  all opened ~f:(fun (inv, opened) ->
-      let structure =
-        List.find ctx.given.shared.structures ~f:(fun st -> String.equal st.invariant inv)
-      in
-      let args = List.Assoc.find invariants inv ~equal:String.equal in
-      match (structure, args) with
-      | Some st, Some args ->
-          let next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
-          let* views = views_after ctx st args (List.map next ~f:fst) in
-          Ok
-            (List.concat_map views ~f:(fun (pred, inputs, value) ->
-                 let raven, _ =
-                   List.Assoc.find_exn ctx.given.preds pred ~equal:String.equal
-                 in
-                 with_views ctx
-                   (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
-                   ~loc:l ~pred (qualified_name ~loc:l raven) (inputs @ [ value ])))
-      | _ -> Ok [])
-  |> Result.map ~f:List.concat
-
 (** The views of the open invariants, set to their values in the states after [p], and
     folded: the views are functions of the state. *)
 let perform_views ctx ~(at : Location.t) (p : performing) =
   let open State.Syntax in
+  let l = loc at in
   let* path = get_path in
   let* invariants = held_invariants in
-  State.imperative ctx (fun () -> views_performed ctx ~at path.opened invariants p)
+  let+ folds =
+    State.all path.opened ~f:(fun (inv, opened) ->
+        let structure =
+          List.find ctx.given.shared.structures ~f:(fun st ->
+              String.equal st.invariant inv)
+        in
+        let args = List.Assoc.find invariants inv ~equal:String.equal in
+        match (structure, args) with
+        | Some st, Some args ->
+            let* next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
+            let+ views = views_after ctx st args (List.map next ~f:fst) in
+            List.concat_map views ~f:(fun (pred, inputs, value) ->
+                let raven, _ =
+                  List.Assoc.find_exn ctx.given.preds pred ~equal:String.equal
+                in
+                with_views ctx
+                  (fun ~loc ~pred:_ p args -> [ R.Stmt.fold ~loc p args ])
+                  ~loc:l ~pred (qualified_name ~loc:l raven) (inputs @ [ value ]))
+        | _ -> State.return [])
+  in
+  List.concat folds
 
 (** The atomic that [t] denotes as the location of a step: one that an immutable record
     holds, as [q.head], or [t]'s value. *)
@@ -755,8 +762,9 @@ let atomic_of env (t : S.term) =
       (({ term_desc = Tvar (Qid { pid_str = x; _ }); _ } as r), Qid { pid_str = label; _ })
     when Option.exists (List.Assoc.find env.var_types x ~equal:String.equal)
            ~f:(fun typ -> Option.is_some (atomic_in_record env.ctx typ label)) ->
-      let* r = formula env r in
-      Ok (R.Expr.field ~loc:l r (qualified_name ~loc:l label))
+      let open State.Syntax in
+      let+ r = formula env r in
+      R.Expr.field ~loc:l r (qualified_name ~loc:l label)
   | _ -> formula env t
 
 (** The positions of [value], read from the atomic [atomic] at a step, in the latest
@@ -779,12 +787,12 @@ let record_read ctx ~atomic value =
                 Ok (action_env ctx st st.params args opened.values []))
           in
           State.iter st.held ~f:(fun (location, field, position) ->
-              let* held =
-                State.imperative ctx (fun () ->
-                    Ok
-                      (match (atomic_of env location, formula env position) with
-                      | Ok held, Ok k when R.Expr.alpha_equal held atomic -> Some k
-                      | _ -> None))
+              let* k = State.attempt (formula env position) in
+              let* held = State.attempt (atomic_of env location) in
+              let held =
+                match (held, k) with
+                | Ok held, Ok k when R.Expr.alpha_equal held atomic -> Some k
+                | _ -> None
               in
               match held with
               | Some k ->
@@ -842,95 +850,101 @@ let rec bind_params env st (opened : opened) params (pattern : S.term) actual =
     end
   | _ -> []
 
-(** The actions that the step [op] may perform on the invariants open in [opened], whose
-    arguments [invariants] gives. *)
-let performings_in ctx ~at ~op ~field ~location args opened invariants =
-  let l = loc at in
-  List.concat_map opened ~f:(fun (inv, opened) ->
-      let structure =
-        List.find ctx.given.shared.structures ~f:(fun st -> String.equal st.invariant inv)
-      in
-      match (structure, List.Assoc.find invariants inv ~equal:String.equal) with
-      | Some st, Some inv_args ->
-          List.filter_map st.actions ~f:(fun a ->
-              match a.step with
-              | Some (o, Some loc_pattern :: patterns)
-                when String.equal o op && List.length patterns = List.length args ->
-                  let env bindings =
-                    action_env ctx st st.params inv_args opened.values bindings
-                  in
-                  let bindings =
-                    List.concat
-                      (List.map2_exn patterns args ~f:(fun p actual ->
-                           match p with
-                           | Some p -> bind_params (env []) st opened a.params p actual
-                           | None -> []))
-                  in
-                  let env = env bindings in
-                  let same_field =
-                    match term_type env loc_pattern with
-                    | Some t ->
-                        begin match field_of_type ctx ~at t "" with
-                        | Ok (Some f) -> String.equal f field
-                        | _ -> true
-                        end
-                    | None -> true
-                  in
-                  let condition =
-                    let* location_pattern = atomic_of env loc_pattern in
-                    let* equalities =
-                      all (List.zip_exn patterns args) ~f:(fun (p, actual) ->
-                          match p with
-                          | Some p ->
-                              let* p = formula env p in
-                              Ok (Some (R.Expr.binary ~loc:l Eq p actual))
-                          | None -> Ok None)
-                    in
-                    (* A position that a parameter gives is within its sequence. *)
-                    let* bounds =
-                      all (List.filter_opt patterns) ~f:(fun p ->
-                          match spine (S.chain p) [] with
-                          | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
-                              [
-                                entries;
-                                ({ term_desc = Tvar (Qid { pid_str = k; _ }); _ } as i);
-                              ] )
-                            when List.mem a.params k ~equal:String.equal ->
-                              let* entries = formula env entries in
-                              let* i = formula env i in
-                              Ok
-                                [
-                                  R.Expr.binary ~loc:l Leq (R.Expr.int ~loc:l 0) i;
-                                  R.Expr.binary ~loc:l Lt i
-                                    (R.Expr.call ~loc:l
-                                       (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
-                                       [ entries ]);
-                                ]
-                          | _ -> Ok [])
-                    in
-                    Ok
-                      (List.fold
-                         (List.filter_opt equalities @ List.concat bounds)
-                         ~init:(R.Expr.binary ~loc:l Eq location_pattern location)
-                         ~f:(R.Expr.binary ~loc:l And))
-                  in
-                  begin match (same_field, condition) with
-                  | true, Ok condition -> Some ({ performed = a; bindings }, condition)
-                  | _ -> None
-                  end
-              | _ -> None)
-      | _ -> [])
-
 (** The actions that the step [op], at [location] with the arguments [args], may perform
     on the open invariants: those whose step is the same operation, at a location of the
     same type as [field] if known, with their parameters bound and the condition under
     which the step is theirs. *)
 let step_performings ctx ~at ~op ~field ~location args =
   let open State.Syntax in
+  let l = loc at in
   let* path = get_path in
   let* invariants = held_invariants in
-  State.imperative ctx (fun () ->
-      Ok (performings_in ctx ~at ~op ~field ~location args path.opened invariants))
+  let+ performings =
+    State.all path.opened ~f:(fun (inv, opened) ->
+        let structure =
+          List.find ctx.given.shared.structures ~f:(fun st ->
+              String.equal st.invariant inv)
+        in
+        match (structure, List.Assoc.find invariants inv ~equal:String.equal) with
+        | Some st, Some inv_args ->
+            let+ performings =
+              State.all st.actions ~f:(fun a ->
+                  match a.step with
+                  | Some (o, Some loc_pattern :: patterns)
+                    when String.equal o op && List.length patterns = List.length args ->
+                      let env bindings =
+                        State.imperative ctx (fun () ->
+                            Ok
+                              (action_env ctx st st.params inv_args opened.values bindings))
+                      in
+                      let* unbound = env [] in
+                      let bindings =
+                        List.concat
+                          (List.map2_exn patterns args ~f:(fun p actual ->
+                               match p with
+                               | Some p -> bind_params unbound st opened a.params p actual
+                               | None -> []))
+                      in
+                      let* env = env bindings in
+                      let* same_field =
+                        match term_type env loc_pattern with
+                        | Some t ->
+                            let+ f =
+                              State.attempt (State.field_of_type ctx.given ~at t "")
+                            in
+                            begin match f with
+                            | Ok (Some f) -> String.equal f field
+                            | _ -> true
+                            end
+                        | None -> State.return true
+                      in
+                      let condition =
+                        let* location_pattern = atomic_of env loc_pattern in
+                        let* equalities =
+                          State.all (List.zip_exn patterns args) ~f:(fun (p, actual) ->
+                              match p with
+                              | Some p ->
+                                  let+ p = formula env p in
+                                  Some (R.Expr.binary ~loc:l Eq p actual)
+                              | None -> State.return None)
+                        in
+                        (* A position that a parameter gives is within its sequence. *)
+                        let+ bounds =
+                          State.all (List.filter_opt patterns) ~f:(fun p ->
+                              match spine (S.chain p) [] with
+                              | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
+                                  [
+                                    entries;
+                                    ({ term_desc = Tvar (Qid { pid_str = k; _ }); _ } as i);
+                                  ] )
+                                when List.mem a.params k ~equal:String.equal ->
+                                  let* entries = formula env entries in
+                                  let+ i = formula env i in
+                                  [
+                                    R.Expr.binary ~loc:l Leq (R.Expr.int ~loc:l 0) i;
+                                    R.Expr.binary ~loc:l Lt i
+                                      (R.Expr.call ~loc:l
+                                         (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
+                                         [ entries ]);
+                                  ]
+                              | _ -> State.return [])
+                        in
+                        List.fold
+                          (List.filter_opt equalities @ List.concat bounds)
+                          ~init:(R.Expr.binary ~loc:l Eq location_pattern location)
+                          ~f:(R.Expr.binary ~loc:l And)
+                      in
+                      let+ condition = State.attempt condition in
+                      begin match (same_field, condition) with
+                      | true, Ok condition -> Some ({ performed = a; bindings }, condition)
+                      | _ -> None
+                      end
+                  | _ -> State.return None)
+            in
+            List.filter_opt performings
+        | _ -> State.return [])
+  in
+  List.concat performings
 
 (** The action named [a] of a structure, for [(*@ performs a *)]. *)
 let named_action ctx (a : S.id) =
@@ -1073,7 +1087,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
   let rec arm (o : S.outcome) =
     match o with
     | Commits_with t ->
-        let* v = State.imperative ctx (fun () -> formula env t) in
+        let* v = formula env t in
         let* commit = au.commit_only ~at ~value:v in
         let* fold = use_invariants ctx ~at ~fold:true in
         let+ () = modify_path (fun path -> { path with snapshots }) in
@@ -1082,7 +1096,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         State.of_result
           (unsupported at "Linearizing with the function's result, before a choice,")
     | Waits (_, key) ->
-        let* key = State.imperative ctx (fun () -> formula env key) in
+        let* key = formula env key in
         let on =
           List.Assoc.find_exn opened.indices pending.pending_field ~equal:String.equal
         in
@@ -1140,7 +1154,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         ]
         @ ends added true
     | Chooses (c, a, b) ->
-        let* c = State.imperative ctx (fun () -> formula env c) in
+        let* c = formula env c in
         let* a = arm a in
         let+ b = arm b in
         [ R.Stmt.if_ ~loc:l c a b ]
@@ -1183,10 +1197,11 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
 
 (** Whether a step's result [value] matches [p], and [result], in the scope of [ctx]. *)
 let collected_terms ctx (p : S.pat) value result =
-  let env = scope_env ctx in
-  let* matches, _ = spec_pattern env p value in
-  let* result = formula env result in
-  Ok (matches, result)
+  let open State.Syntax in
+  let* env = State.imperative ctx (fun () -> Ok (scope_env ctx)) in
+  let* matches, _ = State.of_result (spec_pattern env p value) in
+  let+ result = formula env result in
+  (matches, result)
 
 (** The statements of the step at [at] that collects the result of the function with the
     update [au], left to be helped as [r] says, if its result [value] matches [p]:
@@ -1199,9 +1214,7 @@ let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat)
     open_pending_structure ctx ~at
       "A step that collects a result without a structure with pending calls"
   in
-  let* matches, result =
-    State.imperative ctx (fun () -> collected_terms ctx p value result)
-  in
+  let* matches, result = collected_terms ctx p value result in
   let* commit = au.commit_only ~at ~value:result in
   let* linked = State.fresh "linked" in
   let registration = qualified_name ~loc:l (pending_name st r.pending "registration") in
