@@ -96,13 +96,17 @@ module Names = struct
 
   let create () = { used = Set.empty (module String); bound = []; scope = [] }
 
-  (** A name for [base] not used yet. *)
-  let fresh names base =
+  (** A name for [base] not in [used]. *)
+  let unused used base =
     let rec go n =
       let candidate = if n = 0 then base else Printf.sprintf "%s_%d" base n in
-      if Set.mem names.used candidate then go (n + 1) else candidate
+      if Set.mem used candidate then go (n + 1) else candidate
     in
-    let name = go 0 in
+    go 0
+
+  (** A name for [base] not used yet. *)
+  let fresh names base =
+    let name = unused names.used base in
     names.used <- Set.add names.used name;
     name
 
@@ -156,6 +160,26 @@ type pending = {
 (** A field of calls of [helped] waiting to be helped, each registered on a key: a finite
     set of registrations, ghost cells holding the calls' updates. *)
 
+type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
+(** The state of an open invariant: the variables of its fields and of the index maps of
+    the fields owned by index. *)
+
+type position = {
+  pos_inv : string;
+  pos_field : string;
+  pos_element : R.Expr.t;
+  pos_snapshot : R.Expr.t;
+  pos_k : R.Expr.t;
+}
+(** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
+    index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
+
+type cell_field = {
+  cell_name : string;
+  cell_type : Types.type_expr;
+  cell_declaration : R.Member.t;
+}
+
 (** Whether a function with an atomic contract has linearized, as far as the translation
     knows. Raven needs the atomic update in the same state after both arms of a branch, so
     a step whose effect depends on its result leaves the update open, and the arms of the
@@ -189,19 +213,143 @@ type au_close =
   | Abort  (** The step did not change the abstract state. *)
   | Commit_call  (** The step is a call, which linearized the function in its place. *)
 
+(** The state of a translation, threaded explicitly: what each arm of a branch starts
+    from, what carries on from arm to arm within a procedure, the supply of fresh names,
+    the fields and primitives used, and the checks generated: the monad, without the
+    operations on contexts, which {!State} adds. *)
+module State_monad = struct
+  type au_path = {
+    au_state : au_state;
+    au_step : Location.t;  (** The step that opened the update. *)
+    au_values : R.Expr.t list;
+        (** The values of the implicit parameters in the update. *)
+    au_performing : (performing * R.Expr.t option) option;
+        (** The action that the step performs if it commits, as [(*@ performs pop *)] or
+            by its step, with the condition, if any, under which the step is the action's.
+        *)
+  }
+  (** The part of an atomic update that each arm of a branch starts from. *)
+
+  type au_results = {
+    cas_results : (string * bool) list;
+        (** Variables bound to the result of a [compare_and_set], or its negation if
+            [false], by their unique names. *)
+    read_results : string list;
+        (** Variables bound to the value of the last read, by their unique names. *)
+  }
+  (** The part of an atomic update that carries on from arm to arm. *)
+
+  type path = {
+    opened : (string * opened) list;
+    snapshots : (string * opened list) list;
+    positions : position list;
+    au : au_path option;
+  }
+  (** What each arm of a branch starts from. *)
+
+  type carried = {
+    ghost_returns : (string * string * Types.type_expr) list;
+    proof_state : (R.Expr.t * Types.type_expr) option;
+    return_covered : bool;
+    fields_of : (string * (string * R.Expr.t)) list;
+    formals : R.Expr.t list;
+    facts : R.Spec.t list;
+    invariants : (string * R.Expr.t list) list;
+    au_results : au_results option;
+  }
+  (** What carries on from arm to arm within a procedure. *)
+
+  type names = {
+    used : Set.M(String).t;
+    bound : (string * string) list;
+    scope : (string * (string * Types.type_expr option)) list;
+  }
+
+  type tables = { cells : cell_field list; primitives : (string * R.Member.t) list }
+
+  type state = {
+    path : path;
+    carried : carried;
+    names : names;
+    tables : tables;
+    origins : origin list;  (** The checks generated so far, latest first. *)
+  }
+
+  type 'a t = state -> ('a, error) Result.t * state
+  (** A computation on the state: its result, and its state at the end, which on an error
+      is the state when it failed, as with mutable state. *)
+
+  let return a s = (Ok a, s)
+  let fail e s = (Error e, s)
+  let bind m ~f s = match m s with Ok a, s -> f a s | (Error _ as error), s -> (error, s)
+
+  let map m ~f s =
+    let r, s = m s in
+    (Result.map r ~f, s)
+
+  let of_result r s = (r, s)
+
+  (** [m]'s result as a value, an error included, with the state it ends in. *)
+  let attempt m s =
+    let r, s = m s in
+    (Ok r, s)
+
+  let get s = (Ok s, s)
+  let put s _ = (Ok (), s)
+  let modify f s = (Ok (), f s)
+  let gets f s = (Ok (f s), s)
+
+  module Syntax = struct
+    let ( let* ) m f = bind m ~f
+    let ( let+ ) m f = map m ~f
+  end
+
+  open Syntax
+
+  (** A name for [base] not used yet. *)
+  let fresh base s =
+    let name = Names.unused s.names.used base in
+    (Ok name, { s with names = { s.names with used = Set.add s.names.used name } })
+
+  (** [f] on each of [xs] in turn: their results. *)
+  let all xs ~f =
+    let rec go acc = function
+      | [] -> return (List.rev acc)
+      | x :: rest ->
+          let* y = f x in
+          go (y :: acc) rest
+    in
+    go [] xs
+
+  let iter xs ~f =
+    let+ (_ : unit list) = all xs ~f in
+    ()
+
+  let rec fold xs ~init ~f =
+    match xs with
+    | [] -> return init
+    | x :: rest ->
+        let* acc = f init x in
+        fold rest ~init:acc ~f
+
+  (** Runs each of [arms] from the path before them, the rest of the state carrying on
+      from arm to arm: their results with the path each ends in. The path is then the last
+      arm's. *)
+  let arms (arms : 'a t list) : ('a * path) list t =
+   fun s ->
+    let start = s.path in
+    let rec go s ended = function
+      | [] -> (Ok (List.rev ended), s)
+      | arm :: rest ->
+          begin match arm { s with path = start } with
+          | Ok a, s -> go s ((a, s.path) :: ended) rest
+          | (Error _ as error), s -> (error, s)
+          end
+    in
+    go s [] arms
+end
+
 type au = {
-  mutable state : au_state;
-  mutable cas_results : (string * bool) list;
-      (** Variables bound to the result of a [compare_and_set], or its negation if
-          [false], by their unique names. *)
-  mutable read_results : string list;
-      (** Variables bound to the value of the last read, by their unique names. *)
-  mutable values : R.Expr.t list;
-      (** The values of the implicit parameters in the open update. *)
-  mutable step : Location.t;  (** The step that opened the update. *)
-  mutable performing : (performing * R.Expr.t option) option;
-      (** The action that the step performs if it commits, as [(*@ performs pop *)] or by
-          its step, with the condition, if any, under which the step is the action's. *)
   self : string;  (** The procedure's name. *)
   role : Ident.t;
       (** The function that the update is of: [self], or the one it continues. *)
@@ -209,19 +357,19 @@ type au = {
       (** The ghost results witnessing facts about earlier states, which the update
           commits with. *)
   has_result : bool;
-  open_ :
-    at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list, Report.error) Result.t;
+  open_ : at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list) State_monad.t;
       (** Opens the atomic update for the step at [at]: the statements, unfolding the
           atomic precondition's predicates if [unfold], and the values of the implicit
           parameters. *)
-  close : au_close -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+  close : au_close -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
       (** Closes the open update, committing with the function's result [value]. *)
   token : R.Expr.t;  (** The update's token. *)
-  commit_only : at:Location.t -> value:R.Expr.t -> (R.Stmt.t list, Report.error) Result.t;
+  commit_only : at:Location.t -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
       (** Opens the update and commits it with [value] at once, at the step at [at], the
           invariants left as they are. *)
 }
-(** The atomic update of a function with an atomic contract. *)
+(** The atomic update of a function with an atomic contract, whose state is in
+    {!State_monad.path} and {!State_monad.carried}. *)
 
 type lemma_signature = {
   lemma_raven : string;
@@ -458,20 +606,6 @@ let no_shared =
     dynamic_indices = false;
   }
 
-type opened = { values : R.Expr.t list; indices : (string * R.Expr.t) list }
-(** The state of an open invariant: the variables of its fields and of the index maps of
-    the fields owned by index. *)
-
-type position = {
-  pos_inv : string;
-  pos_field : string;
-  pos_element : R.Expr.t;
-  pos_snapshot : R.Expr.t;
-  pos_k : R.Expr.t;
-}
-(** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
-    index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
-
 let implicit_parameter_count ~kind parameters =
   let rec check seen count = function
     | [] -> Ok (if seen then Some count else None)
@@ -503,12 +637,6 @@ type predicate_body = {
   definition : S.term;
   environment : Env.t;
   project_type : Types.type_expr -> Types.type_expr;
-}
-
-type cell_field = {
-  cell_name : string;
-  cell_type : Types.type_expr;
-  cell_declaration : R.Member.t;
 }
 
 type inputs = {
@@ -575,6 +703,8 @@ type procedure_state = {
           only mention variables, all immutable. *)
   mutable au : au option;
       (** The atomic update, for a function with an atomic contract. *)
+  mutable au_path : State_monad.au_path option;
+  mutable au_results : State_monad.au_results option;
   mutable invariants : (string * R.Expr.t list) list;
       (** The invariants that the function's precondition holds, opened around each of its
           atomic steps, with their arguments. *)
@@ -640,6 +770,8 @@ let initial_procedure () =
     formals = [];
     facts = [];
     au = None;
+    au_path = None;
+    au_results = None;
     invariants = [];
     opened = [];
     snapshots = [];
@@ -648,100 +780,9 @@ let initial_procedure () =
 
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
-(** The state of a translation, threaded explicitly: what each arm of a branch starts
-    from, what carries on from arm to arm within a procedure, the supply of fresh names,
-    the fields and primitives used, and the checks generated. *)
+(** The explicit state, with the operations on contexts. *)
 module State = struct
-  type au_path = {
-    au_state : au_state;
-    au_step : Location.t;
-    au_values : R.Expr.t list;
-    au_performing : (performing * R.Expr.t option) option;
-  }
-  (** The part of an atomic update that each arm of a branch starts from. *)
-
-  type path = {
-    opened : (string * opened) list;
-    snapshots : (string * opened list) list;
-    positions : position list;
-    au : au_path option;
-  }
-  (** What each arm of a branch starts from. *)
-
-  type carried = {
-    ghost_returns : (string * string * Types.type_expr) list;
-    proof_state : (R.Expr.t * Types.type_expr) option;
-    return_covered : bool;
-    fields_of : (string * (string * R.Expr.t)) list;
-    formals : R.Expr.t list;
-    facts : R.Spec.t list;
-    invariants : (string * R.Expr.t list) list;
-    au_results : ((string * bool) list * string list) option;
-        (** The variables bound to the results of an atomic update's [compare_and_set]s
-            and reads. *)
-  }
-  (** What carries on from arm to arm within a procedure. *)
-
-  type names = {
-    used : Set.M(String).t;
-    bound : (string * string) list;
-    scope : (string * (string * Types.type_expr option)) list;
-  }
-
-  type tables = { cells : cell_field list; primitives : (string * R.Member.t) list }
-
-  type state = {
-    path : path;
-    carried : carried;
-    names : names;
-    tables : tables;
-    origins : origin list;  (** The checks generated so far, latest first. *)
-  }
-
-  type 'a t = state -> ('a, error) Result.t * state
-  (** A computation on the state: its result, and its state at the end, which on an error
-      is the state when it failed, as with mutable state. *)
-
-  let return a s = (Ok a, s)
-  let fail e s = (Error e, s)
-  let bind m ~f s = match m s with Ok a, s -> f a s | (Error _ as error), s -> (error, s)
-
-  let map m ~f s =
-    let r, s = m s in
-    (Result.map r ~f, s)
-
-  let of_result r s = (r, s)
-
-  (** [m]'s result as a value, an error included, with the state it ends in. *)
-  let attempt m s =
-    let r, s = m s in
-    (Ok r, s)
-
-  let get s = (Ok s, s)
-  let put s _ = (Ok (), s)
-  let modify f s = (Ok (), f s)
-  let gets f s = (Ok (f s), s)
-
-  module Syntax = struct
-    let ( let* ) m f = bind m ~f
-    let ( let+ ) m f = map m ~f
-  end
-
-  (** Runs each of [arms] from the path before them, the rest of the state carrying on
-      from arm to arm: their results with the path each ends in. The path is then the last
-      arm's. *)
-  let arms (arms : 'a t list) : ('a * path) list t =
-   fun s ->
-    let start = s.path in
-    let rec go s ended = function
-      | [] -> (Ok (List.rev ended), s)
-      | arm :: rest ->
-          begin match arm { s with path = start } with
-          | Ok a, s -> go s ((a, s.path) :: ended) rest
-          | (Error _ as error), s -> (error, s)
-          end
-    in
-    go s [] arms
+  include State_monad
 
   (** The state that [ctx] holds. *)
   let capture (ctx : context) : state =
@@ -752,14 +793,7 @@ module State = struct
           opened = p.opened;
           snapshots = p.snapshots;
           positions = p.positions;
-          au =
-            Option.map p.au ~f:(fun au ->
-                {
-                  au_state = au.state;
-                  au_step = au.step;
-                  au_values = au.values;
-                  au_performing = au.performing;
-                });
+          au = p.au_path;
         };
       carried =
         {
@@ -770,7 +804,7 @@ module State = struct
           formals = p.formals;
           facts = p.facts;
           invariants = p.invariants;
-          au_results = Option.map p.au ~f:(fun au -> (au.cas_results, au.read_results));
+          au_results = p.au_results;
         };
       names = { used = p.names.used; bound = p.names.bound; scope = p.names.scope };
       tables = { cells = !(ctx.collected.refs); primitives = !(ctx.collected.primitives) };
@@ -783,15 +817,8 @@ module State = struct
     p.opened <- s.path.opened;
     p.snapshots <- s.path.snapshots;
     p.positions <- s.path.positions;
-    Option.iter p.au ~f:(fun au ->
-        Option.iter s.path.au ~f:(fun path ->
-            au.state <- path.au_state;
-            au.step <- path.au_step;
-            au.values <- path.au_values;
-            au.performing <- path.au_performing);
-        Option.iter s.carried.au_results ~f:(fun (cas_results, read_results) ->
-            au.cas_results <- cas_results;
-            au.read_results <- read_results));
+    p.au_path <- s.path.au;
+    p.au_results <- s.carried.au_results;
     p.ghost_returns <- s.carried.ghost_returns;
     p.proof_state <- s.carried.proof_state;
     p.return_covered <- s.carried.return_covered;
@@ -814,6 +841,13 @@ module State = struct
 
   (** Makes [ctx] hold the state [f] gives its state. *)
   let update (ctx : context) f = restore ctx (f (capture ctx))
+
+  (** Runs [f], which works on [ctx], with [ctx] holding the state: the state is then the
+      one [f] leaves [ctx] in. *)
+  let imperative (ctx : context) f s =
+    restore ctx s;
+    let r = f () in
+    (r, capture ctx)
 
   let with_origin origin s = { s with origins = origin :: s.origins }
 

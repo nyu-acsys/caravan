@@ -150,7 +150,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | _ -> unsupported at "This field"
     end
   | Texp_match (scrutinee, cases, [], partial) ->
-      let read = is_read_value ctx scrutinee in
+      let* read = State.run ctx (is_read_value scrutinee) in
       let* scrutinee_stmts, v = expr ctx scrutinee in
       (* The cases read the scrutinee repeatedly, so it is named unless it is a variable. *)
       let* naming, v =
@@ -172,8 +172,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let total = match partial with Total -> true | Partial -> false in
       (* A match on the value of a read that left the atomic update open closes it. *)
+      let* state = State.run ctx au_state in
       let commits =
-        match au_state ctx with
+        match state with
         | Some (On_read c) when read -> Some (case_commits c (List.map cases ~f:fst))
         | _ -> None
       in
@@ -188,7 +189,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       apply ctx e path args
   | Texp_apply _ -> unsupported at "This application"
   | Texp_ifthenelse (c, e1, e2) ->
-      let polarity = cas_polarity ctx c in
+      let* polarity = State.run ctx (cas_polarity c) in
       let* c_stmts, c = expr ctx c in
       let* stmts =
         branch ctx e (fun target -> conditional ctx ~at ?polarity ~tail c e1 e2 target)
@@ -202,18 +203,18 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       (* The bound expressions are evaluated before any of their variables is bound. *)
       let* evaluated =
         all bindings ~f:(fun (vb : Typedtree.value_binding) ->
-            let polarity = cas_polarity ctx vb.vb_expr in
-            let read = is_read_value ctx vb.vb_expr in
+            let* polarity = State.run ctx (cas_polarity vb.vb_expr) in
+            let* read = State.run ctx (is_read_value vb.vb_expr) in
             let* stmts, v =
               expr ~continue_state:(List.length bindings = 1) ctx vb.vb_expr
             in
-            begin match (ctx.procedure.au, polarity, vb.vb_pat.pat_desc) with
-            | Some au, Some p, Tpat_var (id, _, _) ->
-                au.cas_results <- (Ident.unique_name id, p) :: au.cas_results
-            | Some au, None, Tpat_var (id, _, _) when read ->
-                au.read_results <- Ident.unique_name id :: au.read_results
-            | _ -> ()
-            end;
+            let* () =
+              match (polarity, vb.vb_pat.pat_desc) with
+              | Some p, Tpat_var (id, _, _) -> State.run ctx (record_cas_result id p)
+              | None, Tpat_var (id, _, _) when read ->
+                  State.run ctx (record_read_result id)
+              | _ -> Ok ()
+            in
             Ok (vb, stmts, v))
       in
       let* defs =
@@ -250,7 +251,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* stmts2, v = expr ~tail ~keep_scope ctx e2 in
       Ok (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
-      let* () = no_loop_before_linearizing ctx ~at in
+      let* () = State.run ctx (no_loop_before_linearizing ~at) in
       let* spec = loop_spec ctx ~after:cond.exp_loc body in
       let* c_stmts, c = expr ctx cond in
       let x = Names.fresh ctx.procedure.names "continue" in
@@ -283,7 +284,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
               ],
             unit_value ~loc:l )
   | Texp_for (id, _, lo, hi, direction, body) ->
-      let* () = no_loop_before_linearizing ctx ~at in
+      let* () = State.run ctx (no_loop_before_linearizing ~at) in
       let* spec = loop_spec ctx ~after:hi.exp_loc body in
       let* lo_stmts, lo = expr ctx lo in
       let* hi_stmts, hi = expr ctx hi in
@@ -403,8 +404,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | Some (S.Performs a), _ ->
         begin match named_action ctx a with
         | Some performed ->
-            Option.iter ctx.procedure.au ~f:(fun au ->
-                au.performing <- Some ({ performed; bindings = [] }, None));
+            let* () = State.run ctx (set_performing performed) in
             Ok default
         | None -> error a.pid_loc (Printf.sprintf "There is no action %s" a.pid_str)
         end
@@ -429,8 +429,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     let* how = how default in
     let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
     let* step =
-      linearize ?step ~value:v ~access_type:e.exp_type ctx ~at how
-        (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
+      State.run ctx
+        (linearize ?step ~value:v ~access_type:e.exp_type ctx ~at how
+           (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)))
     in
     Ok (step, v)
   in
@@ -468,16 +469,18 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* how = how `Abort in
       let value = R.Expr.var ~loc:l (name ~loc:l x) in
       let* step =
-        linearize ~value ~access_type:e.exp_type ctx ~at how
-          (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+        State.run ctx
+          (linearize ~value ~access_type:e.exp_type ctx ~at how
+             (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x)))
       in
-      record_read ctx ~atomic:a value;
+      let* () = State.run ctx (record_read ctx ~atomic:a value) in
       Ok (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
   | "set", [ a; v ] ->
       let* how = how `Commit in
       let* step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
-          [ write ~loc:l a field v ]
+        State.run ctx
+          (linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
+             [ write ~loc:l a field v ])
       in
       Ok (stmts @ step, unit_value ~loc:l)
   | "exchange", [ a; v ] ->
@@ -501,8 +504,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
       let* how = how `Commit in
       let* step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
-          (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
+        State.run ctx
+          (linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
+             (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x)))
       in
       Ok (stmts @ step, unit_value ~loc:l)
   | _ -> unsupported at ("Atomic." ^ op)
@@ -699,18 +703,8 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
     | Some au
       when String.equal au.self f || Option.exists role ~f:(fun r -> Ident.same r au.role)
       ->
-        begin match au.state with
-        | Pending ->
-            let* opening, values = au.open_ ~at:e.exp_loc ~unfold:false in
-            au.values <- values;
-            au.step <- e.exp_loc;
-            au.state <- Committed;
-            Ok (Some (au, opening, values))
-        | Committed -> Ok None
-        | Committing | On_cas | On_read _ | Partly | Registered _ | Unknown ->
-            error e.exp_loc
-              "Caravan cannot tell whether the function has linearized before this call"
-        end
+        let* opened = State.run ctx (open_for_call au ~at:e.exp_loc) in
+        Ok (Option.map opened ~f:(fun (opening, values) -> (au, opening, values)))
     | _ -> Ok None
   in
   let opening, implicit =
@@ -719,7 +713,7 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
   (* The retry commits with its result. *)
   let closing value =
     Option.value_map retry ~default:(Ok []) ~f:(fun (au, _, _) ->
-        au.close Commit_call ~value)
+        State.run ctx (au.close Commit_call ~value))
   in
   (* The latest snapshot witnesses the facts about earlier states that the callee
      requires, with the arguments' positions in it. *)
@@ -734,9 +728,13 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
         match
           (structure, List.Assoc.find ctx.procedure.snapshots inv ~equal:String.equal)
         with
-        | _ when Option.is_some (known_position ctx inv field (List.nth_exn args i)) ->
+        | _
+          when Option.is_some
+                 (known_position ctx.procedure.positions inv field (List.nth_exn args i))
+          ->
             let p =
-              Option.value_exn (known_position ctx inv field (List.nth_exn args i))
+              Option.value_exn
+                (known_position ctx.procedure.positions inv field (List.nth_exn args i))
             in
             Ok [ p.pos_snapshot; p.pos_k ]
         | Some st, Some (latest :: _) ->
@@ -929,11 +927,11 @@ and match_cases ?commits ~tail ctx ~at v
   let l = loc at in
   let enclosing_names = ctx.procedure.names.scope in
   (* Each case starts in the state of the atomic update before the match. *)
-  let start = au_snapshot ctx in
+  let* start = State.run ctx get_path in
   let ends = ref [] in
   let snapshot_ends = ref [] in
   let start_positions = ctx.procedure.positions in
-  let join = new_join () in
+  let join = ref empty_join in
   let position_ends = ref [] in
   let commits =
     match commits with
@@ -946,13 +944,13 @@ and match_cases ?commits ~tail ctx ~at v
   (* The body of a case, after defining the variables of its pattern. *)
   let case_body ?(names = enclosing_names) binds (rhs : Typedtree.expression) =
     ctx.procedure.names.scope <- names;
-    restore_au ctx start;
+    let* () = State.run ctx (set_path start) in
     let commits =
       Option.join
         (List.Assoc.find case_commits rhs ~equal:(fun a b ->
              Poly.equal a.exp_loc b.exp_loc))
     in
-    let* entry = enter_arm ctx ~commits in
+    let* entry = State.run ctx (enter_arm ctx ~commits) in
     let* defs =
       all binds ~f:(fun (id, value, t) ->
           let* typ = typ ctx ~at t in
@@ -962,14 +960,16 @@ and match_cases ?commits ~tail ctx ~at v
             @ assume_in_range ~loc:l t x))
     in
     let* stmts, value = expr ~tail ctx rhs in
-    let* finish = finish_arm ctx ~tail value in
+    let* finish = State.run ctx (finish_arm ctx ~tail value) in
     let assignment =
       Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
     in
-    ends := au_state ctx :: !ends;
+    let* state = State.run ctx au_state in
+    ends := state :: !ends;
     snapshot_ends := ctx.procedure.snapshots :: !snapshot_ends;
     position_ends := ctx.procedure.positions :: !position_ends;
-    let assigned = end_arm ctx join ~start:start_positions in
+    let* assigned, joined = State.run ctx (end_arm ctx !join ~start:start_positions) in
+    join := joined;
     Ok (entry @ List.concat defs @ stmts @ finish @ assignment @ assigned)
   in
   let not_exhaustive () =
@@ -1010,16 +1010,16 @@ and match_cases ?commits ~tail ctx ~at v
         in
         chain cases
   in
-  set_au_state ctx
-    (Option.first_some
-       (List.reduce (List.filter_opt !ends) ~f:join_au)
-       (Option.map
-          (let au, _, _ = start in
-           au)
-          ~f:(fun (state, _, _, _) -> state)));
+  let* () =
+    State.run ctx
+      (set_au_state
+         (Option.first_some
+            (List.reduce (List.filter_opt !ends) ~f:join_au)
+            (Option.map start.au ~f:(fun au -> au.au_state))))
+  in
   ctx.procedure.snapshots <- common_snapshots !snapshot_ends;
-  ctx.procedure.positions <- join_positions join ~start:start_positions !position_ends;
-  Ok (join.decls @ stmts)
+  ctx.procedure.positions <- join_positions !join ~start:start_positions !position_ends;
+  Ok (!join.decls @ stmts)
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
     constructors with variables or [_] as arguments, possibly followed by a variable or
@@ -1086,37 +1086,39 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
   let l = loc at in
   (* Each arm starts in the state of the atomic update before the branch; if [c] is the
      result of the [compare_and_set] that left the update open, the arms close it. *)
-  let start = au_snapshot ctx in
+  let* start = State.run ctx get_path in
   let start_positions = ctx.procedure.positions in
-  let join = new_join () in
+  let join = ref empty_join in
   let arm taken e =
-    restore_au ctx start;
+    let* () = State.run ctx (set_path start) in
     let* entry =
-      enter_arm ctx ~commits:(Option.map polarity ~f:(fun p -> Bool.equal p taken))
+      State.run ctx
+        (enter_arm ctx ~commits:(Option.map polarity ~f:(fun p -> Bool.equal p taken)))
     in
     let* stmts =
       match e with
-      | None -> finish_arm ctx ~tail (unit_value ~loc:l)
+      | None -> State.run ctx (finish_arm ctx ~tail (unit_value ~loc:l))
       | Some e ->
           let* stmts, v = expr ~tail ctx e in
-          let* finish = finish_arm ctx ~tail v in
+          let* finish = State.run ctx (finish_arm ctx ~tail v) in
           let assignment =
             Option.value_map target ~default:[] ~f:(fun t -> [ assign t v ])
           in
           Ok (stmts @ finish @ assignment)
     in
-    let assigned = end_arm ctx join ~start:start_positions in
+    let* assigned, joined = State.run ctx (end_arm ctx !join ~start:start_positions) in
+    join := joined;
+    let* state = State.run ctx au_state in
     Ok
-      ( entry @ stmts @ assigned,
-        (au_state ctx, ctx.procedure.snapshots, ctx.procedure.positions) )
+      (entry @ stmts @ assigned, (state, ctx.procedure.snapshots, ctx.procedure.positions))
   in
   let* then_, (then_state, then_snapshots, then_positions) = arm true (Some e1) in
   let* else_, (else_state, else_snapshots, else_positions) = arm false e2 in
-  set_au_state ctx (Option.map2 then_state else_state ~f:join_au);
+  let* () = State.run ctx (set_au_state (Option.map2 then_state else_state ~f:join_au)) in
   ctx.procedure.snapshots <- common_snapshots [ then_snapshots; else_snapshots ];
   ctx.procedure.positions <-
-    join_positions join ~start:start_positions [ then_positions; else_positions ];
-  Ok (join.decls @ [ R.Stmt.if_ ~loc:l c then_ else_ ])
+    join_positions !join ~start:start_positions [ then_positions; else_positions ];
+  Ok (!join.decls @ [ R.Stmt.if_ ~loc:l c then_ else_ ])
 
 (** The statements [make target] computing the value of [e] into a new variable [target],
     and that variable; no variable if [e] is of type unit. *)

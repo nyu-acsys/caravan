@@ -540,34 +540,43 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
   in
   let fold ~loc ~pred:_ p args = [ R.Stmt.fold ~loc p args ] in
   let unfold ~loc ~pred:_ p args = [ R.Stmt.unfold ~loc p args ] in
-  let open_ ~at ~unfold:with_unfold =
+  (* The values of the implicit parameters in the update opened at [at], in new variables,
+     with their declarations. *)
+  let implicit_values ~at ~const =
+    let open State.Syntax in
     let l = loc at in
-    let* decls =
-      all implicit ~f:(fun (x, _, t, _) ->
-          let* typ = typ ctx ~at t in
-          let v = Names.fresh ctx.procedure.names x in
-          Ok
-            ( R.Stmt.local ~loc:l ~ghost:true ~const:false ~typ (ident ~loc:l v),
-              R.Expr.var ~loc:l (name ~loc:l v) ))
-    in
+    State.all implicit ~f:(fun (x, _, t, _) ->
+        let* typ = State.of_result (typ ctx ~at t) in
+        let+ v = State.fresh x in
+        ( R.Stmt.local ~loc:l ~ghost:true ?const ~typ (ident ~loc:l v),
+          R.Expr.var ~loc:l (name ~loc:l v) ))
+  in
+  let opening ~l values =
+    match values with
+    | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
+    | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
+  in
+  let open_ ~at ~unfold:with_unfold =
+    let open State.Syntax in
+    let l = loc at in
+    let* decls = implicit_values ~at ~const:(Some false) in
     let values = List.map decls ~f:snd in
-    let opening =
-      match values with
-      | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
-      | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
+    let* unfolds =
+      if with_unfold then
+        State.imperative ctx (fun () -> each pres ~at unfold (opened values))
+      else State.return []
     in
-    let* unfolds = if with_unfold then each pres ~at unfold (opened values) else Ok [] in
-    let invariants = if with_unfold then use_invariants ctx ~at ~fold:false else [] in
-    Ok (invariants @ List.concat_map decls ~f:fst @ [ opening ] @ unfolds, values)
+    let+ invariants =
+      if with_unfold then use_invariants ctx ~at ~fold:false else State.return []
+    in
+    (invariants @ List.concat_map decls ~f:fst @ [ opening ~l values ] @ unfolds, values)
+  in
+  (* The update's part of the path when it is bound. *)
+  let initial : State.au_path =
+    { au_state = Pending; au_step = at; au_values = []; au_performing = None }
   in
   let rec au =
     {
-      state = Pending;
-      cas_results = [];
-      read_results = [];
-      values = [];
-      step = at;
-      performing = None;
       self;
       role;
       ghost_results =
@@ -579,144 +588,161 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
       commit_only;
     }
   and commit_only ~at ~value =
+    let open State.Syntax in
     let l = loc at in
-    let* decls =
-      all implicit ~f:(fun (x, _, t, _) ->
-          let* typ = typ ctx ~at t in
-          let v = Names.fresh ctx.procedure.names x in
-          Ok
-            ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l v),
-              R.Expr.var ~loc:l (name ~loc:l v) ))
-    in
+    let* decls = implicit_values ~at ~const:None in
     let values = List.map decls ~f:snd in
-    let opening =
-      match values with
-      | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
-      | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
+    let* unfolds =
+      State.imperative ctx (fun () -> each pres ~at unfold (opened values))
     in
-    let* unfolds = each pres ~at unfold (opened values) in
-    let* folds = each posts ~at (with_views ctx fold) (opened ~value values) in
-    record_origin ctx
-      {
-        at;
-        code = Commit;
-        message =
-          "The atomic postcondition may not hold after this step, which linearizes the \
-           function";
-        related =
-          List.map posts ~f:(fun (t : S.term) -> (t.term_loc, "The atomic postcondition"));
-      };
-    Ok
-      (List.concat_map decls ~f:fst @ [ opening ] @ unfolds @ folds
-      @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ])
+    let* folds =
+      State.imperative ctx (fun () ->
+          each posts ~at (with_views ctx fold) (opened ~value values))
+    in
+    let+ () =
+      State.record_origin
+        {
+          at;
+          code = Commit;
+          message =
+            "The atomic postcondition may not hold after this step, which linearizes the \
+             function";
+          related =
+            List.map posts ~f:(fun (t : S.term) ->
+                (t.term_loc, "The atomic postcondition"));
+        }
+    in
+    List.concat_map decls ~f:fst
+    @ [ opening ~l values ]
+    @ unfolds @ folds
+    @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ]
   and close c ~value =
-    let at = au.step in
-    let l = loc at in
-    let value =
-      match au.ghost_results with
-      | [] -> value
-      | ghosts -> R.Expr.tuple ~loc:l ((if au.has_result then [ value ] else []) @ ghosts)
-    in
-    let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
-    (* The facts that the function ensures about the state after the action. *)
-    let established performs =
-      all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
-          match
-            ( performs,
-              List.Assoc.find ctx.procedure.opened p.inv ~equal:String.equal,
-              List.Assoc.find ctx.procedure.invariants p.inv ~equal:String.equal )
-          with
-          | Some performed, Some opened, Some args ->
-              let next, indices, _ =
-                next_state ctx st ~inv_params:st.params args opened performed
-              in
-              let index =
-                match
-                  List.Assoc.find indices
-                    (List.Assoc.find_exn st.chains p.field ~equal:String.equal)
-                    ~equal:String.equal
-                with
-                | Some index -> index
-                | None -> List.Assoc.find_exn opened.indices p.field ~equal:String.equal
-              in
-              let* e = formula env p.element in
-              Ok
-                [
-                  R.Stmt.assign ~loc:l [ snapshot ]
-                    (R.Stmt.expr_rhs
-                       (state_of ~loc:l st (grown st (List.map next ~f:fst))));
-                  R.Stmt.assign ~loc:l [ k ]
-                    (R.Stmt.expr_rhs (R.Expr.index ~loc:l index e));
-                ]
-          | _ ->
-              error at
-                "This step linearizes the function, which ensures a fact about the state \
-                 after it, but performs no action")
-    in
-    match c with
-    | Commit ->
-        let message =
-          "The atomic postcondition may not hold after this step, which linearizes the \
-           function"
+    State.bind State.get ~f:(fun (s : State.state) ->
+        let au_path = Option.value s.path.au ~default:initial in
+        let at = au_path.au_step in
+        let l = loc at in
+        let value =
+          match au.ghost_results with
+          | [] -> value
+          | ghosts ->
+              R.Expr.tuple ~loc:l ((if au.has_result then [ value ] else []) @ ghosts)
         in
-        record_origin ctx
-          {
-            at;
-            code = Commit;
-            message;
-            related =
-              List.map posts ~f:(fun (t : S.term) ->
-                  (t.term_loc, "The atomic postcondition"));
-          };
-        record_origin ctx
-          {
-            at;
-            code = Fold;
-            message;
-            related =
-              List.map posts ~f:(fun (t : S.term) ->
-                  (t.term_loc, "This part of the atomic postcondition may not hold"));
-          };
-        let* folds =
-          match au.performing with
-          | Some (a, _) ->
-              (* The views follow from the action; the postcondition's other predicates
-                 are folded as usual. *)
-              let others ~loc ~pred p args =
-                if List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal then []
-                else fold ~loc ~pred p args
-              in
-              let* views = perform_views ctx ~at a in
-              let* others = each posts ~at others (opened ~value au.values) in
-              Ok (views @ others)
-          | None -> each posts ~at (with_views ctx fold) (opened ~value au.values)
+        let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
+        (* The facts that the function ensures about the state after the action. *)
+        let established performs =
+          all past_results ~f:(fun ((p : past), st, _, (snapshot, k)) ->
+              match
+                ( performs,
+                  List.Assoc.find s.path.opened p.inv ~equal:String.equal,
+                  List.Assoc.find s.carried.invariants p.inv ~equal:String.equal )
+              with
+              | Some performed, Some opened, Some args ->
+                  let next, indices, _ =
+                    next_state ctx st ~inv_params:st.params args opened performed
+                  in
+                  let index =
+                    match
+                      List.Assoc.find indices
+                        (List.Assoc.find_exn st.chains p.field ~equal:String.equal)
+                        ~equal:String.equal
+                    with
+                    | Some index -> index
+                    | None ->
+                        List.Assoc.find_exn opened.indices p.field ~equal:String.equal
+                  in
+                  let* e = formula env p.element in
+                  Ok
+                    [
+                      R.Stmt.assign ~loc:l [ snapshot ]
+                        (R.Stmt.expr_rhs
+                           (state_of ~loc:l st (grown st (List.map next ~f:fst))));
+                      R.Stmt.assign ~loc:l [ k ]
+                        (R.Stmt.expr_rhs (R.Expr.index ~loc:l index e));
+                    ]
+              | _ ->
+                  error at
+                    "This step linearizes the function, which ensures a fact about the \
+                     state after it, but performs no action")
         in
-        (* The step is the action's, if its step says when. *)
-        let performs = Option.map au.performing ~f:fst in
-        let checked =
-          match au.performing with
-          | Some (p, Some condition) ->
-              [
-                check ctx ~at
-                  (Printf.sprintf "This step may not perform the action %s"
-                     p.performed.action)
-                  condition;
-              ]
-          | _ -> []
-        in
-        let* established = established performs in
-        Ok
-          (checked @ folds @ List.concat established @ [ commit ]
-          @ use_invariants ?performs ctx ~at ~fold:true)
-    | Abort ->
-        let* folds = each pres ~at fold (opened au.values) in
-        Ok
-          (folds
-          @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ]
-          @ use_invariants ctx ~at ~fold:true)
-    | Commit_call -> Ok [ commit ]
+        let open State.Syntax in
+        match c with
+        | Commit ->
+            let message =
+              "The atomic postcondition may not hold after this step, which linearizes \
+               the function"
+            in
+            let* () =
+              State.record_origin
+                {
+                  at;
+                  code = Commit;
+                  message;
+                  related =
+                    List.map posts ~f:(fun (t : S.term) ->
+                        (t.term_loc, "The atomic postcondition"));
+                }
+            in
+            let* () =
+              State.record_origin
+                {
+                  at;
+                  code = Fold;
+                  message;
+                  related =
+                    List.map posts ~f:(fun (t : S.term) ->
+                        (t.term_loc, "This part of the atomic postcondition may not hold"));
+                }
+            in
+            let* folds =
+              match au_path.au_performing with
+              | Some (a, _) ->
+                  (* The views follow from the action; the postcondition's other
+                     predicates are folded as usual. *)
+                  let others ~loc ~pred p args =
+                    if List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal then
+                      []
+                    else fold ~loc ~pred p args
+                  in
+                  let* views = perform_views ctx ~at a in
+                  let+ others =
+                    State.imperative ctx (fun () ->
+                        each posts ~at others (opened ~value au_path.au_values))
+                  in
+                  views @ others
+              | None ->
+                  State.imperative ctx (fun () ->
+                      each posts ~at (with_views ctx fold)
+                        (opened ~value au_path.au_values))
+            in
+            (* The step is the action's, if its step says when. *)
+            let performs = Option.map au_path.au_performing ~f:fst in
+            let* checked =
+              match au_path.au_performing with
+              | Some (p, Some condition) ->
+                  let+ check =
+                    State.check ~at
+                      (Printf.sprintf "This step may not perform the action %s"
+                         p.performed.action)
+                      condition
+                  in
+                  [ check ]
+              | _ -> State.return []
+            in
+            let* established = State.imperative ctx (fun () -> established performs) in
+            let+ closing = use_invariants ?performs ctx ~at ~fold:true in
+            checked @ folds @ List.concat established @ [ commit ] @ closing
+        | Abort ->
+            let* folds =
+              State.imperative ctx (fun () ->
+                  each pres ~at fold (opened au_path.au_values))
+            in
+            let+ closing = use_invariants ctx ~at ~fold:true in
+            folds @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ] @ closing
+        | Commit_call -> State.return [ commit ])
   in
   ctx.procedure.au <- Some au;
+  ctx.procedure.au_path <- Some initial;
+  ctx.procedure.au_results <- Some { cas_results = []; read_results = [] };
   let l = loc at in
   Ok
     (R.Stmt.local ~loc:l ~ghost:true ~const:true
@@ -1194,7 +1220,7 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
   else
     let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
     let* stmts, v = expr ~tail:true ~keep_scope:true ctx f.body in
-    let* finish = finish_arm ctx ~tail:true v in
+    let* finish = State.run ctx (finish_arm ctx ~tail:true v) in
     let stmts = stmts @ finish in
     let assignment =
       if List.is_empty returns then []
@@ -1216,8 +1242,9 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
              ~default:{ f.loc.loc_end with pos_cnum = Int.max_value } ~f:(fun l ->
                l.loc_start))
     in
+    let* state = State.run ctx au_state in
     let* () =
-      match au_state ctx with
+      match state with
       | None | Some Committed -> Ok ()
       | Some Pending ->
           error f.loc
@@ -1289,7 +1316,8 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
     in
     let history_returns =
       List.filter_map past_results ~f:(fun ((p, _, element, _, (snapshot, index)), _) ->
-          Option.map (known_position ctx p.inv p.field element) ~f:(fun position ->
+          Option.map (known_position ctx.procedure.positions p.inv p.field element)
+            ~f:(fun position ->
               R.Stmt.assign ~loc:l [ snapshot; index ]
                 (R.Stmt.expr_rhs
                    (R.Expr.tuple ~loc:l [ position.pos_snapshot; position.pos_k ]))))
