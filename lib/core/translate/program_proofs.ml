@@ -425,8 +425,8 @@ let proof_context_for (proof_env : Proof_env.t)
   module_context context ~projection:Subst.identity
     (proof_context (declaration_scope name) preds spec_funcs proof_support)
 
-let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error) Result.t
-    =
+let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
+    (t * State.state, error) Result.t =
   let {
     Program_scopes.definition_target;
     fresh;
@@ -455,13 +455,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
     Program_declarations.atomic_operations;
     generic_models;
     library_preds;
-    origins;
     predicates;
-    primitives;
     procedure_signatures;
     proof_assets;
     pure;
-    refs;
     resource_types;
     scoped_inputs;
     scoped_proofs;
@@ -939,8 +936,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
         Ok (context, List.concat resources))
   in
   let module_context = module_context ~scoped_binding ~module_parameters in
-  let* atomic_updates =
-    all atomic_operations ~f:(fun (au_source, f) ->
+  let* atomic_updates, state =
+    State.run_from state
+    @@ State.all atomic_operations ~f:(fun (au_source, f) ->
         let preds, spec_funcs, proof_support =
           proof_context ~current_procedure:(proc_name f) ~at:f.loc
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
@@ -952,84 +950,91 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
             (preds, spec_funcs, proof_support)
         in
         let ctx =
-          spec_context types ~refs ~primitives ~shared:no_shared ~ocaml_env:f.environment
-            ~preds ~spec_funcs ~proof_support origins
+          spec_context types ~shared:no_shared ~ocaml_env:f.environment ~preds ~spec_funcs
+            ~proof_support ()
         in
-        let* _, _, implicit, _ =
-          State.run ctx
-            (State.bind (formals ctx f) ~f:(fun formals ->
-                 contract_env ctx ~spec_funcs f formals ~result:"result"))
-        in
-        let signature =
-          List.Assoc.find_exn procedure_signatures (proc_name f) ~equal:String.equal
-        in
-        let au_inputs =
-          List.filter_map f.params ~f:(fun p ->
-              match p.fp_kind with Tparam_pat pat -> Some pat.pat_type | _ -> None)
-          @ List.map signature.procedure_inputs ~f:snd
-        in
-        let project =
-          match au_plan au_source with
-          | Some plan -> Subst.type_expr (Generic_proofs.source_projection plan)
-          | None ->
-              begin match Generic_modules.member generics f.id with
-              | Some (_, application, _) ->
-                  let path =
-                    match au_source.au_operation_path with
-                    | Path.Pdot (owner, _) -> owner
-                    | _ -> application.source.identity
-                  in
-                  Subst.type_expr
-                    (Generic_proofs.implementation_projection application.source path)
-              | None -> Fn.id
-              end
-        in
-        let shape =
-          {
-            inputs = List.map au_inputs ~f:project;
-            result = project f.body.exp_type;
-            ghost_outputs =
-              List.map signature.procedure_outputs ~f:(fun (_, ty) -> project ty);
-            implicit = List.map implicit ~f:(fun (_, _, ty, _) -> project ty);
-          }
-        in
-        let key =
-          Option.first_some
-            (Option.map (au_application_view au_source) ~f:(fun view -> view.key))
-            (List.find_map scoped_proofs.bindings ~f:(fun binding ->
-                 match binding.kind with
-                 | Atomic actual when Ident.same actual.au_id au_source.au_id ->
-                     Some binding.backend
-                 | _ -> None))
-          |> Option.value ~default:au_source.au_name
-        in
-        let owner =
-          match au_plan au_source with
-          | Some plan -> plan.scope.owner
-          | None ->
-              begin match Proof_bindings.scope_for_location scoped_proofs f.loc with
-              | Some scope when List.equal String.equal scope.namespace f.namespace ->
-                  scope.owner
-              | _ ->
-                  List.find_map f.paths ~f:(function
-                    | Path.Pdot (owner, _) ->
-                        Some (Proof_bindings.canonical_owner scoped_proofs owner)
-                    | _ -> None)
-              end
-        in
-        Ok
-          {
-            au_key = key;
-            au_owner = owner;
-            au_private = shape;
-            au_token = au_source.au_token;
-            au_source;
-            au_procedure = au_procedure au_source f;
-            au_inputs = shape.inputs;
-            au_result = shape.result;
-            au_ghost_outputs = shape.ghost_outputs;
-            au_implicit = shape.implicit;
-          })
+        State.in_procedure
+        @@ State.bind
+             (State.bind (formals ctx f) ~f:(fun formals ->
+                  contract_env ctx ~spec_funcs f formals ~result:"result"))
+             ~f:(fun (_, _, implicit, _) ->
+               let signature =
+                 List.Assoc.find_exn procedure_signatures (proc_name f)
+                   ~equal:String.equal
+               in
+               let au_inputs =
+                 List.filter_map f.params ~f:(fun p ->
+                     match p.fp_kind with
+                     | Tparam_pat pat -> Some pat.pat_type
+                     | _ -> None)
+                 @ List.map signature.procedure_inputs ~f:snd
+               in
+               let project =
+                 match au_plan au_source with
+                 | Some plan -> Subst.type_expr (Generic_proofs.source_projection plan)
+                 | None ->
+                     begin match Generic_modules.member generics f.id with
+                     | Some (_, application, _) ->
+                         let path =
+                           match au_source.au_operation_path with
+                           | Path.Pdot (owner, _) -> owner
+                           | _ -> application.source.identity
+                         in
+                         Subst.type_expr
+                           (Generic_proofs.implementation_projection application.source
+                              path)
+                     | None -> Fn.id
+                     end
+               in
+               let shape =
+                 {
+                   inputs = List.map au_inputs ~f:project;
+                   result = project f.body.exp_type;
+                   ghost_outputs =
+                     List.map signature.procedure_outputs ~f:(fun (_, ty) -> project ty);
+                   implicit = List.map implicit ~f:(fun (_, _, ty, _) -> project ty);
+                 }
+               in
+               let key =
+                 Option.first_some
+                   (Option.map (au_application_view au_source) ~f:(fun view -> view.key))
+                   (List.find_map scoped_proofs.bindings ~f:(fun binding ->
+                        match binding.kind with
+                        | Atomic actual when Ident.same actual.au_id au_source.au_id ->
+                            Some binding.backend
+                        | _ -> None))
+                 |> Option.value ~default:au_source.au_name
+               in
+               let owner =
+                 match au_plan au_source with
+                 | Some plan -> plan.scope.owner
+                 | None ->
+                     begin match
+                       Proof_bindings.scope_for_location scoped_proofs f.loc
+                     with
+                     | Some scope when List.equal String.equal scope.namespace f.namespace
+                       ->
+                         scope.owner
+                     | _ ->
+                         List.find_map f.paths ~f:(function
+                           | Path.Pdot (owner, _) ->
+                               Some (Proof_bindings.canonical_owner scoped_proofs owner)
+                           | _ -> None)
+                     end
+               in
+               State.return
+                 {
+                   au_key = key;
+                   au_owner = owner;
+                   au_private = shape;
+                   au_token = au_source.au_token;
+                   au_source;
+                   au_procedure = au_procedure au_source f;
+                   au_inputs = shape.inputs;
+                   au_result = shape.result;
+                   au_ghost_outputs = shape.ghost_outputs;
+                   au_implicit = shape.implicit;
+                 }))
   in
   let proof_support = { proof_support with atomic_updates } in
   let atomic_predicates = atomic_predicates_of (context_atomic None atomic_updates) in
@@ -1176,17 +1181,18 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) : (t, error
     @ proof_lemmas
   in
   Ok
-    {
-      checked_views;
-      checked_resource_entries;
-      logical_declarations;
-      all_logical_functions;
-      proof_support;
-      preds;
-      spec_funcs;
-      lemma_declarations;
-      lemma_context;
-      module_parameters;
-      private_scoped_inputs;
-      proof_env;
-    }
+    ( {
+        checked_views;
+        checked_resource_entries;
+        logical_declarations;
+        all_logical_functions;
+        proof_support;
+        preds;
+        spec_funcs;
+        lemma_declarations;
+        lemma_context;
+        module_parameters;
+        private_scoped_inputs;
+        proof_env;
+      },
+      state )

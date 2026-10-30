@@ -425,19 +425,17 @@ let contract_postconditions env ~at ?atomic posts =
     itself: these are proven for the function's value, by induction, which a precondition
     bounding the function's own value, as for the code to not overflow, would make
     circular. *)
-let func types ~refs ~primitives ~shared ~ocaml_env ~preds ~funcs ~spec_funcs
-    ~proof_support ?declaration_name ?(primitive_namespace = []) origins (f : func) :
-    (R.Callable.t, error) Result.t =
+let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
+    ?declaration_name ?(primitive_namespace = []) (f : func) : R.Callable.t State.t =
   let ctx =
     {
       given =
         declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
           ~primitive_namespace ();
-      procedure = initial_procedure ();
-      collected = { refs; primitives; origins };
+      au = None;
     }
   in
-  State.run ctx
+  State.in_procedure
   @@
   let open State.Syntax in
   let l = loc f.loc in
@@ -538,9 +536,9 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
 
 (** The statements binding the atomic update of the function [self], whose atomic contract
     has the preconditions [pres] and postconditions [posts], and whose implicit parameters
-    are [implicit]; [result] is the contract's name for the result, if there is one. Sets
-    [ctx.procedure.au]. A step inside the update unfolds the predicates of [pres], and
-    folds those of [posts] if it commits, and those of [pres] if it aborts. *)
+    are [implicit]; [result] is the contract's name for the result, if there is one; and
+    the update. A step inside the update unfolds the predicates of [pres], and folds those
+    of [posts] if it commits, and those of [pres] if it aborts. *)
 let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_results =
   let open State.Syntax in
   let* phi = State.fresh "phi" in
@@ -746,16 +744,16 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
             folds @ [ R.Stmt.call ~loc:l (au_call ~l "abortAU" []) ] @ closing
         | Commit_call -> State.return [ commit ])
   in
-  ctx.procedure.au <- Some au;
   let* () = Atomic_proofs.set_path_au initial in
   let+ () =
     State.modify_carried (fun c ->
         { c with au_results = Some { cas_results = []; read_results = [] } })
   in
   let l = loc at in
-  R.Stmt.local ~loc:l ~ghost:true ~const:true
-    ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l "bindAU") []))
-    (ident ~loc:l phi)
+  ( R.Stmt.local ~loc:l ~ghost:true ~const:true
+      ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l "bindAU") []))
+      (ident ~loc:l phi),
+    au )
 
 (** The invariants that the conjunctions [terms] apply, with their arguments. *)
 let invariant_apps ?(include_opaque = false) ctx env (terms : S.term list) =
@@ -894,7 +892,10 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                           (List.mapi es ~f:(fun i e -> (e, R.Expr.int ~loc:l i)))
                           (R.Expr.int ~loc:l 0) ) )
                 | None ->
-                    ctx.given.shared.dynamic_indices <- true;
+                    let* () =
+                      State.modify (fun (s : State.state) ->
+                          { s with tables = { s.tables with dynamic_indices = true } })
+                    in
                     let l = loc term.term_loc in
                     let* target = State.fresh "initial_index" in
                     let index_type =
@@ -971,17 +972,15 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
 
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?pure_name
-    (f : func) : (R.Callable.t, error) Result.t =
-  let procedure = initial_procedure () in
+let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
+    : R.Callable.t State.t =
   let ctx =
     {
       given = { given with current_procedure = Some proc_name; manual = f.manual };
-      procedure;
-      collected;
+      au = None;
     }
   in
-  State.run ctx
+  State.in_procedure
   @@
   let open State.Syntax in
   let l = loc f.loc in
@@ -1214,16 +1213,20 @@ let proc ~given ~collected ~past_structures ~proc_name ~pure ?declaration_name ?
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
   in
   let* atomic_ensures = postconditions ~atomic:true atomic_posts in
-  let* bind_au =
+  let* bind_au, au =
     if atomic && not f.manual then
-      atomic_update ctx env ~at:f.loc ~self:proc_name
-        ~role:(Option.value f.role ~default:f.id)
-        ~result:(Option.some_if (not (List.is_empty returns)) result_name)
-        implicit_decls ~pres:atomic_pres ~posts:atomic_posts
-        ~past_results:
-          (List.map past_results ~f:(fun ((p, st, _, d, w), _) -> (p, st, d, w)))
-    else State.return []
+      let+ binding, au =
+        atomic_update ctx env ~at:f.loc ~self:proc_name
+          ~role:(Option.value f.role ~default:f.id)
+          ~result:(Option.some_if (not (List.is_empty returns)) result_name)
+          implicit_decls ~pres:atomic_pres ~posts:atomic_posts
+          ~past_results:
+            (List.map past_results ~f:(fun ((p, st, _, d, w), _) -> (p, st, d, w)))
+      in
+      (binding, Some au)
+    else State.return ([], None)
   in
+  let ctx = { ctx with au } in
   let* () =
     match Option.value_map f.contract ~default:[] ~f:(fun c -> c.variant) with
     | [] -> State.return ()

@@ -770,7 +770,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                (visible_state group st.invariant)
                { st with invariant = st.backend })
         @ if Option.is_none group then application_structures else []);
-      dynamic_indices = false;
       anchors =
         List.map
           (List.dedup_and_sort (List.map selected_fields ~f:fst) ~compare:String.compare)

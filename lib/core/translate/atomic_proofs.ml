@@ -286,8 +286,7 @@ let modify_results f =
       })
 
 (** The atomic update of the function, with its part of the path, if it has one. *)
-let open_update ctx =
-  State.gets (fun (s : State.state) -> Option.both ctx.procedure.au s.path.au)
+let open_update ctx = State.gets (fun (s : State.state) -> Option.both ctx.au s.path.au)
 
 (** [snapshots] with [state] the latest snapshot of [inv]. *)
 let push_snapshot snapshots inv (state : opened) =
@@ -1255,8 +1254,9 @@ let linearize ?step ?value ?access_type ctx ~at
     match (annotation, value, access_type) with
     | None, _, _ -> State.return access
     | Some annotation, Some result, Some result_type ->
-        access_proof ctx annotation ~result_type (fun _ ->
-            State.return (access, result, []))
+        State.map ~f:fst
+          (access_proof ctx annotation ~result_type (fun _ ->
+               State.return (access, result, [])))
     | Some annotation, _, _ ->
         State.of_result
           (error annotation.loc "This operation does not support an access proof")

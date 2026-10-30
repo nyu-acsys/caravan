@@ -83,18 +83,11 @@ let assume_in_range ~loc:l (t : Types.type_expr) x =
   Option.value_map (range_spec ~loc:l t x) ~default:[] ~f:(fun spec ->
       [ R.Stmt.assume ~loc:l spec ])
 
-(** The names of a function's variables in Raven: OCaml's, made distinct where a name is
-    bound twice. *)
+(** Distinct names, as Raven needs them. *)
 module Names = struct
-  type t = {
-    mutable used : Set.M(String).t;
-    mutable bound : (string * string) list;
-    mutable scope : (string * (string * Types.type_expr option)) list;
-        (** The variables bound so far, by their OCaml names, latest first, with their
-            Raven names and types. *)
-  }
+  type t = { mutable used : Set.M(String).t }
 
-  let create () = { used = Set.empty (module String); bound = []; scope = [] }
+  let create () = { used = Set.empty (module String) }
 
   (** A name for [base] not in [used]. *)
   let unused used base =
@@ -109,16 +102,6 @@ module Names = struct
     let name = unused names.used base in
     names.used <- Set.add names.used name;
     name
-
-  (** The Raven name of the OCaml variable [id] of type [typ], bound now. *)
-  let bind ?typ names (id : Ident.t) =
-    let name = fresh names (Ident.name id) in
-    names.bound <- (Ident.unique_name id, name) :: names.bound;
-    names.scope <- (Ident.name id, (name, typ)) :: names.scope;
-    name
-
-  let find names (id : Ident.t) =
-    List.Assoc.find names.bound (Ident.unique_name id) ~equal:String.equal
 end
 
 type origin = {
@@ -216,7 +199,7 @@ type au_close =
 (** The state of a translation, threaded explicitly: what each arm of a branch starts
     from, what carries on from arm to arm within a procedure, the supply of fresh names,
     the fields and primitives used, and the checks generated: the monad, without the
-    operations on contexts, which {!State} adds. *)
+    operations that use a context's inputs, which {!State} adds. *)
 module State_monad = struct
   type au_path = {
     au_state : au_state;
@@ -265,7 +248,14 @@ module State_monad = struct
     scope : (string * (string * Types.type_expr option)) list;
   }
 
-  type tables = { cells : cell_field list; primitives : (string * R.Member.t) list }
+  type tables = {
+    cells : cell_field list;
+    primitives : (string list * (string * R.Member.t) list) list;
+        (** The atomic operations used so far, by the namespace they are declared in, and
+            by their names (see {!Primitives}). *)
+    dynamic_indices : bool;
+        (** Whether an invariant is established with index maps that are computed. *)
+  }
 
   type state = {
     path : path;
@@ -331,6 +321,77 @@ module State_monad = struct
     | x :: rest ->
         let* acc = f init x in
         fold rest ~init:acc ~f
+
+  let empty_path = { opened = []; snapshots = []; positions = []; au = None }
+
+  let empty_carried =
+    {
+      ghost_returns = [];
+      proof_state = None;
+      return_covered = false;
+      fields_of = [];
+      formals = [];
+      facts = [];
+      invariants = [];
+      au_results = None;
+    }
+
+  let empty_names = { used = Set.empty (module String); bound = []; scope = [] }
+
+  (** The state of a translation before it starts. *)
+  let initial =
+    {
+      path = empty_path;
+      carried = empty_carried;
+      names = empty_names;
+      tables = { cells = []; primitives = []; dynamic_indices = false };
+      origins = [];
+    }
+
+  type local = { local_path : path; local_carried : carried; local_names : names }
+  (** The state of one procedure or declaration of its own, apart from the tables and
+      checks, which carry on. *)
+
+  let new_local =
+    { local_path = empty_path; local_carried = empty_carried; local_names = empty_names }
+
+  (** Runs [m] from the state [local] of its procedure or declaration, the tables and
+      checks carrying on: [m]'s result, with the state of its own that it ends in. *)
+  let within local m s =
+    let r, after =
+      m
+        {
+          s with
+          path = local.local_path;
+          carried = local.local_carried;
+          names = local.local_names;
+        }
+    in
+    let s = { s with tables = after.tables; origins = after.origins } in
+    match r with
+    | Ok a ->
+        ( Ok
+            ( a,
+              {
+                local_path = after.path;
+                local_carried = after.carried;
+                local_names = after.names;
+              } ),
+          s )
+    | Error e -> (Error e, s)
+
+  (** Runs [m] as the translation of one procedure or declaration, from no state of its
+      own. *)
+  let in_procedure m = map (within new_local m) ~f:fst
+
+  (** [m]'s result from the state [s], with the state it ends in. *)
+  let run_from s m = match m s with Ok a, s -> Ok (a, s) | Error e, _ -> Error e
+
+  (** The atomic operations used in [namespace]. *)
+  let primitives_in tables namespace =
+    Option.value
+      (List.Assoc.find tables.primitives namespace ~equal:(List.equal String.equal))
+      ~default:[]
 
   (** Runs [m] from the path [start], the rest of the state carrying on: its result, with
       the path it ends in, which the state then has. *)
@@ -590,7 +651,6 @@ type shared = {
           of the state, half in the view and half in the invariant. *)
   structures : structure list;
   member_aliases : (string * string) list;
-  mutable dynamic_indices : bool;
   anchors : (string * (string * R.Type.t * R.Expr.t option) list) list;
       (** The ghost fields of the views and histories, by the field whose allocation
           allocates them, the field of the structure's reference, with their initial
@@ -616,14 +676,7 @@ let canonical_member shared member =
     ~default:member
 
 let no_shared =
-  {
-    persistent = [];
-    views = [];
-    structures = [];
-    member_aliases = [];
-    anchors = [];
-    dynamic_indices = false;
-  }
+  { persistent = []; views = []; structures = []; member_aliases = []; anchors = [] }
 
 let implicit_parameter_count ~kind parameters =
   let rec check seen count = function
@@ -706,47 +759,10 @@ type inputs = {
 }
 (** What a context is given when it is made: the same throughout its translation. *)
 
-type procedure_state = {
-  names : Names.t;
-  mutable ghost_returns : (string * string * Types.type_expr) list;
-  mutable proof_state : (R.Expr.t * Types.type_expr) option;
-  mutable return_covered : bool;
-  mutable fields_of : (string * (string * R.Expr.t)) list;
-      (** The variables known to be fields of values, by their Raven names: the field and
-          the value, as [tail] of [q] after [let push { tail; _ } value]. *)
-  mutable formals : R.Expr.t list;
-      (** The procedure's parameters, of which a lifted local function that continues it,
-          or that it continues too, takes the first. *)
-  mutable facts : R.Spec.t list;
-      (** Facts that hold throughout the function: its preconditions without [own], which
-          only mention variables, all immutable. *)
-  mutable au : au option;
-      (** The atomic update, for a function with an atomic contract. *)
-  mutable au_path : State_monad.au_path option;
-  mutable au_results : State_monad.au_results option;
-  mutable invariants : (string * R.Expr.t list) list;
-      (** The invariants that the function's precondition holds, opened around each of its
-          atomic steps, with their arguments. *)
-  mutable opened : (string * opened) list;  (** The states of the open invariants. *)
-  mutable snapshots : (string * opened list) list;
-      (** The snapshots of the states of the invariants taken on the current path, latest
-          first. *)
-  mutable positions : position list;
-      (** The positions of entries in snapshots known on the current path. *)
+type context = {
+  given : inputs;
+  au : au option;  (** The atomic update, for a function with an atomic contract. *)
 }
-(** The state of the translation of one procedure, or of a specification outside one. *)
-
-type outputs = {
-  refs : cell_field list ref;
-      (** The fields of the ref cells and atomics used so far, by their names, with their
-          declarations. *)
-  primitives : (string * R.Member.t) list ref;
-      (** The atomic operations used so far, by their names (see {!Primitives}). *)
-  origins : origin list ref;
-}
-(** What the translation collects across contexts. *)
-
-type context = { given : inputs; procedure : procedure_state; collected : outputs }
 
 (** The inputs of a context outside a procedure, which has none of a procedure's tables.
 *)
@@ -778,100 +794,14 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     libraries = Path_bindings.empty;
   }
 
-(** The state of a translation before it starts. *)
-let initial_procedure () =
-  {
-    names = Names.create ();
-    ghost_returns = [];
-    proof_state = None;
-    return_covered = false;
-    fields_of = [];
-    formals = [];
-    facts = [];
-    au = None;
-    au_path = None;
-    au_results = None;
-    invariants = [];
-    opened = [];
-    snapshots = [];
-    positions = [];
-  }
-
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
-(** The explicit state, with the operations on contexts. *)
+(** The explicit state, with the operations that use a context's inputs. *)
 module State = struct
   include State_monad
 
-  (** The state that [ctx] holds. *)
-  let capture (ctx : context) : state =
-    let p = ctx.procedure in
-    {
-      path =
-        {
-          opened = p.opened;
-          snapshots = p.snapshots;
-          positions = p.positions;
-          au = p.au_path;
-        };
-      carried =
-        {
-          ghost_returns = p.ghost_returns;
-          proof_state = p.proof_state;
-          return_covered = p.return_covered;
-          fields_of = p.fields_of;
-          formals = p.formals;
-          facts = p.facts;
-          invariants = p.invariants;
-          au_results = p.au_results;
-        };
-      names = { used = p.names.used; bound = p.names.bound; scope = p.names.scope };
-      tables = { cells = !(ctx.collected.refs); primitives = !(ctx.collected.primitives) };
-      origins = !(ctx.collected.origins);
-    }
-
-  (** Makes [ctx] hold the state [s]. *)
-  let restore (ctx : context) (s : state) =
-    let p = ctx.procedure in
-    p.opened <- s.path.opened;
-    p.snapshots <- s.path.snapshots;
-    p.positions <- s.path.positions;
-    p.au_path <- s.path.au;
-    p.au_results <- s.carried.au_results;
-    p.ghost_returns <- s.carried.ghost_returns;
-    p.proof_state <- s.carried.proof_state;
-    p.return_covered <- s.carried.return_covered;
-    p.fields_of <- s.carried.fields_of;
-    p.formals <- s.carried.formals;
-    p.facts <- s.carried.facts;
-    p.invariants <- s.carried.invariants;
-    p.names.used <- s.names.used;
-    p.names.bound <- s.names.bound;
-    p.names.scope <- s.names.scope;
-    ctx.collected.refs := s.tables.cells;
-    ctx.collected.primitives := s.tables.primitives;
-    ctx.collected.origins := s.origins
-
-  (** Runs [m] on the state that [ctx] holds, which then holds the state [m] ends in. *)
-  let run (ctx : context) (m : 'a t) : ('a, error) Result.t =
-    let r, s = m (capture ctx) in
-    restore ctx s;
-    r
-
-  (** Makes [ctx] hold the state [f] gives its state. *)
-  let update (ctx : context) f = restore ctx (f (capture ctx))
-
-  (** Runs [f], which works on [ctx], with [ctx] holding the state: the state is then the
-      one [f] leaves [ctx] in. *)
-  let imperative (ctx : context) f s =
-    restore ctx s;
-    let r = f () in
-    (r, capture ctx)
-
-  let with_origin origin s = { s with origins = origin :: s.origins }
-
   (** Records a check the translation generates. *)
-  let record_origin origin = modify (with_origin origin)
+  let record_origin origin = modify (fun s -> { s with origins = origin :: s.origins })
 
   open Syntax
 
@@ -911,14 +841,21 @@ module State = struct
   (** The field of the atomics with contents of type [elt]. *)
   let atomic_field given ~at elt = cell_field given ~at elt ~prefix:"atomic_" ~suffix:""
 
-  let add_primitive name proc =
+  let add_primitive ~namespace name proc =
     modify (fun s ->
-        if List.Assoc.mem s.tables.primitives name ~equal:String.equal then s
+        let declared = primitives_in s.tables namespace in
+        if List.Assoc.mem declared name ~equal:String.equal then s
         else
           {
             s with
             tables =
-              { s.tables with primitives = s.tables.primitives @ [ (name, proc ()) ] };
+              {
+                s.tables with
+                primitives =
+                  List.Assoc.add s.tables.primitives namespace
+                    (declared @ [ (name, proc ()) ])
+                    ~equal:(List.equal String.equal);
+              };
           })
 
   (** The procedure performing [op] on the atomics with contents of type [elt]. *)
@@ -933,7 +870,7 @@ module State = struct
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
     let+ () =
-      add_primitive name (fun () ->
+      add_primitive ~namespace:given.primitive_namespace name (fun () ->
           Primitives.proc ~declaration_name ~field ~typ
             ~exact:(Datatypes.immediate given.types elt)
             ~int:(Datatypes.is_int given.types elt)
@@ -952,7 +889,7 @@ module State = struct
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
     let+ () =
-      add_primitive procedure (fun () ->
+      add_primitive ~namespace:given.primitive_namespace procedure (fun () ->
           Primitives.ordinary_proc ~declaration_name ~field ~typ
             ~int:(Datatypes.is_int given.types elt)
             op)
@@ -1033,31 +970,6 @@ module State = struct
     R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r; v ])
 end
 
-(** Declares [field], with values of type [elt], unless it is already. *)
-let declare_field ctx ~at field elt =
-  State.run ctx (State.declare_field ctx.given ~at field elt)
-
-let cell_field ctx ~at elt ~prefix ~suffix =
-  State.run ctx (State.cell_field ctx.given ~at elt ~prefix ~suffix)
-
-(** The field of the ref cells with contents of type [elt]. *)
-let ref_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"ref_" ~suffix:"_contents"
-
-(** The field of the atomics with contents of type [elt]. *)
-let atomic_field ctx ~at elt = cell_field ctx ~at elt ~prefix:"atomic_" ~suffix:""
-
-(** The procedure performing [op] on the atomics with contents of type [elt]. *)
-let primitive ctx ~at elt op = State.run ctx (State.primitive ctx.given ~at elt op)
-
-(** The ordinary read or write of a mutable field. *)
-let ordinary_primitive ctx ~at ~field elt op =
-  State.run ctx (State.ordinary_primitive ctx.given ~at ~field elt op)
-
-(** The Raven field named [label] of the values of type [t] that are references; an
-    atomic's contents have the empty label, as in [own a v]. *)
-let field_of_type ctx ~at t label =
-  State.run ctx (State.field_of_type ctx.given ~at t label)
-
 (** The atomic that the field [label] of a value of the immutable record type [t] holds:
     its type, if it is one. *)
 let atomic_in_record ctx (t : Types.type_expr) label =
@@ -1131,14 +1043,6 @@ let field_type ctx t label =
             | Tconstr (path, [ element ], _) when Datatypes.is_atomic path -> element
             | _ -> fallback
           else source)
-
-(** Records a check the translation generates. *)
-let record_origin ctx origin = State.update ctx (State.with_origin origin)
-
-(** The assertion [c] checking, at [at], what [message] says may fail. *)
-let check ctx ~(at : Location.t) message c =
-  record_origin ctx { at; code = Assertion; message; related = [] };
-  R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
 let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
 

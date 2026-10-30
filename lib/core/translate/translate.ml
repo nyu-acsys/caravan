@@ -67,11 +67,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     pending_declarations;
     available_layouts;
     modules;
-    refs;
-    primitives;
     functions;
     lifted;
-    origins;
     ocaml_env;
     scoped_proofs;
     scoped_inputs;
@@ -93,7 +90,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
       ~pending_declarations:decls.pending_declarations
       ~available_layouts:decls.available_layouts
   in
-  let* proofs = Program_proofs.run scopes decls in
+  let* proofs, state = Program_proofs.run scopes decls State.initial in
   let {
     Program_proofs.checked_views;
     checked_resource_entries;
@@ -115,12 +112,11 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     Program_structures.structures;
     structure_member_lists;
     view_fields;
-    shared;
-    generic_shared;
     past_structures;
     pasts;
     past_returns;
     ghost_args;
+    _;
   } =
     shaped
   in
@@ -138,7 +134,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
         (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
            ~unapplied_proofs:scopes.unapplied_proofs)
   in
-  let* translated = Program_members.run scopes decls proofs shaped in
+  let* translated, state = Program_members.run scopes decls proofs shaped state in
   let {
     Program_members.library_modules;
     publication_members;
@@ -149,7 +145,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     pred_members;
     lemma_members;
     logical_members;
-    runtime_primitives;
     pure_funcs;
     procs;
   } =
@@ -332,8 +327,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                typ))
     in
     let primitive_members =
-      !(List.Assoc.find_exn runtime_primitives destination
-          ~equal:Module_context.same_destination)
+      State.primitives_in state.tables (Module_context.namespace destination)
       |> List.map ~f:snd
     in
     let stages =
@@ -530,7 +524,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
               @ environment
             in
             let cell_fields =
-              List.filter_map !refs ~f:(fun cell ->
+              List.filter_map state.tables.cells ~f:(fun cell ->
                   let name = Qualified_name.of_string cell.cell_name in
                   Option.map
                     (List.Assoc.find field_contexts name.path
@@ -719,7 +713,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
                 Option.some_if (phys_equal argument binding) instance)
           in
           let publications =
-            List.filter_map !publication_members ~f:(fun (owner, member) ->
+            List.filter_map publication_members ~f:(fun (owner, member) ->
                 Option.some_if
                   (phys_equal owner binding || List.mem attached owner ~equal:phys_equal)
                   (R.Member.callable member))
@@ -750,7 +744,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
   let ref_fields =
-    List.filter_map !refs ~f:(fun cell ->
+    List.filter_map state.tables.cells ~f:(fun cell ->
         Option.some_if
           (List.is_empty (Qualified_name.of_string cell.cell_name).path)
           cell.cell_declaration)
@@ -763,10 +757,6 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members
-        @ (if
-             shared.dynamic_indices
-             || List.exists generic_shared ~f:(fun (_, shared) -> shared.dynamic_indices)
-           then Indexed_initialization.members
-           else [])
+        @ (if state.tables.dynamic_indices then Indexed_initialization.members else [])
         @ imported_resource_members @ modules @ library_modules @ root_members),
-      !origins )
+      state.origins )

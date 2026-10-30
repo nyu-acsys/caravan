@@ -640,24 +640,12 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
       let+ statements, value, _ = run None in
       (arguments @ statements, value)
   | Some annotation ->
-      (* The scope's proof runs the call, whose value it does not return. *)
-      let* statements, value =
-        let result = ref None in
-        State.map
-          (access_proof ctx annotation ~result_type:e.exp_type
-             ~input_types:(List.map inputs ~f:snd) ~output_types:(List.map outputs ~f:snd)
-             (fun values ->
-               State.map (run (Some values)) ~f:(fun (statements, value, outputs) ->
-                   result := Some value;
-                   (statements, value, outputs))))
-          ~f:(fun statements -> (statements, !result))
+      let+ statements, value =
+        access_proof ctx annotation ~result_type:e.exp_type
+          ~input_types:(List.map inputs ~f:snd) ~output_types:(List.map outputs ~f:snd)
+          (fun values -> run (Some values))
       in
-      begin match value with
-      | Some value -> State.return (arguments @ statements, value)
-      | None ->
-          State.of_result
-            (error annotation.loc "The scope did not invoke its attached call")
-      end
+      (arguments @ statements, value)
 
 and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
     ~signature_outputs =
@@ -728,7 +716,7 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
      its place, with the atomic update's values of the implicit parameters, as does a call
      of a function that continues the update. *)
   let* retry =
-    match ctx.procedure.au with
+    match ctx.au with
     | Some au
       when String.equal au.self f || Option.exists role ~f:(fun r -> Ident.same r au.role)
       ->

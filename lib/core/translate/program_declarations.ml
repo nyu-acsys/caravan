@@ -32,11 +32,8 @@ type t = {
   pending_declarations : (Base.string list * Datatypes.R.Member.t list) list Base.ref;
   available_layouts : Base.string list Base.ref;
   modules : Datatypes.R.Member.t list;
-  refs : Translate_context.cell_field list Base.ref;
-  primitives : (Base.string * Translate_context.R.Member.t) list Base.ref;
   functions : Base.string Path_bindings.t;
   lifted : (string * (int * Ident.t list * Ident.t option)) list;
-  origins : Translate_context.origin list Base.ref;
   ocaml_env : Env.t;
   scoped_proofs : Proof_bindings.t;
   scoped_inputs : (string * int) list;
@@ -909,8 +906,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let available_layouts = ref [] in
   let take_declarations = take_declarations ~pending_declarations ~available_layouts in
   let modules = take_declarations () in
-  let refs = ref [] in
-  let primitives = ref [] in
   let functions =
     Path_bindings.of_list
       (List.concat_map funcs ~f:(fun f ->
@@ -928,7 +923,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           (proc_name f, (f.prefix_count, f.captured, f.role)))
   in
   let lifted = with_body_names lifted in
-  let origins = ref [] in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
   let* predicates = predicates ~data:types source in
@@ -1019,11 +1013,8 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       pending_declarations;
       available_layouts;
       modules;
-      refs;
-      primitives;
       functions;
       lifted;
-      origins;
       ocaml_env;
       scoped_proofs;
       scoped_inputs;

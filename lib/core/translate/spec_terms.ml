@@ -1043,32 +1043,3 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
           end
       in
       chain cases
-
-(** The translations above, run on the state that the environment's context holds. *)
-module On_context = struct
-  let formula env t = State.run env.ctx (formula env t)
-
-  let collection_application env ~at f args =
-    State.run env.ctx (collection_application env ~at f args)
-
-  let expected_formula env expected t =
-    State.run env.ctx (expected_formula env expected t)
-
-  let application env t = State.run env.ctx (application env t)
-
-  let typed_arguments env ~at inputs args =
-    State.run env.ctx (typed_arguments env ~at inputs args)
-
-  let predicate_arguments env ~at ?display key types args =
-    State.run env.ctx (predicate_arguments env ~at ?display key types args)
-
-  let logical_application env ~at signature args =
-    State.run env.ctx (logical_application env ~at signature args)
-
-  let quantified env t = State.run env.ctx (quantified env t)
-  let location_of env t = State.run env.ctx (location_of env t)
-  let constructor env t args = State.run env.ctx (constructor env t args)
-
-  let spec_match env ~at ?scrutinee_type v cases =
-    State.run env.ctx (spec_match env ~at ?scrutinee_type v cases)
-end

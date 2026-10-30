@@ -835,7 +835,21 @@ let rec proof_expression env targets (body : S.proof_expr) =
       in
       chain cases
 
-and proof_binding ?(ghost_rhs = false) env pattern rhs continuation =
+and proof_binding ?ghost_rhs env pattern rhs continuation =
+  State.map ~f:fst
+    (proof_binding_with ?ghost_rhs env pattern rhs (fun env ->
+         State.map (continuation env) ~f:(fun statements -> (statements, ()))))
+
+(** [proof_binding] with a [continuation] that also gives a value, which it gives too. *)
+and proof_binding_with :
+    'a.
+    ?ghost_rhs:bool ->
+    env ->
+    S.pat ->
+    S.proof_expr ->
+    (env -> (R.Stmt.t list * 'a) State.t) ->
+    (R.Stmt.t list * 'a) State.t =
+ fun ?(ghost_rhs = false) env pattern rhs continuation ->
   let open State.Syntax in
   let l = loc rhs.S.proof_loc in
   let* inferred = proof_result_types env rhs in
@@ -864,12 +878,12 @@ and proof_binding ?(ghost_rhs = false) env pattern rhs continuation =
               var_types = (id.pid_str, ty) :: env.var_types;
             })
   in
-  let+ rest = continuation env in
+  let+ rest, value = continuation env in
   let rhs =
     if ghost_rhs then [ R.Stmt.ghost_block ~loc:(loc rhs.proof_loc) rhs_statements ]
     else rhs_statements
   in
-  List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest
+  (List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest, value)
 
 (** Ghost annotations share the checked lemma expression language. *)
 let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
@@ -938,7 +952,8 @@ let nested_stateful_read access_proofs e =
       Ok (Option.some_if (outer && inner) argument)
   | _ -> Ok None
 
-(** A checked wrapper invokes the original operation once. *)
+(** A checked wrapper invokes the original operation once: its statements, and the value
+    of the operation, which [run] gives. *)
 let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
     =
   let open State.Syntax in
@@ -1085,11 +1100,11 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
                      (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal))
                 ~result_name:id.pid_str ~result_visible:true rest
             in
-            statements @ rest
+            (statements @ rest, result)
         end
     | Proof_let (pattern, rhs, rest) ->
         let* () = reject_operation visible rhs in
-        proof_binding ~ghost_rhs:true env pattern rhs (fun env ->
+        proof_binding_with ~ghost_rhs:true env pattern rhs (fun env ->
             before env
               (visible
               && not (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal)
@@ -1098,8 +1113,8 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
     | Proof_seq (first, rest) ->
         let* () = reject_operation visible first in
         let* first = ghost_statements env first in
-        let+ rest = before env visible rest in
-        first @ rest
+        let+ rest, result = before env visible rest in
+        (first @ rest, result)
     | _ ->
         State.of_result
           (error body.proof_loc
@@ -1141,15 +1156,3 @@ let return_proof ctx annotation ~result_type ~result =
     in
     let+ statements = proof_expression env targets adapter.returns_body in
     [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
-
-(** The operations above that the modules not yet working in the explicit state use, run
-    on the state that the context holds. *)
-module On_context = struct
-  let scope_env ctx = env_of_scope ctx (latest ctx.procedure.names.scope)
-  let ghost ctx ~after ~before = State.run ctx (ghost ctx ~after ~before)
-
-  let proof_binding ?ghost_rhs env pattern rhs continuation =
-    State.run env.ctx
-      (proof_binding ?ghost_rhs env pattern rhs (fun env ->
-           State.imperative env.ctx (fun () -> continuation env)))
-end

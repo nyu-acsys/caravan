@@ -3,8 +3,8 @@
 
 open Base
 open Translate_context
-open Spec_terms.On_context
-open Proof_terms.On_context
+open Spec_terms
+open Proof_terms
 open Atomic_proofs
 open Procedures
 
@@ -835,17 +835,18 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
 
 (** The views that bind the implicit parameters of the function [f] in its atomic
     precondition, as [queue q xs]: the parameter, the view and its ghost field. *)
-let view_bindings ctx (f : func) =
+let view_bindings env (f : func) =
   let atomic_requires =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_requires)
   in
   List.filter_map (List.concat_map atomic_requires ~f:conjuncts) ~f:(fun t ->
       match spine t [] with
       | { term_desc = Tvar q; _ }, args ->
-          let key = logical_key (scope_env ctx) q in
+          let key = logical_key env q in
           let v = key in
           begin match
-            (List.Assoc.find ctx.given.shared.views v ~equal:String.equal, List.last args)
+            ( List.Assoc.find env.ctx.given.shared.views v ~equal:String.equal,
+              List.last args )
           with
           | Some field, Some { term_desc = Tvar (Qid { pid_str = x; _ }); _ } ->
               Some (x, v, field)
@@ -854,15 +855,13 @@ let view_bindings ctx (f : func) =
       | _ -> None)
 
 (** [t] without the applications of predicates in its conjunctions. *)
-let rec without_predicates ctx (t : S.term) : S.term =
+let rec without_predicates env (t : S.term) : S.term =
   match spine (S.chain t) [] with
   | ({ term_desc = Tvar (Qid { pid_str = "&&" | "/\\"; _ }); _ } as op), [ a; b ] ->
-      let a = without_predicates ctx a and b = without_predicates ctx b in
+      let a = without_predicates env a and b = without_predicates env b in
       S.mk_term (Tapply (S.mk_term (Tapply (op, a)) t.term_loc, b)) t.term_loc
   | { term_desc = Tvar q; _ }, _
-    when List.Assoc.mem ctx.given.preds
-           (logical_key (scope_env ctx) q)
-           ~equal:String.equal
+    when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
          || String.equal (qualid_key q) "own" ->
       S.mk_term Ttrue t.term_loc
   | _ -> t
@@ -880,25 +879,29 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let field e f = R.Expr.field ~loc:l e (qualified_name ~loc:l (pending_name st p f)) in
   let half e f v = R.Expr.own ~loc:l [ field e f; v; R.Expr.real ~loc:l 0.5 ] in
   let decl ?(ghost = false) x t = R.Var.make ~loc:l ~ghost (ident ~loc:l x) t in
-  let* key_typ = typ ctx ~at p.key_type in
+  let open State.Syntax in
+  let* key_typ = State.of_result (typ ctx ~at p.key_type) in
   let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
   let bool_typ = R.Type.bool ~loc:l and ref_typ = R.Type.ref ~loc:l in
   let* params =
-    all st.params ~f:(fun (x, t) ->
-        let* typ = typ ctx ~at t in
-        Ok (x, t, decl x typ))
+    State.all st.params ~f:(fun (x, t) ->
+        let+ typ = State.of_result (typ ctx ~at t) in
+        (x, t, decl x typ))
   in
   let args = List.map params ~f:(fun (x, _, _) -> var x) in
   let* () =
-    if List.length helped.params = List.length params then Ok ()
+    if List.length helped.params = List.length params then State.return ()
     else
-      unsupported helped.loc
-        "Helping a function whose parameters are not those of the structure's invariant"
+      State.of_result
+        (unsupported helped.loc
+           "Helping a function whose parameters are not those of the structure's \
+            invariant")
   in
   let* result_name, arg_names =
-    contract_names helped
-      (Option.bind helped.contract ~f:(fun c -> c.header))
-      (List.length helped.params)
+    State.of_result
+      (contract_names helped
+         (Option.bind helped.contract ~f:(fun c -> c.header))
+         (List.length helped.params))
   in
   let env =
     {
@@ -954,22 +957,26 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   in
   (* The values of the structure's views, which the helped function's implicit
      parameters are bound to by its atomic precondition. *)
-  let bindings = view_bindings ctx helped in
+  let* scope_env = scope_env ctx in
+  let bindings = view_bindings scope_env helped in
   let* () =
-    if List.length bindings <= 1 then Ok ()
-    else unsupported helped.loc "Helping a function with several implicit parameters"
+    if List.length bindings <= 1 then State.return ()
+    else
+      State.of_result
+        (unsupported helped.loc "Helping a function with several implicit parameters")
   in
   let* view_values =
-    all st.views ~f:(fun ((v : S.predicate), _) ->
+    State.all st.views ~f:(fun ((v : S.predicate), _) ->
         let v = v.pred_name.pid_str in
         let* t =
           match List.Assoc.find ctx.given.preds v ~equal:String.equal with
-          | Some (_, types) when not (List.is_empty types) -> Ok (List.last_exn types)
-          | _ -> error at (Printf.sprintf "The view %s has no value" v)
+          | Some (_, types) when not (List.is_empty types) ->
+              State.return (List.last_exn types)
+          | _ -> State.of_result (error at (Printf.sprintf "The view %s has no value" v))
         in
-        let* typ = typ ctx ~at t in
+        let+ typ = State.of_result (typ ctx ~at t) in
         let view_field = view_field_in ctx.given.shared v in
-        Ok ("view_" ^ v, v, view_field, t, typ))
+        ("view_" ^ v, v, view_field, t, typ))
   in
   let anchored e =
     match anchor ctx.given.types st.structure_type with
@@ -1010,10 +1017,10 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       var_types = (result_name, helped.body.exp_type) :: post_env.var_types;
     }
   in
-  let* posts =
-    all
+  let+ posts =
+    State.all
       (Option.value_map helped.contract ~default:[] ~f:(fun c -> c.atomic_ensures))
-      ~f:(fun t -> formula post_env (without_predicates ctx t))
+      ~f:(fun t -> formula post_env (without_predicates scope_env t))
   in
   let c = var "c" and regs = var "regs" and on = var "on" and ls = var "ls" in
   let each body =
@@ -1121,7 +1128,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
           ])
       ~decreases:[ regs ] (generated_ident ~loc:l help) (Some body)
   in
-  Ok (ghost_fields @ [ R.Member.callable registration_pred; R.Member.callable help_lemma ])
+  ghost_fields @ [ R.Member.callable registration_pred; R.Member.callable help_lemma ]
 
 (** The parameters of [p], with the OCaml types [param_types], and the environment of the
     predicate's body. *)
@@ -1230,10 +1237,8 @@ type prepared_callable = {
 let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
     (contract : S.contract option) =
   let l = loc at in
-  ctx.procedure.names.used <- Set.add ctx.procedure.names.used "r";
-  let* result_typ = typ ctx ~at result in
   let header = Option.bind contract ~f:(fun c -> c.header) in
-  let* result_name, names =
+  let header_names =
     match header with
     | None -> Ok ("result", List.map args ~f:(fun _ -> None))
     | Some h ->
@@ -1256,11 +1261,18 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
             (Printf.sprintf "This contract names %d arguments, but this function has %d"
                (List.length names) (List.length args))
   in
+  let open State.Syntax in
+  let* () =
+    State.modify (fun (s : State.state) ->
+        { s with names = { s.names with used = Set.add s.names.used "r" } })
+  in
+  let* result_typ = State.of_result (typ ctx ~at result) in
+  let* result_name, names = State.of_result header_names in
   let* params =
-    all (List.zip_exn names args) ~f:(fun (n, t) ->
-        let raven = Names.fresh ctx.procedure.names (Option.value n ~default:"x") in
-        let* typ = typ ctx ~at t in
-        Ok (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
+    State.all (List.zip_exn names args) ~f:(fun (n, t) ->
+        let* raven = State.fresh (Option.value n ~default:"x") in
+        let+ typ = State.of_result (typ ctx ~at t) in
+        (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
   let returns =
     if is_unit result then [] else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
@@ -1287,7 +1299,7 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   let atomic_requires =
     Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_requires)
   in
-  let* implicit = State.run env.ctx (free_typed env (requires @ atomic_requires) ~at) in
+  let* implicit = free_typed env (requires @ atomic_requires) ~at in
   let roles =
     List.map implicit ~f:(fun (x, _, _, _, _) ->
         ( List.exists requires ~f:(fun term ->
@@ -1300,6 +1312,8 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
         { (bind env n (Raven raven)) with var_types = (n, t) :: env.var_types })
   in
   let* () =
+    State.of_result
+    @@
     if not validate then Ok ()
     else
       let predicates q =
@@ -1315,38 +1329,36 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
         ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
   let clauses ?atomic terms =
-    all terms ~f:(fun t -> Result.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
+    State.all terms ~f:(fun t ->
+        State.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
   in
   let* requires = clauses requires in
   let* atomic_requires = clauses ~atomic:true atomic_requires in
   let* ensures =
-    State.run env.ctx
-      (contract_postconditions env ~at
-         (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures)))
+    contract_postconditions env ~at
+      (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
   in
-  let* atomic_ensures =
-    State.run env.ctx
-      (contract_postconditions env ~at ~atomic:true
-         (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures)))
+  let+ atomic_ensures =
+    contract_postconditions env ~at ~atomic:true
+      (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
   in
   let in_range =
     List.filter_map params ~f:(fun (_, raven, typ, _) -> range_spec ~loc:l typ raven)
   in
   let result_in_range = Option.to_list (range_spec ~loc:l result "r") in
-  Ok
-    {
-      prepared_formals =
-        List.map params ~f:(fun (_, _, _, v) -> v)
-        @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
-            R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ);
-      prepared_args =
-        List.map params ~f:(fun (_, raven, _, _) -> R.Expr.var ~loc:l (name ~loc:l raven));
-      prepared_implicit = implicit;
-      prepared_roles = roles;
-      prepared_returns = returns;
-      prepared_requires = in_range @ requires @ atomic_requires;
-      prepared_ensures = result_in_range @ ensures @ atomic_ensures;
-    }
+  {
+    prepared_formals =
+      List.map params ~f:(fun (_, _, _, v) -> v)
+      @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
+          R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ);
+    prepared_args =
+      List.map params ~f:(fun (_, raven, _, _) -> R.Expr.var ~loc:l (name ~loc:l raven));
+    prepared_implicit = implicit;
+    prepared_roles = roles;
+    prepared_returns = returns;
+    prepared_requires = in_range @ requires @ atomic_requires;
+    prepared_ensures = result_in_range @ ensures @ atomic_ensures;
+  }
 
 let prepared_member ~at ~name body prepared =
   R.Callable.proc ~loc:(loc at) ~formals:prepared.prepared_formals
@@ -1356,14 +1368,15 @@ let prepared_member ~at ~name body prepared =
     body
 
 (** A checked call with direct argument and result forwarding. *)
-let forwarding_body ctx ~at ~self ~target ~result ~atomic prepared =
+let forwarding_body ~at ~self ~target ~result ~atomic prepared =
+  let open State.Syntax in
   let l = loc at in
   let var x = R.Expr.var ~loc:l (name ~loc:l x) in
-  let opened =
-    if not atomic then []
+  let* opened =
+    if not atomic then State.return []
     else
-      List.map prepared.prepared_implicit ~f:(fun (_, _, _, typ, _) ->
-          let x = Names.fresh ctx.procedure.names "opened" in
+      State.all prepared.prepared_implicit ~f:(fun (_, _, _, typ, _) ->
+          let+ x = State.fresh "opened" in
           (R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x), var x))
   in
   let implicit_args =
@@ -1379,9 +1392,9 @@ let forwarding_body ctx ~at ~self ~target ~result ~atomic prepared =
     if is_unit result then R.Stmt.call ~loc:l call
     else R.Stmt.assign ~loc:l [ var "r" ] (R.Stmt.expr_rhs call)
   in
-  if not atomic then [ call_statement ]
+  if not atomic then State.return [ call_statement ]
   else
-    let token = Names.fresh ctx.procedure.names "token" in
+    let+ token = State.fresh "token" in
     let bind =
       R.Stmt.local ~loc:l ~ghost:true
         ~typ:(R.Type.atomic_token ~loc:l (qualified_name ~loc:l self))
@@ -1420,13 +1433,16 @@ let contains_atomic_token types typ =
 let library_function ctx ~(at : Location.t) ~name ~args ~result contract =
   match (args, contract) with
   | [], None ->
-      let* result = typ ctx ~at result in
-      Ok
-        (R.Callable.func ~loc:(loc at)
-           ~returns:[ R.Var.make ~loc:(loc at) (ident ~loc:(loc at) "r") result ]
-           (ident ~loc:(loc at) name)
-           None)
-  | [], Some _ -> unsupported at "A contract of a library's value other than a function"
+      State.of_result
+        (Result.map (typ ctx ~at result) ~f:(fun result ->
+             R.Callable.func ~loc:(loc at)
+               ~returns:[ R.Var.make ~loc:(loc at) (ident ~loc:(loc at) "r") result ]
+               (ident ~loc:(loc at) name)
+               None))
+  | [], Some _ ->
+      State.of_result
+        (unsupported at "A contract of a library's value other than a function")
   | _ ->
-      let* prepared = prepare_callable ctx ~at ~args ~result contract in
-      Ok (prepared_member ~at ~name None prepared)
+      State.map
+        (prepare_callable ctx ~at ~args ~result contract)
+        ~f:(prepared_member ~at ~name None)

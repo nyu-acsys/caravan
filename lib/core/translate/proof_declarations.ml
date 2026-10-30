@@ -155,13 +155,12 @@ let action_checks ctx (st : structure) =
             ])
 
 (** The context translating the specifications of declarations, outside functions. *)
-let spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ?(proof_support = empty_proof_support) origins =
+let spec_context types ~shared ~ocaml_env ~preds ~spec_funcs
+    ?(proof_support = empty_proof_support) () =
   {
     given =
       declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support ();
-    procedure = initial_procedure ();
-    collected = { refs; primitives; origins };
+    au = None;
   }
 
 (** Recursive proof calls need checked well-founded descent, including mutual calls. *)
@@ -215,8 +214,8 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
       | _ -> Ok ()))
 
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
-let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ~proof_lemmas ~proof_support ~predicate_bodies ?member_name origins declaration =
+let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof_support
+    ~predicate_bodies ?member_name declaration =
   match declaration with
   | S.Proof_lemma
       {
@@ -229,16 +228,13 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         lemma_body;
       } ->
       let ctx =
-        let base =
-          spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-            origins
-        in
+        let base = spec_context types ~shared ~ocaml_env ~preds ~spec_funcs () in
         {
           base with
           given = { base.given with proof_lemmas; proof_support; predicate_bodies };
         }
       in
-      State.run ctx
+      State.in_procedure
       @@
       let open State.Syntax in
       let l = loc lemma_name.pid_loc in
@@ -314,18 +310,15 @@ let proof_lemma types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
         ~requires ~ensures ~decreases
         (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
         (Some body)
-  | _ -> error Location.none "Expected a lemma declaration"
+  | _ -> State.of_result (error Location.none "Expected a lemma declaration")
 
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]. Each stateful invariant holds half of its views. *)
-let predicate types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
-    ?declaration_name origins ~at ~structures (p : S.predicate) (def : definition)
-    param_types : (R.Callable.t, error) Result.t =
-  let ctx =
-    spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-      ~proof_support origins
-  in
-  State.run ctx
+let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declaration_name
+    ~at ~structures (p : S.predicate) (def : definition) param_types :
+    R.Callable.t State.t =
+  let ctx = spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support () in
+  State.in_procedure
   @@
   let open State.Syntax in
   let l = loc at in
@@ -833,16 +826,15 @@ let pure_logical_body env (t : S.term) =
          else Ok ()))
 
 (** Nonrecursive logical definitions are checked with the rest of the proof. *)
-let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-    ~proof_support ?member_name ~as_value origins declaration =
+let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?member_name
+    ~as_value declaration =
   match declaration with
   | S.Proof_function { function_name; function_params; function_result; function_body } ->
       let l = loc function_name.pid_loc in
       let ctx =
-        spec_context types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
-          ~proof_support origins
+        spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ()
       in
-      State.run ctx
+      State.in_procedure
       @@
       let open State.Syntax in
       let* params =
@@ -888,17 +880,17 @@ let proof_function types ~refs ~primitives ~shared ~ocaml_env ~preds ~spec_funcs
              ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
              ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
              member (Some body))
-  | _ -> error Location.none "Expected a logical function declaration"
+  | _ -> State.of_result (error Location.none "Expected a logical function declaration")
 
-let scoped_contract_context types ~refs ~primitives ~shared ~environment ~proof_support
-    ~preds ~spec_funcs ~own_preds ~own_inputs origins =
+let scoped_contract_context types ~shared ~environment ~proof_support ~preds ~spec_funcs
+    ~own_preds ~own_inputs () =
   let proof_support =
     { proof_support with predicate_inputs = own_inputs @ proof_support.predicate_inputs }
   in
-  spec_context types ~refs ~primitives ~shared ~ocaml_env:environment ~proof_support
+  spec_context types ~shared ~ocaml_env:environment ~proof_support
     ~preds:(own_preds @ preds)
     ~spec_funcs:(List.map own_preds ~f:(fun (p, (raven, _)) -> (p, raven)) @ spec_funcs)
-    origins
+    ()
 
 let check_adapter_shape ~at (contract : S.contract option) =
   match contract with
