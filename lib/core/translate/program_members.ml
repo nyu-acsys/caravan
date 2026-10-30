@@ -286,7 +286,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                  (p.pred_name.pid_str, List.length ts - count))))
     in
     let* environment =
-      Source.realize_signature_ghost_environment source
+      Proof_types.realize_signature_ghost_environment source
         ~substitution:view.view_binding.parameter_substitution
         (List.map view.view_binding.expected.signature_ghost_modules
            ~f:(fun (_, formal) -> formal.Module_inventory.ghost_declaration))

@@ -445,7 +445,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | [] -> (signature.sig_final_env, None)
           in
           let* environment =
-            Source.signature_ghost_environment source ghost_declarations raw_environment
+            Proof_types.signature_ghost_environment source ghost_declarations
+              raw_environment
           in
           let site =
             {
@@ -582,7 +583,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           Poly.equal (Annotation.kind annotation) Ghost_module)
       |> List.fold_result ~init:[] ~f:(fun declarations annotation ->
           let* declaration = Annotation.ghost_module annotation in
-          let* ghost_resource = Source.signature_resource source declaration in
+          let* ghost_resource = Proof_types.signature_resource source declaration in
           let name = declaration.ghost_module_name.pid_str in
           let at = Caravan_spec.Spec_ast.qualid_loc declaration.ghost_module_interface in
           let* signatures = Proof_library.signatures at in
@@ -645,7 +646,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     let* signature_resources =
       List.map signature_resources ~f:(fun (name, resource) ->
           let* environment =
-            Source.signature_ghost_environment source ghost_declarations
+            Proof_types.signature_ghost_environment source ghost_declarations
               resource.site.environment
           in
           Ok (name, { resource with site = { resource.site with environment } }))
@@ -654,7 +655,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     let* signature_ghost_modules =
       List.map signature_ghost_modules ~f:(fun (name, ghost) ->
           let* environment =
-            Source.signature_ghost_environment source ghost_declarations
+            Proof_types.signature_ghost_environment source ghost_declarations
               ghost.site.environment
           in
           Ok (name, { ghost with site = { ghost.site with environment } }))
@@ -821,7 +822,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       ghost.ghost_declaration)
                 in
                 let* environment =
-                  Source.realize_signature_ghost_environment source ~substitution
+                  Proof_types.realize_signature_ghost_environment source ~substitution
                     declarations signature_value.site.environment
                 in
                 let signature_value =
