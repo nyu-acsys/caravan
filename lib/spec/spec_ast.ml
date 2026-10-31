@@ -126,6 +126,7 @@ type predicate = {
   pred_body : term option;  (** [None] for a declaration in an interface. *)
   pred_persistent : bool;
       (** An invariant declaration, duplicable and distinct from ordinary predicates. *)
+  pred_inline : bool;  (** [[@inline]]: its uses are its body, never folded. *)
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
 

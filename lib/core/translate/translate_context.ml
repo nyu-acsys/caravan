@@ -721,6 +721,7 @@ let implicit_parameters (predicate : S.predicate) =
 
 type predicate_body = {
   definition : S.term;
+  inline : bool;  (** Never folded or unfolded. *)
   environment : Env.t;
   project_type : Types.type_expr -> Types.type_expr;
 }

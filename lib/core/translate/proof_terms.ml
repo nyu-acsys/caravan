@@ -281,6 +281,14 @@ and predicate_application env ~unfold t witnesses make =
           State.of_result
             (error head.term_loc
                "The definition of this predicate is hidden by its module signature")
+        else if
+          Option.exists
+            (List.Assoc.find env.ctx.given.predicate_bodies key ~equal:String.equal)
+            ~f:(fun body -> body.inline)
+        then
+          State.of_result
+            (error head.term_loc
+               "An inline predicate stands for its body and is never folded or unfolded")
         else State.return ()
       in
       let raven, types =

@@ -1,0 +1,8 @@
+type count = { n : int; c : integer }
+
+predicate [@inline] bounded (s : count) = s.n <= s.c
+
+lemma unfolded (s : count)
+  requires (bounded s)
+  ensures (s.n <= s.c) =
+  unfold bounded s

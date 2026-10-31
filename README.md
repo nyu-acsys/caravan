@@ -203,6 +203,9 @@ require explicit values for them.
 Exactly the parameters marked `[@implicit]` are implicit, and only ordinary
 predicates can have them. Declarations and definitions must agree on them.
 
+`predicate [@inline] p (x : t) = body` defines a predicate whose uses stand for
+its body. It is never folded or unfolded.
+
 An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
 program code. In a proof body, `unfold p x {n}` names an existential to bind
 with `let value = ... in`, and `fold p x {n = value}` supplies its

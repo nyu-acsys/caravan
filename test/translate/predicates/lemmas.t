@@ -105,6 +105,18 @@ record binds that record, which a fold takes as its last argument.
   There is no field d within type count.
   [1]
 
+An inline predicate stands for its body, so it is never folded or unfolded.
+
+  $ caravan --shh inline_predicates.ml
+  Verification successful.
+
+  $ caravan --shh inline_predicates_fold.ml
+  [Error] File "inline_predicates_fold.proof", line 8, columns 9-16:
+  8 |   unfold bounded s
+               ^^^^^^^
+  Type Error: An inline predicate stands for its body and is never folded or unfolded.
+  [1]
+
 An assertion in a proof body is checked.
 
   $ caravan --shh lemmas_false.ml

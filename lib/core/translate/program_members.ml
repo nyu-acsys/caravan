@@ -1031,17 +1031,23 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           when Option.is_none (scoped_binding p.pred_name.pid_str) ->
             Some
               ( p.S.pred_name.pid_str,
-                { definition = body; environment = ocaml_env; project_type = Fn.id } )
+                {
+                  definition = body;
+                  inline = p.pred_inline;
+                  environment = ocaml_env;
+                  project_type = Fn.id;
+                } )
         | Body _ | Direct_invariant _ -> None
         | Invariant _ | View _ -> None)
     @ List.filter_map scoped_proofs.bindings ~f:(fun binding ->
         match binding.kind with
-        | Predicate (_, Plain body)
+        | Predicate (predicate, Plain body)
           when binding.exported && not (Proof_bindings.opaque scoped_proofs binding) ->
             Some
               ( binding.public_key,
                 {
                   definition = body;
+                  inline = predicate.pred_inline;
                   environment = binding.environment;
                   project_type = Proof_bindings.public_type scoped_proofs;
                 } )
@@ -1057,13 +1063,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     let predicate_bodies =
       List.filter_map scoped_proofs.bindings ~f:(fun binding ->
           match binding.kind with
-          | Predicate (_, Plain body)
+          | Predicate (predicate, Plain body)
             when Proof_bindings.visible scoped_proofs ~scope binding
                  && not (Proof_bindings.opaque_at scoped_proofs ~scope binding) ->
               Some
                 ( binding.public_key,
                   {
                     definition = body;
+                    inline = predicate.pred_inline;
                     environment = binding.environment;
                     project_type = Proof_bindings.public_type scoped_proofs;
                   } )
@@ -1077,7 +1084,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     let predicate_bodies =
       List.filter_map scoped_proofs.applications ~f:(fun view ->
           match view.source.kind with
-          | Predicate (_, Plain body)
+          | Predicate (predicate, Plain body)
             when Proof_bindings.application_visible ~owners scoped_proofs ~scope view
                  && not
                       (Proof_bindings.application_opaque ~owners scoped_proofs ~scope view)
@@ -1086,6 +1093,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 ( view.key,
                   {
                     definition = body;
+                    inline = predicate.pred_inline;
                     environment = view.source.environment;
                     project_type = (fun ty -> project (view.project_type ty));
                   } )
@@ -1095,11 +1103,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     List.filter_map (Proof_bindings.private_bindings scoped_proofs ~scope)
       ~f:(fun binding ->
         match binding.kind with
-        | Predicate (_, Plain body) ->
+        | Predicate (predicate, Plain body) ->
             Some
               ( binding.backend,
                 {
                   definition = body;
+                  inline = predicate.pred_inline;
                   environment = binding.environment;
                   project_type = Fn.id;
                 } )

@@ -248,13 +248,22 @@ predicate:
 invariant_declaration:
 | INVARIANT n = lident ps = pred_param+ EOF
     { { pred_name = n; pred_params = ps; pred_body = None;
-        pred_persistent = true } }
+        pred_persistent = true; pred_inline = false } }
 ;
 
 predicate_decl:
-| PREDICATE n = lident ps = predicate_param+ t = preceded(EQUAL, term)?
-    { { pred_name = n; pred_params = ps; pred_body = t;
-        pred_persistent = false } }
+| PREDICATE a = ATTRIBUTE? n = lident ps = predicate_param+ t = preceded(EQUAL, term)?
+    { let inline =
+        match a with
+        | None -> false
+        | Some "inline" when t <> None -> true
+        | Some "inline" ->
+            raise (Syntax_error (n.pid_loc, "An inline predicate needs a body"))
+        | Some _ ->
+            raise (Syntax_error (mk_loc $loc(a), "A predicate's attribute is [@inline]"))
+      in
+      { pred_name = n; pred_params = ps; pred_body = t;
+        pred_persistent = false; pred_inline = inline } }
 ;
 
 (* The declarations of a proof file. *)

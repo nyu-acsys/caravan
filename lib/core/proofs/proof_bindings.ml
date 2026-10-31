@@ -481,6 +481,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
           pred_params = params;
           pred_body = None;
           pred_persistent = true;
+          pred_inline = false;
         }
       in
       Ok (Predicate (predicate, definition), predicate.pred_params)
@@ -507,6 +508,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
                 pred_params = view_params @ [ value ];
                 pred_body = None;
                 pred_persistent = false;
+                pred_inline = false;
               }
             in
             Ok (Predicate (predicate, View view_value), predicate.pred_params)

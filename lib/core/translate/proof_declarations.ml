@@ -333,8 +333,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars explicit) ~returns:(vars implicit)
-        name (Some body)
+      R.Callable.func ~loc:l ~kind:Pred ~inline:p.pred_inline ~formals:(vars explicit)
+        ~returns:(vars implicit) name (Some body)
   | View _ ->
       (* Half of the view's ghost field, on the structure, its first parameter. *)
       let inputs, value = List.split_n params (List.length params - 1) in
@@ -687,6 +687,7 @@ let predicates (source : Source.t) =
                    pred_params = params;
                    pred_body = None;
                    pred_persistent = true;
+                   pred_inline = false;
                  },
                  Some definition ))
       | Proof_view { view_name; view_params; view_value } ->
@@ -701,6 +702,7 @@ let predicates (source : Source.t) =
                        pred_params = view_params @ [ value ];
                        pred_body = None;
                        pred_persistent = false;
+                       pred_inline = false;
                      },
                      Some (View { value = view_value }) ))
           | Some (at, _) ->
