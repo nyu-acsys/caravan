@@ -15,33 +15,9 @@ let swing_tail q =
       observe_fact q s (Published old_tail);
       segment_info s.root s.head;
       segment_info s.head s.last;
-      let exposure =
-        if old_tail == s.last then At_last
-        else if Finset.mem old_tail s.retired_fp then
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_tail in
-          Retired_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-        else
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split s.head s.last s.values s.active_fp s.active_links old_tail in
-          Active_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-      in
+      let exposure = expose s old_tail in
       let result = step () in
-      begin match exposure with
-      | At_last -> ()
-      | Retired_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore s.root old_tail next s.head before after
-            before_fp after_fp before_links after_links value
-      | Active_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore s.head old_tail next s.last before after
-            before_fp after_fp before_links after_links value
-      end;
+      restore s old_tail exposure;
       begin match result with
       | Nil -> ()
       | Next (value, next) ->

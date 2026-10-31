@@ -67,74 +67,72 @@ lemma segment_append (first : node Atomic.t) (limit : node Atomic.t)
   segment_join first limit successor items [value] cells (Finset.singleton limit)
     edges (Finset.singleton (Edge (limit, value, successor)))
 
+(* A segment split at [target]: the parts before and after it. *)
+type piece = {
+  before : int list; before_cells : node Atomic.t finset; before_edges : edge finset;
+  value : int; next : node Atomic.t;
+  after : int list; after_cells : node Atomic.t finset; after_edges : edge finset;
+}
+
+(* The segment from a cell to [limit] with [items], [cells] and [edges] is [p] around
+   [target]. *)
+let splits (p : piece) (target : node Atomic.t) (limit : node Atomic.t)
+    (items : int list) (cells : node Atomic.t finset) (edges : edge finset) : bool =
+  items = p.before @ (p.value :: p.after)
+  && cells = Finset.union p.before_cells
+       (Finset.union (Finset.singleton target) p.after_cells)
+  && edges = Finset.union p.before_edges
+       (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
+  && Finset.inter p.before_cells p.after_cells = Finset.empty
+  && not (Finset.mem target p.before_cells) && not (Finset.mem target p.after_cells)
+  && target != limit && not (Finset.mem limit p.before_cells)
+
 lemma segment_split (first : node Atomic.t) (limit : node Atomic.t)
     (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
     (target : node Atomic.t)
-  returns (before : int list) (before_cells : node Atomic.t finset)
-    (before_edges : edge finset) (value : int) (next : node Atomic.t)
-    (after : int list) (after_cells : node Atomic.t finset) (after_edges : edge finset)
+  returns (p : piece)
   requires (segment first limit items cells edges && Finset.mem target cells)
-  ensures (segment first target before before_cells before_edges
-    && own target (Next (value, next)) && segment next limit after after_cells after_edges)
-  ensures (items = before @ (value :: after))
-  ensures (cells = Finset.union before_cells (Finset.union (Finset.singleton target) after_cells))
-  ensures (edges = Finset.union before_edges
-    (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges))
-  ensures (Finset.inter before_cells after_cells = Finset.empty)
-  ensures (not (Finset.mem target before_cells) && not (Finset.mem target after_cells))
-  ensures (target != limit && not (Finset.mem limit before_cells))
+  ensures (segment first target p.before p.before_cells p.before_edges
+    && own target (Next (p.value, p.next))
+    && segment p.next limit p.after p.after_cells p.after_edges)
+  ensures (splits p target limit items cells edges)
   variant (items) =
-  let (successor, tail_cells, tail_edges) =
-    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  let w = unfold segment first limit items cells edges in
   match items with
   | [] -> assert false
   | head :: tail ->
       if first == target then begin
         fold segment first target [] Finset.empty Finset.empty;
-        ([], Finset.empty, Finset.empty, head, successor, tail, tail_cells, tail_edges)
+        { before = []; before_cells = Finset.empty; before_edges = Finset.empty;
+          value = head; next = w.next;
+          after = tail; after_cells = w.tail_cells; after_edges = w.tail_edges }
       end else begin
-        let (prefix, prefix_cells, prefix_edges, value, next, after, after_cells, after_edges) =
-          segment_split successor limit tail tail_cells tail_edges target in
-        fold segment first target (head :: prefix)
-          (Finset.union (Finset.singleton first) prefix_cells)
-          (Finset.union (Finset.singleton (Edge (first, head, successor))) prefix_edges)
-          {next = successor; tail_cells = prefix_cells; tail_edges = prefix_edges};
-        (head :: prefix, Finset.union (Finset.singleton first) prefix_cells,
-          Finset.union (Finset.singleton (Edge (first, head, successor))) prefix_edges,
-          value, next, after, after_cells, after_edges)
+        let p = segment_split w.next limit tail w.tail_cells w.tail_edges target in
+        let before_cells = Finset.union (Finset.singleton first) p.before_cells in
+        let before_edges =
+          Finset.union (Finset.singleton (Edge (first, head, w.next))) p.before_edges in
+        fold segment first target (head :: p.before) before_cells before_edges
+          {next = w.next; tail_cells = p.before_cells; tail_edges = p.before_edges};
+        { p with before = head :: p.before; before_cells = before_cells;
+          before_edges = before_edges }
       end
 
 lemma segment_restore (first : node Atomic.t) (target : node Atomic.t)
-    (next : node Atomic.t) (limit : node Atomic.t) (before : int list) (after : int list)
-    (before_cells : node Atomic.t finset) (after_cells : node Atomic.t finset)
-    (before_edges : edge finset) (after_edges : edge finset) (value : int)
-  requires (segment first target before before_cells before_edges
-    && own target (Next (value, next)) && segment next limit after after_cells after_edges)
-  requires (Finset.inter before_cells after_cells = Finset.empty
-    && not (Finset.mem target before_cells) && not (Finset.mem target after_cells)
-    && not (Finset.mem limit before_cells) && target != limit)
-  ensures (segment first limit (before @ (value :: after))
-    (Finset.union before_cells (Finset.union (Finset.singleton target) after_cells))
-    (Finset.union before_edges
-      (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges))) =
-  segment_info next limit;
-  fold segment target limit (value :: after)
-    (Finset.union (Finset.singleton target) after_cells)
-    (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges)
-    {next = next; tail_cells = after_cells; tail_edges = after_edges};
-  segment_join first target limit before (value :: after) before_cells
-    (Finset.union (Finset.singleton target) after_cells) before_edges
-    (Finset.union (Finset.singleton (Edge (target, value, next))) after_edges)
-
-lemma segment_round_trip (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
-    (target : node Atomic.t)
-  requires (segment first limit items cells edges && Finset.mem target cells)
+    (limit : node Atomic.t) (items : int list) (cells : node Atomic.t finset)
+    (edges : edge finset) (p : piece)
+  requires (segment first target p.before p.before_cells p.before_edges
+    && own target (Next (p.value, p.next))
+    && segment p.next limit p.after p.after_cells p.after_edges)
+  requires (splits p target limit items cells edges)
   ensures (segment first limit items cells edges) =
-  let (before, before_cells, before_edges, value, next, after, after_cells, after_edges) =
-    segment_split first limit items cells edges target in
-  segment_restore first target next limit before after before_cells after_cells
-    before_edges after_edges value
+  segment_info p.next limit;
+  fold segment target limit (p.value :: p.after)
+    (Finset.union (Finset.singleton target) p.after_cells)
+    (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
+    {next = p.next; tail_cells = p.after_cells; tail_edges = p.after_edges};
+  segment_join first target limit p.before (p.value :: p.after) p.before_cells
+    (Finset.union (Finset.singleton target) p.after_cells) p.before_edges
+    (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
 
 lemma segment_edge_endpoints (first : node Atomic.t) (limit : node Atomic.t)
     (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
@@ -172,23 +170,6 @@ lemma segment_edges_functional (first : node Atomic.t) (limit : node Atomic.t)
       fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
         tail_edges = tail_edges}
 
-lemma segment_terminal_outside (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells : node Atomic.t finset) (edges : edge finset)
-    (terminal : node Atomic.t)
-  requires (segment first limit items cells edges && own terminal Nil)
-  ensures (segment first limit items cells edges && own terminal Nil)
-  ensures (not (Finset.mem terminal cells))
-  variant (items) =
-  let (next, tail_cells, tail_edges) =
-    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
-  match items with
-  | [] -> fold segment first limit items cells edges
-  | _ :: tail ->
-      assert (first != terminal);
-      segment_terminal_outside next limit tail tail_cells tail_edges terminal;
-      fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
-        tail_edges = tail_edges}
-
 lemma consecutive_segment_edges (first : node Atomic.t) (middle : node Atomic.t)
     (limit : node Atomic.t) (left : int list) (right : int list)
     (left_cells : node Atomic.t finset) (right_cells : node Atomic.t finset)
@@ -213,19 +194,8 @@ lemma consecutive_segment_edges (first : node Atomic.t) (middle : node Atomic.t)
   segment_edges_functional first middle left left_cells left_edges;
   segment_edges_functional middle limit right right_cells right_edges
 
-lemma list_append_assoc (a : int list) (b : int list) (c : int list)
-  ensures ((a @ b) @ c = a @ (b @ c))
-  variant (a) =
-  match a with
-  | [] -> ()
-  | _ :: tail -> list_append_assoc tail b c
-
-type exposed_cell =
-  | At_last
-  | Retired_cell of int list * node Atomic.t finset * edge finset
-      * int * node Atomic.t * int list * node Atomic.t finset * edge finset
-  | Active_cell of int list * node Atomic.t finset * edge finset
-      * int * node Atomic.t * int list * node Atomic.t finset * edge finset
+(* Where a cell of the segments lies: the last cell, or a piece of a segment. *)
+type exposure = At_last | Retired of piece | Active of piece
 
 type empty_observation =
   | Observed_link of edge
@@ -303,6 +273,14 @@ let footprint (s : state) : node Atomic.t finset =
 let links (s : state) : edge finset = Finset.union s.retired_links s.active_links
 let seen (s : state) : node Atomic.t finset = Finset.union s.retired_fp (Finset.singleton s.head)
 
+let separated (s : state) : bool =
+  Finset.inter s.retired_fp s.active_fp = Finset.empty
+  && not (Finset.mem s.last s.retired_fp) && not (Finset.mem s.last s.active_fp)
+
+predicate [@inline] segments (s : state) =
+  segment s.root s.head s.retired_values s.retired_fp s.retired_links
+  && segment s.head s.last s.values s.active_fp s.active_links
+
 let facts (s : state) : fact set = facts_of (footprint s) (links s) (seen s) s.waiting
 
 let holds (s : state) (f : fact) : bool =
@@ -317,12 +295,9 @@ invariant is_queue (q : t) =
     q.head != q.tail
     && own q.head s.head
     && own q.tail s.tail
-    && segment s.root s.head s.retired_values s.retired_fp s.retired_links
-    && segment s.head s.last s.values s.active_fp s.active_links
+    && segments s
     && own s.last Nil
-    && Finset.inter s.retired_fp s.active_fp = Finset.empty
-    && not (Finset.mem s.last s.retired_fp)
-    && not (Finset.mem s.last s.active_fp)
+    && separated s
     && Finset.mem s.tail (footprint s)
     && (forall reg : Ghost.t.
           Finset.mem reg s.waiting ->
@@ -365,6 +340,65 @@ lemma grow_facts (q : t) (s : state) (s' : state)
     s.waiting s'.waiting;
   Ghost.fpu (Ghost.at facts_auth q.head)
     (Fact_auth.auth (Facts.set (facts s))) (Fact_auth.full (Facts.set (facts s')))
+
+let cell_value (e : exposure) : node =
+  match e with
+  | At_last -> Nil
+  | Retired p -> Next (p.value, p.next)
+  | Active p -> Next (p.value, p.next)
+
+(* The segments and the last cell without the points-to of [cell]. *)
+predicate exposed (s : state) (cell : node Atomic.t) (e : exposure) =
+  match e with
+  | At_last -> cell == s.last && segments s
+  | Retired p ->
+      own s.last Nil
+      && segment s.root cell p.before p.before_cells p.before_edges
+      && segment p.next s.head p.after p.after_cells p.after_edges
+      && segment s.head s.last s.values s.active_fp s.active_links
+      && splits p cell s.head s.retired_values s.retired_fp s.retired_links
+  | Active p ->
+      own s.last Nil
+      && segment s.root s.head s.retired_values s.retired_fp s.retired_links
+      && segment s.head cell p.before p.before_cells p.before_edges
+      && segment p.next s.last p.after p.after_cells p.after_edges
+      && splits p cell s.last s.values s.active_fp s.active_links
+
+(* Takes the points-to of a cell of the segments out of them. *)
+lemma expose (s : state) (cell : node Atomic.t)
+  returns (e : exposure)
+  requires (segments s && own s.last Nil && separated s)
+  requires (Finset.mem cell (footprint s) || cell == s.head)
+  ensures (exposed s cell e && own cell (cell_value e)) =
+  segment_info s.root s.head;
+  segment_info s.head s.last;
+  let e =
+    if cell == s.last then At_last
+    else if Finset.mem cell s.retired_fp then begin
+      let p = segment_split s.root s.head s.retired_values s.retired_fp s.retired_links cell in
+      Retired p
+    end else begin
+      let p = segment_split s.head s.last s.values s.active_fp s.active_links cell in
+      Active p
+    end
+  in
+  fold exposed s cell e;
+  e
+
+(* Puts the points-to of an exposed cell back, with its edge if it has one. *)
+lemma restore (s : state) (cell : node Atomic.t) (e : exposure)
+  requires (exposed s cell e && own cell (cell_value e))
+  ensures (segments s && own s.last Nil)
+  ensures (match e with
+    | At_last -> cell == s.last
+    | Retired p -> cell != s.last && Finset.mem (Edge (cell, p.value, p.next)) (links s)
+    | Active p -> cell != s.last && Finset.mem (Edge (cell, p.value, p.next)) (links s)) =
+  unfold exposed s cell e;
+  match e with
+  | At_last -> ()
+  | Retired p ->
+      segment_restore s.root cell s.head s.retired_values s.retired_fp s.retired_links p
+  | Active p -> segment_restore s.head cell s.last s.values s.active_fp s.active_links p
 
 lemma waiting_help (q : t) (cell : node Atomic.t) (xs : int list)
     (waiting : Ghost.t finset)

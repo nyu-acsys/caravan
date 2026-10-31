@@ -43,31 +43,9 @@ let rec fix_tail tail new_tail =
     observe_fact q s (Published new_tail);
     segment_info s.root s.head;
     segment_info s.head s.last;
-    let exposure =
-      if new_tail == s.last then At_last
-      else if Finset.mem new_tail s.retired_fp then
-        let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
-          segment_split s.root s.head s.retired_values s.retired_fp s.retired_links new_tail in
-        Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links)
-      else
-        let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
-          segment_split s.head s.last s.values s.active_fp s.active_links new_tail in
-        Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links)
-    in
+    let exposure = expose s new_tail in
     let result = step () in
-    begin match exposure with
-    | At_last -> ()
-    | Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-      after_links) ->
-      segment_restore s.root new_tail next s.head before after before_fp after_fp before_links
-        after_links value
-    | Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-      after_links) ->
-      segment_restore s.head new_tail next s.last before after before_fp after_fp before_links
-        after_links value
-    end;
+    restore s new_tail exposure;
     fold is_queue q;
     result) *)
     == Nil
@@ -101,28 +79,16 @@ let push { tail; _ } value =
       observe_fact q s (Published curr_end);
       segment_info s.root s.head;
       segment_info s.head s.last;
-      let exposure =
-        if curr_end == s.last then At_last
-        else if Finset.mem curr_end s.retired_fp then
-          let (before, before_fp, before_links, value, next, after, after_fp, after_links)
-            =
-            segment_split s.root s.head s.retired_values s.retired_fp s.retired_links curr_end in
-          Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-            after_links)
-        else
-          let (before, before_fp, before_links, value, next, after, after_fp, after_links)
-            =
-            segment_split s.head s.last s.values s.active_fp s.active_links curr_end in
-          Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-            after_links)
-      in
+      let exposure = expose s curr_end in
       let xs = Push.access token q value in
       unfold queue q xs;
       let result = step () in
       if result then begin
+        assert (exposure = At_last);
+        unfold exposed s curr_end exposure;
         assert (curr_end == s.last);
-        segment_terminal_outside s.root s.head s.retired_values s.retired_fp s.retired_links fresh;
-        segment_terminal_outside s.head s.last s.values s.active_fp s.active_links fresh;
+        segment_excludes_owned s.root s.head s.retired_values s.retired_fp s.retired_links fresh Nil;
+        segment_excludes_owned s.head s.last s.values s.active_fp s.active_links fresh Nil;
         assert (fresh != s.last);
         Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
         fold queue q (s.values @ [value]);
@@ -138,17 +104,7 @@ let push { tail; _ } value =
         issue_fact q s' (Published fresh);
         fold is_queue q s'
       end else begin
-      begin match exposure with
-      | At_last -> ()
-      | Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-        after_links) ->
-        segment_restore s.root curr_end next s.head before after before_fp after_fp
-          before_links after_links value
-      | Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-        after_links) ->
-        segment_restore s.head curr_end next s.last before after before_fp after_fp
-          before_links after_links value
-      end;
+      restore s curr_end exposure;
       fold queue q xs;
       Push.abort token q value;
       fold is_queue q
@@ -162,33 +118,9 @@ let push { tail; _ } value =
         observe_fact q s (Published curr_end);
         segment_info s.root s.head;
         segment_info s.head s.last;
-        let exposure =
-          if curr_end == s.last then At_last
-          else if Finset.mem curr_end s.retired_fp then
-            let (before, before_fp, before_links, value, next, after, after_fp,
-              after_links) =
-              segment_split s.root s.head s.retired_values s.retired_fp s.retired_links curr_end in
-            Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-              after_links)
-          else
-            let (before, before_fp, before_links, value, next, after, after_fp,
-              after_links) =
-              segment_split s.head s.last s.values s.active_fp s.active_links curr_end in
-            Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-              after_links)
-        in
+        let exposure = expose s curr_end in
         let result = step () in
-        begin match exposure with
-        | At_last -> ()
-        | Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links) ->
-          segment_restore s.root curr_end next s.head before after before_fp after_fp
-            before_links after_links value
-        | Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links) ->
-          segment_restore s.head curr_end next s.last before after before_fp after_fp
-            before_links after_links value
-        end;
+        restore s curr_end exposure;
         begin match result with
         | Nil -> ()
         | Next (_, next) ->
@@ -242,26 +174,16 @@ let push { tail; _ } value =
     observe_fact q s (Published old_tail);
     segment_info s.root s.head;
     segment_info s.head s.last;
-    let exposure =
-      if old_tail == s.last then At_last
-      else if Finset.mem old_tail s.retired_fp then
-        let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
-          segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_tail in
-        Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links)
-      else
-        let (before, before_fp, before_links, value, next, after, after_fp, after_links) =
-          segment_split s.head s.last s.values s.active_fp s.active_links old_tail in
-        Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-          after_links)
-    in
+    let exposure = expose s old_tail in
     let xs = Push.access token q value in
     unfold queue q xs;
     let result = step () in
     if result then begin
+      assert (exposure = At_last);
+      unfold exposed s old_tail exposure;
       assert (old_tail == s.last);
-      segment_terminal_outside s.root s.head s.retired_values s.retired_fp s.retired_links new_tail;
-      segment_terminal_outside s.head s.last s.values s.active_fp s.active_links new_tail;
+      segment_excludes_owned s.root s.head s.retired_values s.retired_fp s.retired_links new_tail Nil;
+      segment_excludes_owned s.head s.last s.values s.active_fp s.active_links new_tail Nil;
       assert (new_tail != s.last);
       Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
       fold queue q (s.values @ [value]);
@@ -277,17 +199,7 @@ let push { tail; _ } value =
       issue_fact q s' (Published new_tail);
       fold is_queue q s'
     end else begin
-    begin match exposure with
-    | At_last -> ()
-    | Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-      after_links) ->
-      segment_restore s.root old_tail next s.head before after before_fp after_fp before_links
-        after_links value
-    | Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-      after_links) ->
-      segment_restore s.head old_tail next s.last before after before_fp after_fp before_links
-        after_links value
-    end;
+    restore s old_tail exposure;
     fold queue q xs;
     Push.abort token q value;
     fold is_queue q
@@ -301,33 +213,9 @@ let push { tail; _ } value =
       observe_fact q s (Published old_tail);
       segment_info s.root s.head;
       segment_info s.head s.last;
-      let exposure =
-        if old_tail == s.last then At_last
-        else if Finset.mem old_tail s.retired_fp then
-          let (before, before_fp, before_links, value, next, after, after_fp, after_links)
-            =
-            segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_tail in
-          Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-            after_links)
-        else
-          let (before, before_fp, before_links, value, next, after, after_fp, after_links)
-            =
-            segment_split s.head s.last s.values s.active_fp s.active_links old_tail in
-          Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-            after_links)
-      in
+      let exposure = expose s old_tail in
       let result = step () in
-      begin match exposure with
-      | At_last -> ()
-      | Retired_cell (before, before_fp, before_links, value, next, after, after_fp,
-        after_links) ->
-        segment_restore s.root old_tail next s.head before after before_fp after_fp
-          before_links after_links value
-      | Active_cell (before, before_fp, before_links, value, next, after, after_fp,
-        after_links) ->
-        segment_restore s.head old_tail next s.last before after before_fp after_fp
-          before_links after_links value
-      end;
+      restore s old_tail exposure;
       begin match result with
       | Nil -> ()
       | Next (_, next) ->
@@ -381,33 +269,9 @@ let rec pop_as q backoff =
       observe_fact q s (Head_seen old_head);
       segment_info s.root s.head;
       segment_info s.head s.last;
-      let exposure =
-        if old_head != s.head then
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_head in
-          Retired_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-        else if old_head != s.last then
-          let (before, before_fp, before_links, value, next,
-               after, after_fp, after_links) =
-            segment_split s.head s.last s.values s.active_fp s.active_links old_head in
-          Active_cell (before, before_fp, before_links, value, next,
-            after, after_fp, after_links)
-        else At_last
-      in
+      let exposure = expose s old_head in
       let result = step () in
-      begin match exposure with
-      | At_last -> ()
-      | Retired_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore s.root old_head next s.head before after
-            before_fp after_fp before_links after_links value
-      | Active_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links) ->
-          segment_restore s.head old_head next s.last before after
-            before_fp after_fp before_links after_links value
-      end;
+      restore s old_head exposure;
       begin match result with
       | Nil ->
           let token = Pop.bind () in
@@ -561,33 +425,9 @@ let is_empty { head; _ } =
     end;
     segment_info s.root s.head;
     segment_info s.head s.last;
-    let exposure =
-      if old_head != s.head then
-        let (before, before_fp, before_links, value, next,
-             after, after_fp, after_links) =
-          segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_head in
-        Retired_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links)
-      else if old_head != s.last then
-        let (before, before_fp, before_links, value, next,
-             after, after_fp, after_links) =
-          segment_split s.head s.last s.values s.active_fp s.active_links old_head in
-        Active_cell (before, before_fp, before_links, value, next,
-          after, after_fp, after_links)
-      else At_last
-    in
+    let exposure = expose s old_head in
     let result = step () in
-    begin match exposure with
-    | At_last -> ()
-    | Retired_cell (before, before_fp, before_links, value, next,
-        after, after_fp, after_links) ->
-        segment_restore s.root old_head next s.head before after
-          before_fp after_fp before_links after_links value
-    | Active_cell (before, before_fp, before_links, value, next,
-        after, after_fp, after_links) ->
-        segment_restore s.head old_head next s.last before after
-          before_fp after_fp before_links after_links value
-    end;
+    restore s old_head exposure;
     begin match observation with
     | Observed_link link ->
         consecutive_segment_edges s.root s.head s.last s.retired_values s.values
