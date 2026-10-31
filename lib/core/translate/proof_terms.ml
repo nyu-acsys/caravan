@@ -69,6 +69,123 @@ let lemma_call env (t : S.term) =
       end
   | _ -> State.of_result (error t.term_loc "Expected a lemma applied to its arguments")
 
+(** Existentials are named by their declaration in the predicate, including those nested
+    inside a match or another logical connective. *)
+let rec predicate_existentials (t : S.term) =
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
+  | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
+  | Tquant (Tforall, _, body)
+  | Tcomprehension (_, body)
+  | Tattr (_, body)
+  | Tcast (body, _)
+  | Told body
+  | Tfield (body, _) ->
+      predicate_existentials body
+  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
+      predicate_existentials a @ predicate_existentials b
+  | Tif (c, a, b) ->
+      predicate_existentials c @ predicate_existentials a @ predicate_existentials b
+  | Tmatch (scrutinee, cases) ->
+      predicate_existentials scrutinee
+      @ List.concat_map cases ~f:(fun (_, body) -> predicate_existentials body)
+  | Ttuple ts -> List.concat_map ts ~f:predicate_existentials
+  | Trecord (base, fields) ->
+      List.concat_map (S.record_terms base fields) ~f:predicate_existentials
+
+let unfold_result_types env (t : S.term) witnesses =
+  let head, _ = spine t [] in
+  match head.term_desc with
+  | Tvar q when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
+    ->
+      let key = logical_key env q in
+      let display = qualid_key q in
+      let* () =
+        if List.mem env.ctx.given.proof_support.opaque_predicates key ~equal:String.equal
+        then
+          error head.term_loc
+            "The definition of this predicate is hidden by its module signature"
+        else Ok ()
+      in
+      begin match
+        List.Assoc.find env.ctx.given.predicate_bodies key ~equal:String.equal
+      with
+      | None -> Ok None
+      | Some body ->
+          let bindings = predicate_existentials body.definition in
+          let* types =
+            all witnesses ~f:(fun (witness : S.id) ->
+                match
+                  List.filter bindings ~f:(fun (id, _) ->
+                      String.equal id.S.pid_str witness.pid_str)
+                with
+                | [] ->
+                    error witness.pid_loc
+                      (Printf.sprintf "Predicate %s has no existential named %s" display
+                         witness.pid_str)
+                | [ (_, Some ty) ] ->
+                    let* ty = Source.ocaml_type body.environment ~at:witness.pid_loc ty in
+                    Ok (Some (body.project_type ty))
+                | [ (_, None) ] ->
+                    error witness.pid_loc "An existential variable needs a type"
+                | _ ->
+                    error witness.pid_loc
+                      (Printf.sprintf "Existential name %s is ambiguous in predicate %s"
+                         witness.pid_str display))
+          in
+          Ok (Some types)
+      end
+  | _ -> error t.term_loc "Expected a predicate applied to its arguments"
+
+(** The names of the existentials of the predicate that [t] applies, which unfolding it
+    into a witness record binds. *)
+let existential_names env (t : S.term) =
+  let head, _ = spine t [] in
+  let existentials =
+    match head.term_desc with
+    | Tvar q ->
+        Option.value_map ~default:[]
+          (List.Assoc.find env.ctx.given.predicate_bodies (logical_key env q)
+             ~equal:String.equal)
+          ~f:(fun body -> List.map (predicate_existentials body.definition) ~f:fst)
+    | _ -> []
+  in
+  List.rev
+    (List.fold existentials ~init:[] ~f:(fun names (id : S.id) ->
+         if List.exists names ~f:(fun (n : S.id) -> String.equal n.pid_str id.pid_str)
+         then names
+         else id :: names))
+
+(** The data type, constructor and fields of the existential [id] of the predicate that
+    [t] applies, if it is a logical record. *)
+let existential_record env (t : S.term) (id : S.id) =
+  match unfold_result_types env t [ id ] with
+  | Ok (Some [ Some ty ]) -> Option.map (logical_record env ty) ~f:(fun r -> (ty, r))
+  | _ -> None
+
+(** The only existential of the predicate that [t] applies, if it is a logical record. *)
+let record_existential env (t : S.term) =
+  match existential_names env t with
+  | [ id ] -> Option.map (existential_record env t id) ~f:(fun r -> (id, r))
+  | _ -> None
+
+(** A fold's witness [value] for the existential [id], one per field of a record. *)
+let expand_witness env (t : S.term) ((id : S.id), (value : S.term)) =
+  match existential_record env t id with
+  | None -> Ok [ (id, value) ]
+  | Some (ty, (_, _, fields)) ->
+      let* () =
+        Source.check_logical_expression env.ctx.given.env
+          ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
+          value
+      in
+      Ok
+        (List.map fields ~f:(fun (label, _) ->
+             ( S.mk_id ~loc:id.pid_loc (existential_field id.pid_str label),
+               S.mk_term
+                 (Tfield (value, Qid (S.mk_id ~loc:value.term_loc label)))
+                 value.term_loc )))
+
 (** The witnesses that a fold's last argument [t] gives, if it is a witness record [w] or
     one updated, [{ w with f = e }]: its fields, as [w.f], or their updates. *)
 let record_witnesses env (t : S.term) =
@@ -107,18 +224,52 @@ let record_witnesses env (t : S.term) =
       end
   | _ -> Ok None
 
+(** The fold or unfold [make] of [t]. A fold's last argument beyond the predicate's
+    parameters is its only existential record, and otherwise a witness record. *)
 let rec predicate_use env ~unfold t witnesses make =
   let open State.Syntax in
   match (witnesses, t.S.term_desc) with
-  | [], Tapply (predicate, last) when not unfold -> (
-      let* record = State.of_result (record_witnesses env last) in
-      match record with
-      | Some witnesses -> predicate_use env ~unfold predicate witnesses make
-      | None -> predicate_application env ~unfold t witnesses make)
+  | [], Tapply (predicate, last) when not unfold ->
+      begin match record_existential env predicate with
+      | Some (id, _) when beyond_parameters env t ->
+          predicate_use env ~unfold predicate [ (id, last) ] make
+      | _ -> (
+          let* record = State.of_result (record_witnesses env last) in
+          match record with
+          | Some witnesses -> predicate_use env ~unfold predicate witnesses make
+          | None -> predicate_application env ~unfold t witnesses make)
+      end
+  | _ :: _, _ when not unfold ->
+      (* The fields of a record literal given for the only existential record. *)
+      begin match record_existential env t with
+      | Some (id, _)
+        when not
+               (List.exists witnesses ~f:(fun ((w : S.id), _) ->
+                    String.equal w.pid_str id.pid_str)) ->
+          let at = id.pid_loc in
+          predicate_application env ~unfold t
+            [ (id, S.mk_term (Trecord (None, witnesses)) at) ]
+            make
+      | _ -> predicate_application env ~unfold t witnesses make
+      end
   | _ -> predicate_application env ~unfold t witnesses make
+
+(** Whether [t] applies a predicate to more arguments than it has parameters. *)
+and beyond_parameters env t =
+  let head, args = spine t [] in
+  match head.term_desc with
+  | Tvar q ->
+      begin match
+        List.Assoc.find env.ctx.given.preds (logical_key env q) ~equal:String.equal
+      with
+      | Some (_, types) -> List.length args > List.length types
+      | None -> false
+      end
+  | _ -> false
 
 and predicate_application env ~unfold t witnesses make =
   let open State.Syntax in
+  let predicate = t in
   let head, args = spine t [] in
   match head.term_desc with
   | Tvar q when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
@@ -138,6 +289,12 @@ and predicate_application env ~unfold t witnesses make =
       let* args =
         predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
       in
+      let* witnesses =
+        if unfold then State.return witnesses
+        else
+          State.of_result
+            (Result.map ~f:List.concat (all witnesses ~f:(expand_witness env t)))
+      in
       let+ witnesses =
         State.all witnesses ~f:(fun (id, t) ->
             if unfold then
@@ -146,6 +303,13 @@ and predicate_application env ~unfold t witnesses make =
                   ( List.Assoc.find env.vars id.S.pid_str ~equal:String.equal,
                     t.S.term_desc )
                 with
+                | Some (Raven _), Tvar (Qid existential)
+                  when Option.is_some (existential_record env predicate existential) ->
+                    error existential.pid_loc
+                      (Printf.sprintf
+                         "Unfold into a record to bind the existential record %s, as let \
+                          w = unfold p x"
+                         existential.pid_str)
                 | Some (Raven target), Tvar (Qid existential) ->
                     Ok
                       ( ident ~loc:(loc id.pid_loc) target,
@@ -517,95 +681,9 @@ let unpacked_value ~loc:l types value =
   | [ _ ] -> [ value ]
   | types -> List.mapi types ~f:(fun i _ -> R.Expr.tuple_get ~loc:l value i)
 
-(** Existentials are named by their declaration in the predicate, including those nested
-    inside a match or another logical connective. *)
-let rec predicate_existentials (t : S.term) =
-  match t.term_desc with
-  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
-  | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
-  | Tquant (Tforall, _, body)
-  | Tcomprehension (_, body)
-  | Tattr (_, body)
-  | Tcast (body, _)
-  | Told body
-  | Tfield (body, _) ->
-      predicate_existentials body
-  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
-      predicate_existentials a @ predicate_existentials b
-  | Tif (c, a, b) ->
-      predicate_existentials c @ predicate_existentials a @ predicate_existentials b
-  | Tmatch (scrutinee, cases) ->
-      predicate_existentials scrutinee
-      @ List.concat_map cases ~f:(fun (_, body) -> predicate_existentials body)
-  | Ttuple ts -> List.concat_map ts ~f:predicate_existentials
-  | Trecord (base, fields) ->
-      List.concat_map (S.record_terms base fields) ~f:predicate_existentials
-
-let unfold_result_types env (t : S.term) witnesses =
-  let head, _ = spine t [] in
-  match head.term_desc with
-  | Tvar q when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
-    ->
-      let key = logical_key env q in
-      let display = qualid_key q in
-      let* () =
-        if List.mem env.ctx.given.proof_support.opaque_predicates key ~equal:String.equal
-        then
-          error head.term_loc
-            "The definition of this predicate is hidden by its module signature"
-        else Ok ()
-      in
-      begin match
-        List.Assoc.find env.ctx.given.predicate_bodies key ~equal:String.equal
-      with
-      | None -> Ok None
-      | Some body ->
-          let bindings = predicate_existentials body.definition in
-          let* types =
-            all witnesses ~f:(fun (witness : S.id) ->
-                match
-                  List.filter bindings ~f:(fun (id, _) ->
-                      String.equal id.S.pid_str witness.pid_str)
-                with
-                | [] ->
-                    error witness.pid_loc
-                      (Printf.sprintf "Predicate %s has no existential named %s" display
-                         witness.pid_str)
-                | [ (_, Some ty) ] ->
-                    let* ty = Source.ocaml_type body.environment ~at:witness.pid_loc ty in
-                    Ok (Some (body.project_type ty))
-                | [ (_, None) ] ->
-                    error witness.pid_loc "An existential variable needs a type"
-                | _ ->
-                    error witness.pid_loc
-                      (Printf.sprintf "Existential name %s is ambiguous in predicate %s"
-                         witness.pid_str display))
-          in
-          Ok (Some types)
-      end
-  | _ -> error t.term_loc "Expected a predicate applied to its arguments"
-
-(** The names of the existentials of the predicate that [t] applies, which unfolding it
-    into a witness record binds. *)
-let existential_names env (t : S.term) =
-  let head, _ = spine t [] in
-  let existentials =
-    match head.term_desc with
-    | Tvar q ->
-        Option.value_map ~default:[]
-          (List.Assoc.find env.ctx.given.predicate_bodies (logical_key env q)
-             ~equal:String.equal)
-          ~f:(fun body -> List.map (predicate_existentials body.definition) ~f:fst)
-    | _ -> []
-  in
-  List.rev
-    (List.fold existentials ~init:[] ~f:(fun names (id : S.id) ->
-         if List.exists names ~f:(fun (n : S.id) -> String.equal n.pid_str id.pid_str)
-         then names
-         else id :: names))
-
 (** [let record = unfold t in ...]: unfolds [t], binding its existentials to the fields of
-    the witness record [record] for [continuation]. *)
+    the witness record [record] for [continuation], or, if its only existential is a
+    logical record, [record] to that record. *)
 let witness_binding :
     'a.
     ghost_rhs:bool ->
@@ -626,42 +704,87 @@ let witness_binding :
         State.of_result
           (error t.term_loc "Unfolding into a witness record needs the predicate's body")
   in
-  let* fields =
+  let only_record = Option.is_some (record_existential env t) in
+  (* Each existential's Raven existentials, one per field of a record, with locals. *)
+  let local prefix (existential, ty) =
+    let* raven = State.fresh prefix in
+    let+ raven_type = State.of_result (typ env.ctx ~at:t.term_loc ty) in
+    (existential, raven, raven_type)
+  in
+  let* existentials =
     State.all (List.zip_exn names types) ~f:(fun ((name : S.id), ty) ->
-        let* raven = State.fresh (record.pid_str ^ "_" ^ name.pid_str) in
-        let+ raven_type = State.of_result (typ env.ctx ~at:name.pid_loc ty) in
-        (name, ty, raven, raven_type))
+        let prefix =
+          if only_record then record.pid_str else record.pid_str ^ "_" ^ name.pid_str
+        in
+        match logical_record env ty with
+        | None ->
+            let+ slot = local prefix (name.pid_str, ty) in
+            (name, ty, `Variable slot)
+        | Some (d, c, fields) ->
+            let+ slots =
+              State.all fields ~f:(fun (label, field_type) ->
+                  let+ slot =
+                    local
+                      (prefix ^ "_" ^ label)
+                      (existential_field name.pid_str label, field_type)
+                  in
+                  (label, field_type, slot))
+            in
+            (name, ty, `Record (d, c, slots)))
+  in
+  let slots =
+    List.concat_map existentials ~f:(fun (_, _, binding) ->
+        match binding with
+        | `Variable slot -> [ slot ]
+        | `Record (_, _, fields) -> List.map fields ~f:(fun (_, _, slot) -> slot))
   in
   let* unfold =
     let targets =
-      List.fold fields ~init:env ~f:(fun env (_, _, raven, _) ->
-          bind env raven (Raven raven))
+      List.fold slots ~init:env ~f:(fun env (_, raven, _) -> bind env raven (Raven raven))
     in
     predicate_use targets ~unfold:true t
-      (List.map fields ~f:(fun (name, _, raven, _) ->
-           (S.mk_id ~loc:name.pid_loc raven, S.mk_term (Tvar (Qid name)) name.pid_loc)))
+      (List.map slots ~f:(fun (existential, raven, _) ->
+           ( S.mk_id ~loc:t.term_loc raven,
+             S.mk_term (Tvar (Qid (S.mk_id ~loc:t.term_loc existential))) t.term_loc )))
       R.Stmt.unfold
   in
+  let var raven = R.Expr.var ~loc:l (Translate_context.name ~loc:l raven) in
   let env =
-    List.fold fields
-      ~init:
-        (bind env record.pid_str
-           (State
-              (List.map fields ~f:(fun (name, ty, raven, _) ->
-                   ( name.pid_str,
-                     (R.Expr.var ~loc:l (Translate_context.name ~loc:l raven), ty) )))))
-      ~f:(fun env (name, ty, _, _) ->
+    match existentials with
+    | [ (_, ty, `Record (_, _, fields)) ] when only_record ->
         {
-          env with
-          var_types =
-            (Source.record_field record.pid_str name.pid_str, ty) :: env.var_types;
-        })
+          (bind env record.pid_str
+             (State
+                (List.map fields ~f:(fun (label, field_type, (_, raven, _)) ->
+                     (label, (var raven, field_type))))))
+          with
+          var_types = (record.pid_str, ty) :: env.var_types;
+        }
+    | _ ->
+        let value = function
+          | `Variable (_, raven, _) -> var raven
+          | `Record (d, c, fields) ->
+              R.Expr.call ~loc:l
+                (Datatypes.ctor_name ~loc:l d c)
+                (List.map fields ~f:(fun (_, _, (_, raven, _)) -> var raven))
+        in
+        List.fold existentials
+          ~init:
+            (bind env record.pid_str
+               (State
+                  (List.map existentials ~f:(fun ((name : S.id), ty, binding) ->
+                       (name.pid_str, (value binding, ty))))))
+          ~f:(fun env ((name : S.id), ty, _) ->
+            {
+              env with
+              var_types =
+                (Source.record_field record.pid_str name.pid_str, ty) :: env.var_types;
+            })
   in
   let+ rest, value = continuation env in
   let declarations =
-    List.concat_map fields ~f:(fun (name, _, raven, raven_type) ->
-        R.Stmt.local ~loc:(loc name.pid_loc) ~ghost:true ~typ:raven_type
-          (ident ~loc:l raven))
+    List.concat_map slots ~f:(fun (_, raven, raven_type) ->
+        R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven))
   in
   let unfold =
     if ghost_rhs then [ R.Stmt.ghost_block ~loc:l [ unfold ] ] else [ unfold ]

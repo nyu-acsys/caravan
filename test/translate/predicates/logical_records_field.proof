@@ -1,0 +1,5 @@
+type count = { n : int; c : integer }
+
+lemma raised (s : count) returns (t : count)
+  ensures (t = { s with d = s.c + 1 }) =
+  { s with c = s.c + 1 }

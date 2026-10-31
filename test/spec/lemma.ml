@@ -155,17 +155,22 @@ let () =
     parse_proof
       {|type link = | Linked of node Atomic.t * int * node Atomic.t | Empty
         type state = (* a state comment *) { count : int }
+        type piece = { before : int list; after : int list }
+        invariant counted (t : t) (s : state) = true
         action dec = (* an action comment *) { s with count = s.count - 1 }|}
   with
   | [
-   Proof_type { type_name; type_ctors = [ (linked, args); (empty, []) ] };
+   Proof_type { type_name; type_kind = Variant [ (linked, args); (empty, []) ] };
    Proof_state _;
+   Proof_type { type_name = piece; type_kind = Record [ _; _ ] };
+   Proof_invariant _;
    Proof_action _;
   ] ->
       assert (type_name.pid_str = "link");
       assert (linked.pid_str = "Linked");
       assert (List.length args = 3);
-      assert (empty.pid_str = "Empty")
+      assert (empty.pid_str = "Empty");
+      assert (piece.pid_str = "piece")
   | _ -> failwith "unexpected logical type or state declarations"
   end;
   begin match parse_proof "module Authority = Auth (Owner.Facts)" with

@@ -1186,7 +1186,8 @@ type bound =
   | Raven of string
   | Value of R.Expr.t
   | State of (string * (R.Expr.t * Types.type_expr)) list
-      (** The state of an invariant, by the values and types of its fields. *)
+      (** The state of an invariant, or a record, by the values and types of its fields.
+      *)
 
 type env = {
   ctx : context;  (** For the data types, and the fields of ref cells. *)
@@ -1608,6 +1609,21 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
 let state_fields env x =
   match List.Assoc.find env.vars x ~equal:String.equal with
   | Some (State fields) -> Some fields
+  | _ -> None
+
+(** The existential for the field [label] of the existential record [x]. *)
+let existential_field x label = x ^ "_" ^ label
+
+(** The data type and constructor of the logical record type [t], a record type without
+    mutable fields, with its fields and their types. *)
+let logical_record env (t : Types.type_expr) =
+  match Datatypes.desc env.data t with
+  | Tconstr (p, [], _) ->
+      Option.bind (Datatypes.find env.data p) ~f:(fun d ->
+          match d.ctors with
+          | [ c ] when String.is_empty c.ocaml && Option.is_none d.heap ->
+              Some (d, c, List.zip_exn c.fields c.args)
+          | _ -> None)
   | _ -> None
 
 (** Whether a local module has a hidden representation in this lexical environment. *)

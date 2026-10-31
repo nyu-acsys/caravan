@@ -62,6 +62,11 @@ let rec term_type env (t : S.term) =
       term_type env s
   | _, ({ term_desc = Tvar (Qid { pid_str = "++"; _ }); _ }, [ a; b ]) ->
       Option.first_some (term_type env a) (term_type env b)
+  | Trecord (Some base, _), _ -> term_type env base
+  | Trecord (None, _), _ ->
+      Result.ok
+        (Source.infer_logical_expression env.ctx.given.env
+           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
   | Tfield (base, Qid { pid_str = f; _ }), _ ->
       let state =
         match base.term_desc with
@@ -311,9 +316,24 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       begin match (List.Assoc.find env.vars x ~equal:String.equal, x) with
       | Some (Raven x), _ -> State.return (R.Expr.var ~loc:l (name ~loc:l x))
       | Some (Value v), _ -> State.return v
-      | Some (State _), _ ->
-          State.of_result
-            (error at (Printf.sprintf "The state %s is used by its fields, as %s.f" x x))
+      | Some (State fields), _ ->
+          (* A record bound by its fields is their constructor's application. *)
+          begin match
+            Option.bind
+              (List.Assoc.find env.var_types x ~equal:String.equal)
+              ~f:(logical_record env)
+          with
+          | Some (d, c, labels) ->
+              State.return
+                (R.Expr.call ~loc:l
+                   (Datatypes.ctor_name ~loc:l d c)
+                   (List.map labels ~f:(fun (label, _) ->
+                        fst (List.Assoc.find_exn fields label ~equal:String.equal))))
+          | None ->
+              State.of_result
+                (error at
+                   (Printf.sprintf "The state %s is used by its fields, as %s.f" x x))
+          end
       | None, "max_int" -> State.return (R.Expr.int ~loc:l Prelude.max_int)
       | None, "min_int" -> State.return (R.Expr.int ~loc:l Prelude.min_int)
       | None, _ -> State.of_result (error at (Printf.sprintf "Unbound name %s" x))
@@ -338,33 +358,63 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let+ b = formula env b in
       R.Expr.ite ~loc:l c a b
   | Tquant (q, binders, body) ->
+      let variable ~at x t =
+        let* ty = State.of_result (typ env.ctx ~at t) in
+        let l = loc at in
+        let+ raven = if env.logical_definition then State.fresh x else State.return x in
+        (raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty)
+      in
       let* bound =
         State.all binders ~f:(fun (id, ty) ->
             match ty with
             | None ->
                 State.of_result
                   (error id.pid_loc "A bound variable needs a type, as in x: int")
-            | Some ty ->
+            | Some ty -> begin
                 let* t =
                   State.of_result (Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty)
                 in
-                let* ty = State.of_result (typ env.ctx ~at:id.pid_loc t) in
-                let l = loc id.pid_loc in
-                let+ raven =
-                  if env.logical_definition then State.fresh id.pid_str
-                  else State.return id.pid_str
-                in
-                (id.pid_str, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty))
+                (* An existential record is one existential per field. *)
+                match (q, logical_record env t) with
+                | Texists, Some (_, _, fields) ->
+                    let+ fields =
+                      State.all fields ~f:(fun (label, field_type) ->
+                          let+ variable =
+                            variable ~at:id.pid_loc
+                              (existential_field id.pid_str label)
+                              field_type
+                          in
+                          (label, variable))
+                    in
+                    (id.pid_str, t, `Record fields)
+                | _ ->
+                    let+ variable = variable ~at:id.pid_loc id.pid_str t in
+                    (id.pid_str, t, `Variable variable)
+              end)
       in
       let env =
-        List.fold bound ~init:env ~f:(fun env (x, raven, t, _) ->
-            { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+        List.fold bound ~init:env ~f:(fun env (x, t, binding) ->
+            let binding =
+              match binding with
+              | `Variable (raven, _, _) -> Raven raven
+              | `Record fields ->
+                  State
+                    (List.map fields ~f:(fun (label, (raven, t, _)) ->
+                         (label, (R.Expr.var ~loc:l (name ~loc:l raven), t))))
+            in
+            { (bind env x binding) with var_types = (x, t) :: env.var_types })
       in
       let+ body = formula env body in
-      let vars = List.map bound ~f:(fun (_, _, _, v) -> v) in
+      let variables =
+        List.concat_map bound ~f:(fun (_, _, binding) ->
+            match binding with
+            | `Variable v -> [ v ]
+            | `Record fields -> List.map fields ~f:snd)
+      in
+      let vars = List.map variables ~f:(fun (_, _, v) -> v) in
       (* A variable of type [int] ranges over its values. *)
       let ranges =
-        List.filter_map bound ~f:(fun (_, x, t, _) ->
+        List.filter_map variables ~f:(fun (x, t, _) ->
             Option.map (range_spec ~loc:l t x) ~f:(fun _ ->
                 R.Expr.call ~loc:l
                   (R.Name.make ~loc:l Prelude.in_range)
@@ -403,7 +453,45 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Ttuple ts ->
       let+ ts = State.all ts ~f:(formula env) in
       R.Expr.tuple ~loc:l ts
-  | Trecord _ -> State.of_result (unsupported at "A record other than a fold's witnesses")
+  | Trecord (base, updates) ->
+      let* record_type =
+        match base with
+        | Some base -> State.return (term_type env base)
+        | None ->
+            State.map ~f:Option.some
+              (State.of_result
+                 (Source.infer_logical_expression env.ctx.given.env
+                    ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t))
+      in
+      begin match Option.bind record_type ~f:(logical_record env) with
+      | None -> State.of_result (error at "This record is not of a logical record type")
+      | Some (d, c, fields) ->
+          let* (_ : unit list) =
+            State.all updates ~f:(fun ((u : S.id), _) ->
+                if List.Assoc.mem fields u.pid_str ~equal:String.equal then
+                  State.return ()
+                else
+                  State.of_result
+                    (error u.pid_loc
+                       (Printf.sprintf "This record has no field %s" u.pid_str)))
+          in
+          let+ args =
+            State.all fields ~f:(fun (label, field_type) ->
+                match
+                  ( List.find updates ~f:(fun ((u : S.id), _) ->
+                        String.equal u.pid_str label),
+                    base )
+                with
+                | Some (_, value), _ -> expected_formula env (Some field_type) value
+                | None, Some base ->
+                    formula env
+                      (S.mk_term (Tfield (base, Qid (S.mk_id ~loc:at label))) at)
+                | None, None ->
+                    State.of_result
+                      (error at (Printf.sprintf "This record has no field %s" label)))
+          in
+          R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args
+      end
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
       let* scrutinee_type =
@@ -416,6 +504,18 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let* raven_type = State.of_result (typ env.ctx ~at ty) in
       let+ value = expected_formula env (Some ty) t in
       R.Expr.annotated value raven_type
+  | Tfield ({ term_desc = Trecord (base, updates); _ }, Qid field) ->
+      begin match
+        ( List.find updates ~f:(fun ((u : S.id), _) ->
+              String.equal u.pid_str field.pid_str),
+          base )
+      with
+      | Some (_, value), _ -> formula env value
+      | None, Some base -> formula env (S.mk_term (Tfield (base, Qid field)) at)
+      | None, None ->
+          State.of_result
+            (error at (Printf.sprintf "This record has no field %s" field.pid_str))
+      end
   | Tfield ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
     when Option.is_some (state_fields env x) ->
       begin match

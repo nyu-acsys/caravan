@@ -152,7 +152,7 @@ imported functors, anonymous arguments, nested parameter
 modules, and parameter-dependent heap representations remain unsupported by the
 shared generic translation.
 
-Proof files also support checked lemmas and monomorphic logical variant types.
+Proof files also support checked lemmas and monomorphic logical variant and record types.
 A lemma has typed parameters and an expression body after `=`. Optional
 `returns`, `requires`, and `ensures` clauses state its contract explicitly.
 Recursive lemmas require a `variant`, which can be a list for structural
@@ -209,6 +209,17 @@ with `let value = ... in`, and `fold p x {n = value}` supplies its
 witness. Unfold bindings infer their types from the named existential declarations;
 explicit type annotations remain optional. Use `fold p x` when no explicit witness
 is needed.
+
+`let w = unfold p x in ...` binds all of the predicate's existentials as the
+fields of a witness record, as `w.n`. `fold p x w` supplies them, and
+`fold p x { w with n = e }` changes some.
+
+A record type declared in a proof file, `type count = { n : int; c : integer }`,
+is a logical type, unless an invariant takes it as its state. Its values are
+written `{ n = 0; c = 1 }` or `{ s with c = s.c + 1 }`. An existential of a
+record type, `exists s : count. ...`, stands for one existential per field. When
+it is a predicate's only existential, `let s = unfold p x in ...` binds the
+record itself, and `fold p x s` supplies one.
 
 Specification types include `'a finset`, `'a set`, and `('k, 'v) map` when those
 names are not already declared by the program. `Finset` and `Set` provide

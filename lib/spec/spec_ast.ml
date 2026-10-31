@@ -183,6 +183,12 @@ type proof_module_parameter =
   | Proof_named_parameter of id * qualid
   | Proof_unit_parameter of Location.t
 
+(** The definition of a proof's type. *)
+type type_kind =
+  | Variant of (id * pty list) list
+  | Record of (id * pty) list
+      (** A logical record, [type piece = { before : int list; next : node }]. *)
+
 (** A declaration of a proof. *)
 type proof_decl =
   | Proof_module of {
@@ -198,7 +204,7 @@ type proof_decl =
       module_loc : Location.t;
     }
   | Proof_predicate of predicate
-  | Proof_type of { type_name : id; type_ctors : (id * pty list) list }
+  | Proof_type of { type_name : id; type_kind : type_kind }
   | Proof_resource of {
       resource_name : id;
       resource_functor : qualid;
@@ -222,7 +228,8 @@ type proof_decl =
       lemma_body : proof_expr;
     }
   | Proof_state of { state_name : id; state_fields : state_field list }
-      (** The ghost state of a structure, [type state = { items : int list }]. *)
+      (** The ghost state of a structure, [type state = { items : int list }], which an
+          invariant's last parameter has. Other record types are logical records. *)
   | Proof_invariant of {
       inv_name : id;
       inv_params : (id * pty) list;

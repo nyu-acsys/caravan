@@ -130,7 +130,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
         List.map lds ~f:(fun (ld : Typedtree.label_declaration) -> ld.ld_name.txt)
       in
       let types =
-        List.map lds ~f:(fun (ld : Typedtree.label_declaration) -> ld.ld_type.ctyp_type)
+        List.map lds ~f:(fun (ld : Typedtree.label_declaration) ->
+            match Types.get_desc ld.ld_type.ctyp_type with
+            | Tpoly (t, []) -> t
+            | _ -> ld.ld_type.ctyp_type)
       in
       let is_mutable (ld : Typedtree.label_declaration) =
         match ld.ld_mutable with Mutable -> true | Immutable -> false

@@ -52,6 +52,35 @@
     | Tapply (f, { term_desc = Trecord (None, fields); _ }) -> (f, fields)
     | _ -> (t, [])
 
+  (* The record types that no invariant takes as its state are logical records. *)
+  let logical_records declarations =
+    let rec states = function
+      | Proof_invariant { inv_state = (_, PTtyapp (q, [])); _ } ->
+          [ (match q with Qid x | Qdot (_, x) -> x.pid_str) ]
+      | Proof_module { module_declarations = ds; _ }
+      | Proof_definition { module_declarations = ds; _ } -> List.concat_map states ds
+      | _ -> []
+    in
+    let states = List.concat_map states declarations in
+    let field f =
+      if f.sf_grows || f.sf_helps <> None then
+        raise (Syntax_error (f.sf_name.pid_loc,
+          "Only the state of an invariant has [@grows] or [@helps] fields"));
+      (f.sf_name, f.sf_type)
+    in
+    let rec convert = function
+      | Proof_state { state_name = n; state_fields = fs }
+        when not (List.mem n.pid_str states) ->
+          Proof_type { type_name = n; type_kind = Record (List.map field fs) }
+      | Proof_module m ->
+          Proof_module { m with module_declarations = List.map convert m.module_declarations }
+      | Proof_definition m ->
+          Proof_definition
+            { m with module_declarations = List.map convert m.module_declarations }
+      | d -> d
+    in
+    List.map convert declarations
+
   (* An unfold's record names the existentials it binds, as in [{ root; head }]. *)
   let pun_name ~at (field, value) =
     match value.term_desc with
@@ -230,7 +259,7 @@ predicate_decl:
 
 (* The declarations of a proof file. *)
 proof:
-| ds = proof_decl* EOF { ds }
+| ds = proof_decl* EOF { logical_records ds }
 ;
 
 proof_module_argument:
@@ -302,7 +331,7 @@ proof_decl:
 | TYPE n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
     { Proof_state { state_name = n; state_fields = fs } }
 | TYPE n = lident EQUAL cs = bar_list1(type_ctor)
-    { Proof_type { type_name = n; type_ctors = cs } }
+    { Proof_type { type_name = n; type_kind = Variant cs } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);

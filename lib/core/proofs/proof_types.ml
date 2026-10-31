@@ -61,7 +61,7 @@ let proof_constructor_collision ?(allow_shadowing = false) env interface proof =
   let declared = interface_constructors interface in
   let constructors =
     List.concat_map proof ~f:(function
-      | S.Proof_type { type_ctors; _ } -> List.map type_ctors ~f:fst
+      | S.Proof_type { type_kind = Variant ctors; _ } -> List.map ctors ~f:fst
       | _ -> [])
   in
   let rec find seen = function
@@ -193,15 +193,24 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
           List.rev previous_fields )
       ~f:(fun (env, descriptors, resources, fields) declaration ->
         match declaration with
-        | S.Proof_type { type_name; type_ctors } ->
+        | S.Proof_type { type_name; type_kind } ->
             let constructor ((name : S.id), (args : S.pty list)) =
               Ast_helper.Type.constructor ~loc:name.pid_loc
                 ~args:(Pcstr_tuple (List.map args ~f:(core_type ~at:name.pid_loc)))
                 { txt = name.pid_str; loc = name.pid_loc }
             in
+            let label ((name : S.id), (ty : S.pty)) =
+              Ast_helper.Type.field ~loc:name.pid_loc
+                { txt = name.pid_str; loc = name.pid_loc }
+                (core_type ~at:name.pid_loc ty)
+            in
+            let kind =
+              match type_kind with
+              | Variant ctors -> Parsetree.Ptype_variant (List.map ctors ~f:constructor)
+              | Record fields -> Ptype_record (List.map fields ~f:label)
+            in
             let declaration =
-              Ast_helper.Type.mk ~loc:type_name.pid_loc
-                ~kind:(Ptype_variant (List.map type_ctors ~f:constructor))
+              Ast_helper.Type.mk ~loc:type_name.pid_loc ~kind
                 { txt = type_name.pid_str; loc = type_name.pid_loc }
             in
             let typed, _, _, _, env =

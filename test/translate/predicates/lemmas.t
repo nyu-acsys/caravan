@@ -58,6 +58,53 @@ takes as they are or updated, also where a branch has none.
   Type Error: Only a witness record can be updated.
   [1]
 
+A record type that no invariant takes as its state is a logical record. An existential
+record is one existential per field. Unfolding a predicate whose only existential is a
+record binds that record, which a fold takes as its last argument.
+
+  $ caravan --shh logical_records.ml
+  Verification successful.
+
+  $ caravan --shh logical_records_fail.ml
+  [Error] File "logical_records_fail.proof", line 9, columns 7-13:
+  9 |   fold held b { s with c = s.n - 1 }
+             ^^^^^^
+  Verification Error: Failed to fold predicate. The body of the predicate may not hold at this point.
+  File "logical_records_fail.proof", line 3, columns 64-74:
+  3 | predicate held (b : box) = exists s : count. own b.value s.n && s.n <= s.c
+                                                                      ^^^^^^^^^^
+  Related Location: This assertion may not hold.
+  [1]
+
+  $ caravan --shh logical_records_grows.ml
+  [Error] File "logical_records_grows.proof", line 1, columns 24-25:
+  1 | type count = { n : int; c : integer [@grows] }
+                              ^
+  Syntax Error: Only the state of an invariant has [@grows] or [@helps] fields.
+  [1]
+
+  $ caravan --shh logical_records_named.ml
+  [Error] File "logical_records_named.proof", line 8, columns 31-32:
+  8 |   let (s, m) = unfold pair b { s; m } in
+                                     ^
+  Type Error: Unfold into a record to bind the existential record s, as let w = unfold p x.
+  [1]
+
+  $ caravan --shh logical_records_field.ml
+  [Error] File "logical_records_field.proof", line 4, columns 24-25:
+  4 |   ensures (t = { s with d = s.c + 1 }) =
+                              ^
+  Type Error: This record has no field d.
+  [1]
+
+  $ caravan --shh logical_records_type.ml
+  [Error] File "logical_records_type.proof", line 9, columns 23-24:
+  9 |   fold held b { s with d = 1 }
+                             ^
+  Type Error: This record expression is expected to have type count
+  There is no field d within type count.
+  [1]
+
 An assertion in a proof body is checked.
 
   $ caravan --shh lemmas_false.ml

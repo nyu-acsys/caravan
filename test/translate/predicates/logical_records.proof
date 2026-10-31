@@ -1,0 +1,39 @@
+type count = { n : int; c : integer }
+
+let slack (s : count) : integer = s.c - s.n
+
+lemma raised (s : count) returns (t : count)
+  ensures (t = { s with c = s.c + 1 } && slack t = slack s + 1) =
+  { n = s.n; c = s.c + 1 }
+
+predicate held (b : box) = exists s : count. own b.value s.n && s.n <= s.c
+
+lemma roundtrip (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  assert (slack s >= 0);
+  fold held b s
+
+lemma raise_count (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  let t = raised s in
+  fold held b t
+
+lemma literal (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  fold held b { n = s.n; c = s.c + 2 }
+
+predicate pair (b : box) (d : box) =
+  exists s : count, m : int. own b.value s.n && own d.value m && m <= s.c && s.n <= s.c
+
+lemma pair_roundtrip (b : box) (d : box)
+  requires (pair b d)
+  ensures (pair b d) =
+  let w = unfold pair b d in
+  assert (w.m <= w.s.c);
+  fold pair b d { w with s = { w.s with c = w.s.c + 1 } }

@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 - Source-level verification errors retain solver timeout explanations.
 - `--history=monotone` encodes histories of states by their current state and its lower bounds.
 - Qualified specification names retain their full paths, and contract attachment respects enclosing source scopes.
-- Proof files support checked lemmas with inferable trailing arguments, implicit predicate parameters, general invariants, logical variant types, and sets and maps.
+- Proof files support checked lemmas with inferable trailing arguments, implicit predicate parameters, general invariants, logical variant and record types, and sets and maps.
 - First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
 - Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
 - Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
