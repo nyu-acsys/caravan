@@ -16,6 +16,8 @@ Past facts resolve the state in their own module.
 
   $ caravan --shh scoped_state_past.ml
   Verification successful.
+  $ caravan --shh --history=monotone scoped_state_past.ml
+  Verification successful.
 
 A past fact still requires its invariant, even when no view is mentioned.
 

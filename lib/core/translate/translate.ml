@@ -10,7 +10,10 @@ open Translate_context
 open Procedures
 open Program_items
 
-let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
+(** The Raven program translating [source], with its histories encoded in [history], and
+    the origins of its proof obligations. *)
+let program ?(history = History.default) (source : Source.t) :
+    (R.Program.t * origin list, error) Result.t =
   let* scopes = Program_scopes.run source in
   let {
     Program_scopes.annotations;
@@ -100,7 +103,7 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
   } =
     proofs
   in
-  let* shaped = Program_structures.run scopes decls proofs in
+  let* shaped = Program_structures.run ~history scopes decls proofs in
   let {
     Program_structures.structures;
     structure_member_lists;
@@ -770,5 +773,8 @@ let program (source : Source.t) : (R.Program.t * origin list, error) Result.t =
     ( R.Program.make ~loc:start
         (Prelude.members
         @ (if state.tables.dynamic_indices then Indexed_initialization.members else [])
+        @ (if List.exists structure_member_lists ~f:(fun (st, _) -> has_history st) then
+             History.program_members history
+           else [])
         @ imported_resource_members @ modules @ library_modules @ root_members),
       state.origins )

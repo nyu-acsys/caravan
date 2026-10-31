@@ -28,3 +28,8 @@
  (modules annotation_env)
  (libraries base caravan_core compiler-libs.common)
  (deps annotation_env_fixture.ml annotation_env_fixture.proof))
+
+(test
+ (name monotone_history)
+ (modules monotone_history)
+ (libraries caravan_core raven-ivl.api))

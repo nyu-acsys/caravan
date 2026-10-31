@@ -2,6 +2,8 @@ Past facts in a generic state resolve in each application and its clients.
 
   $ caravan --shh generic_state_past.ml
   Verification successful.
+  $ caravan --shh --history=monotone generic_state_past.ml
+  Verification successful.
   $ caravan --shh --emit-rav generic_state_past.ml > generic_state_past.rav
   $ raven --shh generic_state_past.rav
   Verification successful.

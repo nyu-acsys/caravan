@@ -42,6 +42,17 @@ let smt_timeout =
     & opt int Raven_api.default_options.smt_timeout
     & info [ "smt-timeout" ] ~docv:"MS" ~doc)
 
+let history =
+  let doc =
+    "How histories of states are encoded: $(b,sets), by the set of the states that the \
+     current one extends, or $(b,monotone), by the current state, with lower bounds of \
+     it as snapshots."
+  in
+  Arg.(
+    value
+    & opt (enum Caravan_core.History.encodings) Caravan_core.History.default
+    & info [ "history" ] ~docv:"ENCODING" ~doc)
+
 let include_dirs =
   let doc =
     "Look for libraries, interfaces without an implementation, also in $(docv), after \
@@ -53,11 +64,11 @@ let files =
   let doc = "The OCaml files to verify." in
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
 
-let main () no_greeting include_dirs emit_rav smt_timeout files =
+let main () no_greeting include_dirs history emit_rav smt_timeout files =
   if not no_greeting then Logs.app (fun m -> m "%s" greeting);
   (* Every file is checked, also after one that fails. *)
   let results =
-    List.map (Caravan_core.Check.file ~include_dirs ~emit_rav ~smt_timeout) files
+    List.map (Caravan_core.Check.file ~include_dirs ~history ~emit_rav ~smt_timeout) files
   in
   let verified = List.for_all Fun.id results in
   if verified then 0 else 1
@@ -66,6 +77,7 @@ let cmd =
   let info = Cmd.info "caravan" ~version:Caravan_config.version in
   Cmd.v info
     Term.(
-      const main $ setup $ no_greeting $ include_dirs $ emit_rav $ smt_timeout $ files)
+      const main $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ smt_timeout
+      $ files)
 
 let () = Stdlib.exit (Cmd.eval' cmd)

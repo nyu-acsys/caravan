@@ -117,6 +117,8 @@ let run (source : Source.t) : (t, error) Result.t =
   Fresh_names.reset ();
   Fresh_names.reserve
     [
+      Monotone_history.order_interface;
+      Monotone_history.algebra;
       "Library";
       "List";
       "Option";

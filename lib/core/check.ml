@@ -60,17 +60,17 @@ let blame ~explicit_proof_files (d : R.Diagnostic.t) : R.Diagnostic.t =
       }
   | _ -> d
 
-(** Verifies [file], with the libraries in [include_dirs], giving the solver [smt_timeout]
-    milliseconds a query; whether it verified. With [emit_rav], the Raven program is
-    printed instead. *)
-let file ~(include_dirs : string list) ~(emit_rav : bool) ~(smt_timeout : int)
-    (file : string) : bool =
+(** Verifies [file], with the libraries in [include_dirs], encoding histories in [history]
+    and giving the solver [smt_timeout] milliseconds a query; whether it verified. With
+    [emit_rav], the Raven program is printed instead. *)
+let file ~(include_dirs : string list) ~(history : History.encoding) ~(emit_rav : bool)
+    ~(smt_timeout : int) (file : string) : bool =
   match Source.load ~include_dirs file with
   | Error error ->
       Report.print error;
       false
   | Ok source -> (
-      match Translate.program source with
+      match Translate.program ~history source with
       | Error error ->
           Report.print error;
           false

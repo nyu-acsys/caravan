@@ -61,8 +61,8 @@ let state_members ~(declaration_context : string -> Module_context.t) group list
         members
       |> Option.value ~default:[])
 
-let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
-    (proofs : Program_proofs.t) : (t, error) Result.t =
+let run ~(history : History.encoding) (scopes : Program_scopes.t)
+    (decls : Program_declarations.t) (proofs : Program_proofs.t) : (t, error) Result.t =
   let { Program_scopes.funcs; generic_proofs; generics; _ } = scopes in
   let declaration_context =
     Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
@@ -683,25 +683,17 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   let* structure_member_lists =
     all structures ~f:(fun st ->
-        let* members = structure_members types st ~at:st.at in
+        let* members = structure_members ~history types st ~at:st.at in
         Ok (st, members))
   in
   let history_fields =
     List.filter_map structures ~f:(fun st ->
         Option.some_if (has_history st)
           (let l = R.Loc.none in
-           let qn m x = qualified_name ~loc:l (m ^ "." ^ x) in
            ( Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst,
              ( member_name st "history",
                R.Type.named ~loc:l (qualified_name ~loc:l (module_name st "history")) [],
-               Some
-                 (R.Expr.call ~loc:l
-                    (qn (module_name st "history") "full")
-                    [
-                      R.Expr.call ~loc:l
-                        (qn (module_name st "states") "set")
-                        [ R.Expr.set ~loc:l [] ];
-                    ]) ) )))
+               Some (history_elements ~loc:l history st).initial ) )))
   in
   let view_fields = view_fields @ history_fields in
   let owner_destination = owner_destination ~declaration_context in
@@ -763,6 +755,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     {
       persistent;
       member_aliases = (if Option.is_none group then application_aliases else []);
+      history;
       views = view_names;
       structures =
         (List.filter_map declared_structures ~f:(fun st ->

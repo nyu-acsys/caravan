@@ -598,30 +598,6 @@ let state_of ~loc:l st values =
     (generated_module_member ~loc:l (module_name st "state") "state")
     values
 
-(** That the snapshot [snapshot] of [st]'s history, on the structure [structure], has the
-    value [e] at the position [k] of its field [field]. *)
-let past_fact ~loc:l st ~structure ~field ~snapshot ~k e =
-  let qn m x = generated_module_member ~loc:l m x in
-  let entries = R.Expr.field ~loc:l snapshot (qualified_name ~loc:l field) in
-  let bin op a b = R.Expr.binary ~loc:l op a b in
-  List.reduce_exn ~f:(bin And)
-    [
-      R.Expr.own ~loc:l
-        [
-          structure;
-          R.Expr.call ~loc:l
-            (qn (module_name st "history") "frag")
-            [
-              R.Expr.call ~loc:l
-                (qn (module_name st "states") "set")
-                [ R.Expr.set ~loc:l [ snapshot ] ];
-            ];
-        ];
-      bin Leq (R.Expr.int ~loc:l 0) k;
-      bin Lt k (R.Expr.call ~loc:l (qn "Seq" "length") [ entries ]);
-      bin Eq (R.Expr.index ~loc:l entries k) e;
-    ]
-
 type shared = {
   persistent : (string * Location.t) list;
       (** The invariants, by their names, with their definitions. *)
@@ -634,6 +610,7 @@ type shared = {
       (** The ghost fields of the views and histories, by the field whose allocation
           allocates them, the field of the structure's reference, with their initial
           values: arbitrary for views. *)
+  history : History.encoding;  (** How the histories of states are encoded. *)
 }
 (** The shared structures of a program: invariants and views. *)
 
@@ -655,7 +632,69 @@ let canonical_member shared member =
     ~default:member
 
 let no_shared =
-  { persistent = []; views = []; structures = []; member_aliases = []; anchors = [] }
+  {
+    persistent = [];
+    views = [];
+    structures = [];
+    member_aliases = [];
+    anchors = [];
+    history = History.default;
+  }
+
+type history_elements = {
+  auth : R.Expr.t -> R.Expr.t;  (** The authority over the current state [s]. *)
+  frag : R.Expr.t -> R.Expr.t;  (** A fragment for the state [s]. *)
+  auth_frag : R.Expr.t -> R.Expr.t -> R.Expr.t;
+      (** The authority over [t], with a fragment for the state [s], before it. *)
+  full : R.Expr.t -> R.Expr.t;  (** The authority over [s], with a fragment for it. *)
+  initial : R.Expr.t;  (** The history as allocated, before its first state. *)
+}
+(** The elements of the history of a structure's states. *)
+
+(** The elements of the history of [st]'s states, in [encoding]. *)
+let history_elements ~loc:l (encoding : History.encoding) st =
+  let call f args =
+    R.Expr.call ~loc:l (generated_module_member ~loc:l (module_name st "history") f) args
+  in
+  match encoding with
+  | Sets ->
+      let set s =
+        R.Expr.call ~loc:l
+          (generated_module_member ~loc:l (module_name st "states") "set")
+          [ s ]
+      in
+      let all s =
+        set (R.Expr.call ~loc:l (qualified_name ~loc:l (member_name st "states")) [ s ])
+      and one s = set (R.Expr.set ~loc:l [ s ]) in
+      {
+        auth = (fun s -> call "auth" [ all s ]);
+        frag = (fun s -> call "frag" [ one s ]);
+        auth_frag = (fun t s -> call "auth_frag" [ all t; one s ]);
+        full = (fun s -> call "full" [ all s ]);
+        initial = call "full" [ set (R.Expr.set ~loc:l []) ];
+      }
+  | Monotone ->
+      {
+        auth = (fun s -> call "auth" [ s ]);
+        frag = (fun s -> call "frag" [ s ]);
+        auth_frag = (fun t s -> call "auth_frag" [ t; s ]);
+        full = (fun s -> call "full" [ s ]);
+        initial = call "empty" [];
+      }
+
+(** That the snapshot [snapshot] of [st]'s history, on the structure [structure], has the
+    value [e] at the position [k] of its field [field]. *)
+let past_fact ~loc:l ~history st ~structure ~field ~snapshot ~k e =
+  let qn m x = generated_module_member ~loc:l m x in
+  let entries = R.Expr.field ~loc:l snapshot (qualified_name ~loc:l field) in
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  List.reduce_exn ~f:(bin And)
+    [
+      R.Expr.own ~loc:l [ structure; (history_elements ~loc:l history st).frag snapshot ];
+      bin Leq (R.Expr.int ~loc:l 0) k;
+      bin Lt k (R.Expr.call ~loc:l (qn "Seq" "length") [ entries ]);
+      bin Eq (R.Expr.index ~loc:l entries k) e;
+    ]
 
 let implicit_parameter_count ~kind parameters =
   let rec check seen count = function

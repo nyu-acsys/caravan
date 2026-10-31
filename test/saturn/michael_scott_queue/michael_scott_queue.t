@@ -1,5 +1,7 @@
   $ caravan --shh -I ../backoff --smt-timeout=30000 michael_scott_queue.ml
   Verification successful.
+  $ caravan --shh --history=monotone -I ../backoff --smt-timeout=30000 michael_scott_queue.ml
+  Verification successful.
 
 The emitted history proof, including its dynamic initializer, is standalone Raven.
 

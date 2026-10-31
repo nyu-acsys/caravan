@@ -927,11 +927,7 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
           let history =
             if has_history st then
               let qn m x = generated_module_member ~loc:l m x in
-              let full s =
-                R.Expr.call ~loc:l
-                  (qn (module_name st "history") "full")
-                  [ R.Expr.call ~loc:l (qn (module_name st "states") "set") [ s ] ]
-              in
+              let history = history_elements ~loc:l ctx.given.shared.history st in
               let state =
                 R.Expr.call ~loc:l
                   (qn (module_name st "state") "state")
@@ -948,14 +944,7 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
               [
                 R.Stmt.call ~loc:l
                   (R.Expr.call ~loc:l (name ~loc:l "fpu")
-                     [
-                       location;
-                       full (R.Expr.set ~loc:l []);
-                       full
-                         (R.Expr.call ~loc:l
-                            (qualified_name ~loc:l (member_name st "states"))
-                            [ state ]);
-                     ]);
+                     [ location; history.initial; history.full state ]);
               ]
             else []
           in
@@ -1160,8 +1149,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
         ],
         (var snapshot, var k) ),
       R.Spec.make
-        (past_fact ~loc:l st ~structure ~field:p.field ~snapshot:(var snapshot) ~k:(var k)
-           e) )
+        (past_fact ~loc:l ~history:ctx.given.shared.history st ~structure ~field:p.field
+           ~snapshot:(var snapshot) ~k:(var k) e) )
   in
   let* past_params = State.all past_pres ~f:witnesses in
   let* past_results = State.all past_posts ~f:witnesses in

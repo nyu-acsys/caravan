@@ -632,10 +632,11 @@ let chain_of ~state (t : S.term) =
   | _ -> None
 
 (** The members generated for the state of [st]: the state of its growing fields as a data
-    type, its order, with transitivity, the states it extends, their history as a resource
-    algebra and its ghost field, and lemmas taking snapshots of the history and growing
-    it. *)
-let structure_members types (st : structure) ~at : (R.Member.t list, error) Result.t =
+    type and its order, with transitivity; and, if it has a history, the history as a
+    resource algebra in the encoding [history], with what defines it, its ghost field, and
+    lemmas taking snapshots of the history and growing it. *)
+let structure_members ~(history : History.encoding) types (st : structure) ~at :
+    (R.Member.t list, error) Result.t =
   let l = loc at in
   let n x = R.Name.make ~loc:l x in
   let qn m x = generated_module_member ~loc:l m x in
@@ -647,10 +648,10 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
   let decl x t = R.Var.make ~loc:l (ident ~loc:l x) t in
   let length s = call (qn "Seq" "length") [ s ] in
   let extends a b = call (qualified_name ~loc:l (member_name st "extends")) [ a; b ] in
-  let states s = call (qualified_name ~loc:l (member_name st "states")) [ s ] in
-  let set_module = module_name st "states"
+  let order_module = module_name st "order"
+  and set_module = module_name st "states"
   and history_module = module_name st "history" in
-  let auth s = call (qn history_module "auth") [ call (qn set_module "set") [ s ] ] in
+  let elements = history_elements ~loc:l history st in
   let history_field = member_name st "history" in
   let* structure_typ = Datatypes.typ types ~at st.structure_type in
   let* anchored =
@@ -699,6 +700,37 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
     in
     Option.value (List.reduce grows ~f:(bin And)) ~default:(R.Expr.bool ~loc:l true)
   in
+  (* For the monotone encoding: sequences are compatible if one is a prefix of the other,
+     and join to the longer one; pending calls join to their union, integers to their
+     maximum. *)
+  let compat, join =
+    let a = var "a" and b = var "b" in
+    let field e f = R.Expr.field ~loc:l e (n f) in
+    let parts =
+      List.filter_map st.fields ~f:(fun (f, _, _, t, grows) ->
+          if not grows then None
+          else
+            let x = field a f and y = field b f in
+            match Datatypes.desc types t with
+            | Tconstr (p, [ _ ], _)
+              when Option.exists (Datatypes.find types p) ~f:Datatypes.is_sequence ->
+                let shorter = bin Leq (length x) (length y) in
+                Some
+                  ( Some
+                      (R.Expr.ite ~loc:l shorter
+                         (bin Eq x (R.Expr.slice_to ~loc:l y (length x)))
+                         (bin Eq y (R.Expr.slice_to ~loc:l x (length y)))),
+                    R.Expr.ite ~loc:l shorter y x )
+            | _ when List.exists st.pendings ~f:(fun p -> String.equal p.pending_field f)
+              ->
+                Some (None, bin Union x y)
+            | _ -> Some (None, R.Expr.ite ~loc:l (bin Leq x y) y x))
+    in
+    ( Option.value
+        (List.reduce (List.filter_map parts ~f:fst) ~f:(bin And))
+        ~default:(R.Expr.bool ~loc:l true),
+      call (qn state_module "state") (List.map parts ~f:snd) )
+  in
   let func name formals ret body =
     R.Member.callable
       (R.Callable.func ~loc:l ~formals
@@ -713,6 +745,53 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
          (generated_ident ~loc:l name) (Some body))
   in
   let fpu location a b = R.Stmt.call ~loc:l (call (n "fpu") [ location; a; b ]) in
+  let order_function name ret body =
+    R.Member.callable
+      (R.Callable.func ~loc:l
+         ~formals:
+           [
+             decl "a" (R.Type.named ~loc:l (n "T") []);
+             decl "b" (R.Type.named ~loc:l (n "T") []);
+           ]
+         ~returns:[ decl "ret" ret ]
+         (ident ~loc:l name) (Some body))
+  in
+  let instance name ~def =
+    R.Member.instance ~loc:l ~def:(name, def) (generated_ident ~loc:l history_module) name
+  in
+  (* The history's resource algebra, and what defines it. *)
+  let algebra =
+    match history with
+    | Sets ->
+        let library = R.Name.make ~loc:l ~path:[ "Library" ] in
+        [
+          func (member_name st "states")
+            [ decl "s" state_type ]
+            (R.Type.set ~loc:l state_type)
+            (R.Expr.set_compr ~loc:l (decl "e" state_type) (extends (var "e") (var "s")));
+          R.Member.instance ~loc:l
+            ~def:(library "SetRA", [ state_type ])
+            (generated_ident ~loc:l set_module)
+            (library "SetRA");
+          instance (library "Auth")
+            ~def:[ R.Type.named ~loc:l (qualified_name ~loc:l set_module) [] ];
+        ]
+    | Monotone ->
+        [
+          R.Member.module_ ~loc:l
+            ~implements:[ (n Monotone_history.order_interface, []) ]
+            (generated_ident ~loc:l order_module)
+            ([
+               R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "T") (Some state_type);
+               order_function "le" (R.Type.bool ~loc:l) (extends (var "a") (var "b"));
+               order_function "compat" (R.Type.bool ~loc:l) compat;
+               order_function "join" (R.Type.named ~loc:l (n "T") []) join;
+             ]
+            @ Monotone_history.laws R.Callable.Lemma);
+          instance (n Monotone_history.algebra)
+            ~def:[ R.Type.named ~loc:l (qualified_name ~loc:l order_module) [] ];
+        ]
+  in
   let x = var "x" and s = var "s" and s1 = var "s1" and s2 = var "s2" in
   let history = anchored x in
   Ok
@@ -729,90 +808,40 @@ let structure_members types (st : structure) ~at : (R.Member.t list, error) Resu
          ~requires:[ bin And (extends (var "a") (var "b")) (extends (var "b") (var "c")) ]
          ~ensures:[ extends (var "a") (var "c") ]
          [];
-       func (member_name st "states")
-         [ decl "s" state_type ]
-         (R.Type.set ~loc:l state_type)
-         (R.Expr.set_compr ~loc:l (decl "e" state_type) (extends (var "e") s));
-       R.Member.instance ~loc:l
-         ~def:(R.Name.make ~loc:l ~path:[ "Library" ] "SetRA", [ state_type ])
-         (generated_ident ~loc:l set_module)
-         (R.Name.make ~loc:l ~path:[ "Library" ] "SetRA");
-       R.Member.instance ~loc:l
-         ~def:
-           ( R.Name.make ~loc:l ~path:[ "Library" ] "Auth",
-             [ R.Type.named ~loc:l (qualified_name ~loc:l set_module) [] ] )
-         (generated_ident ~loc:l history_module)
-         (R.Name.make ~loc:l ~path:[ "Library" ] "Auth");
-       R.Member.field ~loc:l ~ghost:true
-         (generated_ident ~loc:l history_field)
-         (R.Type.named ~loc:l (qualified_name ~loc:l history_module) []);
-       (* Takes note of the current state. *)
-       lemma (member_name st "snapshot")
-         [ decl "x" structure_typ; decl "s" state_type ]
-         ~requires:[ R.Expr.own ~loc:l [ history; auth (states s) ] ]
-         ~ensures:
-           [
-             R.Expr.own ~loc:l
-               [
-                 history;
-                 call
-                   (qn history_module "auth_frag")
-                   [
-                     call (qn set_module "set") [ states s ];
-                     call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
-                   ];
-               ];
-           ]
-         [
-           fpu history
-             (auth (states s))
-             (call
-                (qn history_module "auth_frag")
-                [
-                  call (qn set_module "set") [ states s ];
-                  call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
-                ]);
-         ];
-       (* Moves the history on to a state that extends the current one. *)
-       lemma (member_name st "learn")
-         [ decl "x" structure_typ; decl "s1" state_type; decl "s2" state_type ]
-         ~requires:
-           [ bin And (R.Expr.own ~loc:l [ history; auth (states s1) ]) (extends s1 s2) ]
-         ~ensures:
-           [
-             R.Expr.own ~loc:l
-               [
-                 history;
-                 call (qn history_module "full")
-                   [ call (qn set_module "set") [ states s2 ] ];
-               ];
-           ]
-         [
-           fpu history
-             (auth (states s1))
-             (call (qn history_module "full")
-                [ call (qn set_module "set") [ states s2 ] ]);
-         ];
-       (* A snapshot precedes the current state. *)
-       (let t = var "t" in
-        let both =
-          R.Expr.own ~loc:l
-            [
-              history;
-              call
-                (qn history_module "auth_frag")
-                [
-                  call (qn set_module "set") [ states t ];
-                  call (qn set_module "set") [ R.Expr.set ~loc:l [ s ] ];
-                ];
-            ]
-        in
-        lemma (member_name st "observe")
-          [ decl "x" structure_typ; decl "s" state_type; decl "t" state_type ]
-          ~requires:[ both ]
-          ~ensures:[ both; extends s t ]
-          []);
      ]
+    @ (if not (has_history st) then []
+       else
+         algebra
+         @ [
+             R.Member.field ~loc:l ~ghost:true
+               (generated_ident ~loc:l history_field)
+               (R.Type.named ~loc:l (qualified_name ~loc:l history_module) []);
+             (* Takes note of the current state. *)
+             lemma (member_name st "snapshot")
+               [ decl "x" structure_typ; decl "s" state_type ]
+               ~requires:[ R.Expr.own ~loc:l [ history; elements.auth s ] ]
+               ~ensures:[ R.Expr.own ~loc:l [ history; elements.auth_frag s s ] ]
+               [ fpu history (elements.auth s) (elements.auth_frag s s) ];
+             (* Moves the history on to a state that extends the current one. *)
+             lemma (member_name st "learn")
+               [ decl "x" structure_typ; decl "s1" state_type; decl "s2" state_type ]
+               ~requires:
+                 [
+                   bin And
+                     (R.Expr.own ~loc:l [ history; elements.auth s1 ])
+                     (extends s1 s2);
+                 ]
+               ~ensures:[ R.Expr.own ~loc:l [ history; elements.full s2 ] ]
+               [ fpu history (elements.auth s1) (elements.full s2) ];
+             (* A snapshot precedes the current state. *)
+             (let t = var "t" in
+              let both = R.Expr.own ~loc:l [ history; elements.auth_frag t s ] in
+              lemma (member_name st "observe")
+                [ decl "x" structure_typ; decl "s" state_type; decl "t" state_type ]
+                ~requires:[ both ]
+                ~ensures:[ both; extends s t ]
+                []);
+           ])
     @ List.map st.chains ~f:(fun (field, _) ->
         (* A later state keeps the entries of an earlier one at their positions. *)
         let t = var "t" and k = var "k" in

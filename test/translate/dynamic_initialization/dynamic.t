@@ -3,6 +3,8 @@ tuple results, successive bindings, and lexical shadowing.
 
   $ caravan --shh dynamic.ml
   Verification successful.
+  $ caravan --shh --history=monotone dynamic.ml
+  Verification successful.
 
 The generated checked helper, including its decreases measure, prints as Raven.
 

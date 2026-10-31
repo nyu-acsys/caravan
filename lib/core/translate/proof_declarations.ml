@@ -565,17 +565,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                 R.Expr.field ~loc:l
                   (anchored (var structure))
                   (qualified_name ~loc:l (member_name st "history"));
-                R.Expr.call ~loc:l
-                  (qn (module_name st "history") "auth")
-                  [
-                    R.Expr.call ~loc:l
-                      (qn (module_name st "states") "set")
-                      [
-                        R.Expr.call ~loc:l
-                          (qualified_name ~loc:l (member_name st "states"))
-                          [ state_value ];
-                      ];
-                  ];
+                (history_elements ~loc:l shared.history st).auth state_value;
               ];
           ]
         else []
