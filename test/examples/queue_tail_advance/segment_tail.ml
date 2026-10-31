@@ -2,47 +2,31 @@ let swing_tail q =
   let old_tail =
     Atomic.get q.tail
     (*@ Ghost.scope (fun step ->
-      let (root, head, last, tail, retired_values, values,
-           retired_fp, active_fp, retired_links, active_links,
-           waiting, waiting_on) =
-        unfold is_queue q {root; head; last; tail; retired_values; values;
-          retired_fp; active_fp; retired_links; active_links; waiting;
-          waiting_on} in
+      let s = unfold is_queue q in
       let result = step () in
-      is_queue_published_snapshot q
-        (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-        (Finset.union retired_links active_links)
-        (Finset.union retired_fp (Finset.singleton head)) waiting result;
+      issue_fact q s (Published result);
       fold is_queue q;
       result) *)
   in
   match
     Atomic.get old_tail
     (*@ Ghost.scope (fun step ->
-      let (root, head, last, tail, retired_values, values,
-           retired_fp, active_fp, retired_links, active_links,
-           waiting, waiting_on) =
-        unfold is_queue q {root; head; last; tail; retired_values; values;
-          retired_fp; active_fp; retired_links; active_links; waiting;
-          waiting_on} in
-      is_queue_published_observe q old_tail
-        (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-        (Finset.union retired_links active_links)
-        (Finset.union retired_fp (Finset.singleton head)) waiting;
-      segment_info root head;
-      segment_info head last;
+      let s = unfold is_queue q in
+      observe_fact q s (Published old_tail);
+      segment_info s.root s.head;
+      segment_info s.head s.last;
       let exposure =
-        if old_tail == last then At_last
-        else if Finset.mem old_tail retired_fp then
+        if old_tail == s.last then At_last
+        else if Finset.mem old_tail s.retired_fp then
           let (before, before_fp, before_links, value, next,
                after, after_fp, after_links) =
-            segment_split root head retired_values retired_fp retired_links old_tail in
+            segment_split s.root s.head s.retired_values s.retired_fp s.retired_links old_tail in
           Retired_cell (before, before_fp, before_links, value, next,
             after, after_fp, after_links)
         else
           let (before, before_fp, before_links, value, next,
                after, after_fp, after_links) =
-            segment_split head last values active_fp active_links old_tail in
+            segment_split s.head s.last s.values s.active_fp s.active_links old_tail in
           Active_cell (before, before_fp, before_links, value, next,
             after, after_fp, after_links)
       in
@@ -51,21 +35,17 @@ let swing_tail q =
       | At_last -> ()
       | Retired_cell (before, before_fp, before_links, value, next,
           after, after_fp, after_links) ->
-          segment_restore root old_tail next head before after
+          segment_restore s.root old_tail next s.head before after
             before_fp after_fp before_links after_links value
       | Active_cell (before, before_fp, before_links, value, next,
           after, after_fp, after_links) ->
-          segment_restore head old_tail next last before after
+          segment_restore s.head old_tail next s.last before after
             before_fp after_fp before_links after_links value
       end;
       begin match result with
       | Nil -> ()
       | Next (value, next) ->
-          is_queue_link_snapshot q
-            (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-            (Finset.union retired_links active_links)
-            (Finset.union retired_fp (Finset.singleton head)) waiting
-            (Edge (old_tail, value, next))
+          issue_fact q s (Linked (Edge (old_tail, value, next)))
       end;
       fold is_queue q;
       result) *)
@@ -75,19 +55,11 @@ let swing_tail q =
       if
         Atomic.compare_and_set q.tail old_tail next
         (*@ Ghost.scope (fun step ->
-          let (root, head, last, tail, retired_values, values,
-               retired_fp, active_fp, retired_links, active_links,
-               waiting, waiting_on) =
-            unfold is_queue q {root; head; last; tail; retired_values; values;
-              retired_fp; active_fp; retired_links; active_links; waiting;
-              waiting_on} in
-          is_queue_link_observe q (Edge (old_tail, value, next))
-            (Finset.union retired_fp (Finset.union active_fp (Finset.singleton last)))
-            (Finset.union retired_links active_links)
-            (Finset.union retired_fp (Finset.singleton head)) waiting;
-          consecutive_segment_edges root head last retired_values values
-            retired_fp active_fp retired_links active_links;
-          segment_info head last;
+          let s = unfold is_queue q in
+          observe_fact q s (Linked (Edge (old_tail, value, next)));
+          consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+            s.retired_fp s.active_fp s.retired_links s.active_links;
+          segment_info s.head s.last;
           let result = step () in
           if result then
             fold is_queue q {tail = next}

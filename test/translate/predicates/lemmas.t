@@ -60,7 +60,8 @@ takes as they are or updated, also where a branch has none.
 
 A record type that no invariant takes as its state is a logical record. An existential
 record is one existential per field. Unfolding a predicate whose only existential is a
-record binds that record, which a fold takes as its last argument.
+record binds that record, which a fold takes as its last argument. A fold can also name
+some of its fields, leaving the others to Raven.
 
   $ caravan --shh logical_records.ml
   Verification successful.

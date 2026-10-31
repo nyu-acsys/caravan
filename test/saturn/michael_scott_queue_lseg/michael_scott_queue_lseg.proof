@@ -257,28 +257,6 @@ let facts_of (published : node Atomic.t finset) (links : edge finset)
     | Head_seen cell -> Finset.mem cell seen
     | Registered reg -> Finset.mem reg waiting)
 
-lemma published_fact (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-    (cell : node Atomic.t)
-  requires (Finset.mem cell published)
-  ensures (Set.mem (Published cell) (facts_of published links seen waiting)) = ()
-
-lemma linked_fact (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset) (link : edge)
-  requires (Finset.mem link links)
-  ensures (Set.mem (Linked link) (facts_of published links seen waiting)) = ()
-
-lemma head_fact (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-    (cell : node Atomic.t)
-  requires (Finset.mem cell seen)
-  ensures (Set.mem (Head_seen cell) (facts_of published links seen waiting)) = ()
-
-lemma registration_fact (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset) (reg : Ghost.t)
-  requires (Finset.mem reg waiting)
-  ensures (Set.mem (Registered reg) (facts_of published links seen waiting)) = ()
-
 lemma facts_grow (before_pub : node Atomic.t finset)
     (after_pub : node Atomic.t finset) (before_links : edge finset)
     (after_links : edge finset) (before_seen : node Atomic.t finset)
@@ -291,180 +269,6 @@ lemma facts_grow (before_pub : node Atomic.t finset)
   ensures (Set.subset
     (facts_of before_pub before_links before_seen before_waiting)
     (facts_of after_pub after_links after_seen after_waiting)) = ()
-
-lemma issue_fact (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (f : fact)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  requires (Set.mem f (facts_of published links seen waiting))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton f)))) =
-  Ghost.fpu (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting)))
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton f)))
-
-lemma observe_fact (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (f : fact)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton f))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton f))))
-  ensures (Set.mem f (facts_of published links seen waiting)) = ()
-
-lemma is_queue_published_snapshot (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (cell : node Atomic.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  requires (Finset.mem cell published)
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Published cell))))) =
-  published_fact published links seen waiting cell;
-  issue_fact q published links seen waiting (Published cell)
-
-lemma is_queue_published_observe (q : t) (cell : node Atomic.t)
-    (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Published cell)))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Published cell)))))
-  ensures (Finset.mem cell published) =
-  observe_fact q published links seen waiting (Published cell)
-
-lemma is_queue_link_snapshot (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (link : edge)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  requires (Finset.mem link links)
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Linked link))))) =
-  linked_fact published links seen waiting link;
-  issue_fact q published links seen waiting (Linked link)
-
-lemma is_queue_link_observe (q : t) (link : edge)
-    (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Linked link)))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Linked link)))))
-  ensures (Finset.mem link links) =
-  observe_fact q published links seen waiting (Linked link)
-
-lemma is_queue_head_snapshot (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (cell : node Atomic.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  requires (Finset.mem cell seen)
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Head_seen cell))))) =
-  head_fact published links seen waiting cell;
-  issue_fact q published links seen waiting (Head_seen cell)
-
-lemma is_queue_head_observe (q : t) (cell : node Atomic.t)
-    (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Head_seen cell)))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Head_seen cell)))))
-  ensures (Finset.mem cell seen) =
-  observe_fact q published links seen waiting (Head_seen cell)
-
-lemma is_queue_registration_snapshot (q : t)
-    (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset) (reg : Ghost.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  requires (Finset.mem reg waiting)
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Registered reg))))) =
-  registration_fact published links seen waiting reg;
-  issue_fact q published links seen waiting (Registered reg)
-
-lemma is_queue_registration_observe (q : t) (reg : Ghost.t)
-    (published : node Atomic.t finset) (links : edge finset)
-    (seen : node Atomic.t finset) (waiting : Ghost.t finset)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Registered reg)))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth_frag (Facts.set (facts_of published links seen waiting))
-      (Facts.set (Set.singleton (Registered reg)))))
-  ensures (Finset.mem reg waiting) =
-  observe_fact q published links seen waiting (Registered reg)
-
-lemma is_queue_fact_link (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (old_last : node Atomic.t)
-    (value : int) (new_last : node Atomic.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.full (Facts.set
-      (facts_of (Finset.union published (Finset.singleton new_last))
-        (Finset.union links (Finset.singleton (Edge (old_last, value, new_last))))
-        seen waiting)))) =
-  facts_grow published (Finset.union published (Finset.singleton new_last))
-    links (Finset.union links (Finset.singleton (Edge (old_last, value, new_last))))
-    seen seen waiting waiting;
-  Ghost.fpu (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting)))
-    (Fact_auth.full (Facts.set
-      (facts_of (Finset.union published (Finset.singleton new_last))
-        (Finset.union links (Finset.singleton (Edge (old_last, value, new_last))))
-        seen waiting)))
-
-lemma is_queue_fact_pop (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (new_head : node Atomic.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.full (Facts.set
-      (facts_of published links (Finset.union seen (Finset.singleton new_head))
-        waiting)))) =
-  facts_grow published published links links seen
-    (Finset.union seen (Finset.singleton new_head)) waiting waiting;
-  Ghost.fpu (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting)))
-    (Fact_auth.full (Facts.set
-      (facts_of published links (Finset.union seen (Finset.singleton new_head))
-        waiting)))
-
-lemma is_queue_fact_register (q : t) (published : node Atomic.t finset)
-    (links : edge finset) (seen : node Atomic.t finset)
-    (waiting : Ghost.t finset) (reg : Ghost.t)
-  requires (own (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting))))
-  ensures (own (Ghost.at facts_auth q.head)
-    (Fact_auth.full (Facts.set
-      (facts_of published links seen (Finset.union waiting (Finset.singleton reg)))))) =
-  facts_grow published published links links seen seen waiting
-    (Finset.union waiting (Finset.singleton reg));
-  Ghost.fpu (Ghost.at facts_auth q.head)
-    (Fact_auth.auth (Facts.set (facts_of published links seen waiting)))
-    (Fact_auth.full (Facts.set
-      (facts_of published links seen (Finset.union waiting (Finset.singleton reg)))))
 
 let waiting_watched : (Ghost.t, node Atomic.t) Ghost.field = Ghost.field ()
 let waiting_linked : (Ghost.t, bool) Ghost.field = Ghost.field ()
@@ -483,43 +287,84 @@ predicate waiting_registration (reg : Ghost.t) (q : t) =
 predicate queue (q : t) (xs [@implicit] : int list) =
   own ~fraction:Permission.half (Ghost.at view_queue q.head) xs
 
+(* The invariant's witnesses: the cells of the queue's two segments, their values, links
+   and footprints, and the registered is_empty calls. *)
+type state = {
+  root : node Atomic.t; head : node Atomic.t; last : node Atomic.t; tail : node Atomic.t;
+  retired_values : int list; values : int list;
+  retired_fp : node Atomic.t finset; active_fp : node Atomic.t finset;
+  retired_links : edge finset; active_links : edge finset;
+  waiting : Ghost.t finset; waiting_on : (Ghost.t, node Atomic.t) map;
+}
+
+let footprint (s : state) : node Atomic.t finset =
+  Finset.union s.retired_fp (Finset.union s.active_fp (Finset.singleton s.last))
+
+let links (s : state) : edge finset = Finset.union s.retired_links s.active_links
+let seen (s : state) : node Atomic.t finset = Finset.union s.retired_fp (Finset.singleton s.head)
+
+let facts (s : state) : fact set = facts_of (footprint s) (links s) (seen s) s.waiting
+
+let holds (s : state) (f : fact) : bool =
+  match f with
+  | Published cell -> Finset.mem cell (footprint s)
+  | Linked edge -> Finset.mem edge (links s)
+  | Head_seen cell -> Finset.mem cell (seen s)
+  | Registered reg -> Finset.mem reg s.waiting
+
 invariant is_queue (q : t) =
-  exists root : node Atomic.t, head : node Atomic.t,
-    last : node Atomic.t, tail : node Atomic.t,
-    retired_values : int list, values : int list,
-    retired_fp : node Atomic.t finset, active_fp : node Atomic.t finset,
-    retired_links : edge finset, active_links : edge finset,
-    waiting : Ghost.t finset, waiting_on : (Ghost.t, node Atomic.t) map.
+  exists s : state.
     q.head != q.tail
-    && own q.head head
-    && own q.tail tail
-    && segment root head retired_values retired_fp retired_links
-    && segment head last values active_fp active_links
-    && own last Nil
-    && Finset.inter retired_fp active_fp = Finset.empty
-    && not (Finset.mem last retired_fp)
-    && not (Finset.mem last active_fp)
-    && Finset.mem tail
-         (Finset.union retired_fp
-           (Finset.union active_fp (Finset.singleton last)))
+    && own q.head s.head
+    && own q.tail s.tail
+    && segment s.root s.head s.retired_values s.retired_fp s.retired_links
+    && segment s.head s.last s.values s.active_fp s.active_links
+    && own s.last Nil
+    && Finset.inter s.retired_fp s.active_fp = Finset.empty
+    && not (Finset.mem s.last s.retired_fp)
+    && not (Finset.mem s.last s.active_fp)
+    && Finset.mem s.tail (footprint s)
     && (forall reg : Ghost.t.
-          Finset.mem reg waiting ->
+          Finset.mem reg s.waiting ->
             own ~fraction:Permission.half (Ghost.at waiting_watched reg)
-              (Map.get waiting_on reg)
-            && Finset.mem (Map.get waiting_on reg)
-                 (Finset.union retired_fp
-                   (Finset.union active_fp (Finset.singleton last)))
+              (Map.get s.waiting_on reg)
+            && Finset.mem (Map.get s.waiting_on reg) (footprint s)
             && own ~fraction:Permission.half (Ghost.at waiting_linked reg)
-                 (Map.get waiting_on reg != last)
+                 (Map.get s.waiting_on reg != s.last)
             && waiting_registration reg q)
-    && own ~fraction:Permission.half (Ghost.at view_queue q.head) values
+    && own ~fraction:Permission.half (Ghost.at view_queue q.head) s.values
     && own (Ghost.at facts_auth q.head)
-         (Fact_auth.auth (Facts.set
-           (facts_of
-             (Finset.union retired_fp
-               (Finset.union active_fp (Finset.singleton last)))
-             (Finset.union retired_links active_links)
-             (Finset.union retired_fp (Finset.singleton head)) waiting)))
+         (Fact_auth.auth (Facts.set (facts s)))
+
+(* A fact of the state, as a fragment of the authority over its facts. *)
+lemma issue_fact (q : t) (s : state) (f : fact)
+  requires (own (Ghost.at facts_auth q.head) (Fact_auth.auth (Facts.set (facts s))))
+  requires (holds s f)
+  ensures (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f)))) =
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.auth (Facts.set (facts s)))
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f)))
+
+(* A fragment's fact holds of the current state. *)
+lemma observe_fact (q : t) (s : state) (f : fact)
+  requires (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f))))
+  ensures (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f))))
+  ensures (holds s f) = ()
+
+(* The facts of a state that extends another. *)
+lemma grow_facts (q : t) (s : state) (s' : state)
+  requires (own (Ghost.at facts_auth q.head) (Fact_auth.auth (Facts.set (facts s))))
+  requires (Finset.subset (footprint s) (footprint s')
+    && Finset.subset (links s) (links s') && Finset.subset (seen s) (seen s')
+    && Finset.subset s.waiting s'.waiting)
+  ensures (own (Ghost.at facts_auth q.head) (Fact_auth.full (Facts.set (facts s')))) =
+  facts_grow (footprint s) (footprint s') (links s) (links s') (seen s) (seen s')
+    s.waiting s'.waiting;
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.auth (Facts.set (facts s))) (Fact_auth.full (Facts.set (facts s')))
 
 lemma waiting_help (q : t) (cell : node Atomic.t) (xs : int list)
     (waiting : Ghost.t finset)

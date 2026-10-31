@@ -240,16 +240,26 @@ let rec predicate_use env ~unfold t witnesses make =
           | None -> predicate_application env ~unfold t witnesses make)
       end
   | _ :: _, _ when not unfold ->
-      (* The fields of a record literal given for the only existential record. *)
+      (* Named fields of the only existential record supply those fields. *)
       begin match record_existential env t with
-      | Some (id, _)
+      | Some (id, (_, (_, _, fields)))
         when not
                (List.exists witnesses ~f:(fun ((w : S.id), _) ->
                     String.equal w.pid_str id.pid_str)) ->
-          let at = id.pid_loc in
-          predicate_application env ~unfold t
-            [ (id, S.mk_term (Trecord (None, witnesses)) at) ]
-            make
+          let* witnesses =
+            State.all witnesses ~f:(fun ((field : S.id), value) ->
+                if List.Assoc.mem fields field.pid_str ~equal:String.equal then
+                  State.return
+                    ( S.mk_id ~loc:field.pid_loc
+                        (existential_field id.pid_str field.pid_str),
+                      value )
+                else
+                  State.of_result
+                    (error field.pid_loc
+                       (Printf.sprintf "The existential record %s has no field %s"
+                          id.pid_str field.pid_str)))
+          in
+          predicate_application env ~unfold t witnesses make
       | _ -> predicate_application env ~unfold t witnesses make
       end
   | _ -> predicate_application env ~unfold t witnesses make

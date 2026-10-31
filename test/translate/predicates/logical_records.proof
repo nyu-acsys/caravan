@@ -28,6 +28,12 @@ lemma literal (b : box)
   let s = unfold held b in
   fold held b { n = s.n; c = s.c + 2 }
 
+lemma partial (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  fold held b { c = s.c + 3 }
+
 predicate pair (b : box) (d : box) =
   exists s : count, m : int. own b.value s.n && own d.value m && m <= s.c && s.n <= s.c
 

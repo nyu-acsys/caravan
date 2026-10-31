@@ -222,7 +222,8 @@ is a logical type, unless an invariant takes it as its state. Its values are
 written `{ n = 0; c = 1 }` or `{ s with c = s.c + 1 }`. An existential of a
 record type, `exists s : count. ...`, stands for one existential per field. When
 it is a predicate's only existential, `let s = unfold p x in ...` binds the
-record itself, and `fold p x s` supplies one.
+record itself, and `fold p x s` supplies one; `fold p x { c = e }` supplies only
+the fields it names.
 
 Specification types include `'a finset`, `'a set`, and `('k, 'v) map` when those
 names are not already declared by the program. `Finset` and `Set` provide
