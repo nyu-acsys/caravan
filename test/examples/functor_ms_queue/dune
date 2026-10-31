@@ -46,8 +46,8 @@
  (deps
   ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
   ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
-  ../module_ms_queue/client.ml
-  clients.ml)
+  segment_client.ml
+  segment_clients.ml)
  (action
   (with-stdout-to
    %{target}
@@ -58,9 +58,9 @@
     (cat ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml)
     (echo
      "\nend\n\nmodule First = Make ()\nmodule Second = Make ()\nmodule Alias = First\n\n")
-    (cat ../module_ms_queue/client.ml)
+    (cat segment_client.ml)
     (echo "\n")
-    (cat clients.ml)))))
+    (cat segment_clients.ml)))))
 
 (rule
  (target segment_queue.proof)
@@ -95,4 +95,5 @@
   segment_queue.proof
   segment_api.mli
   ../module_ms_queue/client.ml
+  segment_client.ml
   ../../saturn/backoff/backoff.mli))

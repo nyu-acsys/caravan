@@ -1,7 +1,7 @@
 (* Saturn's Michael-Scott queue, of integers: creation, push and pop, and
    moving the tail on by a cell. *)
 
-type node = Nil | Next of int * node Atomic.t
+type node = Nil | Next of bool * node Atomic.t
 type t = { head : node Atomic.t Atomic.t; tail : node Atomic.t Atomic.t }
 
 let create () =

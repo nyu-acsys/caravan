@@ -3,7 +3,7 @@
    popping moves the head. *)
 type state = {
   cells : node Atomic.t sequence [@grows];
-  values : int sequence [@grows];
+  values : bool sequence [@grows];
   head : integer [@grows];
   tail : integer;
   waiting : node Atomic.t pending [@helps is_empty];
@@ -36,7 +36,7 @@ action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }
 
 
 predicate built_chain (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells [@implicit] : node Atomic.t list) =
+    (items : bool list) (cells [@implicit] : node Atomic.t list) =
   match items with
   | [] -> first == limit && cells === [limit]
   | value :: tail ->
@@ -45,7 +45,7 @@ predicate built_chain (first : node Atomic.t) (limit : node Atomic.t)
       && built_chain next limit tail rest
 
 lemma built_excludes_owned (first : node Atomic.t) (limit : node Atomic.t)
-    (items : int list) (cells : node Atomic.t list) (other : node Atomic.t)
+    (items : bool list) (cells : node Atomic.t list) (other : node Atomic.t)
     (contents : node)
   requires (built_chain first limit items cells && own limit Nil && own other contents)
   ensures (built_chain first limit items cells && own limit Nil && own other contents)
@@ -63,7 +63,7 @@ lemma built_excludes_owned (first : node Atomic.t) (limit : node Atomic.t)
       fold built_chain first limit items cells {next = next; rest = rest}
 
 lemma expose_built_chain (head : node Atomic.t Atomic.t option)
-    (limit : node Atomic.t) (items : int list)
+    (limit : node Atomic.t) (items : bool list)
     (first [@implicit] : node Atomic.t) (cells [@implicit] : node Atomic.t list)
   returns (cell_list : node Atomic.t list)
   requires (match head with None -> true | Some head -> own head first)
