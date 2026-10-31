@@ -18,7 +18,8 @@ let typed source =
          (structure, environment)))
 
 let proof text =
-  Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token (Lexing.from_string text)
+  (Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token (Lexing.from_string text))
+    .declarations
 
 let resolve source text =
   let structure, environment = typed source in

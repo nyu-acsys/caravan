@@ -3,12 +3,8 @@
 type t = int list Atomic.t
 
 let create () = Atomic.make_contended []
-(*@ fold stack t [] *)
-
 let of_list list = Atomic.make_contended list
-(*@ fold stack t list *)
-
-let is_empty t = Atomic.get t (*@ commit *) == []
+let is_empty t = Atomic.get t == []
 
 let rec push t value backoff =
   let before = Atomic.get t in
@@ -18,7 +14,7 @@ let rec push t value backoff =
 let push t value = push t value Backoff.default
 
 let rec pop_opt t backoff =
-  match Atomic.get t (*@ returning [] -> commit *) with
+  match Atomic.get t with
   | [] -> None
   | hd :: tail as before ->
       if Atomic.compare_and_set t before tail then Some hd
@@ -27,7 +23,7 @@ let rec pop_opt t backoff =
 let pop_opt t = pop_opt t Backoff.default
 
 let rec pop_all t backoff =
-  match Atomic.get t (*@ returning [] -> commit *) with
+  match Atomic.get t with
   | [] -> []
   | old_head ->
       if Atomic.compare_and_set t old_head [] then old_head

@@ -555,6 +555,20 @@ or companion proof file. The regression verifies both the stack implementation
 and the client against the same interface, with the representation hidden from
 the client.
 
+Instead of annotations in the `.ml`, the `.proof` file can hold proof outlines,
+which give each function's proof as steps at places in its code:
+
+```ocaml
+proof create = on return fold stack t []
+proof pop_opt t backoff = at (Atomic.get t) returning [] -> commit
+```
+
+`proof f` names the function, with its parameters when several share the name.
+`at (code) step` puts a linearization step after the one place of the function
+that `code` matches after the previous step, modulo formatting, parentheses, `@@`
+and `|>`. `on return e` runs the ghost code `e` when the function returns. A
+program with outlines has no annotations in its `.ml`.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.

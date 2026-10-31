@@ -1,0 +1,3 @@
+predicate cell (c : t) (v [@implicit] : int) = own c v
+
+proof get = after (Atomic.get c) commit

@@ -3,7 +3,7 @@ open Spec_ast
 
 let parse_proof source =
   let lexbuf = Lexing.from_string source in
-  try Spec_parser.proof Spec_lexer.token lexbuf
+  try (Spec_parser.proof Spec_lexer.token lexbuf).declarations
   with Spec_parser.Error ->
     failwith
       (Printf.sprintf "proof syntax error at %d (%S)" (Lexing.lexeme_start lexbuf)

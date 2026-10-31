@@ -920,7 +920,7 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
       ~proof_layout:(Generic_proofs.has_models source)
       inventory.Module_inventory.specializations
   in
-  let annotations = Annotation.of_comments source.comments in
+  let annotations = Source.annotations source in
   let rec field_term (term : S.term) =
     match S.past_membership term with
     | Some (element, _, _) -> field_term element

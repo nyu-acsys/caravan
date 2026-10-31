@@ -90,7 +90,7 @@ let proof_worker ~(module_contexts : Module_context.registry)
   (declaration_context name).worker
 
 let run (source : Source.t) : (t, error) Result.t =
-  let annotations = Annotation.of_comments source.comments in
+  let annotations = Source.annotations source in
   (* Each annotation on an atomic step, by the end of the code it follows. *)
   let linearizations =
     List.filter_map annotations ~f:(fun a ->

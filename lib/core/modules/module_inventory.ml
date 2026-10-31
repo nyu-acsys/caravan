@@ -1536,9 +1536,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     items { empty_module with application_identity = identity } structure.str_items
   in
   let* view =
-    collect_structure
-      (Annotation.of_comments source.comments)
-      [] ~identity:None source.scope structure
+    collect_structure (Source.annotations source) [] ~identity:None source.scope structure
   in
   let* () =
     match source.interface with

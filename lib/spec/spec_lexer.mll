@@ -63,6 +63,7 @@
         "old", OLD;
         "performs", PERFORMS;
         "predicate", PREDICATE;
+        "proof", PROOF;
         "pure", PURE;
         "requires", REQUIRES;
         "returning", RETURNING;

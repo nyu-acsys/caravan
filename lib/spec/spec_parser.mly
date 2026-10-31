@@ -134,7 +134,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS PROOF
 %token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
 
 (* Keywords *)
@@ -184,7 +184,7 @@
 %start <Spec_ast.predicate> predicate
 %start <Spec_ast.predicate> invariant_declaration
 %start <Spec_ast.ghost_module> ghost_module_declaration
-%start <Spec_ast.proof_decl list> proof
+%start <Spec_ast.proof_file> proof
 %start <Spec_ast.ghost_stmt list> ghost_stmts
 %start <Spec_ast.linearization> linearization
 %start <Spec_ast.initialization> initially
@@ -268,7 +268,41 @@ predicate_decl:
 
 (* The declarations of a proof file. *)
 proof:
-| ds = proof_decl* EOF { logical_records ds }
+| items = proof_item* EOF
+    { let declarations = List.filter_map (function `Decl d -> Some d | `Outline _ -> None) items in
+      let outlines = List.filter_map (function `Outline o -> Some o | `Decl _ -> None) items in
+      { declarations = logical_records declarations; outlines } }
+;
+
+proof_item:
+| d = proof_decl { `Decl d }
+| o = outline { `Outline o }
+;
+
+outline:
+| PROOF n = lident ps = lident* EQUAL ss = separated_nonempty_list(SEMICOLON, outline_step)
+    { { outline_name = n; outline_params = (match ps with [] -> None | ps -> Some ps);
+        outline_steps = ss; outline_loc = mk_loc $loc } }
+;
+
+outline_step:
+| a = lident LEFTPAR anchor = term RIGHTPAR action = step_linearization
+    { if a.pid_str <> "at" then
+        raise (Syntax_error (a.pid_loc, "A step is at (code) followed by its step, or on return followed by ghost code"));
+      At { anchor; anchor_loc = mk_loc $loc(anchor); action_loc = action } }
+| ON r = lident e = proof_nonseq
+    { if r.pid_str <> "return" then
+        raise (Syntax_error (r.pid_loc, "A step is at (code) followed by its step, or on return followed by ghost code"));
+      ignore e;
+      On_return { return_loc = mk_loc $loc(e) } }
+;
+
+step_linearization:
+| COMMIT { mk_loc $loc }
+| COMMIT term_arg { mk_loc $loc }
+| RETURNING mpat ARROW outcome { mk_loc $loc }
+| PERFORMS lident { mk_loc $loc }
+;
 ;
 
 proof_module_argument:

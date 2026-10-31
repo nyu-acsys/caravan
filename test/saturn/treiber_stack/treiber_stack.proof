@@ -1,2 +1,13 @@
 (* The stack owns its atomic, which holds its contents. *)
 predicate stack (t : t) (xs [@implicit] : int list) = own t xs
+
+proof create = on return fold stack t []
+
+proof of_list = on return fold stack t list
+
+proof is_empty = at (Atomic.get t) commit
+
+(* The recursive helpers; the wrappers of the same name take only [t]. *)
+proof pop_opt t backoff = at (Atomic.get t) returning [] -> commit
+
+proof pop_all t backoff = at (Atomic.get t) returning [] -> commit

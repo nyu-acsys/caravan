@@ -107,7 +107,7 @@ let () =
   assert (follows (location ~file:"remapped.ml" 40 60));
   assert (follows ~next:(Some (location 80 90)) (location 60 80));
   assert (not (follows ~next:(Some (location 80 90)) (location 60 81)));
-  let annotation text loc : C.Annotation.t = { text; loc } in
+  let annotation text loc : C.Annotation.t = { text; loc; origin = None } in
   let contract at = annotation "result = f x ensures result = x" at in
   let inside = location 40 100 in
   let outside = location 101 120 in

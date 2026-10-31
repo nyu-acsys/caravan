@@ -261,6 +261,26 @@ type proof_decl =
           the state, the fields it changes, in terms of the state before, and the
           functions it linearizes. Without a step, only [(*@ performs a *)] names it. *)
 
+(** A step of a proof outline: ghost code at a place in a function, written in the
+    [.proof] file as [at (anchor) step] or [on return e]. *)
+type outline_step =
+  | At of {
+      anchor : term;  (** The code it follows, by its own names. *)
+      anchor_loc : Location.t;
+      action_loc : Location.t;  (** A linearization, as [commit]. *)
+    }
+  | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
+
+type outline = {
+  outline_name : id;
+  outline_params : id list option;  (** The parameters that select the function. *)
+  outline_steps : outline_step list;
+  outline_loc : Location.t;
+}
+(** The proof of a function, [proof f x = steps], in program order. *)
+
+type proof_file = { declarations : proof_decl list; outlines : outline list }
+
 (** What an atomic step does to the update of the function that performs it, if its result
     matches a pattern: linearize it, with the function's result or a given one, leave it
     to be helped, as [wait in s.waiting on c], or either, by a condition. *)

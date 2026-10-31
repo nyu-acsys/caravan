@@ -97,6 +97,8 @@ type t = {
   scope : Declaration_scope.t;
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
+  outline_annotations : Annotation.t list;
+      (** The annotations that the proof outlines of the [.proof] file stand for. *)
   env : Env.t;
       (** The environment at the end of the file, for types in annotations, with the type
           [integer], [sequence], [finset], [set], and [map] of specifications. *)
@@ -118,6 +120,10 @@ type t = {
   libraries : library list;
   spec_bindings : Types.signature;
 }
+
+(** The annotations of the implementation: its own, or those of its proof outlines. *)
+let annotations source =
+  Annotation.of_comments source.comments @ source.outline_annotations
 
 (** The specification declarations added after the runtime program was typed. *)
 let specification_bindings runtime_env env =

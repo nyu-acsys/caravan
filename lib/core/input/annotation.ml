@@ -4,19 +4,31 @@
 open Base
 open Caravan_spec
 
-type t = { text : string; loc : Location.t }
+type t = {
+  text : string;
+  loc : Location.t;
+  origin : Lexing.position option;
+      (** Where [text] is written, if not in the comment at [loc]: in a proof outline. *)
+}
 
 (** The annotations among [comments]. *)
 let of_comments (comments : (string * Location.t) list) : t list =
   List.filter_map comments ~f:(fun (text, loc) ->
-      Option.map (String.chop_prefix text ~prefix:"@") ~f:(fun text -> { text; loc }))
+      Option.map (String.chop_prefix text ~prefix:"@") ~f:(fun text ->
+          { text; loc; origin = None }))
 
 (** A lexer buffer reading [annotation]'s text at its place in the source, after the
     comment's opening delimiter and its [@]. *)
 let lexbuf (annotation : t) =
   let lexbuf = Lexing.from_string annotation.text in
-  let start = annotation.loc.loc_start in
-  Lexing.set_position lexbuf { start with pos_cnum = start.pos_cnum + 3 };
+  let start =
+    match annotation.origin with
+    | Some origin -> origin
+    | None ->
+        let start = annotation.loc.loc_start in
+        { start with pos_cnum = start.pos_cnum + 3 }
+  in
+  Lexing.set_position lexbuf start;
   Lexing.set_filename lexbuf start.pos_fname;
   lexbuf
 

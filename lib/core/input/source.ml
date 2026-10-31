@@ -376,7 +376,7 @@ let specialize_to_interface _env (typed : Typedtree.structure)
           structure declared.sig_final_env Subst.identity typed declared.sig_type))
 
 (** The declarations of the proof in [file]. *)
-let load_proof file : (S.proof_decl list, Report.error) Result.t =
+let load_proof file : (S.proof_file, Report.error) Result.t =
   let lexbuf = lexbuf_of file in
   let lexeme_loc () =
     {
@@ -524,8 +524,23 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
           interface.interface_comments)
       @ List.concat_map libraries ~f:(fun library -> library.library.interface_comments)
     in
-    let proof = Option.value_map (sibling file ".proof") ~default:(Ok []) ~f:load_proof in
-    Result.bind proof ~f:(fun proof ->
+    let proof_file = sibling file ".proof" in
+    let proof =
+      Option.value_map proof_file
+        ~default:(Ok { S.declarations = []; outlines = [] })
+        ~f:load_proof
+    in
+    Result.bind proof ~f:(fun { S.declarations = proof; outlines } ->
+        let* outline_annotations =
+          match proof_file with
+          | None -> Ok []
+          | Some proof_file ->
+              Outline.annotations
+                ~proof_text:(Stdio.In_channel.read_all proof_file)
+                ~structure:parsed
+                ~annotations:(Annotation.of_comments comments)
+                outlines
+        in
         let* env, _, _, _, _ = Proof_types.elaborate_proof_types env interface [] in
         let* signature_resources =
           Proof_types.signature_ghost_resources env signature_comments
@@ -776,6 +791,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                 scope;
                 typed;
                 comments;
+                outline_annotations;
                 env;
                 sequence;
                 logical_types;
