@@ -191,15 +191,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     let* typ = Datatypes.typ types ~at:x.S.pid_loc t in
                     Ok (t, R.Var.make ~loc:l (ident ~loc:l x.pid_str) typ))
               in
-              (* Libraries share the program's predicate output convention. *)
-              let* outputs = predicate_output_count types p param_types in
-              let inputs, outputs = List.split_n params (List.length params - outputs) in
+              let* implicit = implicit_parameters p in
+              let explicit, implicit =
+                List.split_n params (List.length params - implicit)
+              in
               let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
               Ok
                 (R.Member.free
                    (R.Member.callable
-                      (R.Callable.func ~loc:l ~kind ~formals:(List.map inputs ~f:snd)
-                         ~returns:(List.map outputs ~f:snd)
+                      (R.Callable.func ~loc:l ~kind ~formals:(List.map explicit ~f:snd)
+                         ~returns:(List.map implicit ~f:snd)
                          (ident ~loc:l p.pred_name.pid_str)
                          None))))
         in
@@ -710,8 +711,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               let* typ = Datatypes.typ view.view_types ~at:id.S.pid_loc t in
               Ok (R.Var.make ~loc:l (ident ~loc:l id.pid_str) typ))
         in
-        let* outputs = predicate_output_count view.view_types p parameter_types in
-        let formals, returns = List.split_n vars (List.length vars - outputs) in
+        let* implicit = implicit_parameters p in
+        let formals, returns = List.split_n vars (List.length vars - implicit) in
         let stem =
           List.Assoc.find_exn group.Generic_modules.resources p.pred_name.pid_str
             ~equal:String.equal

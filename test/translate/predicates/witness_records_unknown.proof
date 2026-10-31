@@ -1,0 +1,7 @@
+predicate held (b : box) = exists n : int, c : integer. own b.value n && n <= c
+
+lemma misnamed (b : box)
+  requires (held b)
+  ensures (held b) =
+  let w = unfold held b in
+  fold held b { w with count = w.c }

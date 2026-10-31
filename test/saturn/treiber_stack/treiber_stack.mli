@@ -2,7 +2,7 @@
 
 type t
 
-(*@ predicate stack (t : t) (xs : int list) *)
+(*@ predicate stack (t : t) (xs [@implicit] : int list) *)
 
 val create : unit -> t
 (*@ t = create ()

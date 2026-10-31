@@ -1,5 +1,5 @@
 module type Queue = sig
-  (*@ predicate contents (cell : int Atomic.t) (xs : int sequence) *)
+  (*@ predicate contents (cell : int Atomic.t) (xs [@implicit] : int sequence) *)
 
   val push : int Atomic.t -> int -> unit
   (*@ push cell value

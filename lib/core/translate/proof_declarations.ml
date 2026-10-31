@@ -331,10 +331,9 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body)
   | Body body ->
       let* body = quantified env body in
-      (* Explicit output attributes override the trailing reference-free convention. *)
-      let+ outputs = State.of_result (predicate_output_count types p param_types) in
-      let inputs, outputs = List.split_n params (List.length params - outputs) in
-      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars outputs)
+      let+ implicit = State.of_result (implicit_parameters p) in
+      let explicit, implicit = List.split_n params (List.length params - implicit) in
+      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars explicit) ~returns:(vars implicit)
         name (Some body)
   | View _ ->
       (* Half of the view's ghost field, on the structure, its first parameter. *)
@@ -632,7 +631,7 @@ let direct_interface_comments (interface : Source.interface) =
          | _ -> None))
     interface.interface_comments
 
-let predicates ~data (source : Source.t) =
+let predicates (source : Source.t) =
   let of_annotations ~interface comments =
     all
       (List.filter
@@ -721,7 +720,7 @@ let predicates ~data (source : Source.t) =
     let* types =
       all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type source.env ~at t)
     in
-    let* _ = predicate_output_count data p types in
+    let* _ = implicit_parameters p in
     Ok (at, p, def, types)
   in
   let* declared =
@@ -779,9 +778,9 @@ let predicates ~data (source : Source.t) =
              Printf.sprintf "The predicate %s must be defined as an ordinary predicate"
                (name p))
     | None, (def_at, definition, _, def_types) :: _ ->
-        let* declared_outputs = predicate_output_count data p types in
-        let* defined_outputs = predicate_output_count data definition def_types in
-        if declared_outputs = defined_outputs then Ok ()
+        let* declared_implicit = implicit_parameters p in
+        let* defined_implicit = implicit_parameters definition in
+        if declared_implicit = defined_implicit then Ok ()
         else
           error def_at
             ~related:[ (at, "Its declaration") ]
@@ -935,6 +934,7 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
         | Tmatch (t, cases) ->
             field_term t || List.exists cases ~f:(fun (_, t) -> field_term t)
         | Ttuple ts -> List.exists ts ~f:field_term
+        | Trecord (base, fields) -> List.exists (S.record_terms base fields) ~f:field_term
         | Ttrue | Tfalse | Tconst _ | Tvar _ -> false
         end
   in
@@ -947,16 +947,8 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
   in
   let* groups =
     all groups ~f:(fun group ->
-        let symbolic =
-          List.concat_map (Generic_modules.parameter_groups group) ~f:(fun stage ->
-              Generic_modules.types stage ~owner:(String.split stage.interface ~on:'.'))
-          @ types
-        in
         let* modes =
           all group.applications ~f:(fun application ->
-              let concrete =
-                checked_raw_types types application.Generic_modules.source.argument
-              in
               all
                 (List.zip_exn group.representative.parameters
                    application.source.parameters) ~f:(fun (representative, instance) ->
@@ -968,22 +960,8 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
                           instance.Module_inventory.argument.expected.signature_resources
                           member ~equal:String.equal
                       in
-                      let parameters (resource : Module_inventory.signature_resource) =
-                        let environment =
-                          Source.annotation_env source
-                            resource.Module_inventory.site.environment
-                        in
-                        all resource.declaration.pred_params ~f:(fun (id, pty) ->
-                            Source.ocaml_type environment ~at:id.S.pid_loc pty)
-                      in
-                      let* symbolic_types = parameters formal in
-                      let* concrete_types = parameters actual in
-                      let* expected =
-                        predicate_output_count symbolic formal.declaration symbolic_types
-                      in
-                      let* actual =
-                        predicate_output_count concrete actual.declaration concrete_types
-                      in
+                      let* expected = implicit_parameters formal.declaration in
+                      let* actual = implicit_parameters actual.declaration in
                       Ok (expected = actual))
                   |> Result.map ~f:(List.for_all ~f:Fn.id)))
         in
@@ -1119,43 +1097,6 @@ let scoped_function (binding : Proof_bindings.binding) =
   | Action _ ->
       None
 
-let signature_has_refs ~types ~environment ~substitution typ =
-  let rec contains seen typ =
-    let fallback () = Datatypes.has_refs types (Subst.type_expr substitution typ) in
-    match Types.get_desc (Ctype.expand_head environment typ) with
-    | Tconstr (path, args, _) -> (
-        List.exists args ~f:(contains seen)
-        ||
-        if List.mem seen path ~equal:Path.same then fallback ()
-        else
-          let seen = path :: seen in
-          match (Env.find_type path environment).type_kind with
-          | Type_abstract _ ->
-              let logical =
-                Option.exists (Datatypes.find types path) ~f:(fun descriptor ->
-                    Option.is_some descriptor.collection
-                    || descriptor.mathematical_integer)
-              in
-              ((not logical)
-              && match path with Pident id when Ident.is_predef id -> false | _ -> true)
-              || fallback ()
-          | Type_record (fields, _) ->
-              List.exists fields ~f:(fun field ->
-                  Poly.equal field.Types.ld_mutable Asttypes.Mutable
-                  || contains seen field.ld_type)
-          | Type_variant (constructors, _) ->
-              List.exists constructors ~f:(fun constructor ->
-                  match constructor.Types.cd_args with
-                  | Cstr_tuple args -> List.exists args ~f:(contains seen)
-                  | Cstr_record fields ->
-                      List.exists fields ~f:(fun field -> contains seen field.ld_type))
-          | Type_open | Type_external _ -> fallback ())
-    | Ttuple fields -> List.exists fields ~f:(fun (_, typ) -> contains seen typ)
-    | Tpoly (typ, []) -> contains seen typ
-    | _ -> fallback ()
-  in
-  contains [] typ
-
 let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
   Result.all_unit
     (List.map inventory.Module_inventory.constraints ~f:(fun constraint_ ->
@@ -1250,28 +1191,9 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                         error at ~related
                           "The module resource has different parameter types"
                     in
-                    let* expected_modes =
-                      implicit_parameter_count ~kind:"predicate" declared.pred_params
-                    in
-                    let* actual_modes =
-                      implicit_parameter_count ~kind:"predicate" actual.pred_params
-                    in
-                    let* expected_outputs =
-                      Signature_contract.compiler ~at (fun () ->
-                          predicate_output_count
-                            ~has_refs:
-                              (signature_has_refs ~types ~environment
-                                 ~substitution:constraint_.substitution)
-                            types declared raw)
-                      |> Result.join
-                    in
-                    let* actual_outputs =
-                      predicate_output_count types actual implementation_types
-                    in
-                    if
-                      Poly.equal expected_modes actual_modes
-                      && Int.equal expected_outputs actual_outputs
-                    then Ok ()
+                    let* expected = implicit_parameters declared in
+                    let* actual_implicit = implicit_parameters actual in
+                    if Int.equal expected actual_implicit then Ok ()
                     else
                       error at ~related
-                        "The module resource has different implicit parameter modes"))))
+                        "The module resource has different implicit parameters"))))

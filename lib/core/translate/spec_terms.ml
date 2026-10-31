@@ -403,6 +403,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Ttuple ts ->
       let+ ts = State.all ts ~f:(formula env) in
       R.Expr.tuple ~loc:l ts
+  | Trecord _ -> State.of_result (unsupported at "A record other than a fold's witnesses")
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
       let* scrutinee_type =

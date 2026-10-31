@@ -939,6 +939,10 @@ let shadow_list_projection is_list names =
   in
   fun term -> (not (shadowed term)) && is_list term
 
+(** The name under which the type of the field [field] of the record [record], one that no
+    OCaml type declares, is known to logical expressions. *)
+let record_field record field = record ^ "." ^ field
+
 let rec logical_expression ~functions ~is_list (term : S.term) =
   let loc = term.term_loc in
   let exp = logical_expression ~functions ~is_list in
@@ -959,6 +963,13 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tvar q when logical_constructor q ->
       Ok (Ast_helper.Exp.construct ~loc { txt = longident q; loc } None)
   | Tvar q -> Ok (logical_identifier ~functions ~loc q)
+  | Tfield ({ term_desc = Tvar (Qid record); _ }, Qid field)
+    when List.mem functions
+           (record_field record.pid_str field.pid_str)
+           ~equal:String.equal ->
+      Ok
+        (Ast_helper.Exp.ident ~loc
+           { txt = Lident (record_field record.pid_str field.pid_str); loc })
   | Tapply
       ( {
           term_desc = Tapply ({ term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, head);
@@ -1041,6 +1052,23 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tfield (value, field) ->
       let* value = exp value in
       Ok (Ast_helper.Exp.field ~loc value { txt = longident field; loc })
+  | Trecord (base, fields) ->
+      let* base =
+        match base with
+        | None -> Ok None
+        | Some base -> Result.map (exp base) ~f:Option.some
+      in
+      let* fields =
+        Result.all
+          (List.map fields ~f:(fun (field, value) ->
+               Result.map (exp value) ~f:(fun value ->
+                   ( {
+                       Location.txt = Longident.Lident field.S.pid_str;
+                       loc = field.pid_loc;
+                     },
+                     value ))))
+      in
+      Ok (Ast_helper.Exp.record ~loc fields base)
   | Tattr (_, value) | Told value -> exp value
 
 (** Types logical expressions before Raven erases reference element types. *)

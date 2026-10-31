@@ -624,6 +624,9 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                 (Ttuple
                    (List.map types ~f:(fun typ ->
                         (None, Option.value typ ~default:(Ctype.newvar ())))))))
+    | Trecord (base, fields) ->
+        let* _ = Result.all (List.map (S.record_terms base fields) ~f:(walk variables)) in
+        Ok None
     | Tattr (_, value) | Told value -> walk variables value
   in
   let* variables =
@@ -849,6 +852,7 @@ let lowerable source (view : Module_inventory.signature_value) ~environment
         let* () = check_type t.term_loc typ in
         term bound subject
     | Ttuple values -> terms bound values
+    | Trecord (base, fields) -> terms bound (S.record_terms base fields)
   and terms bound values =
     Result.map (Result.all (List.map values ~f:(term bound))) ~f:(fun _ -> ())
   in

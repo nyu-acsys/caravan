@@ -514,12 +514,19 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
       else [ R.Stmt.ghost_block ~loc:l [ R.Stmt.if_ ~loc:l c a b ] ]
   | _, _, Tmatch (scrutinee, cases) ->
       let* v = Spec_terms.formula env scrutinee in
+      let scrutinee_type = Result.ok (Spec_terms.equality_term_type env scrutinee) in
       let rec chain = function
         | [] -> State.return []
         | (p, body) :: rest -> begin
             let* cond, binds = State.of_result (spec_pattern env p v) in
+            let types =
+              Option.value_map scrutinee_type ~default:[]
+                ~f:(Spec_terms.pattern_types env p)
+            in
             let env =
-              List.fold binds ~init:env ~f:(fun env (x, v) -> bind env x (Value v))
+              List.fold binds
+                ~init:{ env with var_types = types @ env.var_types }
+                ~f:(fun env (x, v) -> bind env x (Value v))
             in
             let* body = uses ctx env ~at make body in
             match (cond, rest) with

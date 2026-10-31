@@ -2,7 +2,7 @@ type t
 
 (*@ invariant shared (cell : t) *)
 (*@ predicate holds (cell : t) (value [@implicit] : int) *)
-(*@ predicate ticket (cell : t) (count : int) *)
+(*@ predicate ticket (cell : t) (count [@implicit] : int) *)
 
 val make : int -> t
 (*@ cell = make value

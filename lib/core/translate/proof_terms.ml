@@ -69,7 +69,55 @@ let lemma_call env (t : S.term) =
       end
   | _ -> State.of_result (error t.term_loc "Expected a lemma applied to its arguments")
 
-let predicate_use env ~unfold t witnesses make =
+(** The witnesses that a fold's last argument [t] gives, if it is a witness record [w] or
+    one updated, [{ w with f = e }]: its fields, as [w.f], or their updates. *)
+let record_witnesses env (t : S.term) =
+  let fields (w : S.id) =
+    Option.map (state_fields env w.pid_str) ~f:(fun fields ->
+        List.map fields ~f:(fun (field, _) ->
+            let field = S.mk_id ~loc:w.pid_loc field in
+            ( field,
+              S.mk_term (Tfield (S.mk_term (Tvar (Qid w)) w.pid_loc, Qid field)) w.pid_loc
+            )))
+  in
+  match t.term_desc with
+  | Tvar (Qid w) -> Ok (fields w)
+  | Trecord (Some { term_desc = Tvar (Qid w); _ }, updates) ->
+      begin match fields w with
+      | None -> error t.term_loc "Only a witness record can be updated"
+      | Some fields ->
+          let* (_ : unit list) =
+            all updates ~f:(fun ((field : S.id), _) ->
+                if
+                  List.exists fields ~f:(fun (f, _) ->
+                      String.equal f.pid_str field.pid_str)
+                then Ok ()
+                else
+                  error field.pid_loc
+                    (Printf.sprintf "The witness record %s has no field %s" w.pid_str
+                       field.pid_str))
+          in
+          Ok
+            (Some
+               (List.map fields ~f:(fun ((f : S.id), value) ->
+                    Option.value
+                      (List.find updates ~f:(fun ((u : S.id), _) ->
+                           String.equal u.pid_str f.pid_str))
+                      ~default:(f, value))))
+      end
+  | _ -> Ok None
+
+let rec predicate_use env ~unfold t witnesses make =
+  let open State.Syntax in
+  match (witnesses, t.S.term_desc) with
+  | [], Tapply (predicate, last) when not unfold -> (
+      let* record = State.of_result (record_witnesses env last) in
+      match record with
+      | Some witnesses -> predicate_use env ~unfold predicate witnesses make
+      | None -> predicate_application env ~unfold t witnesses make)
+  | _ -> predicate_application env ~unfold t witnesses make
+
+and predicate_application env ~unfold t witnesses make =
   let open State.Syntax in
   let head, args = spine t [] in
   match head.term_desc with
@@ -490,6 +538,8 @@ let rec predicate_existentials (t : S.term) =
       predicate_existentials scrutinee
       @ List.concat_map cases ~f:(fun (_, body) -> predicate_existentials body)
   | Ttuple ts -> List.concat_map ts ~f:predicate_existentials
+  | Trecord (base, fields) ->
+      List.concat_map (S.record_terms base fields) ~f:predicate_existentials
 
 let unfold_result_types env (t : S.term) witnesses =
   let head, _ = spine t [] in
@@ -534,6 +584,89 @@ let unfold_result_types env (t : S.term) witnesses =
           Ok (Some types)
       end
   | _ -> error t.term_loc "Expected a predicate applied to its arguments"
+
+(** The names of the existentials of the predicate that [t] applies, which unfolding it
+    into a witness record binds. *)
+let existential_names env (t : S.term) =
+  let head, _ = spine t [] in
+  let existentials =
+    match head.term_desc with
+    | Tvar q ->
+        Option.value_map ~default:[]
+          (List.Assoc.find env.ctx.given.predicate_bodies (logical_key env q)
+             ~equal:String.equal)
+          ~f:(fun body -> List.map (predicate_existentials body.definition) ~f:fst)
+    | _ -> []
+  in
+  List.rev
+    (List.fold existentials ~init:[] ~f:(fun names (id : S.id) ->
+         if List.exists names ~f:(fun (n : S.id) -> String.equal n.pid_str id.pid_str)
+         then names
+         else id :: names))
+
+(** [let record = unfold t in ...]: unfolds [t], binding its existentials to the fields of
+    the witness record [record] for [continuation]. *)
+let witness_binding :
+    'a.
+    ghost_rhs:bool ->
+    env ->
+    S.id ->
+    S.term ->
+    (env -> (R.Stmt.t list * 'a) State.t) ->
+    (R.Stmt.t list * 'a) State.t =
+ fun ~ghost_rhs env record t continuation ->
+  let open State.Syntax in
+  let l = loc t.term_loc in
+  let names = existential_names env t in
+  let* types = State.of_result (unfold_result_types env t names) in
+  let* types =
+    match types with
+    | Some types -> State.return (List.filter_opt types)
+    | None ->
+        State.of_result
+          (error t.term_loc "Unfolding into a witness record needs the predicate's body")
+  in
+  let* fields =
+    State.all (List.zip_exn names types) ~f:(fun ((name : S.id), ty) ->
+        let* raven = State.fresh (record.pid_str ^ "_" ^ name.pid_str) in
+        let+ raven_type = State.of_result (typ env.ctx ~at:name.pid_loc ty) in
+        (name, ty, raven, raven_type))
+  in
+  let* unfold =
+    let targets =
+      List.fold fields ~init:env ~f:(fun env (_, _, raven, _) ->
+          bind env raven (Raven raven))
+    in
+    predicate_use targets ~unfold:true t
+      (List.map fields ~f:(fun (name, _, raven, _) ->
+           (S.mk_id ~loc:name.pid_loc raven, S.mk_term (Tvar (Qid name)) name.pid_loc)))
+      R.Stmt.unfold
+  in
+  let env =
+    List.fold fields
+      ~init:
+        (bind env record.pid_str
+           (State
+              (List.map fields ~f:(fun (name, ty, raven, _) ->
+                   ( name.pid_str,
+                     (R.Expr.var ~loc:l (Translate_context.name ~loc:l raven), ty) )))))
+      ~f:(fun env (name, ty, _, _) ->
+        {
+          env with
+          var_types =
+            (Source.record_field record.pid_str name.pid_str, ty) :: env.var_types;
+        })
+  in
+  let+ rest, value = continuation env in
+  let declarations =
+    List.concat_map fields ~f:(fun (name, _, raven, raven_type) ->
+        R.Stmt.local ~loc:(loc name.pid_loc) ~ghost:true ~typ:raven_type
+          (ident ~loc:l raven))
+  in
+  let unfold =
+    if ghost_rhs then [ R.Stmt.ghost_block ~loc:l [ unfold ] ] else [ unfold ]
+  in
+  (declarations @ unfold @ rest, value)
 
 let rec proof_result_types env (body : S.proof_expr) =
   let open State.Syntax in
@@ -850,6 +983,20 @@ and proof_binding_with :
     (env -> (R.Stmt.t list * 'a) State.t) ->
     (R.Stmt.t list * 'a) State.t =
  fun ?(ghost_rhs = false) env pattern rhs continuation ->
+  match (pattern.pat_desc, rhs.S.proof_desc) with
+  | Pid record, Proof_unfold (t, []) ->
+      witness_binding ~ghost_rhs env record t continuation
+  | _ -> proof_value_binding ~ghost_rhs env pattern rhs continuation
+
+and proof_value_binding :
+    'a.
+    ghost_rhs:bool ->
+    env ->
+    S.pat ->
+    S.proof_expr ->
+    (env -> (R.Stmt.t list * 'a) State.t) ->
+    (R.Stmt.t list * 'a) State.t =
+ fun ~ghost_rhs env pattern rhs continuation ->
   let open State.Syntax in
   let l = loc rhs.S.proof_loc in
   let* inferred = proof_result_types env rhs in

@@ -3,7 +3,7 @@
 
 type t = bool Atomic.t
 
-(*@ predicate is_lock (l : t) (b : bool) = own l b *)
+(*@ predicate is_lock (l : t) (b [@implicit] : bool) = own l b *)
 
 let create () = Atomic.make false
 (*@ l = create ()

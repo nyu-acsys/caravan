@@ -47,6 +47,8 @@ let predicate_parameters ~lookup ~bound terms =
           @ List.concat_map cases ~f:(fun (pattern, body) ->
               collect (Source.logical_pattern_names pattern @ bound) body)
       | Ttuple values -> List.concat_map values ~f:(collect bound)
+      | Trecord (base, fields) ->
+          List.concat_map (S.record_terms base fields) ~f:(collect bound)
       | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
     in
     here @ nested

@@ -480,7 +480,7 @@ predicate waiting_registration (reg : Ghost.t) (q : t) =
         else if linked then Empty.committed token q false
         else Empty.pending token q)
 
-predicate queue (q : t) (xs : int list) =
+predicate queue (q : t) (xs [@implicit] : int list) =
   own ~fraction:Permission.half (Ghost.at view_queue q.head) xs
 
 invariant is_queue (q : t) =

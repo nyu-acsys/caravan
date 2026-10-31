@@ -26,10 +26,10 @@ The definition must agree with the signature's resource kind and source type.
   $ caravan --shh resource_type_case.ml > resource_type_case.out 2>&1; status=$?; test "$status" -eq 1 && grep -F 'The module resource has different parameter types' resource_type_case.out
   Type Error: The module resource has different parameter types.
 
-Implicit resource parameter modes must agree too.
+Implicit resource parameters must agree too.
 
-  $ caravan --shh resource_modes.ml > resource_modes.out 2>&1; status=$?; test "$status" -eq 1 && grep -F 'The module resource has different implicit parameter modes' resource_modes.out
-  Type Error: The module resource has different implicit parameter modes.
+  $ caravan --shh resource_modes.ml > resource_modes.out 2>&1; status=$?; test "$status" -eq 1 && grep -F 'The module resource has different implicit parameters' resource_modes.out
+  Type Error: The module resource has different implicit parameters.
 
 The emitted module proof also verifies through Raven's source parser.
 

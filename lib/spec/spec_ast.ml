@@ -79,6 +79,8 @@ and term_desc =
   | Tmatch of term * (pat * term) list
   | Tcast of term * pty
   | Ttuple of term list
+  | Trecord of term option * (id * term) list
+      (** A record, [{ f = e; ... }], or one updating another, [{ r with f = e; ... }]. *)
   | Told of term
 
 type header = { hd_name : id; hd_ret : labelled_arg list; hd_args : labelled_arg list }
@@ -266,6 +268,9 @@ type linearization = Commit | Returning of pat * outcome | Performs of id
 
 let mk_loc (s, e) = { Location.loc_start = s; loc_end = e; loc_ghost = false }
 let mk_term t l = { term_desc = t; term_loc = l }
+
+(** The terms of a record: what it updates, if anything, then its field values. *)
+let record_terms base fields = Option.to_list base @ List.map snd fields
 
 (** The application of the operator [op] to [args]. *)
 let mk_op_apply op args =

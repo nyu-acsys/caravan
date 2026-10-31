@@ -1,5 +1,5 @@
 module Counter = struct
-  predicate contents (cell : t) (value : int) = own cell value
+  predicate contents (cell : t) (value [@implicit] : int) = own cell value
   module Read = Ghost.AU (struct let operation = read end)
 end
 

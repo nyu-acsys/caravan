@@ -1,4 +1,4 @@
-Sequence predicate arguments translate and typecheck with inferred sequence outputs.
+Sequence predicate arguments translate and typecheck with implicit sequence parameters.
 
   $ caravan --shh --emit-rav sequence_predicate.ml > sequence_predicate.rav
   $ raven --shh --typeonly sequence_predicate.rav

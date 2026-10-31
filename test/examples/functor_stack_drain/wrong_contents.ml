@@ -1,7 +1,7 @@
 module type STACK = sig
   type t
 
-  (*@ predicate stack (t : t) (xs : int list) *)
+  (*@ predicate stack (t : t) (xs [@implicit] : int list) *)
   val pop_opt : t -> int option
   (*@ result = atomic pop_opt t
       atomic requires stack t xs

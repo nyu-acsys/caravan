@@ -1,7 +1,7 @@
 module type Cell = sig
   type t
 
-  (*@ predicate holds (cell : t) (value : int) *)
+  (*@ predicate holds (cell : t) (value [@implicit] : int) *)
 
   val make : int -> t
   (*@ cell = make value ensures holds cell value *)
@@ -17,7 +17,7 @@ module type Atomic_cell = sig
 
   (*@ invariant shared (cell : t) *)
   (*@ predicate holds (cell : t) (value [@implicit] : int) *)
-  (*@ predicate ticket (cell : t) (count : int) *)
+  (*@ predicate ticket (cell : t) (count [@implicit] : int) *)
 
   val make : int -> t
   (*@ cell = make value

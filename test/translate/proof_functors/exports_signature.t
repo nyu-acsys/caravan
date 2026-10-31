@@ -22,7 +22,7 @@ The predicate definition is opaque, and the implementation lemma is hidden.
   $ grep -F 'Type Error: Unknown lemma Alias.preserve.' hidden.out
   Type Error: Unknown lemma Alias.preserve.
 
-Signature kind, source parameter types and implicit modes must agree with the template.
+Signature kind, source parameter types and implicit parameters must agree with the template.
 
   $ cp exports_signature.proof exports_signature_kind.proof
   $ sed -e '/^module Sealed/,/^end =/ s/predicate wrapped/invariant wrapped/' -e '/^module Sealed/,/^end =/ s/ \[@implicit\]//' exports_signature.ml > exports_signature_kind.ml
@@ -39,8 +39,8 @@ Signature kind, source parameter types and implicit modes must agree with the te
   $ cp exports_signature.proof exports_signature_mode.proof
   $ sed '/^module Sealed/,/^end =/ s/ \[@implicit\]//' exports_signature.ml > exports_signature_mode.ml
   $ ! caravan --shh exports_signature_mode.ml > mode.out 2>&1
-  $ grep -F 'Type Error: The module resource has different implicit parameter modes.' mode.out
-  Type Error: The module resource has different implicit parameter modes.
+  $ grep -F 'Type Error: The module resource has different implicit parameters.' mode.out
+  Type Error: The module resource has different implicit parameters.
 
 A compilation-unit interface checks each named application independently.
 

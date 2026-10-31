@@ -1,2 +1,2 @@
 (* The stack owns its atomic, which holds its contents. *)
-predicate stack (t : t) (xs : int list) = own t xs
+predicate stack (t : t) (xs [@implicit] : int list) = own t xs

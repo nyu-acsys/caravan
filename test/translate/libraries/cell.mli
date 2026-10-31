@@ -2,7 +2,7 @@
 
 type t
 
-(*@ predicate holds (c : t) (v : int) *)
+(*@ predicate holds (c : t) (v [@implicit] : int) *)
 
 val make : int -> t
 (*@ c = make v

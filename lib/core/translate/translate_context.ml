@@ -477,7 +477,7 @@ type proof_support = {
   logical_functions : (string * lemma_signature) list;
   mathematical_types : Datatypes.t list;
   predicate_inputs : (string * int) list;
-      (** Explicit overrides of the type-based predicate output convention. *)
+      (** The number of explicit parameters of each predicate with implicit ones. *)
   proof_key : Env.t -> S.qualid -> string option;
   action_key : S.id -> string option;
   opaque_predicates : string list;
@@ -708,20 +708,16 @@ let implicit_parameter_count ~kind parameters =
   in
   check false 0 parameters
 
-let predicate_output_count ?has_refs data (predicate : S.predicate) types =
-  let* explicit = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
-  match explicit with
+(** The number of [predicate]'s implicit parameters, those marked [[@implicit]]; an
+    invariant has none. *)
+let implicit_parameters (predicate : S.predicate) =
+  let* count = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
+  match count with
   | Some _ when predicate.pred_persistent ->
       error predicate.pred_name.pid_loc
         "Implicit parameter annotations require an ordinary predicate"
   | Some count -> Ok count
-  | None when predicate.pred_persistent -> Ok 0
-  | None ->
-      let has_refs = Option.value has_refs ~default:(Datatypes.has_refs data) in
-      let count =
-        List.length (List.take_while (List.rev types) ~f:(fun typ -> not (has_refs typ)))
-      in
-      Ok (if count = List.length types then 0 else count)
+  | None -> Ok 0
 
 type predicate_body = {
   definition : S.term;
@@ -1479,6 +1475,7 @@ let rec term_names (t : S.term) : string list =
       @ List.concat_map cases ~f:(fun (p, body) ->
           without (pat_names p) (term_names body))
   | Ttuple ts -> List.concat_map ts ~f:term_names
+  | Trecord (base, fields) -> List.concat_map (S.record_terms base fields) ~f:term_names
   | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
 
 let rec term_references bound (t : S.term) =
@@ -1497,6 +1494,7 @@ let rec term_references bound (t : S.term) =
       refs t
       @ List.concat_map cases ~f:(fun (p, b) -> term_references (pat_names p @ bound) b)
   | Ttuple ts -> List.concat_map ts ~f:refs
+  | Trecord (base, fields) -> List.concat_map (S.record_terms base fields) ~f:refs
   | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> refs t
 
 (** The location of the first occurrence of the name [x] in [terms]. *)

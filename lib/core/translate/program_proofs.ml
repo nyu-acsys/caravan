@@ -602,29 +602,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                         ("The resource declaration " ^ member
                        ^ " has different parameter types")
                   in
-                  let* expected_modes =
-                    implicit_parameter_count ~kind:"predicate" declaration.pred_params
-                  in
-                  let* actual_modes =
-                    implicit_parameter_count ~kind:"predicate"
-                      actual.resource_declaration.pred_params
-                  in
-                  let* expected_outputs =
-                    predicate_output_count view_types declaration raw
-                  in
-                  let* actual_outputs =
-                    predicate_output_count types actual.resource_declaration
-                      actual.resource_types
+                  let* expected = implicit_parameters declaration in
+                  let* actual_implicit =
+                    implicit_parameters actual.resource_declaration
                   in
                   let* () =
-                    if
-                      Poly.equal expected_modes actual_modes
-                      && expected_outputs = actual_outputs
-                    then Ok ()
+                    if expected = actual_implicit then Ok ()
                     else
                       error binding.site.item_loc
                         ("The resource declaration " ^ member
-                       ^ " has different implicit parameter modes")
+                       ^ " has different implicit parameters")
                   in
                   Ok
                     ( formal,
@@ -917,7 +904,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                           Source.ocaml_type environment ~at:id.S.pid_loc ty)
                     in
                     let ts = List.map ts ~f:(Subst.type_expr substitution) in
-                    let* outputs = predicate_output_count types formal.declaration ts in
+                    let* implicit = implicit_parameters formal.declaration in
                     let stem =
                       List.Assoc.find_exn generic.resources name ~equal:String.equal
                     in
@@ -928,7 +915,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                       ( (name, [ original; parameter.instance.parameter ]),
                         key,
                         ts,
-                        List.length ts - outputs ))
+                        List.length ts - implicit ))
               in
               Ok resources)
         in

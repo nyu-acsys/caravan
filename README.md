@@ -183,8 +183,8 @@ checked against their OCaml types before translation. Inference uses Raven's
 existing witness computation; values hidden inside predicates or not determined
 by available resources may need explicit arguments.
 
-Ordinary predicates use the same attribute for implicit output parameters,
-including values containing references:
+Ordinary predicates use the same attribute for implicit parameters, including
+values containing references:
 
 ```ocaml
 predicate held (cell : int Atomic.t Atomic.t)
@@ -192,17 +192,16 @@ predicate held (cell : int Atomic.t Atomic.t)
   own cell value
 ```
 
-Write `held cell` to omit the output, or `held cell value` to specify it.
-The same choice is available in `fold` and `unfold`, and callers can supply an
-initial part of a longer output suffix. Raven checks that simultaneously owned
-instances with the same explicit arguments agree on their outputs. It can then
-infer lemma arguments from an owned predicate instance. Constructing or refolding
-an instance may still require explicit output values.
+Write `held cell` to omit the implicit argument, or `held cell value` to supply
+it. The same choice is available in `fold` and `unfold`, and callers can supply
+an initial part of a longer implicit suffix. Implicit parameters are not
+determined by the explicit ones: Raven checks that simultaneously owned instances
+with the same explicit arguments agree on them. It can then infer lemma arguments
+from an owned predicate instance. Constructing or refolding an instance may still
+require explicit values for them.
 
-Declarations and definitions must agree on the output parameters. Unannotated
-predicates retain the existing convention of treating trailing parameters that
-contain no references as outputs. Explicit output attributes apply to ordinary
-predicates; invariants retain their existing parameter handling.
+Exactly the parameters marked `[@implicit]` are implicit, and only ordinary
+predicates can have them. Declarations and definitions must agree on them.
 
 An annotation `(*@ lemma lemma_name args *)` calls a checked lemma from
 program code. In a proof body, `unfold p x {n}` names an existential to bind

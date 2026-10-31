@@ -45,6 +45,10 @@ let rec term t =
       "(match " ^ term t ^ " " ^ String.concat " " (List.map case cases) ^ ")"
   | Tcast (t, _) -> "(cast " ^ term t ^ ")"
   | Ttuple ts -> "(tuple " ^ String.concat " " (List.map term ts) ^ ")"
+  | Trecord (base, fs) ->
+      let base = match base with Some b -> term b ^ " with " | None -> "" in
+      let field (id, t) = id.pid_str ^ " = " ^ term t in
+      "(record " ^ base ^ String.concat "; " (List.map field fs) ^ ")"
   | Told t -> "(old " ^ term t ^ ")"
 
 let arg = function

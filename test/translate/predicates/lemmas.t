@@ -27,6 +27,37 @@ owned predicate.
   $ caravan --shh lemmas_witness.ml
   Verification successful.
 
+Unfolding into a witness record binds all existentials as its fields, which a fold
+takes as they are or updated, also where a branch has none.
+
+  $ caravan --shh witness_records.ml
+  Verification successful.
+
+  $ caravan --shh witness_records_fail.ml
+  [Error] File "witness_records_fail.proof", line 7, columns 7-13:
+  7 |   fold held b { w with c = w.n - 1 }
+             ^^^^^^
+  Verification Error: Failed to fold predicate. The body of the predicate may not hold at this point.
+  File "witness_records_fail.proof", line 1, columns 73-79:
+  1 | predicate held (b : box) = exists n : int, c : integer. own b.value n && n <= c
+                                                                               ^^^^^^
+  Related Location: This assertion may not hold.
+  [1]
+
+  $ caravan --shh witness_records_unknown.ml
+  [Error] File "witness_records_unknown.proof", line 7, columns 23-28:
+  7 |   fold held b { w with count = w.c }
+                             ^^^^^
+  Type Error: The witness record w has no field count.
+  [1]
+
+  $ caravan --shh witness_records_not_record.ml
+  [Error] File "witness_records_not_record.proof", line 7, columns 14-30:
+  7 |   fold held b { v with c = 0 }
+                    ^^^^^^^^^^^^^^^^
+  Type Error: Only a witness record can be updated.
+  [1]
+
 An assertion in a proof body is checked.
 
   $ caravan --shh lemmas_false.ml

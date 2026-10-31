@@ -1,6 +1,6 @@
 module Counter : sig
   type t
-  (*@ predicate contents (cell : t) (value : int) *)
+  (*@ predicate contents (cell : t) (value [@implicit] : int) *)
 
   val read : t -> int
   (*@ result = atomic read cell

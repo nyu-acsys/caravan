@@ -2,7 +2,7 @@ type t
 (** Michael-Scott queue with a List-valued FIFO specification. *)
 
 (*@ invariant is_queue (q : t) *)
-(*@ predicate queue (q : t) (xs : int list) *)
+(*@ predicate queue (q : t) (xs [@implicit] : int list) *)
 val create : unit -> t
 
 (*@ q = create () ensures is_queue q && queue q [] *)

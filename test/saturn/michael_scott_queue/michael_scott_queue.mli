@@ -4,7 +4,7 @@
 type t
 
 (*@ invariant is_queue (q : t) *)
-(*@ predicate queue (q : t) (xs : int sequence) *)
+(*@ predicate queue (q : t) (xs [@implicit] : int sequence) *)
 
 val create : unit -> t
 (*@ q = create ()

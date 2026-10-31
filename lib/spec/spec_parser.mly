@@ -46,6 +46,18 @@
 
   let proof_term desc loc = proof_value (mk_term desc loc)
 
+  (* A fold's or unfold's last argument, if a record, gives the witnesses. *)
+  let record_argument t =
+    match t.term_desc with
+    | Tapply (f, { term_desc = Trecord (None, fields); _ }) -> (f, fields)
+    | _ -> (t, [])
+
+  (* An unfold's record names the existentials it binds, as in [{ root; head }]. *)
+  let pun_name ~at (field, value) =
+    match value.term_desc with
+    | Tvar (Qid x) when x.pid_str = field.pid_str -> field
+    | _ -> raise (Syntax_error (at, "An unfold names the existentials it binds"))
+
   let fractional_own f fraction location value loc =
     begin match f.term_desc with
     | Tvar (Qid id) when id.pid_str = "own" -> ()
@@ -428,12 +440,12 @@ proof_nonseq:
     { mk_proof (Proof_match (term_of_proof t, cases)) $loc }
 | ASSERT t = proof_value_expr
     { mk_proof (Proof_assert (term_of_proof t)) $loc }
-| FOLD t = proof_value_expr ws = fold_witnesses?
-    { mk_proof (Proof_fold (term_of_proof t,
-        match ws with None -> [] | Some ws -> ws)) $loc }
-| UNFOLD t = proof_value_expr names = unfold_names?
-    { mk_proof (Proof_unfold (term_of_proof t,
-        match names with None -> [] | Some names -> names)) $loc }
+| FOLD t = proof_value_expr
+    { let t, ws = record_argument (term_of_proof t) in
+      mk_proof (Proof_fold (t, ws)) $loc }
+| UNFOLD t = proof_value_expr
+    { let t, ws = record_argument (term_of_proof t) in
+      mk_proof (Proof_unfold (t, List.map (pun_name ~at:(mk_loc $loc)) ws)) $loc }
 | BEGIN e = proof_expr END { { e with proof_loc = mk_loc $loc } }
 | e = proof_value_expr { e }
 ;
@@ -492,6 +504,10 @@ proof_value_atom:
 | LEFTPAR first = proof_nonseq COMMA rest = comma_list1(proof_nonseq) RIGHTPAR
     { proof_term (Ttuple (List.map term_of_proof (first :: rest))) $loc }
 | LEFTSQRIGHTSQ { proof_term (Tvar (Qid (mk_pid "[]" $loc))) $loc }
+| LEFTBRC fs = semicolon_list1(proof_field) RIGHTBRC
+    { proof_term (Trecord (None, fs)) $loc }
+| LEFTBRC r = proof_postfix WITH fs = semicolon_list1(proof_field) RIGHTBRC
+    { proof_term (Trecord (Some (term_of_proof r), fs)) $loc }
 | LEFTSQ ts = semicolon_list1(proof_nonseq) RIGHTSQ
     { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($3)))) $loc($3) in
       let cons e l =
@@ -501,6 +517,12 @@ proof_value_atom:
       proof_value (List.fold_right cons ts nil) }
 ;
 
+(* A field of a record, [f = e], or [f] for [f = f]. *)
+proof_field:
+| x = lident EQUAL e = proof_nonseq { (x, term_of_proof e) }
+| x = lident { (x, mk_term (Tvar (Qid x)) $loc) }
+;
+
 proof_cases:
 | c = proof_case %prec below_BAR { [c] }
 | c = proof_case BAR cs = proof_cases { c :: cs }
@@ -508,14 +530,6 @@ proof_cases:
 
 proof_case:
 | p = mpat ARROW e = proof_expr { (p, e) }
-;
-
-fold_witnesses:
-| LEFTBRC ws = semicolon_list1(field_value) RIGHTBRC { ws }
-;
-
-unfold_names:
-| LEFTBRC names = semicolon_list1(lident) RIGHTBRC { names }
 ;
 
 ghost_witnesses:
@@ -735,6 +749,10 @@ term_block_:
 | LEFTPAR RIGHTPAR                                  { Ttuple [] }
 | LEFTSQRIGHTSQ
     { Tvar (Qid (mk_pid "[]"  $loc)) }
+| LEFTBRC fs = semicolon_list1(field_value) RIGHTBRC
+    { Trecord (None, fs) }
+| LEFTBRC r = term_arg WITH fs = semicolon_list1(field_value) RIGHTBRC
+    { Trecord (Some r, fs) }
 | LEFTSQ ts = semicolon_list1(term) RIGHTSQ
     { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($3)))) $loc($3) in
       let cons t l =

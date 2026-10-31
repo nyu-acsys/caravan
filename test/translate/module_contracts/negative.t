@@ -145,7 +145,7 @@
   [Error] File "predicate_modes_fail.ml", line 13, columns 15-36:
   13 | module Checked : View = Actual.First
                       ^^^^^^^^^^^^^^^^^^^^^
-  Type Error: The resource declaration counter has different implicit parameter modes.
+  Type Error: The resource declaration counter has different implicit parameters.
   [1]
 
   $ caravan --shh predicate_type_fail.ml

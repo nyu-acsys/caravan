@@ -925,7 +925,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let lifted = with_body_names lifted in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
-  let* predicates = predicates ~data:types source in
+  let* predicates = predicates source in
   let* () = check_scoped_resources ~types source inventory untyped_scoped_proofs in
   let* applications =
     all untyped_scoped_proofs.applications ~f:(fun view ->
@@ -956,13 +956,13 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   let* scoped_predicates =
     all (List.filter_map scoped_proofs.bindings ~f:scoped_predicate)
       ~f:(fun ((_, p, _, ts) as declaration) ->
-        let* _ = predicate_output_count types p ts in
+        let* _ = implicit_parameters p in
         Ok declaration)
   in
   let* scoped_inputs =
     all scoped_predicates ~f:(fun (_, p, _, ts) ->
-        let* outputs = predicate_output_count types p ts in
-        Ok (p.pred_name.pid_str, List.length ts - outputs))
+        let* implicit = implicit_parameters p in
+        Ok (p.pred_name.pid_str, List.length ts - implicit))
   in
   let predicates = predicates @ scoped_predicates in
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
