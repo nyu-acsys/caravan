@@ -959,6 +959,19 @@ let shadow_list_projection is_list names =
     OCaml type declares, is known to logical expressions. *)
 let record_field record field = record ^ "." ^ field
 
+(** Drops synthetic projections when a lexical binding shadows their record. *)
+let shadow_record_projections names variables =
+  List.filter variables ~f:(fun (variable, _) ->
+      not
+        (List.exists names ~f:(fun name -> String.is_prefix variable ~prefix:(name ^ "."))))
+
+let shadow_logical_functions names functions =
+  names
+  @ List.filter functions ~f:(fun function_ ->
+      not
+        (List.exists names ~f:(fun name ->
+             String.is_prefix function_ ~prefix:(name ^ "."))))
+
 let rec logical_expression ~functions ~is_list (term : S.term) =
   let loc = term.term_loc in
   let exp = logical_expression ~functions ~is_list in
@@ -1013,7 +1026,9 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tlet (pattern, rhs, body) ->
       let* rhs = exp rhs in
       let is_list = shadow_list_projection is_list (logical_pattern_names pattern) in
-      let functions = logical_pattern_names pattern @ functions in
+      let functions =
+        shadow_logical_functions (logical_pattern_names pattern) functions
+      in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (Ast_helper.Exp.let_ ~loc Nonrecursive
@@ -1027,7 +1042,9 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
                let is_list =
                  shadow_list_projection is_list (logical_pattern_names pattern)
                in
-               let functions = logical_pattern_names pattern @ functions in
+               let functions =
+                 shadow_logical_functions (logical_pattern_names pattern) functions
+               in
                let* body = logical_expression ~functions ~is_list body in
                Ok (Ast_helper.Exp.case (logical_pattern pattern) body)))
       in
@@ -1042,7 +1059,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tquant (_, binders, body) ->
       let names = List.map binders ~f:(fun (id, _) -> id.S.pid_str) in
       let is_list = shadow_list_projection is_list names in
-      let functions = names @ functions in
+      let functions = shadow_logical_functions names functions in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (List.fold_right binders ~init:body ~f:(fun (id, typ) body ->
@@ -1051,7 +1068,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
                [ logical_lambda ~loc id typ body ]))
   | Tcomprehension ((id, typ), body) ->
       let is_list = shadow_list_projection is_list [ id.pid_str ] in
-      let functions = id.pid_str :: functions in
+      let functions = shadow_logical_functions [ id.pid_str ] functions in
       let* body = logical_expression ~functions ~is_list body in
       Ok
         (apply

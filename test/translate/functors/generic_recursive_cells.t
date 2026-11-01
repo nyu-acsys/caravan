@@ -9,5 +9,5 @@ Recursive atomic payloads share one worker and retain their layout fields in cli
   1
   $ grep -c '^[[:space:]]*proc method_create(' emitted.rav
   1
-  $ grep -c '^[[:space:]]*field atomic_Data_node:' emitted.rav
+  $ grep -c '^[[:space:]]*field atomic_.*: .*Data_node.T' emitted.rav
   1

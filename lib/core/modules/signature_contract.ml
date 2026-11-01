@@ -275,7 +275,7 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
       Ok
         (List.map2_exn names types ~f:(fun name typ ->
              (name, Option.some_if (determined typ) typ))
-        @ variables)
+        @ Source.shadow_record_projections names variables)
     else
       Error
         (Report.error Type p.pat_loc
@@ -537,6 +537,14 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
         | None -> apply variables term callee arguments
         end
     | Tinfix _ -> walk variables (S.chain term)
+    | Tfield ({ term_desc = Tvar (Qid record); _ }, Qid field)
+      when List.Assoc.mem variables
+             (Source.record_field record.pid_str field.pid_str)
+             ~equal:String.equal ->
+        Ok
+          (List.Assoc.find_exn variables
+             (Source.record_field record.pid_str field.pid_str)
+             ~equal:String.equal)
     | Tfield (base, field) ->
         let* typ = walk variables base in
         begin match typ with
@@ -582,12 +590,21 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                  in
                  Ok (id.S.pid_str, typ)))
         in
-        let* typ = walk (added @ variables) body in
+        let* typ =
+          walk
+            (added @ Source.shadow_record_projections (List.map added ~f:fst) variables)
+            body
+        in
         let* () = require ~at:body.term_loc Predef.type_bool typ in
         Ok (Some Predef.type_bool)
     | Tcomprehension ((id, typ), body) ->
         let* typ = Source.ocaml_type environment ~at:id.pid_loc typ in
-        let* body_type = walk ((id.pid_str, Some typ) :: variables) body in
+        let* body_type =
+          walk
+            ((id.pid_str, Some typ)
+            :: Source.shadow_record_projections [ id.pid_str ] variables)
+            body
+        in
         let* () = require ~at:body.term_loc Predef.type_bool body_type in
         Ok None
     | Tlet (p, rhs, body) ->

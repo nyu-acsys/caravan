@@ -324,7 +324,7 @@ let program ?(history = History.default) (source : Source.t) :
     in
     let primitive_members =
       State.primitives_in state.tables (Module_context.namespace destination)
-      |> List.map ~f:snd
+      |> List.map ~f:(fun primitive -> primitive.State.member)
     in
     let stages =
       match destination with

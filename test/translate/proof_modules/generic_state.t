@@ -11,5 +11,5 @@ A named generic functor verifies one stateful counter worker for multiple applic
 The generic worker rejects an action that does not match its state transition.
 
   $ ! caravan --shh generic_state_action_fail.ml > generic_state_action_fail.out 2>&1
-  $ grep -q 'Verification Error: The invariant' generic_state_action_fail.out
+  $ grep -q 'Verification Error: This step may not perform the action' generic_state_action_fail.out
   $ ! grep -q 'Internal Error:' generic_state_action_fail.out

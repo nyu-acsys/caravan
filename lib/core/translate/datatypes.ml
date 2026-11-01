@@ -5,15 +5,25 @@
     element types.
 
     A record type with a mutable field is a reference instead, with a Raven field per
-    OCaml field, named after the type, as [counter_count]; so is a ref cell, with a field
-    per type of contents, as [ref_Int_contents]. A record type without a mutable field is
-    a data type with one constructor, named as the type. *)
+    OCaml field, identified by its type and label; so is a ref cell, with a field per type
+    of contents, as [ref_Int_contents]. A record type without a mutable field is a data
+    type with one constructor, named as the type. *)
 
 open Base
 module R = Raven_api
 
 let ( let* ) = Result.( >>= )
 let loc (l : Location.t) = R.Loc.make l.loc_start l.loc_end
+
+(** Length framing separates components even when a source name contains separators. *)
+let framed components =
+  Int.to_string (List.length components)
+  ^ "$"
+  ^ String.concat
+      (List.map components ~f:(fun component ->
+           Int.to_string (String.length component) ^ "$" ^ component))
+
+let record_field_name record label = "record$" ^ framed [ record; label ]
 
 type ctor = {
   ocaml : string;
@@ -142,7 +152,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
         if List.exists lds ~f:is_mutable then
           ( Some
               (List.map2_exn labels types ~f:(fun label typ ->
-                   { label; raven_field = name ^ "_" ^ label; typ })),
+                   { label; raven_field = record_field_name name label; typ })),
             [] )
         else
           ( None,
@@ -212,7 +222,8 @@ let with_name (d : t) module_name =
   in
   let heap =
     Option.map d.heap ~f:(fun fields ->
-        List.map fields ~f:(fun f -> { f with raven_field = record_name ^ "_" ^ f.label }))
+        List.map fields ~f:(fun f ->
+            { f with raven_field = record_field_name record_name f.label }))
   in
   { d with module_name; ctors; heap }
 
@@ -463,52 +474,147 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   | Tpoly (t, []) -> typ types ?self ~at t
   | _ -> Report.unsupported at (Stdlib.Format.asprintf "The type %a" Printtyp.type_expr t)
 
-(** A name for the type [t], unique among those of [types], for the names of the fields of
-    ref cells, as [IntList] for [int list]. *)
-let rec tag ?(qualified = false) (types : t list) (t : Types.type_expr) : string =
-  match desc types t with
-  | Tconstr (p, [], _) when Path.same p Predef.path_int -> "Int"
-  | Tconstr (p, [], _) when Path.same p Predef.path_bool -> "Bool"
-  | Tconstr (p, [], _) when Path.same p Predef.path_unit -> "Unit"
-  | Tconstr (p, [], _) when is_ghost p -> "Ghost"
-  | Tconstr (p, [], _) when is_permission p -> "Permission"
-  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_list ->
-      tag ~qualified types elt ^ "List"
-  | Tconstr (p, [ elt ], _) when Path.same p Predef.path_option ->
-      tag ~qualified types elt ^ "Option"
-  | Tconstr (p, [ elt ], _) when is_ref p -> tag ~qualified types elt ^ "Ref"
-  | Tconstr (p, [ elt ], _) when is_atomic p -> tag ~qualified types elt ^ "Atomic"
-  | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
-      tag ~qualified types elt ^ "Seq"
-  | Tconstr (p, [ elt ], _) when is_collection types p FinSet ->
-      tag ~qualified types elt ^ "FinSet"
-  | Tconstr (p, [ elt ], _) when is_collection types p Set ->
-      tag ~qualified types elt ^ "Set"
-  | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
-      tag ~qualified types key ^ "To" ^ tag ~qualified types value ^ "Map"
-  | Tconstr (p, [], _) when Option.is_some (find types p) ->
-      let data = Option.value_exn (find types p) in
-      begin match (data.cell_namespace, data.module_path) with
-      | Some owner, Some path ->
-          let leaf = Option.value (List.last path) ~default:data.module_name in
-          if qualified then String.concat ~sep:"_" (owner @ [ leaf ]) else leaf
-      | _ -> data.module_name
-      end
-  | Ttuple components ->
-      String.concat (List.map components ~f:(fun (_, t) -> tag ~qualified types t))
-      ^ "Tuple"
-  | Tpoly (t, []) -> tag ~qualified types t
-  | _ -> "Other"
+(** Storage identities use the translated type structure, rather than a display tag.
+    References have one representation; nominal value types retain their owner. *)
+type type_key =
+  | Int_key
+  | Integer_key
+  | Bool_key
+  | Unit_key
+  | Ref_key
+  | Permission_key
+  | Named_key of string list
+  | List_key of type_key
+  | Option_key of type_key
+  | Seq_key of type_key
+  | Finset_key of type_key
+  | Set_key of type_key
+  | Map_key of type_key * type_key
+  | Tuple_key of type_key list
+  | Atomic_token_key of string list
+
+let equal_type_key = Poly.equal
+
+let rec type_key types t =
+  let mathematical =
+    match Types.get_desc t with
+    | Tconstr (path, [], _) ->
+        Option.exists (find types path) ~f:(fun data -> data.mathematical_integer)
+    | _ -> false
+  in
+  let unary constructor element = Option.map (type_key types element) ~f:constructor in
+  let alias =
+    match Types.get_desc t with
+    | Tconstr (path, [], _) -> Option.bind (find types path) ~f:(fun data -> data.alias)
+    | Tpoly (body, []) -> Some body
+    | _ -> None
+  in
+  if mathematical then Some Integer_key
+  else if Option.is_some alias then type_key types (Option.value_exn alias)
+  else
+    match desc types t with
+    | Tconstr (p, [], _) when Path.same p Predef.path_int -> Some Int_key
+    | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Some Bool_key
+    | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Some Unit_key
+    | Tconstr (p, [], _) when is_permission p -> Some Permission_key
+    | Tconstr (p, [], _) when is_ghost p -> Some Ref_key
+    | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Some Ref_key
+    | Tconstr (p, [ element ], _) when Path.same p Predef.path_list ->
+        unary (fun key -> List_key key) element
+    | Tconstr (p, [ element ], _) when Path.same p Predef.path_option ->
+        unary (fun key -> Option_key key) element
+    | Tconstr (p, arguments, _) when Option.is_some (collection_kind types p) ->
+        begin match (collection_kind types p, arguments) with
+        | Some Sequence, [ element ] -> unary (fun key -> Seq_key key) element
+        | Some FinSet, [ element ] -> unary (fun key -> Finset_key key) element
+        | Some Set, [ element ] -> unary (fun key -> Set_key key) element
+        | Some Map, [ key; value ] ->
+            Option.map
+              (Option.both (type_key types key) (type_key types value))
+              ~f:(fun (key, value) -> Map_key (key, value))
+        | _ -> None
+        end
+    | Tconstr (p, [], _) ->
+        Option.map (find types p) ~f:(fun data ->
+            match (data.heap, data.atomic_procedure, data.backend_type) with
+            | Some _, _, _ -> Ref_key
+            | None, Some operation, _ -> Atomic_token_key (String.split operation ~on:'.')
+            | None, None, Some qualified ->
+                Named_key (qualified.Qualified_name.path @ [ qualified.name ])
+            | None, None, None -> Named_key [ data.module_name; "T" ])
+    | Ttuple components ->
+        Option.map
+          (Option.all (List.map components ~f:(fun (_, t) -> type_key types t)))
+          ~f:(fun keys -> Tuple_key keys)
+    | Tpoly (body, []) -> type_key types body
+    | _ -> None
+
+let rec key_name = function
+  | Int_key -> "Int"
+  | Integer_key -> "Integer"
+  | Bool_key -> "Bool"
+  | Unit_key -> "Unit"
+  | Ref_key -> "Ref"
+  | Permission_key -> "Permission"
+  | Named_key path -> "Named$" ^ framed path
+  | List_key child -> key_name child ^ "List"
+  | Option_key child -> key_name child ^ "Option"
+  | Seq_key child -> key_name child ^ "Seq"
+  | Finset_key child -> key_name child ^ "FinSet"
+  | Set_key child -> key_name child ^ "Set"
+  | Map_key (key, value) -> "Map$" ^ framed [ key_name key; key_name value ]
+  | Tuple_key arguments -> "Tuple$" ^ framed (List.map arguments ~f:key_name)
+  | Atomic_token_key path -> "Token$" ^ framed [ key_name (Named_key path) ]
+
+let relative_path owner path =
+  let rec strip owner path =
+    match (owner, path) with
+    | [], rest -> Some rest
+    | prefix :: owner, component :: path when String.equal prefix component ->
+        strip owner path
+    | _ -> None
+  in
+  Option.value (strip owner path) ~default:path
+
+let rec relative_key owner = function
+  | (Int_key | Integer_key | Bool_key | Unit_key | Ref_key | Permission_key) as key -> key
+  | Named_key path -> Named_key (relative_path owner path)
+  | List_key child -> List_key (relative_key owner child)
+  | Option_key child -> Option_key (relative_key owner child)
+  | Seq_key child -> Seq_key (relative_key owner child)
+  | Finset_key child -> Finset_key (relative_key owner child)
+  | Set_key child -> Set_key (relative_key owner child)
+  | Map_key (key, value) -> Map_key (relative_key owner key, relative_key owner value)
+  | Tuple_key arguments -> Tuple_key (List.map arguments ~f:(relative_key owner))
+  | Atomic_token_key path -> Atomic_token_key (relative_path owner path)
+
+type cell_key = {
+  namespace : string list;
+  prefix : string;
+  suffix : string;
+  payload : type_key;
+}
+
+let equal_cell_key = Poly.equal
+
+let cell_identity ~prefix ~suffix data typ =
+  let namespace =
+    match cell_namespaces data typ with
+    | [] -> Some []
+    | [ owner ] -> Some owner
+    | owners when List.for_all owners ~f:(fun owner -> List.length owner = 1) -> Some []
+    | _ -> None
+  in
+  Option.bind namespace ~f:(fun namespace ->
+      Option.map (type_key data typ) ~f:(fun payload ->
+          { namespace; prefix; suffix; payload = relative_key namespace payload }))
+
+let cell_key_name key =
+  String.concat ~sep:"."
+    (key.namespace @ [ key.prefix ^ key_name key.payload ^ key.suffix ])
 
 let cell_name ~prefix ~suffix data typ =
-  let leaf = prefix ^ tag data typ ^ suffix in
-  match cell_namespaces data typ with
-  | [] -> Some leaf
-  | [ owner ] -> Some (String.concat ~sep:"." (owner @ [ leaf ]))
-  | owners when List.for_all owners ~f:(fun owner -> List.length owner = 1) ->
-      (* Concrete layout selections are top-level modules. *)
-      Some (prefix ^ tag ~qualified:true data typ ^ suffix)
-  | _ -> None
+  Option.map (cell_identity ~prefix ~suffix data typ) ~f:cell_key_name
 
 let rec is_int types t =
   match Types.get_desc t with

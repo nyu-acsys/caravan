@@ -149,9 +149,43 @@ let anchored ctx ~loc ~pred (e : R.Expr.t) =
       end
   | _ -> e
 
+(** The source types of action parameters, inferred from their atomic step patterns. *)
+let action_parameter_types env (a : action) =
+  let rec typed (pattern : S.term) (t : Types.type_expr) =
+    match spine (S.chain pattern) [] with
+    | { term_desc = Tvar (Qid { pid_str = x; _ }); _ }, []
+      when List.mem a.params x ~equal:String.equal ->
+        [ (x, t) ]
+    | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
+        [ _; { term_desc = Tvar (Qid { pid_str = k; _ }); _ } ] )
+      when List.mem a.params k ~equal:String.equal ->
+        [ (k, Predef.type_int) ]
+    | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, ctor_args
+      when Char.is_uppercase c.[0] -> begin
+        let ctor_args =
+          match ctor_args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> ctor_args
+        in
+        match find_constructor env (S.Qid (S.mk_id ~loc:pattern.term_loc c)) with
+        | Some (_, ctor) when List.length ctor.args = List.length ctor_args ->
+            List.concat (List.map2_exn ctor_args ctor.args ~f:typed)
+        | _ -> []
+      end
+    | _ -> []
+  in
+  match a.step with
+  | Some (_, Some location :: patterns) ->
+      begin match Option.map (term_type env location) ~f:(Datatypes.desc env.data) with
+      | Some (Tconstr (p, [ contents ], _)) when Datatypes.is_atomic p ->
+          List.concat_map patterns ~f:(function
+            | Some pattern -> typed pattern contents
+            | None -> [])
+      | _ -> []
+      end
+  | _ -> []
+
 (** The environment of an action's terms: the state [values] of [st], its parameters with
     their [bindings] and the invariant's parameters, with the values [args]. *)
-let action_env ctx st inv_params args values bindings =
+let action_env ?action ctx st inv_params args values bindings =
   let ctx =
     {
       ctx with
@@ -179,7 +213,14 @@ let action_env ctx st inv_params args values bindings =
           ~f:(fun env ((x, t), e) ->
             { (bind env x (Value e)) with var_types = (x, t) :: env.var_types })
       in
-      List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e)))
+      let param_types =
+        Option.value_map action ~default:[] ~f:(action_parameter_types env)
+      in
+      List.fold bindings ~init:env ~f:(fun env (x, e) ->
+          let env = bind env x (Value e) in
+          match List.Assoc.find param_types x ~equal:String.equal with
+          | None -> env
+          | Some typ -> { env with var_types = (x, typ) :: env.var_types }))
 
 (** The state after [p] of [st] from [opened], whose invariant has the parameters
     [inv_params] and the arguments [args]: each field's value, whether it changes, the
@@ -187,14 +228,27 @@ let action_env ctx st inv_params args values bindings =
     entry to, and the entries appended, with their fields and positions. *)
 let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
   let open State.Syntax in
-  let* env = action_env ctx st inv_params args opened.values p.bindings in
+  let* env =
+    action_env ~action:p.performed ctx st inv_params args opened.values p.bindings
+  in
   let* next =
     State.all (List.zip_exn st.fields opened.values) ~f:(fun ((f, _, _, t, _), v) ->
         match List.Assoc.find p.performed.update f ~equal:String.equal with
         | Some term ->
-            let+ e = State.attempt (expected_formula env (Some t) term) in
-            begin match e with Ok e -> (e, true) | Error _ -> (v, false)
-            end
+            let* () =
+              State.of_result
+                (Signature_contract.terms ~expected:t ~logical_types:env.data
+                   ~predicates:(fun q ->
+                     Option.map
+                       (List.Assoc.find env.ctx.given.preds (logical_key env q)
+                          ~equal:String.equal)
+                       ~f:snd)
+                   ~environment:env.ctx.given.env
+                   ~variables:(Logical_context.variables env)
+                   [ term ])
+            in
+            let+ e = expected_formula env (Some t) term in
+            (e, true)
         | None -> State.return (v, false))
   in
   (* An entry appended to a field owned by index, at the field's length. *)
@@ -212,7 +266,7 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
             begin match spine added [] with
             | ( { term_desc = Tvar (Qid { pid_str = "::"; _ }); _ },
                 [ e; { term_desc = Tvar (Qid { pid_str = "[]"; _ }); _ } ] ) ->
-                State.map (State.attempt (formula env e)) ~f:Result.ok
+                State.map (formula env e) ~f:Option.some
             | _ -> State.return None
             end
         | _ -> State.return None
@@ -302,7 +356,9 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
   let open State.Syntax in
   match p.performed.helps with
   | Some (field, key, _) -> begin
-      let* env = action_env ctx st st.params args opened.values p.bindings in
+      let* env =
+        action_env ~action:p.performed ctx st st.params args opened.values p.bindings
+      in
       let* views = State.attempt (views_after ctx st args values) in
       let+ c = State.attempt (formula env key) in
       match
@@ -853,7 +909,8 @@ let step_performings ctx ~at ~op ~field ~location args =
                   | Some (o, Some loc_pattern :: patterns)
                     when String.equal o op && List.length patterns = List.length args ->
                       let env bindings =
-                        action_env ctx st st.params inv_args opened.values bindings
+                        action_env ~action:a ctx st st.params inv_args opened.values
+                          bindings
                       in
                       let* unbound = env [] in
                       let bindings =
@@ -1364,7 +1421,20 @@ let linearize ?step ?value ?access_type ctx ~at
                   begin match
                     (linearizing, Option.bind path.au ~f:(fun au -> au.au_performing))
                   with
-                  | _, Some _ | [], None -> State.return []
+                  | _, Some (selected, None) ->
+                      begin match
+                        List.find performings ~f:(fun (p, _) ->
+                            String.equal p.performed.action selected.performed.action)
+                      with
+                      | None -> State.return []
+                      | Some (p, condition) ->
+                          let+ () =
+                            modify_au (fun au ->
+                                { au with au_performing = Some (p, Some condition) })
+                          in
+                          []
+                      end
+                  | _, Some (_, Some _) | [], None -> State.return []
                   | [ (p, condition) ], None ->
                       let+ () =
                         modify_au (fun au ->

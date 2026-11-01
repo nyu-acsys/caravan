@@ -1,5 +1,6 @@
 Automatic views store RA elements as data, including invalid elements. Two views of
 one carrier keep distinct observations through allocation, CAS and read commits.
+State projections and inferred action parameters stay typed inside helper calls.
 
   $ caravan --shh ra_view.ml
   Verification successful.

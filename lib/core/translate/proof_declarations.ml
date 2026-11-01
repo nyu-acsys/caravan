@@ -48,44 +48,7 @@ let action_checks ctx (st : structure) =
           List.fold params ~init:env ~f:(fun env (x, raven, t, _) ->
               { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
         in
-        (* The types of the parameters, from the step's arguments. *)
-        let rec typed (pattern : S.term) (t : Types.type_expr) =
-          match spine (S.chain pattern) [] with
-          | { term_desc = Tvar (Qid { pid_str = x; _ }); _ }, []
-            when List.mem a.params x ~equal:String.equal ->
-              [ (x, t) ]
-          | ( { term_desc = Tvar (Qid { pid_str = "([])"; _ }); _ },
-              [ _; { term_desc = Tvar (Qid { pid_str = k; _ }); _ } ] )
-            when List.mem a.params k ~equal:String.equal ->
-              [ (k, Predef.type_int) ]
-          | { term_desc = Tvar (Qid { pid_str = c; _ }); _ }, ctor_args
-            when Char.is_uppercase c.[0] -> begin
-              let ctor_args =
-                match ctor_args with
-                | [ { term_desc = Ttuple ts; _ } ] -> ts
-                | _ -> ctor_args
-              in
-              match find_constructor env (S.Qid (S.mk_id ~loc:pattern.term_loc c)) with
-              | Some (_, ctor) when List.length ctor.args = List.length ctor_args ->
-                  List.concat (List.map2_exn ctor_args ctor.args ~f:typed)
-              | _ -> []
-            end
-          | _ -> []
-        in
-        let param_types =
-          match a.step with
-          | Some (_, Some location :: patterns) ->
-              begin match
-                Option.map (term_type env location) ~f:(Datatypes.desc ctx.given.types)
-              with
-              | Some (Tconstr (p, [ contents ], _)) when Datatypes.is_atomic p ->
-                  List.concat_map patterns ~f:(function
-                    | Some pattern -> typed pattern contents
-                    | None -> [])
-              | _ -> []
-              end
-          | _ -> []
-        in
+        let param_types = action_parameter_types env a in
         let* typed_params =
           State.all a.params ~f:(fun x ->
               match List.Assoc.find param_types x ~equal:String.equal with
@@ -462,6 +425,25 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             let hc = R.Expr.var ~loc:l (R.Name.make ~loc:l "hc") in
             let key = R.Expr.index ~loc:l on hc in
             let helping_state, helping_key, _ = p.helping in
+            let* membership_chains =
+              State.all st.chains ~f:(fun (field, _) ->
+                  match
+                    List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
+                  with
+                  | Some (_, entries, _, t, _) ->
+                      begin match Datatypes.desc types t with
+                      | Tconstr (_, [ element ], _) ->
+                          let+ equal =
+                            State.of_result
+                              (Signature_contract.compiler ~at (fun () ->
+                                   Ctype.is_equal state_env.ctx.given.env false
+                                     [ element ] [ p.key_type ]))
+                          in
+                          Option.some_if equal (field, entries)
+                      | _ -> State.return None
+                      end
+                  | None -> State.return None)
+            in
             let+ helped_key =
               formula
                 (bind state_env helping_state
@@ -477,31 +459,18 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             in
             (* A key that is an entry of a field owned by index is at its position. *)
             let membership =
-              List.filter_map st.chains ~f:(fun (field, _) ->
-                  match
-                    List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
-                  with
-                  | Some (_, entries, _, t, _) ->
-                      begin match Datatypes.desc types t with
-                      | Tconstr (_, [ elt ], _)
-                        when String.equal (Datatypes.tag types elt)
-                               (Datatypes.tag types p.key_type) ->
-                          let index =
-                            R.Expr.index ~loc:l
-                              (var
-                                 (List.Assoc.find_exn st.chains field ~equal:String.equal))
-                              key
-                          in
-                          Some
-                            (List.reduce_exn ~f:(bin And)
-                               [
-                                 bin Leq (R.Expr.int ~loc:l 0) index;
-                                 bin Lt index (length (var entries));
-                                 bin Eq (R.Expr.index ~loc:l (var entries) index) key;
-                               ])
-                      | _ -> None
-                      end
-                  | None -> None)
+              List.map (List.filter_opt membership_chains) ~f:(fun (field, entries) ->
+                  let index =
+                    R.Expr.index ~loc:l
+                      (var (List.Assoc.find_exn st.chains field ~equal:String.equal))
+                      key
+                  in
+                  List.reduce_exn ~f:(bin And)
+                    [
+                      bin Leq (R.Expr.int ~loc:l 0) index;
+                      bin Lt index (length (var entries));
+                      bin Eq (R.Expr.index ~loc:l (var entries) index) key;
+                    ])
             in
             let registered =
               R.Expr.call ~loc:l

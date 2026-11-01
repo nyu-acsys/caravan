@@ -42,11 +42,15 @@ let rec term_type env (t : S.term) =
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
       Result.ok
         (Source.infer_logical_expression env.ctx.given.env
-           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+           ~functions:(List.map env.funcs ~f:fst)
+           ~variables:(Logical_context.variables env)
+           t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, [ _ ]) ->
       Result.ok
         (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
-           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+           ~functions:(List.map env.funcs ~f:fst)
+           ~variables:(Logical_context.variables env)
+           t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "length"; _ }); _ }, [ _ ]) ->
       Some Predef.type_int
   | ( _,
@@ -66,7 +70,9 @@ let rec term_type env (t : S.term) =
   | Trecord (None, _), _ ->
       Result.ok
         (Source.infer_logical_expression env.ctx.given.env
-           ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+           ~functions:(List.map env.funcs ~f:fst)
+           ~variables:(Logical_context.variables env)
+           t)
   | Tfield (base, Qid { pid_str = f; _ }), _ ->
       let state =
         match base.term_desc with
@@ -130,7 +136,9 @@ and equality_term_type env (t : S.term) =
   | Some ty -> Ok ty
   | None ->
       Source.infer_logical_expression env.ctx.given.env
-        ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t
+        ~functions:(List.map env.funcs ~f:fst)
+        ~variables:(Logical_context.variables env)
+        t
 
 (** Equality operands share a type, so a known operand supplies its context. *)
 and equality_operand_types env a b =
@@ -293,7 +301,8 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                (List.Assoc.find env.ctx.given.preds (logical_key env q)
                   ~equal:String.equal)
                ~f:snd)
-           ~variables:env.var_types t)
+           ~variables:(Logical_context.variables env)
+           t)
     else State.return ()
   in
   let at = t.term_loc in
@@ -461,7 +470,9 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
             State.map ~f:Option.some
               (State.of_result
                  (Source.infer_logical_expression env.ctx.given.env
-                    ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t))
+                    ~functions:(List.map env.funcs ~f:fst)
+                    ~variables:(Logical_context.variables env)
+                    t))
       in
       begin match Option.bind record_type ~f:(logical_record env) with
       | None -> State.of_result (error at "This record is not of a logical record type")
@@ -602,7 +613,9 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
                  (List.Assoc.find env.ctx.given.preds (logical_key env q)
                     ~equal:String.equal)
                  ~f:snd)
-             ~environment:env.ctx.given.env ~variables:env.var_types [ t ])
+             ~environment:env.ctx.given.env
+             ~variables:(Logical_context.variables env)
+             [ t ])
     | Some _ | None -> State.return ()
   in
   let literal = list_literal in
@@ -625,7 +638,9 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
       let* () =
         State.of_result
           (Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
-             ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected t)
+             ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
+             ~expected t)
       in
       let* value = formula env t in
       let+ ty = State.of_result (typ env.ctx ~at:t.term_loc expected) in
@@ -684,8 +699,9 @@ and application env (t : S.term) =
         | Some _, Some expected ->
             State.of_result
               (Source.check_logical_expression env.ctx.given.env
-                 ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected
-                 v)
+                 ~functions:(List.map env.funcs ~f:fst)
+                 ~variables:(Logical_context.variables env)
+                 ~expected v)
         | _ -> State.return ()
       in
       let* location = location_of env location in
@@ -709,7 +725,8 @@ and application env (t : S.term) =
             let* () =
               State.of_result
                 (Source.check_logical_expression env.ctx.given.env
-                   ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                   ~functions:(List.map env.funcs ~f:fst)
+                   ~variables:(Logical_context.variables env)
                    ~expected:permission_type fraction)
             in
             let+ fraction = formula env fraction in
@@ -787,7 +804,9 @@ and application env (t : S.term) =
         let* _ =
           State.of_result
             (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
-               ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+               ~functions:(List.map env.funcs ~f:fst)
+               ~variables:(Logical_context.variables env)
+               t)
         in
         let+ args = State.all args ~f:(formula env) in
         R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "of_list") args
@@ -840,10 +859,13 @@ and typed_arguments env ~at inputs args =
                      (List.Assoc.find env.ctx.given.preds (logical_key env q)
                         ~equal:String.equal)
                      ~f:snd)
-                 ~environment:env.ctx.given.env ~variables:env.var_types [ value ]
+                 ~environment:env.ctx.given.env
+                 ~variables:(Logical_context.variables env)
+                 [ value ]
              else
                Source.check_logical_expression ~is_list env.ctx.given.env
-                 ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+                 ~functions:(List.map env.funcs ~f:fst)
+                 ~variables:(Logical_context.variables env)
                  ~expected:ty value)
         in
         let* () =
@@ -945,7 +967,8 @@ and location_of env (t : S.term) =
       let* () =
         State.of_result
           (Source.check_logical_expression env.ctx.given.env
-             ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+             ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
              ~expected:field.field_owner owner)
       in
       let+ owner = formula env owner in

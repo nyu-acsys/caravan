@@ -137,6 +137,8 @@ type position = {
     index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
 
 type cell_field = {
+  cell_key : Datatypes.cell_key;
+  cell_bounded : bool;
   cell_name : string;
   cell_type : Types.type_expr;
   cell_declaration : R.Member.t;
@@ -229,9 +231,23 @@ module State_monad = struct
     scope : (string * (string * Types.type_expr option)) list;
   }
 
+  type primitive_operation =
+    | Atomic of Primitives.op
+    | Ordinary of Primitives.ordinary_op
+
+  type primitive_key = {
+    field : string;
+    payload : Datatypes.type_key;
+    operation : primitive_operation;
+    exact : bool;
+    bounded : bool;
+  }
+
+  type primitive = { key : primitive_key; name : string; member : R.Member.t }
+
   type tables = {
     cells : cell_field list;
-    primitives : (string list * (string * R.Member.t) list) list;
+    primitives : (string list * primitive list) list;
         (** The atomic operations used so far, by the namespace they are declared in, and
             by their names (see {!Primitives}). *)
     dynamic_indices : bool;
@@ -828,11 +844,18 @@ module State = struct
 
   open Syntax
 
-  let declare_field (given : inputs) ~at field elt =
+  let declare_field (given : inputs) ~at key field elt =
     let* t = of_result (Datatypes.typ given.types ~at elt) in
-    modify (fun s ->
-        if List.exists s.tables.cells ~f:(fun cell -> String.equal cell.cell_name field)
-        then s
+    let bounded = Datatypes.is_int given.types elt in
+    let* cells = gets (fun s -> s.tables.cells) in
+    match List.find cells ~f:(fun cell -> Datatypes.equal_cell_key cell.cell_key key) with
+    | Some cell ->
+        if String.equal cell.cell_name field && Bool.equal cell.cell_bounded bounded then
+          return ()
+        else of_result (error at "Incompatible representations for a shared cell field")
+    | None ->
+        if List.exists cells ~f:(fun cell -> String.equal cell.cell_name field) then
+          of_result (error at "Distinct cell types have the same generated field name")
         else
           let file =
             { Lexing.dummy_pos with pos_fname = at.Location.loc_start.pos_fname }
@@ -840,6 +863,8 @@ module State = struct
           let loc = R.Loc.make file file in
           let cell =
             {
+              cell_key = key;
+              cell_bounded = bounded;
               cell_name = field;
               cell_type = elt;
               cell_declaration =
@@ -847,15 +872,17 @@ module State = struct
                   (Qualified_name.of_string field).name t elt;
             }
           in
-          { s with tables = { s.tables with cells = s.tables.cells @ [ cell ] } })
+          modify (fun s -> { s with tables = { s.tables with cells = cells @ [ cell ] } })
 
   let cell_field (given : inputs) ~at elt ~prefix ~suffix =
-    match Datatypes.cell_name ~prefix ~suffix given.types elt with
-    | None ->
-        of_result (unsupported at "A cell payload combining distinct result layouts")
-    | Some field ->
-        let* () = declare_field given ~at field elt in
+    match Datatypes.cell_identity ~prefix ~suffix given.types elt with
+    | Some key ->
+        let field = Datatypes.cell_key_name key in
+        let* () = declare_field given ~at key field elt in
         return field
+    | None ->
+        let* _ = of_result (Datatypes.typ given.types ~at elt) in
+        of_result (unsupported at "A cell payload combining distinct result layouts")
 
   (** The field of the ref cells with contents of type [elt]. *)
   let ref_field given ~at elt =
@@ -864,60 +891,71 @@ module State = struct
   (** The field of the atomics with contents of type [elt]. *)
   let atomic_field given ~at elt = cell_field given ~at elt ~prefix:"atomic_" ~suffix:""
 
-  let add_primitive ~namespace name proc =
-    modify (fun s ->
-        let declared = primitives_in s.tables namespace in
-        if List.Assoc.mem declared name ~equal:String.equal then s
-        else
-          {
-            s with
-            tables =
+  let add_primitive ~namespace ~key ~base proc =
+    let* declared = gets (fun s -> primitives_in s.tables namespace) in
+    match List.find declared ~f:(fun primitive -> Poly.equal primitive.key key) with
+    | Some primitive -> return primitive.name
+    | None ->
+        let used = Set.of_list (module String) (List.map declared ~f:(fun p -> p.name)) in
+        let name = Fresh_names.unused used base in
+        let declaration_name = (Qualified_name.of_string name).name in
+        let primitive = { key; name; member = proc declaration_name } in
+        let+ () =
+          modify (fun s ->
               {
-                s.tables with
-                primitives =
-                  List.Assoc.add s.tables.primitives namespace
-                    (declared @ [ (name, proc ()) ])
-                    ~equal:(List.equal String.equal);
-              };
-          })
+                s with
+                tables =
+                  {
+                    s.tables with
+                    primitives =
+                      List.Assoc.add s.tables.primitives namespace
+                        (declared @ [ primitive ]) ~equal:(List.equal String.equal);
+                  };
+              })
+        in
+        name
+
+  let primitive_key given ~at ~field elt operation =
+    match Datatypes.type_key given.types elt with
+    | None -> of_result (unsupported at "This primitive's payload type")
+    | Some payload ->
+        return
+          {
+            field;
+            payload;
+            operation;
+            exact = Datatypes.immediate given.types elt;
+            bounded = Datatypes.is_int given.types elt;
+          }
+
+  let primitive_stem field =
+    let qualified = Qualified_name.of_string field in
+    match qualified.path with
+    | [] -> String.uncapitalize qualified.name
+    | path -> "field$" ^ Datatypes.framed (path @ [ qualified.name ])
 
   (** The procedure performing [op] on the atomics with contents of type [elt]. *)
   let primitive (given : inputs) ~at elt op =
     let* field = atomic_field given ~at elt in
-    let stem =
-      String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.'))
-    in
-    let declaration_name = Primitives.name ~field:stem op in
-    let name =
+    let* key = primitive_key given ~at ~field elt (Atomic op) in
+    let declaration_name = Primitives.name ~field:(primitive_stem field) op in
+    let base =
       String.concat ~sep:"." (given.primitive_namespace @ [ declaration_name ])
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
-    let+ () =
-      add_primitive ~namespace:given.primitive_namespace name (fun () ->
-          Primitives.proc ~declaration_name ~field ~typ
-            ~exact:(Datatypes.immediate given.types elt)
-            ~int:(Datatypes.is_int given.types elt)
-            op)
-    in
-    name
+    add_primitive ~namespace:given.primitive_namespace ~key ~base (fun declaration_name ->
+        Primitives.proc ~declaration_name ~field ~typ ~exact:key.exact ~int:key.bounded op)
 
   (** The ordinary read or write of a mutable field. *)
   let ordinary_primitive (given : inputs) ~at ~field elt op =
-    let stem =
-      String.uncapitalize (String.concat ~sep:"_" (String.split field ~on:'.'))
-    in
-    let declaration_name = Primitives.ordinary_name ~field:stem op in
-    let procedure =
+    let* key = primitive_key given ~at ~field elt (Ordinary op) in
+    let declaration_name = Primitives.ordinary_name ~field:(primitive_stem field) op in
+    let base =
       String.concat ~sep:"." (given.primitive_namespace @ [ declaration_name ])
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
-    let+ () =
-      add_primitive ~namespace:given.primitive_namespace procedure (fun () ->
-          Primitives.ordinary_proc ~declaration_name ~field ~typ
-            ~int:(Datatypes.is_int given.types elt)
-            op)
-    in
-    procedure
+    add_primitive ~namespace:given.primitive_namespace ~key ~base (fun declaration_name ->
+        Primitives.ordinary_proc ~declaration_name ~field ~typ ~int:key.bounded op)
 
   (** The assertion [c] checking, at [at], what [message] says may fail. *)
   let check ~(at : Location.t) message c =

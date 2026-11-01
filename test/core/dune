@@ -33,3 +33,8 @@
  (name monotone_history)
  (modules monotone_history)
  (libraries caravan_core raven-ivl.api))
+
+(test
+ (name storage_identities)
+ (modules storage_identities)
+ (libraries base caravan_core compiler-libs.common))
