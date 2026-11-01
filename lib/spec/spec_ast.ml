@@ -190,18 +190,63 @@ type type_kind =
   | Record of (id * pty) list
       (** A logical record, [type piece = { before : int list; next : node }]. *)
 
+(** The names that [p] binds. *)
+let rec pat_names (p : pat) =
+  match p.pat_desc with
+  | Pwild | Pconst _ | Pconstr (_, None) -> []
+  | Pid id -> [ id.pid_str ]
+  | Ptuple ps -> List.concat_map pat_names ps
+  | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+
+(** A step of a proof outline: ghost code at a place in a function, written in the
+    [.proof] file as [at (anchor) step] or [on return e]. *)
+type outline_step =
+  | At of {
+      anchor : term;  (** The code it follows, by its own names. *)
+      anchor_loc : Location.t;
+      action : step_action;
+      action_loc : Location.t;
+      export : pat option;
+          (** [let p = at ...]: the value the scope returns with the result, for the later
+              steps. *)
+    }
+  | Let of { pattern : pat; value : proof_expr }
+      (** [let p = e in ...]: pure ghost code for the later steps, which run it where they
+          use it. *)
+  | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
+  | Nested of outline  (** The outline of a local function. *)
+
+(** What a step does at its code. *)
+and step_action =
+  | Linearize  (** [commit], [returning p -> commit] or [performs a]. *)
+  | Scope  (** A proof around the access or call, [(fun step -> e)]. *)
+  | Initializes  (** The ghost fields of an allocation, [initializes [...]]. *)
+
+and outline = {
+  outline_name : id;
+  outline_params : id list option;  (** The parameters that select the function. *)
+  outline_contract : Location.t option;
+  outline_steps : outline_step list;
+  outline_loc : Location.t;
+}
+(** The proof of a function, [proof f x = steps], in program order. A function without a
+    contract in the interface gives it in the header, [proof r = f x requires p = steps].
+*)
+
 (** A declaration of a proof. *)
 type proof_decl =
   | Proof_module of {
       module_name : id;
       module_parameters : proof_module_parameter list;
       module_declarations : proof_decl list;
+      module_outlines : outline list;
       module_loc : Location.t;
     }
   | Proof_definition of {
       module_name : id;
       module_interface : qualid;
       module_declarations : proof_decl list;
+      module_outlines : outline list;
       module_loc : Location.t;
     }
   | Proof_predicate of predicate
@@ -260,24 +305,6 @@ type proof_decl =
           performs it, an operation with its arguments, [_] for any, what the step gives
           the state, the fields it changes, in terms of the state before, and the
           functions it linearizes. Without a step, only [(*@ performs a *)] names it. *)
-
-(** A step of a proof outline: ghost code at a place in a function, written in the
-    [.proof] file as [at (anchor) step] or [on return e]. *)
-type outline_step =
-  | At of {
-      anchor : term;  (** The code it follows, by its own names. *)
-      anchor_loc : Location.t;
-      action_loc : Location.t;  (** A linearization, as [commit]. *)
-    }
-  | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
-
-type outline = {
-  outline_name : id;
-  outline_params : id list option;  (** The parameters that select the function. *)
-  outline_steps : outline_step list;
-  outline_loc : Location.t;
-}
-(** The proof of a function, [proof f x = steps], in program order. *)
 
 type proof_file = { declarations : proof_decl list; outlines : outline list }
 

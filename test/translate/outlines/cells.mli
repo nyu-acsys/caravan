@@ -15,3 +15,8 @@ val twice : t -> int
 (*@ r = atomic twice c
     atomic requires cell c v
     atomic ensures cell c v *)
+
+val both : t -> int
+(*@ r = atomic both c
+    atomic requires cell c v
+    atomic ensures cell c v *)

@@ -4,18 +4,29 @@
 open Base
 open Caravan_spec
 
+type outline = {
+  export : (string * Spec_ast.pat) option;
+      (** The key under which the step keeps the value it exports, and its pattern. *)
+  imports : (string * Spec_ast.pat) list;
+      (** The exports of earlier steps that the step uses, by key and pattern. *)
+  lets : (Spec_ast.pat * Spec_ast.proof_expr) list;
+      (** The outline's pure bindings that the step uses, in order. *)
+}
+(** What a step of a proof outline shares with the other steps. *)
+
 type t = {
   text : string;
   loc : Location.t;
   origin : Lexing.position option;
       (** Where [text] is written, if not in the comment at [loc]: in a proof outline. *)
+  outline : outline option;
 }
 
 (** The annotations among [comments]. *)
 let of_comments (comments : (string * Location.t) list) : t list =
   List.filter_map comments ~f:(fun (text, loc) ->
       Option.map (String.chop_prefix text ~prefix:"@") ~f:(fun text ->
-          { text; loc; origin = None }))
+          { text; loc; origin = None; outline = None }))
 
 (** A lexer buffer reading [annotation]'s text at its place in the source, after the
     comment's opening delimiter and its [@]. *)

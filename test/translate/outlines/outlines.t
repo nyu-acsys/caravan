@@ -1,9 +1,38 @@
 A proof outline gives a function's proof in the .proof file, as steps at its code:
 ghost code on return, and a linearization at an atomic access, which an anchor names
-with the code's own names.
+with the code's own names, or as the code bound to a name.
 
   $ caravan --shh cells.ml
   Verification successful.
+
+A step can export a value to the later steps, as let p = at (code) (fun step -> e),
+whose scope returns the value with the result, and the outline can bind pure ghost code
+for them, as let x = e. A step uses an export only if the code exporting it runs on
+every path to it; the earlier steps' state is not threaded through scopes.
+
+  $ caravan --shh exports.ml
+  Verification successful.
+
+  $ caravan --shh conditional_export.ml
+  [Error] File "conditional_export.proof", line 11, column 28 to line 16, column 11:
+  11 |   at (let b = Atomic.get c) (fun step ->
+                                   ^^^^^^^^^^^^
+  Type Error: The step exporting first, at line 7 of the code, does not run on every path to this step.
+  [1]
+
+  $ caravan --shh export_shape.ml
+  [Error] File "export_shape.proof", line 10, columns 4-10:
+  10 |     result) in
+           ^^^^^^
+  Type Error: A scope that exports a value returns (unchanged operation result, value).
+  [1]
+
+  $ caravan --shh state_binder.ml
+  [Error] File "state_binder.proof", line 6, columns 38-40:
+  6 |   at (let a = Atomic.get c) (fun step () ->
+                                            ^^
+  Syntax Error: A step exports a value for later steps as let p = at (code) (fun step -> e).
+  [1]
 
 Errors in a step's code are reported where the outline writes it.
 
@@ -48,9 +77,9 @@ An outline names a function of the program, by its parameters if several have it
 
   $ caravan --shh parameters.ml
   [Error] File "parameters.proof", line 3, columns 6-9:
-  3 | proof get d = at (Atomic.get d) commit
+  3 | proof get c d = at (Atomic.get c) commit
             ^^^
-  Type Error: No function get has these parameters.
+  Type Error: The function get has 1 parameter.
   [1]
 
 A program whose proofs are outlines has no annotations, and one outline per function.
@@ -59,7 +88,7 @@ A program whose proofs are outlines has no annotations, and one outline per func
   [Error] File "mixed.ml", line 5, columns 0-20:
   5 | (*@ fold cell c v *)
       ^^^^^^^^^^^^^^^^^^^^
-  Type Error: A program whose proofs are outlines in its .proof file has no annotations.
+  Type Error: A program whose proofs are outlines in its .proof file has no proof annotations.
   [1]
 
   $ caravan --shh duplicate.ml

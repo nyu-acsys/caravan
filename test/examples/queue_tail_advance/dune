@@ -24,7 +24,15 @@
 
 (copy_files ../../saturn/michael_scott_queue_lseg/*.mli)
 
-(copy_files ../../saturn/michael_scott_queue_lseg/*.proof)
+(rule
+ (target michael_scott_queue_lseg.proof)
+ (deps
+  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.proof
+  segment_tail.proof)
+ (action
+  (with-stdout-to
+   %{target}
+   (cat %{deps}))))
 
 (cram
  (deps

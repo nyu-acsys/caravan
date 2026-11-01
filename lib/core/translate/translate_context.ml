@@ -212,6 +212,8 @@ module State_monad = struct
   type carried = {
     ghost_returns : (string * string * Types.type_expr) list;
     proof_state : (R.Expr.t * Types.type_expr) option;
+    outline_exports : (string * (R.Expr.t * Types.type_expr)) list;
+        (** The values that steps of the function's outline exported, by their keys. *)
     return_covered : bool;
     fields_of : (string * (string * R.Expr.t)) list;
     formals : R.Expr.t list;
@@ -307,6 +309,7 @@ module State_monad = struct
     {
       ghost_returns = [];
       proof_state = None;
+      outline_exports = [];
       return_covered = false;
       fields_of = [];
       formals = [];
@@ -1451,12 +1454,7 @@ let ctor_args ~at arity (args : 'a list) ~(tuple : 'a -> 'a list option) =
   | n, _ -> error at (Printf.sprintf "This constructor expects %d arguments" n)
 
 (** The variables bound by a specification pattern. *)
-let rec pat_names (p : S.pat) =
-  match p.pat_desc with
-  | Pwild | Pconst _ | Pconstr (_, None) -> []
-  | Pid id -> [ id.pid_str ]
-  | Ptuple ps -> List.concat_map ps ~f:pat_names
-  | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
+let pat_names = S.pat_names
 
 (** The names that the contract term [t] uses free. *)
 let rec term_names (t : S.term) : string list =

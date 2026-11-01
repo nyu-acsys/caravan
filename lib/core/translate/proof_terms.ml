@@ -1173,6 +1173,26 @@ and proof_value_binding :
   in
   (List.concat_map declarations ~f:(fun (_, _, stmts) -> stmts) @ rhs @ rest, value)
 
+(** [env] with the exports of earlier steps that the outline step [outline] uses. *)
+let outline_env env (outline : Annotation.outline option) =
+  let open State.Syntax in
+  let imports = Option.value_map outline ~default:[] ~f:(fun o -> o.Annotation.imports) in
+  let* exports = State.gets (fun (s : State.state) -> s.carried.outline_exports) in
+  State.fold imports ~init:env ~f:(fun env (key, (pattern : S.pat)) ->
+      match List.Assoc.find exports key ~equal:String.equal with
+      | Some (value, ty) -> State.of_result (bind_proof_pattern env pattern ty value)
+      | None ->
+          State.of_result
+            (error pattern.pat_loc "This export is not available at this step"))
+
+(** [body] after the outline's pure bindings that its step uses. *)
+let with_outline_lets (outline : Annotation.outline option) (body : S.proof_expr) =
+  List.fold_right
+    (Option.value_map outline ~default:[] ~f:(fun o -> o.Annotation.lets))
+    ~init:body
+    ~f:(fun (pattern, value) body ->
+      { S.proof_desc = Proof_let (pattern, value, body); proof_loc = body.proof_loc })
+
 (** Ghost annotations share the checked lemma expression language. *)
 let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
   let open State.Syntax in
@@ -1189,7 +1209,10 @@ let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
         | Annotation.Proof ->
             let* body = State.of_result (Annotation.proof annotation) in
             let* env = scope_env ctx in
-            let+ statements = proof_expression env [] body in
+            let* env = outline_env env annotation.outline in
+            let+ statements =
+              proof_expression env [] (with_outline_lets annotation.outline body)
+            in
             [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
         | _ ->
             let* statements = State.of_result (Annotation.ghost_stmts annotation) in
@@ -1246,7 +1269,10 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
     =
   let open State.Syntax in
   let* scope = State.of_result (Annotation.scope annotation) in
-  let operation = scope.scope_operation and body = scope.scope_body in
+  let export = Option.bind annotation.Annotation.outline ~f:(fun o -> o.export) in
+  let stateful = Option.is_some scope.scope_state || Option.is_some export in
+  let operation = scope.scope_operation
+  and body = with_outline_lets annotation.outline scope.scope_body in
   let uses_operation body =
     List.mem (proof_names body) operation.pid_str ~equal:String.equal
   in
@@ -1279,7 +1305,11 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
         let l = loc state.term_loc in
         let result = R.Expr.var ~loc:l (name ~loc:l raven) in
         let+ () =
-          State.modify_carried (fun c -> { c with proof_state = Some (result, ty) })
+          State.modify_carried (fun c ->
+              match export with
+              | Some (key, _) ->
+                  { c with outline_exports = (key, (result, ty)) :: c.outline_exports }
+              | None -> { c with proof_state = Some (result, ty) })
         in
         R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
         @ [
@@ -1295,10 +1325,9 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
       | _ -> false
     in
     match body.S.proof_desc with
-    | Proof_value t when Option.is_none scope.scope_state && unchanged t ->
-        State.return []
+    | Proof_value t when (not stateful) && unchanged t -> State.return []
     | Proof_value { term_desc = Ttuple [ runtime; state ]; _ }
-      when Option.is_some scope.scope_state && unchanged runtime ->
+      when stateful && unchanged runtime ->
         finish_state env state
     | Proof_seq (first, rest) ->
         let* first = ghost_statements env first in
@@ -1320,7 +1349,9 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
     | _ ->
         State.of_result
           (error body.proof_loc
-             (if Option.is_some scope.scope_state then
+             (if Option.is_some export then
+                "A scope that exports a value returns (unchanged operation result, value)"
+              else if stateful then
                 "A stateful scope must return (unchanged operation result, output state)"
               else
                 "An access proof must return the unchanged result of the attached \
@@ -1410,6 +1441,7 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
               operation")
   in
   let* env = scope_env ctx in
+  let* env = outline_env env annotation.outline in
   let* env =
     match scope.scope_state with
     | None -> State.return env

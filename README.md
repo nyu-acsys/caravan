@@ -564,10 +564,19 @@ proof pop_opt t backoff = at (Atomic.get t) returning [] -> commit
 ```
 
 `proof f` names the function, with its parameters when several share the name.
-`at (code) step` puts a linearization step after the one place of the function
-that `code` matches after the previous step, modulo formatting, parentheses, `@@`
-and `|>`. `on return e` runs the ghost code `e` when the function returns. A
-program with outlines has no annotations in its `.ml`.
+`at (code) step` places a step after the one place of the function that `code`
+matches after the previous step, modulo formatting, parentheses, `@@` and `|>`;
+`at (let x = code)` names the code bound to `x`. A step is a linearization, an
+access or call scope `(fun step -> e)`, or `initializes [...]`; `on return e` runs
+the ghost code `e` when the function returns. `let p = at (code) (fun step -> e) in`
+exports the value that the scope returns with the result, `(result, value)`, to the
+later steps; it can be used where the exporting code runs on every path to the step.
+`let x = e in` binds pure ghost code, which each later step that uses `x` runs. A function without a contract in the interface gives it in the header,
+with parenthesized clauses: `proof r = f x requires (p) ensures (q) = steps`. A
+local function's outline is nested where it is defined, as `proof g y = begin
+steps end`, and an outline in a proof module proves a function of the source
+module of its name. Outlines with steps other than linearizations are manual
+proofs. A program with outlines has no proof annotations in its `.ml`.
 
 ## Building
 

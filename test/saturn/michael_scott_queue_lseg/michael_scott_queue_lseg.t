@@ -17,12 +17,13 @@ Clients initialize empty, singleton, and longer queues and exercise FIFO operati
 Building an empty chain cannot establish the input contents.
 
   $ mkdir wrong_contents
-  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg.proof wrong_contents/
+  $ cp michael_scott_queue_lseg.mli wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.ml > wrong_contents/michael_scott_queue_lseg.ml
+  $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.proof > wrong_contents/michael_scott_queue_lseg.proof
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue_lseg.ml
-  [Error] File "wrong_contents/michael_scott_queue_lseg.ml", line 480, columns 10-45:
-  480 | (*@ proof initialize_built_queue q tail_ list *)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  [Error] File "wrong_contents/michael_scott_queue_lseg.proof", line 899, columns 12-47:
+  899 |   on return initialize_built_queue q tail_ list
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: A precondition may not hold for this call.
   File "wrong_contents/michael_scott_queue_lseg.proof", line 480, columns 7-43:
   480 |     && segment root last values cells edges
@@ -36,9 +37,9 @@ The builder must return the owned terminal cell at the end of the chain.
   $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> let _ = tail_ in Atomic.make Nil/' michael_scott_queue_lseg.ml > wrong_terminal/michael_scott_queue_lseg.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue_lseg.ml
-  [Error] File "wrong_terminal/michael_scott_queue_lseg.ml", line 468, columns 17-66:
-  468 |     | [] -> fold segment result tail_ [] Finset.empty Finset.empty
-                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  [Error] File "wrong_terminal/michael_scott_queue_lseg.proof", line 893, columns 19-68:
+  893 |       | [] -> fold segment result tail_ [] Finset.empty Finset.empty
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: Failed to fold predicate. The body of the predicate may not hold at this point.
   File "wrong_terminal/michael_scott_queue_lseg.proof", line 8, columns 14-28:
   8 |       | [] -> first == limit && cells = Finset.empty && edges = Finset.empty

@@ -530,7 +530,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
         ~default:(Ok { S.declarations = []; outlines = [] })
         ~f:load_proof
     in
-    Result.bind proof ~f:(fun { S.declarations = proof; outlines } ->
+    Result.bind proof ~f:(fun ({ S.declarations = proof; _ } as proof_file_contents) ->
         let* outline_annotations =
           match proof_file with
           | None -> Ok []
@@ -539,7 +539,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
                 ~proof_text:(Stdio.In_channel.read_all proof_file)
                 ~structure:parsed
                 ~annotations:(Annotation.of_comments comments)
-                outlines
+                proof_file_contents
         in
         let* env, _, _, _, _ = Proof_types.elaborate_proof_types env interface [] in
         let* signature_resources =

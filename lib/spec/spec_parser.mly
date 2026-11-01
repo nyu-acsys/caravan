@@ -52,6 +52,10 @@
     | Tapply (f, { term_desc = Trecord (None, fields); _ }) -> (f, fields)
     | _ -> (t, [])
 
+  let split_items items =
+    ( List.filter_map (function `Decl d -> Some d | `Outline _ -> None) items,
+      List.filter_map (function `Outline o -> Some o | `Decl _ -> None) items )
+
   (* The record types that no invariant takes as its state are logical records. *)
   let logical_records declarations =
     let rec states = function
@@ -134,7 +138,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS PROOF
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS PROOF AT
 %token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
 
 (* Keywords *)
@@ -269,39 +273,112 @@ predicate_decl:
 (* The declarations of a proof file. *)
 proof:
 | items = proof_item* EOF
-    { let declarations = List.filter_map (function `Decl d -> Some d | `Outline _ -> None) items in
-      let outlines = List.filter_map (function `Outline o -> Some o | `Decl _ -> None) items in
+    { let declarations, outlines = split_items items in
       { declarations = logical_records declarations; outlines } }
 ;
 
 proof_item:
 | d = proof_decl { `Decl d }
-| o = outline { `Outline o }
+| o = outline(outline_steps) { `Outline o }
 ;
 
-outline:
-| PROOF n = lident ps = lident* EQUAL ss = separated_nonempty_list(SEMICOLON, outline_step)
-    { { outline_name = n; outline_params = (match ps with [] -> None | ps -> Some ps);
-        outline_steps = ss; outline_loc = mk_loc $loc } }
+outline(steps):
+| PROOF n = lident ps = fun_arg* cs = outline_clause* EQUAL b = outline_body(steps)
+    { let params ps =
+        match List.filter_map (function Lvar x -> Some x | _ -> None) ps with
+        | [] -> None
+        | xs -> Some xs
+      in
+      let header_end = match cs with [] -> None | _ -> Some $endpos(cs) in
+      match b with
+      | `Steps ss ->
+          { outline_name = n; outline_params = params ps;
+            outline_contract =
+              Option.map (fun e -> { (mk_loc $loc) with loc_start = $startpos(n); loc_end = e })
+                header_end;
+            outline_steps = ss; outline_loc = mk_loc $loc }
+      | `Contract (f, fs, contract_end, ss) ->
+          if ps <> [] || cs <> [] then
+            raise (Syntax_error (n.pid_loc, "A result name is followed by = and the call"));
+          { outline_name = f; outline_params = params fs;
+            outline_contract =
+              Option.map (fun e -> { (mk_loc $loc) with loc_start = $startpos(n); loc_end = e })
+                contract_end;
+            outline_steps = ss; outline_loc = mk_loc $loc } }
+;
+
+outline_body(steps):
+| ss = steps { `Steps ss }
+| f = lident fs = fun_arg* cs = outline_clause* EQUAL ss = steps
+    { `Contract (f, fs, (match cs with [] -> None | _ -> Some $endpos(cs)), ss) }
+| ATOMIC f = lident fs = fun_arg* cs = outline_clause* EQUAL ss = steps
+    { `Contract (f, fs, (match cs with [] -> None | _ -> Some $endpos(cs)), ss) }
+;
+
+(* A clause of an outline's contract, parenthesized as a lemma's. *)
+outline_clause:
+| REQUIRES LEFTPAR term RIGHTPAR {}
+| ENSURES LEFTPAR term RIGHTPAR {}
+| ATOMIC_REQUIRES LEFTPAR term RIGHTPAR {}
+| ATOMIC_ENSURES LEFTPAR term RIGHTPAR {}
+;
+
+(* Steps in program order. [let p = at (a) (fun step -> e) in ...] exports the value that
+   the scope returns with the result to the later steps; [let x = e in ...] binds pure
+   ghost code for them. *)
+outline_steps:
+| s = outline_step { [s] }
+| s = outline_step SEMICOLON ss = outline_steps { s :: ss }
+| LET p = pat EQUAL AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
+    IN ss = outline_steps
+    { let action, action_loc = action in
+      At { anchor; anchor_loc = mk_loc $loc(anchor); action; action_loc; export = Some p }
+      :: ss }
+| LET p = pat EQUAL e = proof_expr IN ss = outline_steps
+    { Let { pattern = p; value = e } :: ss }
+;
+
+nested_steps:
+| BEGIN ss = outline_steps END { ss }
 ;
 
 outline_step:
-| a = lident LEFTPAR anchor = term RIGHTPAR action = step_linearization
-    { if a.pid_str <> "at" then
-        raise (Syntax_error (a.pid_loc, "A step is at (code) followed by its step, or on return followed by ghost code"));
-      At { anchor; anchor_loc = mk_loc $loc(anchor); action_loc = action } }
+| AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
+    { let action, action_loc = action in
+      At { anchor; anchor_loc = mk_loc $loc(anchor); action; action_loc; export = None } }
+| a = lident LEFTPAR anchor RIGHTPAR step_action
+    { raise (Syntax_error (a.pid_loc,
+        "A step is at (code) followed by its step, or on return followed by ghost code")) }
 | ON r = lident e = proof_nonseq
     { if r.pid_str <> "return" then
-        raise (Syntax_error (r.pid_loc, "A step is at (code) followed by its step, or on return followed by ghost code"));
+        raise (Syntax_error (r.pid_loc,
+          "A step is at (code) followed by its step, or on return followed by ghost code"));
       ignore e;
       On_return { return_loc = mk_loc $loc(e) } }
+| o = outline(nested_steps) { Nested o }
 ;
 
-step_linearization:
-| COMMIT { mk_loc $loc }
-| COMMIT term_arg { mk_loc $loc }
-| RETURNING mpat ARROW outcome { mk_loc $loc }
-| PERFORMS lident { mk_loc $loc }
+(* The code a step follows, or the code bound to a name, as [let head = Atomic.make x]. *)
+anchor:
+| t = term { t }
+| LET pat EQUAL t = term { t }
+;
+
+step_action:
+| COMMIT { (Linearize, mk_loc $loc) }
+| COMMIT term_arg { (Linearize, mk_loc $loc) }
+| RETURNING mpat ARROW outcome { (Linearize, mk_loc $loc) }
+| PERFORMS lident { (Linearize, mk_loc $loc) }
+| LEFTPAR FUN lident state = pat_arg? ARROW proof_expr RIGHTPAR
+    { if state <> None then
+        raise (Syntax_error (mk_loc $loc(state),
+          "A step exports a value for later steps as let p = at (code) (fun step -> e)"));
+      (Scope, mk_loc $loc) }
+| i = lident term_arg
+    { if i.pid_str <> "initializes" then
+        raise (Syntax_error (i.pid_loc, "Expected commit, returning, performs, \
+          initializes or a scope (fun step -> ...)"));
+      (Initializes, mk_loc $loc) }
 ;
 ;
 
@@ -317,14 +394,17 @@ proof_module_argument:
 proof_decl:
 | p = predicate_decl { Proof_predicate p }
 | MODULE n = uident EQUAL ds = proof_module_body
-    { Proof_module { module_name = n; module_parameters = [];
-        module_declarations = ds; module_loc = mk_loc $loc } }
+    { let ds, os = ds in
+      Proof_module { module_name = n; module_parameters = [];
+        module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
 | MODULE n = uident ps = proof_module_parameter+ EQUAL ds = proof_module_body
-    { Proof_module { module_name = n; module_parameters = ps;
-        module_declarations = ds; module_loc = mk_loc $loc } }
+    { let ds, os = ds in
+      Proof_module { module_name = n; module_parameters = ps;
+        module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
 | MODULE n = uident COLON interface = uqualid EQUAL ds = proof_module_body
-    { Proof_definition { module_name = n; module_interface = interface;
-        module_declarations = ds; module_loc = mk_loc $loc } }
+    { let ds, os = ds in
+      Proof_definition { module_name = n; module_interface = interface;
+        module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
 | MODULE n = uident EQUAL f = uqualid LEFTPAR STRUCT
     LET operation = lident EQUAL target = lqualid END RIGHTPAR
     { begin match f with
@@ -393,7 +473,7 @@ proof_decl:
 ;
 
 proof_module_body:
-| STRUCT ds = proof_decl* END { ds }
+| STRUCT items = proof_item* END { split_items items }
 ;
 
 proof_module_parameter:
@@ -986,18 +1066,21 @@ qualid:
 | id = ident_rich                  { Qid id }
 | q = uqualid DOT id = ident_rich  { Qdot (q, id) }
 | q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
+| q = uqualid DOT AT { Qdot (q, mk_pid "at" $loc) }
 ;
 
 lqualid_rich:
 | id = lident_rich                 { Qid id }
 | q = uqualid DOT id = lident_rich { Qdot (q, id) }
 | q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
+| q = uqualid DOT AT { Qdot (q, mk_pid "at" $loc) }
 ;
 
 lqualid:
 | id = lident                      { Qid id }
 | q = uqualid DOT id = lident      { Qdot (q, id) }
 | q = uqualid DOT COMMIT { Qdot (q, mk_pid "commit" $loc) }
+| q = uqualid DOT AT { Qdot (q, mk_pid "at" $loc) }
 ;
 
 uqualid:

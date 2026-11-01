@@ -267,7 +267,7 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
       ~f:(fun (state, scope, scopes, entries) declaration ->
         match declaration with
         | S.Proof_module
-            { module_name; module_parameters; module_declarations; module_loc } ->
+            { module_name; module_parameters; module_declarations; module_loc; _ } ->
             let* nested = child_scope scope module_name module_parameters module_loc in
             begin match List.find scopes ~f:(same_scope nested) with
             | Some previous ->
@@ -285,7 +285,7 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
                 Ok (state, scope, scopes, entries)
             end
         | S.Proof_definition
-            { module_name; module_interface; module_declarations; module_loc } ->
+            { module_name; module_interface; module_declarations; module_loc; _ } ->
             let* state, scope =
               prepare_definition state scope module_name module_interface
             in

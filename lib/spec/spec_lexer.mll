@@ -45,6 +45,7 @@
         "wait", WAIT;
         "linearizes", LINEARIZES;
         "assert", ASSERT;
+        "at", AT;
         "atomic", ATOMIC;
         "begin", BEGIN;
         "commit", COMMIT;

@@ -5,3 +5,5 @@ proof make = on return fold cell c v
 proof get = at (Atomic.get c) commit
 
 proof twice = at (Atomic.get c) commit
+
+proof both = at (let second = Atomic.get c) commit

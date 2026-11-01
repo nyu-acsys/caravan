@@ -1,0 +1,10 @@
+predicate cell (c : t) (v [@implicit] : int) = own c v
+
+proof make = on return fold cell c v
+
+proof diff =
+  at (let a = Atomic.get c) (fun step () ->
+    unfold cell c;
+    let result = step () in
+    fold cell c;
+    (result, result))
