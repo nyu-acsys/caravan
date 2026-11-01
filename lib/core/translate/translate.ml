@@ -315,12 +315,12 @@ let program ?(history = History.default) (source : Source.t) :
       ~applications ~late_members =
     let group = List.hd (Module_context.groups destination) in
     let ghost_fields =
-      List.filter_map view_fields ~f:(fun (_, (field, typ, init)) ->
-          Option.some_if
-            (Option.is_none init && same_group (field_group field) group)
-            (R.Member.field ~loc:at ~ghost:true
-               (ident ~loc:at (Module_context.local_name destination field))
-               typ))
+      List.concat_map view_fields ~f:(fun (_, view) ->
+          if same_group (field_group view.View_storage.field) group then
+            View_storage.members ~loc:at
+              ~local_name:(Module_context.local_name destination)
+              view
+          else [])
     in
     let primitive_members =
       State.primitives_in state.tables (Module_context.namespace destination)
@@ -357,8 +357,8 @@ let program ?(history = History.default) (source : Source.t) :
             `Public_resources;
             `Applications;
             `Fields;
-            `State;
             `View_fields;
+            `State;
             `Proof_definitions;
             `Late_members;
             `Predicates;

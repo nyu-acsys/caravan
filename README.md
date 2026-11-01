@@ -375,6 +375,7 @@ actions belong to a stateful invariant in the same proof scope: parameter types 
 state binders identify the invariant, and ambiguous matches are rejected. Signatures
 export the invariant and view contracts while hiding their state representation and
 actions. Aliases retain their identities; sibling modules can reuse proof names.
+Views can observe resource-algebra values as ordinary data.
 
 A `(*@ manual *)` annotation after a function selects a checked manual proof.
 The function keeps its OCaml implementation and contract; its proof supplies

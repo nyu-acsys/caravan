@@ -10,7 +10,7 @@ open Program_items
 type t = {
   structures : structure list;
   structure_member_lists : (structure * R.Member.t list) list;
-  view_fields : (string * (string * R.Type.t * R.Expr.t option)) list;
+  view_fields : (string * View_storage.t) list;
   shared : shared;
   generic_shared : (string * shared) list;
   past_structures : ?symbolic:bool -> Procedures.func -> structure list;
@@ -141,7 +141,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
             (declaration_context p.pred_name.pid_str)
             (view_field p.pred_name.pid_str)
         in
-        Ok (anchor, (field, typ, None)))
+        Ok (anchor, { View_storage.field; value_type = typ }))
   in
   let resolve_function ~environment (id : S.id) =
     match Source.value_path environment (S.Qid id) with
@@ -691,11 +691,14 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         Option.some_if (has_history st)
           (let l = R.Loc.none in
            ( Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst,
-             ( member_name st "history",
-               R.Type.named ~loc:l (qualified_name ~loc:l (module_name st "history")) [],
-               Some (history_elements ~loc:l history st).initial ) )))
+             (member_name st "history", Fixed (history_elements ~loc:l history st).initial)
+           )))
   in
-  let view_fields = view_fields @ history_fields in
+  let allocated_fields =
+    List.map view_fields ~f:(fun (anchor, view) ->
+        (anchor, (view.View_storage.field, Snapshot view.value_type)))
+    @ history_fields
+  in
   let owner_destination = owner_destination ~declaration_context in
   let visible_state group name =
     match owner_destination name with
@@ -747,7 +750,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
               | _ -> (persistent, views))
     in
     let selected_fields =
-      List.filter view_fields ~f:(fun (_, (field, _, _)) ->
+      List.filter allocated_fields ~f:(fun (_, (field, _)) ->
           match field_group field with
           | None -> true
           | Some owner -> Option.exists group ~f:(phys_equal owner))

@@ -601,6 +601,11 @@ let state_of ~loc:l st values =
     (generated_module_member ~loc:l (module_name st "state") "state")
     values
 
+type ghost_initializer =
+  | Fixed of R.Expr.t
+  | Snapshot of R.Type.t
+      (** A full agreement chunk over an arbitrary value of the source view type. *)
+
 type shared = {
   persistent : (string * Location.t) list;
       (** The invariants, by their names, with their definitions. *)
@@ -609,7 +614,7 @@ type shared = {
           of the state, half in the view and half in the invariant. *)
   structures : structure list;
   member_aliases : (string * string) list;
-  anchors : (string * (string * R.Type.t * R.Expr.t option) list) list;
+  anchors : (string * (string * ghost_initializer) list) list;
       (** The ghost fields of the views and histories, by the field whose allocation
           allocates them, the field of the structure's reference, with their initial
           values: arbitrary for views. *)

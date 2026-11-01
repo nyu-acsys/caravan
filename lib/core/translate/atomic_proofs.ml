@@ -703,13 +703,7 @@ let with_views ctx make ~loc ~pred p args =
   match List.Assoc.find ctx.given.shared.views pred ~equal:String.equal with
   | Some field ->
       let structure = List.hd_exn args and value = List.last_exn args in
-      R.Stmt.assign ~loc
-        [
-          R.Expr.field ~loc
-            (anchored ctx ~loc ~pred structure)
-            (qualified_name ~loc field);
-        ]
-        (R.Stmt.expr_rhs value)
+      View_storage.write ~loc ~field (anchored ctx ~loc ~pred structure) value
       :: make ~loc ~pred p args
   | None -> make ~loc ~pred p args
 
@@ -1542,13 +1536,17 @@ let view_allocation ctx ~loc:l (fields : string list) =
           ~default:[])
   in
   let+ allocated =
-    State.all views ~f:(fun (view, typ, init) ->
+    State.all views ~f:(fun (view, init) ->
         match init with
-        | Some init -> State.return ([], (qualified_name ~loc:l view, Some init))
-        | None ->
+        | Fixed init -> State.return ([], (qualified_name ~loc:l view, Some init))
+        | Snapshot typ ->
             let+ x = State.fresh "view" in
             ( R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x),
-              (qualified_name ~loc:l view, Some (R.Expr.var ~loc:l (name ~loc:l x))) ))
+              ( qualified_name ~loc:l view,
+                Some
+                  (View_storage.chunk ~loc:l ~field:view
+                     (R.Expr.var ~loc:l (name ~loc:l x))
+                     1.0) ) ))
   in
   (List.concat_map allocated ~f:fst, List.map allocated ~f:snd)
 

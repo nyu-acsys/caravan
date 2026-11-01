@@ -1015,12 +1015,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let structure = List.hd_exn args in
   let view_owned =
     List.map view_values ~f:(fun (x, _, view_field, _, _) ->
-        R.Expr.own ~loc:l
-          [
-            R.Expr.field ~loc:l (anchored structure) (qualified_name ~loc:l view_field);
-            var x;
-            R.Expr.real ~loc:l 0.5;
-          ])
+        View_storage.own ~loc:l ~field:view_field (anchored structure) (var x) 0.5)
   in
   (* The helped function's atomic postcondition, for the result, without its predicates. *)
   let post_env =

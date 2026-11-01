@@ -348,18 +348,12 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
         | None -> structure
       in
       let _, raven, _, _ = List.hd_exn value in
-      let field =
-        R.Expr.field ~loc:l structure
-          (qualified_name ~loc:l (view_field_in ctx.given.shared p.pred_name.pid_str))
-      in
+      let field = view_field_in ctx.given.shared p.pred_name.pid_str in
       R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value) name
         (Some
-           (R.Expr.own ~loc:l
-              [
-                field;
-                R.Expr.var ~loc:l (R.Name.make ~loc:l raven);
-                R.Expr.real ~loc:l 0.5;
-              ]))
+           (View_storage.own ~loc:l ~field structure
+              (R.Expr.var ~loc:l (R.Name.make ~loc:l raven))
+              0.5))
   | Invariant { state; body; _ } ->
       (* The state's fields are existentials, as are the index maps of the fields owned by
          index; its views hold the other halves of their ghost fields, and its history
@@ -542,13 +536,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                   })
             in
             let+ value = formula view_env value in
-            let field =
-              R.Expr.field ~loc:l
-                (anchored (var structure))
-                (qualified_name ~loc:l
-                   (view_field_in ctx.given.shared v.pred_name.pid_str))
-            in
-            R.Expr.own ~loc:l [ field; value; R.Expr.real ~loc:l 0.5 ])
+            let field = view_field_in ctx.given.shared v.pred_name.pid_str in
+            View_storage.own ~loc:l ~field (anchored (var structure)) value 0.5)
       in
       let history =
         if has_history st then
