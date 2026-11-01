@@ -131,6 +131,7 @@ let run (source : Source.t) : (t, error) Result.t =
       "Bool";
       Prelude.div;
       Prelude.mod_;
+      Prelude.value_interface;
       Prelude.in_range;
       Prelude.wrap;
     ];
@@ -416,6 +417,7 @@ let run (source : Source.t) : (t, error) Result.t =
                           ( Datatypes.library_type ~library:lib.library_name
                               ~library_id:lib.library_id ~at:decl.ptype_loc
                               decl.ptype_name.txt
+                          |> Datatypes.with_abstract_domain
                           |> fun descriptor ->
                             Datatypes.with_paths descriptor
                               [ Path.Pdot (lib.library_path, decl.ptype_name.txt) ] )

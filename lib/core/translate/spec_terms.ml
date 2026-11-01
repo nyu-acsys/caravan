@@ -3,6 +3,14 @@
 open Base
 open Translate_context
 
+let integer_literal ~at text =
+  match Int.of_string_opt text with
+  | Some value -> Ok value
+  | None ->
+      error at
+        "This integer literal is outside the supported OCaml int range; use a \
+         mathematical expression with smaller literals"
+
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
     concatenation. *)
 let rec term_type env (t : S.term) =
@@ -215,7 +223,8 @@ let rec spec_pattern env (p : S.pat) (v : R.Expr.t) =
   | Pid id -> Ok (None, [ (id.pid_str, v) ])
   | Pcast (p, _) -> spec_pattern env p v
   | Pconst (Pconst_integer (n, None)) ->
-      Ok (Some (R.Expr.binary ~loc:l Eq v (R.Expr.int ~loc:l (Int.of_string n))), [])
+      let* value = integer_literal ~at n in
+      Ok (Some (R.Expr.binary ~loc:l Eq v (R.Expr.int ~loc:l value)), [])
   | Pconst _ -> unsupported at "This constant"
   | Ptuple ps ->
       let* conds, binds =
@@ -311,7 +320,8 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Ttrue -> State.return (R.Expr.bool ~loc:l true)
   | Tfalse -> State.return (R.Expr.bool ~loc:l false)
   | Tconst (Pconst_integer (n, None)) ->
-      State.return (R.Expr.int ~loc:l (Int.of_string n))
+      let+ value = State.of_result (integer_literal ~at n) in
+      R.Expr.int ~loc:l value
   | Tconst _ -> State.of_result (unsupported at "This constant")
   | Tvar (Qid { pid_str = x; _ }) when is_constructor x -> constructor env t []
   | Tvar (Qdot (_, id)) when is_constructor id.pid_str -> constructor env t []
@@ -413,6 +423,26 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
             in
             { (bind env x binding) with var_types = (x, t) :: env.var_types })
       in
+      let rec mathematical_record typ =
+        match Types.get_desc typ with
+        | Tconstr (path, [], _) ->
+            begin match Datatypes.find env.data path with
+            | Some data when data.mathematical -> true
+            | Some { alias = Some typ; _ } -> mathematical_record typ
+            | Some _ | None -> false
+            end
+        | Tpoly (body, []) -> mathematical_record body
+        | _ -> false
+      in
+      let* () =
+        State.iter bound ~f:(fun (_, parent_type, binding) ->
+            match binding with
+            | `Variable (_, typ, _) -> State.note_domain env.data typ
+            | `Record _ when mathematical_record parent_type -> State.return ()
+            | `Record fields ->
+                State.iter fields ~f:(fun (_, (_, typ, _)) ->
+                    State.note_domain env.data typ))
+      in
       let+ body = formula env body in
       let variables =
         List.concat_map bound ~f:(fun (_, _, binding) ->
@@ -421,13 +451,23 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
             | `Record fields -> List.map fields ~f:snd)
       in
       let vars = List.map variables ~f:(fun (_, _, v) -> v) in
-      (* A variable of type [int] ranges over its values. *)
+      (* Flattening a mathematical record preserves its original scalar domains. *)
       let ranges =
-        List.filter_map variables ~f:(fun (x, t, _) ->
-            Option.map (range_spec ~loc:l t x) ~f:(fun _ ->
-                R.Expr.call ~loc:l
-                  (R.Name.make ~loc:l Prelude.in_range)
-                  [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+        List.concat_map bound ~f:(fun (_, parent_type, binding) ->
+            let admissible (x, typ, _) =
+              Datatypes.admissible ~loc:l env.data typ
+                (R.Expr.var ~loc:l (R.Name.make ~loc:l x))
+            in
+            match binding with
+            | `Variable variable -> Option.to_list (admissible variable)
+            | `Record fields when mathematical_record parent_type ->
+                List.filter_map fields ~f:(fun (_, (x, typ, _)) ->
+                    Option.map (range_spec ~loc:l typ x) ~f:(fun _ ->
+                        R.Expr.call ~loc:l
+                          (R.Name.make ~loc:l Prelude.in_range)
+                          [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+            | `Record fields ->
+                List.filter_map fields ~f:(fun (_, variable) -> admissible variable))
       in
       let guard = List.reduce ranges ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
       begin match (q, guard) with
@@ -439,6 +479,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Tcomprehension ((id, ty), body) ->
       let* ty = State.of_result (Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty) in
       let* raven_type = State.of_result (typ env.ctx ~at:id.pid_loc ty) in
+      let* () = State.note_domain env.data ty in
       let* raven = State.fresh id.pid_str in
       let env =
         {
@@ -449,14 +490,11 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       in
       let+ body = formula env body in
       let body =
-        match range_spec ~loc:l ty raven with
+        match
+          Datatypes.admissible ~loc:l env.data ty (R.Expr.var ~loc:l (name ~loc:l raven))
+        with
         | None -> body
-        | Some _ ->
-            R.Expr.binary ~loc:l And
-              (R.Expr.call ~loc:l
-                 (name ~loc:l Prelude.in_range)
-                 [ R.Expr.var ~loc:l (name ~loc:l raven) ])
-              body
+        | Some admissible -> R.Expr.binary ~loc:l And admissible body
       in
       R.Expr.set_compr ~loc:l (R.Var.make ~loc:l (ident ~loc:l raven) raven_type) body
   | Ttuple ts ->

@@ -310,8 +310,30 @@ let types group ~owner =
               name = List.Assoc.find_exn group.types source ~equal:String.equal;
             }
         in
-        Datatypes.parameter_type ~parameter:group.representative.parameter ~name:source
-          ~declaration ~backend)
+        let descriptor =
+          Datatypes.parameter_type ~parameter:group.representative.parameter ~name:source
+            ~declaration ~backend
+        in
+        match declaration.Typedtree.typ_manifest with
+        | Some _ -> descriptor
+        | None ->
+            let domain_scope =
+              if Option.equal String.equal (List.last owner) (Some group.parameter) then
+                String.split group.name ~on:'.'
+              else owner
+            in
+            {
+              descriptor with
+              backend_type =
+                Some
+                  Qualified_name.
+                    { path = backend.path @ [ backend.name ]; name = "Carrier" };
+              value_constraint =
+                Some
+                  Qualified_name.
+                    { path = backend.path @ [ backend.name ]; name = "holds" };
+              domain_scope = Some domain_scope;
+            })
   in
   let ghost_types =
     List.map group.representative.argument.expected.signature_ghost_modules
@@ -339,7 +361,8 @@ let algebra_name group member = "Algebra_" ^ group.parameter ^ "_" ^ member
 
 let world_types group ~owner =
   let ordinary, ghosts = List.split_n (types group ~owner) (List.length group.types) in
-  ordinary
+  List.map ordinary ~f:(fun descriptor ->
+      { descriptor with Datatypes.domain_scope = Some owner })
   @ List.map2_exn group.representative.argument.expected.signature_ghost_modules ghosts
       ~f:(fun (member, _) descriptor ->
         let stem = carrier_name group member in
@@ -354,3 +377,12 @@ let type_slots group =
       List.map stage.types ~f:snd
       @ List.map stage.representative.argument.expected.signature_ghost_modules
           ~f:(fun (member, _) -> carrier_name stage member))
+
+(** Ordinary abstract type slots carry their source-value domain with the carrier. *)
+let value_type_slots group =
+  List.concat_map (parameter_groups group) ~f:(fun stage ->
+      List.filter_map stage.representative.argument.expected.signature_types
+        ~f:(fun (source, declaration) ->
+          Option.some_if
+            (Option.is_none declaration.Typedtree.typ_manifest)
+            (List.Assoc.find_exn stage.types source ~equal:String.equal)))

@@ -1291,11 +1291,13 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
         { s with names = { s.names with used = Set.add s.names.used "r" } })
   in
   let* result_typ = State.of_result (typ ctx ~at result) in
+  let* () = State.note_domain ctx.given.types result in
   let* result_name, names = State.of_result header_names in
   let* params =
     State.all (List.zip_exn names args) ~f:(fun (n, t) ->
         let* raven = State.fresh (Option.value n ~default:"x") in
-        let+ typ = State.of_result (typ ctx ~at t) in
+        let* typ = State.of_result (typ ctx ~at t) in
+        let+ () = State.note_domain ctx.given.types t in
         (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
   let returns =
@@ -1367,9 +1369,9 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
       (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
   in
   let in_range =
-    List.filter_map params ~f:(fun (_, raven, typ, _) -> range_spec ~loc:l typ raven)
+    List.filter_map params ~f:(fun (_, raven, typ, _) -> value_spec ctx ~loc:l typ raven)
   in
-  let result_in_range = Option.to_list (range_spec ~loc:l result "r") in
+  let result_in_range = Option.to_list (value_spec ctx ~loc:l result "r") in
   {
     prepared_formals =
       List.map params ~f:(fun (_, _, _, v) -> v)
@@ -1457,12 +1459,14 @@ let contains_atomic_token types typ =
 let library_function ctx ~(at : Location.t) ~name ~args ~result contract =
   match (args, contract) with
   | [], None ->
-      State.of_result
-        (Result.map (typ ctx ~at result) ~f:(fun result ->
-             R.Callable.func ~loc:(loc at)
-               ~returns:[ R.Var.make ~loc:(loc at) (ident ~loc:(loc at) "r") result ]
-               (ident ~loc:(loc at) name)
-               None))
+      let open State.Syntax in
+      let* () = State.note_domain ctx.given.types result in
+      let+ result_type = State.of_result (typ ctx ~at result) in
+      let l = loc at in
+      R.Callable.func ~loc:l
+        ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
+        ~ensures:(Option.to_list (value_spec ctx ~loc:l result "r"))
+        (ident ~loc:l name) None
   | [], Some _ ->
       State.of_result
         (unsupported at "A contract of a library's value other than a function")

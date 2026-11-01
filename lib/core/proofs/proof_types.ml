@@ -222,7 +222,11 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   match item.str_desc with Tstr_type (_, ds) -> ds | _ -> [])
             in
             let* added =
-              Result.all (List.map typed_declarations ~f:Datatypes.of_declaration)
+              Result.all
+                (List.map typed_declarations ~f:(fun declaration ->
+                     Result.map
+                       (Datatypes.of_declaration declaration)
+                       ~f:Datatypes.with_mathematical_domain))
             in
             Ok (env, List.rev_append added descriptors, resources, fields)
         | Proof_au { au_name = name; au_operation = operation } ->

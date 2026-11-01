@@ -77,12 +77,6 @@ let range_spec ~loc:l (t : Types.type_expr) x =
           (R.Name.make ~loc:l Prelude.in_range)
           [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
 
-(** That [x] is in the range of OCaml's [int], if its type [t] is [int]: true of every
-    value, since every [int] the translation creates is checked to be. *)
-let assume_in_range ~loc:l (t : Types.type_expr) x =
-  Option.value_map (range_spec ~loc:l t x) ~default:[] ~f:(fun spec ->
-      [ R.Stmt.assume ~loc:l spec ])
-
 type origin = {
   at : Location.t;
   code : R.Diagnostic.code;
@@ -136,9 +130,18 @@ type position = {
 (** That [pos_element] is at the position [pos_k] of the field [pos_field], owned by
     index, of the snapshot [pos_snapshot] of the history of the invariant [pos_inv]. *)
 
+type domain_request = { domain_types : Datatypes.t list; domain_type : Types.type_expr }
+
+type default_request = {
+  default_namespace : string list;
+  default_name : string;
+  default_type : R.Type.t;
+}
+
 type cell_field = {
   cell_key : Datatypes.cell_key;
   cell_bounded : bool;
+  cell_admissibility : string option;
   cell_name : string;
   cell_type : Types.type_expr;
   cell_declaration : R.Member.t;
@@ -241,6 +244,7 @@ module State_monad = struct
     operation : primitive_operation;
     exact : bool;
     bounded : bool;
+    admissibility : string option;
   }
 
   type primitive = { key : primitive_key; name : string; member : R.Member.t }
@@ -250,6 +254,8 @@ module State_monad = struct
     primitives : (string list * primitive list) list;
         (** The atomic operations used so far, by the namespace they are declared in, and
             by their names (see {!Primitives}). *)
+    domains : domain_request list;
+    defaults : default_request list;
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
   }
@@ -292,6 +298,29 @@ module State_monad = struct
   end
 
   open Syntax
+
+  let note_domain types typ =
+    match Datatypes.constraint_name types typ with
+    | None -> return ()
+    | Some name when String.equal name Prelude.in_range -> return ()
+    | Some name ->
+        modify (fun s ->
+            if
+              List.exists s.tables.domains ~f:(fun request ->
+                  Option.equal String.equal
+                    (Datatypes.constraint_name request.domain_types request.domain_type)
+                    (Some name))
+            then s
+            else
+              {
+                s with
+                tables =
+                  {
+                    s.tables with
+                    domains =
+                      s.tables.domains @ [ { domain_types = types; domain_type = typ } ];
+                  };
+              })
 
   (** A name for [base] not used yet. *)
   let fresh base s =
@@ -342,7 +371,14 @@ module State_monad = struct
       path = empty_path;
       carried = empty_carried;
       names = empty_names;
-      tables = { cells = []; primitives = []; dynamic_indices = false };
+      tables =
+        {
+          cells = [];
+          primitives = [];
+          domains = [];
+          defaults = [];
+          dynamic_indices = false;
+        };
       origins = [];
     }
 
@@ -833,6 +869,15 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     libraries = Path_bindings.empty;
   }
 
+let value_spec ctx ~loc typ variable =
+  Option.map
+    (Datatypes.admissible ~loc ctx.given.types typ (R.Expr.var ~loc (name ~loc variable)))
+    ~f:R.Spec.make
+
+let assert_admissible ctx ~loc typ variable =
+  Option.value_map (value_spec ctx ~loc typ variable) ~default:[] ~f:(fun spec ->
+      [ R.Stmt.assert_ ~loc spec ])
+
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
 (** The explicit state, with the operations that use a context's inputs. *)
@@ -845,13 +890,18 @@ module State = struct
   open Syntax
 
   let declare_field (given : inputs) ~at key field elt =
+    let* () = note_domain given.types elt in
     let* t = of_result (Datatypes.typ given.types ~at elt) in
     let bounded = Datatypes.is_int given.types elt in
+    let admissibility = Datatypes.constraint_name given.types elt in
     let* cells = gets (fun s -> s.tables.cells) in
     match List.find cells ~f:(fun cell -> Datatypes.equal_cell_key cell.cell_key key) with
     | Some cell ->
-        if String.equal cell.cell_name field && Bool.equal cell.cell_bounded bounded then
-          return ()
+        if
+          String.equal cell.cell_name field
+          && Bool.equal cell.cell_bounded bounded
+          && Option.equal String.equal cell.cell_admissibility admissibility
+        then return ()
         else of_result (error at "Incompatible representations for a shared cell field")
     | None ->
         if List.exists cells ~f:(fun cell -> String.equal cell.cell_name field) then
@@ -865,6 +915,7 @@ module State = struct
             {
               cell_key = key;
               cell_bounded = bounded;
+              cell_admissibility = admissibility;
               cell_name = field;
               cell_type = elt;
               cell_declaration =
@@ -926,6 +977,7 @@ module State = struct
             operation;
             exact = Datatypes.immediate given.types elt;
             bounded = Datatypes.is_int given.types elt;
+            admissibility = Datatypes.constraint_name given.types elt;
           }
 
   let primitive_stem field =
@@ -936,6 +988,7 @@ module State = struct
 
   (** The procedure performing [op] on the atomics with contents of type [elt]. *)
   let primitive (given : inputs) ~at elt op =
+    let* () = note_domain given.types elt in
     let* field = atomic_field given ~at elt in
     let* key = primitive_key given ~at ~field elt (Atomic op) in
     let declaration_name = Primitives.name ~field:(primitive_stem field) op in
@@ -944,10 +997,12 @@ module State = struct
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
     add_primitive ~namespace:given.primitive_namespace ~key ~base (fun declaration_name ->
-        Primitives.proc ~declaration_name ~field ~typ ~exact:key.exact ~int:key.bounded op)
+        Primitives.proc ~declaration_name ~field ~typ ~exact:key.exact ~int:key.bounded
+          ?admissibility:key.admissibility op)
 
   (** The ordinary read or write of a mutable field. *)
   let ordinary_primitive (given : inputs) ~at ~field elt op =
+    let* () = note_domain given.types elt in
     let* key = primitive_key given ~at ~field elt (Ordinary op) in
     let declaration_name = Primitives.ordinary_name ~field:(primitive_stem field) op in
     let base =
@@ -955,7 +1010,8 @@ module State = struct
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
     add_primitive ~namespace:given.primitive_namespace ~key ~base (fun declaration_name ->
-        Primitives.ordinary_proc ~declaration_name ~field ~typ ~int:key.bounded op)
+        Primitives.ordinary_proc ~declaration_name ~field ~typ ~int:key.bounded
+          ?admissibility:key.admissibility op)
 
   (** The assertion [c] checking, at [at], what [message] says may fail. *)
   let check ~(at : Location.t) message c =
@@ -1690,3 +1746,41 @@ let opaque_module_types env =
   env.ctx.given.proof_support.strict_source_types
   || List.exists env.ctx.given.types ~f:(fun data ->
       List.exists data.Datatypes.paths ~f:(opaque_module_path env))
+
+(** An arbitrary carrier value, without a source admissibility assumption. *)
+let raw_default ctx ~at typ =
+  let open State.Syntax in
+  let* carrier = State.of_result (Datatypes.typ ctx.given.types ~at typ) in
+  let* key =
+    match Datatypes.type_key ctx.given.types typ with
+    | Some key -> State.return key
+    | None -> State.of_result (unsupported at "An unreachable expression of this type")
+  in
+  let namespace = ctx.given.primitive_namespace in
+  let stem = "ocaml_default$" ^ Datatypes.key_name key in
+  let qualified = String.concat ~sep:"." (namespace @ [ stem ]) in
+  let+ () =
+    State.modify (fun (s : State.state) ->
+        if
+          List.exists s.tables.defaults ~f:(fun request ->
+              String.equal request.default_name qualified)
+        then s
+        else
+          {
+            s with
+            tables =
+              {
+                s.tables with
+                defaults =
+                  s.tables.defaults
+                  @ [
+                      {
+                        default_namespace = namespace;
+                        default_name = qualified;
+                        default_type = carrier;
+                      };
+                    ];
+              };
+          })
+  in
+  R.Expr.var ~loc:(loc at) (qualified_name ~loc:(loc at) qualified)

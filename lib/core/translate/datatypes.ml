@@ -46,6 +46,13 @@ type t = {
   alias : Types.type_expr option;  (** The type that an abbreviation stands for. *)
   collection : collection_kind option;
   mathematical_integer : bool;
+  mathematical : bool;
+      (** A logical model whose carrier is not a runtime value domain. *)
+  empty : bool;  (** An empty source variant, represented by an inhabited carrier. *)
+  value_constraint : Qualified_name.t option;
+      (** An abstract source-value domain, distinct from mathematical carrier validity. *)
+  domain_scope : string list option;
+      (** The lexical scope containing parameters used by this value representation. *)
   atomic_procedure : string option;
   backend_type : Qualified_name.t option;
   library : Path.t option;
@@ -68,6 +75,10 @@ let list =
     alias = None;
     collection = None;
     mathematical_integer = false;
+    mathematical = false;
+    empty = false;
+    value_constraint = None;
+    domain_scope = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -90,6 +101,10 @@ let option =
     alias = None;
     collection = None;
     mathematical_integer = false;
+    mathematical = false;
+    empty = false;
+    value_constraint = None;
+    domain_scope = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -127,6 +142,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           alias = None;
           collection = None;
           mathematical_integer = false;
+          mathematical = false;
+          empty = List.is_empty cds;
+          value_constraint = None;
+          domain_scope = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -175,6 +194,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           alias = None;
           collection = None;
           mathematical_integer = false;
+          mathematical = false;
+          empty = false;
+          value_constraint = None;
+          domain_scope = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -194,6 +217,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           alias = Option.map decl.typ_manifest ~f:(fun ct -> ct.ctyp_type);
           collection = None;
           mathematical_integer = false;
+          mathematical = false;
+          empty = false;
+          value_constraint = None;
+          domain_scope = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -225,7 +252,13 @@ let with_name (d : t) module_name =
         List.map fields ~f:(fun f ->
             { f with raven_field = record_field_name record_name f.label }))
   in
-  { d with module_name; ctors; heap }
+  let value_constraint =
+    Option.map d.value_constraint ~f:(fun constraint_ ->
+        if List.equal String.equal constraint_.Qualified_name.path [ d.module_name ] then
+          { constraint_ with path = [ module_name ] }
+        else constraint_)
+  in
+  { d with module_name; ctors; heap; value_constraint }
 
 let declares (d : t) (p : Path.t) =
   (match (d.id, p) with Some id, Pident id' -> Ident.same id id' | _ -> false)
@@ -244,12 +277,27 @@ let library_type ~library ~library_id ~at name =
     alias = None;
     collection = None;
     mathematical_integer = false;
+    mathematical = false;
+    empty = false;
+    value_constraint = None;
+    domain_scope = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
     cell_namespace = None;
     library = Some (Path.Pdot (Pident library_id, name));
     at;
+  }
+
+(** Keeps a logical datatype's mathematical carrier unrestricted. *)
+let with_mathematical_domain (d : t) = { d with mathematical = true }
+
+(** Gives an imported runtime type its unknown source-value domain. *)
+let with_abstract_domain (d : t) =
+  {
+    d with
+    value_constraint =
+      Some Qualified_name.{ path = [ d.module_name ]; name = "ocaml_value" };
   }
 
 (** A nominal proof resource, represented by the instantiated Raven module's type. *)
@@ -292,6 +340,10 @@ let collection id kind =
     alias = None;
     collection = Some kind;
     mathematical_integer = false;
+    mathematical = false;
+    empty = false;
+    value_constraint = None;
+    domain_scope = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -620,17 +672,258 @@ let rec is_int types t =
   match Types.get_desc t with
   | Tconstr (p, [], _) ->
       begin match find types p with
-      | Some { mathematical_integer = true; _ } -> false
+      | Some { mathematical_integer = true; _ } | Some { mathematical = true; _ } -> false
       | Some { alias = Some t; _ } -> is_int types t
       | _ -> Path.same p Predef.path_int
       end
   | Tpoly (t, []) -> is_int types t
   | _ -> false
 
-(** The field [name] of type [typ], for values of the OCaml type [t]: an [int] field's
-    values are in [int]'s range, which owning the field then implies. *)
+let rec abstract_value_constraint types t =
+  match Types.get_desc t with
+  | Tconstr (path, [], _) ->
+      begin match find types path with
+      | Some { mathematical = true; _ } -> None
+      | Some { value_constraint = Some constraint_; _ } -> Some constraint_
+      | Some { alias = Some body; _ } -> abstract_value_constraint types body
+      | Some _ | None -> None
+      end
+  | Tpoly (body, []) -> abstract_value_constraint types body
+  | _ -> None
+
+(** Whether the carrier contains values outside the source value domain. Recursive
+    algebraic cycles without constrained payloads have a trivial domain. *)
+let has_domain types t =
+  let rec visit seen t =
+    let mathematical =
+      match Types.get_desc t with
+      | Tconstr (path, [], _) ->
+          Option.exists (find types path) ~f:(fun d -> d.mathematical)
+      | _ -> false
+    in
+    if mathematical then false
+    else if Option.is_some (abstract_value_constraint types t) || is_int types t then true
+    else
+      match Types.get_desc t with
+      | Tconstr (path, [], _) ->
+          begin match find types path with
+          | Some { mathematical_integer = true; _ } -> false
+          | Some { alias = Some body; _ } -> visit seen body
+          | Some { heap = Some _; _ } | Some { library = Some _; _ } -> false
+          | Some data when data.empty -> true
+          | Some data when not (List.mem seen path ~equal:Path.same) ->
+              List.exists data.ctors ~f:(fun ctor ->
+                  List.exists ctor.args ~f:(visit (path :: seen)))
+          | Some _ | None -> false
+          end
+      | Tconstr (path, [ element ], _)
+        when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+          visit seen element
+      | Ttuple components -> List.exists components ~f:(fun (_, t) -> visit seen t)
+      | Tpoly (body, []) -> visit seen body
+      | _ -> false
+  in
+  visit [] t
+
+(** A container domain must be declared where all of its carrier parameters are visible.
+    Layout-dependent carriers retain the layout's own domain members. *)
+let domain_identity types t =
+  let rec scopes seen t =
+    match Types.get_desc t with
+    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
+    | Tconstr (path, [], _) ->
+        begin match find types path with
+        | Some { heap = Some _; _ } -> []
+        | Some data ->
+            let own = Option.to_list data.domain_scope in
+            begin match data.alias with
+            | Some body ->
+                (if Option.is_some data.value_constraint then own else [])
+                @ scopes seen body
+            | None when data.mathematical -> own
+            | None when not (List.mem seen path ~equal:Path.same) ->
+                own
+                @ List.concat_map data.ctors ~f:(fun ctor ->
+                    List.concat_map ctor.args ~f:(scopes (path :: seen)))
+            | None -> own
+            end
+        | None -> []
+        end
+    | Tconstr (path, [ element ], _)
+      when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+        scopes seen element
+    | Ttuple components -> List.concat_map components ~f:(fun (_, t) -> scopes seen t)
+    | Tpoly (body, []) -> scopes seen body
+    | _ -> []
+  in
+  let prefix outer inner = List.is_prefix inner ~prefix:outer ~equal:String.equal in
+  let merge scope next =
+    if prefix scope next then Some next
+    else if prefix next scope then Some scope
+    else None
+  in
+  Option.bind (cell_identity ~prefix:"ocaml_value$" ~suffix:"" types t) ~f:(fun key ->
+      if not (List.is_empty key.namespace) then Some key
+      else
+        Option.map
+          (List.fold (scopes [] t) ~init:(Some []) ~f:(fun scope next ->
+               Option.bind scope ~f:(fun scope -> merge scope next)))
+          ~f:(fun namespace ->
+            { key with namespace; payload = relative_key namespace key.payload }))
+
+let constraint_name types t =
+  match abstract_value_constraint types t with
+  | Some constraint_ -> Some (Qualified_name.to_string constraint_)
+  | None -> (
+      if is_int types t then Some Prelude.in_range
+      else if not (has_domain types t) then None
+      else
+        match domain_identity types t with
+        | Some key -> Some (cell_key_name key)
+        | None ->
+            Option.map (type_key types t) ~f:(fun key -> "ocaml_value$" ^ key_name key))
+
+let admissible ~loc types t value =
+  Option.map (constraint_name types t) ~f:(fun name ->
+      R.Expr.call ~loc
+        (Qualified_name.raven ~loc (Qualified_name.of_string name))
+        [ value ])
+
+(** The monomorphic domain functions needed by the requested carriers. Mathematical
+    collections and abstract library carriers retain their own logical contracts. *)
+let domain_members types requested =
+  let conjunction ~loc expressions =
+    Option.value
+      (List.reduce expressions ~f:(R.Expr.binary ~loc And))
+      ~default:(R.Expr.bool ~loc true)
+  in
+  let children t =
+    match desc types t with
+    | Tconstr (path, [ element ], _)
+      when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+        [ element ]
+    | Tconstr (path, [], _) ->
+        Option.value_map (find types path) ~default:[] ~f:(fun data ->
+            List.concat_map data.ctors ~f:(fun ctor -> ctor.args))
+    | Ttuple components -> List.map components ~f:snd
+    | _ -> []
+  in
+  let definition t qualified =
+    let at =
+      match desc types t with
+      | Tconstr (path, [], _) ->
+          Option.value_map (find types path) ~default:Location.none ~f:(fun d -> d.at)
+      | _ -> Location.none
+    in
+    let l = loc at in
+    let ident text = R.Ident.make ~loc:l text in
+    let value text = R.Expr.var ~loc:l (R.Name.make ~loc:l text) in
+    let x = value "source$value" in
+    let holds t expression = admissible ~loc:l types t expression in
+    let conjuncts terms = conjunction ~loc:l (List.filter_opt terms) in
+    let datatype_cases ctors =
+      List.map ctors ~f:(fun ctor ->
+          let arguments = List.mapi ctor.args ~f:(fun i _ -> "part$" ^ Int.to_string i) in
+          ( R.Expr.Case (ident ctor.raven, List.map arguments ~f:ident),
+            conjuncts
+              (List.map2_exn ctor.args arguments ~f:(fun t name -> holds t (value name)))
+          ))
+    in
+    let* body =
+      match desc types t with
+      | Tconstr (path, [ element ], _)
+        when Path.same path Predef.path_list
+             && Option.is_some (abstract_value_constraint types element) ->
+          let* element_type = typ types ~at element in
+          let item = value "source$item" in
+          let member =
+            R.Expr.call ~loc:l
+              (Qualified_name.raven ~loc:l (Qualified_name.of_string "Library.List.in"))
+              [ item; x ]
+          in
+          Ok
+            (R.Expr.forall ~loc:l
+               [ R.Var.make ~loc:l (ident "source$item") element_type ]
+               (R.Expr.binary ~loc:l Impl member (conjuncts [ holds element item ])))
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
+          Ok
+            (R.Expr.match_ ~loc:l x
+               [
+                 (R.Expr.Case (ident "nil", []), R.Expr.bool ~loc:l true);
+                 ( R.Expr.Case (ident "::", [ ident "source$head"; ident "source$tail" ]),
+                   conjuncts
+                     [
+                       holds element (value "source$head"); holds t (value "source$tail");
+                     ] );
+               ])
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
+          Ok
+            (R.Expr.match_ ~loc:l x
+               [
+                 (R.Expr.Case (ident "none", []), R.Expr.bool ~loc:l true);
+                 ( R.Expr.Case (ident "some", [ ident "source$item" ]),
+                   conjuncts [ holds element (value "source$item") ] );
+               ])
+      | Ttuple components ->
+          Ok
+            (conjuncts
+               (List.mapi components ~f:(fun i (_, t) ->
+                    holds t (R.Expr.tuple_get ~loc:l x i))))
+      | Tconstr (path, [], _) ->
+          Ok
+            (match find types path with
+            | Some data when data.empty -> R.Expr.bool ~loc:l false
+            | Some data -> R.Expr.match_ ~loc:l x (datatype_cases data.ctors)
+            | None -> R.Expr.bool ~loc:l true)
+      | _ -> Ok (R.Expr.bool ~loc:l true)
+    in
+    let* carrier = typ types ~at t in
+    let name = Qualified_name.of_string qualified in
+    Ok
+      (R.Member.callable
+         (R.Callable.func ~loc:l
+            ~formals:[ R.Var.make ~loc:l (ident "source$value") carrier ]
+            ~returns:
+              [ R.Var.make ~loc:l (ident "source$admissible") (R.Type.bool ~loc:l) ]
+            (ident name.name) (Some body)))
+  in
+  let rec collect (seen, members) t =
+    match constraint_name types t with
+    | _ when Option.is_some (abstract_value_constraint types t) -> Ok (seen, members)
+    | None -> Ok (seen, members)
+    | Some name when String.equal name Prelude.in_range || Set.mem seen name ->
+        Ok (seen, members)
+    | Some name ->
+        let* _ =
+          match domain_identity types t with
+          | Some _ -> Ok ()
+          | None ->
+              Report.unsupported Location.none
+                "A source value domain combining incompatible symbolic scopes"
+        in
+        let seen = Set.add seen name in
+        let* seen, members =
+          List.fold_result (children t) ~init:(seen, members) ~f:collect
+        in
+        let* member = definition t name in
+        Ok (seen, members @ [ (name, member) ])
+  in
+  let* _, members =
+    List.fold_result requested ~init:(Set.empty (module String), []) ~f:collect
+  in
+  Ok members
+
+(** Runtime fields preserve their source value domain; mathematical ghost fields retain
+    scalar integer bounds. *)
 let field_member ?(ghost = false) types ~loc name typ (t : Types.type_expr) =
-  let where = Option.some_if (is_int types t) (R.Name.make ~loc Prelude.in_range) in
+  let constraint_ =
+    if ghost then Option.some_if (is_int types t) Prelude.in_range
+    else constraint_name types t
+  in
+  let where =
+    Option.map constraint_ ~f:(fun name ->
+        Qualified_name.raven ~loc (Qualified_name.of_string name))
+  in
   R.Member.field ~loc ~ghost ?where (R.Ident.make ~loc name) typ
 
 (** Whether the values of type [t] are immediate or references, so that physical equality
@@ -711,6 +1004,30 @@ let member (types : t list) (d : t) : (R.Member.t, Report.error) Result.t =
     | Some _ -> R.Member.free (R.Member.type_ ~loc:l (R.Ident.make ~loc:l "T") None)
     | None ->
         R.Member.type_ ~loc:l (R.Ident.make ~loc:l "T")
-          (Some (R.Type.data ~loc:l variants))
+          (Some (if d.empty then R.Type.tuple ~loc:l [] else R.Type.data ~loc:l variants))
   in
-  Ok (R.Member.module_ ~loc:l (R.Ident.make ~loc:l d.module_name) [ t ])
+  let domain =
+    match (d.library, d.value_constraint) with
+    | Some _, Some constraint_ ->
+        [
+          R.Member.free
+            (R.Member.callable
+               (R.Callable.func ~loc:l
+                  ~formals:
+                    [
+                      R.Var.make ~loc:l
+                        (R.Ident.make ~loc:l "source$value")
+                        (R.Type.named ~loc:l (R.Name.make ~loc:l "T") []);
+                    ]
+                  ~returns:
+                    [
+                      R.Var.make ~loc:l
+                        (R.Ident.make ~loc:l "source$admissible")
+                        (R.Type.bool ~loc:l);
+                    ]
+                  (R.Ident.make ~loc:l constraint_.Qualified_name.name)
+                  None));
+        ]
+    | None, _ | Some _, None -> []
+  in
+  Ok (R.Member.module_ ~loc:l (R.Ident.make ~loc:l d.module_name) (t :: domain))

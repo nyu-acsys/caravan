@@ -22,8 +22,8 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
 
 (** The invariants of a loop at [at]: those of [spec], with the variables in scope there,
-    the facts that hold throughout the function, and the ranges of the integer variables
-    in scope but a [for] loop's [counter], which goes one beyond. Names free in [spec]'s
+    the facts that hold throughout the function, and the value domains of variables in
+    scope but a [for] loop's [counter], which goes one beyond. Names free in [spec]'s
     invariants are existentially quantified, as [k] in [invariant own i.contents k];
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
     as the value of the loop's condition. *)
@@ -39,6 +39,10 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
       end
   in
   let* scope = scope in
+  let* runtime_names =
+    State.gets (fun (state : State.state) -> List.map state.names.bound ~f:snd)
+  in
+  let runtime name = List.mem runtime_names name ~equal:String.equal in
   let* env = scope_env ctx in
   let* env, state_invariants =
     State.fold spec.state_invariants ~init:(env, [])
@@ -80,6 +84,14 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
         | _ -> State.return None)
   in
   let* related = relation (List.filter_opt reads) in
+  let* () =
+    State.iter scope ~f:(fun (_, (raven, typ)) ->
+        if String.equal raven counter || not (runtime raven) then State.return ()
+        else
+          match typ with
+          | None -> State.return ()
+          | Some typ -> State.note_domain ctx.given.types typ)
+  in
   let+ facts = State.gets (fun (s : State.state) -> s.carried.facts) in
   let invariants = invariants @ Option.to_list related in
   let user =
@@ -97,7 +109,10 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
   let ranges =
     List.filter_map scope ~f:(fun (_, (raven, t)) ->
         if String.equal raven counter then None
-        else Option.bind t ~f:(fun t -> range_spec ~loc:l t raven))
+        else
+          Option.bind t ~f:(fun t ->
+              if runtime raven then value_spec ctx ~loc:l t raven
+              else range_spec ~loc:l t raven))
   in
   ranges @ facts @ user
 

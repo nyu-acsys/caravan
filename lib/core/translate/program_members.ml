@@ -658,11 +658,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      operation.operation_name ) )
                  :: checked_prepared)
            in
-           ( ( operation,
-               expected,
+           (* Grouped adapters inherit their instantiated interface contracts. *)
+           let inherit_contract =
+             List.exists checked_modules ~f:(fun checked ->
+                 phys_equal checked.Checked_modules.binding binding
+                 && checked.grouped && Option.is_none checked.target)
+           in
+           let member =
+             if inherit_contract then
+               R.Callable.proc ~loc:(loc at) ~formals:expected.prepared_formals
+                 ~returns:expected.prepared_returns
+                 (ident ~loc:(loc at) operation.operation_member)
+                 (Some body)
+             else
                prepared_member ~at ~name:operation.operation_member (Some body) expected
-             )
-             :: adapters,
+           in
+           ( (operation, expected, member) :: adapters,
              checked_prepared,
              publications,
              publication_members ))
@@ -741,37 +752,64 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           else
             let at = declaration.Typedtree.typ_loc in
             let l = loc at in
-            let* definition =
-              if aliases then
-                let t =
-                  Btype.newgenty
-                    (Tconstr (Path.Pident declaration.typ_id, [], ref Types.Mnil))
-                in
-                Result.map (Datatypes.typ view.view_types ~at t) ~f:Option.some
-              else
-                match (group.Generic_modules.world, declaration.typ_manifest) with
-                | Some world, _ ->
-                    let stem =
-                      List.Assoc.find_exn group.types source ~equal:String.equal
-                    in
-                    Ok
-                      (Some
-                         (R.Type.named ~loc:l
-                            (R.Name.make ~loc:l ~path:[ world ] stem)
-                            []))
-                | None, None -> Ok None
-                | None, Some t ->
-                    Result.map
-                      (Datatypes.typ view.view_types ~at t.ctyp_type)
-                      ~f:Option.some
-            in
             let stem =
               List.Assoc.find_exn group.Generic_modules.types source ~equal:String.equal
             in
-            Ok (Some (R.Member.type_ ~loc:l (ident ~loc:l stem) definition)))
+            match declaration.Typedtree.typ_manifest with
+            | None ->
+                let interface = qualified_name ~loc:l Prelude.value_interface in
+                if aliases then
+                  let source_type = Ctype.newconstr (Path.Pident declaration.typ_id) [] in
+                  let* carrier = Datatypes.typ view.view_types ~at source_type in
+                  let value = R.Expr.var ~loc:l (name ~loc:l "value") in
+                  let body =
+                    Option.value
+                      (Datatypes.admissible ~loc:l view.view_types source_type value)
+                      ~default:(R.Expr.bool ~loc:l true)
+                  in
+                  Ok
+                    (Some
+                       (R.Member.module_ ~loc:l
+                          ~implements:[ (interface, []) ]
+                          (ident ~loc:l stem)
+                          [
+                            R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "Carrier")
+                              (Some carrier);
+                            R.Member.callable
+                              (R.Callable.func ~loc:l
+                                 ~formals:
+                                   [
+                                     R.Var.make ~loc:l (ident ~loc:l "value")
+                                       (R.Type.named ~loc:l (name ~loc:l "Carrier") []);
+                                   ]
+                                 ~returns:
+                                   [
+                                     R.Var.make ~loc:l (ident ~loc:l "result")
+                                       (R.Type.bool ~loc:l);
+                                   ]
+                                 (ident ~loc:l "holds") (Some body));
+                          ]))
+                else
+                  Ok
+                    (Some
+                       (match group.Generic_modules.world with
+                       | None -> R.Member.instance ~loc:l (ident ~loc:l stem) interface
+                       | Some world ->
+                           R.Member.alias ~loc:l (ident ~loc:l stem)
+                             (qualified_name ~loc:l (world ^ "." ^ stem))))
+            | Some manifest ->
+                let* definition =
+                  match group.Generic_modules.world with
+                  | Some world ->
+                      Ok
+                        (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ world ] stem) [])
+                  | None -> Datatypes.typ view.view_types ~at manifest.ctyp_type
+                in
+                Ok (Some (R.Member.type_ ~loc:l (ident ~loc:l stem) (Some definition))))
     in
     Ok (List.filter_opt members)
   in
+
   let ghost_contract_members ?(carrier_interface = fun _ -> None) ~aliases ~implementation
       ~scope ~path ~at signature =
     all signature.Module_inventory.signature_ghost_modules ~f:(fun (member, formal) ->
@@ -871,7 +909,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               State.of_result
                 (ghost_module_members ~aliases:false group.representative.argument)
             in
-            let+ operations =
+            let* operations =
               State.all checked_operations ~f:(fun operation ->
                   if
                     not
@@ -884,6 +922,25 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                       (R.Member.callable
                          (prepared_member ~at:operation.operation_signature.site.item_loc
                             ~name:operation.operation_member None prepared)))
+            in
+            let* requests =
+              State.gets (fun (state : State.state) -> state.tables.domains)
+            in
+            let* domains =
+              State.of_result
+                (all requests ~f:(fun request ->
+                     Datatypes.domain_members request.domain_types [ request.domain_type ]))
+            in
+            let namespace = String.split group.interface ~on:'.' in
+            let domains =
+              List.concat domains
+              |> List.dedup_and_sort ~compare:(fun (left, _) (right, _) ->
+                  String.compare left right)
+              |> List.filter_map ~f:(fun (qualified, member) ->
+                  Option.some_if
+                    (List.equal String.equal (Qualified_name.of_string qualified).path
+                       namespace)
+                    member)
             in
             let l = loc group.representative.argument.site.item_loc in
             let carriers =
@@ -904,12 +961,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                                   []));
                         ]))
             in
-            carriers
-            @ [
-                R.Member.module_ ~loc:l ~interface:true
-                  (ident ~loc:l (Qualified_name.of_string group.interface).name)
-                  (types @ resources @ ghost_modules @ List.filter_opt operations);
-              ]))
+            State.return
+              (carriers
+              @ [
+                  R.Member.module_ ~loc:l ~interface:true
+                    (ident ~loc:l (Qualified_name.of_string group.interface).name)
+                    (types @ domains @ resources @ ghost_modules
+                   @ List.filter_opt operations);
+                ])))
   in
   let generic_interfaces = List.map generic_interfaces ~f:List.concat in
   let* checked_module_members =

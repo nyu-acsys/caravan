@@ -9,6 +9,7 @@ let div = "ocaml_div"
 let mod_ = "ocaml_mod"
 let in_range = "ocaml_int"
 let wrap = "ocaml_wrap"
+let value_interface = "Ocaml$Value"
 
 (** The bounds of OCaml's 63-bit [int]. *)
 let min_int = Stdlib.min_int
@@ -23,12 +24,26 @@ let func name ret body =
     ~returns:[ int_var ret ]
     (R.Ident.make ~loc name) (Some body)
 
+let value_signature =
+  let carrier = R.Type.named ~loc (R.Name.make ~loc "Carrier") [] in
+  R.Member.module_ ~loc ~interface:true
+    (R.Ident.make ~loc value_interface)
+    [
+      R.Member.type_ ~loc ~rep:true (R.Ident.make ~loc "Carrier") None;
+      R.Member.callable
+        (R.Callable.func ~loc
+           ~formals:[ R.Var.make ~loc (R.Ident.make ~loc "value") carrier ]
+           ~returns:[ R.Var.make ~loc (R.Ident.make ~loc "result") (R.Type.bool ~loc) ]
+           (R.Ident.make ~loc "holds") None);
+    ]
+
 let members : R.Member.t list =
   let a = var "a" and b = var "b" in
   let ocaml_div x y = R.Expr.call ~loc (R.Name.make ~loc div) [ x; y ] in
   let x = var "x" in
   let bound op n = R.Expr.binary ~loc op x (R.Expr.int ~loc n) in
   [
+    value_signature;
     R.Member.callable
       (R.Callable.func ~loc ~inline:true
          ~formals:[ int_var "x" ]

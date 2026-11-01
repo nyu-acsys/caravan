@@ -32,7 +32,11 @@ let ordinary_name ~field = function
   | Write -> field ^ "_ordinary_write"
 
 (** An ordinary field access is a call so it cannot be used as an atomic step. *)
-let ordinary_proc ?declaration_name ~field ~(typ : R.Type.t) ~int op : R.Member.t =
+let ordinary_proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~int op :
+    R.Member.t =
+  let admissibility =
+    Option.first_some admissibility (Option.some_if int Prelude.in_range)
+  in
   let x = var "x" and v = var "v" in
   let content =
     R.Expr.field ~loc x (Qualified_name.raven ~loc (Qualified_name.of_string field))
@@ -55,7 +59,12 @@ let ordinary_proc ?declaration_name ~field ~(typ : R.Type.t) ~int op : R.Member.
         let new_val = var "new_val" in
         ( [ formal "x" (R.Type.ref ~loc); formal "new_val" typ; ghost "v" typ ],
           [],
-          (if int then [ R.Spec.make (call Prelude.in_range [ new_val ]) ] else [])
+          Option.to_list
+            (Option.map admissibility ~f:(fun predicate ->
+                 R.Spec.make
+                   (R.Expr.call ~loc
+                      (Qualified_name.raven ~loc (Qualified_name.of_string predicate))
+                      [ new_val ])))
           @ [ R.Spec.make (own v one) ],
           [ R.Spec.make (own new_val one) ],
           [ R.Stmt.assign ~loc [ content ] (R.Stmt.expr_rhs new_val) ] )
@@ -68,7 +77,11 @@ let ordinary_proc ?declaration_name ~field ~(typ : R.Type.t) ~int op : R.Member.
 (** The procedure performing [op] on [field], whose values have type [typ]; [exact] if
     they are immediate, [int] if they are OCaml's [int]s, which the values written are
     then required to be. *)
-let proc ?declaration_name ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t =
+let proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~exact ~int op :
+    R.Member.t =
+  let admissibility =
+    Option.first_some admissibility (Option.some_if int Prelude.in_range)
+  in
   let x = var "x" and v = var "v" and q = var "q" in
   let content =
     R.Expr.field ~loc x (Qualified_name.raven ~loc (Qualified_name.of_string field))
@@ -138,10 +151,13 @@ let proc ?declaration_name ~field ~(typ : R.Type.t) ~exact ~int op : R.Member.t 
          ((formal "x" (R.Type.ref ~loc) :: args) @ [ ghost "v" typ; ghost "q" real ])
        ~returns:[ ret ]
        ~requires:
-         ((if int then
-             let written = match op with Fetch_and_add -> "n" | _ -> "new_val" in
-             [ R.Spec.make (call Prelude.in_range [ var written ]) ]
-           else [])
+         ((let written = match op with Fetch_and_add -> "n" | _ -> "new_val" in
+           Option.to_list
+             (Option.map admissibility ~f:(fun predicate ->
+                  R.Spec.make
+                    (R.Expr.call ~loc
+                       (Qualified_name.raven ~loc (Qualified_name.of_string predicate))
+                       [ var written ]))))
          @ [ R.Spec.make (bin And (own v) pre) ])
        ~ensures:[ R.Spec.make post ]
        (ident (Option.value declaration_name ~default:(name ~field op)))

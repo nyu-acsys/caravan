@@ -262,6 +262,12 @@ let program ?(history = History.default) (source : Source.t) :
              field.Source.field_scope)
           member)
   in
+  let raw_resource_field field =
+    Option.is_some field.Source.field_resource
+    || List.exists all_resource_views ~f:(fun resource ->
+        resource.Source.resource_is_ra
+        && same_named_type field.field_value resource.resource_type)
+  in
   let* explicit_fields =
     all source.proof_fields ~f:(fun field ->
         let l = loc field.Source.field_at in
@@ -307,9 +313,55 @@ let program ?(history = History.default) (source : Source.t) :
         in
         Ok
           ( field,
-            Datatypes.field_member ~ghost:true types ~loc:l
-              (Qualified_name.of_string (ghost_field_name field)).name value_type
-              field.field_value ))
+            let field_name = (Qualified_name.of_string (ghost_field_name field)).name in
+            if raw_resource_field field then
+              R.Member.field ~ghost:true ~loc:l (ident ~loc:l field_name) value_type
+            else
+              Datatypes.field_member ~ghost:true types ~loc:l field_name value_type
+                field.field_value ))
+  in
+  let field_domain_types =
+    List.concat_map types ~f:(fun data ->
+        List.map (Option.value data.Datatypes.heap ~default:[]) ~f:(fun field ->
+            field.Datatypes.typ))
+  in
+  let* argument_domains =
+    all generics ~f:(fun group ->
+        all group.Generic_modules.applications ~f:(fun application ->
+            all application.source.parameters ~f:(fun parameter ->
+                let concrete =
+                  checked_raw_types types parameter.Module_inventory.argument
+                in
+                Ok
+                  (List.filter_map parameter.argument.expected.signature_types
+                     ~f:(fun (_, declaration) ->
+                       Option.some_if
+                         (Option.is_none declaration.Typedtree.typ_manifest)
+                         {
+                           domain_types = concrete;
+                           domain_type =
+                             Ctype.newconstr (Path.Pident declaration.typ_id) [];
+                         }))))
+        |> Result.map ~f:(fun groups -> List.concat (List.concat groups)))
+    |> Result.map ~f:List.concat
+  in
+  let domain_requests = state.tables.domains @ argument_domains in
+  let* value_domains =
+    let* registered =
+      all domain_requests ~f:(fun request ->
+          Datatypes.domain_members request.domain_types [ request.domain_type ])
+    in
+    let* fields = Datatypes.domain_members types field_domain_types in
+    Ok
+      (List.dedup_and_sort
+         (fields @ List.concat registered)
+         ~compare:(fun (left, _) (right, _) -> String.compare left right))
+  in
+  let domains_in namespace =
+    List.filter_map value_domains ~f:(fun (name, member) ->
+        Option.some_if
+          (List.equal String.equal (Qualified_name.of_string name).path namespace)
+          member)
   in
   let emit_context_members destination ~at ~representations ~native_resources
       ~applications ~late_members =
@@ -326,6 +378,17 @@ let program ?(history = History.default) (source : Source.t) :
       State.primitives_in state.tables (Module_context.namespace destination)
       |> List.map ~f:(fun primitive -> primitive.State.member)
     in
+    let domains = domains_in (Module_context.namespace destination) in
+    let defaults =
+      List.filter_map state.tables.defaults ~f:(fun request ->
+          Option.some_if
+            (List.equal String.equal request.default_namespace
+               (Module_context.namespace destination))
+            (R.Member.free
+               (R.Member.value ~loc:at ~typ:request.default_type
+                  (ident ~loc:at (Qualified_name.of_string request.default_name).name)
+                  None)))
+    in
     let stages =
       match destination with
       | Module_context.Flat ->
@@ -335,6 +398,7 @@ let program ?(history = History.default) (source : Source.t) :
             `Native_resources;
             `Public_resources;
             `Applications;
+            `Value_domains;
             `View_fields;
             `Fields;
             `Proof_definitions;
@@ -356,6 +420,7 @@ let program ?(history = History.default) (source : Source.t) :
             `Native_resources;
             `Public_resources;
             `Applications;
+            `Value_domains;
             `Fields;
             `View_fields;
             `State;
@@ -373,6 +438,7 @@ let program ?(history = History.default) (source : Source.t) :
       | `Native_resources -> native_resources
       | `Public_resources -> emitted_assets destination public_resource_members
       | `Applications -> applications
+      | `Value_domains -> domains @ defaults
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
       | `Proof_definitions -> emitted_assets destination definition_proof_modules
@@ -391,6 +457,90 @@ let program ?(history = History.default) (source : Source.t) :
           List.map (emitted_proofs destination proof_lemma_members) ~f:R.Member.callable
       | `Logical_functions -> emitted_proofs destination logical_members
       | `Procedures -> List.map (owned destination procs) ~f:procedure_member)
+  in
+  let* value_dictionaries =
+    let* requests =
+      all
+        (List.filter generics ~f:(fun group -> Option.is_some group.Generic_modules.world))
+        ~f:(fun group ->
+          all group.Generic_modules.applications ~f:(fun application ->
+              all application.source.parameters ~f:(fun parameter ->
+                  let concrete =
+                    checked_raw_types types parameter.Module_inventory.argument
+                  in
+                  all
+                    (List.filter parameter.argument.expected.signature_types
+                       ~f:(fun (_, declaration) ->
+                         Option.is_none declaration.Typedtree.typ_manifest))
+                    ~f:(fun (_, declaration) ->
+                      let at = declaration.Typedtree.typ_loc in
+                      let t = Ctype.newconstr (Path.Pident declaration.typ_id) [] in
+                      let* carrier = Datatypes.typ concrete ~at t in
+                      let* key =
+                        match Datatypes.type_key concrete t with
+                        | Some key -> Ok key
+                        | None ->
+                            unsupported at "This module argument's source value domain"
+                      in
+                      let domain = Datatypes.constraint_name concrete t in
+                      let domain_key =
+                        match domain with
+                        | None -> [ "true" ]
+                        | Some domain -> "predicate" :: String.split domain ~on:'.'
+                      in
+                      let stem =
+                        "Source_value$"
+                        ^ Datatypes.framed (Datatypes.key_name key :: domain_key)
+                      in
+                      let l = loc at in
+                      let value = R.Expr.var ~loc:l (name ~loc:l "value") in
+                      let holds =
+                        Option.value
+                          (Datatypes.admissible ~loc:l concrete t value)
+                          ~default:(R.Expr.bool ~loc:l true)
+                      in
+                      let member =
+                        R.Member.module_ ~loc:l
+                          ~implements:
+                            [ (qualified_name ~loc:l Prelude.value_interface, []) ]
+                          (ident ~loc:l stem)
+                          [
+                            R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "Carrier")
+                              (Some carrier);
+                            R.Member.callable
+                              (R.Callable.func ~loc:l
+                                 ~formals:
+                                   [ R.Var.make ~loc:l (ident ~loc:l "value") carrier ]
+                                 ~returns:
+                                   [
+                                     R.Var.make ~loc:l (ident ~loc:l "result")
+                                       (R.Type.bool ~loc:l);
+                                   ]
+                                 (ident ~loc:l "holds") (Some holds));
+                          ]
+                      in
+                      Ok (parameter.argument, declaration.typ_id, stem, member))))
+          |> Result.map ~f:(fun applications -> List.concat (List.concat applications)))
+      |> Result.map ~f:List.concat
+    in
+    Ok requests
+  in
+  let dictionary_for binding id =
+    List.find_map_exn value_dictionaries ~f:(fun (owner, source, stem, _) ->
+        Option.some_if (phys_equal owner binding && Ident.same source id) stem)
+  in
+  let dictionary_members binding =
+    List.filter_map
+      (List.dedup_and_sort value_dictionaries ~compare:(fun (_, _, a, _) (_, _, b, _) ->
+           String.compare a b))
+      ~f:(fun (_, _, stem, member) ->
+        let owner =
+          List.find_exn checked_modules ~f:(fun view ->
+              List.exists value_dictionaries ~f:(fun (candidate, _, name, _) ->
+                  String.equal stem name
+                  && phys_equal view.Checked_modules.binding candidate))
+        in
+        Option.some_if (phys_equal owner.binding binding) member)
   in
   let* generic_implementations =
     all generics ~f:(fun group ->
@@ -530,6 +680,38 @@ let program ?(history = History.default) (source : Source.t) :
               |> List.dedup_and_sort ~compare:(fun (left, _) (right, _) ->
                   String.compare left right)
             in
+            let* layout_domain_members =
+              let rebase typ = Subst.type_expr projection typ in
+              let layout_roots =
+                List.concat_map layout_types ~f:(fun data ->
+                    let own =
+                      Option.to_list
+                        (Option.map data.Datatypes.id ~f:(fun id ->
+                             Ctype.newconstr (Path.Pident id) []))
+                    in
+                    own
+                    @ List.map (Option.value data.heap ~default:[]) ~f:(fun field ->
+                        field.Datatypes.typ))
+                @ List.map cell_fields ~f:snd
+              in
+              let requests =
+                List.filter_map domain_requests ~f:(fun request ->
+                    Option.bind
+                      (Datatypes.constraint_name request.domain_types request.domain_type)
+                      ~f:(fun name ->
+                        Option.map
+                          (List.Assoc.find field_contexts
+                             (Qualified_name.of_string name).path
+                             ~equal:(List.equal String.equal))
+                          ~f:(fun substitution ->
+                            Subst.type_expr substitution request.domain_type)))
+              in
+              let* members =
+                Datatypes.domain_members cell_environment
+                  (List.map layout_roots ~f:rebase @ requests)
+              in
+              Ok members
+            in
             let* cell_fields =
               all cell_fields ~f:(fun (field, elt) ->
                   let* typ =
@@ -538,9 +720,31 @@ let program ?(history = History.default) (source : Source.t) :
                   in
                   Ok (Datatypes.field_member cell_environment ~loc:l field typ elt))
             in
+            let layout_domains =
+              List.filter_map layout_domain_members ~f:(fun (name, member) ->
+                  Option.some_if
+                    (List.equal String.equal (Qualified_name.of_string name).path
+                       [ world; "Shape" ])
+                    member)
+            in
+            let world_domains =
+              List.dedup_and_sort
+                (List.filter_map layout_domain_members ~f:(fun (name, member) ->
+                     Option.some_if
+                       (List.equal String.equal (Qualified_name.of_string name).path
+                          [ world ])
+                       (name, member))
+                @ List.filter_map value_domains ~f:(fun (name, member) ->
+                    Option.some_if
+                      (List.equal String.equal (Qualified_name.of_string name).path
+                         [ world ])
+                      (name, member)))
+                ~compare:(fun (a, _) (b, _) -> String.compare a b)
+              |> List.map ~f:snd
+            in
             let shape =
               R.Member.module_ ~loc:l ~interface:true (ident ~loc:l "Shape")
-                (data_members @ fields @ cell_fields)
+                (data_members @ layout_domains @ fields @ cell_fields)
             in
             let factory =
               R.Member.unit_factory ~loc:l
@@ -551,12 +755,20 @@ let program ?(history = History.default) (source : Source.t) :
               (R.Member.module_ ~loc:l
                  ~params:
                    (List.map (Generic_modules.type_slots group) ~f:(fun stem ->
-                        (ident ~loc:l stem, R.Name.make ~loc:l ~path:[ "Library" ] "Type")))
+                        ( ident ~loc:l stem,
+                          qualified_name ~loc:l
+                            (if
+                               List.mem
+                                 (Generic_modules.value_type_slots group)
+                                 stem ~equal:String.equal
+                             then Prelude.value_interface
+                             else "Library.Type") )))
                  (ident ~loc:l world)
-                 (List.nth_exn generic_interfaces
-                    (List.findi_exn generics ~f:(fun _ candidate ->
-                         phys_equal candidate group)
-                    |> fst)
+                 (world_domains
+                 @ List.nth_exn generic_interfaces
+                     (List.findi_exn generics ~f:(fun _ candidate ->
+                          phys_equal candidate group)
+                     |> fst)
                  @ [ shape; factory; worker ])))
   in
   let* generic_instances =
@@ -589,7 +801,14 @@ let program ?(history = History.default) (source : Source.t) :
                                      [],
                                      ref Types.Mnil ))
                             in
-                            Datatypes.typ concrete ~at:declaration.typ_loc t)
+                            if Option.is_none declaration.typ_manifest then
+                              Ok
+                                (R.Type.named ~loc:l
+                                   (q
+                                      (dictionary_for parameter.argument
+                                         declaration.typ_id))
+                                   [])
+                            else Datatypes.typ concrete ~at:declaration.typ_loc t)
                         |> Result.bind ~f:(fun ordinary ->
                             all parameter.argument.expected.signature_ghost_modules
                               ~f:(fun (_, formal) ->
@@ -696,6 +915,9 @@ let program ?(history = History.default) (source : Source.t) :
                      ~f:(fun (view, _) ->
                        phys_equal view.Checked_modules.binding argument)))
           in
+          let dictionaries =
+            List.concat_map (attached @ [ binding ]) ~f:dictionary_members
+          in
           let prefix =
             List.concat_map
               (List.zip_exn generics
@@ -748,8 +970,8 @@ let program ?(history = History.default) (source : Source.t) :
             Program_declarations.take_declarations ~available pending
           in
           ( (binding :: attached) @ emitted,
-            (prefix @ setup @ declarations @ publications @ attached_members @ members
-           @ instances @ after_instances)
+            (prefix @ dictionaries @ setup @ declarations @ publications
+           @ attached_members @ members @ instances @ after_instances)
             :: blocks,
             pending,
             available ))

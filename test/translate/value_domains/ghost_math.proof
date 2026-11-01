@@ -1,0 +1,14 @@
+let increment (value : int) : int = value + 1
+
+lemma mathematical_result
+  ensures (increment 4611686018427387903 === 4611686018427387903 + 1) = ()
+
+lemma mathematical_domain
+  ensures (Set.mem (4611686018427387903 + 1)
+    (Set.of_predicate (fun (value : integer) -> value > 4611686018427387903))) = ()
+
+type model = { items : int list }
+
+lemma mathematical_record
+  ensures (exists snapshot : model.
+    snapshot.items === [4611686018427387903 + 1]) = ()

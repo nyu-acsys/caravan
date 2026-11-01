@@ -149,9 +149,10 @@ let formals ?(names = []) ctx (f : func) =
       | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = State.of_result (typ ctx ~at:pat_loc pat_type) in
+          let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.bind_name ~typ:pat_type id in
           ( Some (Ident.name id, x),
-            range_spec ~loc:(loc pat_loc) pat_type x,
+            value_spec ctx ~loc:(loc pat_loc) pat_type x,
             R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
       | Tparam_pat
           { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ } ->
@@ -162,10 +163,11 @@ let formals ?(names = []) ctx (f : func) =
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = State.of_result (typ ctx ~at:pat_loc pat_type) in
           let contract_name = Option.join (List.nth names i) in
+          let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.fresh (Option.value contract_name ~default:"arg") in
           let l = loc pat_loc in
           ( Some (Option.value contract_name ~default:"", x),
-            None,
+            value_spec ctx ~loc:l pat_type x,
             R.Var.make ~loc:l (ident ~loc:l x) typ )
       | _ -> State.of_result (unsupported p.fp_loc "This parameter"))
 
@@ -189,10 +191,11 @@ let pattern_params ctx (f : func) formals =
                 let* stmts =
                   State.all binds ~f:(fun (id, value, t) ->
                       let* typ = State.of_result (typ ctx ~at:pat_loc t) in
+                      let* () = State.note_domain ctx.given.types t in
                       let+ y = State.bind_name ~typ:t id in
                       R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
                         (ident ~loc:l y)
-                      @ assume_in_range ~loc:l t y)
+                      @ assert_admissible ctx ~loc:l t y)
                 in
                 (* The variables of a record's fields are its fields. *)
                 let+ () =
@@ -465,6 +468,33 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
       ~f:(Spec_terms.formula env)
   in
   let* ensures = State.all (clauses (fun c -> c.ensures)) ~f:(Spec_terms.formula env) in
+  let domains =
+    List.filter_map (List.zip_exn f.params formals)
+      ~f:(fun ((parameter : Typedtree.function_param), (formal_name, _, _)) ->
+        match (parameter.fp_kind, formal_name) with
+        | Tparam_pat pattern, Some (_, name) ->
+            Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
+              (R.Expr.var ~loc:l (R.Name.make ~loc:l name))
+        | _ -> None)
+  in
+  let requires = domains @ requires in
+  let source_requires = clauses (fun c -> c.requires) in
+  let resource_dependent term =
+    List.exists (term_references [] term) ~f:(fun q ->
+        String.equal (qualid_key q) "own"
+        || List.Assoc.mem ctx.given.preds (logical_key env q) ~equal:String.equal
+        || Option.is_some (atomic_method env q))
+  in
+  let result_domain =
+    if
+      List.exists source_requires ~f:(fun term ->
+          calls_self term || resource_dependent term)
+    then None
+    else
+      Datatypes.admissible ~loc:l ctx.given.types f.body.exp_type
+        (R.Expr.var ~loc:l (name ~loc:l result))
+  in
+  let ensures = Option.to_list result_domain @ ensures in
   let ensures =
     List.map ensures ~f:(fun post ->
         R.Spec.make
@@ -472,6 +502,7 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
                R.Expr.binary ~loc:l Impl pre post)))
   in
   let* result_typ = State.of_result (typ ctx ~at:f.body.exp_loc f.body.exp_type) in
+  let* () = State.note_domain ctx.given.types f.body.exp_type in
   let+ body = pure ctx ~funcs [] f.body in
   R.Callable.func ~loc:l
     ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
@@ -1096,8 +1127,9 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   in
   (* Values of type [int] are in its range. *)
   let in_range = List.filter_map formals ~f:(fun (_, range, _) -> range) in
+  let* () = State.note_domain ctx.given.types f.body.exp_type in
   let result_in_range =
-    if List.is_empty returns then None else range_spec ~loc:l f.body.exp_type result
+    if List.is_empty returns then None else value_spec ctx ~loc:l f.body.exp_type result
   in
   let pres = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
   let* requires = specs pres in

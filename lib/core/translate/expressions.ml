@@ -81,6 +81,12 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           end)
   | Texp_constant (Const_int n) -> State.return ([], R.Expr.int ~loc:l n)
   | Texp_constant _ -> State.of_result (unsupported at "This constant")
+  | Texp_unreachable ->
+      let* typ = State.of_result (typ ctx ~at e.exp_type) in
+      let+ x = State.fresh "unreachable" in
+      ( R.Stmt.assert_ ~loc:l (R.Spec.make (R.Expr.bool ~loc:l false))
+        :: R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
+        R.Expr.var ~loc:l (name ~loc:l x) )
   | Texp_construct ({ txt = Lident "true"; _ }, _, []) ->
       State.return ([], R.Expr.bool ~loc:l true)
   | Texp_construct ({ txt = Lident "false"; _ }, _, []) ->
@@ -140,16 +146,19 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
             State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type v
           in
           (stmts @ reading, value)
-      | Some (field, false) ->
+      | Some (field, false) -> begin
           let value = R.Expr.field ~loc:l v (qualified_name ~loc:l field) in
-          if is_int e.exp_type then
-            let+ x = State.fresh "tmp" in
-            ( stmts
-              @ R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init:(R.Stmt.expr_rhs value)
-                  (ident ~loc:l x)
-              @ assume_in_range ~loc:l e.exp_type x,
-              R.Expr.var ~loc:l (name ~loc:l x) )
-          else State.return (stmts, value)
+          match Datatypes.admissible ~loc:l ctx.given.types e.exp_type value with
+          | None -> State.return (stmts, value)
+          | Some _ ->
+              let* typ = State.of_result (typ ctx ~at e.exp_type) in
+              let* () = State.note_domain ctx.given.types e.exp_type in
+              let+ x = State.fresh "tmp" in
+              ( stmts
+                @ R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
+                @ assert_admissible ctx ~loc:l e.exp_type x,
+                R.Expr.var ~loc:l (name ~loc:l x) )
+        end
       | None -> State.of_result (unsupported at "This field")
     end
   | Texp_setfield (record, _, label, value) -> begin
@@ -244,10 +253,11 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                 let+ defs =
                   State.all binds ~f:(fun (id, value, t) ->
                       let* typ = State.of_result (typ ctx ~at t) in
+                      let* () = State.note_domain ctx.given.types t in
                       let+ x = State.bind_name ~typ:t id in
                       R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
                         (ident ~loc:l x)
-                      @ assume_in_range ~loc:l t x)
+                      @ assert_admissible ctx ~loc:l t x)
                 in
                 reading @ List.concat defs)
       in
@@ -970,9 +980,10 @@ and match_cases ?commits ~tail ctx ~at v
          let* defs =
            State.all binds ~f:(fun (id, value, t) ->
                let* typ = State.of_result (typ ctx ~at t) in
+               let* () = State.note_domain ctx.given.types t in
                let+ x = State.bind_name ~typ:t id in
                R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
-               @ assume_in_range ~loc:l t x)
+               @ assert_admissible ctx ~loc:l t x)
          in
          let* stmts, value = expr ~tail ctx rhs in
          let* finish = finish_arm ctx ~tail value in
@@ -1010,7 +1021,13 @@ and match_cases ?commits ~tail ctx ~at v
             let+ fails = not_exhaustive () in
             [ (R.Expr.Default, fails) ]
         in
-        ([ R.Stmt.match_ ~loc:l v (List.rev raven_cases @ default) ], join, ends)
+        let cases = List.rev raven_cases @ default in
+        let statements =
+          match cases with
+          | [ (R.Expr.Default, body) ] -> body
+          | _ -> [ R.Stmt.match_ ~loc:l v cases ]
+        in
+        (statements, join, ends)
     | None ->
         let rec chain join ends = function
           | [] ->
@@ -1098,8 +1115,9 @@ and flat_cases ctx v cases =
         let var = function
           | None -> State.return (ident ~loc:l "_", [])
           | Some (id, t) ->
+              let* () = State.note_domain ctx.given.types t in
               let+ x = State.bind_name ~typ:t id in
-              (ident ~loc:l x, assume_in_range ~loc:l t x)
+              (ident ~loc:l x, assert_admissible ctx ~loc:l t x)
         in
         let* vars = State.all args ~f:var in
         let+ scope = State.get_scope in
@@ -1192,6 +1210,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
   in
   let* names = State.gets (fun (s : State.state) -> s.names) in
   match e.exp_desc with
+  | Texp_unreachable -> raw_default ctx ~at e.exp_type
   | Texp_ident (Pident id, _, _) ->
       begin match
         ( List.Assoc.find values (Ident.unique_name id) ~equal:String.equal,
@@ -1290,6 +1309,13 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
         body ) ->
       let* v = pure_in values vb_expr in
       pure_in ((Ident.unique_name id, v) :: values) body
+  | Texp_match (scrutinee, _, [], Total)
+    when match Datatypes.desc ctx.given.types scrutinee.exp_type with
+         | Tconstr (path, [], _) ->
+             Option.exists (Datatypes.find ctx.given.types path) ~f:(fun data ->
+                 data.empty)
+         | _ -> false ->
+      raw_default ctx ~at e.exp_type
   | Texp_match (scrutinee, cases, [], Total) -> begin
       let* v = pure_in values scrutinee in
       let* cases =
@@ -1310,7 +1336,10 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
                 let+ body = pure_in (with_binds binds) rhs in
                 (case, body))
           in
-          R.Expr.match_ ~loc:l v cases
+          begin match cases with
+          | [ (R.Expr.Default, body) ] -> body
+          | _ -> R.Expr.match_ ~loc:l v cases
+          end
       | None ->
           (* OCaml found the cases exhaustive, so the last one needs no test. *)
           let rec chain = function
