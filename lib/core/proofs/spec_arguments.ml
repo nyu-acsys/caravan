@@ -3,7 +3,17 @@
 open Base
 module S = Caravan_spec.Spec_ast
 
-let predicate_parameters ~lookup ~bound terms =
+let predicate_parameters ?(expand = Fn.id) ~lookup ~bound terms =
+  let rec bindings bound (term : S.term) typ =
+    match (term.term_desc, Types.get_desc (expand typ)) with
+    | Tvar (Qid id), _ when not (List.mem bound id.pid_str ~equal:String.equal) ->
+        [ (id, typ) ]
+    | Ttuple values, Ttuple fields when List.length values = List.length fields ->
+        List.concat
+          (List.map2_exn values fields ~f:(fun value (_, typ) -> bindings bound value typ))
+    | (Tcast (value, _) | Tattr (_, value)), _ -> bindings bound value typ
+    | _ -> []
+  in
   let rec spine (term : S.term) arguments =
     match term.term_desc with
     | Tapply (callee, argument) -> spine callee (argument :: arguments)
@@ -17,14 +27,9 @@ let predicate_parameters ~lookup ~bound terms =
       | Tvar name ->
           begin match lookup name arguments with
           | Some types when List.length arguments <= List.length types ->
-              List.filter_map
+              List.concat_map
                 (List.zip_exn arguments (List.take types (List.length arguments)))
-                ~f:(fun (argument, typ) ->
-                  match argument.S.term_desc with
-                  | Tvar (Qid id) when not (List.mem bound id.pid_str ~equal:String.equal)
-                    ->
-                      Some (id, typ)
-                  | _ -> None)
+                ~f:(fun (argument, typ) -> bindings bound argument typ)
           | _ -> []
           end
       | _ -> []

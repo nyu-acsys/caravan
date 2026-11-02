@@ -10,6 +10,8 @@ type predicate_definition =
   | Stateful of {
       state : string;
       fields : S.state_field list;
+      field_types : Types.type_expr list;
+      parameter_types : Types.type_expr list;
       body : S.term;
       environment : Env.t;
       state_scope : Proof_scopes.scope;
@@ -277,6 +279,62 @@ let parameter_types environment parameters =
            id.S.pid_loc))
     (List.map parameters ~f:snd)
 
+let check_state_parameters ~at ~parameters ~arguments fields =
+  let* () =
+    match
+      List.find_a_dup parameters ~compare:(fun a b ->
+          String.compare a.S.pid_str b.pid_str)
+    with
+    | None -> Ok ()
+    | Some parameter ->
+        Error
+          (Report.error Type parameter.pid_loc
+             (Printf.sprintf "The state type parameter '%s is declared twice"
+                parameter.pid_str))
+  in
+  if List.length parameters <> List.length arguments then
+    Error
+      (Report.error Type at
+         (Printf.sprintf "The state type expects %d type arguments, but received %d"
+            (List.length parameters) (List.length arguments)))
+  else
+    let names = List.map parameters ~f:(fun id -> id.S.pid_str) in
+    let rec check = function
+      | S.PTtyvar id ->
+          if List.mem names id.pid_str ~equal:String.equal then Ok ()
+          else
+            Error
+              (Report.error Type id.pid_loc
+                 (Printf.sprintf "The state type parameter '%s is not declared" id.pid_str))
+      | PTtyapp (_, arguments) -> Result.all_unit (List.map arguments ~f:check)
+      | PTtuple elements -> Result.all_unit (List.map elements ~f:check)
+      | PTarrow (argument, result) ->
+          let* () = check argument in
+          check result
+    in
+    Result.all_unit (List.map fields ~f:(fun field -> check field.S.sf_type))
+
+let type_state_fields ~at ~environment ~field_environment ~parameters ~state_parameters
+    ~state_arguments fields =
+  let* () =
+    check_state_parameters ~at ~parameters:state_parameters ~arguments:state_arguments
+      fields
+  in
+  let* combined =
+    Source.ocaml_types environment ~at (List.map parameters ~f:snd @ state_arguments)
+  in
+  let parameter_types, state_arguments = List.split_n combined (List.length parameters) in
+  let variables =
+    List.zip_exn (List.map state_parameters ~f:(fun id -> id.S.pid_str)) state_arguments
+  in
+  let* field_types =
+    Result.all
+      (List.map fields ~f:(fun field ->
+           Source.ocaml_type ~variables field_environment ~at:field.S.sf_name.pid_loc
+             field.sf_type))
+  in
+  Ok (parameter_types, field_types)
+
 let state_entry scopes entries ~scope ~environment (name : S.qualid) =
   let candidate =
     match name with
@@ -437,7 +495,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
   | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body } ->
       let* state_definition =
         match state_type with
-        | PTtyapp (name, []) ->
+        | PTtyapp (name, arguments) ->
             begin match
               state_entry source.proof_scopes source.proof_scopes.declarations ~scope
                 ~environment name
@@ -449,11 +507,17 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
                     definition
                 then
                   begin match definition.declaration with
-                  | Proof_state { state_fields; _ } ->
+                  | Proof_state { state_params; state_fields; _ } ->
                       let environment =
                         Source.annotation_env source definition.scope.environment
                       in
-                      Ok (Some (state_fields, environment, definition.scope))
+                      Ok
+                        (Some
+                           ( state_fields,
+                             state_params,
+                             arguments,
+                             environment,
+                             definition.scope ))
                   | _ -> Ok None
                   end
                 else
@@ -463,19 +527,27 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
             end
         | _ -> Ok None
       in
-      let params, definition =
+      let* params, definition =
         match state_definition with
-        | Some (fields, environment, state_scope) ->
-            ( inv_params,
-              Stateful
-                {
-                  state = state.pid_str;
-                  fields;
-                  body = inv_body;
-                  environment;
-                  state_scope;
-                } )
-        | None -> (inv_params @ [ (state, state_type) ], Plain inv_body)
+        | Some (fields, state_parameters, state_arguments, field_environment, state_scope)
+          ->
+            let* parameter_types, field_types =
+              type_state_fields ~at:inv_name.pid_loc ~environment ~field_environment
+                ~parameters:inv_params ~state_parameters ~state_arguments fields
+            in
+            Ok
+              ( inv_params,
+                Stateful
+                  {
+                    state = state.pid_str;
+                    fields;
+                    field_types;
+                    parameter_types;
+                    body = inv_body;
+                    environment = field_environment;
+                    state_scope;
+                  } )
+        | None -> Ok (inv_params @ [ (state, state_type) ], Plain inv_body)
       in
       let predicate =
         {
@@ -668,6 +740,7 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
         let environment = Source.annotation_env source scope.environment in
         let* private_types =
           match (kind, entry.declaration) with
+          | Predicate (_, Stateful { parameter_types; _ }), _ -> Ok parameter_types
           | Predicate (_, View _), Proof_view { view_name; view_params; _ } ->
               begin match view_declaration inventory scope view_name.pid_str with
               | None ->
@@ -676,17 +749,31 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                        "Missing resource declaration for view")
               | Some (constraint_, formal) ->
                   let* inputs = parameter_types environment view_params in
-                  let value = List.last_exn formal.declaration.pred_params in
                   let signature_environment =
                     Source.annotation_env source formal.site.environment
                   in
-                  let* output = parameter_types signature_environment [ value ] in
+                  let* signature =
+                    parameter_types signature_environment formal.declaration.pred_params
+                  in
                   let substitution =
                     Option.value
                       (private_view_substitution source inventory scope constraint_)
                       ~default:constraint_.substitution
                   in
-                  Ok (inputs @ List.map output ~f:(Subst.type_expr substitution))
+                  let signature =
+                    Compiler_types.map_group signature ~f:(Subst.type_expr substitution)
+                  in
+                  let* scheme =
+                    Generic_parameters.discover ~key:view_name.pid_str
+                      ~name:view_name.pid_str ~at:view_name.pid_loc
+                      ~explicit:(List.length inputs) signature
+                  in
+                  let* arguments =
+                    Generic_parameters.instantiate ~environment ~expand:Fn.id
+                      ~at:view_name.pid_loc scheme
+                      (List.map inputs ~f:Option.some @ [ None ])
+                  in
+                  Ok (Generic_parameters.parameter_types scheme arguments)
               end
           | _ -> parameter_types environment parameters
         in
@@ -718,7 +805,8 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                          (List.length right.namespace))
           in
           match declared with
-          | None -> Ok (List.map private_types ~f:(Subst.type_expr projection))
+          | None ->
+              Ok (Compiler_types.map_group private_types ~f:(Subst.type_expr projection))
           | Some (_, signature, formal) ->
               let signature_environment =
                 Source.annotation_env source formal.site.environment
@@ -730,7 +818,7 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                 Option.value_map scope.owner ~default:projection ~f:(fun owner ->
                     signature_type_projection projection owner signature)
               in
-              Ok (List.map types ~f:(Subst.type_expr projection))
+              Ok (Compiler_types.map_group types ~f:(Subst.type_expr projection))
         in
         let base =
           String.uncapitalize

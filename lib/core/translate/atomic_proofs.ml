@@ -132,8 +132,8 @@ let anchor_source (types : Datatypes.t list) (t : Types.type_expr) =
   match Datatypes.desc types t with
   | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p -> Some (`Atomic elt, itself)
   | Tconstr (p, [ elt ], _) when Datatypes.is_ref p -> Some (`Reference elt, itself)
-  | Tconstr (p, [], _) ->
-      begin match Datatypes.find types p with
+  | Tconstr _ ->
+      begin match Datatypes.instantiated types t with
       | Some { heap = Some (f :: _); _ } -> Some (`Field f.raven_field, itself)
       | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
           List.find_map (List.zip_exn fields args) ~f:(fun (label, a) ->
@@ -170,6 +170,363 @@ let anchored ctx ~loc ~pred (e : R.Expr.t) =
       | None -> e
       end
   | _ -> e
+
+(** Resolve shared proof declarations in the caller's type context. *)
+let specialize_shared env ~terms =
+  let open State.Syntax in
+  let add entries key value =
+    (key, value) :: List.Assoc.remove entries key ~equal:String.equal
+  in
+  let specialize_owner env worker arguments prefix =
+    let shared = env.ctx.given.shared in
+    let rebase text =
+      Option.value_map
+        (String.chop_prefix text ~prefix:(worker.Generic_parameters.name ^ "."))
+        ~default:text
+        ~f:(fun suffix -> prefix ^ "." ^ suffix)
+    in
+    let owners =
+      List.filter shared.structures ~f:(fun st ->
+          Option.exists st.generic ~f:(fun owner -> String.equal owner.name worker.name))
+    in
+    State.fold owners ~init:env ~f:(fun env st ->
+        let owner = Option.value_exn st.generic in
+        let project ty =
+          List.hd_exn
+            (Generic_parameters.parameter_types
+               { owner with parameters = [ ty ] }
+               arguments)
+        in
+        let backend = rebase st.backend in
+        if
+          List.exists env.ctx.given.shared.structures ~f:(fun instance ->
+              String.equal instance.invariant backend && Option.is_none instance.generic)
+        then State.return env
+        else
+          let signature signature =
+            {
+              signature with
+              lemma_raven = rebase signature.lemma_raven;
+              lemma_inputs = List.map signature.lemma_inputs ~f:project;
+              lemma_outputs = List.map signature.lemma_outputs ~f:project;
+            }
+          in
+          let* fields =
+            State.all st.fields ~f:(fun (field, raven, typ, source, grows) ->
+                let source = project source in
+                let+ typ =
+                  if
+                    List.exists st.pendings ~f:(fun pending ->
+                        String.equal pending.pending_field field)
+                  then State.return typ
+                  else State.of_result (Datatypes.typ env.data ~at:st.at source)
+                in
+                (field, raven, typ, source, grows))
+          in
+          let* view_data =
+            State.all st.views ~f:(fun ((view : S.predicate), value) ->
+                let key = view.pred_name.pid_str in
+                let target, parameters =
+                  List.Assoc.find_exn st.context.declaration_predicates key
+                    ~equal:String.equal
+                in
+                let target = rebase target in
+                let parameters = List.map parameters ~f:project in
+                let old_field = view_field_in shared key in
+                let field = rebase old_field in
+                let+ typ =
+                  State.of_result
+                    (Datatypes.typ env.data ~at:view.pred_name.pid_loc
+                       (List.last_exn parameters))
+                in
+                ( { view with pred_name = { view.pred_name with pid_str = target } },
+                  value,
+                  parameters,
+                  field,
+                  typ ))
+          in
+          let aliases =
+            (backend, (backend, List.map st.params ~f:(fun (_, typ) -> project typ)))
+            :: List.map view_data ~f:(fun (view, _, parameters, _, _) ->
+                let target = view.S.pred_name.pid_str in
+                (target, (target, parameters)))
+          in
+          let context =
+            {
+              declaration_predicates =
+                aliases
+                @ List.map st.context.declaration_predicates
+                    ~f:(fun (key, (target, parameters)) ->
+                      (key, (rebase target, List.map parameters ~f:project)));
+              declaration_functions =
+                List.map st.context.declaration_functions ~f:(fun (key, target) ->
+                    (key, rebase target));
+              declaration_support =
+                {
+                  st.context.declaration_support with
+                  logical_functions =
+                    List.map st.context.declaration_support.logical_functions
+                      ~f:(fun (key, declaration) -> (key, signature declaration));
+                };
+            }
+          in
+          let st =
+            {
+              st with
+              context;
+              generic = None;
+              invariant = backend;
+              backend;
+              fields;
+              params = List.map st.params ~f:(fun (key, typ) -> (key, project typ));
+              structure_type = project st.structure_type;
+              views = List.map view_data ~f:(fun (view, value, _, _, _) -> (view, value));
+              pendings =
+                List.map st.pendings ~f:(fun pending ->
+                    { pending with key_type = project pending.key_type });
+            }
+          in
+          let shared = env.ctx.given.shared in
+          let views =
+            List.fold view_data ~init:shared.views ~f:(fun views (view, _, _, field, _) ->
+                add views view.S.pred_name.pid_str field)
+          in
+          let fields =
+            List.map view_data ~f:(fun (_, _, _, field, typ) -> (field, Snapshot typ))
+            @
+            if has_history st then
+              [
+                ( member_name st "history",
+                  Fixed (history_elements ~loc:R.Loc.none shared.history st).initial );
+              ]
+            else []
+          in
+          let anchors =
+            match anchor env.data st.structure_type with
+            | None -> shared.anchors
+            | Some (tag, _) ->
+                let existing =
+                  Option.value
+                    (List.Assoc.find shared.anchors tag ~equal:String.equal)
+                    ~default:[]
+                in
+                let fields =
+                  List.fold fields ~init:existing ~f:(fun fields (key, value) ->
+                      add fields key value)
+                in
+                add shared.anchors tag fields
+          in
+          let shared =
+            {
+              shared with
+              persistent = add shared.persistent backend st.at;
+              views;
+              anchors;
+              structures =
+                st
+                :: List.filter shared.structures ~f:(fun other ->
+                    not (String.equal other.invariant backend));
+            }
+          in
+          let preds =
+            List.fold aliases ~init:env.ctx.given.preds ~f:(fun preds (key, value) ->
+                add preds key value)
+          in
+          let predicate_inputs =
+            List.fold view_data ~init:env.ctx.given.proof_support.predicate_inputs
+              ~f:(fun inputs (view, _, parameters, _, _) ->
+                add inputs view.S.pred_name.pid_str (List.length parameters - 1))
+          in
+          State.return
+            {
+              env with
+              ctx =
+                {
+                  env.ctx with
+                  given =
+                    {
+                      env.ctx.given with
+                      shared;
+                      preds;
+                      proof_support =
+                        { env.ctx.given.proof_support with predicate_inputs };
+                    };
+                };
+            })
+  in
+  let register env q args at =
+    let key = logical_key env q in
+    match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
+    | None -> State.return env
+    | Some (target, _) ->
+        let shared = env.ctx.given.shared in
+        if
+          not
+            (List.Assoc.mem shared.persistent
+               (canonical_member shared target)
+               ~equal:String.equal
+            || List.Assoc.mem shared.views key ~equal:String.equal)
+        then State.return env
+        else
+          let* instance =
+            State.of_result (predicate_instance env ~at ~key ~target args)
+          in
+          begin match instance with
+          | None -> State.return env
+          | Some (worker, arguments) ->
+              let* resolved = predicate_target env ~at ~key ~target args in
+              let prefix =
+                String.concat ~sep:"." (Qualified_name.of_string resolved).path
+              in
+              let* env = specialize_owner env worker arguments prefix in
+              let shared = env.ctx.given.shared in
+              let persistent =
+                if List.Assoc.mem shared.persistent target ~equal:String.equal then
+                  add shared.persistent resolved at
+                else shared.persistent
+              in
+              State.return
+                {
+                  env with
+                  ctx =
+                    {
+                      env.ctx with
+                      given = { env.ctx.given with shared = { shared with persistent } };
+                    };
+                }
+          end
+  in
+  let typed_bindings env bindings =
+    List.fold bindings ~init:env ~f:(fun env (name, typ) ->
+        { (bind env name (Raven name)) with var_types = (name, typ) :: env.var_types })
+  in
+  let rec local env bindings body =
+    let+ specialized = visit (typed_bindings env bindings) body in
+    { env with ctx = specialized.ctx }
+  and visit env (term : S.term) =
+    let term = S.chain term in
+    let head, arguments = spine term [] in
+    match head.term_desc with
+    | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+        State.fold arguments ~init:env ~f:visit
+    | Tvar q
+      when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal ->
+        let* env = register env q arguments term.term_loc in
+        State.fold arguments ~init:env ~f:visit
+    | _ ->
+        begin match term.term_desc with
+        | Tquant (_, binders, body) ->
+            let* bindings =
+              State.all binders ~f:(fun (id, annotation) ->
+                  match annotation with
+                  | None -> State.return None
+                  | Some annotation ->
+                      let+ typ =
+                        State.of_result
+                          (source_type env.ctx.given ~at:id.S.pid_loc annotation)
+                      in
+                      Some (id.pid_str, typ))
+            in
+            local env (List.filter_opt bindings) body
+        | Tcomprehension ((id, annotation), body) ->
+            let* typ =
+              State.of_result (source_type env.ctx.given ~at:id.S.pid_loc annotation)
+            in
+            local env [ (id.pid_str, typ) ] body
+        | Tlet (pattern, rhs, body) ->
+            let* env = visit env rhs in
+            let bindings =
+              Option.value_map (term_type env rhs) ~default:[]
+                ~f:(pattern_types env pattern)
+            in
+            local env bindings body
+        | Tmatch (value, cases) ->
+            let* env = visit env value in
+            State.fold cases ~init:env ~f:(fun env (pattern, body) ->
+                let bindings =
+                  Option.value_map (term_type env value) ~default:[]
+                    ~f:(pattern_types env pattern)
+                in
+                local env bindings body)
+        | _ ->
+            let children =
+              match term.term_desc with
+              | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
+              | Tfield (base, _) | Tattr (_, base) | Tcast (base, _) | Told base ->
+                  [ base ]
+              | Tapply (left, right) | Tinfix (left, _, right) -> [ left; right ]
+              | Tif (condition, yes, no) -> [ condition; yes; no ]
+              | Ttuple values -> values
+              | Trecord (base, fields) -> Option.to_list base @ List.map fields ~f:snd
+              | Tquant _ | Tcomprehension _ | Tlet _ | Tmatch _ -> []
+            in
+            State.fold children ~init:env ~f:visit
+        end
+  in
+  let shared = env.ctx.given.shared in
+  if
+    List.exists env.ctx.given.generic_predicates ~f:(fun worker ->
+        List.Assoc.mem shared.views worker.Generic_parameters.key ~equal:String.equal
+        || Option.exists
+             (List.Assoc.find env.ctx.given.preds worker.key ~equal:String.equal)
+             ~f:(fun (target, _) ->
+               List.Assoc.mem shared.persistent
+                 (canonical_member shared target)
+                 ~equal:String.equal))
+  then State.fold terms ~init:env ~f:visit
+  else State.return env
+
+(** The instance whose history carries a fact about [field]. *)
+let resolve_shared_structure ?element_type env ~at ~invariant ~field =
+  let shared = env.ctx.given.shared in
+  let target =
+    match List.Assoc.find env.ctx.given.preds invariant ~equal:String.equal with
+    | None -> invariant
+    | Some (target, _) ->
+        begin match
+          Generic_parameters.find ~target env.ctx.given.generic_predicates invariant
+        with
+        | None -> canonical_member shared target
+        | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
+        end
+  in
+  let prototype =
+    List.find shared.structures ~f:(fun st -> String.equal st.invariant target)
+  in
+  let candidates =
+    match Option.bind prototype ~f:(fun st -> st.generic) with
+    | None -> Option.to_list prototype
+    | Some worker ->
+        List.filter shared.structures ~f:(fun st ->
+            Option.is_none st.generic
+            && Option.exists
+                 (List.Assoc.find st.context.declaration_predicates worker.key
+                    ~equal:String.equal) ~f:(fun (target, _) ->
+                   String.equal target st.invariant))
+  in
+  let candidates =
+    if Option.is_none (Option.bind prototype ~f:(fun st -> st.generic)) then candidates
+    else
+      List.filter candidates ~f:(fun st ->
+          match
+            List.find st.fields ~f:(fun (name, _, _, _, _) -> String.equal name field)
+          with
+          | None -> false
+          | Some (_, _, _, typ, _) ->
+              Option.value_map element_type ~default:true ~f:(fun element_type ->
+                  match Datatypes.desc env.data typ with
+                  | Tconstr (_, [ element ], _) ->
+                      Ctype.is_equal env.ctx.given.env false [ element ] [ element_type ]
+                  | _ -> false))
+  in
+  match candidates with
+  | [ st ] -> State.return st
+  | [] ->
+      State.of_result
+        (error at "No instantiated invariant matches this fact about an earlier state")
+  | _ :: _ :: _ ->
+      State.of_result
+        (error at "Several instantiated invariants match this fact about an earlier state")
 
 (** The source types of action parameters, inferred from their atomic step patterns. *)
 let action_parameter_types env (a : action) =
@@ -410,6 +767,9 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
 
 (** The statements opening the invariants the function holds before the step at [at], or
     with [fold] closing them after it, where a failure is reported. *)
+let performing_on (performing : performing) invariant =
+  Option.value_map performing.invariant ~default:true ~f:(String.equal invariant)
+
 let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
   let open State.Syntax in
   let after = { at with loc_start = at.loc_end } in
@@ -565,7 +925,7 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                           ~equal:String.equal ))
                 in
                 begin match performs with
-                | Some p ->
+                | Some p when performing_on p inv ->
                     (* The action's state, which the history learns if a growing field
                        changes, supplies the fold witnesses. *)
                     let* next, indices, appended =
@@ -627,10 +987,10 @@ let use_invariants ?performs ?(no_action = false) ctx ~(at : Location.t) ~fold =
                       let+ snapshot = snapshot st state in
                       helping @ learn @ (snapshot :: fold ~witnesses ())
                     else State.return (fold ~witnesses ())
-                | None when has_history st ->
+                | (None | Some _) when has_history st ->
                     let+ snapshot = snapshot st opened in
                     snapshot :: fold ~witnesses:(witnesses opened) ()
-                | None ->
+                | None | Some _ ->
                     (* The heap determines the state without a history. *)
                     State.return (fold ())
                 end
@@ -785,6 +1145,19 @@ let with_views ctx make ~loc ~pred p args =
       :: make ~loc ~pred p args
   | None -> make ~loc ~pred p args
 
+let performing_updates_view ctx performing pred =
+  let target key =
+    canonical_member ctx.given.shared
+      (Option.value_map
+         (List.Assoc.find ctx.given.preds key ~equal:String.equal)
+         ~default:key ~f:fst)
+  in
+  List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal
+  && List.exists ctx.given.shared.structures ~f:(fun st ->
+      performing_on performing st.invariant
+      && List.exists st.views ~f:(fun (view, _) ->
+          String.equal (target pred) (target view.S.pred_name.pid_str)))
+
 (** The views of the open invariants, set to their values in the states after [p], and
     folded: the views are functions of the state. *)
 let perform_views ctx ~(at : Location.t) (p : performing) =
@@ -800,7 +1173,7 @@ let perform_views ctx ~(at : Location.t) (p : performing) =
         in
         let args = List.Assoc.find invariants inv ~equal:String.equal in
         match (structure, args) with
-        | Some st, Some args ->
+        | Some st, Some args when performing_on p inv ->
             let* next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
             let+ views = views_after ctx st args (List.map next ~f:fst) in
             List.concat_map views ~f:(fun (pred, inputs, value) ->
@@ -993,7 +1366,9 @@ let step_performings ctx ~at ~op ~field ~location args =
                       in
                       let+ condition = State.attempt condition in
                       begin match (same_field, condition) with
-                      | true, Ok condition -> Some ({ performed = a; bindings }, condition)
+                      | true, Ok condition ->
+                          Some
+                            ({ performed = a; bindings; invariant = Some inv }, condition)
                       | _ -> None
                       end
                   | _ -> State.return None)
@@ -1500,7 +1875,10 @@ let open_for_call (au : au) ~(at : Location.t) =
     says. *)
 let set_performing performed =
   modify_au (fun au ->
-      { au with au_performing = Some ({ performed; bindings = [] }, None) })
+      {
+        au with
+        au_performing = Some ({ performed; bindings = []; invariant = None }, None);
+      })
 
 (** That the variable [id] is bound to the result of a [compare_and_set], or to its
     negation if not [polarity]. *)

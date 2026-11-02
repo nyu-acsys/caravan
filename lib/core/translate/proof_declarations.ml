@@ -76,6 +76,7 @@ let action_checks ctx (st : structure) =
               {
                 performed = a;
                 bindings = List.map action_params ~f:(fun (x, raven, _) -> (x, var raven));
+                invariant = Some st.invariant;
               }
             in
             let* next, _, _ =
@@ -633,7 +634,8 @@ let predicates (source : Source.t) =
   let declaration x = List.find declared ~f:(fun (_, p) -> String.equal (name p) x) in
   let states =
     List.filter_map source.proof ~f:(function
-      | Proof_state { state_name; state_fields } -> Some (state_name.pid_str, state_fields)
+      | Proof_state { state_name; state_params; state_fields } ->
+          Some (state_name.pid_str, (state_params, state_fields))
       | _ -> None)
   in
   let* proof =
@@ -646,21 +648,31 @@ let predicates (source : Source.t) =
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
-          let params, definition =
+          let* params, definition =
             match state_type with
-            | PTtyapp (Qid t, []) when List.Assoc.mem states t.pid_str ~equal:String.equal
-              ->
-                let fields = List.Assoc.find_exn states t.pid_str ~equal:String.equal in
-                ( inv_params,
-                  Invariant
-                    {
-                      state = state.pid_str;
-                      fields;
-                      body = inv_body;
-                      field_environment = source.env;
-                      field_scope = None;
-                    } )
-            | _ -> (inv_params @ [ (state, state_type) ], Direct_invariant inv_body)
+            | PTtyapp (Qid t, state_arguments)
+              when List.Assoc.mem states t.pid_str ~equal:String.equal ->
+                let state_parameters, fields =
+                  List.Assoc.find_exn states t.pid_str ~equal:String.equal
+                in
+                let* parameter_types, field_types =
+                  Proof_bindings.type_state_fields ~at:inv_name.pid_loc
+                    ~environment:source.env ~field_environment:source.env
+                    ~parameters:inv_params ~state_parameters ~state_arguments fields
+                in
+                Ok
+                  ( inv_params,
+                    Invariant
+                      {
+                        state = state.pid_str;
+                        fields;
+                        field_types;
+                        parameter_types;
+                        body = inv_body;
+                        field_environment = source.env;
+                        field_scope = None;
+                      } )
+            | _ -> Ok (inv_params @ [ (state, state_type) ], Direct_invariant inv_body)
           in
           Ok
             (Some
@@ -702,7 +714,12 @@ let predicates (source : Source.t) =
   in
   let proof = List.filter_opt proof in
   let typed (at, (p : S.predicate), def) =
-    let* types = Source.ocaml_types source.env ~at (List.map p.pred_params ~f:snd) in
+    let* types =
+      match def with
+      | Some (Invariant { parameter_types; _ }) -> Ok parameter_types
+      | Some (Body _ | Direct_invariant _ | View _) | None ->
+          Source.ocaml_types source.env ~at (List.map p.pred_params ~f:snd)
+    in
     let* _ = implicit_parameters p in
     Ok (at, p, def, types)
   in
@@ -1085,11 +1102,22 @@ let scoped_predicate (binding : Proof_bindings.binding) =
       let definition =
         match definition with
         | Plain body -> if p.pred_persistent then Direct_invariant body else Body body
-        | Stateful { state; fields; body; environment; state_scope } ->
+        | Stateful
+            {
+              state;
+              fields;
+              field_types;
+              parameter_types;
+              body;
+              environment;
+              state_scope;
+            } ->
             Invariant
               {
                 state;
                 fields;
+                field_types;
+                parameter_types;
                 body;
                 field_environment = environment;
                 field_scope = Some state_scope;
@@ -1196,18 +1224,17 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                       Source.annotation_env source formal.site.environment
                     in
                     let* raw =
-                      all declared.pred_params ~f:(fun (id, ty) ->
-                          Source.ocaml_type environment ~at:id.S.pid_loc ty)
+                      Proof_bindings.parameter_types environment declared.pred_params
                     in
                     let expected =
-                      List.map raw ~f:(fun typ ->
+                      Compiler_types.map_group raw ~f:(fun typ ->
                           Subst.type_expr check_projection
                             (Subst.type_expr constraint_.substitution typ))
                     in
                     let* equal =
                       Signature_contract.compiler ~at (fun () ->
                           List.length expected = List.length implementation_types
-                          && Ctype.is_equal implementation_environment false expected
+                          && Ctype.is_equal implementation_environment true expected
                                implementation_types)
                     in
                     let* () =

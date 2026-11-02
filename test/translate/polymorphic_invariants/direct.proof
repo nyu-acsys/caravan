@@ -1,0 +1,1 @@
+invariant constant (q : 'a t) (value : 'a) = own q value

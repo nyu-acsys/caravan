@@ -20,6 +20,7 @@ type t = {
   pure : Procedures.func list;
   polymorphic_functions : Polymorphic_functions.t list;
   generic_predicates : Generic_predicates.t list;
+  generic_predicate_workers : Generic_predicates.t list;
   runtime_destinations : Module_context.destination list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
   atomic_operations : (Source.proof_au * Procedures.func) list;
@@ -52,6 +53,40 @@ type t = {
   procedures : (Ident.t * string) list;
   generic_procedures : (string * string) list;
 }
+
+let same_scope a b =
+  Option.equal
+    (fun a b -> Option.equal Path.same a.Proof_scopes.owner b.Proof_scopes.owner)
+    a b
+
+let view_owners ~scope_of ~environment predicates (view, value, view_types) =
+  let scope = scope_of view.S.pred_name.pid_str in
+  let state_names =
+    List.filter_map (term_references [] value) ~f:(function
+      | S.Qid id
+        when not
+               (List.exists view.pred_params ~f:(fun (parameter, _) ->
+                    String.equal parameter.S.pid_str id.pid_str)) ->
+          Option.some_if
+            (List.exists predicates ~f:(fun (_, predicate, definition, _) ->
+                 same_scope scope (scope_of predicate.S.pred_name.pid_str)
+                 &&
+                 match definition with
+                 | Invariant { state; _ } -> String.equal state id.pid_str
+                 | Body _ | Direct_invariant _ | View _ -> false))
+            id.pid_str
+      | Qid _ | Qdot _ -> None)
+  in
+  List.filter_map predicates ~f:(fun (_, predicate, definition, parameters) ->
+      match definition with
+      | Invariant { state; _ }
+        when same_scope scope (scope_of predicate.S.pred_name.pid_str)
+             && List.length parameters = List.length view_types - 1
+             && Ctype.is_equal environment true parameters (List.drop_last_exn view_types)
+             && (List.is_empty state_names
+                || List.mem state_names state ~equal:String.equal) ->
+          Some predicate.S.pred_name.pid_str
+      | Body _ | Direct_invariant _ | Invariant _ | View _ -> None)
 
 let asset_worker ~(asset_context : Path.t option -> Module_context.t) owner =
   (asset_context owner).worker
@@ -1101,7 +1136,11 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
               Proof_bindings.signature_type_projection Subst.identity view.path
                 constraint_.signature
             in
-            Ok { view with types = List.map raw ~f:(Subst.type_expr projection) }
+            Ok
+              {
+                view with
+                types = Compiler_types.map_group raw ~f:(Subst.type_expr projection);
+              }
         | _ -> Ok view)
   in
   let scoped_proofs =
@@ -1133,8 +1172,10 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             parameters
         in
         if List.is_empty worker.variables then Ok None
-        else if Option.is_some context.identity then
-          unsupported at "Polymorphic predicates in source modules"
+        else if
+          Option.is_some context.identity
+          && match definition with Body _ -> true | _ -> false
+        then unsupported at "Polymorphic predicates in source modules"
         else
           match definition with
           | Body body ->
@@ -1154,10 +1195,88 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                   (context.namespace @ [ Fresh_names.fresh ("PolyPredicate$" ^ key) ])
               in
               Ok (Some { worker with name })
-          | Direct_invariant _ | Invariant _ | View _ ->
-              unsupported at "A polymorphic invariant or view")
+          | Direct_invariant _ | Invariant _ ->
+              let* () =
+                match definition with
+                | Invariant { field_types; _ } ->
+                    if
+                      List.for_all field_types ~f:(fun typ ->
+                          List.for_all (Polymorphic_functions.all_variables typ)
+                            ~f:(fun variable ->
+                              List.mem worker.variables variable ~equal:Types.eq_type))
+                    then Ok ()
+                    else
+                      unsupported at
+                        "A state type parameter not determined by the invariant \
+                         parameters"
+                | Body _ | Direct_invariant _ | View _ -> Ok ()
+              in
+              let name =
+                String.concat ~sep:"."
+                  (context.namespace
+                  @ [
+                      Fresh_names.fresh
+                        ("PolyInvariant$" ^ (Qualified_name.of_string key).name);
+                    ])
+              in
+              Ok (Some { worker with name })
+          | View _ -> Ok None)
   in
   let generic_predicates = List.filter_opt generic_predicates in
+  let scope_of =
+    Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs
+  in
+  let* predicates, generic_views =
+    List.map predicates
+      ~f:(fun ((at, predicate, definition, parameters) as declaration) ->
+        match definition with
+        | View { value } ->
+            let environment =
+              Program_scopes.declaration_environment ~source
+                ~unapplied_proofs:scopes.unapplied_proofs predicate.S.pred_name.pid_str
+            in
+            begin match
+              view_owners ~scope_of ~environment predicates (predicate, value, parameters)
+            with
+            | [ owner ] ->
+                let _, _, _, inputs =
+                  List.find_exn predicates ~f:(fun (_, p, _, _) ->
+                      String.equal p.S.pred_name.pid_str owner)
+                in
+                let* scheme =
+                  Generic_parameters.discover ~expand:(Datatypes.expand types)
+                    ~key:predicate.pred_name.pid_str ~name:predicate.pred_name.pid_str ~at
+                    ~explicit:(List.length inputs) parameters
+                in
+                let* arguments =
+                  Generic_parameters.instantiate ~environment
+                    ~expand:(Datatypes.expand types) ~at scheme
+                    (List.map inputs ~f:Option.some @ [ None ])
+                in
+                let parameters = Generic_parameters.parameter_types scheme arguments in
+                let generic =
+                  Option.map (Generic_parameters.find generic_predicates owner)
+                    ~f:(fun worker ->
+                      {
+                        worker with
+                        key = predicate.pred_name.pid_str;
+                        member =
+                          (Qualified_name.of_string predicate.pred_name.pid_str).name;
+                        parameters;
+                        explicit = List.length inputs;
+                      })
+                in
+                Ok ((at, predicate, definition, parameters), generic)
+            | [] -> error at "No stateful invariant matches this view"
+            | _ ->
+                error at
+                  "Several stateful invariants match this view: use distinct state \
+                   binders"
+            end
+        | Body _ | Direct_invariant _ | Invariant _ -> Ok (declaration, None))
+    |> Result.all |> Result.map ~f:List.unzip
+  in
+  let generic_predicates = generic_predicates @ List.filter_opt generic_views in
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
@@ -1202,6 +1321,29 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                }))
   in
   let generic_predicates = generic_predicates @ List.filter_opt imported_predicates in
+  let generic_predicate_workers = generic_predicates in
+  let* application_predicates =
+    all scoped_proofs.applications ~f:(fun view ->
+        match
+          Generic_parameters.find generic_predicates view.Proof_bindings.source.backend
+        with
+        | None -> Ok None
+        | Some worker ->
+            let parameters =
+              Compiler_types.map_group worker.parameters ~f:view.project_type
+            in
+            let* worker =
+              Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~at:view.source.entry.name.pid_loc worker parameters
+            in
+            let name =
+              String.concat ~sep:"."
+                ((Qualified_name.of_string view.backend).path
+                @ [ (Qualified_name.of_string worker.name).name ])
+            in
+            Ok (Some { worker with key = view.key; name }))
+  in
+  let generic_predicates = generic_predicates @ List.filter_opt application_predicates in
   let* imported_functions =
     all libraries ~f:(fun lib ->
         match lib.Library_modules.library.typed_signature with
@@ -1258,6 +1400,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       pure;
       polymorphic_functions;
       generic_predicates;
+      generic_predicate_workers;
       runtime_destinations;
       procedure_signatures;
       atomic_operations;

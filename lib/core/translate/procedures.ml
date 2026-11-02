@@ -365,7 +365,7 @@ and pattern_definitions env (f : func) =
               match args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> args
             in
             let+ v = State.attempt (Spec_terms.formula env value) in
-            match (find_constructor env q, v) with
+            match (find_constructor ?occurrence:(term_type env value) env q, v) with
             | Some (_, ctor), Ok v when List.length ctor.fields = List.length args ->
                 List.fold
                   (List.zip_exn args (List.zip_exn ctor.fields ctor.args))
@@ -567,14 +567,19 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
     when List.Assoc.mem ctx.given.preds (logical_key env q) ~equal:String.equal ->
       let key = logical_key env q in
       let raven, types = List.Assoc.find_exn ctx.given.preds key ~equal:String.equal in
+      let generic =
+        Option.is_some
+          (Generic_predicates.find ~target:raven env.ctx.given.generic_predicates key)
+      in
       let* raven =
         Spec_terms.predicate_target env ~at:t.term_loc ~key ~target:raven args
       in
+      let pred = if generic then raven else key in
       let+ args =
         Spec_terms.predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key
           types args
       in
-      make ~loc:l ~pred:key (qualified_name ~loc:l raven) args
+      make ~loc:l ~pred (qualified_name ~loc:l raven) args
   | _, _, Tif (c, a, b) ->
       let* c = Spec_terms.formula env c in
       let* a = uses ctx env ~at make a in
@@ -787,8 +792,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                   (* The views follow from the action; the postcondition's other
                      predicates are folded as usual. *)
                   let others ~loc ~pred p args =
-                    if List.Assoc.mem ctx.given.shared.views pred ~equal:String.equal then
-                      []
+                    if performing_updates_view ctx a pred then []
                     else fold ~loc ~pred p args
                   in
                   let* views = perform_views ctx ~at a in
@@ -833,6 +837,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
 
 (** The invariants that the conjunctions [terms] apply, with their arguments. *)
 let invariant_apps ?(include_opaque = false) ctx env (terms : S.term list) =
+  let open State.Syntax in
   let rec apps (t : S.term) =
     let t = S.chain t in
     match spine t [] with
@@ -849,13 +854,14 @@ let invariant_apps ?(include_opaque = false) ctx env (terms : S.term list) =
                   || not
                        (List.mem ctx.given.proof_support.opaque_predicates key
                           ~equal:String.equal)) ->
-            [ (key, args) ]
+            [ (key, args, t.term_loc) ]
         | _ -> []
         end
     | _ -> []
   in
-  State.all (List.concat_map terms ~f:apps) ~f:(fun (p, args) ->
+  State.all (List.concat_map terms ~f:apps) ~f:(fun (p, args, at) ->
       let raven, _ = List.Assoc.find_exn ctx.given.preds p ~equal:String.equal in
+      let* raven = predicate_target env ~at ~key:p ~target:raven args in
       State.map
         (State.all args ~f:(Spec_terms.formula env))
         ~f:(fun args -> (canonical_member ctx.given.shared raven, args)))
@@ -1107,6 +1113,14 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* _, env, implicit, ghosts =
     contract_env ctx ~spec_funcs:ctx.given.spec_funcs f formals ~result
   in
+  let* env =
+    specialize_shared env
+      ~terms:
+        (Option.value_map f.contract ~default:[] ~f:(fun contract ->
+             contract.requires @ contract.ensures @ contract.atomic_requires
+             @ contract.atomic_ensures))
+  in
+  let ctx = env.ctx in
   let* ghost_returns =
     State.of_result
       (all (ghost_results f) ~f:(fun (id, _) ->
@@ -1185,15 +1199,11 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* history_invariants = invariant_apps ~include_opaque:true ctx env pres in
   let witnesses (p : past) =
     let* st =
-      match
-        List.find ctx.given.shared.structures ~f:(fun st ->
-            String.equal st.invariant p.inv)
-      with
-      | Some st -> State.return st
-      | None ->
-          State.of_result
-            (error p.element.term_loc "A fact about an earlier state without a state")
+      resolve_shared_structure
+        ?element_type:(Spec_terms.term_type env p.element)
+        env ~at:p.element.term_loc ~invariant:p.inv ~field:p.field
     in
+    let p = { p with inv = st.invariant } in
     let* structure =
       match List.Assoc.find history_invariants p.inv ~equal:String.equal with
       | Some (x :: _) ->

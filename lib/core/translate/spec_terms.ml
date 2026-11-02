@@ -432,6 +432,16 @@ let predicate_instance env ~at ~key ~target args =
   match Generic_predicates.find ~target env.ctx.given.generic_predicates key with
   | None -> Ok None
   | Some worker ->
+      let worker =
+        { worker with name = canonical_member env.ctx.given.shared worker.name }
+      in
+      let* worker =
+        match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
+        | None -> Ok worker
+        | Some (_, parameters) ->
+            Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at worker
+              parameters
+      in
       let* arguments =
         Generic_predicates.instantiate ~environment:env.ctx.given.env
           ~expand:(Datatypes.expand env.data) ~at worker
@@ -491,7 +501,9 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Tvar q when Option.is_some (logical_signature env q) ->
       logical_application ~term:t env ~at (Option.value_exn (logical_signature env q)) []
   | Tvar (Qid { pid_str = x; _ })
-    when List.Assoc.mem env.ctx.given.proof_support.predicate_inputs x ~equal:String.equal
+    when (List.Assoc.mem env.ctx.given.proof_support.predicate_inputs x
+            ~equal:String.equal
+         || List.Assoc.mem env.ctx.given.preds x ~equal:String.equal)
          && not (List.Assoc.mem env.vars x ~equal:String.equal) ->
       application env t
   | Tvar (Qid { pid_str = x; _ }) ->
@@ -859,8 +871,7 @@ and application env (t : S.term) =
             (error at "An AU operation is only allowed in a proof expression")
       end
   | Tvar q, _
-    when List.Assoc.mem env.ctx.given.proof_support.predicate_inputs (logical_key env q)
-           ~equal:String.equal ->
+    when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal ->
       let key = logical_key env q in
       let raven, types =
         List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal

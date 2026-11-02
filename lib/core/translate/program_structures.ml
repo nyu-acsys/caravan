@@ -15,8 +15,7 @@ type t = {
   generic_shared : (string * shared) list;
   past_structures : ?symbolic:bool -> Procedures.func -> structure list;
   pasts : (string * (string * string * int) list) list;
-  past_returns :
-    (string * (string * string * (R.Expr.t list -> R.Expr.t option)) list) list;
+  past_returns : (string * past_return list) list;
   ghost_args : (string * (int * string) option list) list;
 }
 
@@ -54,13 +53,10 @@ let body_shared ~(body_module_context : Procedures.func -> Module_context.t)
   let shared_for_destination = shared_for_destination ~shared ~generic_shared in
   shared_for_destination (body_module_context f).destination
 
-let state_members ~(declaration_context : string -> Module_context.t) group lists =
-  let owner_destination = owner_destination ~declaration_context in
+let state_members ~destination_of destination lists =
   List.concat_map lists ~f:(fun (st, members) ->
       Option.some_if
-        (Module_context.same_destination
-           (owner_destination st.invariant)
-           (destination_of_group group))
+        (Module_context.same_destination (destination_of st.invariant) destination)
         members
       |> Option.value ~default:[])
 
@@ -83,6 +79,21 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
       ~unapplied_proofs:scopes.unapplied_proofs
   in
   let { Program_declarations.predicates; scoped_proofs; source; types; _ } = decls in
+  let generic key = Generic_parameters.find decls.generic_predicates key in
+  let types_for key =
+    Option.value_map (generic key) ~default:types ~f:(fun worker ->
+        Generic_parameters.types worker types)
+  in
+  let predicate_backend key =
+    match generic key with
+    | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
+    | None -> Module_context.member (declaration_context key) key
+  in
+  let view_backend key =
+    match generic key with
+    | Some worker -> worker.name ^ "." ^ view_field (Generic_parameters.member worker)
+    | None -> Module_context.member (declaration_context key) (view_field key)
+  in
   let body_module_context =
     Program_declarations.body_module_context ~module_contexts:scopes.module_contexts
       ~context_for_group:
@@ -129,6 +140,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   in
   let* view_fields =
     all views ~f:(fun ((p : S.predicate), _, param_types) ->
+        let types = types_for p.pred_name.pid_str in
         let at = p.pred_name.pid_loc in
         let structure = List.hd_exn param_types in
         let* allocation =
@@ -140,11 +152,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                  with a mutable field"
         in
         let* typ = Datatypes.typ types ~at (List.last_exn param_types) in
-        let field =
-          Module_context.member
-            (declaration_context p.pred_name.pid_str)
-            (view_field p.pred_name.pid_str)
-        in
+        let field = view_backend p.pred_name.pid_str in
         Ok (allocation, { View_storage.field; value_type = typ }))
   in
   let resolve_function ~environment (id : S.id) =
@@ -230,30 +238,55 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     all
       (List.filter_map predicates ~f:(fun (at, p, def, param_types) ->
            match def with
-           | Invariant { state; fields; body; field_environment; field_scope } ->
+           | Invariant
+               { state; fields; field_types; body; field_environment; field_scope; _ } ->
                Some
-                 (at, p, state, fields, body, param_types, field_environment, field_scope)
+                 ( at,
+                   p,
+                   state,
+                   fields,
+                   field_types,
+                   body,
+                   param_types,
+                   field_environment,
+                   field_scope )
            | Body _ | Direct_invariant _ | View _ -> None))
       ~f:(fun
           ( at,
             (p : S.predicate),
             state,
             state_fields,
+            state_types,
             body,
             param_types,
             field_environment,
             field_scope )
         ->
+        let types = types_for p.pred_name.pid_str in
         let scope = declaration_scope p.pred_name.pid_str in
         let environment = declaration_environment p.pred_name.pid_str in
         let declaration_predicates, declaration_functions, declaration_support =
           proof_context_for ~preds ~spec_funcs ~proof_support p.pred_name.pid_str
         in
         let context =
-          { declaration_predicates; declaration_functions; declaration_support }
+          {
+            declaration_predicates =
+              List.map declaration_predicates ~f:(fun (key, (target, parameters)) ->
+                  ( key,
+                    match generic key with
+                    | Some worker ->
+                        ( worker.name ^ "." ^ Generic_parameters.member worker,
+                          if
+                            Option.exists (generic p.pred_name.pid_str) ~f:(fun owner ->
+                                String.equal owner.name worker.name)
+                          then worker.parameters
+                          else parameters )
+                    | None -> (target, parameters) ));
+            declaration_functions;
+            declaration_support;
+          }
         in
-        let field_type term =
-          let* ty = Source.ocaml_type field_environment ~at term in
+        let state_types =
           let private_state =
             match (field_scope, scope) with
             | None, _ -> true
@@ -262,12 +295,26 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                   (Proof_bindings.drop_prefix owner.namespace caller.namespace)
             | Some _, None -> false
           in
-          Ok
-            (if private_state then ty
-             else
-               Proof_bindings.context_type scoped_proofs ~environment
-                 (Proof_bindings.public_type scoped_proofs ty))
+          if private_state then state_types
+          else
+            let project ty =
+              Proof_bindings.context_type scoped_proofs ~environment
+                (Proof_bindings.public_type scoped_proofs ty)
+            in
+            match generic p.pred_name.pid_str with
+            | None -> Compiler_types.map_group state_types ~f:project
+            | Some worker ->
+                let projected =
+                  Compiler_types.map_group (worker.variables @ state_types) ~f:project
+                in
+                let variables, parameters =
+                  List.split_n projected (List.length worker.variables)
+                in
+                Generic_parameters.parameter_types
+                  { worker with variables; parameters }
+                  worker.variables
         in
+        let typed_fields = List.zip_exn state_fields state_types in
         let actions =
           List.filter_map actions ~f:(fun (owner, action) ->
               Option.some_if
@@ -285,8 +332,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
           | _ -> None
         in
         let* fields =
-          all state_fields ~f:(fun (sf : S.state_field) ->
-              let* t = field_type sf.sf_type in
+          all typed_fields ~f:(fun ((sf : S.state_field), t) ->
               let raven = state ^ "_" ^ sf.sf_name.pid_str in
               match pending_key t with
               | Some _ ->
@@ -303,10 +349,8 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         in
         let* pendings =
           all
-            (List.filter_map state_fields ~f:(fun (sf : S.state_field) ->
-                 match field_type sf.sf_type with
-                 | Ok t -> Option.map (pending_key t) ~f:(fun key -> (sf, key))
-                 | Error _ -> None))
+            (List.filter_map typed_fields ~f:(fun ((sf : S.state_field), t) ->
+                 Option.map (pending_key t) ~f:(fun key -> (sf, key))))
             ~f:(fun ((sf : S.state_field), key) ->
               let field = sf.sf_name.pid_str in
               let* helped =
@@ -351,14 +395,12 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         in
         Ok
           {
+            generic = generic p.pred_name.pid_str;
             context;
             scope;
             environment;
             invariant = p.pred_name.pid_str;
-            backend =
-              Module_context.member
-                (declaration_context p.pred_name.pid_str)
-                p.pred_name.pid_str;
+            backend = predicate_backend p.pred_name.pid_str;
             state;
             fields;
             chains = List.map chains ~f:(fun f -> (f, state ^ "_" ^ f ^ "_index"));
@@ -394,31 +436,11 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
             structure_type = List.hd_exn param_types;
             views =
               List.filter_map views ~f:(fun (view, value, view_types) ->
-                  let params = List.drop_last_exn view_types in
-                  let state_names =
-                    List.filter_map (term_references [] value) ~f:(function
-                      | S.Qid id
-                        when (not
-                                (List.exists view.pred_params ~f:(fun (parameter, _) ->
-                                     String.equal parameter.S.pid_str id.pid_str)))
-                             && List.exists predicates
-                                  ~f:(fun (_, predicate, definition, _) ->
-                                    same_scope scope
-                                      (declaration_scope predicate.S.pred_name.pid_str)
-                                    &&
-                                    match definition with
-                                    | Invariant { state; _ } ->
-                                        String.equal state id.pid_str
-                                    | _ -> false) ->
-                          Some id.pid_str
-                      | Qid _ | Qdot _ -> None)
-                  in
                   Option.some_if
-                    (same_scope scope (declaration_scope view.pred_name.pid_str)
-                    && List.length params = List.length param_types
-                    && Ctype.is_equal environment false params param_types
-                    && (List.is_empty state_names
-                       || List.mem state_names state ~equal:String.equal))
+                    (List.mem
+                       (Program_declarations.view_owners ~scope_of:declaration_scope
+                          ~environment predicates (view, value, view_types))
+                       p.pred_name.pid_str ~equal:String.equal)
                     (view, value));
             at;
           })
@@ -495,7 +517,33 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
              ~f:(fun st -> (view, st))))
       ~f:(fun (view, st) ->
         let plan = Option.value_exn (proof_worker st.invariant) in
-        let project = view.Proof_bindings.project_type in
+        let applied_generic =
+          Option.map (generic view.Proof_bindings.key) ~f:(fun worker ->
+              { worker with name = canonical_backend worker.name })
+        in
+        let types =
+          Option.value_map applied_generic ~default:types ~f:(fun worker ->
+              Generic_parameters.types worker types)
+        in
+        let project ty =
+          match (st.generic, applied_generic) with
+          | Some original, Some applied ->
+              let packed = Generic_parameters.aggregate (original.variables @ [ ty ]) in
+              let projected = view.project_type packed in
+              let components =
+                match Types.get_desc projected with
+                | Ttuple fields -> List.map fields ~f:snd
+                | _ -> [ projected ]
+              in
+              let variables, values =
+                List.split_n components (List.length original.variables)
+              in
+              List.hd_exn
+                (Generic_parameters.parameter_types
+                   { original with variables; parameters = values }
+                   applied.variables)
+          | _ -> view.project_type ty
+        in
         let rebase text =
           Option.value_map
             (String.chop_prefix text ~prefix:(plan.group.name ^ "."))
@@ -648,20 +696,30 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
               Env.add_module ~noalias:false parameter Types.Mp_present
                 (Types.Mty_alias argument) environment)
         in
+        let projected_predicates =
+          List.map st.context.declaration_predicates ~f:(fun (key, (target, tys)) ->
+              (key, (rebase target, Compiler_types.map_group tys ~f:project)))
+        in
+        let application_predicates =
+          List.filter_map scoped_proofs.applications ~f:(fun other ->
+              if Path.same other.path view.path then
+                Option.map
+                  (List.Assoc.find projected_predicates other.source.backend
+                     ~equal:String.equal) ~f:(fun signature -> (other.key, signature))
+              else None)
+        in
         Ok
           {
             st with
-            invariant = canonical_backend view.backend;
-            backend = canonical_backend view.backend;
+            generic = applied_generic;
+            invariant = rebase st.backend;
+            backend = rebase st.backend;
             fields;
             views;
             environment;
             context =
               {
-                declaration_predicates =
-                  List.map st.context.declaration_predicates
-                    ~f:(fun (key, (target, tys)) ->
-                      (key, (rebase target, List.map tys ~f:project)));
+                declaration_predicates = application_predicates @ projected_predicates;
                 declaration_functions =
                   List.map st.context.declaration_functions ~f:(fun (key, target) ->
                       (key, rebase target));
@@ -687,12 +745,16 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   in
   let* structure_member_lists =
     all structures ~f:(fun st ->
-        let* members = structure_members ~history types st ~at:st.at in
+        let* members = structure_members ~history (types_for st.invariant) st ~at:st.at in
         Ok (st, members))
   in
   let history_fields =
     List.map (List.filter structures ~f:has_history) ~f:(fun st ->
-        let tag = Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst in
+        let tag =
+          Option.value_map
+            (anchor (types_for st.invariant) st.structure_type)
+            ~default:"" ~f:fst
+        in
         let l = R.Loc.none in
         ( tag,
           (member_name st "history", Fixed (history_elements ~loc:l history st).initial)
@@ -713,16 +775,17 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   let field_group = field_group ~generics in
   let make_shared group =
     let persistent =
-      List.filter_map predicates ~f:(fun (at, p, def, _) ->
+      List.concat_map predicates ~f:(fun (at, p, def, _) ->
           match def with
           | (Direct_invariant _ | Invariant _)
             when visible_state group p.pred_name.pid_str ->
-              Some
-                ( Module_context.member
-                    (declaration_context p.pred_name.pid_str)
-                    p.pred_name.pid_str,
-                  at )
-          | _ -> None)
+              let key = p.pred_name.pid_str in
+              (predicate_backend key, at)
+              ::
+              (if Option.is_none (generic key) then []
+               else
+                 [ (key, at); (Module_context.member (declaration_context key) key, at) ])
+          | Body _ | Direct_invariant _ | Invariant _ | View _ -> [])
     in
     let selected_views =
       List.filter views ~f:(fun (p, _, _) -> visible_state group p.S.pred_name.pid_str)
@@ -730,7 +793,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     let view_names =
       List.map selected_views ~f:(fun (p, _, _) ->
           let key = p.S.pred_name.pid_str in
-          let field = Module_context.member (declaration_context key) (view_field key) in
+          let field = view_backend key in
           (key, field))
     in
     let persistent, view_names =
@@ -744,12 +807,25 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                   let backend = Qualified_name.of_string view.backend in
                   ( persistent,
                     ( view.key,
-                      canonical_backend
-                        (String.concat ~sep:"."
-                           (backend.path @ [ view_field backend.name ])) )
+                      match generic view.key with
+                      | Some worker ->
+                          canonical_backend
+                            (worker.name ^ "."
+                            ^ view_field (Generic_parameters.member worker))
+                      | None ->
+                          canonical_backend
+                            (String.concat ~sep:"."
+                               (backend.path @ [ view_field backend.name ])) )
                     :: views )
               | Predicate (p, _) when p.pred_persistent ->
-                  ( (canonical_backend view.backend, p.pred_name.pid_loc) :: persistent,
+                  ( ( (match generic view.key with
+                      | Some worker ->
+                          canonical_backend
+                            (worker.name ^ "." ^ Generic_parameters.member worker)
+                      | None -> canonical_backend view.backend),
+                      p.pred_name.pid_loc )
+                    :: (view.backend, p.pred_name.pid_loc)
+                    :: persistent,
                     views )
               | _ -> (persistent, views))
     in
@@ -826,7 +902,9 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
           Option.map key ~f:(fun key ->
               Option.value_map (List.Assoc.find predicates key ~equal:String.equal)
                 ~default:key ~f:(fun (backend, _) ->
-                  canonical_member selected_shared backend)))
+                  match generic key with
+                  | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
+                  | None -> canonical_member selected_shared backend)))
     in
     let selected =
       List.filter structures ~f:(fun st ->
@@ -836,7 +914,9 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                 (Option.value_map
                    (List.Assoc.find predicates p.S.pred_name.pid_str ~equal:String.equal)
                    ~default:p.pred_name.pid_str ~f:(fun (backend, _) ->
-                     canonical_member selected_shared backend))
+                     match generic p.pred_name.pid_str with
+                     | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
+                     | None -> canonical_member selected_shared backend))
                 ~equal:String.equal))
     in
     if not (List.is_empty selected) then selected
@@ -899,12 +979,73 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                   unsupported p.element.term_loc
                     "A fact about an earlier state other than of a parameter,")
         in
-        Ok
-          ( (proc_name f, required),
-            ( proc_name f,
-              List.map
-                (clauses (fun c -> c.ensures))
-                ~f:(fun p -> (p.inv, p.field, entry_of_args types f names p.element)) ) ))
+        let* returned =
+          match clauses (fun c -> c.ensures) with
+          | [] -> Ok []
+          | clauses ->
+              let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+              let context = proof_context scope preds spec_funcs proof_support in
+              let owner = body_module_context f in
+              let preds, spec_funcs, proof_support =
+                module_context owner ~projection:owner.projection context
+              in
+              let ctx =
+                Proof_declarations.spec_context
+                  (Program_declarations.function_types decls.polymorphic_functions f types)
+                  ~shared:(body_shared f) ~ocaml_env:f.environment ~preds ~spec_funcs
+                  ~proof_support ~generic_predicates:decls.generic_predicates ()
+              in
+              let computation =
+                let open State.Syntax in
+                let* formals = formals ~names ctx f in
+                let typed_function =
+                  {
+                    f with
+                    contract =
+                      Option.map f.contract ~f:(fun contract ->
+                          let ordinary terms =
+                            List.filter terms ~f:(fun term ->
+                                Option.is_none (past_of structures term))
+                          in
+                          {
+                            contract with
+                            requires = ordinary contract.requires;
+                            ensures = ordinary contract.ensures;
+                          });
+                  }
+                in
+                let* _, env, _, _ =
+                  contract_env ctx ~spec_funcs typed_function formals
+                    ~result:"past$result"
+                in
+                State.all clauses ~f:(fun p ->
+                    let+ past_element =
+                      State.of_result
+                        (match Spec_terms.term_type env p.element with
+                        | Some typ -> Ok typ
+                        | None ->
+                            Source.infer_logical_expression f.environment
+                              ~functions:(List.map env.funcs ~f:fst)
+                              ~variables:(Logical_context.variables env)
+                              p.element)
+                    in
+                    {
+                      past_invariant = p.inv;
+                      past_field = p.field;
+                      past_entry = entry_of_args types f names p.element;
+                      past_inputs =
+                        List.map f.params ~f:(fun parameter ->
+                            match parameter.Typedtree.fp_kind with
+                            | Tparam_pat pattern | Tparam_optional_default (pattern, _) ->
+                                pattern.pat_type);
+                      past_result = f.body.exp_type;
+                      past_element;
+                    })
+              in
+              let* result, _ = State.run_from State.initial computation in
+              Ok result
+        in
+        Ok ((proc_name f, required), (proc_name f, returned)))
   in
   let pasts, past_returns = List.unzip pasts in
   let body_past_name f inv =
@@ -935,8 +1076,8 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   in
   let past_returns =
     with_body_pasts past_returns (fun f clauses ->
-        List.map clauses ~f:(fun (inv, field, element) ->
-            (body_past_name f inv, field, element)))
+        List.map clauses ~f:(fun past ->
+            { past with past_invariant = body_past_name f past.past_invariant }))
   in
   (* For each ghost parameter, a parameter that a precondition makes a field of it. *)
   let* ghost_args =

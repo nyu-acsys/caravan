@@ -59,7 +59,7 @@
   (* The record types that no invariant takes as its state are logical records. *)
   let logical_records declarations =
     let rec states = function
-      | Proof_invariant { inv_state = (_, PTtyapp (q, [])); _ } ->
+      | Proof_invariant { inv_state = (_, PTtyapp (q, _)); _ } ->
           [ (match q with Qid x | Qdot (_, x) -> x.pid_str) ]
       | Proof_module { module_declarations = ds; _ }
       | Proof_definition { module_declarations = ds; _ } -> List.concat_map states ds
@@ -73,9 +73,9 @@
       (f.sf_name, f.sf_type)
     in
     let rec convert = function
-      | Proof_state { state_name = n; state_fields = fs }
+      | Proof_state { state_name = n; state_params = ps; state_fields = fs }
         when not (List.mem n.pid_str states) ->
-          Proof_type { type_name = n; type_params = []; type_kind = Record (List.map field fs) }
+          Proof_type { type_name = n; type_params = ps; type_kind = Record (List.map field fs) }
       | Proof_module m ->
           Proof_module { m with module_declarations = List.map convert m.module_declarations }
       | Proof_definition m ->
@@ -452,14 +452,7 @@ proof_decl:
         lemma_variant = List.rev variant; lemma_body = body;
       } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
-    { let field f =
-        if f.sf_grows || f.sf_helps <> None then
-          raise (Syntax_error (f.sf_name.pid_loc,
-            "Only the state of an invariant has [@grows] or [@helps] fields"));
-        (f.sf_name, f.sf_type)
-      in
-      if ps = [] then Proof_state { state_name = n; state_fields = fs }
-      else Proof_type { type_name = n; type_params = ps; type_kind = Record (List.map field fs) } }
+    { Proof_state { state_name = n; state_params = ps; state_fields = fs } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL cs = bar_list1(type_ctor)
     { Proof_type { type_name = n; type_params = ps; type_kind = Variant cs } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term

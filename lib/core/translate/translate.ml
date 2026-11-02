@@ -93,6 +93,7 @@ let program ?(history = History.default) (source : Source.t) :
     generic_procedures;
     polymorphic_functions;
     generic_predicates;
+    generic_predicate_workers;
   } =
     decls
   in
@@ -145,13 +146,9 @@ let program ?(history = History.default) (source : Source.t) :
         (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
            ~unapplied_proofs:scopes.unapplied_proofs)
   in
-  let same_group = Program_structures.same_group in
   let field_group = Program_structures.field_group ~generics:scopes.generics in
   let state_members =
-    Program_structures.state_members
-      ~declaration_context:
-        (Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
-           ~unapplied_proofs:scopes.unapplied_proofs)
+    Program_structures.state_members ~destination_of:predicate_destination
   in
   let* translated, state = Program_members.run scopes decls proofs shaped state in
   let {
@@ -472,9 +469,11 @@ let program ?(history = History.default) (source : Source.t) :
     captured && not final
   in
   let candidates =
-    List.map (generic_predicates @ generic_callables) ~f:(fun worker ->
+    List.map (generic_predicate_workers @ generic_callables) ~f:(fun worker ->
         Proof_worker worker)
     @ List.map polymorphic_functions ~f:(fun worker -> Runtime_worker worker)
+    |> List.dedup_and_sort ~compare:(fun left right ->
+        String.compare (callable_name left) (callable_name right))
   in
   let owns worker namespace =
     List.is_prefix namespace
@@ -570,7 +569,18 @@ let program ?(history = History.default) (source : Source.t) :
         let parameters =
           match worker with
           | Runtime_worker worker -> function_value_types worker.scheme.typ
-          | Proof_worker worker -> worker.parameters
+          | Proof_worker worker ->
+              worker.parameters
+              @ List.concat_map generic_predicates ~f:(fun declaration ->
+                  if String.equal declaration.Generic_parameters.name worker.name then
+                    declaration.parameters
+                  else [])
+              @ List.concat_map structures ~f:(fun st ->
+                  if
+                    Option.exists st.generic ~f:(fun generic ->
+                        String.equal generic.name worker.name)
+                  then List.map st.fields ~f:(fun (_, _, _, typ, _) -> typ)
+                  else [])
         in
         let layouts =
           List.concat_map parameters
@@ -663,10 +673,20 @@ let program ?(history = History.default) (source : Source.t) :
     let namespace =
       Option.value namespace ~default:(Module_context.namespace destination)
     in
-    let group = List.hd (Module_context.groups destination) in
     let ghost_fields =
       List.concat_map view_fields ~f:(fun (_, view) ->
-          if same_group (field_group view.View_storage.field) group then
+          let owner =
+            match
+              List.find generic_predicates ~f:(fun worker ->
+                  String.is_prefix view.View_storage.field
+                    ~prefix:(worker.Generic_parameters.name ^ "."))
+            with
+            | Some worker -> predicate_destination worker.key
+            | None ->
+                Program_structures.destination_of_group
+                  (field_group view.View_storage.field)
+          in
+          if Module_context.same_destination owner destination then
             View_storage.members ~loc:at
               ~local_name:(Module_context.local_name destination)
               view
@@ -772,6 +792,8 @@ let program ?(history = History.default) (source : Source.t) :
               `Value_domains;
               `Function_instances;
               `Primitives;
+              `View_fields;
+              `State;
               `Predicates;
               `Logical_functions;
               `Lemmas;
@@ -790,9 +812,9 @@ let program ?(history = History.default) (source : Source.t) :
       | `Fields -> emitted_fields destination explicit_fields
       | `Proof_definitions -> emitted_assets destination definition_proof_modules
       | `State ->
-          state_members group structure_member_lists
-          @ state_members group pending_member_lists
-          @ state_members group action_check_lists
+          state_members destination structure_member_lists
+          @ state_members destination pending_member_lists
+          @ state_members destination action_check_lists
       | `Late_members -> late_members
       | `Primitives -> primitive_members
       | `Predicates -> (

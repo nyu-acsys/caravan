@@ -785,8 +785,8 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   let* retry =
     match ctx.au with
     | Some au
-      when String.equal au.self f || Option.exists role ~f:(fun r -> Ident.same r au.role)
-      ->
+      when String.equal au.self (Option.value actual_target ~default:f)
+           || Option.exists role ~f:(fun r -> Ident.same r au.role) ->
         let+ opened = open_for_call au ~at:e.exp_loc in
         Option.map opened ~f:(fun (opening, values) -> (au, opening, values))
     | _ -> State.return None
@@ -802,32 +802,36 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   (* The latest snapshot witnesses the facts about earlier states that the callee
      requires, with the arguments' positions in it. *)
   let* path = get_path in
+  let* env = scope_env ctx in
+  let argument_type index =
+    Option.map
+      (List.nth ocaml_args (index - List.length prefix))
+      ~f:(fun (argument : Typedtree.expression) -> argument.exp_type)
+  in
   let* witnesses =
-    State.of_result
-      (all
-         (Option.value
-            (List.Assoc.find ctx.given.pasts f ~equal:String.equal)
-            ~default:[])
-         ~f:(fun (inv, field, i) ->
-           let structure =
-             List.find ctx.given.shared.structures ~f:(fun st ->
-                 String.equal st.invariant inv)
-           in
-           match
-             ( structure,
-               List.Assoc.find path.snapshots inv ~equal:String.equal,
-               known_position path.positions inv field (List.nth_exn args i) )
-           with
-           | _, _, Some p -> Ok [ p.pos_snapshot; p.pos_k ]
-           | Some st, Some (latest :: _), None ->
-               let index = List.Assoc.find_exn latest.indices field ~equal:String.equal in
-               Ok
-                 [
-                   state_of ~loc:l st (grown st latest.values);
-                   R.Expr.index ~loc:l index (List.nth_exn args i);
-                 ]
-           | _ ->
-               error e.exp_loc
+    State.all
+      (Option.value (List.Assoc.find ctx.given.pasts f ~equal:String.equal) ~default:[])
+      ~f:(fun (inv, field, i) ->
+        let* st =
+          resolve_shared_structure ?element_type:(argument_type i) env ~at:e.exp_loc
+            ~invariant:inv ~field
+        in
+        let inv = st.invariant in
+        match
+          ( List.Assoc.find path.snapshots inv ~equal:String.equal,
+            known_position path.positions inv field (List.nth_exn args i) )
+        with
+        | _, Some p -> State.return [ p.pos_snapshot; p.pos_k ]
+        | Some (latest :: _), None ->
+            let index = List.Assoc.find_exn latest.indices field ~equal:String.equal in
+            State.return
+              [
+                state_of ~loc:l st (grown st latest.values);
+                R.Expr.index ~loc:l index (List.nth_exn args i);
+              ]
+        | _ ->
+            State.of_result
+              (error e.exp_loc
                  "This call needs a fact about an earlier state, of which no snapshot \
                   was taken"))
   in
@@ -836,10 +840,49 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   let callee = R.Expr.call ~loc:l callee_name (args @ List.concat witnesses @ implicit) in
   (* The ghost results witnessing facts about the state after the call: the caller's own,
      if the callee continues its update with the same ones. *)
-  let ghost_facts =
-    Option.value
-      (List.Assoc.find ctx.given.past_returns f ~equal:String.equal)
-      ~default:[]
+  let* ghost_facts =
+    let metadata =
+      Option.value
+        (List.Assoc.find ctx.given.past_returns f ~equal:String.equal)
+        ~default:[]
+    in
+    State.all metadata ~f:(fun past ->
+        let parameters = past.past_inputs @ [ past.past_result; past.past_element ] in
+        let* worker =
+          State.of_result
+            (Generic_parameters.discover ~expand:(Datatypes.expand env.data)
+               ~key:past.past_invariant ~name:past.past_invariant ~at:e.exp_loc
+               ~explicit:(List.length past.past_inputs)
+               parameters)
+        in
+        let* element_type =
+          if List.is_empty worker.variables then State.return past.past_element
+          else
+            let* () =
+              if
+                List.length past.past_inputs = List.length prefix + List.length ocaml_args
+              then State.return ()
+              else
+                State.of_result
+                  (unsupported e.exp_loc "This lifted history call's type arguments")
+            in
+            let* arguments =
+              State.of_result
+                (Generic_parameters.instantiate ~environment:env.ctx.given.env
+                   ~expand:(Datatypes.expand env.data) ~at:e.exp_loc worker
+                   (List.init (List.length prefix) ~f:(fun _ -> None)
+                   @ List.map ocaml_args ~f:(fun (argument : Typedtree.expression) ->
+                       Some argument.exp_type)
+                   @ [ Some e.exp_type; None ]))
+            in
+            State.return
+              (List.last_exn (Generic_parameters.parameter_types worker arguments))
+        in
+        let+ st =
+          resolve_shared_structure ~element_type env ~at:e.exp_loc
+            ~invariant:past.past_invariant ~field:past.past_field
+        in
+        { past with past_invariant = st.invariant; past_element = element_type })
   in
   let ghost_count = 2 * List.length ghost_facts in
   let* ghost_decls, ghosts =
@@ -849,10 +892,10 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
         State.return ([], au.ghost_results)
     | _ ->
         let+ fresh =
-          State.all ghost_facts ~f:(fun (inv, _, _) ->
+          State.all ghost_facts ~f:(fun past ->
               let st =
                 List.find_exn ctx.given.shared.structures ~f:(fun st ->
-                    String.equal st.invariant inv)
+                    String.equal st.invariant past.past_invariant)
               in
               let* position = State.fresh "position" in
               let+ snapshot = State.fresh "snapshot" in
@@ -872,13 +915,13 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   (* The ghost results witness the positions of the entries the callee ensures. *)
   let rec witnessed facts ghosts =
     match (facts, ghosts) with
-    | (inv, field, entry) :: facts, snapshot :: k :: ghosts ->
+    | past :: facts, snapshot :: k :: ghosts ->
         let rest = witnessed facts ghosts in
-        begin match entry args with
+        begin match past.past_entry args with
         | Some e ->
             {
-              pos_inv = inv;
-              pos_field = field;
+              pos_inv = past.past_invariant;
+              pos_field = past.past_field;
               pos_element = e;
               pos_snapshot = snapshot;
               pos_k = k;

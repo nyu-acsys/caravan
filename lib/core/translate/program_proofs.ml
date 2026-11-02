@@ -204,7 +204,7 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
   in
   let preds =
     List.map preds ~f:(fun (key, (backend, types)) ->
-        (key, (backend, List.map types ~f:project)))
+        (key, (backend, Compiler_types.map_group types ~f:project)))
   in
   let logical_functions =
     List.map proof_support.logical_functions ~f:(fun (key, signature) ->
@@ -223,7 +223,8 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
   let application_preds =
     List.filter_map application_views ~f:(fun view ->
         match view.source.kind with
-        | Predicate _ -> Some (view.key, (view.backend, List.map view.types ~f:project))
+        | Predicate _ ->
+            Some (view.key, (view.backend, Compiler_types.map_group view.types ~f:project))
         | _ -> None)
   in
   let application_inputs =
@@ -603,17 +604,21 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                     Source.annotation_env source formal.site.environment
                   in
                   let* raw =
-                    all declaration.pred_params ~f:(fun (id, pty) ->
-                        Source.ocaml_type environment ~at:id.S.pid_loc pty)
+                    Proof_bindings.parameter_types environment declaration.pred_params
                   in
-                  let projected = List.map raw ~f:(Subst.type_expr actual_substitution) in
+                  let projected =
+                    Compiler_types.map_group raw ~f:(Subst.type_expr actual_substitution)
+                  in
+                  let implemented =
+                    Compiler_types.map_group actual.resource_types
+                      ~f:(Subst.type_expr binding.parameter_substitution)
+                  in
+                  let* equal =
+                    Signature_contract.compiler ~at:binding.site.item_loc (fun () ->
+                        Ctype.is_equal binding.site.environment true projected implemented)
+                  in
                   let* () =
-                    if
-                      List.for_all2_exn projected actual.resource_types
-                        ~f:(fun expected actual ->
-                          Ctype.is_equal binding.site.environment false [ expected ]
-                            [ Subst.type_expr binding.parameter_substitution actual ])
-                    then Ok ()
+                    if equal then Ok ()
                     else
                       error binding.site.item_loc
                         ("The resource declaration " ^ member
@@ -638,7 +643,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                         resource_declaration = declaration;
                         resource_backend = actual.resource_backend;
                         resource_types =
-                          List.map raw ~f:(Subst.type_expr source_substitution);
+                          Compiler_types.map_group raw
+                            ~f:(Subst.type_expr source_substitution);
                         resource_raw_types = raw;
                       } ))
         in
@@ -923,10 +929,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                         formal.Module_inventory.site.environment
                     in
                     let* ts =
-                      all formal.declaration.pred_params ~f:(fun (id, ty) ->
-                          Source.ocaml_type environment ~at:id.S.pid_loc ty)
+                      Proof_bindings.parameter_types environment
+                        formal.declaration.pred_params
                     in
-                    let ts = List.map ts ~f:(Subst.type_expr substitution) in
+                    let ts =
+                      Compiler_types.map_group ts ~f:(Subst.type_expr substitution)
+                    in
                     let* implicit = implicit_parameters formal.declaration in
                     let stem =
                       List.Assoc.find_exn generic.resources name ~equal:String.equal

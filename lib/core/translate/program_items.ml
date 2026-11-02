@@ -20,8 +20,7 @@ let items source (inventory : Module_inventory.t) =
           ~f:(fun (name, resource) ->
             let environment = Source.annotation_env source resource.site.environment in
             let* parameters =
-              all resource.declaration.pred_params ~f:(fun (id, ty) ->
-                  Source.ocaml_type environment ~at:id.S.pid_loc ty)
+              Proof_bindings.parameter_types environment resource.declaration.pred_params
             in
             Ok
               (List.map constraint_.signature.signature_values ~f:(fun (_, value) ->
@@ -660,6 +659,8 @@ type definition =
   | Invariant of {
       state : string;
       fields : S.state_field list;
+      field_types : Types.type_expr list;
+      parameter_types : Types.type_expr list;
       body : S.term;
       field_environment : Env.t;
       field_scope : Proof_scopes.scope option;

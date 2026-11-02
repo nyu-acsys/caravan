@@ -1,0 +1,9 @@
+type 'a state = { value : 'a; tag : int }
+
+invariant is_cell (q : 'a t) (s : 'a state) = own q s.value
+
+view cell (q : 'a t) = (s.value, s.tag)
+
+lemma invalid_bound (q : 'a t) (value : 'a) (tag : int)
+  requires (is_cell q && cell q (value, tag))
+  ensures (tag <= max_int) = ()

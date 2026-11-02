@@ -334,8 +334,14 @@ lemma reflex (value : 'a)
 Calls infer type arguments from arguments or expected results and share one
 generic verification body. Recursive lemmas can use generic predicates and proof
 datatypes. Proof values retain their mathematical domains: an `int` field in a
-proof datatype does not imply OCaml integer bounds. Generic invariants, views,
-resource-algebra instances, and atomic update contexts are not yet supported.
+proof datatype does not imply OCaml integer bounds.
+
+Invariant state records can also have type parameters, as in
+`type 'a state = { value : 'a }`. Invariants and their views infer type arguments
+from their inputs and retain their identities through module aliases and repeated
+functor applications. Growing state fields and facts about earlier states support
+the same parameters. Generic resource-algebra instances and explicit atomic update
+contexts are not yet supported.
 
 Named instances of `SetRA` and `Auth` expose Raven's resource algebras:
 

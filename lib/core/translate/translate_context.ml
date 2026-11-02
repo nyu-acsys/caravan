@@ -101,7 +101,12 @@ type action = {
 }
 (** An action of a structure (see {!S.Proof_action}). *)
 
-type performing = { performed : action; bindings : (string * R.Expr.t) list }
+type performing = {
+  performed : action;
+  bindings : (string * R.Expr.t) list;
+  invariant : string option;
+      (** The instance matched by the step; absent for an unresolved named action. *)
+}
 (** An action that a step performs, with the values of its parameters. *)
 
 type pending = {
@@ -567,6 +572,7 @@ type declaration_context = {
 }
 
 type structure = {
+  generic : Generic_parameters.t option;
   context : declaration_context;
   scope : Proof_scopes.scope option;
   environment : Env.t;
@@ -638,6 +644,16 @@ type past = { inv : string; field : string; element : S.term }
 (** A fact about an earlier state of a structure, [past (mem e s.f)]: [e] was in the field
     [f], owned by index, of a state of the invariant [inv], which a snapshot of its
     history and a position in [f] witness. *)
+
+type past_return = {
+  past_invariant : string;
+  past_field : string;
+  past_entry : R.Expr.t list -> R.Expr.t option;
+  past_inputs : Types.type_expr list;
+  past_result : Types.type_expr;
+  past_element : Types.type_expr;
+}
+(** A returned history fact and the source types used to instantiate its element. *)
 
 (** [t] as a fact about an earlier state, if it is one, of the structures [structures]. *)
 let past_of structures (t : S.term) =
@@ -799,8 +815,7 @@ type inputs = {
   pasts : (string * (string * string * int) list) list;
       (** The facts about earlier states that procedures require, by their names: the
           invariant, the field, and the position of the parameter that was in it. *)
-  past_returns :
-    (string * (string * string * (R.Expr.t list -> R.Expr.t option)) list) list;
+  past_returns : (string * past_return list) list;
       (** The facts about earlier states that procedures ensure, by their names, each
           witnessed by two ghost results: the invariant, the field, and the entry, given
           the arguments, if it is known. *)
@@ -1773,7 +1788,8 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     | None, _ -> []
   in
   let passed =
-    Spec_arguments.predicate_parameters ~bound:[] terms ~lookup:(fun q arguments ->
+    Spec_arguments.predicate_parameters ~expand:(Datatypes.expand env.data) ~bound:[]
+      terms ~lookup:(fun q arguments ->
         let key = logical_key env q in
         let original = List.Assoc.find env.ctx.given.preds key ~equal:String.equal in
         match original with
@@ -1796,11 +1812,17 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
                                ~variables:env.var_types argument))
                 in
                 match
-                  Generic_predicates.instantiate ~environment:env.ctx.given.env
-                    ~expand:(Datatypes.expand env.data) ~at predicate actuals
+                  let* predicate =
+                    Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at
+                      predicate parameters
+                  in
+                  let* actuals =
+                    Generic_predicates.instantiate ~environment:env.ctx.given.env
+                      ~expand:(Datatypes.expand env.data) ~at predicate actuals
+                  in
+                  Ok (Generic_predicates.parameter_types predicate actuals)
                 with
-                | Ok actuals ->
-                    Some (Generic_predicates.parameter_types predicate actuals)
+                | Ok parameters -> Some parameters
                 | Error _ -> None)))
     |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
   in

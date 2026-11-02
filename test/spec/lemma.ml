@@ -188,6 +188,22 @@ let () =
       assert (second.pid_str = "b")
   | _ -> failwith "unexpected parameterized logical type declarations"
   end;
+  begin match
+    parse_proof
+      {|type 'a state = { current : 'a; values : 'a sequence [@grows] }
+        type ('a, 'b) pair = { first : 'a; second : 'b }
+        invariant shared (cell : 'a t) (s : 'a state) = true|}
+  with
+  | [
+   Proof_state
+     { state_params = [ parameter ]; state_fields = [ _; { sf_grows = true; _ } ]; _ };
+   Proof_type { type_params = [ _; _ ]; type_kind = Record [ _; _ ]; _ };
+   Proof_invariant { inv_state = _, PTtyapp (_, [ PTtyvar argument ]); _ };
+  ] ->
+      assert (parameter.pid_str = "a");
+      assert (argument.pid_str = "a")
+  | _ -> failwith "unexpected parameterized state declarations"
+  end;
   begin match parse_proof "module Authority = Auth (Owner.Facts)" with
   | [
    Proof_resource

@@ -168,9 +168,7 @@ let rec same_destination left right =
       && String.equal left.name right.name
       && same_destination left_parent right_parent
   | Proof_worker (left, left_parent), Proof_worker (right, right_parent) ->
-      String.equal left.key right.key
-      && String.equal left.name right.name
-      && same_destination left_parent right_parent
+      String.equal left.name right.name && same_destination left_parent right_parent
   | (Flat | Worker _ | Function_worker _ | Proof_worker _), _ -> false
 
 let is_function = function

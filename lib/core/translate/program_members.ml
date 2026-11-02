@@ -353,8 +353,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             Source.annotation_env source formal.Module_inventory.site.environment
           in
           let* ts =
-            all formal.declaration.pred_params ~f:(fun (id, pty) ->
-                Source.ocaml_type environment ~at:id.S.pid_loc pty)
+            Proof_bindings.parameter_types environment formal.declaration.pred_params
           in
           Ok (formal.declaration, resource.resource_backend, ts))
     in
@@ -800,10 +799,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let p = formal.Module_inventory.declaration in
         let l = loc p.pred_name.pid_loc in
         let environment = Source.annotation_env source formal.site.environment in
-        let* parameter_types =
-          all p.pred_params ~f:(fun (id, pty) ->
-              Source.ocaml_type environment ~at:id.S.pid_loc pty)
-        in
+        let* parameter_types = Proof_bindings.parameter_types environment p.pred_params in
         let* vars =
           all (List.zip_exn p.pred_params parameter_types) ~f:(fun ((id, _), t) ->
               let* typ = Datatypes.typ view.view_types ~at:id.S.pid_loc t in
@@ -1113,6 +1109,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* action_check_lists, state =
     State.run_from state
     @@ State.all structures ~f:(fun st ->
+        let types =
+          Option.value_map st.generic ~default:types ~f:(fun worker ->
+              Generic_parameters.types worker types)
+        in
         let preds, spec_funcs, proof_support =
           proof_context_for ~preds ~spec_funcs ~proof_support st.invariant
         in
@@ -1120,7 +1120,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           spec_context types
             ~shared:(shared_for_proof st.invariant)
             ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
-            ~primitive_namespace:(declaration_context st.invariant).namespace
+            ~primitive_namespace:
+              (Option.value_map st.generic
+                 ~default:(declaration_context st.invariant).namespace ~f:(fun worker ->
+                   String.split worker.name ~on:'.'))
             ~generic_predicates ()
         in
         State.map
@@ -1187,8 +1190,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                       {
                         worker with
                         name =
-                          application.name ^ "."
-                          ^ (Qualified_name.of_string worker.name).name;
+                          canonical_member shared
+                            (application.name ^ "."
+                           ^ (Qualified_name.of_string worker.name).name);
                       })
           in
           Option.value_map worker ~default:[] ~f:(fun worker ->

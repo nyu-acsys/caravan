@@ -273,7 +273,11 @@ type proof_decl =
       lemma_variant : term list;
       lemma_body : proof_expr;
     }
-  | Proof_state of { state_name : id; state_fields : state_field list }
+  | Proof_state of {
+      state_name : id;
+      state_params : id list;
+      state_fields : state_field list;
+    }
       (** The ghost state of a structure, [type state = { items : int list }], which an
           invariant's last parameter has. Other record types are logical records. *)
   | Proof_invariant of {

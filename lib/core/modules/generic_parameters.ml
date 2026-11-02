@@ -6,6 +6,7 @@ let ( let* ) result f = Result.bind result ~f
 
 type t = {
   key : string;
+  member : string;
   name : string;
   loc : Location.t;
   parameters : Types.type_expr list;
@@ -20,7 +21,16 @@ let aggregate = function
 
 let discover ?(expand = Fn.id) ~key ~name ~at ~explicit parameters =
   let* scheme = Polymorphic_functions.discover ~expand ~at (aggregate parameters) in
-  Ok { key; name; loc = at; parameters; variables = scheme.variables; explicit }
+  Ok
+    {
+      key;
+      member = (Qualified_name.of_string key).name;
+      name;
+      loc = at;
+      parameters;
+      variables = scheme.variables;
+      explicit;
+    }
 
 let find ?target predicates key =
   List.find predicates ~f:(fun predicate ->
@@ -29,18 +39,17 @@ let find ?target predicates key =
           String.equal predicate.key target
           ||
           let owner = (Qualified_name.of_string predicate.name).path in
-          String.equal target
-            (String.concat ~sep:"."
-               (owner @ [ (Qualified_name.of_string predicate.key).name ]))))
+          String.equal target (String.concat ~sep:"." (owner @ [ predicate.member ]))))
 
-let member predicate = (Qualified_name.of_string predicate.key).name
+let member predicate = predicate.member
 
 let rebind ~expand ~at declaration parameters =
   let* rebound =
     discover ~expand ~key:declaration.key ~name:declaration.name ~at
       ~explicit:declaration.explicit parameters
   in
-  if List.length rebound.variables = List.length declaration.variables then Ok rebound
+  if List.length rebound.variables = List.length declaration.variables then
+    Ok { rebound with member = declaration.member }
   else Report.unsupported at "A generic proof signature with different type parameters"
 
 let instantiate ?environment ~expand ~at predicate actuals =

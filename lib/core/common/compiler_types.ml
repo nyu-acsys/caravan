@@ -2,6 +2,19 @@
 
 open Base
 
+(** Project related types together so shared generic variables retain their identity. *)
+let map_group types ~f =
+  match types with
+  | [] -> []
+  | [ typ ] -> [ f typ ]
+  | types -> (
+      let packed =
+        Btype.newgenty (Types.Ttuple (List.map types ~f:(fun typ -> (None, typ))))
+      in
+      match Types.get_desc (f packed) with
+      | Ttuple fields -> List.map fields ~f:snd
+      | _ -> failwith "A type projection must preserve tuple structure")
+
 let prefix = "$caravan_"
 
 let internal_name ~(at : Location.t) member =

@@ -1,0 +1,10 @@
+module Definition = struct
+  type 'a state = { value : 'a; tag : tag }
+end
+
+module Cell = struct
+  invariant is_cell (q : 'a t) (s : ('a * tag) Definition.state) =
+    own q s.value && s.tag
+
+  view cell (q : 'a t) = s.value
+end
