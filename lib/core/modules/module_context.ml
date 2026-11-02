@@ -9,7 +9,7 @@ type destination =
   | Flat
   | Worker of Generic_modules.t
   | Function_worker of Polymorphic_functions.t * destination
-  | Generic_predicate of Generic_predicates.t * destination
+  | Proof_worker of Generic_parameters.t * destination
 
 type t = {
   scope : Proof_scopes.scope;
@@ -132,7 +132,7 @@ let for_group registry group =
   List.find registry.contexts ~f:(fun context ->
       match context.destination with
       | Worker actual -> phys_equal actual group
-      | Flat | Function_worker _ | Generic_predicate _ -> false)
+      | Flat | Function_worker _ | Proof_worker _ -> false)
 
 let member context backend = String.concat ~sep:"." (context.namespace @ [ backend ])
 
@@ -167,15 +167,15 @@ let rec same_destination left right =
       Ident.same left.id right.id
       && String.equal left.name right.name
       && same_destination left_parent right_parent
-  | Generic_predicate (left, left_parent), Generic_predicate (right, right_parent) ->
+  | Proof_worker (left, left_parent), Proof_worker (right, right_parent) ->
       String.equal left.key right.key
       && String.equal left.name right.name
       && same_destination left_parent right_parent
-  | (Flat | Worker _ | Function_worker _ | Generic_predicate _), _ -> false
+  | (Flat | Worker _ | Function_worker _ | Proof_worker _), _ -> false
 
 let is_function = function
   | Function_worker _ -> true
-  | Flat | Worker _ | Generic_predicate _ -> false
+  | Flat | Worker _ | Proof_worker _ -> false
 
 let emits_owner registry ~destination owner =
   same_destination (for_owner registry owner).destination destination
@@ -184,13 +184,13 @@ let rec groups = function
   | Flat -> []
   | Worker group -> [ group ]
   | Function_worker (_, parent) -> groups parent
-  | Generic_predicate (_, parent) -> groups parent
+  | Proof_worker (_, parent) -> groups parent
 
 let namespace = function
   | Flat -> []
   | Worker group -> String.split group.name ~on:'.'
   | Function_worker (worker, _) -> String.split worker.name ~on:'.'
-  | Generic_predicate (worker, _) -> String.split worker.name ~on:'.'
+  | Proof_worker (worker, _) -> String.split worker.name ~on:'.'
 
 let local_name destination backend =
   match namespace destination with

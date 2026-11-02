@@ -873,7 +873,7 @@ let has_domain types t =
     let t = expand_parameterized types t in
     let mathematical =
       match Types.get_desc t with
-      | Tconstr (path, [], _) ->
+      | Tconstr (path, _, _) ->
           Option.exists (find types path) ~f:(fun d -> d.mathematical)
       | _ -> false
     in
@@ -1040,7 +1040,8 @@ and dictionary_name types t =
                 ])
           in
           match value_family types t with
-          | Some (data, _) when Option.is_none data.library -> dictionary ^ ".Self"
+          | Some (data, _) when Option.is_none data.library && not data.mathematical ->
+              dictionary ^ ".Self"
           | _ -> dictionary)
 
 let constraint_name types t =
@@ -1242,7 +1243,8 @@ let domain_members ?(dictionaries = false) types requested =
             let* _ = require_identity t in
             let name =
               match value_family types t with
-              | Some (data, _) when Option.is_none data.library ->
+              | Some (data, _) when Option.is_none data.library && not data.mathematical
+                ->
                   Option.value (String.chop_suffix name ~suffix:".Self") ~default:name
               | _ -> name
             in
@@ -1378,7 +1380,15 @@ let value_family_members types (data : t) =
       R.Type.named ~loc:l (name (String.concat ~sep:"." carrier_path)) arguments
     in
     let own_carrier = R.Type.named ~loc:l (name "Carrier") [] in
-    if Option.is_some data.library then
+    if data.mathematical then
+      Ok
+        ( [
+            ( qualified,
+              Prelude.value_dictionary_parameters ~loc:l ~parameters ~name:leaf ~carrier
+                ~unrestricted:(R.Expr.bool ~loc:l true) ~body:(R.Expr.bool ~loc:l true) );
+          ],
+          [] )
+    else if Option.is_some data.library then
       Ok
         ( [
             ( qualified,

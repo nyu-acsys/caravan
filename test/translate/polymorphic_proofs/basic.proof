@@ -1,0 +1,53 @@
+let identity (value : 'a) : 'a = value
+
+lemma reflex (value : 'a)
+  ensures (identity value === value) = ()
+
+lemma keep (value : 'a)
+  returns (result : 'a)
+  ensures (result === value) = value
+
+lemma integers
+  ensures (identity 17 === 17) =
+  reflex 17;
+  let result = keep 17 in
+  assert (result === 17)
+
+lemma booleans
+  ensures (identity true === true) =
+  reflex true;
+  let result = keep true in
+  assert result
+
+let empty (unused : unit) : 'a list = []
+let no_items : 'a list = []
+
+lemma same (value : 'a) (other [@implicit] : 'a)
+  returns (result : 'a)
+  requires (value === other)
+  ensures (result === value) = other
+
+lemma expected_results
+  ensures (empty () === ([] : int list))
+  ensures (empty () === ([] : bool list))
+  ensures (no_items === ([] : int list))
+  ensures (no_items === ([] : bool list)) =
+  let result = same 17 in
+  assert (result === 17)
+
+lemma returned_empty (unused : unit)
+  returns (result : 'a list)
+  ensures (result === []) = []
+
+lemma returned_empty_int
+  returns (result : int list)
+  ensures (result === []) = returned_empty ()
+
+lemma returned_empty_bool
+  returns (result : bool list)
+  ensures (result === []) = returned_empty ()
+
+lemma returned_empty_bindings =
+  let (integers : int list) = returned_empty () in
+  let (booleans : bool list) = returned_empty () in
+  assert (integers === [] && booleans === [])

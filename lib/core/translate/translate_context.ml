@@ -254,6 +254,7 @@ module State_monad = struct
     domains : domain_request list;
     dictionaries : domain_request list;
     function_instances : function_instance list;
+    call_targets : (string list * string) list;
     defaults : default_request list;
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
@@ -376,6 +377,7 @@ module State_monad = struct
           domains = [];
           dictionaries = [];
           function_instances = [];
+          call_targets = [];
           defaults = [];
           dynamic_indices = false;
         };
@@ -488,6 +490,7 @@ type au = {
 type lemma_signature = {
   lemma_raven : string;
   lemma_constant : bool;
+  lemma_generic : Generic_parameters.t option;
   lemma_inputs : Types.type_expr list;
   lemma_implicit_count : int;
   lemma_outputs : Types.type_expr list;
@@ -886,6 +889,16 @@ let assert_admissible ctx ~loc typ variable =
 
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
+let source_type (given : inputs) ~at annotation =
+  let variables =
+    List.filter_map given.types ~f:(fun data ->
+        Option.bind data.Datatypes.variable ~f:(fun variable ->
+            match Types.get_desc variable with
+            | Tvar (Some name) -> Some (name, variable)
+            | _ -> None))
+  in
+  Source.ocaml_type ~variables given.env ~at annotation
+
 (** The explicit state, with the operations that use a context's inputs. *)
 module State = struct
   include State_monad
@@ -894,6 +907,17 @@ module State = struct
   let record_origin origin = modify (fun s -> { s with origins = origin :: s.origins })
 
   open Syntax
+
+  let note_call (given : inputs) target =
+    let request = (given.primitive_namespace, target) in
+    modify (fun state ->
+        if List.mem state.tables.call_targets request ~equal:Poly.equal then state
+        else
+          {
+            state with
+            tables =
+              { state.tables with call_targets = request :: state.tables.call_targets };
+          })
 
   let value_instance_given (given : inputs) ~at ~target ~arguments =
     let* dictionaries =
@@ -1525,6 +1549,7 @@ let resource_operation env = function
                   lemma_raven = resource.resource_backend ^ "." ^ name;
                   lemma_constant =
                     List.mem resource.resource_constants name ~equal:String.equal;
+                  lemma_generic = None;
                   lemma_inputs = inputs;
                   lemma_implicit_count = 0;
                   lemma_outputs = [ result ];

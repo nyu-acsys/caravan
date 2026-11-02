@@ -120,11 +120,11 @@ let action_checks ctx (st : structure) =
 (** The context translating the specifications of declarations, outside functions. *)
 let spec_context types ~shared ~ocaml_env ~preds ~spec_funcs
     ?(proof_support = empty_proof_support) ?(generic_predicates = [])
-    ?(primitive_namespace = []) () =
+    ?(primitive_namespace = []) ?(polymorphic_functions = Path_bindings.empty) () =
   {
     given =
       declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
-        ~generic_predicates ~primitive_namespace ();
+        ~generic_predicates ~primitive_namespace ~polymorphic_functions ();
     au = None;
   }
 
@@ -181,7 +181,7 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof_support
     ~predicate_bodies ?member_name ?(primitive_namespace = []) ?(generic_predicates = [])
-    declaration =
+    ?polymorphic_functions declaration =
   match declaration with
   | S.Proof_lemma
       {
@@ -193,10 +193,29 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         lemma_variant;
         lemma_body;
       } ->
+      let open State.Syntax in
+      let signature =
+        List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
+      in
+      let* rebound =
+        State.of_result
+          (match signature.lemma_generic with
+          | None -> Ok None
+          | Some worker ->
+              Result.map
+                (Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                   ~at:lemma_name.pid_loc worker
+                   (signature.lemma_inputs @ signature.lemma_outputs))
+                ~f:Option.some)
+      in
+      let types =
+        Option.value_map rebound ~default:types ~f:(fun worker ->
+            Generic_parameters.types worker types)
+      in
       let ctx =
         let base =
           spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~primitive_namespace
-            ~generic_predicates ()
+            ~generic_predicates ?polymorphic_functions ()
         in
         {
           base with
@@ -207,9 +226,6 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
       @@
       let open State.Syntax in
       let l = loc lemma_name.pid_loc in
-      let signature =
-        List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
-      in
       let declare ?(implicit = false) (id, _) ty =
         let* raven_type = State.of_result (typ ctx ~at:id.S.pid_loc ty) in
         let+ raven = State.fresh id.pid_str in
@@ -779,31 +795,47 @@ let pure_logical_body env (t : S.term) =
 
 (** Nonrecursive logical definitions are checked with the rest of the proof. *)
 let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?member_name
-    ?(primitive_namespace = []) ?(generic_predicates = []) ~as_value declaration =
+    ?(primitive_namespace = []) ?(generic_predicates = []) ?polymorphic_functions
+    ?signature ~as_value declaration =
   match declaration with
   | S.Proof_function { function_name; function_params; function_result; function_body } ->
+      let open State.Syntax in
       let l = loc function_name.pid_loc in
+      let* inputs, output, generic =
+        State.of_result
+          (match signature with
+          | Some signature ->
+              Ok
+                ( signature.lemma_inputs,
+                  List.hd_exn signature.lemma_outputs,
+                  signature.lemma_generic )
+          | None ->
+              Result.map
+                (Source.ocaml_types ocaml_env ~at:function_name.pid_loc
+                   (List.map function_params ~f:snd @ [ function_result ]))
+                ~f:(fun parameters ->
+                  let inputs, outputs =
+                    List.split_n parameters (List.length function_params)
+                  in
+                  (inputs, List.hd_exn outputs, None)))
+      in
+      let types =
+        Option.value_map generic ~default:types ~f:(fun worker ->
+            Generic_parameters.types worker types)
+      in
       let ctx =
         spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
-          ~primitive_namespace ~generic_predicates ()
+          ~primitive_namespace ~generic_predicates ?polymorphic_functions ()
       in
       State.in_procedure
       @@
-      let open State.Syntax in
       let* params =
-        State.all function_params ~f:(fun (id, ty) ->
-            let* ty = State.of_result (Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty) in
-            let* raven_type = State.of_result (typ ctx ~at:id.pid_loc ty) in
+        State.all (List.zip_exn function_params inputs) ~f:(fun ((id, _), ty) ->
+            let* raven_type = State.of_result (typ ctx ~at:id.S.pid_loc ty) in
             let+ raven = State.fresh id.pid_str in
             (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
       in
-      let* result_type =
-        State.of_result
-          (Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result)
-      in
-      let* result_type =
-        State.of_result (typ ctx ~at:function_name.pid_loc result_type)
-      in
+      let* result_type = State.of_result (typ ctx ~at:function_name.pid_loc output) in
       let env =
         {
           ctx;

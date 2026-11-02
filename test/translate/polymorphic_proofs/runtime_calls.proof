@@ -1,0 +1,14 @@
+let logical_identity (value : 'a) : 'a = identity value
+
+lemma reflex (value : 'a)
+  ensures (logical_identity value === value) = ()
+
+let after_instance (value : 'a) : 'a =
+  let ignored = Instance.identity_int 0 in
+  logical_identity value
+
+lemma clients
+  ensures (logical_identity 17 === 17)
+  ensures (logical_identity true === true)
+  ensures (after_instance 23 === 23)
+  ensures (after_instance false === false) = ()

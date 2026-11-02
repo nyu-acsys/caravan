@@ -819,9 +819,53 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
 
 (** The OCaml type that the type [t] of an annotation at [at] denotes in [env]. The
     compiler's type checker reports errors by raising. *)
-let ocaml_type (env : Env.t) ~(at : Location.t) (t : S.pty) :
+let ocaml_type ?(variables = []) (env : Env.t) ~(at : Location.t) (t : S.pty) :
     (Types.type_expr, Report.error) Result.t =
-  try Ok (Typetexp.transl_simple_type env ~closed:true (core_type ~at t)).ctyp_type
+  try
+    let env, aliases =
+      List.fold variables ~init:(env, []) ~f:(fun (env, aliases) (name, variable) ->
+          let id =
+            Ident.create_local (Compiler_types.internal_name ~at ("proof_type_" ^ name))
+          in
+          let declaration = Ctype.new_local_type ~loc:at Definition in
+          (Env.add_type ~check:false id declaration env, (name, id, variable) :: aliases))
+    in
+    let mapper =
+      {
+        Ast_mapper.default_mapper with
+        typ =
+          (fun self typ ->
+            match typ.Parsetree.ptyp_desc with
+            | Ptyp_var name ->
+                begin match
+                  List.find aliases ~f:(fun (bound, _, _) -> String.equal bound name)
+                with
+                | Some (_, id, _) ->
+                    {
+                      typ with
+                      ptyp_desc =
+                        Ptyp_constr
+                          ({ txt = Lident (Ident.name id); loc = typ.ptyp_loc }, []);
+                    }
+                | None -> typ
+                end
+            | _ -> Ast_mapper.default_mapper.typ self typ);
+      }
+    in
+    let typed =
+      Typetexp.transl_simple_type env ~closed:true (mapper.typ mapper (core_type ~at t))
+    in
+    let rec restore typ =
+      match Types.get_desc typ with
+      | Tconstr (Pident id, [], _) ->
+          Option.value_map
+            (List.find aliases ~f:(fun (_, alias, _) -> Ident.same alias id))
+            ~default:typ
+            ~f:(fun (_, _, variable) -> variable)
+      | Tvar _ | Tunivar _ -> typ
+      | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
+    in
+    Ok (if List.is_empty aliases then typed.ctyp_type else restore typed.ctyp_type)
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error
@@ -1158,7 +1202,11 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
     in
     let env, substitutions =
       List.fold free ~init:(env, []) ~f:(fun (env, substitutions) variable ->
-          let id = Ident.create_local "caravan$logical$type" in
+          let id =
+            Ident.create_local
+              (Compiler_types.internal_name ~at:term.term_loc
+                 ("logical_type_" ^ Int.to_string (Types.get_id variable)))
+          in
           let declaration = Ctype.new_local_type ~loc:term.term_loc Definition in
           let path = Path.Pident id in
           ( Env.add_type ~check:false id declaration env,
@@ -1194,6 +1242,35 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
     let expected = Option.map expected ~f:freeze in
     let functions = List.map variables ~f:fst @ functions in
     let* expression = logical_expression ~functions ~is_list term in
+    let mapper =
+      {
+        Ast_mapper.default_mapper with
+        typ =
+          (fun self typ ->
+            match typ.Parsetree.ptyp_desc with
+            | Ptyp_var name ->
+                let path =
+                  List.find_map substitutions ~f:(fun (variable, path, _) ->
+                      match Types.get_desc variable with
+                      | Tvar (Some bound) when String.equal bound name -> Some path
+                      | _ -> None)
+                in
+                begin match path with
+                | Some (Pident id) ->
+                    {
+                      typ with
+                      ptyp_desc =
+                        Ptyp_constr
+                          ({ txt = Lident (Ident.name id); loc = typ.ptyp_loc }, []);
+                    }
+                | Some (Pdot _ | Papply _ | Pextra_ty _) | None -> typ
+                end
+            | _ -> Ast_mapper.default_mapper.typ self typ);
+      }
+    in
+    let expression =
+      if List.is_empty substitutions then expression else mapper.expr mapper expression
+    in
     let env =
       (Typemod.type_interface env
          (Parse.interface (Lexing.from_string logical_check_signature)))
@@ -1288,13 +1365,15 @@ let check_logical_expression ?is_list env ~functions ~variables ~expected term =
 
 let check_logical_function env ~functions = function
   | S.Proof_function { function_params; function_result; function_body; function_name } ->
-      let* variables =
-        Result.all
-          (List.map function_params ~f:(fun ((id : S.id), typ) ->
-               let* typ = ocaml_type env ~at:id.pid_loc typ in
-               Ok (id.pid_str, typ)))
+      let* types =
+        ocaml_types env ~at:function_name.pid_loc
+          (List.map function_params ~f:snd @ [ function_result ])
       in
-      let* expected = ocaml_type env ~at:function_name.pid_loc function_result in
+      let inputs, outputs = List.split_n types (List.length function_params) in
+      let variables =
+        List.map2_exn function_params inputs ~f:(fun (id, _) typ -> (id.S.pid_str, typ))
+      in
+      let expected = List.hd_exn outputs in
       check_logical_expression env ~functions ~variables ~expected function_body
   | _ -> Ok ()
 

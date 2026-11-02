@@ -250,7 +250,7 @@ type proof_decl =
       module_loc : Location.t;
     }
   | Proof_predicate of predicate
-  | Proof_type of { type_name : id; type_kind : type_kind }
+  | Proof_type of { type_name : id; type_params : id list; type_kind : type_kind }
   | Proof_resource of {
       resource_name : id;
       resource_functor : qualid;

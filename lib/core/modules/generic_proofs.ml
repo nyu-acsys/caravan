@@ -514,6 +514,40 @@ let model_types source inventory plans =
                     (application_projection source plan instance.source path)
                 in
                 List.map (models source plan) ~f:(fun data ->
+                    let components =
+                      data.parameters @ Option.to_list data.alias
+                      @ List.concat_map data.ctors ~f:(fun ctor -> ctor.Datatypes.args)
+                    in
+                    let projected =
+                      match components with
+                      | [] -> []
+                      | _ ->
+                          let packed =
+                            Btype.newgenty
+                              (Ttuple (List.map components ~f:(fun typ -> (None, typ))))
+                          in
+                          begin match Types.get_desc (project_type packed) with
+                          | Ttuple fields -> List.map fields ~f:snd
+                          | _ ->
+                              failwith
+                                "A module substitution must preserve tuple structure"
+                          end
+                    in
+                    let parameters, projected =
+                      List.split_n projected (List.length data.parameters)
+                    in
+                    let alias, projected =
+                      match data.alias with
+                      | None -> (None, projected)
+                      | Some _ -> (Some (List.hd_exn projected), List.tl_exn projected)
+                    in
+                    let _, ctors =
+                      List.fold_map data.ctors ~init:projected ~f:(fun projected ctor ->
+                          let args, rest =
+                            List.split_n projected (List.length ctor.args)
+                          in
+                          (rest, { ctor with args }))
+                    in
                     let representation =
                       model_descriptor data ~owner:[ canonical.layout ]
                     in
@@ -524,14 +558,7 @@ let model_types source inventory plans =
                             Path.Pdot (instance.source.identity, Ident.name id);
                           ])
                     in
-                    {
-                      representation with
-                      id = None;
-                      paths;
-                      ctors =
-                        List.map data.ctors ~f:(fun ctor ->
-                            { ctor with args = List.map ctor.args ~f:project_type });
-                    })))
+                    { representation with id = None; paths; parameters; alias; ctors })))
       in
       symbolic @ concrete)
 

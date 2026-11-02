@@ -39,8 +39,8 @@ let rec shared_for_destination ~(shared : shared)
   | Module_context.Flat -> shared
   | Module_context.Worker group ->
       List.Assoc.find_exn generic_shared group.Generic_modules.name ~equal:String.equal
-  | Module_context.Function_worker (_, parent)
-  | Module_context.Generic_predicate (_, parent) ->
+  | Module_context.Function_worker (_, parent) | Module_context.Proof_worker (_, parent)
+    ->
       shared_for_destination ~shared ~generic_shared parent
 
 let shared_for_proof ~(declaration_context : string -> Module_context.t)

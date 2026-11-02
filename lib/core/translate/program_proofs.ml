@@ -29,6 +29,7 @@ type t = {
     (Path.t * string * Program_items.resource_signature * Types.type_expr list) list;
   logical_declarations : S.proof_decl list;
   all_logical_functions : (string * lemma_signature) list;
+  generic_callables : Generic_parameters.t list;
   proof_support : proof_support;
   preds : (string * (string * Types.type_expr list)) list;
   spec_funcs : (string * string) list;
@@ -468,6 +469,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
   } =
     decls
   in
+  let generic_callable ~key ~at ~explicit parameters =
+    let context =
+      Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+        ~unapplied_proofs:scopes.unapplied_proofs key
+    in
+    let name =
+      String.concat ~sep:"."
+        (context.namespace
+        @ [ Fresh_names.fresh ("PolyProof$" ^ (Qualified_name.of_string key).name) ])
+    in
+    let* worker =
+      Generic_parameters.discover ~expand:(Datatypes.expand types) ~key ~name ~at
+        ~explicit parameters
+    in
+    if List.is_empty worker.variables then Ok None else Ok (Some worker)
+  in
   let au_application_view =
     Program_declarations.au_application_view ~untyped_scoped_proofs:scopes.scoped_proofs
   in
@@ -762,18 +779,24 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
     all logical_declarations ~f:(function
       | S.Proof_function { function_name; function_params; function_result; _ } ->
           let ocaml_env = declaration_environment function_name.pid_str in
-          let* lemma_inputs =
-            all function_params ~f:(fun (id, ty) ->
-                Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
+          let* parameters =
+            Source.ocaml_types ocaml_env ~at:function_name.pid_loc
+              (List.map function_params ~f:snd @ [ function_result ])
           in
-          let* output =
-            Source.ocaml_type ocaml_env ~at:function_name.pid_loc function_result
+          let lemma_inputs, outputs =
+            List.split_n parameters (List.length function_params)
+          in
+          let output = List.hd_exn outputs in
+          let* lemma_generic =
+            generic_callable ~key:function_name.pid_str ~at:function_name.pid_loc
+              ~explicit:(List.length function_params) parameters
           in
           Ok
             ( function_name.pid_str,
               {
                 lemma_raven = function_name.pid_str;
                 lemma_constant = List.is_empty function_params;
+                lemma_generic;
                 lemma_inputs;
                 lemma_implicit_count = 0;
                 lemma_outputs = [ output ];
@@ -1057,13 +1080,20 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
     all lemma_declarations ~f:(function
       | S.Proof_lemma { lemma_name; lemma_params; lemma_returns; _ } ->
           let ocaml_env = declaration_environment lemma_name.pid_str in
-          let types_of ps =
-            all ps ~f:(fun (id, ty) -> Source.ocaml_type ocaml_env ~at:id.S.pid_loc ty)
-          in
           let* implicit = implicit_parameter_count ~kind:"lemma" lemma_params in
           let lemma_implicit_count = Option.value implicit ~default:0 in
-          let* lemma_inputs = types_of lemma_params in
-          let* lemma_outputs = types_of lemma_returns in
+          let* parameters =
+            Source.ocaml_types ocaml_env ~at:lemma_name.pid_loc
+              (List.map (lemma_params @ lemma_returns) ~f:snd)
+          in
+          let lemma_inputs, lemma_outputs =
+            List.split_n parameters (List.length lemma_params)
+          in
+          let* lemma_generic =
+            generic_callable ~key:lemma_name.pid_str ~at:lemma_name.pid_loc
+              ~explicit:(List.length lemma_inputs - lemma_implicit_count)
+              parameters
+          in
           if
             List.Assoc.mem spec_funcs lemma_name.pid_str ~equal:String.equal
             || List.exists funcs ~f:(fun f ->
@@ -1077,6 +1107,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                 {
                   lemma_raven = lemma_name.pid_str;
                   lemma_constant = false;
+                  lemma_generic;
                   lemma_inputs;
                   lemma_implicit_count;
                   lemma_outputs;
@@ -1175,6 +1206,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
         checked_resource_entries;
         logical_declarations;
         all_logical_functions;
+        generic_callables =
+          List.filter_map (all_logical_functions @ all_proof_lemmas)
+            ~f:(fun (_, signature) -> signature.lemma_generic);
         proof_support;
         preds;
         spec_funcs;

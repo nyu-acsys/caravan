@@ -130,7 +130,7 @@ let predicate_destination ~generic_predicates ~declaration_context key =
   let parent = (declaration_context key).Module_context.destination in
   match Generic_predicates.find generic_predicates key with
   | None -> parent
-  | Some predicate -> Module_context.Generic_predicate (predicate, parent)
+  | Some predicate -> Module_context.Proof_worker (predicate, parent)
 
 let worker_member polymorphic_functions f target =
   match enclosing_worker polymorphic_functions f with

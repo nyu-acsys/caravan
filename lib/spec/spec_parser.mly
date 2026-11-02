@@ -75,7 +75,7 @@
     let rec convert = function
       | Proof_state { state_name = n; state_fields = fs }
         when not (List.mem n.pid_str states) ->
-          Proof_type { type_name = n; type_kind = Record (List.map field fs) }
+          Proof_type { type_name = n; type_params = []; type_kind = Record (List.map field fs) }
       | Proof_module m ->
           Proof_module { m with module_declarations = List.map convert m.module_declarations }
       | Proof_definition m ->
@@ -451,10 +451,17 @@ proof_decl:
         lemma_requires = List.rev requires; lemma_ensures = List.rev ensures;
         lemma_variant = List.rev variant; lemma_body = body;
       } }
-| TYPE n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
-    { Proof_state { state_name = n; state_fields = fs } }
-| TYPE n = lident EQUAL cs = bar_list1(type_ctor)
-    { Proof_type { type_name = n; type_kind = Variant cs } }
+| TYPE ps = loption(type_parameters) n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
+    { let field f =
+        if f.sf_grows || f.sf_helps <> None then
+          raise (Syntax_error (f.sf_name.pid_loc,
+            "Only the state of an invariant has [@grows] or [@helps] fields"));
+        (f.sf_name, f.sf_type)
+      in
+      if ps = [] then Proof_state { state_name = n; state_fields = fs }
+      else Proof_type { type_name = n; type_params = ps; type_kind = Record (List.map field fs) } }
+| TYPE ps = loption(type_parameters) n = lident EQUAL cs = bar_list1(type_ctor)
+    { Proof_type { type_name = n; type_params = ps; type_kind = Variant cs } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
@@ -480,6 +487,11 @@ proof_module_parameter:
 | LEFTPAR n = uident COLON ty = uqualid RIGHTPAR
     { Proof_named_parameter (n, ty) }
 | LEFTPAR RIGHTPAR { Proof_unit_parameter (mk_loc $loc) }
+;
+
+type_parameters:
+| p = quote_lident { [p] }
+| LEFTPAR ps = separated_nonempty_list(COMMA, quote_lident) RIGHTPAR { ps }
 ;
 
 type_ctor:

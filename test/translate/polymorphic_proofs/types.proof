@@ -1,0 +1,5 @@
+type 'a edge = Edge of 'a
+
+type ('a, 'b) pair = { first : 'a; second : 'b }
+
+type 'a tree = Leaf of 'a | Branch of 'a tree list

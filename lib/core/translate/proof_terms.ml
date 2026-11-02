@@ -30,7 +30,7 @@ let scope = State.map State.get_scope ~f:latest
 let scope_env ctx = State.map scope ~f:(env_of_scope ctx)
 
 (** A call of a checked proof lemma, separate from logical function applications. *)
-let lemma_call env (t : S.term) =
+let lemma_call ?expected env (t : S.term) =
   let open State.Syntax in
   let head, args = spine t [] in
   match head.term_desc with
@@ -57,6 +57,9 @@ let lemma_call env (t : S.term) =
                     Printf.sprintf "Lemma %s expects between %d and %d arguments" display
                       minimum maximum))
           else
+            let* signature =
+              instantiate_proof_signature env ~at:t.term_loc ?expected signature args
+            in
             let+ args =
               typed_arguments env ~at:t.term_loc
                 (List.take signature.lemma_inputs arity)
@@ -94,7 +97,7 @@ let rec predicate_existentials (t : S.term) =
       List.concat_map (S.record_terms base fields) ~f:predicate_existentials
 
 let unfold_result_types env (t : S.term) witnesses =
-  let head, _ = spine t [] in
+  let head, args = spine t [] in
   match head.term_desc with
   | Tvar q when List.Assoc.mem env.ctx.given.preds (logical_key env q) ~equal:String.equal
     ->
@@ -112,6 +115,17 @@ let unfold_result_types env (t : S.term) witnesses =
       with
       | None -> Ok None
       | Some body ->
+          let target =
+            fst (List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal)
+          in
+          let* instance = predicate_instance env ~at:t.term_loc ~key ~target args in
+          let variables =
+            Option.value_map instance ~default:[] ~f:(fun (worker, _) ->
+                List.filter_map worker.Generic_parameters.variables ~f:(fun variable ->
+                    match Types.get_desc variable with
+                    | Tvar (Some name) -> Some (name, variable)
+                    | _ -> None))
+          in
           let bindings = predicate_existentials body.definition in
           let* types =
             all witnesses ~f:(fun (witness : S.id) ->
@@ -124,7 +138,18 @@ let unfold_result_types env (t : S.term) witnesses =
                       (Printf.sprintf "Predicate %s has no existential named %s" display
                          witness.pid_str)
                 | [ (_, Some ty) ] ->
-                    let* ty = Source.ocaml_type body.environment ~at:witness.pid_loc ty in
+                    let* ty =
+                      Source.ocaml_type ~variables body.environment ~at:witness.pid_loc ty
+                    in
+                    let ty =
+                      match instance with
+                      | None -> ty
+                      | Some (worker, arguments) ->
+                          List.hd_exn
+                            (Generic_parameters.parameter_types
+                               { worker with parameters = [ ty ] }
+                               arguments)
+                    in
                     Ok (Some (body.project_type ty))
                 | [ (_, None) ] ->
                     error witness.pid_loc "An existential variable needs a type"
@@ -378,6 +403,7 @@ let atomic_proof_signature env t =
                 {
                   lemma_raven = qualid_key q;
                   lemma_constant = false;
+                  lemma_generic = None;
                   lemma_inputs = inputs;
                   lemma_implicit_count = 0;
                   lemma_outputs = outputs;
@@ -385,7 +411,7 @@ let atomic_proof_signature env t =
           else None)
   | _ -> None
 
-let proof_call env t =
+let proof_call ?expected env t =
   let open State.Syntax in
   let head, args = spine t [] in
   match head.S.term_desc with
@@ -418,7 +444,7 @@ let proof_call env t =
         | _ -> method_
       in
       State.return (R.Expr.call ~loc:l (name ~loc:l method_) values, outputs)
-  | _ -> lemma_call env t
+  | _ -> lemma_call ?expected env t
 
 let proof_signature env (t : S.term) =
   let head, _ = spine t [] in
@@ -533,10 +559,15 @@ let ghost_value_location env t =
 
 (** Type information for lexical bindings; annotations resolve logical operations whose
     OCaml result type is not available. Raven checks every generated assignment. *)
-let rec proof_value_types env (t : S.term) =
+let rec proof_value_types ?expected env (t : S.term) =
   let open State.Syntax in
   match proof_signature env t with
-  | Some signature -> State.return (List.map signature.lemma_outputs ~f:Option.some)
+  | Some signature ->
+      let+ signature =
+        instantiate_proof_signature env ~at:t.term_loc ?expected signature
+          (snd (spine t []))
+      in
+      List.map signature.lemma_outputs ~f:Option.some
   | None ->
       begin match t.term_desc with
       | Ttuple ts -> State.all ts ~f:(proof_value_type env)
@@ -557,9 +588,7 @@ and proof_value_type env (t : S.term) =
   | _ -> (
       match t.term_desc with
       | Tcast (_, ty) ->
-          let+ ty =
-            State.of_result (Source.ocaml_type env.ctx.given.env ~at:t.term_loc ty)
-          in
+          let+ ty = State.of_result (source_type env.ctx.given ~at:t.term_loc ty) in
           Some ty
       | Tconst (Pconst_integer _) -> State.return (Some Predef.type_int)
       | Ttrue | Tfalse -> State.return (Some Predef.type_bool)
@@ -613,7 +642,7 @@ let proof_binding_types env pattern inferred =
         let* p, ty =
           match p.pat_desc with
           | Pcast (p, ty) ->
-              let* ty = Source.ocaml_type env.ctx.given.env ~at:p.pat_loc ty in
+              let* ty = source_type env.ctx.given ~at:p.pat_loc ty in
               Ok (p, Some ty)
           | _ -> Ok (p, inferred)
         in
@@ -658,9 +687,7 @@ let rec proof_pattern env (pattern : S.pat) ty value =
           var_types = (id.pid_str, ty) :: env.var_types;
         }
   | Pcast (pattern, annotation) ->
-      let* expected =
-        Source.ocaml_type env.ctx.given.env ~at:pattern.pat_loc annotation
-      in
+      let* expected = source_type env.ctx.given ~at:pattern.pat_loc annotation in
       if Ctype.is_equal env.ctx.given.env false [ expected ] [ ty ] then
         proof_pattern env pattern ty value
       else error pattern.pat_loc "The proof pattern has a different type from its input"
@@ -688,6 +715,15 @@ let packed_type = function
   | [] -> Predef.type_unit
   | [ ty ] -> ty
   | types -> Btype.newgenty (Ttuple (List.map types ~f:(fun ty -> (None, ty))))
+
+let proof_binding_expected_type env pattern =
+  if
+    List.for_all (proof_pattern_parts pattern) ~f:(fun part ->
+        match part.S.pat_desc with Pcast _ -> true | _ -> false)
+  then
+    let* bindings = proof_binding_types env pattern None in
+    Ok (Some (packed_type (List.map bindings ~f:snd)))
+  else Ok None
 
 let packed_value ~loc:l = function
   | [] -> unit_value ~loc:l
@@ -810,26 +846,26 @@ let witness_binding :
   in
   (declarations @ unfold @ rest, value)
 
-let rec proof_result_types env (body : S.proof_expr) =
+let rec proof_result_types ?expected env (body : S.proof_expr) =
   let open State.Syntax in
   match body.proof_desc with
   | Proof_value t
     when is_ghost_fpu t || Option.equal String.equal (ghost_operation t) (Some "write") ->
       State.return (Some [])
   | Proof_value t ->
-      let+ ts = proof_value_types env t in
+      let+ ts = proof_value_types ?expected env t in
       Some ts
   | Proof_assert { term_desc = Tfalse; _ } -> State.return None
   | Proof_assert _ | Proof_fold _ -> State.return (Some [])
   | Proof_unfold (_, []) -> State.return (Some [])
   | Proof_unfold (predicate, witnesses) ->
       State.of_result (unfold_result_types env predicate witnesses)
-  | Proof_seq (_, body) -> proof_result_types env body
+  | Proof_seq (_, body) -> proof_result_types ?expected env body
   | Proof_if (_, yes, no) ->
-      let* types = proof_result_types env yes in
+      let* types = proof_result_types ?expected env yes in
       begin match types with
       | Some _ -> State.return types
-      | None -> proof_result_types env no
+      | None -> proof_result_types ?expected env no
       end
   | Proof_match (_, []) ->
       State.of_result (error body.proof_loc "A match needs at least one case")
@@ -846,15 +882,16 @@ let rec proof_result_types env (body : S.proof_expr) =
                 ~init:{ env with var_types = types @ env.var_types }
                 ~f:(fun env (x, _) -> bind env x (Raven x))
             in
-            let* types = proof_result_types branch_env body in
+            let* types = proof_result_types ?expected branch_env body in
             begin match types with Some _ -> State.return types | None -> infer rest
             end
       in
       infer cases
   | Proof_let (pattern, rhs, body) ->
-      let* inferred = proof_result_types env rhs in
+      let* binding_expected = State.of_result (proof_binding_expected_type env pattern) in
+      let* inferred = proof_result_types ?expected:binding_expected env rhs in
       let* bindings = State.of_result (proof_binding_types env pattern inferred) in
-      proof_result_types (proof_typed_env env bindings) body
+      proof_result_types ?expected (proof_typed_env env bindings) body
 
 (** Lexical expressions assign only to fresh internal result variables. *)
 let rec proof_expression env targets (body : S.proof_expr) =
@@ -928,6 +965,13 @@ let rec proof_expression env targets (body : S.proof_expr) =
   | Proof_value t ->
       begin match proof_signature env t with
       | Some signature ->
+          let expected =
+            packed_type (List.map targets ~f:(fun target -> target.target_type))
+          in
+          let* signature =
+            instantiate_proof_signature env ~at:t.term_loc ~expected signature
+              (snd (spine t []))
+          in
           let* () =
             if
               Ctype.is_equal env.ctx.given.env false
@@ -939,7 +983,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
                 (error t.term_loc
                    "The proof expression has a different result type from its binding")
           in
-          let* call, outputs = proof_call env t in
+          let* call, outputs = proof_call ~expected env t in
           if List.length outputs = List.length targets then
             if List.is_empty targets then State.return [ R.Stmt.call ~loc:l call ]
             else
@@ -1141,7 +1185,8 @@ and proof_value_binding :
  fun ~ghost_rhs env pattern rhs continuation ->
   let open State.Syntax in
   let l = loc rhs.S.proof_loc in
-  let* inferred = proof_result_types env rhs in
+  let* expected = State.of_result (proof_binding_expected_type env pattern) in
+  let* inferred = proof_result_types ?expected env rhs in
   let* bindings = State.of_result (proof_binding_types env pattern inferred) in
   let* declarations =
     State.all bindings ~f:(fun (id, ty) ->

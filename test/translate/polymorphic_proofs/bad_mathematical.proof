@@ -1,0 +1,6 @@
+type 'a snapshot = { payload : 'a; count : int }
+
+let count (model : 'a snapshot) : int = model.count
+
+lemma invalid_bound (model : bool snapshot)
+  ensures (count model <= max_int) = ()

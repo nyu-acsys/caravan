@@ -10,6 +10,18 @@ open Translate_context
 open Procedures
 open Program_items
 
+type callable_worker =
+  | Runtime_worker of Polymorphic_functions.t
+  | Proof_worker of Generic_parameters.t
+
+let callable_name = function
+  | Runtime_worker worker -> worker.Polymorphic_functions.name
+  | Proof_worker worker -> worker.Generic_parameters.name
+
+let callable_location = function
+  | Runtime_worker worker -> worker.Polymorphic_functions.loc
+  | Proof_worker worker -> worker.Generic_parameters.loc
+
 (** The Raven program translating [source], with its histories encoded in [history], and
     the origins of its proof obligations. *)
 let program ?(history = History.default) (source : Source.t) :
@@ -96,6 +108,7 @@ let program ?(history = History.default) (source : Source.t) :
     checked_resource_entries;
     logical_declarations;
     all_logical_functions;
+    generic_callables;
     proof_support;
     preds;
     spec_funcs;
@@ -258,10 +271,16 @@ let program ?(history = History.default) (source : Source.t) :
                     (ident ~loc:(loc resource.resource_at) backend)
                     members )))
   in
+  let proof_destination name =
+    let parent = owner_destination name in
+    match Generic_parameters.find generic_callables name with
+    | None -> parent
+    | Some worker -> Module_context.Proof_worker (worker, parent)
+  in
   let emitted_proofs destination members =
     List.filter_map members ~f:(fun (name, member) ->
         Option.some_if
-          (Module_context.same_destination (owner_destination name) destination
+          (Module_context.same_destination (proof_destination name) destination
           && Option.is_none (Option.bind (scoped_binding name) ~f:definition_target))
           member)
   in
@@ -452,49 +471,53 @@ let program ?(history = History.default) (source : Source.t) :
     in
     captured && not final
   in
-  let* polymorphic_functions =
-    Polymorphic_functions.order polymorphic_functions ~dependencies:(fun worker ->
-        let namespace =
-          (Qualified_name.of_string worker.Polymorphic_functions.name).path
-        in
-        List.filter_map state.tables.function_instances ~f:(fun instance ->
-            if
-              List.is_prefix instance.instance_namespace
-                ~prefix:(String.split worker.name ~on:'.')
-                ~equal:String.equal
-              && (not (String.equal instance.instance_worker worker.name))
-              && List.exists polymorphic_functions ~f:(fun dependency ->
-                  String.equal dependency.name instance.instance_worker
-                  && List.equal String.equal namespace
-                       (Qualified_name.of_string dependency.name).path)
-            then Some instance.instance_worker
-            else None))
+  let candidates =
+    List.map (generic_predicates @ generic_callables) ~f:(fun worker ->
+        Proof_worker worker)
+    @ List.map polymorphic_functions ~f:(fun worker -> Runtime_worker worker)
   in
-  let root_function_workers =
-    List.filter polymorphic_functions ~f:(fun worker ->
-        List.is_empty (Qualified_name.of_string worker.Polymorphic_functions.name).path)
+  let owns worker namespace =
+    List.is_prefix namespace
+      ~prefix:(String.split (callable_name worker) ~on:'.')
+      ~equal:String.equal
   in
-  let root_predicate_workers =
-    List.filter generic_predicates ~f:(fun worker ->
-        List.is_empty (Qualified_name.of_string worker.Generic_predicates.name).path)
-    |> List.stable_sort ~compare:(fun left right ->
-        Int.compare left.Generic_predicates.loc.loc_start.pos_cnum
-          right.Generic_predicates.loc.loc_start.pos_cnum)
+  let targets worker =
+    List.filter_map state.tables.function_instances ~f:(fun instance ->
+        Option.some_if (owns worker instance.instance_namespace) instance.instance_worker)
+    @ List.filter_map state.tables.call_targets ~f:(fun (namespace, target) ->
+        Option.some_if (owns worker namespace) target)
   in
-  let worker_binding_position (worker : Polymorphic_functions.t) =
-    List.fold inventory.specializations ~init:worker.loc.loc_start.pos_cnum
-      ~f:(fun position specialization ->
-        if
-          List.exists specialization.Module_inventory.body_members ~f:(fun (_, id) ->
-              Ident.same id worker.id)
-        then Int.max position specialization.argument.site.item_loc.loc_start.pos_cnum
-        else position)
+  let calls target worker =
+    List.is_prefix (String.split target ~on:'.')
+      ~prefix:(String.split (callable_name worker) ~on:'.')
+      ~equal:String.equal
   in
-  let rec function_value_types typ =
-    match Datatypes.desc types typ with
-    | Tarrow (_, argument, result, _) -> argument :: function_value_types result
-    | Tpoly (body, []) -> function_value_types body
-    | _ -> [ typ ]
+  let dependencies worker =
+    let namespace = (Qualified_name.of_string (callable_name worker)).path in
+    List.filter_map candidates ~f:(fun dependency ->
+        Option.some_if
+          ((not (String.equal (callable_name dependency) (callable_name worker)))
+          && List.equal String.equal namespace
+               (Qualified_name.of_string (callable_name dependency)).path
+          && List.exists (targets worker) ~f:(fun target -> calls target dependency))
+          (callable_name dependency))
+  in
+  let* callable_workers =
+    Polymorphic_functions.order_by candidates ~name:callable_name
+      ~location:callable_location ~dependencies
+  in
+  let root_callable_workers =
+    List.filter callable_workers ~f:(fun worker ->
+        List.is_empty (Qualified_name.of_string (callable_name worker)).path)
+  in
+  let function_value_types typ =
+    let rec collect typ =
+      match Datatypes.desc types typ with
+      | Tarrow (_, argument, result, _) -> argument :: collect result
+      | Tpoly (body, []) -> collect body
+      | _ -> [ typ ]
+    in
+    collect typ
   in
   let lexical_dependencies position =
     List.concat_map generics ~f:(fun group ->
@@ -508,47 +531,75 @@ let program ?(history = History.default) (source : Source.t) :
           && view.binding.site.item_loc.loc_start.pos_cnum <= position)
           view.name)
   in
-  let predicate_dependencies =
-    List.map root_predicate_workers ~f:(fun worker ->
-        ( worker.Generic_predicates.name,
-          lexical_dependencies worker.loc.loc_start.pos_cnum
-          @ List.concat_map worker.parameters
-              ~f:
-                (Result_layouts.type_dependencies
-                   ~additional:(Generic_proofs.layout_dependencies generic_proofs)
-                   layouts types) ))
-    |> Map.of_alist_exn (module String)
+  let application_dependencies target =
+    List.concat_map generics ~f:(fun group ->
+        List.filter_map group.Generic_modules.applications ~f:(fun application ->
+            Option.some_if
+              (List.is_prefix (String.split target ~on:'.')
+                 ~prefix:(String.split application.name ~on:'.')
+                 ~equal:String.equal)
+              application.name))
+    @ List.filter_map checked_modules ~f:(fun view ->
+        Option.some_if
+          (List.is_prefix (String.split target ~on:'.')
+             ~prefix:(String.split view.Checked_modules.name ~on:'.')
+             ~equal:String.equal)
+          view.name)
   in
   let worker_dependencies =
-    List.fold root_function_workers
+    List.fold root_callable_workers
       ~init:(Map.empty (module String))
       ~f:(fun previous worker ->
-        let position = worker_binding_position worker in
-        let lexical = lexical_dependencies position in
+        let lexical =
+          match worker with
+          | Proof_worker _ -> []
+          | Runtime_worker worker ->
+              let position =
+                List.fold inventory.specializations ~init:worker.loc.loc_start.pos_cnum
+                  ~f:(fun position specialization ->
+                    if
+                      List.exists specialization.Module_inventory.body_members
+                        ~f:(fun (_, id) -> Ident.same id worker.id)
+                    then
+                      Int.max position
+                        specialization.argument.site.item_loc.loc_start.pos_cnum
+                    else position)
+              in
+              lexical_dependencies position
+        in
+        let parameters =
+          match worker with
+          | Runtime_worker worker -> function_value_types worker.scheme.typ
+          | Proof_worker worker -> worker.parameters
+        in
         let layouts =
-          List.concat_map
-            (function_value_types worker.scheme.typ)
+          List.concat_map parameters
             ~f:
               (Result_layouts.type_dependencies
                  ~additional:(Generic_proofs.layout_dependencies generic_proofs)
                  layouts types)
         in
         let called =
-          List.concat_map state.tables.function_instances ~f:(fun instance ->
-              if
-                List.is_prefix instance.instance_namespace
-                  ~prefix:(String.split worker.name ~on:'.')
-                  ~equal:String.equal
-              then
-                Option.value
-                  (Option.first_some
-                     (Map.find previous instance.instance_worker)
-                     (Map.find predicate_dependencies instance.instance_worker))
-                  ~default:[]
-              else [])
+          List.concat_map (dependencies worker) ~f:(fun dependency ->
+              Option.value (Map.find previous dependency) ~default:[])
         in
-        Map.set previous ~key:worker.name
-          ~data:(List.dedup_and_sort (lexical @ layouts @ called) ~compare:String.compare))
+        let targets = targets worker in
+        let applications = List.concat_map targets ~f:application_dependencies in
+        let source_dependencies =
+          List.concat_map targets ~f:(fun target ->
+              List.concat_map pure ~f:(fun function_ ->
+                  if
+                    String.equal target
+                      (Qualified_name.to_string
+                         (Program_declarations.pure_reference ~generics function_))
+                  then lexical_dependencies function_.loc.loc_start.pos_cnum
+                  else []))
+        in
+        Map.set previous ~key:(callable_name worker)
+          ~data:
+            (List.dedup_and_sort
+               (lexical @ layouts @ called @ applications @ source_dependencies)
+               ~compare:String.compare))
   in
   let take_available ~available (declarations, domains, workers, fields) =
     let declarations, pending_declarations =
@@ -635,25 +686,13 @@ let program ?(history = History.default) (source : Source.t) :
                   (ident ~loc:at (Qualified_name.of_string request.default_name).name)
                   None)))
     in
-    let predicate_workers =
-      List.filter generic_predicates ~f:(fun worker ->
-          List.equal String.equal
-            (Qualified_name.of_string worker.Generic_predicates.name).path namespace
-          && ((not (List.is_empty namespace))
-             || List.is_empty (Map.find_exn predicate_dependencies worker.name)))
-      |> List.stable_sort ~compare:(fun left right ->
-          Int.compare left.Generic_predicates.loc.loc_start.pos_cnum
-            right.Generic_predicates.loc.loc_start.pos_cnum)
-      |> List.map ~f:(emit_predicate_worker destination)
-    in
     let function_workers =
-      List.filter polymorphic_functions ~f:(fun worker ->
-          List.equal String.equal
-            (Qualified_name.of_string worker.Polymorphic_functions.name).path namespace)
-      |> List.filter ~f:(fun (worker : Polymorphic_functions.t) ->
-          (not (List.is_empty namespace))
-          || List.is_empty (Map.find_exn worker_dependencies worker.name))
-      |> List.map ~f:(emit_function_worker destination)
+      List.filter callable_workers ~f:(fun worker ->
+          List.equal String.equal (Qualified_name.of_string (callable_name worker)).path
+            namespace
+          && ((not (List.is_empty namespace))
+             || List.is_empty (Map.find_exn worker_dependencies (callable_name worker))))
+      |> List.map ~f:(emit_callable_worker destination)
     in
     let function_instances =
       List.filter_map state.tables.function_instances ~f:(fun instance ->
@@ -668,7 +707,6 @@ let program ?(history = History.default) (source : Source.t) :
       if library then
         [
           `Value_domains;
-          `Predicate_workers;
           `Function_workers;
           `Function_instances;
           `Primitives;
@@ -682,7 +720,6 @@ let program ?(history = History.default) (source : Source.t) :
               `Definitions;
               `Native_resources;
               `Public_resources;
-              `Predicate_workers;
               `Function_workers;
               `Applications;
               `Value_domains;
@@ -707,7 +744,6 @@ let program ?(history = History.default) (source : Source.t) :
               `Public_resources;
               `Applications;
               `Value_domains;
-              `Predicate_workers;
               `Function_workers;
               `Function_instances;
               `Primitives;
@@ -725,15 +761,21 @@ let program ?(history = History.default) (source : Source.t) :
         | Module_context.Function_worker _ ->
             [
               `Value_domains;
-              `Predicate_workers;
               `Function_workers;
               `Function_instances;
               `Primitives;
               `Pure_functions;
               `Procedures;
             ]
-        | Module_context.Generic_predicate _ ->
-            [ `Value_domains; `Function_instances; `Primitives; `Predicates ]
+        | Module_context.Proof_worker _ ->
+            [
+              `Value_domains;
+              `Function_instances;
+              `Primitives;
+              `Predicates;
+              `Logical_functions;
+              `Lemmas;
+            ]
     in
     List.concat_map stages ~f:(function
       | `Representations -> representations
@@ -741,7 +783,6 @@ let program ?(history = History.default) (source : Source.t) :
       | `Native_resources -> native_resources
       | `Public_resources -> emitted_assets destination public_resource_members
       | `Applications -> applications
-      | `Predicate_workers -> predicate_workers
       | `Function_workers -> function_workers
       | `Function_instances -> function_instances
       | `Value_domains -> domains @ defaults
@@ -758,7 +799,7 @@ let program ?(history = History.default) (source : Source.t) :
           List.map (emitted_predicates destination) ~f:R.Member.callable
           @
           match destination with
-          | Module_context.Generic_predicate _ -> imported_worker_members namespace
+          | Module_context.Proof_worker _ -> imported_worker_members namespace
           | Flat | Worker _ | Function_worker _ -> [])
       | `Pure_functions ->
           List.map (owned destination pure_funcs) ~f:(fun (_, member) ->
@@ -771,41 +812,36 @@ let program ?(history = History.default) (source : Source.t) :
           @
           match destination with
           | Module_context.Function_worker _ -> imported_worker_members namespace
-          | Flat | Worker _ | Generic_predicate _ -> []))
-  and emit_predicate_worker parent (worker : Generic_predicates.t) =
-    let destination = Module_context.Generic_predicate (worker, parent) in
-    let l = loc worker.loc in
-    R.Member.module_ ~loc:l
-      ~params:
-        (List.mapi worker.variables ~f:(fun i _ ->
-             ( ident ~loc:l ("A" ^ Int.to_string i),
-               qualified_name ~loc:l Prelude.value_interface )))
-      (ident ~loc:l (Qualified_name.of_string worker.name).name)
-      (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
-         ~applications:[] ~late_members:[])
-  and emit_function_worker parent (worker : Polymorphic_functions.t) =
-    let destination = Module_context.Function_worker (worker, parent) in
-    let l = loc worker.loc in
-    R.Member.module_ ~loc:l
-      ~params:
-        (List.mapi worker.scheme.variables ~f:(fun i _ ->
-             ( ident ~loc:l ("A" ^ Int.to_string i),
-               qualified_name ~loc:l Prelude.value_interface )))
-      (ident ~loc:l (Qualified_name.of_string worker.name).name)
-      (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
-         ~applications:[] ~late_members:[])
+          | Flat | Worker _ | Proof_worker _ -> []))
+  and emit_callable_worker parent = function
+    | Proof_worker worker ->
+        let destination = Module_context.Proof_worker (worker, parent) in
+        let l = loc worker.loc in
+        R.Member.module_ ~loc:l
+          ~params:
+            (List.mapi worker.variables ~f:(fun index _ ->
+                 ( ident ~loc:l ("A" ^ Int.to_string index),
+                   qualified_name ~loc:l Prelude.value_interface )))
+          (ident ~loc:l (Qualified_name.of_string worker.name).name)
+          (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
+             ~applications:[] ~late_members:[])
+    | Runtime_worker worker ->
+        let destination = Module_context.Function_worker (worker, parent) in
+        let l = loc worker.loc in
+        R.Member.module_ ~loc:l
+          ~params:
+            (List.mapi worker.scheme.variables ~f:(fun index _ ->
+                 ( ident ~loc:l ("A" ^ Int.to_string index),
+                   qualified_name ~loc:l Prelude.value_interface )))
+          (ident ~loc:l (Qualified_name.of_string worker.name).name)
+          (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
+             ~applications:[] ~late_members:[])
   in
   let deferred_function_workers =
-    List.filter_map root_predicate_workers ~f:(fun worker ->
-        let dependencies =
-          Map.find_exn predicate_dependencies worker.Generic_predicates.name
-        in
+    List.filter_map root_callable_workers ~f:(fun worker ->
+        let dependencies = Map.find_exn worker_dependencies (callable_name worker) in
         if List.is_empty dependencies then None
-        else Some (dependencies, [ emit_predicate_worker Module_context.Flat worker ]))
-    @ List.filter_map root_function_workers ~f:(fun worker ->
-        let dependencies = Map.find_exn worker_dependencies worker.name in
-        if List.is_empty dependencies then None
-        else Some (dependencies, [ emit_function_worker Module_context.Flat worker ]))
+        else Some (dependencies, [ emit_callable_worker Module_context.Flat worker ]))
   in
   let library_modules =
     List.map library_parts ~f:(fun (library, members) ->
@@ -821,8 +857,14 @@ let program ?(history = History.default) (source : Source.t) :
       ~init:(Set.empty (module String), [])
       ~f:(fun (seen, families) data ->
         let name = Datatypes.value_family_name data in
+        let generic_model =
+          List.exists generic_proofs ~f:(fun plan ->
+              List.exists (Generic_proofs.models source plan) ~f:(fun model ->
+                  Poly.equal model.Datatypes.at data.Datatypes.at))
+        in
         if
-          (not (Datatypes.is_value_family data))
+          generic_model
+          || (not (Datatypes.is_value_family data))
           || Option.value_map data.module_path ~default:false ~f:(fun path ->
               List.length path <> 1)
           || Set.mem seen name

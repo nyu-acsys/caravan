@@ -160,9 +160,9 @@ let () =
         action dec = (* an action comment *) { s with count = s.count - 1 }|}
   with
   | [
-   Proof_type { type_name; type_kind = Variant [ (linked, args); (empty, []) ] };
+   Proof_type { type_name; type_kind = Variant [ (linked, args); (empty, []) ]; _ };
    Proof_state _;
-   Proof_type { type_name = piece; type_kind = Record [ _; _ ] };
+   Proof_type { type_name = piece; type_kind = Record [ _; _ ]; _ };
    Proof_invariant _;
    Proof_action _;
   ] ->
@@ -172,6 +172,21 @@ let () =
       assert (empty.pid_str = "Empty");
       assert (piece.pid_str = "piece")
   | _ -> failwith "unexpected logical type or state declarations"
+  end;
+  begin match
+    parse_proof
+      {|type 'a edge = Edge of 'a
+        type ('a, 'b) pair = { first : 'a; second : 'b }|}
+  with
+  | [
+   Proof_type { type_params = [ a ]; type_kind = Variant [ (_, [ PTtyvar payload ]) ]; _ };
+   Proof_type { type_params = [ first; second ]; type_kind = Record [ _; _ ]; _ };
+  ] ->
+      assert (a.pid_str = "a");
+      assert (payload.pid_str = "a");
+      assert (first.pid_str = "a");
+      assert (second.pid_str = "b")
+  | _ -> failwith "unexpected parameterized logical type declarations"
   end;
   begin match parse_proof "module Authority = Auth (Owner.Facts)" with
   | [

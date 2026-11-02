@@ -1150,7 +1150,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          (match owner_destination st.invariant with
                          | Module_context.Flat -> proc_name helped
                          | Module_context.Worker _ | Module_context.Function_worker _
-                         | Module_context.Generic_predicate _ ->
+                         | Module_context.Proof_worker _ ->
                              body_proc_name helped))
               | None ->
                   State.of_result
@@ -1159,6 +1159,40 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           (Ident.name p.helped))))
         in
         State.map members ~f:(fun members -> (st, List.concat members)))
+  in
+  let polymorphic_registry destination =
+    let current_groups = Module_context.groups destination in
+    Path_bindings.of_list
+      (library_registry.entries
+      @ List.concat_map funcs ~f:(fun candidate ->
+          let worker =
+            match Generic_modules.member generics candidate.id with
+            | None -> Program_declarations.function_worker polymorphic_functions candidate
+            | Some (group, application, stem) ->
+                let source =
+                  List.find_map group.body_members ~f:(fun (source, target) ->
+                      Option.some_if (String.equal stem target) source)
+                in
+                let representative =
+                  Option.bind source ~f:(fun source ->
+                      List.Assoc.find group.representative.body_members source
+                        ~equal:String.equal)
+                in
+                Option.bind representative ~f:(fun id ->
+                    List.find polymorphic_functions ~f:(fun worker ->
+                        Ident.same worker.Polymorphic_functions.id id))
+                |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
+                    if List.exists current_groups ~f:(phys_equal group) then worker
+                    else
+                      {
+                        worker with
+                        name =
+                          application.name ^ "."
+                          ^ (Qualified_name.of_string worker.name).name;
+                      })
+          in
+          Option.value_map worker ~default:[] ~f:(fun worker ->
+              List.map candidate.paths ~f:(fun path -> (path, worker)))))
   in
   let* pred_members, state =
     State.run_from state
@@ -1294,6 +1328,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             lemma_outputs = List.map signature.lemma_outputs ~f:project;
           } ))
   in
+  let callable_worker key = Generic_parameters.find proofs.generic_callables key in
+  let callable_namespace key =
+    Option.value_map (callable_worker key) ~default:(declaration_context key).namespace
+      ~f:(fun worker -> String.split worker.name ~on:'.')
+  in
+  let callable_member key =
+    Option.map (callable_worker key) ~f:Generic_parameters.member |> fun generic ->
+    Option.first_some generic (definition_member_name key)
+  in
   let* lemma_members, state =
     State.run_from state
     @@ State.all lemma_declarations ~f:(fun declaration ->
@@ -1307,12 +1350,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           module_lemmas (declaration_context declaration_name) ~project:Fn.id lemmas
         in
         proof_lemma types ~shared
-          ~primitive_namespace:(declaration_context declaration_name).namespace
+          ~polymorphic_functions:
+            (polymorphic_registry (declaration_context declaration_name).destination)
+          ~primitive_namespace:(callable_namespace declaration_name)
           ~generic_predicates
           ~ocaml_env:(declaration_environment declaration_name)
           ~preds ~spec_funcs ~proof_lemmas:lemmas ~proof_support
           ~predicate_bodies:(body_contexts scope)
-          ?member_name:(definition_member_name declaration_name)
+          ?member_name:(callable_member declaration_name)
           declaration)
   in
   let* logical_members, state =
@@ -1399,12 +1444,18 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
              | _ -> Ok ())
              ~f:(fun () ->
                proof_function types ~shared
-                 ~primitive_namespace:(declaration_context declaration_name).namespace
+                 ~polymorphic_functions:
+                   (polymorphic_registry
+                      (declaration_context declaration_name).destination)
+                 ~signature:
+                   (List.Assoc.find_exn all_logical_functions declaration_name
+                      ~equal:String.equal)
+                 ~primitive_namespace:(callable_namespace declaration_name)
                  ~generic_predicates
                  ~ocaml_env:(declaration_environment declaration_name)
                  ~preds ~spec_funcs
                  ~proof_support:{ proof_support with logical_functions }
-                 ?member_name:(definition_member_name declaration_name)
+                 ?member_name:(callable_member declaration_name)
                  ~as_value:
                    (match declaration with
                    | S.Proof_function { function_params = []; _ } -> true
@@ -1423,7 +1474,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           Module_context.namespace
             (match destination with
             | Module_context.Function_worker (_, parent)
-            | Module_context.Generic_predicate (_, parent) ->
+            | Module_context.Proof_worker (_, parent) ->
                 parent
             | Flat | Worker _ -> destination)
         in
@@ -1442,7 +1493,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           | Module_context.Function_worker (worker, _) ->
               let f = List.find_exn funcs ~f:(fun f -> Ident.same worker.id f.id) in
               Program_declarations.function_types polymorphic_functions f body_types
-          | Module_context.Generic_predicate (worker, _) ->
+          | Module_context.Proof_worker (worker, _) ->
               Generic_predicates.types worker body_types
           | Flat | Worker _ -> body_types
         in
@@ -1515,40 +1566,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 map_functions ~only_pure:true proof_support.runtime_functions
                   body_pure_reference;
             } ))
-  in
-  let polymorphic_registry destination =
-    let current_groups = Module_context.groups destination in
-    Path_bindings.of_list
-      (library_registry.entries
-      @ List.concat_map funcs ~f:(fun candidate ->
-          let worker =
-            match Generic_modules.member generics candidate.id with
-            | None -> Program_declarations.function_worker polymorphic_functions candidate
-            | Some (group, application, stem) ->
-                let source =
-                  List.find_map group.body_members ~f:(fun (source, target) ->
-                      Option.some_if (String.equal stem target) source)
-                in
-                let representative =
-                  Option.bind source ~f:(fun source ->
-                      List.Assoc.find group.representative.body_members source
-                        ~equal:String.equal)
-                in
-                Option.bind representative ~f:(fun id ->
-                    List.find polymorphic_functions ~f:(fun worker ->
-                        Ident.same worker.Polymorphic_functions.id id))
-                |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
-                    if List.exists current_groups ~f:(phys_equal group) then worker
-                    else
-                      {
-                        worker with
-                        name =
-                          application.name ^ "."
-                          ^ (Qualified_name.of_string worker.name).name;
-                      })
-          in
-          Option.value_map worker ~default:[] ~f:(fun worker ->
-              List.map candidate.paths ~f:(fun path -> (path, worker)))))
   in
   let polymorphic_registries =
     if List.is_empty polymorphic_functions then []

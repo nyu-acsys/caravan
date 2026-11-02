@@ -193,7 +193,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
           List.rev previous_fields )
       ~f:(fun (env, descriptors, resources, fields) declaration ->
         match declaration with
-        | S.Proof_type { type_name; type_kind } ->
+        | S.Proof_type { type_name; type_params; type_kind } ->
             let constructor ((name : S.id), (args : S.pty list)) =
               Ast_helper.Type.constructor ~loc:name.pid_loc
                 ~args:(Pcstr_tuple (List.map args ~f:(core_type ~at:name.pid_loc)))
@@ -210,7 +210,12 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
               | Record fields -> Ptype_record (List.map fields ~f:label)
             in
             let declaration =
-              Ast_helper.Type.mk ~loc:type_name.pid_loc ~kind
+              let params =
+                List.map type_params ~f:(fun parameter ->
+                    ( Ast_helper.Typ.var ~loc:parameter.pid_loc parameter.pid_str,
+                      (Asttypes.NoVariance, Asttypes.NoInjectivity) ))
+              in
+              Ast_helper.Type.mk ~loc:type_name.pid_loc ~kind ~params
                 { txt = type_name.pid_str; loc = type_name.pid_loc }
             in
             let typed, _, _, _, env =

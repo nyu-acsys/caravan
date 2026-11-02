@@ -15,7 +15,7 @@ let integer_literal ~at text =
     concatenation. *)
 let rec term_type env (t : S.term) =
   match (t.term_desc, spine (S.chain t) []) with
-  | Tcast (_, ty), _ -> Result.ok (Source.ocaml_type env.ctx.given.env ~at:t.term_loc ty)
+  | Tcast (_, ty), _ -> Result.ok (source_type env.ctx.given ~at:t.term_loc ty)
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
   | ( _,
@@ -39,14 +39,23 @@ let rec term_type env (t : S.term) =
       Option.first_some (term_type env a) (term_type env b)
   | Tcomprehension ((_, ty), _), _ ->
       Result.ok
-        (Source.ocaml_type env.ctx.given.env ~at:t.term_loc
+        (source_type env.ctx.given ~at:t.term_loc
            (S.PTtyapp (Qid (S.mk_id ~loc:t.term_loc "set"), [ ty ])))
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
       Option.bind (atomic_inputs signature method_) ~f:(fun (_, outputs) ->
           List.hd outputs)
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
-      List.hd (Option.value_exn (logical_signature env q)).lemma_outputs
+      let signature = Option.value_exn (logical_signature env q) in
+      begin match signature.lemma_generic with
+      | None -> List.hd signature.lemma_outputs
+      | Some _ ->
+          Result.ok
+            (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+               ~functions:(List.map env.funcs ~f:fst)
+               ~variables:(Logical_context.variables env)
+               t)
+      end
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
       Result.ok
         (Source.infer_logical_expression env.ctx.given.env
@@ -326,6 +335,99 @@ let equality_check env (id : S.id) operator a b =
             "Physical equality on boxed values is unsupported in specifications"
   | _ -> Ok ()
 
+let instantiate_proof_signature env ~at ?expected ?term signature args =
+  let open State.Syntax in
+  match signature.lemma_generic with
+  | None ->
+      let+ () = State.note_call env.ctx.given signature.lemma_raven in
+      signature
+  | Some original ->
+      let* worker =
+        State.of_result
+          (Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at original
+             (signature.lemma_inputs @ signature.lemma_outputs))
+      in
+      let target = Qualified_name.of_string signature.lemma_raven in
+      let worker =
+        if List.is_empty target.path then worker
+        else
+          {
+            worker with
+            name =
+              String.concat ~sep:"."
+                (target.path @ [ (Qualified_name.of_string worker.name).name ]);
+          }
+      in
+      let output_types result =
+        match (signature.lemma_outputs, result) with
+        | [ _ ], Some result -> [ Some result ]
+        | outputs, Some result ->
+            begin match Datatypes.desc env.data result with
+            | Ttuple fields when List.length fields = List.length outputs ->
+                List.map fields ~f:(fun (_, typ) -> Some typ)
+            | _ -> List.map outputs ~f:(fun _ -> None)
+            end
+        | outputs, None -> List.map outputs ~f:(fun _ -> None)
+      in
+      let supplied = List.map args ~f:(term_type env) in
+      let omitted =
+        List.init
+          (Int.max 0 (List.length signature.lemma_inputs - List.length supplied))
+          ~f:(fun _ -> None)
+      in
+      let infer result =
+        Generic_parameters.instantiate ~environment:env.ctx.given.env
+          ~expand:(Datatypes.expand env.data) ~at worker
+          (supplied @ omitted @ output_types result)
+      in
+      let* arguments =
+        State.of_result
+          (match (infer expected, expected, term) with
+          | Ok arguments, _, _ -> Ok arguments
+          | Error _, None, Some term ->
+              begin match
+                Source.infer_logical_expression ~is_list:(is_list_term env)
+                  env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                  ~variables:(Logical_context.variables env)
+                  term
+              with
+              | Ok result -> infer (Some result)
+              | Error error -> Error error
+              end
+          | Error error, _, _ -> Error error)
+      in
+      let inputs, outputs =
+        List.split_n
+          (Generic_parameters.parameter_types worker arguments)
+          (List.length signature.lemma_inputs)
+      in
+      let* raven =
+        if
+          String.equal
+            (String.concat ~sep:"." env.ctx.given.primitive_namespace)
+            worker.name
+        then
+          if
+            List.equal Types.eq_type worker.variables
+              (List.map arguments ~f:(Datatypes.expand env.data))
+          then State.return (worker.name ^ "." ^ Generic_parameters.member worker)
+          else State.of_result (unsupported at "Polymorphic proof recursion")
+        else
+          let+ instance =
+            State.value_instance env.ctx ~at ~target:worker.name ~arguments
+          in
+          instance ^ "." ^ Generic_parameters.member worker
+      in
+      let* () = State.note_call env.ctx.given raven in
+      State.return
+        {
+          signature with
+          lemma_raven = raven;
+          lemma_generic = None;
+          lemma_inputs = inputs;
+          lemma_outputs = outputs;
+        }
+
 let predicate_instance env ~at ~key ~target args =
   match Generic_predicates.find ~target env.ctx.given.generic_predicates key with
   | None -> Ok None
@@ -387,7 +489,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Tvar (Qid { pid_str = x; _ }) when is_constructor x -> constructor env t []
   | Tvar (Qdot (_, id)) when is_constructor id.pid_str -> constructor env t []
   | Tvar q when Option.is_some (logical_signature env q) ->
-      logical_application env ~at (Option.value_exn (logical_signature env q)) []
+      logical_application ~term:t env ~at (Option.value_exn (logical_signature env q)) []
   | Tvar (Qid { pid_str = x; _ })
     when List.Assoc.mem env.ctx.given.proof_support.predicate_inputs x ~equal:String.equal
          && not (List.Assoc.mem env.vars x ~equal:String.equal) ->
@@ -451,9 +553,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                 State.of_result
                   (error id.pid_loc "A bound variable needs a type, as in x: int")
             | Some ty -> begin
-                let* t =
-                  State.of_result (Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty)
-                in
+                let* t = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in
                 (* An existential record is one existential per field. *)
                 match (q, logical_record env t) with
                 | Texists, Some (_, _, fields) ->
@@ -538,7 +638,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       | Texists, Some g -> R.Expr.exists ~loc:l vars (R.Expr.binary ~loc:l And g body)
       end
   | Tcomprehension ((id, ty), body) ->
-      let* ty = State.of_result (Source.ocaml_type env.ctx.given.env ~at:id.pid_loc ty) in
+      let* ty = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in
       let* raven_type = State.of_result (typ env.ctx ~at:id.pid_loc ty) in
       let* () = State.note_domain env.data ty in
       let* raven = State.fresh id.pid_str in
@@ -570,7 +670,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       spec_match env ~at ?scrutinee_type v cases
   | Tattr (_, t) -> formula env t
   | Tcast (t, ty) ->
-      let* ty = State.of_result (Source.ocaml_type env.ctx.given.env ~at ty) in
+      let* ty = State.of_result (source_type env.ctx.given ~at ty) in
       let* raven_type = State.of_result (typ env.ctx ~at ty) in
       let+ value = expected_formula env (Some ty) t in
       R.Expr.annotated value raven_type
@@ -689,6 +789,21 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
       let+ elements = State.all elements ~f:(formula env) in
       R.Expr.seq ~loc:(loc t.term_loc) elements
   | Some expected, _
+    when begin match fst (spine t []) with
+         | { term_desc = Tvar q; _ } ->
+             Option.exists (logical_signature env q) ~f:(fun signature ->
+                 Option.is_some signature.lemma_generic)
+         | _ -> false
+         end ->
+      let head, args = spine t [] in
+      begin match head.term_desc with
+      | Tvar q ->
+          logical_application ~expected ~term:t env ~at:t.term_loc
+            (Option.value_exn (logical_signature env q))
+            args
+      | _ -> formula env t
+      end
+  | Some expected, _
     when Option.is_some (logical_record env expected)
          && match t.term_desc with Trecord _ -> true | _ -> false ->
       begin match t.term_desc with
@@ -754,7 +869,9 @@ and application env (t : S.term) =
       let+ args = predicate_arguments env ~at ~display:(qualid_key q) key types args in
       R.Expr.call ~loc:l (qualified_name ~loc:l raven) args
   | Tvar q, args when Option.is_some (logical_signature env q) ->
-      logical_application env ~at (Option.value_exn (logical_signature env q)) args
+      logical_application ~term:t env ~at
+        (Option.value_exn (logical_signature env q))
+        args
   | Tvar q, args when Option.is_some (runtime_spec env q) ->
       let target = Qualified_name.to_string (Option.value_exn (runtime_spec env q)) in
       let* target =
@@ -786,6 +903,7 @@ and application env (t : S.term) =
             end
         | Some _ | None -> State.return target
       in
+      let* () = State.note_call env.ctx.given target in
       let+ args = State.all args ~f:(formula env) in
       R.Expr.call ~loc:l (qualified_name ~loc:l target) args
   | Tvar (Qdot (parent, _) as q), _ when Option.is_some (resource_module env parent) ->
@@ -821,7 +939,7 @@ and application env (t : S.term) =
             in
             let* permission_type =
               State.of_result
-                (Source.ocaml_type env.ctx.given.env ~at
+                (source_type env.ctx.given ~at
                    (S.PTtyapp
                       (Qdot (Qid (S.mk_id ~loc:at "Permission"), S.mk_id ~loc:at "t"), [])))
             in
@@ -1035,7 +1153,7 @@ and predicate_arguments env ~at ?display key types args =
                 minimum maximum))
       else typed_arguments env ~at (List.take types arity) args
 
-and logical_application env ~at signature args =
+and logical_application ?expected ?term env ~at signature args =
   let l = loc at in
   let* () =
     if List.length args = List.length signature.lemma_inputs then State.return ()
@@ -1045,6 +1163,7 @@ and logical_application env ~at signature args =
            (Printf.sprintf "%s expects %d arguments" signature.lemma_raven
               (List.length signature.lemma_inputs)))
   in
+  let* signature = instantiate_proof_signature env ~at ?expected ?term signature args in
   let+ args = typed_arguments env ~at signature.lemma_inputs args in
   let n = qualified_name ~loc:l signature.lemma_raven in
   if signature.lemma_constant then R.Expr.var ~loc:l n else R.Expr.call ~loc:l n args
