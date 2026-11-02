@@ -32,6 +32,8 @@ type t = {
   pending_declarations : (Base.string list * Datatypes.R.Member.t list) list;
       (** The declarations not emitted yet, each with the layouts it needs. *)
   modules : Datatypes.R.Member.t list;
+  fields : Datatypes.R.Member.t list;
+  pending_fields : (Base.string list * Datatypes.R.Member.t list) list;
   functions : Base.string Path_bindings.t;
   lifted : (string * (int * Ident.t list * Ident.t option)) list;
   ocaml_env : Env.t;
@@ -904,8 +906,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             fields ))
   in
   let modules, pending_declarations =
-    take_declarations ~available:[] (module_declarations @ field_declarations)
+    take_declarations ~available:[] module_declarations
   in
+  let fields, pending_fields = take_declarations ~available:[] field_declarations in
   let functions =
     Path_bindings.of_list
       (List.concat_map funcs ~f:(fun f ->
@@ -1012,6 +1015,8 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       deferred_native_resource_members;
       pending_declarations;
       modules;
+      fields;
+      pending_fields;
       functions;
       lifted;
       ocaml_env;

@@ -760,35 +760,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 let interface = qualified_name ~loc:l Prelude.value_interface in
                 if aliases then
                   let source_type = Ctype.newconstr (Path.Pident declaration.typ_id) [] in
-                  let* carrier = Datatypes.typ view.view_types ~at source_type in
-                  let value = R.Expr.var ~loc:l (name ~loc:l "value") in
-                  let body =
-                    Option.value
-                      (Datatypes.admissible ~loc:l view.view_types source_type value)
-                      ~default:(R.Expr.bool ~loc:l true)
-                  in
-                  Ok
-                    (Some
-                       (R.Member.module_ ~loc:l
-                          ~implements:[ (interface, []) ]
-                          (ident ~loc:l stem)
-                          [
-                            R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "Carrier")
-                              (Some carrier);
-                            R.Member.callable
-                              (R.Callable.func ~loc:l
-                                 ~formals:
-                                   [
-                                     R.Var.make ~loc:l (ident ~loc:l "value")
-                                       (R.Type.named ~loc:l (name ~loc:l "Carrier") []);
-                                   ]
-                                 ~returns:
-                                   [
-                                     R.Var.make ~loc:l (ident ~loc:l "result")
-                                       (R.Type.bool ~loc:l);
-                                   ]
-                                 (ident ~loc:l "holds") (Some body));
-                          ]))
+                  begin match Datatypes.dictionary_name view.view_types source_type with
+                  | Some dictionary ->
+                      Ok
+                        (Some
+                           (R.Member.alias ~loc:l (ident ~loc:l stem)
+                              (qualified_name ~loc:l dictionary)))
+                  | None ->
+                      unsupported at "A canonical source-value dictionary for this type"
+                  end
                 else
                   Ok
                     (Some
@@ -933,9 +913,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             in
             let namespace = String.split group.interface ~on:'.' in
             let domains =
-              List.concat domains
-              |> List.dedup_and_sort ~compare:(fun (left, _) (right, _) ->
-                  String.compare left right)
+              List.concat domains |> Datatypes.unique_domain_members
               |> List.filter_map ~f:(fun (qualified, member) ->
                   Option.some_if
                     (List.equal String.equal (Qualified_name.of_string qualified).path

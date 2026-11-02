@@ -771,17 +771,91 @@ let domain_identity types t =
           ~f:(fun namespace ->
             { key with namespace; payload = relative_key namespace key.payload }))
 
+let container types t =
+  match desc types t with
+  | Tconstr (path, [ _ ], _)
+    when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+      true
+  | Ttuple _ -> true
+  | _ -> false
+
+let structural_constraint_name types t =
+  match domain_identity types t with
+  | Some key -> Some (cell_key_name key)
+  | None -> Option.map (type_key types t) ~f:(fun key -> "ocaml_value$" ^ key_name key)
+
+let supplied_dictionary types t =
+  match abstract_value_constraint types t with
+  | Some { Qualified_name.path; name = "holds" } ->
+      Option.some_if (not (List.is_empty path)) (String.concat ~sep:"." path)
+  | Some _ | None -> None
+
+let rec domain_key ~namespace types t =
+  match abstract_value_constraint types t with
+  | Some predicate ->
+      let parts = predicate.Qualified_name.path @ [ predicate.name ] in
+      let parts =
+        if List.is_prefix parts ~prefix:namespace ~equal:String.equal then
+          List.drop parts (List.length namespace)
+        else parts
+      in
+      "abstract$" ^ framed parts
+  | None when is_int types t -> "bounded_int"
+  | None when not (has_domain types t) -> "unrestricted"
+  | None -> (
+      match desc types t with
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
+          "list$" ^ framed [ domain_key ~namespace types element ]
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
+          "option$" ^ framed [ domain_key ~namespace types element ]
+      | Ttuple components ->
+          "tuple$"
+          ^ framed (List.map components ~f:(fun (_, t) -> domain_key ~namespace types t))
+      | _ ->
+          "nominal$"
+          ^ framed
+              (Option.value_map (structural_constraint_name types t) ~default:[]
+                 ~f:(fun name ->
+                   let parts = String.split name ~on:'.' in
+                   if List.is_prefix parts ~prefix:namespace ~equal:String.equal then
+                     List.drop parts (List.length namespace)
+                   else parts)))
+
+let dictionary_name types t =
+  match supplied_dictionary types t with
+  | Some dictionary -> Some dictionary
+  | None when is_int types t -> Some Prelude.value_int
+  | None ->
+      Option.map (domain_identity types t) ~f:(fun key ->
+          String.concat ~sep:"."
+            (key.namespace
+            @ [
+                "Ocaml$Values$"
+                ^ framed
+                    [ key_name key.payload; domain_key ~namespace:key.namespace types t ];
+              ]))
+
 let constraint_name types t =
   match abstract_value_constraint types t with
   | Some constraint_ -> Some (Qualified_name.to_string constraint_)
-  | None -> (
-      if is_int types t then Some Prelude.in_range
-      else if not (has_domain types t) then None
-      else
-        match domain_identity types t with
-        | Some key -> Some (cell_key_name key)
-        | None ->
-            Option.map (type_key types t) ~f:(fun key -> "ocaml_value$" ^ key_name key))
+  | None when is_int types t -> Some Prelude.in_range
+  | None when not (has_domain types t) -> None
+  | None when container types t ->
+      Option.map (dictionary_name types t) ~f:(fun dictionary -> dictionary ^ ".holds")
+  | None -> structural_constraint_name types t
+
+let domain_namespace types t =
+  Option.map (domain_identity types t) ~f:(fun key -> key.namespace)
+
+let unique_domain_members members =
+  let _, members =
+    List.fold members
+      ~init:(Set.empty (module String), [])
+      ~f:(fun (seen, members) ((name, _) as member) ->
+        if Set.mem seen name then (seen, members)
+        else (Set.add seen name, member :: members))
+  in
+  List.rev members
 
 let admissible ~loc types t value =
   Option.map (constraint_name types t) ~f:(fun name ->
@@ -789,14 +863,12 @@ let admissible ~loc types t value =
         (Qualified_name.raven ~loc (Qualified_name.of_string name))
         [ value ])
 
-(** The monomorphic domain functions needed by the requested carriers. Mathematical
-    collections and abstract library carriers retain their own logical contracts. *)
-let domain_members types requested =
-  let conjunction ~loc expressions =
-    Option.value
-      (List.reduce expressions ~f:(R.Expr.binary ~loc And))
-      ~default:(R.Expr.bool ~loc true)
-  in
+type domain_node =
+  | Domain_function of Types.type_expr * string
+  | Value_dictionary of Types.type_expr * string option
+
+(** Plans declarations and template requirements with one dependency traversal. *)
+let domain_nodes ?(dictionaries = false) types requested =
   let children t =
     match desc types t with
     | Tconstr (path, [ element ], _)
@@ -807,6 +879,49 @@ let domain_members types requested =
             List.concat_map data.ctors ~f:(fun ctor -> ctor.args))
     | Ttuple components -> List.map components ~f:snd
     | _ -> []
+  in
+  let rec domain (seen, nodes) t =
+    match constraint_name types t with
+    | _ when Option.is_some (abstract_value_constraint types t) -> (seen, nodes)
+    | None -> (seen, nodes)
+    | Some name when String.equal name Prelude.in_range || Set.mem seen name ->
+        (seen, nodes)
+    | Some _ when container types t -> dictionary (seen, nodes) t
+    | Some name ->
+        let seen, nodes =
+          List.fold (children t) ~init:(Set.add seen name, nodes) ~f:domain
+        in
+        (seen, Domain_function (t, name) :: nodes)
+  and dictionary (seen, nodes) t =
+    match (supplied_dictionary types t, dictionary_name types t) with
+    | Some _, _ -> (seen, nodes)
+    | None, None -> (seen, Value_dictionary (t, None) :: nodes)
+    | None, Some name when Set.mem seen name -> (seen, nodes)
+    | None, Some name ->
+        let seen = Set.add seen name in
+        if String.equal name Prelude.value_int then
+          (seen, Value_dictionary (t, Some name) :: nodes)
+        else if container types t then
+          let seen, nodes = List.fold (children t) ~init:(seen, nodes) ~f:dictionary in
+          (seen, Value_dictionary (t, Some name) :: nodes)
+        else
+          (* A nominal dictionary supplies the carrier of its recursive containers. *)
+          domain (seen, Value_dictionary (t, Some name) :: nodes) t
+  in
+  let _, nodes =
+    List.fold requested
+      ~init:(Set.empty (module String), [])
+      ~f:(if dictionaries then dictionary else domain)
+  in
+  List.rev nodes
+
+(** The monomorphic domain functions needed by the requested carriers. Mathematical
+    collections and abstract library carriers retain their own logical contracts. *)
+let domain_members ?(dictionaries = false) types requested =
+  let conjunction ~loc expressions =
+    Option.value
+      (List.reduce expressions ~f:(R.Expr.binary ~loc And))
+      ~default:(R.Expr.bool ~loc true)
   in
   let definition t qualified =
     let at =
@@ -829,53 +944,15 @@ let domain_members types requested =
               (List.map2_exn ctor.args arguments ~f:(fun t name -> holds t (value name)))
           ))
     in
-    let* body =
+    let body =
       match desc types t with
-      | Tconstr (path, [ element ], _)
-        when Path.same path Predef.path_list
-             && Option.is_some (abstract_value_constraint types element) ->
-          let* element_type = typ types ~at element in
-          let item = value "source$item" in
-          let member =
-            R.Expr.call ~loc:l
-              (Qualified_name.raven ~loc:l (Qualified_name.of_string "Library.List.in"))
-              [ item; x ]
-          in
-          Ok
-            (R.Expr.forall ~loc:l
-               [ R.Var.make ~loc:l (ident "source$item") element_type ]
-               (R.Expr.binary ~loc:l Impl member (conjuncts [ holds element item ])))
-      | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
-          Ok
-            (R.Expr.match_ ~loc:l x
-               [
-                 (R.Expr.Case (ident "nil", []), R.Expr.bool ~loc:l true);
-                 ( R.Expr.Case (ident "::", [ ident "source$head"; ident "source$tail" ]),
-                   conjuncts
-                     [
-                       holds element (value "source$head"); holds t (value "source$tail");
-                     ] );
-               ])
-      | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
-          Ok
-            (R.Expr.match_ ~loc:l x
-               [
-                 (R.Expr.Case (ident "none", []), R.Expr.bool ~loc:l true);
-                 ( R.Expr.Case (ident "some", [ ident "source$item" ]),
-                   conjuncts [ holds element (value "source$item") ] );
-               ])
-      | Ttuple components ->
-          Ok
-            (conjuncts
-               (List.mapi components ~f:(fun i (_, t) ->
-                    holds t (R.Expr.tuple_get ~loc:l x i))))
       | Tconstr (path, [], _) ->
-          Ok
-            (match find types path with
-            | Some data when data.empty -> R.Expr.bool ~loc:l false
-            | Some data -> R.Expr.match_ ~loc:l x (datatype_cases data.ctors)
-            | None -> R.Expr.bool ~loc:l true)
-      | _ -> Ok (R.Expr.bool ~loc:l true)
+          begin match find types path with
+          | Some data when data.empty -> R.Expr.bool ~loc:l false
+          | Some data -> R.Expr.match_ ~loc:l x (datatype_cases data.ctors)
+          | None -> R.Expr.bool ~loc:l true
+          end
+      | _ -> R.Expr.bool ~loc:l true
     in
     let* carrier = typ types ~at t in
     let name = Qualified_name.of_string qualified in
@@ -887,31 +964,95 @@ let domain_members types requested =
               [ R.Var.make ~loc:l (ident "source$admissible") (R.Type.bool ~loc:l) ]
             (ident name.name) (Some body)))
   in
-  let rec collect (seen, members) t =
-    match constraint_name types t with
-    | _ when Option.is_some (abstract_value_constraint types t) -> Ok (seen, members)
-    | None -> Ok (seen, members)
-    | Some name when String.equal name Prelude.in_range || Set.mem seen name ->
-        Ok (seen, members)
-    | Some name ->
-        let* _ =
-          match domain_identity types t with
-          | Some _ -> Ok ()
-          | None ->
-              Report.unsupported Location.none
-                "A source value domain combining incompatible symbolic scopes"
+  let dictionary_definition t qualified =
+    let l = loc Location.none in
+    let q text = Qualified_name.raven ~loc:l (Qualified_name.of_string text) in
+    let ident text = R.Ident.make ~loc:l text in
+    let module_arg t =
+      match dictionary_name types t with
+      | Some dictionary -> Ok (R.Type.named ~loc:l (q dictionary) [])
+      | None -> Report.unsupported Location.none "This value dictionary's carrier"
+    in
+    let* factory, arguments =
+      match desc types t with
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
+          let* argument = module_arg element in
+          Ok (Some Prelude.value_list, [ argument ])
+      | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
+          let* argument = module_arg element in
+          Ok (Some Prelude.value_option, [ argument ])
+      | Ttuple components ->
+          let* arguments =
+            Result.all (List.map components ~f:(fun (_, t) -> module_arg t))
+          in
+          Ok (Some (Prelude.value_tuple (List.length components)), arguments)
+      | _ -> Ok (None, [])
+    in
+    let name = Qualified_name.of_string qualified in
+    match factory with
+    | Some factory ->
+        Ok
+          (R.Member.instance ~loc:l
+             ~def:(q factory, arguments)
+             (ident name.name) (q factory))
+    | None ->
+        let* carrier = typ types ~at:Location.none t in
+        let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
+        let body =
+          Option.value
+            (admissible ~loc:l types t value)
+            ~default:(R.Expr.bool ~loc:l true)
         in
-        let seen = Set.add seen name in
-        let* seen, members =
-          List.fold_result (children t) ~init:(seen, members) ~f:collect
-        in
-        let* member = definition t name in
-        Ok (seen, members @ [ (name, member) ])
+        Ok
+          (Prelude.value_dictionary ~loc:l ~name:name.name ~carrier
+             ~unrestricted:(R.Expr.bool ~loc:l (not (has_domain types t)))
+             ~body)
   in
-  let* _, members =
-    List.fold_result requested ~init:(Set.empty (module String), []) ~f:collect
+  let require_identity t =
+    match domain_identity types t with
+    | Some identity -> Ok identity
+    | None ->
+        Report.unsupported Location.none
+          "A source value domain combining incompatible symbolic scopes"
   in
-  Ok members
+  let* members =
+    Result.all
+      (List.map (domain_nodes ~dictionaries types requested) ~f:(function
+        | Value_dictionary (_, None) ->
+            Report.unsupported Location.none "This source value dictionary"
+        | Value_dictionary (_, Some name) when String.equal name Prelude.value_int ->
+            Ok None
+        | Value_dictionary (t, Some name) ->
+            let* _ = require_identity t in
+            let* member = dictionary_definition t name in
+            Ok (Some (name, member))
+        | Domain_function (t, name) ->
+            let* _ = require_identity t in
+            let* member = definition t name in
+            Ok (Some (name, member))))
+  in
+  Ok (List.filter_opt members)
+
+type value_template =
+  | Int_dictionary
+  | List_dictionary
+  | Option_dictionary
+  | Tuple_dictionary of int
+
+let value_templates ?(dictionaries = false) types requested =
+  List.filter_map (domain_nodes ~dictionaries types requested) ~f:(function
+    | Domain_function _ | Value_dictionary (_, None) -> None
+    | Value_dictionary (t, Some _) -> (
+        if is_int types t then Some Int_dictionary
+        else
+          match desc types t with
+          | Tconstr (path, [ _ ], _) when Path.same path Predef.path_list ->
+              Some List_dictionary
+          | Tconstr (path, [ _ ], _) when Path.same path Predef.path_option ->
+              Some Option_dictionary
+          | Ttuple components -> Some (Tuple_dictionary (List.length components))
+          | _ -> None))
+  |> List.dedup_and_sort ~compare:Poly.compare
 
 (** Runtime fields preserve their source value domain; mathematical ghost fields retain
     scalar integer bounds. *)

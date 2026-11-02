@@ -1,5 +1,10 @@
 module Make () = struct
+  type unused = Unused of (int * bool)
   type node = Nil | Next of int * node Atomic.t
+  type forest = Forest of int * forest list
+
+  let root (value : forest) = match value with Forest (number, _) -> number
+  (*@ result = root value ensures min_int <= result && result <= max_int *)
 
   let create () = Atomic.make Nil
   (*@ cell = create () ensures own cell Nil *)
@@ -36,3 +41,6 @@ let mixed () =
   match Atomic.get second with
   | First.Nil, First.Nil, Second.Nil -> ()
   | _ -> assert false
+
+let forest (children : First.forest list) = First.root (First.Forest (7, children))
+(*@ result = forest children ensures min_int <= result && result <= max_int *)

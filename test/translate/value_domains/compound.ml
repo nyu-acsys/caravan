@@ -42,3 +42,18 @@ let repeated (items : int list) =
     let _ = first items in
     assert (index <= 1)
   done
+
+type storage = { mutable contents : int option list }
+
+let recorded (items : int option list) =
+  let cell = { contents = items } in
+  cell.contents <- Some 0 :: cell.contents;
+  cell.contents
+
+type forest = Forest of int * forest list
+
+let root (value : forest) = match value with Forest (number, _) -> number
+(*@ result = root value ensures min_int <= result && result <= max_int *)
+
+let roots (values : forest list) = match values with [] -> 0 | value :: _ -> root value
+(*@ result = roots values ensures min_int <= result && result <= max_int *)

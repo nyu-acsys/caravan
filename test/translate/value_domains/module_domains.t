@@ -1,5 +1,5 @@
 Abstract module arguments carry source-value constraints through one shared worker.
-List identities preserve the same domain across generic and concrete callers.
+Nested lists, options and tuples share domains across generic and concrete callers.
 
   $ caravan --shh module_domains.ml
   Verification successful.
@@ -22,3 +22,13 @@ Imported runtime constants guarantee admissibility, unlike raw logical defaults.
 
   $ caravan --shh constant_domain.ml
   Verification successful.
+
+Imported container contracts share their dictionaries through checked module views.
+
+  $ caravan --shh container_operation.ml
+  Verification successful.
+  $ caravan --shh --emit-rav container_operation.ml > container_operation.rav
+  $ raven --shh container_operation.rav
+  Verification successful.
+  $ grep -c '^module Generic_' container_operation.rav
+  1

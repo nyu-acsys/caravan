@@ -1,22 +1,24 @@
+Shared leaf dictionaries contribute one contract check per abstract source type.
+
   $ caravan --shh generic_methods.ml
   Verification successful.
 
   $ caravan --shh --emit-rav generic_methods.ml > methods.rav
   $ raven --shh --fingerprints methods.rav > methods.fingerprints
   $ grep -c '^[0-9a-f]\{32\} ' methods.fingerprints
-  7
+  9
   $ grep -c ' Generic_.*\.method_' methods.fingerprints
   3
 
   $ caravan --shh --emit-rav ordinary.ml > ordinary.rav
   $ raven --shh --fingerprints ordinary.rav > ordinary.fingerprints
   $ grep -c '^[0-9a-f]\{32\} ' ordinary.fingerprints
-  5
+  7
 
   $ caravan --shh --emit-rav atomic.ml > atomic.rav
   $ raven --shh --fingerprints atomic.rav > atomic.fingerprints
   $ grep -c '^[0-9a-f]\{32\} ' atomic.fingerprints
-  8
+  10
 
   $ caravan --shh generic_manifest.ml
   Verification successful.
@@ -29,7 +31,7 @@
   $ grep -c ' Generic_.*\.method_' persistent.fingerprints
   1
   $ grep -c '^[0-9a-f]\{32\} ' persistent.fingerprints
-  5
+  7
   $ raven --shh persistent.rav
   Verification successful.
 
