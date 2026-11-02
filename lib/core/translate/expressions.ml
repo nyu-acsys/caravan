@@ -6,6 +6,16 @@ open Proof_terms
 open Atomic_proofs
 open State.Syntax
 
+let captured_arguments ~at ~values names captured =
+  all captured ~f:(fun id ->
+      match List.Assoc.find values (Ident.unique_name id) ~equal:String.equal with
+      | Some value -> Ok value
+      | None ->
+          begin match State.name_in names id with
+          | Some variable -> Ok (R.Expr.var ~loc:(loc at) (name ~loc:(loc at) variable))
+          | None -> error at (Printf.sprintf "%s is not in scope here" (Ident.name id))
+          end)
+
 let constructor_value ctx ~at ~result_type data constructor arguments =
   let value =
     R.Expr.call ~loc:(loc at)
@@ -727,12 +737,7 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
        else error e.exp_loc "This call needs the parameters of the function it continues")
   in
   let* captured =
-    State.of_result
-      (all captured ~f:(fun x ->
-           match State.name_in s.names x with
-           | Some y -> Ok (R.Expr.var ~loc:l (name ~loc:l y))
-           | None ->
-               error e.exp_loc (Printf.sprintf "%s is not in scope here" (Ident.name x))))
+    State.of_result (captured_arguments ~at:e.exp_loc ~values:[] s.names captured)
   in
   let prefix = prefix @ captured in
   (* A ghost argument is the value of which the argument a precondition relates it to is a
@@ -1373,11 +1378,23 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
           let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
           begin match Path_bindings.find funcs path with
           | Some f ->
+              let prefix, captured, role =
+                Option.value
+                  (List.Assoc.find ctx.given.lifted f ~equal:String.equal)
+                  ~default:(0, [], None)
+              in
+              let* () =
+                if prefix = 0 && Option.is_none role then State.return ()
+                else not_pure "A continuation call"
+              in
+              let* captured =
+                State.of_result (captured_arguments ~at ~values names captured)
+              in
               let+ actual_target =
                 State.polymorphic_call ctx ~at ~path ~declaration:declaration.val_type
                   ~occurrence:callee.exp_type ~target:f
               in
-              R.Expr.call ~loc:l (qualified_name ~loc:l actual_target) args
+              R.Expr.call ~loc:l (qualified_name ~loc:l actual_target) (captured @ args)
           | None -> not_pure ("A call of " ^ Path.name path)
           end
       | _ -> not_pure "This application"
@@ -1387,6 +1404,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       let* a = pure_in values a in
       let+ b = pure_in values b in
       R.Expr.ite ~loc:l c a b
+  | Texp_let (_, [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; _ } ], body)
+    when Path_bindings.mem funcs (Path.Pident id) ->
+      pure_in values body
   | Texp_let
       ( Nonrecursive,
         [ { vb_pat = { pat_desc = Tpat_var (id, _, _); _ }; vb_expr; _ } ],

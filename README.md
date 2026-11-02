@@ -26,9 +26,14 @@ and pure functions used in contracts. Lists, options, tuples, references and ato
 retain their source-value constraints at each instantiation. Parameterized type
 aliases and generic ownership predicates work with imported function contracts;
 the Saturn Treiber stack and its drain clients use this support. Higher-order
-parameters, explicitly quantified source annotations, generalized local functions
-and local helpers in generic bodies remain unsupported, as do parameterized mutable
-records and ordering on generic values.
+parameters, explicitly quantified source annotations, parameterized mutable records
+and ordering on generic values remain unsupported.
+
+Local helpers can capture values and reuse the enclosing function's type parameters,
+including recursive and pure helpers. Independently generalized helpers use the
+same generic workers as top-level functions when they do not depend on enclosing
+type parameters. Combining independent generalization with captured enclosing type
+parameters remains unsupported.
 
 Variants and immutable records can have type parameters, including regular recursive
 definitions. Their carriers are shared across callers, source modules and supported

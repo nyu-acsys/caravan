@@ -16,6 +16,24 @@ type t = {
 
 let same_variable left right = Int.equal (Types.get_id left) (Types.get_id right)
 
+let order workers ~dependencies =
+  let rec place available emitted pending =
+    let ready, pending =
+      List.partition_tf pending ~f:(fun worker ->
+          List.for_all (dependencies worker) ~f:(Set.mem available))
+    in
+    match (ready, pending) with
+    | [], [] -> Ok (List.rev emitted)
+    | [], worker :: _ -> Report.unsupported worker.loc "Cyclic generic function workers"
+    | _ :: _, _ ->
+        let available =
+          List.fold ready ~init:available ~f:(fun available worker ->
+              Set.add available worker.name)
+        in
+        place available (List.rev_append ready emitted) pending
+  in
+  place (Set.empty (module String)) [] workers
+
 (** Includes nongeneric variables, so enclosing lexical binders can exclude them. *)
 let all_variables typ =
   let rec visit (seen, variables) typ =

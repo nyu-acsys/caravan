@@ -15,6 +15,7 @@ type func = {
   environment : Env.t;
   signature_sites : Module_inventory.signature_value list;
   scheme_type : Types.type_expr;
+  lexical_owner : Ident.t option;
   raven_name : string;
   params : Typedtree.function_param list;
   body : Typedtree.expression;
@@ -433,13 +434,18 @@ let contract_postconditions env ~at ?atomic posts =
     circular. *)
 let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
     ?declaration_name ?(primitive_namespace = []) ?polymorphic_functions
-    ?current_polymorphic ?generic_predicates (f : func) : R.Callable.t State.t =
+    ?current_polymorphic ?generic_predicates ?(lifted = []) (f : func) :
+    R.Callable.t State.t =
   let ctx =
     {
       given =
-        declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
-          ~primitive_namespace ?polymorphic_functions ?current_polymorphic
-          ?generic_predicates ();
+        {
+          (declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs
+             ~proof_support ~primitive_namespace ?polymorphic_functions
+             ?current_polymorphic ?generic_predicates ())
+          with
+          lifted;
+        };
       au = None;
     }
   in

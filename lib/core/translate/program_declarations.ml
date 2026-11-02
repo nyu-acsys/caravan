@@ -107,8 +107,16 @@ let function_worker polymorphic_functions (f : func) =
   List.find polymorphic_functions ~f:(fun worker ->
       Ident.same worker.Polymorphic_functions.id f.id)
 
-let function_types polymorphic_functions f types =
+let enclosing_worker polymorphic_functions (f : func) =
   match function_worker polymorphic_functions f with
+  | Some _ as worker -> worker
+  | None ->
+      Option.bind f.lexical_owner ~f:(fun id ->
+          List.find polymorphic_functions ~f:(fun worker ->
+              Ident.same worker.Polymorphic_functions.id id))
+
+let function_types polymorphic_functions f types =
+  match enclosing_worker polymorphic_functions f with
   | None -> types
   | Some worker ->
       List.mapi worker.scheme.variables ~f:(fun index variable ->
@@ -125,7 +133,7 @@ let predicate_destination ~generic_predicates ~declaration_context key =
   | Some predicate -> Module_context.Generic_predicate (predicate, parent)
 
 let worker_member polymorphic_functions f target =
-  match function_worker polymorphic_functions f with
+  match enclosing_worker polymorphic_functions f with
   | None -> target
   | Some worker -> worker.name ^ "." ^ (Qualified_name.of_string target).name
 
@@ -136,26 +144,37 @@ let body_proc_name ?(polymorphic_functions = []) ~(generics : Generic_modules.t 
   let proc_name = proc_name ~procedures in
   worker_member polymorphic_functions f
     (match Generic_modules.member generics f.id with
-    | None -> proc_name f
+    | None ->
+        begin match Option.bind f.lexical_owner ~f:(Generic_modules.member generics) with
+        | Some (group, _, _) ->
+            group.name ^ "." ^ (Qualified_name.of_string (proc_name f)).name
+        | None -> proc_name f
+        end
     | Some (group, _, stem) -> group.name ^ "." ^ procedure_stem group stem)
 
 let body_pure_name ?(polymorphic_functions = []) ~(generics : Generic_modules.t list) f =
   let pure_name = pure_name ~generics in
   worker_member polymorphic_functions f
     (match Generic_modules.member generics f.id with
-    | None -> pure_name f
+    | None ->
+        begin match Option.bind f.lexical_owner ~f:(Generic_modules.member generics) with
+        | Some (group, _, _) ->
+            group.name ^ "." ^ (Qualified_name.of_string (pure_name f)).name
+        | None -> pure_name f
+        end
     | Some (group, _, stem) -> group.name ^ "." ^ stem)
 
 let body_pure_reference ?(polymorphic_functions = []) ~(generics : Generic_modules.t list)
     f =
   match
-    (function_worker polymorphic_functions f, Generic_modules.member generics f.id)
+    ( enclosing_worker polymorphic_functions f,
+      Generic_modules.member generics (Option.value f.lexical_owner ~default:f.id) )
   with
   | None, None -> pure_reference ~generics f
   | _ -> Qualified_name.of_string (body_pure_name ~polymorphic_functions ~generics f)
 
 let body_owner ~(generics : Generic_modules.t list) f =
-  match Generic_modules.member generics f.id with
+  match Generic_modules.member generics (Option.value f.lexical_owner ~default:f.id) with
   | None -> None
   | Some (group, application, _) ->
       Some (group, phys_equal application.source group.representative)
@@ -180,7 +199,7 @@ let body_destination ?(polymorphic_functions = []) ~(generics : Generic_modules.
     | None -> (body_module_context f).destination
     | Some (group, _) -> Module_context.Worker group
   in
-  match function_worker polymorphic_functions f with
+  match enclosing_worker polymorphic_functions f with
   | None -> parent
   | Some worker -> Module_context.Function_worker (worker, parent)
 
@@ -585,14 +604,37 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           | Some (_, false) -> false
           | Some (_, true) | None -> true
         in
+        let excluded =
+          Option.to_list
+            (Option.bind f.lexical_owner ~f:(fun id ->
+                 Option.map
+                   (List.find funcs ~f:(fun outer -> Ident.same outer.id id))
+                   ~f:(fun outer -> outer.scheme_type)))
+        in
         let* scheme =
-          Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
-            f.scheme_type
+          Polymorphic_functions.discover ~excluded ~expand:(Datatypes.expand types)
+            ~at:f.loc f.scheme_type
+        in
+        let inherited = List.concat_map excluded ~f:Polymorphic_functions.all_variables in
+        let captured_types =
+          f.scheme_type
+          :: List.filter_map f.params ~f:(fun parameter ->
+              match parameter.Typedtree.fp_kind with
+              | Tparam_pat pattern | Tparam_optional_default (pattern, _) ->
+                  Some pattern.pat_type)
+        in
+        let captures_type =
+          List.exists captured_types ~f:(fun typ ->
+              List.exists (Polymorphic_functions.all_variables typ) ~f:(fun variable ->
+                  List.mem inherited variable ~equal:Polymorphic_functions.same_variable))
         in
         if (not representative) || List.is_empty scheme.variables then Ok None
+        else if Option.is_some f.lexical_owner && captures_type then
+          unsupported f.loc "Generalized local functions with captured type parameters"
         else
           let source_binding =
-            List.exists inventory.values ~f:(fun entry ->
+            Option.is_some f.lexical_owner
+            || List.exists inventory.values ~f:(fun entry ->
                 match entry.Module_inventory.binding.vb_pat.pat_desc with
                 | Tpat_var (id, _, _) -> Ident.same id f.id
                 | _ -> false)
@@ -618,22 +660,6 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   in
   let* () =
     List.fold_result funcs ~init:() ~f:(fun () f ->
-        let enclosing =
-          List.find polymorphic_functions ~f:(fun worker ->
-              (not (Ident.same worker.id f.id))
-              && Proof_bindings.contains worker.loc f.loc
-              && not
-                   (List.exists inventory.values ~f:(fun entry ->
-                        match entry.Module_inventory.binding.vb_pat.pat_desc with
-                        | Tpat_var (id, _, _) -> Ident.same id f.id
-                        | _ -> false)))
-        in
-        match enclosing with
-        | None -> Ok ()
-        | Some _ -> unsupported f.loc "Local functions within polymorphic functions")
-  in
-  let* () =
-    List.fold_result funcs ~init:() ~f:(fun () f ->
         match function_worker polymorphic_functions f with
         | None -> Ok ()
         | Some _ ->
@@ -641,6 +667,10 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
             if
               List.exists polymorphic_functions ~f:(fun other ->
                   (not (Ident.same other.id f.id))
+                  && (not
+                        (List.exists funcs ~f:(fun candidate ->
+                             Ident.same candidate.id other.id
+                             && Option.is_some candidate.lexical_owner)))
                   && other.loc.loc_start.pos_cnum >= f.loc.loc_start.pos_cnum
                   && List.mem references other.id ~equal:Ident.same)
             then unsupported f.loc "Mutually recursive polymorphic functions"
@@ -1032,12 +1062,19 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
               (path, operation.operation_name))))
   in
   let lifted =
-    List.filter_map funcs ~f:(fun f ->
-        Option.some_if
-          ((not (List.is_empty f.prefix))
-          || (not (List.is_empty f.captured))
-          || Option.is_some f.role)
-          (proc_name f, (f.prefix_count, f.captured, f.role)))
+    List.concat_map funcs ~f:(fun f ->
+        if List.is_empty f.prefix && List.is_empty f.captured && Option.is_none f.role
+        then []
+        else
+          let metadata = (f.prefix_count, f.captured, f.role) in
+          (proc_name f, metadata)
+          ::
+          (if is_pure f then
+             [
+               (pure_name ~generics f, metadata);
+               (body_pure_name ~polymorphic_functions ~generics f, metadata);
+             ]
+           else []))
   in
   let lifted = with_body_names lifted in
   let ocaml_env = source.env in

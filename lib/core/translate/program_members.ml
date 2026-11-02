@@ -1468,9 +1468,17 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         in
         let representatives =
           List.filter funcs ~f:(fun f ->
-              List.exists groups ~f:(fun group ->
-                  List.exists group.representative.body_members ~f:(fun (_, id) ->
-                      Ident.same id f.id)))
+              (Option.is_some f.lexical_owner
+              && Option.is_some
+                   (Program_declarations.enclosing_worker polymorphic_functions f)
+              &&
+              match body_owner f with
+              | Some (_, false) -> false
+              | Some (_, true) | None -> true)
+              || List.exists groups ~f:(fun group ->
+                  match body_owner f with
+                  | Some (owner, true) -> phys_equal group owner
+                  | Some (_, false) | None -> false))
         in
         let map_functions ?(only_pure = false) initial target =
           let selected =
@@ -1632,9 +1640,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               func data ~shared:(body_shared f) ~ocaml_env:f.environment ~preds:predicates
                 ~funcs:pure_functions ~spec_funcs ~proof_support ~declaration_name
                 ~primitive_namespace ~polymorphic_functions:(body_polymorphic_registry f)
-                ~generic_predicates
+                ~lifted ~generic_predicates
                 ?current_polymorphic:
-                  (Program_declarations.function_worker polymorphic_functions f)
+                  (Program_declarations.enclosing_worker polymorphic_functions f)
                 f
             in
             Some (f, member))
@@ -1663,7 +1671,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      ~polymorphic_functions:(body_polymorphic_registry f)
                      ~generic_predicates
                      ?current_polymorphic:
-                       (Program_declarations.function_worker polymorphic_functions f)
+                       (Program_declarations.enclosing_worker polymorphic_functions f)
                      ())
                   with
                   functions;

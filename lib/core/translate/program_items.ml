@@ -160,6 +160,7 @@ let items source (inventory : Module_inventory.t) =
                    Source.annotation_env source ~at:site.item_loc site.environment;
                  signature_sites = entry.signatures;
                  scheme_type = vb.vb_pat.pat_type;
+                 lexical_owner = None;
                  raven_name = Fresh_names.fresh base;
                  params;
                  body;
@@ -423,6 +424,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           environment = Source.annotation_env source ~at:rest.exp_loc rest.exp_env;
           signature_sites = [];
           scheme_type = vb.vb_pat.pat_type;
+          lexical_owner = Some outer.id;
           raven_name =
             (if List.is_empty outer.namespace then Ident.name id
              else String.concat ~sep:"_" [ outer.raven_name; Ident.name id ]);

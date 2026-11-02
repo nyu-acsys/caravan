@@ -452,12 +452,27 @@ let program ?(history = History.default) (source : Source.t) :
     in
     captured && not final
   in
+  let* polymorphic_functions =
+    Polymorphic_functions.order polymorphic_functions ~dependencies:(fun worker ->
+        let namespace =
+          (Qualified_name.of_string worker.Polymorphic_functions.name).path
+        in
+        List.filter_map state.tables.function_instances ~f:(fun instance ->
+            if
+              List.is_prefix instance.instance_namespace
+                ~prefix:(String.split worker.name ~on:'.')
+                ~equal:String.equal
+              && (not (String.equal instance.instance_worker worker.name))
+              && List.exists polymorphic_functions ~f:(fun dependency ->
+                  String.equal dependency.name instance.instance_worker
+                  && List.equal String.equal namespace
+                       (Qualified_name.of_string dependency.name).path)
+            then Some instance.instance_worker
+            else None))
+  in
   let root_function_workers =
     List.filter polymorphic_functions ~f:(fun worker ->
         List.is_empty (Qualified_name.of_string worker.Polymorphic_functions.name).path)
-    |> List.stable_sort ~compare:(fun left right ->
-        Int.compare left.Polymorphic_functions.loc.loc_start.pos_cnum
-          right.Polymorphic_functions.loc.loc_start.pos_cnum)
   in
   let root_predicate_workers =
     List.filter generic_predicates ~f:(fun worker ->
@@ -635,9 +650,6 @@ let program ?(history = History.default) (source : Source.t) :
       List.filter polymorphic_functions ~f:(fun worker ->
           List.equal String.equal
             (Qualified_name.of_string worker.Polymorphic_functions.name).path namespace)
-      |> List.stable_sort ~compare:(fun left right ->
-          Int.compare left.Polymorphic_functions.loc.loc_start.pos_cnum
-            right.Polymorphic_functions.loc.loc_start.pos_cnum)
       |> List.filter ~f:(fun (worker : Polymorphic_functions.t) ->
           (not (List.is_empty namespace))
           || List.is_empty (Map.find_exn worker_dependencies worker.name))
