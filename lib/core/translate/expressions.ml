@@ -6,6 +6,17 @@ open Proof_terms
 open Atomic_proofs
 open State.Syntax
 
+let constructor_value ctx ~at ~result_type data constructor arguments =
+  let value =
+    R.Expr.call ~loc:(loc at)
+      (Datatypes.ctor_name ~loc:(loc at) data constructor)
+      arguments
+  in
+  if List.is_empty data.Datatypes.parameters then State.return value
+  else
+    let+ typ = State.of_result (typ ctx ~at result_type) in
+    R.Expr.annotated value typ
+
 let polymorphic_ordering ctx path (args : Typedtree.expression list) =
   match stdlib_name path with
   | Some ("<" | ">" | "<=" | ">=" | "compare") ->
@@ -105,11 +116,12 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) ->
       State.return ([], unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match Datatypes.find_cstr ctx.given.types cstr with
+      begin match occurrence_constructor ctx.given.types e.exp_type cstr with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (d, c) ->
-          let+ stmts, args = operands ctx args in
-          (stmts, R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args)
+          let* stmts, args = operands ctx args in
+          let+ value = constructor_value ctx ~at ~result_type:e.exp_type d c args in
+          (stmts, value)
       end
   | Texp_tuple components ->
       let+ stmts, components = operands ctx (List.map components ~f:snd) in
@@ -125,7 +137,11 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let* stmts, args = operands ctx (List.map values ~f:snd) in
       let label, _ = List.hd_exn fields in
-      begin match Datatypes.find_label ctx.given.types label with
+      begin match
+        Option.first_some
+          (Datatypes.instantiated ctx.given.types e.exp_type)
+          (Datatypes.find_label ctx.given.types label)
+      with
       | Some { heap = Some _; _ } ->
           let* typ = State.of_result (typ ctx ~at e.exp_type) in
           let* fields =
@@ -144,7 +160,8 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           ( stmts @ views @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
             R.Expr.var ~loc:l (name ~loc:l x) )
       | Some ({ ctors = [ c ]; _ } as d) ->
-          State.return (stmts, R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args)
+          let+ value = constructor_value ctx ~at ~result_type:e.exp_type d c args in
+          (stmts, value)
       | _ -> State.of_result (unsupported at "This record")
       end
   | Texp_record _ -> State.of_result (unsupported at "A record copied with changes")
@@ -958,7 +975,7 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
           [] )
   | Tpat_construct (_, { cstr_name = "()"; _ }, [], _) -> State.return ([], None, [])
   | Tpat_construct (_, cstr, ps, _) ->
-      begin match Datatypes.find_cstr ctx.given.types cstr with
+      begin match occurrence_constructor ctx.given.types p.pat_type cstr with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (_, c) ->
           let is_c = R.Expr.is_ ~loc:l v (ident ~loc:l c.raven) in
@@ -1123,7 +1140,7 @@ and flat_cases ctx v cases =
         begin match p.pat_desc with
         | Tpat_construct (_, cstr, ps, _) ->
             begin match
-              ( Datatypes.find_cstr ctx.given.types cstr,
+              ( occurrence_constructor ctx.given.types p.pat_type cstr,
                 Option.all (List.map ps ~f:flat_arg) )
             with
             | Some (_, c), Some args when not (List.mem seen c.raven ~equal:String.equal)
@@ -1266,11 +1283,23 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       State.return (R.Expr.bool ~loc:l (String.equal b "true"))
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) -> State.return (unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match Datatypes.find_cstr ctx.given.types cstr with
+      begin match occurrence_constructor ctx.given.types e.exp_type cstr with
       | None -> not_pure "This constructor"
       | Some (d, c) ->
-          let+ args = State.all args ~f:(pure_in values) in
-          R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args
+          let* args = State.all args ~f:(pure_in values) in
+          constructor_value ctx ~at ~result_type:e.exp_type d c args
+      end
+  | Texp_record { fields; extended_expression = None; _ } ->
+      begin match Datatypes.instantiated ctx.given.types e.exp_type with
+      | Some ({ heap = None; ctors = [ constructor ]; _ } as data) ->
+          let* arguments =
+            State.all (Array.to_list fields) ~f:(fun (_, definition) ->
+                match definition with
+                | Typedtree.Overridden (_, expression) -> pure_in values expression
+                | Kept _ -> not_pure "This record")
+          in
+          constructor_value ctx ~at ~result_type:e.exp_type data constructor arguments
+      | Some _ | None -> not_pure "A mutable record allocation"
       end
   | Texp_tuple components ->
       let+ components = State.all components ~f:(fun (_, c) -> pure_in values c) in
@@ -1307,6 +1336,15 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
                (qualified_name ~loc:l field))
       | None -> not_pure "This field"
     end
+  | Texp_field (record, _, label) ->
+      let* field = State.field_of_label ctx.given ~at label in
+      begin match field with
+      | Some (field, false) ->
+          let+ record = pure_in values record in
+          R.Expr.field ~loc:l record (qualified_name ~loc:l field)
+      | Some (_, true) -> not_pure "A read of a mutable field"
+      | None -> not_pure "This field"
+      end
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
     when runtime_structural_equality_unsafe ctx path a b ->
       State.of_result
@@ -1357,7 +1395,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       pure_in ((Ident.unique_name id, v) :: values) body
   | Texp_match (scrutinee, _, [], Total)
     when match Datatypes.desc ctx.given.types scrutinee.exp_type with
-         | Tconstr (path, [], _) ->
+         | Tconstr (path, _, _) ->
              Option.exists (Datatypes.find ctx.given.types path) ~f:(fun data ->
                  data.empty)
          | _ -> false ->

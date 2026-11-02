@@ -174,10 +174,9 @@ let asset_projection source plan path substitution =
       then Subst.add_module au.au_id (Path.Pdot (path, au.au_name)) substitution
       else substitution)
 
-let nullary_alias (declaration : Typedtree.type_declaration) =
+let manifest_alias (declaration : Typedtree.type_declaration) =
   match declaration.typ_kind with
-  | Ttype_abstract ->
-      List.is_empty declaration.typ_params && Option.is_some declaration.typ_manifest
+  | Ttype_abstract -> Option.is_some declaration.typ_manifest
   | _ -> false
 
 let plan groups scopes =
@@ -223,7 +222,9 @@ let plan groups scopes =
                   String.equal declaration.Typedtree.typ_name.txt
                     other.Typedtree.typ_name.txt)
             with
-            | [ other ] when nullary_alias declaration && nullary_alias other ->
+            | [ other ]
+              when manifest_alias declaration && manifest_alias other
+                   && List.length declaration.typ_params = List.length other.typ_params ->
                 Ok (declaration, other)
             | _ -> Report.unsupported declaration.typ_loc "This generic proof type alias")
         |> Result.all

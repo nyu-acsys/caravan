@@ -71,32 +71,37 @@ let value_signature =
 
 (** A value dictionary shares the total holds contract across leaf and container
     implementations. The carrier alias does not require an automatic Type provider. *)
-let value_dictionary_parameters ~loc ~parameters ~name ~carrier ~unrestricted ~body =
+let value_dictionary_with_members ~loc ~parameters ~name ~carrier ~unrestricted ~body
+    ~members =
   let ident text = R.Ident.make ~loc text in
   let variable text = R.Expr.var ~loc (R.Name.make ~loc text) in
   let own_carrier = R.Type.named ~loc (R.Name.make ~loc "Carrier") [] in
   R.Member.module_ ~loc ~params:parameters
     ~implements:[ (R.Name.make ~loc value_interface, []) ]
     (ident name)
-    [
-      R.Member.type_ ~loc ~rep:true (ident "Carrier") (Some carrier);
-      R.Member.callable
-        (R.Callable.func ~loc
-           ~returns:[ R.Var.make ~loc (ident "result") (R.Type.bool ~loc) ]
-           (ident "unrestricted") (Some unrestricted));
-      R.Member.callable
-        (R.Callable.func ~loc
-           ~formals:[ R.Var.make ~loc (ident "value") own_carrier ]
-           ~returns:[ R.Var.make ~loc (ident "result") (R.Type.bool ~loc) ]
-           ~ensures:
-             [
-               R.Spec.make
-                 (R.Expr.binary ~loc Impl
-                    (R.Expr.call ~loc (R.Name.make ~loc "unrestricted") [])
-                    (variable "result"));
-             ]
-           (ident "holds") (Some body));
-    ]
+    ((R.Member.type_ ~loc ~rep:true (ident "Carrier") (Some carrier) :: members)
+    @ [
+        R.Member.callable
+          (R.Callable.func ~loc
+             ~returns:[ R.Var.make ~loc (ident "result") (R.Type.bool ~loc) ]
+             (ident "unrestricted") (Some unrestricted));
+        R.Member.callable
+          (R.Callable.func ~loc
+             ~formals:[ R.Var.make ~loc (ident "value") own_carrier ]
+             ~returns:[ R.Var.make ~loc (ident "result") (R.Type.bool ~loc) ]
+             ~ensures:
+               [
+                 R.Spec.make
+                   (R.Expr.binary ~loc Impl
+                      (R.Expr.call ~loc (R.Name.make ~loc "unrestricted") [])
+                      (variable "result"));
+               ]
+             (ident "holds") (Some body));
+      ])
+
+let value_dictionary_parameters ~loc ~parameters ~name ~carrier ~unrestricted ~body =
+  value_dictionary_with_members ~loc ~parameters ~name ~carrier ~unrestricted ~body
+    ~members:[]
 
 let value_dictionary ~loc ~name ~carrier ~unrestricted ~body =
   value_dictionary_parameters ~loc ~parameters:[] ~name ~carrier ~unrestricted ~body

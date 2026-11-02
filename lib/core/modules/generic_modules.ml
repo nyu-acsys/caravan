@@ -148,8 +148,20 @@ let eligible (source : Module_inventory.specialization) =
                 List.for_all declarations ~f:(fun declaration ->
                     match declaration.Typedtree.typ_kind with
                     | Ttype_abstract -> Option.is_some declaration.typ_manifest
-                    | Ttype_variant _ | Ttype_record _ ->
+                    | Ttype_variant constructors ->
                         List.is_empty declaration.typ_params
+                        || List.for_all constructors ~f:(fun constructor ->
+                            Option.is_none constructor.Typedtree.cd_res
+                            &&
+                            match constructor.cd_args with
+                            | Cstr_tuple _ -> true
+                            | Cstr_record _ -> false)
+                    | Ttype_record fields ->
+                        List.is_empty declaration.typ_params
+                        || List.for_all fields ~f:(fun field ->
+                            match field.Typedtree.ld_mutable with
+                            | Immutable -> true
+                            | Mutable -> false)
                     | _ -> false)
             | _ -> false)
     | None -> false

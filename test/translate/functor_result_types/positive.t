@@ -70,3 +70,5 @@
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' sealed_nested.rav
   3
+  $ caravan --shh polymorphic.ml
+  Verification successful.

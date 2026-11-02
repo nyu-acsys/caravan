@@ -36,13 +36,6 @@
   Related Location: This assertion may not hold.
   [1]
 
-  $ caravan --shh polymorphic_fail.ml
-  [Error] File "polymorphic_fail.ml", line 4, columns 2-25:
-  4 |   type 'a t = Value of 'a
-        ^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A type with parameters is not supported yet.
-  [1]
-
   $ caravan --shh sealed_nested_fail.ml
   [Error] File "sealed_nested_fail.ml", line 28, columns 41-42:
   28 | let incorrect (x : First.t) : Second.t = x

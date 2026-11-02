@@ -1148,19 +1148,14 @@ end
 (** The atomic that the field [label] of a value of the immutable record type [t] holds:
     its type, if it is one. *)
 let atomic_in_record ctx (t : Types.type_expr) label =
-  match Datatypes.desc ctx.given.types t with
-  | Tconstr (p, [], _) ->
-      begin match Datatypes.find ctx.given.types p with
-      | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
-          List.find_map (List.zip_exn fields args) ~f:(fun (f, a) ->
-              match Datatypes.desc ctx.given.types a with
-              | Tconstr (q, [ _ ], _) when String.equal f label && Datatypes.is_atomic q
-                ->
-                  Some a
-              | _ -> None)
-      | _ -> None
-      end
-  | _ -> None
+  match Datatypes.instantiated ctx.given.types t with
+  | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
+      List.find_map (List.zip_exn fields args) ~f:(fun (f, a) ->
+          match Datatypes.desc ctx.given.types a with
+          | Tconstr (q, [ _ ], _) when String.equal f label && Datatypes.is_atomic q ->
+              Some a
+          | _ -> None)
+  | Some _ | None -> None
 
 (** The OCaml type of the field [label] of values of type [t] that are references, or of
     the contents of an atomic an immutable record holds. *)
@@ -1178,8 +1173,8 @@ let backend_field_type ctx (t : Types.type_expr) label =
           Some elt
       | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
           Some elt
-      | Tconstr (p, [], _) ->
-          begin match Datatypes.find ctx.given.types p with
+      | Tconstr _ ->
+          begin match Datatypes.instantiated ctx.given.types t with
           | Some { heap = Some fields; _ } ->
               Option.map
                 (List.find fields ~f:(fun f -> String.equal f.label label))
@@ -1447,8 +1442,23 @@ let logical_key env q =
           end
       end
 
-let find_constructor env q =
-  Option.bind (Source.constructor env.ctx.given.env q) ~f:(Datatypes.find_cstr env.data)
+let occurrence_constructor types occurrence
+    (description : Data_types.constructor_description) =
+  Option.bind (Datatypes.find_cstr types description) ~f:(fun (data, constructor) ->
+      match (Types.get_desc description.cstr_res, Datatypes.desc types occurrence) with
+      | Tconstr (_, parameters, _), Tconstr (_, arguments, _) ->
+          Option.map
+            (Option.all
+               (List.map description.cstr_args
+                  ~f:(Datatypes.instantiate_alias parameters arguments)))
+            ~f:(fun args -> (data, { constructor with args }))
+      | _ -> None)
+
+let find_constructor ?occurrence env q =
+  Option.bind (Source.constructor env.ctx.given.env q) ~f:(fun description ->
+      match occurrence with
+      | Some occurrence -> occurrence_constructor env.data occurrence description
+      | None -> Datatypes.find_cstr env.data description)
 
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)
@@ -1798,14 +1808,11 @@ let existential_field x label = x ^ "_" ^ label
 (** The data type and constructor of the logical record type [t], a record type without
     mutable fields, with its fields and their types. *)
 let logical_record env (t : Types.type_expr) =
-  match Datatypes.desc env.data t with
-  | Tconstr (p, [], _) ->
-      Option.bind (Datatypes.find env.data p) ~f:(fun d ->
-          match d.ctors with
-          | [ c ] when String.is_empty c.ocaml && Option.is_none d.heap ->
-              Some (d, c, List.zip_exn c.fields c.args)
-          | _ -> None)
-  | _ -> None
+  Option.bind (Datatypes.instantiated env.data t) ~f:(fun d ->
+      match d.ctors with
+      | [ c ] when String.is_empty c.ocaml && Option.is_none d.heap ->
+          Some (d, c, List.zip_exn c.fields c.args)
+      | _ -> None)
 
 (** Whether a local module has a hidden representation in this lexical environment. *)
 let opaque_module_path env path =

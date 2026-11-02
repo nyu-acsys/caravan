@@ -365,8 +365,11 @@ let program ?(history = History.default) (source : Source.t) :
   let argument_domains = argument_domains @ state.tables.dictionaries in
   let layout_domain_requests =
     List.concat_map types ~f:(fun data ->
-        if data.Datatypes.mathematical || not (Result_layouts.contains layouts data) then
-          []
+        if
+          data.Datatypes.mathematical
+          || (not (List.is_empty data.parameters))
+          || not (Result_layouts.contains layouts data)
+        then []
         else
           List.concat_map data.ctors ~f:(fun ctor ->
               List.map ctor.Datatypes.args ~f:(fun t ->
@@ -801,12 +804,23 @@ let program ?(history = History.default) (source : Source.t) :
              Module_context.Flat ~at:l ~representations:[] ~native_resources:[]
              ~applications:[] ~late_members:members))
   in
-  let value_factories =
-    List.filter types ~f:Datatypes.is_value_family
-    |> List.dedup_and_sort ~compare:(fun left right ->
-        String.compare left.Datatypes.module_name right.Datatypes.module_name)
-    |> List.concat_map ~f:Datatypes.value_family_members
+  let _, family_types =
+    List.fold types
+      ~init:(Set.empty (module String), [])
+      ~f:(fun (seen, families) data ->
+        let name = Datatypes.value_family_name data in
+        if
+          (not (Datatypes.is_value_family data))
+          || Option.value_map data.module_path ~default:false ~f:(fun path ->
+              List.length path <> 1)
+          || Set.mem seen name
+        then (seen, families)
+        else (Set.add seen name, data :: families))
   in
+  let* value_family_parts =
+    all (List.rev family_types) ~f:(Datatypes.value_family_members types)
+  in
+  let value_factory_templates = List.concat_map value_family_parts ~f:snd in
   let dictionary_for binding id =
     let concrete = checked_raw_types types binding in
     Option.value_exn
@@ -851,7 +865,7 @@ let program ?(history = History.default) (source : Source.t) :
             members
         in
         match group.world with
-        | None -> Ok (worker, [])
+        | None -> Ok (worker, [], [])
         | Some world ->
             let* layout_types =
               Result_layouts.symbolic layouts group ~owner:[ world; "Shape" ]
@@ -881,6 +895,13 @@ let program ?(history = History.default) (source : Source.t) :
                 (List.filter layout_types ~f:(fun d -> Option.is_none d.Datatypes.heap))
                 ~f:(Datatypes.member environment)
             in
+            let* family_parts =
+              all layout_types ~f:(Datatypes.value_family_members environment)
+            in
+            let family_members =
+              Datatypes.unique_domain_members (List.concat_map family_parts ~f:fst)
+            in
+            let family_templates = List.concat_map family_parts ~f:snd in
             let* fields =
               all
                 (List.concat_map layout_types ~f:(fun d ->
@@ -955,9 +976,11 @@ let program ?(history = History.default) (source : Source.t) :
               let layout_roots =
                 List.concat_map layout_types ~f:(fun data ->
                     let own =
-                      Option.to_list
-                        (Option.map data.Datatypes.id ~f:(fun id ->
-                             Ctype.newconstr (Path.Pident id) []))
+                      if not (List.is_empty data.Datatypes.parameters) then []
+                      else
+                        Option.to_list
+                          (Option.map data.Datatypes.id ~f:(fun id ->
+                               Ctype.newconstr (Path.Pident id) []))
                     in
                     own
                     @ List.map (Option.value data.heap ~default:[]) ~f:(fun field ->
@@ -993,7 +1016,8 @@ let program ?(history = History.default) (source : Source.t) :
             in
             let world_domains =
               Datatypes.unique_domain_members
-                (List.filter_map layout_domain_members ~f:(fun (name, member) ->
+                (List.filter_map (family_members @ layout_domain_members)
+                   ~f:(fun (name, member) ->
                      Option.some_if
                        (List.equal String.equal (Qualified_name.of_string name).path
                           [ world ])
@@ -1007,7 +1031,13 @@ let program ?(history = History.default) (source : Source.t) :
             in
             let shape =
               R.Member.module_ ~loc:l ~interface:true (ident ~loc:l "Shape")
-                (data_members @ layout_domains @ fields)
+                (data_members
+                @ List.filter_map family_members ~f:(fun (name, member) ->
+                    Option.some_if
+                      (List.equal String.equal (Qualified_name.of_string name).path
+                         [ world; "Shape" ])
+                      member)
+                @ layout_domains @ fields)
             in
             let factory =
               R.Member.unit_factory ~loc:l
@@ -1033,12 +1063,29 @@ let program ?(history = History.default) (source : Source.t) :
                            phys_equal candidate group)
                       |> fst)
                   @ [ shape; factory; worker ]),
-                layout_templates ))
+                family_templates @ layout_templates,
+                List.filter family_members ~f:(fun (name, _) ->
+                    List.is_empty (Qualified_name.of_string name).path) ))
   in
-  let generic_implementations, layout_templates =
-    List.unzip generic_implementation_templates
+  let generic_implementations =
+    List.map generic_implementation_templates ~f:(fun (members, _, _) -> members)
   in
-  let value_templates = ordinary_value_templates @ List.concat layout_templates in
+  let layout_templates =
+    List.map generic_implementation_templates ~f:(fun (_, templates, _) -> templates)
+  in
+  let value_factories =
+    Datatypes.unique_domain_members
+      (List.concat_map value_family_parts ~f:fst
+      @ List.concat_map generic_implementation_templates ~f:(fun (_, _, dependencies) ->
+          dependencies))
+    |> List.filter_map ~f:(fun (name, member) ->
+        Option.some_if
+          (not (List.Assoc.mem value_domains name ~equal:String.equal))
+          member)
+  in
+  let value_templates =
+    ordinary_value_templates @ value_factory_templates @ List.concat layout_templates
+  in
   let needs_template template = List.mem value_templates template ~equal:Poly.equal in
   let tuple_arities =
     List.filter_map value_templates ~f:(function

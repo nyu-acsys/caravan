@@ -97,8 +97,8 @@ let rec term_type env (t : S.term) =
                    if String.equal f "hd" then Some elt
                    else if String.equal f "tl" then Some ty
                    else None
-               | Tconstr (p, [], _) ->
-                   Option.bind (Datatypes.find env.data p) ~f:(fun d ->
+               | Tconstr _ ->
+                   Option.bind (Datatypes.instantiated env.data ty) ~f:(fun d ->
                        match d.ctors with
                        | [ c ] ->
                            Option.map
@@ -179,17 +179,16 @@ and pattern_types env (p : S.pat) (t : Types.type_expr) : (string * Types.type_e
         | "::", [ elt ] when Path.same path Predef.path_list -> [ elt; t ]
         | "Some", [ elt ] when Path.same path Predef.path_option -> [ elt ]
         | _ ->
-            begin match find_constructor env q with
-            | Some (d, ctor) when Datatypes.declares d path -> ctor.args
-            | Some _ | None ->
-                begin match Datatypes.find env.data path with
-                | Some d ->
+            begin match find_constructor ~occurrence:t env q with
+            | Some (_, constructor) -> constructor.args
+            | None ->
+                Option.value_map (Datatypes.instantiated env.data t) ~default:[]
+                  ~f:(fun data ->
                     Option.value_map
-                      (List.find d.ctors ~f:(fun ctor -> String.equal ctor.ocaml c))
+                      (List.find data.ctors ~f:(fun constructor ->
+                           String.equal constructor.ocaml c))
                       ~default:[]
-                      ~f:(fun ctor -> ctor.args)
-                | None -> []
-                end
+                      ~f:(fun constructor -> constructor.args))
             end
       in
       let arg_patterns =
@@ -279,7 +278,19 @@ let equality_check env (id : S.id) operator a b =
       begin match (term_type env a, term_type env b) with
       | Some left, Some right
         when not (Ctype.is_equal env.ctx.given.env false [ left ] [ right ]) ->
-          error id.pid_loc "Logical equality requires operands of the same OCaml type"
+          let operator = S.mk_term (Tvar (Qid id)) id.pid_loc in
+          let application = S.mk_term (Tapply (operator, a)) a.term_loc in
+          let comparison = S.mk_term (Tapply (application, b)) id.pid_loc in
+          begin match
+            Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+              ~functions:(List.map env.funcs ~f:fst)
+              ~variables:(Logical_context.variables env)
+              ~expected:Predef.type_bool comparison
+          with
+          | Ok () -> Ok ()
+          | Error _ ->
+              error id.pid_loc "Logical equality requires operands of the same OCaml type"
+          end
       | _ -> Ok ()
       end
   | ("=" | "<>") when not (nullary_constructor a || nullary_constructor b) ->
@@ -550,47 +561,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Ttuple ts ->
       let+ ts = State.all ts ~f:(formula env) in
       R.Expr.tuple ~loc:l ts
-  | Trecord (base, updates) ->
-      let* record_type =
-        match base with
-        | Some base -> State.return (term_type env base)
-        | None ->
-            State.map ~f:Option.some
-              (State.of_result
-                 (Source.infer_logical_expression env.ctx.given.env
-                    ~functions:(List.map env.funcs ~f:fst)
-                    ~variables:(Logical_context.variables env)
-                    t))
-      in
-      begin match Option.bind record_type ~f:(logical_record env) with
-      | None -> State.of_result (error at "This record is not of a logical record type")
-      | Some (d, c, fields) ->
-          let* (_ : unit list) =
-            State.all updates ~f:(fun ((u : S.id), _) ->
-                if List.Assoc.mem fields u.pid_str ~equal:String.equal then
-                  State.return ()
-                else
-                  State.of_result
-                    (error u.pid_loc
-                       (Printf.sprintf "This record has no field %s" u.pid_str)))
-          in
-          let+ args =
-            State.all fields ~f:(fun (label, field_type) ->
-                match
-                  ( List.find updates ~f:(fun ((u : S.id), _) ->
-                        String.equal u.pid_str label),
-                    base )
-                with
-                | Some (_, value), _ -> expected_formula env (Some field_type) value
-                | None, Some base ->
-                    formula env
-                      (S.mk_term (Tfield (base, Qid (S.mk_id ~loc:at label))) at)
-                | None, None ->
-                    State.of_result
-                      (error at (Printf.sprintf "This record has no field %s" label)))
-          in
-          R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args
-      end
+  | Trecord (base, updates) -> record env t base updates
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
       let* scrutinee_type =
@@ -717,6 +688,21 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
   | Some ty, Some elements when is_sequence ty ->
       let+ elements = State.all elements ~f:(formula env) in
       R.Expr.seq ~loc:(loc t.term_loc) elements
+  | Some expected, _
+    when Option.is_some (logical_record env expected)
+         && match t.term_desc with Trecord _ -> true | _ -> false ->
+      begin match t.term_desc with
+      | Trecord (base, updates) -> record ~expected env t base updates
+      | _ -> formula env t
+      end
+  | Some expected, _
+    when begin match fst (spine t []) with
+         | { term_desc = Tvar q; _ } ->
+             Option.exists (find_constructor env q) ~f:(fun (data, _) ->
+                 not (List.is_empty data.parameters))
+         | _ -> false
+         end ->
+      constructor ~expected env t (snd (spine t []))
   | Some expected, _
     when match spine t [] with
          | { term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, _ ->
@@ -1196,7 +1182,7 @@ and location_of env (t : S.term) =
         end)
 
 (** The constructor [t], or the application [t] of a constructor to [args]. *)
-and constructor env (t : S.term) args =
+and constructor ?expected env (t : S.term) args =
   let at = t.term_loc in
   let l = loc at in
   let head, _ = spine t [] in
@@ -1211,8 +1197,88 @@ and constructor env (t : S.term) args =
         match a.term_desc with Ttuple ts -> Some ts | _ -> None
       in
       let* args = State.of_result (ctor_args ~at (List.length c.fields) args ~tuple) in
-      let+ args = State.all args ~f:(formula env) in
-      R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l d c) args
+      let* occurrence =
+        match expected with
+        | Some _ -> State.return expected
+        | None when List.is_empty d.parameters || List.is_empty args -> State.return None
+        | None ->
+            State.map ~f:Option.some
+              (State.of_result
+                 (Source.infer_logical_expression env.ctx.given.env
+                    ~functions:(List.map env.funcs ~f:fst)
+                    ~variables:(Logical_context.variables env)
+                    t))
+      in
+      let data, ctor =
+        Option.value
+          (Option.bind occurrence ~f:(fun occurrence ->
+               find_constructor ~occurrence env q))
+          ~default:(d, c)
+      in
+      let* args =
+        if Option.is_some occurrence && List.length ctor.args = List.length args then
+          State.all (List.zip_exn ctor.args args) ~f:(fun (typ, argument) ->
+              expected_formula env (Some typ) argument)
+        else State.all args ~f:(formula env)
+      in
+      let value = R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data ctor) args in
+      begin match expected with
+      | Some expected when not (List.is_empty data.parameters) ->
+          let+ typ = State.of_result (typ env.ctx ~at expected) in
+          R.Expr.annotated value typ
+      | Some _ | None -> State.return value
+      end
+
+and record ?expected env (t : S.term) base updates =
+  let at = t.term_loc in
+  let l = loc at in
+  let* record_type =
+    match (expected, base) with
+    | Some expected, _ -> State.return (Some expected)
+    | None, Some base -> State.return (term_type env base)
+    | None, None ->
+        State.map ~f:Option.some
+          (State.of_result
+             (Source.infer_logical_expression env.ctx.given.env
+                ~functions:(List.map env.funcs ~f:fst)
+                ~variables:(Logical_context.variables env)
+                t))
+  in
+  match Option.bind record_type ~f:(logical_record env) with
+  | None -> State.of_result (error at "This record is not of a logical record type")
+  | Some (data, constructor, fields) ->
+      let* () =
+        State.iter updates ~f:(fun ((field : S.id), _) ->
+            if List.Assoc.mem fields field.pid_str ~equal:String.equal then
+              State.return ()
+            else
+              State.of_result
+                (error field.pid_loc
+                   (Printf.sprintf "This record has no field %s" field.pid_str)))
+      in
+      let* arguments =
+        State.all fields ~f:(fun (label, field_type) ->
+            match
+              ( List.find updates ~f:(fun ((field : S.id), _) ->
+                    String.equal field.pid_str label),
+                base )
+            with
+            | Some (_, value), _ -> expected_formula env (Some field_type) value
+            | None, Some base ->
+                formula env (S.mk_term (Tfield (base, Qid (S.mk_id ~loc:at label))) at)
+            | None, None ->
+                State.of_result
+                  (error at (Printf.sprintf "This record has no field %s" label)))
+      in
+      let value =
+        R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data constructor) arguments
+      in
+      begin match expected with
+      | Some expected when not (List.is_empty data.parameters) ->
+          let+ typ = State.of_result (typ env.ctx ~at expected) in
+          R.Expr.annotated value typ
+      | Some _ | None -> State.return value
+      end
 
 (** A match on the value [v] in a contract: a Raven match if the cases are flat, and
     otherwise conditional expressions, whose last case is not tested. *)

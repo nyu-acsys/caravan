@@ -998,6 +998,14 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
               | _ -> true)
         in
         let representation_stable =
+          let parameterized_data =
+            List.exists group.representative.declarations ~f:(fun declaration ->
+                (not (List.is_empty declaration.Typedtree.typ_params))
+                &&
+                match declaration.typ_kind with
+                | Ttype_variant _ | Ttype_record _ -> true
+                | _ -> false)
+          in
           List.for_all group.applications ~f:(fun application ->
               List.for_all application.source.parameters ~f:(fun instance ->
                   let concrete =
@@ -1011,11 +1019,15 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
                         Btype.newgenty
                           (Tconstr (Path.Pident declaration.typ_id, [], ref Types.Mnil))
                       in
-                      match Datatypes.desc concrete t with
-                      | Tconstr (path, _, _) ->
-                          Option.exists (Datatypes.find concrete path) ~f:(fun data ->
-                              Option.is_some data.Datatypes.library)
-                      | _ -> false)))
+                      if parameterized_data then
+                        Result.is_ok (Datatypes.typ concrete ~at:declaration.typ_loc t)
+                        && Option.is_some (Datatypes.dictionary_name concrete t)
+                      else
+                        match Datatypes.desc concrete t with
+                        | Tconstr (path, [], _) ->
+                            Option.exists (Datatypes.find concrete path) ~f:(fun data ->
+                                Option.is_some data.library)
+                        | _ -> false)))
         in
         Ok
           (Option.some_if

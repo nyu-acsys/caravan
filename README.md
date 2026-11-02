@@ -27,10 +27,16 @@ retain their source-value constraints at each instantiation. Parameterized type
 aliases and generic ownership predicates work with imported function contracts;
 the Saturn Treiber stack and its drain clients use this support. Higher-order
 parameters, explicitly quantified source annotations, generalized local functions
-and local helpers in generic bodies remain unsupported, as do parameterized record and variant
-definitions and ordering on generic values.
+and local helpers in generic bodies remain unsupported, as do parameterized mutable
+records and ordering on generic values.
 
-Functions and monomorphic types can be grouped in `module ... = struct ... end`,
+Variants and immutable records can have type parameters, including regular recursive
+definitions. Their carriers are shared across callers, source modules and supported
+functors. Constructor and record annotations use the surrounding type when payloads
+alone cannot determine it. GADTs, inline constructor records and nonregular recursive
+datatypes remain unsupported.
+
+Functions and types can be grouped in `module ... = struct ... end`,
 including nested modules. Calls and annotations resolve names in their enclosing
 OCaml scope. Plain module aliases retain the original types and ownership predicates.
 Named signatures and `.mli` files restrict the members available to callers;

@@ -76,16 +76,34 @@ let concrete layouts types =
       match List.find layouts ~f:(fun entry -> same_type entry.concrete data) with
       | None -> Ok data
       | Some entry ->
-          Result.map (descriptor entry ~owner:[ (owner layouts entry).layout ])
+          Result.bind (descriptor entry ~owner:[ (owner layouts entry).layout ])
             ~f:(fun representation ->
-              {
-                data with
-                module_path = representation.module_path;
-                cell_namespace = representation.cell_namespace;
-                backend_type = representation.backend_type;
-                ctors = representation.ctors;
-                heap = representation.heap;
-              }))
+              let rebind typ =
+                match
+                  Datatypes.instantiate_alias representation.parameters data.parameters
+                    typ
+                with
+                | Some typ -> Ok typ
+                | None ->
+                    Report.unsupported data.at
+                      "A datatype layout with incompatible parameters"
+              in
+              let ctors =
+                List.map representation.ctors ~f:(fun ctor ->
+                    Result.map
+                      (Result.all (List.map ctor.args ~f:rebind))
+                      ~f:(fun args -> { ctor with args }))
+                |> Result.all
+              in
+              Result.map ctors ~f:(fun ctors ->
+                  {
+                    data with
+                    module_path = representation.module_path;
+                    cell_namespace = representation.cell_namespace;
+                    backend_type = representation.backend_type;
+                    ctors;
+                    heap = representation.heap;
+                  })))
   |> Result.all
 
 let symbolic layouts group ~owner =
