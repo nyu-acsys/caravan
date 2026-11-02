@@ -6,6 +6,17 @@ open Proof_terms
 open Atomic_proofs
 open State.Syntax
 
+let polymorphic_ordering ctx path (args : Typedtree.expression list) =
+  match stdlib_name path with
+  | Some ("<" | ">" | "<=" | ">=" | "compare") ->
+      List.exists args ~f:(fun argument ->
+          List.exists
+            (Polymorphic_functions.all_variables
+               (Datatypes.expand ctx.given.types argument.exp_type))
+            ~f:(fun variable ->
+              Option.is_some (Datatypes.find_variable ctx.given.types variable)))
+  | _ -> false
+
 (** The statements evaluating [e], and the value of [e] after them; [tail] if the value is
     the function's result. *)
 let rec expr ?(tail = false) ?(continue_state = false) ?(keep_scope = false)
@@ -210,9 +221,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       (scrutinee_stmts @ naming @ fst stmts, snd stmts)
   | Texp_match (_, _, _ :: _, _) -> State.of_result (unsupported at "An effect handler")
-  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) ->
+  | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
       let* args = State.of_result (plain_args ~at args) in
-      apply ctx e path args
+      apply ctx e path declaration callee.exp_type args
   | Texp_apply _ -> State.of_result (unsupported at "This application")
   | Texp_ifthenelse (c, e1, e2) ->
       let* polarity = cas_polarity c in
@@ -355,12 +366,18 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           ],
         unit_value ~loc:l )
   | Texp_assert (c, _) ->
-      let+ stmts, c = expr ctx c in
-      (stmts @ [ R.Stmt.assert_ ~loc:l (R.Spec.make c) ], unit_value ~loc:l)
+      let* stmts, c = expr ctx c in
+      let statements = stmts @ [ R.Stmt.assert_ ~loc:l (R.Spec.make c) ] in
+      if is_unit e.exp_type then State.return (statements, unit_value ~loc:l)
+      else
+        let* typ = State.of_result (typ ctx ~at e.exp_type) in
+        let+ result = State.fresh "unreachable" in
+        ( statements @ R.Stmt.local ~loc:l ~typ (ident ~loc:l result),
+          R.Expr.var ~loc:l (name ~loc:l result) )
   | _ -> State.of_result (unsupported at "This expression")
 
 (** The application of the function at [path] to [args], in [e]. *)
-and apply ctx (e : Typedtree.expression) (path : Path.t)
+and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
     (args : Typedtree.expression list) =
   let at = e.exp_loc in
   let l = loc at in
@@ -408,7 +425,7 @@ and apply ctx (e : Typedtree.expression) (path : Path.t)
       let* writing = State.ordinary_write ctx.given ~at ~field ~elt:int_type r v' in
       let+ overflow = State.no_overflow ~at what v' in
       (stmts @ reading @ [ overflow; writing ], unit_value ~loc:l)
-  | _ -> apply_operator ctx e path args
+  | _ -> apply_operator ctx e path declaration occurrence args
 
 (** The application of [Atomic.op] to [args], in [e]. *)
 and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) =
@@ -532,105 +549,115 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   | _ -> State.of_result (unsupported at ("Atomic." ^ op))
 
 (** The application of the operator or function at [path] to [args], in [e]. *)
-and apply_operator ctx (e : Typedtree.expression) (path : Path.t)
+and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
     (args : Typedtree.expression list) =
   let at = e.exp_loc in
   let l = loc at in
-  match (binop_of_path path, unop_of_path path, args) with
-  | Some (Eq | Neq), _, [ a; b ] when runtime_structural_equality_unsafe ctx path a b ->
-      State.of_result
-        (error at "Structural equality on values containing references is unsupported")
-  | Some ((And | Or) as op), _, [ a; b ] ->
-      (* The right operand is evaluated only if the left one does not decide. *)
-      let* a_stmts, a = expr ctx a in
-      let* before = get_path in
-      let* b_stmts, b = expr ctx b in
-      (* The snapshots that the right operand takes are on one path only. *)
-      let* () =
-        modify_path (fun path ->
-            {
-              path with
-              snapshots = common_snapshots [ before.snapshots; path.snapshots ];
-              positions = before.positions;
-            })
-      in
-      if List.is_empty b_stmts then State.return (a_stmts, R.Expr.binary ~loc:l op a b)
-      else
-        let then_, else_ =
-          match op with And -> (`Rhs, `Value false) | _ -> (`Value true, `Rhs)
+  if polymorphic_ordering ctx path args then
+    State.of_result (unsupported at "Ordering on polymorphic values")
+  else
+    match (binop_of_path path, unop_of_path path, args) with
+    | Some (Eq | Neq), _, [ a; b ] when runtime_structural_equality_unsafe ctx path a b ->
+        State.of_result
+          (error at "Structural equality on values containing references is unsupported")
+    | Some ((And | Or) as op), _, [ a; b ] ->
+        (* The right operand is evaluated only if the left one does not decide. *)
+        let* a_stmts, a = expr ctx a in
+        let* before = get_path in
+        let* b_stmts, b = expr ctx b in
+        (* The snapshots that the right operand takes are on one path only. *)
+        let* () =
+          modify_path (fun path ->
+              {
+                path with
+                snapshots = common_snapshots [ before.snapshots; path.snapshots ];
+                positions = before.positions;
+              })
         in
-        let+ stmts, v =
-          branch ctx e (fun target ->
-              let target = Option.value_exn target in
-              let arm = function
-                | `Rhs -> b_stmts @ [ assign target b ]
-                | `Value v -> [ assign target (R.Expr.bool ~loc:l v) ]
-              in
-              State.return [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
+        if List.is_empty b_stmts then State.return (a_stmts, R.Expr.binary ~loc:l op a b)
+        else
+          let then_, else_ =
+            match op with And -> (`Rhs, `Value false) | _ -> (`Value true, `Rhs)
+          in
+          let+ stmts, v =
+            branch ctx e (fun target ->
+                let target = Option.value_exn target in
+                let arm = function
+                  | `Rhs -> b_stmts @ [ assign target b ]
+                  | `Value v -> [ assign target (R.Expr.bool ~loc:l v) ]
+                in
+                State.return [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
+          in
+          (a_stmts @ stmts, v)
+    | Some ((Eq | Neq) as op), _, [ a; b ]
+      when is_physical path && not (exact_physical ctx.given.types a b) -> (
+        let* b_stmts, b = expr ctx b in
+        let* a_stmts, a = expr ctx a in
+        let+ x = State.fresh "same" in
+        let same = R.Expr.var ~loc:l (name ~loc:l x) in
+        ( b_stmts @ a_stmts
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.bool ~loc:l) (ident ~loc:l x)
+          @ [
+              R.Stmt.havoc ~loc:l (name ~loc:l x);
+              R.Stmt.assume ~loc:l
+                (R.Spec.make
+                   (R.Expr.binary ~loc:l Impl same (R.Expr.binary ~loc:l Eq a b)));
+            ],
+          match op with Eq -> same | _ -> R.Expr.not_ ~loc:l same ))
+    | Some op, _, [ a; b ] ->
+        let divisor = b.exp_loc in
+        let* b_stmts, b = expr ctx b in
+        let* a_stmts, a = expr ctx a in
+        let stmts = b_stmts @ a_stmts in
+        let nonzero () =
+          State.check ~at:divisor "This divisor may be zero"
+            (R.Expr.binary ~loc:(loc divisor) Neq b (R.Expr.int ~loc:(loc divisor) 0))
         in
-        (a_stmts @ stmts, v)
-  | Some ((Eq | Neq) as op), _, [ a; b ]
-    when is_physical path && not (exact_physical ctx.given.types a b) -> (
-      let* b_stmts, b = expr ctx b in
-      let* a_stmts, a = expr ctx a in
-      let+ x = State.fresh "same" in
-      let same = R.Expr.var ~loc:l (name ~loc:l x) in
-      ( b_stmts @ a_stmts
-        @ R.Stmt.local ~loc:l ~typ:(R.Type.bool ~loc:l) (ident ~loc:l x)
-        @ [
-            R.Stmt.havoc ~loc:l (name ~loc:l x);
-            R.Stmt.assume ~loc:l
-              (R.Spec.make (R.Expr.binary ~loc:l Impl same (R.Expr.binary ~loc:l Eq a b)));
-          ],
-        match op with Eq -> same | _ -> R.Expr.not_ ~loc:l same ))
-  | Some op, _, [ a; b ] ->
-      let divisor = b.exp_loc in
-      let* b_stmts, b = expr ctx b in
-      let* a_stmts, a = expr ctx a in
-      let stmts = b_stmts @ a_stmts in
-      let nonzero () =
-        State.check ~at:divisor "This divisor may be zero"
-          (R.Expr.binary ~loc:(loc divisor) Neq b (R.Expr.int ~loc:(loc divisor) 0))
-      in
-      let checked what v =
-        let+ overflow = State.no_overflow ~at what v in
-        (stmts @ [ overflow ], v)
-      in
-      begin match op with
-      | Plus -> checked "addition" (R.Expr.binary ~loc:l op a b)
-      | Minus -> checked "subtraction" (R.Expr.binary ~loc:l op a b)
-      | Mult -> checked "multiplication" (R.Expr.binary ~loc:l op a b)
-      | Div ->
-          let v = prelude_call ~loc:l Prelude.div [ a; b ] in
-          let* nonzero = nonzero () in
-          let+ overflow = State.no_overflow ~at "division" v in
-          (stmts @ [ nonzero; overflow ], v)
-      | Mod ->
-          let+ nonzero = nonzero () in
-          (stmts @ [ nonzero ], prelude_call ~loc:l Prelude.mod_ [ a; b ])
-      | _ -> State.return (stmts, R.Expr.binary ~loc:l op a b)
-      end
-  | _, Some op, [ a ] -> (
-      let* stmts, a = expr ctx a in
-      match op with
-      | `Not -> State.return (stmts, R.Expr.not_ ~loc:l a)
-      | `Neg ->
-          let v = R.Expr.neg ~loc:l a in
-          let+ overflow = State.no_overflow ~at "negation" v in
-          (stmts @ [ overflow ], v))
-  | None, None, _ -> (
-      let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
-      match resolved_call ctx.given.functions ctx.given.libraries path with
-      | Some f -> call ctx e f args
-      | None -> (
-          match path with
-          | Pident _ -> State.of_result (unsupported at "A call of a local function")
-          | _ -> State.of_result (unsupported at ("A call of " ^ Path.name path))))
-  | _ -> State.of_result (unsupported at "This application")
+        let checked what v =
+          let+ overflow = State.no_overflow ~at what v in
+          (stmts @ [ overflow ], v)
+        in
+        begin match op with
+        | Plus -> checked "addition" (R.Expr.binary ~loc:l op a b)
+        | Minus -> checked "subtraction" (R.Expr.binary ~loc:l op a b)
+        | Mult -> checked "multiplication" (R.Expr.binary ~loc:l op a b)
+        | Div ->
+            let v = prelude_call ~loc:l Prelude.div [ a; b ] in
+            let* nonzero = nonzero () in
+            let+ overflow = State.no_overflow ~at "division" v in
+            (stmts @ [ nonzero; overflow ], v)
+        | Mod ->
+            let+ nonzero = nonzero () in
+            (stmts @ [ nonzero ], prelude_call ~loc:l Prelude.mod_ [ a; b ])
+        | _ -> State.return (stmts, R.Expr.binary ~loc:l op a b)
+        end
+    | _, Some op, [ a ] -> (
+        let* stmts, a = expr ctx a in
+        match op with
+        | `Not -> State.return (stmts, R.Expr.not_ ~loc:l a)
+        | `Neg ->
+            let v = R.Expr.neg ~loc:l a in
+            let+ overflow = State.no_overflow ~at "negation" v in
+            (stmts @ [ overflow ], v))
+    | None, None, _ -> (
+        let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
+        match resolved_call ctx.given.functions ctx.given.libraries path with
+        | Some f ->
+            let* actual_target =
+              State.polymorphic_call ctx ~at ~path ~declaration:declaration.val_type
+                ~occurrence ~target:f
+            in
+            call ~actual_target ctx e f args
+        | None -> (
+            match path with
+            | Pident _ -> State.of_result (unsupported at "A call of a local function")
+            | _ -> State.of_result (unsupported at ("A call of " ^ Path.name path))))
+    | _ -> State.of_result (unsupported at "This application")
 
 (** The call of the top-level function [f] with [args], in [e]: a statement, whose result
     is kept in a variable unless it is unit. *)
-and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression list) =
+and call ?actual_target ctx (e : Typedtree.expression) f
+    (ocaml_args : Typedtree.expression list) =
   let* arguments, args = operands ctx ocaml_args in
   let signature = List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal in
   let inputs = Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_inputs) in
@@ -638,7 +665,8 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
     Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_outputs)
   in
   let run explicit =
-    call_prepared ctx e f ocaml_args args ~explicit ~signature_outputs:outputs
+    call_prepared ?actual_target ctx e f ocaml_args args ~explicit
+      ~signature_outputs:outputs
   in
   let annotation =
     List.Assoc.find ctx.given.access_proofs
@@ -657,8 +685,8 @@ and call ctx (e : Typedtree.expression) f (ocaml_args : Typedtree.expression lis
       in
       (arguments @ statements, value)
 
-and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
-    ~signature_outputs =
+and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args args
+    ~explicit ~signature_outputs =
   let l = loc e.exp_loc in
   let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
@@ -775,7 +803,7 @@ and call_prepared ctx (e : Typedtree.expression) f ocaml_args args ~explicit
                   was taken"))
   in
   (* A library's procedure is qualified by its module, as [Backoff.once]. *)
-  let callee_name = qualified_name ~loc:l f in
+  let callee_name = qualified_name ~loc:l (Option.value actual_target ~default:f) in
   let callee = R.Expr.call ~loc:l callee_name (args @ List.concat witnesses @ implicit) in
   (* The ghost results witnessing facts about the state after the call: the caller's own,
      if the callee continues its update with the same ones. *)
@@ -1279,8 +1307,14 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg a); (_, Arg b) ])
     when is_physical path && not (exact_physical ctx.given.types a b) ->
       not_pure "Physical equality on values that are not immediate"
-  | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args) -> begin
+  | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
+    begin
       let* args = State.of_result (plain_args ~at args) in
+      let* () =
+        if polymorphic_ordering ctx path args then
+          State.of_result (unsupported at "Ordering on polymorphic values")
+        else State.return ()
+      in
       let* args = State.all args ~f:(pure_in values) in
       match (binop_of_path path, unop_of_path path, path, args) with
       | Some Div, _, _, [ a; b ] ->
@@ -1293,7 +1327,12 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       | None, None, path, _ ->
           let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
           begin match Path_bindings.find funcs path with
-          | Some f -> State.return (R.Expr.call ~loc:l (qualified_name ~loc:l f) args)
+          | Some f ->
+              let+ actual_target =
+                State.polymorphic_call ctx ~at ~path ~declaration:declaration.val_type
+                  ~occurrence:callee.exp_type ~target:f
+              in
+              R.Expr.call ~loc:l (qualified_name ~loc:l actual_target) args
           | None -> not_pure ("A call of " ^ Path.name path)
           end
       | _ -> not_pure "This application"

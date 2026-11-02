@@ -252,6 +252,25 @@ let rec spec_pattern env (p : S.pat) (v : R.Expr.t) =
           Ok (conjoin (Some (R.Expr.is_ ~loc:l v (ident ~loc:l c.raven)) :: conds), binds)
       end
 
+let generic_operands env operands =
+  let rec generic typ =
+    match Datatypes.desc env.data typ with
+    | Tvar _ -> Option.is_some (Datatypes.find_variable env.data typ)
+    | Tconstr (_, arguments, _) -> List.exists arguments ~f:generic
+    | Ttuple components -> List.exists components ~f:(fun (_, typ) -> generic typ)
+    | Tpoly (body, []) -> generic body
+    | _ -> false
+  in
+  List.exists operands ~f:(fun operand ->
+      Option.exists (term_type env operand) ~f:generic)
+
+(** Generic source values carry no arithmetic or ordering operations. *)
+let numeric_check env ~at operands =
+  if generic_operands env operands then
+    error at
+      "Arithmetic and ordering are unavailable for a universally quantified source type"
+  else Ok ()
+
 (** Whether the operands [a] and [b] of the comparison [operator], at [id], have types
     that it can compare. *)
 let equality_check env (id : S.id) operator a b =
@@ -719,10 +738,38 @@ and application env (t : S.term) =
   | Tvar q, args when Option.is_some (logical_signature env q) ->
       logical_application env ~at (Option.value_exn (logical_signature env q)) args
   | Tvar q, args when Option.is_some (runtime_spec env q) ->
+      let target = Qualified_name.to_string (Option.value_exn (runtime_spec env q)) in
+      let* target =
+        let registry = env.ctx.given.polymorphic_functions in
+        match
+          if List.is_empty registry.entries then None
+          else Source.value_path env.ctx.given.env q
+        with
+        | Some path when Path_bindings.mem registry path ->
+            let* expression =
+              State.of_result
+                (Source.infer_typed_logical_expression ~is_list:(is_list_term env)
+                   env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                   ~variables:(Logical_context.variables env)
+                   t)
+            in
+            let rec callee (expression : Typedtree.expression) =
+              match expression.exp_desc with
+              | Texp_apply (function_, _) -> callee function_
+              | Texp_ident (_, _, declaration) -> Some (declaration, expression.exp_type)
+              | _ -> None
+            in
+            begin match callee expression with
+            | Some (declaration, occurrence) ->
+                State.polymorphic_call env.ctx ~at ~path ~declaration:declaration.val_type
+                  ~occurrence ~target
+            | None ->
+                State.of_result (unsupported at "This polymorphic logical application")
+            end
+        | Some _ | None -> State.return target
+      in
       let+ args = State.all args ~f:(formula env) in
-      R.Expr.call ~loc:l
-        (Qualified_name.raven ~loc:l (Option.value_exn (runtime_spec env q)))
-        args
+      R.Expr.call ~loc:l (qualified_name ~loc:l target) args
   | Tvar (Qdot (parent, _) as q), _ when Option.is_some (resource_module env parent) ->
       State.of_result (error at ("Unknown proof module member " ^ qualid_key q))
   | Tvar q, args when Option.is_some (collection_builtin env q) ->
@@ -789,6 +836,7 @@ and application env (t : S.term) =
       let+ b = operand b in
       R.Expr.call ~loc:l (R.Name.make ~loc:l "++") [ a; b ]
   | Tvar (Qid { pid_str = "-"; pid_fixity = Prefix; _ }), [ a ] ->
+      let* () = State.of_result (numeric_check env ~at [ a ]) in
       let+ a = formula env a in
       R.Expr.neg ~loc:l a
   | Tvar (Qid { pid_str = "@"; pid_fixity = Infix; _ }), [ a; b ] ->
@@ -800,6 +848,25 @@ and application env (t : S.term) =
       | None ->
           State.of_result (unsupported at (Printf.sprintf "The operator %s" operator))
       | Some op -> (
+          let* () =
+            State.of_result
+              (match operator with
+              | "+" | "-" | "*" | "/" | "mod" | "<" | ">" | "<=" | ">=" ->
+                  numeric_check env ~at [ a; b ]
+              | _ -> Ok ())
+          in
+          let* () =
+            State.of_result
+              (match operator with
+              | "=" | "<>" | "==" | "!=" | "===" | "=/=" | "&&" | "||" | "/\\" | "\\/"
+              | "->" | "<->"
+                when generic_operands env [ a; b ] ->
+                  Source.check_logical_expression ~is_list:(is_list_term env)
+                    env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                    ~variables:(Logical_context.variables env)
+                    ~expected:Predef.type_bool t
+              | _ -> Ok ())
+          in
           let* () = State.of_result (equality_check env id operator a b) in
           (* A literal compared with a sequence is one. *)
           let a_type = term_type env a and b_type = term_type env b in

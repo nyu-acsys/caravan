@@ -19,6 +19,15 @@ validate the implementation against it before verification. Abstract interface
 types, private implementation bindings, and monomorphic interface specializations
 of polymorphic implementations are supported.
 
+Named first-order functions can be polymorphic: type arguments are inferred from
+OCaml's generalized types, and each generic body is verified once. This includes
+functions in static modules and supported source functors, recursive functions,
+and pure functions used in contracts. Lists, options and tuples retain their
+source-value constraints at each instantiation. Higher-order parameters, explicitly
+quantified source annotations, generalized local functions and local helpers in
+generic bodies remain unsupported, as do polymorphic mutable payloads and
+ordering on generic values.
+
 Functions and monomorphic types can be grouped in `module ... = struct ... end`,
 including nested modules. Calls and annotations resolve names in their enclosing
 OCaml scope. Plain module aliases retain the original types and ownership predicates.

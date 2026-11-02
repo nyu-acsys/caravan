@@ -935,6 +935,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
           module_context context ~projection:context.projection
             (preds, spec_funcs, proof_support)
         in
+        let types =
+          Program_declarations.function_types decls.polymorphic_functions f types
+        in
         let ctx =
           spec_context types ~shared:no_shared ~ocaml_env:f.environment ~preds ~spec_funcs
             ~proof_support ()

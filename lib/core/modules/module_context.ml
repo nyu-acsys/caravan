@@ -5,7 +5,10 @@ module S = Caravan_spec.Spec_ast
 
 let ( let* ) = Result.( >>= )
 
-type destination = Flat | Worker of Generic_modules.t
+type destination =
+  | Flat
+  | Worker of Generic_modules.t
+  | Function_worker of Polymorphic_functions.t * destination
 
 type t = {
   scope : Proof_scopes.scope;
@@ -128,7 +131,7 @@ let for_group registry group =
   List.find registry.contexts ~f:(fun context ->
       match context.destination with
       | Worker actual -> phys_equal actual group
-      | Flat -> false)
+      | Flat | Function_worker _ -> false)
 
 let member context backend = String.concat ~sep:"." (context.namespace @ [ backend ])
 
@@ -155,19 +158,30 @@ let runtime_pairs context =
           |> Option.filter ~f:(fun (_, target) ->
               not (Ident.same original.typ_id target.Typedtree.typ_id))))
 
-let same_destination left right =
+let rec same_destination left right =
   match (left, right) with
   | Flat, Flat -> true
   | Worker left, Worker right -> phys_equal left right
-  | Flat, Worker _ | Worker _, Flat -> false
+  | Function_worker (left, left_parent), Function_worker (right, right_parent) ->
+      Ident.same left.id right.id
+      && String.equal left.name right.name
+      && same_destination left_parent right_parent
+  | (Flat | Worker _ | Function_worker _), _ -> false
+
+let is_function = function Function_worker _ -> true | Flat | Worker _ -> false
 
 let emits_owner registry ~destination owner =
   same_destination (for_owner registry owner).destination destination
 
-let groups = function Flat -> [] | Worker group -> [ group ]
+let rec groups = function
+  | Flat -> []
+  | Worker group -> [ group ]
+  | Function_worker (_, parent) -> groups parent
 
-let namespace destination =
-  List.concat_map (groups destination) ~f:(fun group -> String.split group.name ~on:'.')
+let namespace = function
+  | Flat -> []
+  | Worker group -> String.split group.name ~on:'.'
+  | Function_worker (worker, _) -> String.split worker.name ~on:'.'
 
 let local_name destination backend =
   match namespace destination with

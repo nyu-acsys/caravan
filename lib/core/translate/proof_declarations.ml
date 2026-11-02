@@ -873,10 +873,27 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
             resource.Source.resource_descriptor :: resource.resource_aliases))
     @ types
   in
+  let specializations =
+    List.map inventory.Module_inventory.specializations
+      ~f:(fun (specialization : Module_inventory.specialization) ->
+        let members =
+          List.map specialization.members ~f:(fun (name, id) ->
+              let body =
+                List.find functions ~f:(fun function_ ->
+                    List.mem function_.paths (Path.Pident id) ~equal:Path.same)
+              in
+              (name, Option.value_map body ~default:id ~f:(fun function_ -> function_.id)))
+        in
+        if
+          List.equal
+            (fun (left, left_id) (right, right_id) ->
+              String.equal left right && Ident.same left_id right_id)
+            members specialization.members
+        then specialization
+        else { specialization with members })
+  in
   let groups =
-    Generic_modules.plan
-      ~proof_layout:(Generic_proofs.has_models source)
-      inventory.Module_inventory.specializations
+    Generic_modules.plan ~proof_layout:(Generic_proofs.has_models source) specializations
   in
   let annotations = Source.annotations source in
   let rec field_term (term : S.term) =
@@ -1008,7 +1025,7 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
     (List.filter groups ~f:(fun group ->
          Option.is_none group.Generic_modules.world
          || List.for_all group.applications ~f:(fun application ->
-             List.for_all inventory.specializations ~f:(fun other ->
+             List.for_all specializations ~f:(fun other ->
                  (not (Path.same application.source.identity other.identity))
                  || List.exists group.applications ~f:(fun member ->
                      phys_equal member.source other)))))

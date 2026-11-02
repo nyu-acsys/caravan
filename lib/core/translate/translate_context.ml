@@ -132,6 +132,13 @@ type position = {
 
 type domain_request = { domain_types : Datatypes.t list; domain_type : Types.type_expr }
 
+type function_instance = {
+  instance_namespace : string list;
+  instance_name : string;
+  instance_worker : string;
+  instance_arguments : string list;
+}
+
 type default_request = {
   default_namespace : string list;
   default_name : string;
@@ -255,6 +262,8 @@ module State_monad = struct
         (** The atomic operations used so far, by the namespace they are declared in, and
             by their names (see {!Primitives}). *)
     domains : domain_request list;
+    dictionaries : domain_request list;
+    function_instances : function_instance list;
     defaults : default_request list;
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
@@ -376,6 +385,8 @@ module State_monad = struct
           cells = [];
           primitives = [];
           domains = [];
+          dictionaries = [];
+          function_instances = [];
           defaults = [];
           dynamic_indices = false;
         };
@@ -789,6 +800,8 @@ type predicate_body = {
 type inputs = {
   types : Datatypes.t list;
   primitive_namespace : string list;
+  polymorphic_functions : Polymorphic_functions.t Path_bindings.t;
+  current_polymorphic : Polymorphic_functions.t option;
   functions : string Path_bindings.t;
       (** Checked functions, indexed by their compiler paths. *)
   pasts : (string * (string * string * int) list) list;
@@ -842,10 +855,13 @@ type context = {
 (** The inputs of a context outside a procedure, which has none of a procedure's tables.
 *)
 let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
-    ?(primitive_namespace = []) () =
+    ?(primitive_namespace = []) ?(polymorphic_functions = Path_bindings.empty)
+    ?current_polymorphic () =
   {
     types;
     primitive_namespace;
+    polymorphic_functions;
+    current_polymorphic;
     functions = Path_bindings.empty;
     lifted = [];
     pasts = [];
@@ -889,7 +905,106 @@ module State = struct
 
   open Syntax
 
+  let polymorphic_call ctx ~at ~path ~declaration ~occurrence ~target =
+    match Path_bindings.find ctx.given.polymorphic_functions path with
+    | None -> return target
+    | Some worker ->
+        let* arguments =
+          of_result
+            (Polymorphic_functions.instantiate
+               ~expand:(Datatypes.expand ctx.given.types)
+               ~at worker.scheme ~declaration ~occurrence)
+        in
+        let stem = (Qualified_name.of_string target).name in
+        let recursive =
+          Option.exists ctx.given.current_polymorphic ~f:(fun current ->
+              String.equal current.name worker.name)
+        in
+        if recursive then
+          if
+            List.equal Polymorphic_functions.same_variable worker.scheme.variables
+              (List.map arguments ~f:(Datatypes.expand ctx.given.types))
+          then return (worker.name ^ "." ^ stem)
+          else of_result (unsupported at "Polymorphic recursion")
+        else
+          let* dictionaries =
+            all arguments ~f:(fun argument ->
+                match Datatypes.dictionary_name ctx.given.types argument with
+                | None -> of_result (unsupported at "This polymorphic type argument")
+                | Some dictionary ->
+                    let* () =
+                      modify (fun state ->
+                          if
+                            List.exists state.tables.dictionaries ~f:(fun request ->
+                                Option.equal String.equal
+                                  (Datatypes.dictionary_name request.domain_types
+                                     request.domain_type)
+                                  (Some dictionary))
+                          then state
+                          else
+                            {
+                              state with
+                              tables =
+                                {
+                                  state.tables with
+                                  dictionaries =
+                                    state.tables.dictionaries
+                                    @ [
+                                        {
+                                          domain_types = ctx.given.types;
+                                          domain_type = argument;
+                                        };
+                                      ];
+                                };
+                            })
+                    in
+                    return dictionary)
+          in
+          let namespace = ctx.given.primitive_namespace in
+          let* instances = gets (fun state -> state.tables.function_instances) in
+          let* instance =
+            match
+              List.find instances ~f:(fun instance ->
+                  List.equal String.equal namespace instance.instance_namespace
+                  && String.equal worker.name instance.instance_worker
+                  && List.equal String.equal dictionaries instance.instance_arguments)
+            with
+            | Some instance -> return instance.instance_name
+            | None ->
+                let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
+                let* instance_name = fresh base in
+                let instance =
+                  {
+                    instance_namespace = namespace;
+                    instance_name;
+                    instance_worker = worker.name;
+                    instance_arguments = dictionaries;
+                  }
+                in
+                let* () =
+                  modify (fun state ->
+                      {
+                        state with
+                        tables =
+                          {
+                            state.tables with
+                            function_instances =
+                              state.tables.function_instances @ [ instance ];
+                          };
+                      })
+                in
+                return instance_name
+          in
+          return (String.concat ~sep:"." (namespace @ [ instance; stem ]))
+
   let declare_field (given : inputs) ~at key field elt =
+    let* () =
+      if
+        List.exists (Polymorphic_functions.all_variables elt) ~f:(fun variable ->
+            Option.is_some (Datatypes.find_variable given.types variable))
+      then of_result (unsupported at "Mutable storage with polymorphic payload types")
+      else return ()
+    in
     let* () = note_domain given.types elt in
     let* t = of_result (Datatypes.typ given.types ~at elt) in
     let bounded = Datatypes.is_int given.types elt in

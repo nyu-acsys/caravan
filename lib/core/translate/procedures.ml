@@ -14,6 +14,7 @@ type func = {
   paths : Path.t list;
   environment : Env.t;
   signature_sites : Module_inventory.signature_value list;
+  scheme_type : Types.type_expr;
   raven_name : string;
   params : Typedtree.function_param list;
   body : Typedtree.expression;
@@ -159,7 +160,8 @@ let formals ?(names = []) ctx (f : func) =
           let+ x = State.fresh "unit" in
           let l = loc pat_loc in
           (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
-      | Tparam_pat { pat_desc = Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
+      | Tparam_pat
+          { pat_desc = Tpat_any | Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = State.of_result (typ ctx ~at:pat_loc pat_type) in
           let contract_name = Option.join (List.nth names i) in
@@ -179,7 +181,8 @@ let pattern_params ctx (f : func) formals =
     State.all (List.zip_exn f.params formals)
       ~f:(fun ((p : Typedtree.function_param), (ocaml, _, _)) ->
         match (p.fp_kind, ocaml) with
-        | ( Tparam_pat ({ pat_desc = Tpat_record _ | Tpat_tuple _; pat_loc; _ } as pat),
+        | ( Tparam_pat
+              ({ pat_desc = Tpat_any | Tpat_record _ | Tpat_tuple _; pat_loc; _ } as pat),
             Some (_, x) ) ->
             let l = loc pat_loc in
             let value = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -429,12 +432,13 @@ let contract_postconditions env ~at ?atomic posts =
     bounding the function's own value, as for the code to not overflow, would make
     circular. *)
 let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
-    ?declaration_name ?(primitive_namespace = []) (f : func) : R.Callable.t State.t =
+    ?declaration_name ?(primitive_namespace = []) ?polymorphic_functions
+    ?current_polymorphic (f : func) : R.Callable.t State.t =
   let ctx =
     {
       given =
         declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
-          ~primitive_namespace ();
+          ~primitive_namespace ?polymorphic_functions ?current_polymorphic ();
       au = None;
     }
   in
@@ -503,7 +507,31 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
   in
   let* result_typ = State.of_result (typ ctx ~at:f.body.exp_loc f.body.exp_type) in
   let* () = State.note_domain ctx.given.types f.body.exp_type in
-  let+ body = pure ctx ~funcs [] f.body in
+  let* bindings =
+    State.all (List.zip_exn f.params formals)
+      ~f:(fun ((parameter : Typedtree.function_param), (formal, _, _)) ->
+        match (parameter.fp_kind, formal) with
+        | Tparam_pat pat, Some (_, formal) ->
+            let value =
+              R.Expr.var ~loc:(loc pat.pat_loc) (name ~loc:(loc pat.pat_loc) formal)
+            in
+            let* access, condition, bindings = pattern ctx pat value in
+            begin match (access, condition) with
+            | [], None ->
+                State.return
+                  (List.map bindings ~f:(fun (id, value, _) ->
+                       (Ident.unique_name id, value)))
+            | _ :: _, _ ->
+                State.of_result
+                  (unsupported pat.pat_loc
+                     "A mutable parameter pattern in a pure function")
+            | [], Some _ ->
+                State.of_result
+                  (unsupported pat.pat_loc "A refutable pattern as a parameter")
+            end
+        | _ -> State.return [])
+  in
+  let+ body = pure ctx ~funcs (List.concat bindings) f.body in
   R.Callable.func ~loc:l
     ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
     ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_typ ]
@@ -1036,7 +1064,11 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       ~f:(fun ((parameter, source), (formal, _, _)) ->
         match (parameter.Typedtree.fp_kind, source, formal) with
         | ( Tparam_pat
-              { pat_desc = Tpat_var _ | Tpat_record _ | Tpat_tuple _; pat_type; _ },
+              {
+                pat_desc = Tpat_any | Tpat_var _ | Tpat_record _ | Tpat_tuple _;
+                pat_type;
+                _;
+              },
             Some source,
             Some (_, raven) ) ->
             let* scope = State.get_scope in

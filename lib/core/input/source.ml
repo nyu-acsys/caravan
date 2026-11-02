@@ -1105,9 +1105,60 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tattr (_, value) | Told value -> exp value
 
 (** Types logical expressions before Raven erases reference element types. *)
-let type_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
+let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
     ?expected (term : S.term) =
   try
+    let rec free_variables (seen, found) typ =
+      let id = Types.get_id typ in
+      if Set.mem seen id then (seen, found)
+      else
+        let seen = Set.add seen id in
+        match Types.get_desc typ with
+        | Tvar _ when Types.get_level typ = Btype.generic_level -> (seen, typ :: found)
+        | _ -> Btype.fold_type_expr free_variables (seen, found) typ
+    in
+    let _, free =
+      List.fold
+        (List.map variables ~f:snd @ Option.to_list expected)
+        ~init:(Set.empty (module Int), [])
+        ~f:free_variables
+    in
+    let env, substitutions =
+      List.fold free ~init:(env, []) ~f:(fun (env, substitutions) variable ->
+          let id = Ident.create_local "caravan$logical$type" in
+          let declaration = Ctype.new_local_type ~loc:term.term_loc Definition in
+          let path = Path.Pident id in
+          ( Env.add_type ~check:false id declaration env,
+            (variable, path, Ctype.newconstr path []) :: substitutions ))
+    in
+    (* Generalized source variables are rigid; inference placeholders stay flexible. *)
+    let rec freeze typ =
+      if List.is_empty substitutions then typ
+      else
+        match
+          List.find substitutions ~f:(fun (variable, _, _) -> Types.eq_type variable typ)
+        with
+        | Some (_, _, frozen) -> frozen
+        | None ->
+            begin match Types.get_desc typ with
+            | Tvar _ | Tunivar _ -> typ
+            | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
+            end
+    in
+    let rec restore typ =
+      match Types.get_desc typ with
+      | Tconstr (path, [], _) ->
+          begin match
+            List.find substitutions ~f:(fun (_, frozen, _) -> Path.same path frozen)
+          with
+          | Some (variable, _, _) -> variable
+          | None -> typ
+          end
+      | Tvar _ | Tunivar _ -> typ
+      | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
+    in
+    let variables = List.map variables ~f:(fun (name, typ) -> (name, freeze typ)) in
+    let expected = Option.map expected ~f:freeze in
     let functions = List.map variables ~f:fst @ functions in
     let* expression = logical_expression ~functions ~is_list term in
     let env =
@@ -1169,12 +1220,30 @@ let type_logical_expression ?(is_list = fun _ -> false) env ~functions ~variable
     in
     iterator.expr iterator typed;
     match !partial_match with
-    | None -> Ok typed.exp_type
+    | None when List.is_empty substitutions -> Ok typed
+    | None ->
+        let mapper =
+          {
+            Tast_mapper.default with
+            expr =
+              (fun self expression ->
+                let expression = Tast_mapper.default.expr self expression in
+                { expression with exp_type = restore expression.exp_type });
+          }
+        in
+        Ok (mapper.expr mapper typed)
     | Some at -> Error (Report.error Type at "A logical match must be exhaustive")
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error
     | None -> Error (Report.error Type term.term_loc (Stdlib.Printexc.to_string exn)))
+
+let type_logical_expression ?is_list env ~functions ~variables ?expected term =
+  Result.map (typed_logical_expression ?is_list env ~functions ~variables ?expected term)
+    ~f:(fun expression -> expression.Typedtree.exp_type)
+
+let infer_typed_logical_expression ?is_list env ~functions ~variables term =
+  typed_logical_expression ?is_list env ~functions ~variables term
 
 let infer_logical_expression ?is_list env ~functions ~variables term :
     (Types.type_expr, Report.error) Result.t =

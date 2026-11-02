@@ -79,11 +79,12 @@ let program ?(history = History.default) (source : Source.t) :
     library_preds;
     procedures;
     generic_procedures;
+    polymorphic_functions;
   } =
     decls
   in
   let body_destination =
-    Program_declarations.body_destination ~generics:scopes.generics
+    Program_declarations.body_destination ~polymorphic_functions ~generics:scopes.generics
       ~module_contexts:scopes.module_contexts
       ~context_for_group:
         (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
@@ -347,6 +348,7 @@ let program ?(history = History.default) (source : Source.t) :
         |> Result.map ~f:(fun groups -> List.concat (List.concat groups)))
     |> Result.map ~f:List.concat
   in
+  let argument_domains = argument_domains @ state.tables.dictionaries in
   let layout_domain_requests =
     List.concat_map types ~f:(fun data ->
         if data.Datatypes.mathematical || not (Result_layouts.contains layouts data) then
@@ -419,18 +421,95 @@ let program ?(history = History.default) (source : Source.t) :
   let ready_domains, deferred_domains =
     Program_declarations.take_declarations ~available:[] root_domain_declarations
   in
-  let take_available ~available (declarations, domains, fields) =
+  let deferred_native_binding binding =
+    let captured =
+      List.exists generics ~f:(fun group ->
+          List.exists group.Generic_modules.captures ~f:(fun stage ->
+              List.exists stage.applications ~f:(fun application ->
+                  phys_equal application.source.argument binding)))
+    in
+    let final =
+      List.exists generics ~f:(fun group ->
+          List.exists group.Generic_modules.applications ~f:(fun application ->
+              phys_equal application.source.argument binding))
+    in
+    captured && not final
+  in
+  let root_function_workers =
+    List.filter polymorphic_functions ~f:(fun worker ->
+        List.is_empty (Qualified_name.of_string worker.Polymorphic_functions.name).path)
+    |> List.stable_sort ~compare:(fun left right ->
+        Int.compare left.Polymorphic_functions.loc.loc_start.pos_cnum
+          right.Polymorphic_functions.loc.loc_start.pos_cnum)
+  in
+  let worker_binding_position (worker : Polymorphic_functions.t) =
+    List.fold inventory.specializations ~init:worker.loc.loc_start.pos_cnum
+      ~f:(fun position specialization ->
+        if
+          List.exists specialization.Module_inventory.body_members ~f:(fun (_, id) ->
+              Ident.same id worker.id)
+        then Int.max position specialization.argument.site.item_loc.loc_start.pos_cnum
+        else position)
+  in
+  let rec function_value_types typ =
+    match Datatypes.desc types typ with
+    | Tarrow (_, argument, result, _) -> argument :: function_value_types result
+    | Tpoly (body, []) -> function_value_types body
+    | _ -> [ typ ]
+  in
+  let worker_dependencies =
+    List.fold root_function_workers
+      ~init:(Map.empty (module String))
+      ~f:(fun previous worker ->
+        let position = worker_binding_position worker in
+        let lexical =
+          List.concat_map generics ~f:(fun group ->
+              List.filter_map group.Generic_modules.applications ~f:(fun application ->
+                  Option.some_if
+                    (application.source.argument.site.item_loc.loc_start.pos_cnum
+                   < position)
+                    application.name))
+          @ List.filter_map checked_modules ~f:(fun view ->
+              Option.some_if
+                ((not (deferred_native_binding view.Checked_modules.binding))
+                && view.binding.site.item_loc.loc_start.pos_cnum <= position)
+                view.name)
+        in
+        let layouts =
+          List.concat_map
+            (function_value_types worker.scheme.typ)
+            ~f:
+              (Result_layouts.type_dependencies
+                 ~additional:(Generic_proofs.layout_dependencies generic_proofs)
+                 layouts types)
+        in
+        let called =
+          List.concat_map state.tables.function_instances ~f:(fun instance ->
+              if
+                List.is_prefix instance.instance_namespace
+                  ~prefix:(String.split worker.name ~on:'.')
+                  ~equal:String.equal
+              then Option.value (Map.find previous instance.instance_worker) ~default:[]
+              else [])
+        in
+        Map.set previous ~key:worker.name
+          ~data:(List.dedup_and_sort (lexical @ layouts @ called) ~compare:String.compare))
+  in
+  let take_available ~available (declarations, domains, workers, fields) =
     let declarations, pending_declarations =
       Program_declarations.take_declarations ~available declarations
     in
     let domains, pending_domains =
       Program_declarations.take_declarations ~available domains
     in
+    let workers, pending_workers =
+      Program_declarations.take_declarations ~available workers
+    in
     let fields, pending_fields =
       Program_declarations.take_declarations ~available fields
     in
-    ( declarations @ domains @ fields,
-      (pending_declarations, pending_domains, pending_fields) )
+    ( declarations @ domains @ workers @ fields,
+      (pending_declarations, pending_domains, pending_workers, pending_fields) )
   in
   let domains_in namespace =
     if List.is_empty namespace then []
@@ -440,7 +519,7 @@ let program ?(history = History.default) (source : Source.t) :
             (List.equal String.equal (Qualified_name.of_string name).path namespace)
             member)
   in
-  let emit_context_members destination ~at ~representations ~native_resources
+  let rec emit_context_members destination ~at ~representations ~native_resources
       ~applications ~late_members =
     let group = List.hd (Module_context.groups destination) in
     let ghost_fields =
@@ -466,6 +545,32 @@ let program ?(history = History.default) (source : Source.t) :
                   (ident ~loc:at (Qualified_name.of_string request.default_name).name)
                   None)))
     in
+    let function_workers =
+      List.filter polymorphic_functions ~f:(fun worker ->
+          List.equal String.equal
+            (Qualified_name.of_string worker.Polymorphic_functions.name).path
+            (Module_context.namespace destination))
+      |> List.stable_sort ~compare:(fun left right ->
+          Int.compare left.Polymorphic_functions.loc.loc_start.pos_cnum
+            right.Polymorphic_functions.loc.loc_start.pos_cnum)
+      |> List.filter ~f:(fun (worker : Polymorphic_functions.t) ->
+          (not (Module_context.same_destination destination Module_context.Flat))
+          || List.is_empty (Map.find_exn worker_dependencies worker.name))
+      |> List.map ~f:(emit_function_worker destination)
+    in
+    let function_instances =
+      List.filter_map state.tables.function_instances ~f:(fun instance ->
+          Option.some_if
+            (List.equal String.equal instance.instance_namespace
+               (Module_context.namespace destination))
+            (R.Member.instance ~loc:at
+               ~def:
+                 ( qualified_name ~loc:at instance.instance_worker,
+                   List.map instance.instance_arguments ~f:(fun argument ->
+                       R.Type.named ~loc:at (qualified_name ~loc:at argument) []) )
+               (ident ~loc:at instance.instance_name)
+               (qualified_name ~loc:at instance.instance_worker)))
+    in
     let stages =
       match destination with
       | Module_context.Flat ->
@@ -474,8 +579,10 @@ let program ?(history = History.default) (source : Source.t) :
             `Definitions;
             `Native_resources;
             `Public_resources;
+            `Function_workers;
             `Applications;
             `Value_domains;
+            `Function_instances;
             `View_fields;
             `Fields;
             `Proof_definitions;
@@ -496,6 +603,8 @@ let program ?(history = History.default) (source : Source.t) :
             `Public_resources;
             `Applications;
             `Value_domains;
+            `Function_workers;
+            `Function_instances;
             `Primitives;
             `Pure_functions;
             `Fields;
@@ -508,6 +617,15 @@ let program ?(history = History.default) (source : Source.t) :
             `Logical_functions;
             `Procedures;
           ]
+      | Module_context.Function_worker _ ->
+          [
+            `Value_domains;
+            `Function_workers;
+            `Function_instances;
+            `Primitives;
+            `Pure_functions;
+            `Procedures;
+          ]
     in
     List.concat_map stages ~f:(function
       | `Representations -> representations
@@ -515,6 +633,8 @@ let program ?(history = History.default) (source : Source.t) :
       | `Native_resources -> native_resources
       | `Public_resources -> emitted_assets destination public_resource_members
       | `Applications -> applications
+      | `Function_workers -> function_workers
+      | `Function_instances -> function_instances
       | `Value_domains -> domains @ defaults
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
@@ -534,6 +654,23 @@ let program ?(history = History.default) (source : Source.t) :
           List.map (emitted_proofs destination proof_lemma_members) ~f:R.Member.callable
       | `Logical_functions -> emitted_proofs destination logical_members
       | `Procedures -> List.map (owned destination procs) ~f:procedure_member)
+  and emit_function_worker parent (worker : Polymorphic_functions.t) =
+    let destination = Module_context.Function_worker (worker, parent) in
+    let l = loc worker.loc in
+    R.Member.module_ ~loc:l
+      ~params:
+        (List.mapi worker.scheme.variables ~f:(fun i _ ->
+             ( ident ~loc:l ("A" ^ Int.to_string i),
+               qualified_name ~loc:l Prelude.value_interface )))
+      (ident ~loc:l (Qualified_name.of_string worker.name).name)
+      (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
+         ~applications:[] ~late_members:[])
+  in
+  let deferred_function_workers =
+    List.filter_map root_function_workers ~f:(fun worker ->
+        let dependencies = Map.find_exn worker_dependencies worker.name in
+        if List.is_empty dependencies then None
+        else Some (dependencies, [ emit_function_worker Module_context.Flat worker ]))
   in
   let dictionary_for binding id =
     let concrete = checked_raw_types types binding in
@@ -872,21 +1009,17 @@ let program ?(history = History.default) (source : Source.t) :
   let _, native_blocks, pending, _ =
     List.fold
       (List.zip_exn checked_modules checked_module_members)
-      ~init:([], [], (pending_declarations, deferred_domains, pending_fields), [])
+      ~init:
+        ( [],
+          [],
+          ( pending_declarations,
+            deferred_domains,
+            deferred_function_workers,
+            pending_fields ),
+          [] )
       ~f:(fun (emitted, blocks, pending, available) (view, members) ->
         let binding = view.Checked_modules.binding in
-        let captured =
-          List.exists generics ~f:(fun group ->
-              List.exists group.Generic_modules.captures ~f:(fun stage ->
-                  List.exists stage.applications ~f:(fun application ->
-                      phys_equal application.source.argument binding)))
-        in
-        let final =
-          List.exists generics ~f:(fun group ->
-              List.exists group.Generic_modules.applications ~f:(fun application ->
-                  phys_equal application.source.argument binding))
-        in
-        if captured && not final then (emitted, blocks, pending, available)
+        if deferred_native_binding binding then (emitted, blocks, pending, available)
         else
           let attached =
             List.concat_map generics ~f:(fun group ->
@@ -974,6 +1107,15 @@ let program ?(history = History.default) (source : Source.t) :
                   (phys_equal application.source.argument binding)
                   application.name)
           in
+          let available =
+            view.name
+            :: List.fold attached ~init:available ~f:(fun available binding ->
+                let view =
+                  List.find_exn checked_modules ~f:(fun view ->
+                      phys_equal view.Checked_modules.binding binding)
+                in
+                view.name :: available)
+          in
           let after_instances, pending = take_available ~available pending in
           ( (binding :: attached) @ emitted,
             (before_setup @ prefix @ setup @ declarations @ publications
@@ -983,7 +1125,7 @@ let program ?(history = History.default) (source : Source.t) :
             available ))
   in
   let native_modules = List.concat (List.rev native_blocks) in
-  let pending_declarations, pending_domains, pending_fields = pending in
+  let pending_declarations, pending_domains, pending_workers, pending_fields = pending in
 
   let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
   let start = R.Loc.make file_start file_start in
@@ -997,7 +1139,9 @@ let program ?(history = History.default) (source : Source.t) :
     emit_context_members Module_context.Flat ~at:start ~representations:[]
       ~native_resources:deferred_native_resource_members ~applications:native_modules
       ~late_members:
-        (List.concat_map (pending_declarations @ pending_domains @ pending_fields) ~f:snd
+        (List.concat_map
+           (pending_declarations @ pending_domains @ pending_workers @ pending_fields)
+           ~f:snd
         @ ref_fields)
   in
   Ok

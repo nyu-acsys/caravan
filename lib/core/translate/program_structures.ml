@@ -34,11 +34,13 @@ let field_group ~(generics : Generic_modules.t list) field =
   List.find generics ~f:(fun group ->
       String.is_prefix field ~prefix:(group.Generic_modules.name ^ "."))
 
-let shared_for_destination ~(shared : shared) ~(generic_shared : (string * shared) list) =
-  function
+let rec shared_for_destination ~(shared : shared)
+    ~(generic_shared : (string * shared) list) = function
   | Module_context.Flat -> shared
   | Module_context.Worker group ->
       List.Assoc.find_exn generic_shared group.Generic_modules.name ~equal:String.equal
+  | Module_context.Function_worker (_, parent) ->
+      shared_for_destination ~shared ~generic_shared parent
 
 let shared_for_proof ~(declaration_context : string -> Module_context.t)
     ~(shared : shared) ~(generic_shared : (string * shared) list) name =
@@ -89,13 +91,14 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   let body_owner = Program_declarations.body_owner ~generics:scopes.generics in
   let body_proc_name =
     Program_declarations.body_proc_name ~generics:scopes.generics
+      ~polymorphic_functions:decls.polymorphic_functions
       ~generic_procedures:decls.generic_procedures ~procedures:decls.procedures
   in
   let proc_name = Program_declarations.proc_name ~procedures:decls.procedures in
   let with_body_names lifted_argument =
     Program_declarations.with_body_names ~funcs:scopes.funcs ~procedures:decls.procedures
-      ~generics:scopes.generics ~generic_procedures:decls.generic_procedures
-      lifted_argument
+      ~polymorphic_functions:decls.polymorphic_functions ~generics:scopes.generics
+      ~generic_procedures:decls.generic_procedures lifted_argument
   in
   let { Program_proofs.preds; proof_support; spec_funcs; _ } = proofs in
   let module_context =

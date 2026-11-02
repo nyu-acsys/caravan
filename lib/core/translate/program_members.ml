@@ -74,6 +74,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     predicates;
     procedure_signatures;
     pure;
+    polymorphic_functions;
     runtime_destinations;
     scoped_proofs;
     source;
@@ -83,7 +84,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     decls
   in
   let body_destination =
-    Program_declarations.body_destination ~generics:scopes.generics
+    Program_declarations.body_destination ~polymorphic_functions ~generics:scopes.generics
       ~module_contexts:scopes.module_contexts
       ~context_for_group:
         (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
@@ -96,12 +97,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   let body_owner = Program_declarations.body_owner ~generics:scopes.generics in
   let body_proc_name =
-    Program_declarations.body_proc_name ~generics:scopes.generics
+    Program_declarations.body_proc_name ~polymorphic_functions ~generics:scopes.generics
       ~generic_procedures:decls.generic_procedures ~procedures:decls.procedures
   in
-  let body_pure_name = Program_declarations.body_pure_name ~generics:scopes.generics in
+  let body_pure_name =
+    Program_declarations.body_pure_name ~polymorphic_functions ~generics:scopes.generics
+  in
   let body_pure_reference =
-    Program_declarations.body_pure_reference ~generics:scopes.generics
+    Program_declarations.body_pure_reference ~polymorphic_functions
+      ~generics:scopes.generics
   in
   let is_pure = Program_declarations.is_pure ~pure:decls.pure in
   let proc_name = Program_declarations.proc_name ~procedures:decls.procedures in
@@ -1039,7 +1043,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                        ~helped_proc:
                          (match owner_destination st.invariant with
                          | Module_context.Flat -> proc_name helped
-                         | Module_context.Worker _ -> body_proc_name helped))
+                         | Module_context.Worker _ | Module_context.Function_worker _ ->
+                             body_proc_name helped))
               | None ->
                   State.of_result
                     (error st.at
@@ -1289,7 +1294,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* runtime_contexts =
     all runtime_destinations ~f:(fun destination ->
         let groups = Module_context.groups destination in
-        let namespace = Module_context.namespace destination in
+        let namespace =
+          Module_context.namespace
+            (match destination with
+            | Module_context.Function_worker (_, parent) -> parent
+            | Flat | Worker _ -> destination)
+        in
         let* layouts =
           all groups ~f:(fun group ->
               Result_layouts.symbolic layouts group ~owner:(namespace @ [ "Layout" ]))
@@ -1299,6 +1309,13 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           @ List.concat_map groups ~f:(fun group ->
               Generic_modules.worker_types group ~owner:namespace)
           @ types
+        in
+        let body_types =
+          match destination with
+          | Module_context.Function_worker (worker, _) ->
+              let f = List.find_exn funcs ~f:(fun f -> Ident.same worker.id f.id) in
+              Program_declarations.function_types polymorphic_functions f body_types
+          | Flat | Worker _ -> body_types
         in
         let stages = List.concat_map groups ~f:Generic_modules.parameter_groups in
         let predicate_overrides =
@@ -1361,6 +1378,52 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 map_functions ~only_pure:true proof_support.runtime_functions
                   body_pure_reference;
             } ))
+  in
+  let polymorphic_registry destination =
+    let current_groups = Module_context.groups destination in
+    Path_bindings.of_list
+      (List.concat_map funcs ~f:(fun candidate ->
+           let worker =
+             match Generic_modules.member generics candidate.id with
+             | None ->
+                 Program_declarations.function_worker polymorphic_functions candidate
+             | Some (group, application, stem) ->
+                 let source =
+                   List.find_map group.body_members ~f:(fun (source, target) ->
+                       Option.some_if (String.equal stem target) source)
+                 in
+                 let representative =
+                   Option.bind source ~f:(fun source ->
+                       List.Assoc.find group.representative.body_members source
+                         ~equal:String.equal)
+                 in
+                 Option.bind representative ~f:(fun id ->
+                     List.find polymorphic_functions ~f:(fun worker ->
+                         Ident.same worker.Polymorphic_functions.id id))
+                 |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
+                     if List.exists current_groups ~f:(phys_equal group) then worker
+                     else
+                       {
+                         worker with
+                         name =
+                           application.name ^ "."
+                           ^ (Qualified_name.of_string worker.name).name;
+                       })
+           in
+           Option.value_map worker ~default:[] ~f:(fun worker ->
+               List.map candidate.paths ~f:(fun path -> (path, worker)))))
+  in
+  let polymorphic_registries =
+    if List.is_empty polymorphic_functions then []
+    else
+      List.map runtime_destinations ~f:(fun destination ->
+          (destination, polymorphic_registry destination))
+  in
+  let body_polymorphic_registry f =
+    Option.value
+      (List.Assoc.find polymorphic_registries (body_destination f)
+         ~equal:Module_context.same_destination)
+      ~default:Path_bindings.empty
   in
   let body_context f =
     let context = body_module_context f in
@@ -1439,7 +1502,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             let+ member =
               func data ~shared:(body_shared f) ~ocaml_env:f.environment ~preds:predicates
                 ~funcs:pure_functions ~spec_funcs ~proof_support ~declaration_name
-                ~primitive_namespace f
+                ~primitive_namespace ~polymorphic_functions:(body_polymorphic_registry f)
+                ?current_polymorphic:
+                  (Program_declarations.function_worker polymorphic_functions f)
+                f
             in
             Some (f, member))
   in
@@ -1463,7 +1529,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               let given =
                 {
                   (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
-                     ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace ())
+                     ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace
+                     ~polymorphic_functions:(body_polymorphic_registry f)
+                     ?current_polymorphic:
+                       (Program_declarations.function_worker polymorphic_functions f)
+                     ())
                   with
                   functions;
                   lifted;

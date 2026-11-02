@@ -46,8 +46,20 @@ let items source (inventory : Module_inventory.t) =
     let a = a.site.scope.location and b = b.site.scope.location in
     a.loc_start.pos_cnum = b.loc_start.pos_cnum && a.loc_end.pos_cnum = b.loc_end.pos_cnum
   in
+  let function_type (entry : Module_inventory.value) =
+    let rec arrow typ =
+      match
+        Types.get_desc (Ctype.expand_head entry.Module_inventory.site.environment typ)
+      with
+      | Tarrow _ -> true
+      | Tpoly (body, []) -> arrow body
+      | _ -> false
+    in
+    arrow entry.binding.vb_pat.pat_type
+  in
   let* functions =
-    all inventory.values ~f:(fun (entry : Module_inventory.value) ->
+    List.fold_result inventory.values ~init:[]
+      ~f:(fun functions (entry : Module_inventory.value) ->
         let vb = entry.binding in
         match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
         | Tpat_var (id, _, _), Some (params, body) ->
@@ -138,41 +150,92 @@ let items source (inventory : Module_inventory.t) =
                 String.uncapitalize
                   (String.concat ~sep:"_" (entry.namespace @ [ Ident.name id ]))
             in
+            let base = String.map base ~f:(function '.' -> '_' | c -> c) in
             Ok
-              {
-                id;
-                namespace = entry.namespace;
-                paths = entry.paths;
-                environment =
-                  Source.annotation_env source ~at:site.item_loc site.environment;
-                signature_sites = entry.signatures;
-                raven_name = Fresh_names.fresh base;
-                params;
-                body;
-                loc = vb.vb_loc;
-                contract;
-                next =
-                  Some
-                    (Option.value site.next
-                       ~default:
-                         {
-                           site.scope.location with
-                           loc_start = site.scope.location.loc_end;
-                         });
-                prefix = [];
-                prefix_count = 0;
-                captured = [];
-                role = None;
-                manual =
-                  manual_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
-                    ~next:site.next;
-                trusted =
-                  trusted_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
-                    ~next:site.next;
-              }
+              ({
+                 id;
+                 namespace = entry.namespace;
+                 paths = entry.paths;
+                 environment =
+                   Source.annotation_env source ~at:site.item_loc site.environment;
+                 signature_sites = entry.signatures;
+                 scheme_type = vb.vb_pat.pat_type;
+                 raven_name = Fresh_names.fresh base;
+                 params;
+                 body;
+                 loc = vb.vb_loc;
+                 contract;
+                 next =
+                   Some
+                     (Option.value site.next
+                        ~default:
+                          {
+                            site.scope.location with
+                            loc_start = site.scope.location.loc_end;
+                          });
+                 prefix = [];
+                 prefix_count = 0;
+                 captured = [];
+                 role = None;
+                 manual =
+                   manual_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                     ~next:site.next;
+                 trusted =
+                   trusted_after ~scope:site.scope site.annotations
+                     ~item_loc:site.item_loc ~next:site.next;
+               }
+              :: functions)
+        | Tpat_var _, None when function_type entry ->
+            begin match vb.vb_expr.exp_desc with
+            | Texp_ident (path, _, _) ->
+                let* contracts =
+                  let site = entry.site in
+                  let* own =
+                    contract_after ~scope:site.scope site.annotations
+                      ~item_loc:site.item_loc ~next:site.next
+                  in
+                  let* supplied =
+                    all entry.signatures
+                      ~f:(fun (view : Module_inventory.signature_value) ->
+                        let site = view.site in
+                        contract_after ~scope:site.scope site.annotations
+                          ~item_loc:site.item_loc ~next:site.next)
+                  in
+                  Ok (own :: supplied)
+                in
+                let* () =
+                  if List.exists contracts ~f:Option.is_some then
+                    unsupported vb.vb_loc "Contracts on function value aliases"
+                  else Ok ()
+                in
+                let* path =
+                  Source.normalize_value_path entry.site.environment
+                    ~at:vb.vb_expr.exp_loc path
+                in
+                begin match
+                  List.find functions ~f:(fun target ->
+                      List.mem target.paths path ~equal:Path.same)
+                with
+                | None ->
+                    unsupported vb.vb_loc
+                      "A function value alias that does not refer to an earlier \
+                       translated function"
+                | Some target ->
+                    let paths =
+                      List.fold entry.paths ~init:target.paths ~f:(fun paths path ->
+                          if List.mem paths path ~equal:Path.same then paths
+                          else paths @ [ path ])
+                    in
+                    Ok
+                      (List.map functions ~f:(fun function_ ->
+                           if phys_equal function_ target then { function_ with paths }
+                           else function_))
+                end
+            | _ -> unsupported vb.vb_loc "This definition"
+            end
         | _ -> unsupported vb.vb_loc "This definition")
   in
-  Ok (data, functions)
+  Ok (data, List.rev functions)
 
 (** The identifiers that [e] refers to by a name of its own. *)
 let referenced (e : Typedtree.expression) : Ident.t list =
@@ -359,6 +422,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           paths = [ Path.Pident id ];
           environment = Source.annotation_env source ~at:rest.exp_loc rest.exp_env;
           signature_sites = [];
+          scheme_type = vb.vb_pat.pat_type;
           raven_name =
             (if List.is_empty outer.namespace then Ident.name id
              else String.concat ~sep:"_" [ outer.raven_name; Ident.name id ]);

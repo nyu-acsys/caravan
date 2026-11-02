@@ -18,6 +18,7 @@ type t = {
   checked_modules : Checked_modules.t list;
   checked_operations : Program_items.checked_operation list;
   pure : Procedures.func list;
+  polymorphic_functions : Polymorphic_functions.t list;
   runtime_destinations : Module_context.destination list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
   atomic_operations : (Source.proof_au * Procedures.func) list;
@@ -101,27 +102,50 @@ let pure_reference ~(generics : Generic_modules.t list) f =
 let proc_name ~(procedures : (Ident.t * string) list) (f : func) =
   List.Assoc.find_exn procedures f.id ~equal:Ident.same
 
-let body_proc_name ~(generics : Generic_modules.t list)
+let function_worker polymorphic_functions (f : func) =
+  List.find polymorphic_functions ~f:(fun worker ->
+      Ident.same worker.Polymorphic_functions.id f.id)
+
+let function_types polymorphic_functions f types =
+  match function_worker polymorphic_functions f with
+  | None -> types
+  | Some worker ->
+      List.mapi worker.scheme.variables ~f:(fun index variable ->
+          Datatypes.variable_type ~variable
+            ~owner:(String.split worker.name ~on:'.')
+            ~parameter:("A" ^ Int.to_string index)
+            ~at:worker.loc)
+      @ types
+
+let worker_member polymorphic_functions f target =
+  match function_worker polymorphic_functions f with
+  | None -> target
+  | Some worker -> worker.name ^ "." ^ (Qualified_name.of_string target).name
+
+let body_proc_name ?(polymorphic_functions = []) ~(generics : Generic_modules.t list)
     ~(generic_procedures : (string * string) list) ~(procedures : (Ident.t * string) list)
     f =
   let procedure_stem = procedure_stem ~generic_procedures in
   let proc_name = proc_name ~procedures in
-  match Generic_modules.member generics f.id with
-  | None -> proc_name f
-  | Some (group, _, stem) -> group.name ^ "." ^ procedure_stem group stem
+  worker_member polymorphic_functions f
+    (match Generic_modules.member generics f.id with
+    | None -> proc_name f
+    | Some (group, _, stem) -> group.name ^ "." ^ procedure_stem group stem)
 
-let body_pure_name ~(generics : Generic_modules.t list) f =
+let body_pure_name ?(polymorphic_functions = []) ~(generics : Generic_modules.t list) f =
   let pure_name = pure_name ~generics in
-  match Generic_modules.member generics f.id with
-  | None -> pure_name f
-  | Some (group, _, stem) -> group.name ^ "." ^ stem
+  worker_member polymorphic_functions f
+    (match Generic_modules.member generics f.id with
+    | None -> pure_name f
+    | Some (group, _, stem) -> group.name ^ "." ^ stem)
 
-let body_pure_reference ~(generics : Generic_modules.t list) f =
-  let pure_reference = pure_reference ~generics in
-  let body_pure_name = body_pure_name ~generics in
-  match Generic_modules.member generics f.id with
-  | None -> pure_reference f
-  | Some _ -> Qualified_name.of_string (body_pure_name f)
+let body_pure_reference ?(polymorphic_functions = []) ~(generics : Generic_modules.t list)
+    f =
+  match
+    (function_worker polymorphic_functions f, Generic_modules.member generics f.id)
+  with
+  | None, None -> pure_reference ~generics f
+  | _ -> Qualified_name.of_string (body_pure_name ~polymorphic_functions ~generics f)
 
 let body_owner ~(generics : Generic_modules.t list) f =
   match Generic_modules.member generics f.id with
@@ -137,31 +161,39 @@ let body_module_context ~(module_contexts : Module_context.registry)
   | Some (group, _) -> context_for_group group
   | None -> Module_context.for_location module_contexts f.loc
 
-let body_destination ~(generics : Generic_modules.t list)
+let body_destination ?(polymorphic_functions = []) ~(generics : Generic_modules.t list)
     ~(module_contexts : Module_context.registry)
     ~(context_for_group : Generic_modules.t -> Module_context.t) f =
   let body_owner = body_owner ~generics in
   let body_module_context =
     body_module_context ~module_contexts ~context_for_group ~generics
   in
-  match body_owner f with
-  | None -> (body_module_context f).destination
-  | Some (group, _) -> Module_context.Worker group
+  let parent =
+    match body_owner f with
+    | None -> (body_module_context f).destination
+    | Some (group, _) -> Module_context.Worker group
+  in
+  match function_worker polymorphic_functions f with
+  | None -> parent
+  | Some worker -> Module_context.Function_worker (worker, parent)
 
-let with_body_names ~(funcs : Procedures.func list)
+let with_body_names ?(polymorphic_functions = []) ~(funcs : Procedures.func list)
     ~(procedures : (Ident.t * string) list) ~(generics : Generic_modules.t list)
     ~(generic_procedures : (string * string) list) entries =
   let proc_name = proc_name ~procedures in
-  let body_proc_name = body_proc_name ~generics ~generic_procedures ~procedures in
+  let body_proc_name =
+    body_proc_name ~polymorphic_functions ~generics ~generic_procedures ~procedures
+  in
   let body_owner = body_owner ~generics in
   entries
   @ List.filter_map funcs ~f:(fun f ->
       match body_owner f with
-      | Some (_, true) ->
+      | (Some (_, true) | None) when not (String.equal (proc_name f) (body_proc_name f))
+        ->
           Option.map
             (List.Assoc.find entries (proc_name f) ~equal:String.equal)
             ~f:(fun value -> (body_proc_name f, value))
-      | Some (_, false) | None -> None)
+      | Some _ | None -> None)
 
 let au_plan ~(asset_context : Path.t option -> Module_context.t) (au : Source.proof_au) =
   let asset_worker = asset_worker ~asset_context in
@@ -539,11 +571,83 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         (f.id, name))
   in
   let proc_name = proc_name ~procedures in
+  let* polymorphic_functions =
+    all funcs ~f:(fun f ->
+        let representative =
+          match body_owner ~generics f with
+          | Some (_, false) -> false
+          | Some (_, true) | None -> true
+        in
+        let* scheme = Polymorphic_functions.discover ~at:f.loc f.scheme_type in
+        if (not representative) || List.is_empty scheme.variables then Ok None
+        else
+          let source_binding =
+            List.exists inventory.values ~f:(fun entry ->
+                match entry.Module_inventory.binding.vb_pat.pat_desc with
+                | Tpat_var (id, _, _) -> Ident.same id f.id
+                | _ -> false)
+          in
+          let* () =
+            if source_binding then Ok ()
+            else unsupported f.loc "Generalized local functions"
+          in
+          let context =
+            body_module_context ~module_contexts
+              ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
+              ~generics f
+          in
+          let name =
+            String.concat ~sep:"."
+              (context.namespace @ [ Fresh_names.fresh ("Poly$" ^ f.raven_name) ])
+          in
+          Ok
+            (Some
+               Polymorphic_functions.
+                 { id = f.id; paths = f.paths; scheme; name; loc = f.loc }))
+    |> Result.map ~f:List.filter_opt
+  in
+  let* () =
+    List.fold_result funcs ~init:() ~f:(fun () f ->
+        let enclosing =
+          List.find polymorphic_functions ~f:(fun worker ->
+              (not (Ident.same worker.id f.id))
+              && Proof_bindings.contains worker.loc f.loc
+              && not
+                   (List.exists inventory.values ~f:(fun entry ->
+                        match entry.Module_inventory.binding.vb_pat.pat_desc with
+                        | Tpat_var (id, _, _) -> Ident.same id f.id
+                        | _ -> false)))
+        in
+        match enclosing with
+        | None -> Ok ()
+        | Some _ -> unsupported f.loc "Local functions within polymorphic functions")
+  in
+  let* () =
+    List.fold_result funcs ~init:() ~f:(fun () f ->
+        match function_worker polymorphic_functions f with
+        | None -> Ok ()
+        | Some _ ->
+            let references = Program_items.referenced f.body in
+            if
+              List.exists polymorphic_functions ~f:(fun other ->
+                  (not (Ident.same other.id f.id))
+                  && other.loc.loc_start.pos_cnum >= f.loc.loc_start.pos_cnum
+                  && List.mem references other.id ~equal:Ident.same)
+            then unsupported f.loc "Mutually recursive polymorphic functions"
+            else Ok ())
+  in
   let runtime_destinations =
-    Module_context.Flat :: List.map generics ~f:(fun group -> Module_context.Worker group)
+    Module_context.Flat
+    :: List.map generics ~f:(fun group -> Module_context.Worker group)
+    @ List.filter_map funcs ~f:(fun f ->
+        Option.map (function_worker polymorphic_functions f) ~f:(fun _ ->
+            body_destination ~polymorphic_functions ~generics ~module_contexts
+              ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
+              f))
   in
   let with_body_names lifted_argument =
-    with_body_names ~funcs ~procedures ~generics ~generic_procedures lifted_argument
+    with_body_names ~polymorphic_functions ~funcs ~procedures ~generics
+      ~generic_procedures lifted_argument
   in
   let* procedure_signatures =
     all funcs ~f:(fun f ->
@@ -1002,6 +1106,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       checked_modules;
       checked_operations;
       pure;
+      polymorphic_functions;
       runtime_destinations;
       procedure_signatures;
       atomic_operations;

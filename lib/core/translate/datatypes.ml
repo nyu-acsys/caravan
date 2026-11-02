@@ -38,6 +38,7 @@ type collection_kind = Sequence | FinSet | Set | Map
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
   paths : Path.t list;  (** Other paths naming the same implementation type. *)
+  variable : Types.type_expr option;  (** A scheme-local source type variable binding. *)
   module_name : string;
   module_path : string list option;
   cell_namespace : string list option;
@@ -65,6 +66,7 @@ let list =
   {
     id = None;
     paths = [];
+    variable = None;
     module_name = "List";
     ctors =
       [
@@ -91,6 +93,7 @@ let option =
   {
     id = None;
     paths = [];
+    variable = None;
     module_name = "Option";
     ctors =
       [
@@ -136,6 +139,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
         {
           id = Some decl.typ_id;
           paths = [];
+          variable = None;
           module_name = String.capitalize decl.typ_name.txt;
           ctors;
           heap = None;
@@ -188,6 +192,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
         {
           id = Some decl.typ_id;
           paths = [];
+          variable = None;
           module_name = String.capitalize name;
           ctors;
           heap;
@@ -211,6 +216,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
         {
           id = Some decl.typ_id;
           paths = [];
+          variable = None;
           module_name = String.capitalize decl.typ_name.txt;
           ctors = [];
           heap = None;
@@ -271,6 +277,7 @@ let library_type ~library ~library_id ~at name =
   {
     id = None;
     paths = [];
+    variable = None;
     module_name = library ^ "_" ^ name;
     ctors = [];
     heap = None;
@@ -304,6 +311,21 @@ let with_abstract_domain (d : t) =
 let resource_type ~name ~module_id ~at =
   { (library_type ~library:name ~library_id:module_id ~at "t") with module_name = name }
 
+(** Binds a generalized variable directly to its worker's value dictionary. *)
+let variable_type ~variable ~owner ~parameter ~at =
+  let path = owner @ [ parameter ] in
+  {
+    list with
+    variable = Some variable;
+    module_name = parameter;
+    module_path = Some path;
+    ctors = [];
+    backend_type = Some Qualified_name.{ path; name = "Carrier" };
+    value_constraint = Some Qualified_name.{ path; name = "holds" };
+    domain_scope = Some owner;
+    at;
+  }
+
 let parameter_type ~parameter ~name ~declaration ~backend =
   {
     (library_type ~library:"Parameter" ~library_id:parameter
@@ -334,6 +356,7 @@ let collection id kind =
   {
     id = Some id;
     paths = [];
+    variable = None;
     module_name;
     ctors = [];
     heap = None;
@@ -392,6 +415,16 @@ let rec expand (types : t list) (t : Types.type_expr) =
   | _ -> t
 
 let desc types t = Types.get_desc (expand types t)
+
+(** Variable IDs are local to the typed binding and never become generated names. *)
+let find_variable (types : t list) variable =
+  let variable = expand types variable in
+  match Types.get_desc variable with
+  | Tvar _ ->
+      List.find types ~f:(fun data ->
+          Option.exists data.variable ~f:(fun bound ->
+              Int.equal (Types.get_id (expand types bound)) (Types.get_id variable)))
+  | _ -> None
 
 (** The backend constructor of [cstr], retaining its source payload types. *)
 let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
@@ -471,6 +504,13 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
     (R.Type.t, Report.error) Result.t =
   let l = loc at in
   match desc types t with
+  | Tvar _ ->
+      begin match
+        Option.bind (find_variable types t) ~f:(fun data -> data.backend_type)
+      with
+      | Some backend -> Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l backend) [])
+      | None -> Report.unsupported at "An unbound polymorphic type variable"
+      end
   | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
@@ -565,6 +605,10 @@ let rec type_key types t =
   else if Option.is_some alias then type_key types (Option.value_exn alias)
   else
     match desc types t with
+    | Tvar _ ->
+        Option.map
+          (Option.bind (find_variable types t) ~f:(fun data -> data.backend_type))
+          ~f:(fun backend -> Named_key (backend.Qualified_name.path @ [ backend.name ]))
     | Tconstr (p, [], _) when Path.same p Predef.path_int -> Some Int_key
     | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Some Bool_key
     | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Some Unit_key
@@ -681,6 +725,7 @@ let rec is_int types t =
 
 let rec abstract_value_constraint types t =
   match Types.get_desc t with
+  | Tvar _ -> Option.bind (find_variable types t) ~f:(fun data -> data.value_constraint)
   | Tconstr (path, [], _) ->
       begin match find types path with
       | Some { mathematical = true; _ } -> None
@@ -730,6 +775,9 @@ let has_domain types t =
 let domain_identity types t =
   let rec scopes seen t =
     match Types.get_desc t with
+    | Tvar _ ->
+        Option.value_map (find_variable types t) ~default:[] ~f:(fun data ->
+            Option.to_list data.domain_scope)
     | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
     | Tconstr (path, [], _) ->
         begin match find types path with
@@ -1092,6 +1140,7 @@ let rec immediate (types : t list) (t : Types.type_expr) =
 let has_refs (types : t list) (t : Types.type_expr) =
   let rec go seen t =
     match desc types t with
+    | Tvar _ -> true
     | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
     | Tconstr (p, [], _) when is_ghost p -> true
     | Tconstr (p, args, _) -> begin
