@@ -433,12 +433,13 @@ let contract_postconditions env ~at ?atomic posts =
     circular. *)
 let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
     ?declaration_name ?(primitive_namespace = []) ?polymorphic_functions
-    ?current_polymorphic (f : func) : R.Callable.t State.t =
+    ?current_polymorphic ?generic_predicates (f : func) : R.Callable.t State.t =
   let ctx =
     {
       given =
         declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
-          ~primitive_namespace ?polymorphic_functions ?current_polymorphic ();
+          ~primitive_namespace ?polymorphic_functions ?current_polymorphic
+          ?generic_predicates ();
       au = None;
     }
   in
@@ -560,6 +561,9 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
     when List.Assoc.mem ctx.given.preds (logical_key env q) ~equal:String.equal ->
       let key = logical_key env q in
       let raven, types = List.Assoc.find_exn ctx.given.preds key ~equal:String.equal in
+      let* raven =
+        Spec_terms.predicate_target env ~at:t.term_loc ~key ~target:raven args
+      in
       let+ args =
         Spec_terms.predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key
           types args
@@ -1000,8 +1004,8 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                   (grown st (List.map values ~f:(fun (_, v, _) -> v)))
               in
               let location =
-                match anchor ctx.given.types st.structure_type with
-                | Some (_, at) ->
+                match anchor_location ctx.given.types st.structure_type with
+                | Some at ->
                     R.Expr.field ~loc:l
                       (at ~loc:l (List.hd_exn args))
                       (qualified_name ~loc:l (member_name st "history"))
@@ -1188,8 +1192,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       match List.Assoc.find history_invariants p.inv ~equal:String.equal with
       | Some (x :: _) ->
           let anchored =
-            match anchor ctx.given.types st.structure_type with
-            | Some (_, at) -> at ~loc:l x
+            match anchor_location ctx.given.types st.structure_type with
+            | Some at -> at ~loc:l x
             | None -> x
           in
           State.return

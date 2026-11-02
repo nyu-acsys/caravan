@@ -315,6 +315,37 @@ let equality_check env (id : S.id) operator a b =
             "Physical equality on boxed values is unsupported in specifications"
   | _ -> Ok ()
 
+let predicate_instance env ~at ~key ~target args =
+  match Generic_predicates.find ~target env.ctx.given.generic_predicates key with
+  | None -> Ok None
+  | Some worker ->
+      let* arguments =
+        Generic_predicates.instantiate ~environment:env.ctx.given.env
+          ~expand:(Datatypes.expand env.data) ~at worker
+          (List.map args ~f:(term_type env))
+      in
+      Ok (Some (worker, arguments))
+
+let predicate_target env ~at ~key ~target args =
+  let open State.Syntax in
+  let* instance = State.of_result (predicate_instance env ~at ~key ~target args) in
+  match instance with
+  | None -> State.return target
+  | Some (worker, arguments) ->
+      if
+        String.equal
+          (String.concat ~sep:"." env.ctx.given.primitive_namespace)
+          worker.name
+      then
+        if
+          List.equal Types.eq_type worker.variables
+            (List.map arguments ~f:(Datatypes.expand env.data))
+        then State.return (worker.name ^ "." ^ Generic_predicates.member worker)
+        else State.of_result (unsupported at "Polymorphic predicate recursion")
+      else
+        let+ instance = State.value_instance env.ctx ~at ~target:worker.name ~arguments in
+        instance ^ "." ^ Generic_predicates.member worker
+
 open State.Syntax
 
 (** The formula [t] of a contract. *)
@@ -733,6 +764,7 @@ and application env (t : S.term) =
       let raven, types =
         List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal
       in
+      let* raven = predicate_target env ~at ~key ~target:raven args in
       let+ args = predicate_arguments env ~at ~display:(qualid_key q) key types args in
       R.Expr.call ~loc:l (qualified_name ~loc:l raven) args
   | Tvar q, args when Option.is_some (logical_signature env q) ->
@@ -989,6 +1021,16 @@ and typed_arguments env ~at inputs args =
         R.Expr.annotated value raven_type)
 
 and predicate_arguments env ~at ?display key types args =
+  let target =
+    Option.value_map
+      (List.Assoc.find env.ctx.given.preds key ~equal:String.equal)
+      ~default:key ~f:fst
+  in
+  let* instance = State.of_result (predicate_instance env ~at ~key ~target args) in
+  let types =
+    Option.value_map instance ~default:types ~f:(fun (worker, arguments) ->
+        Generic_predicates.parameter_types worker arguments)
+  in
   match
     List.Assoc.find env.ctx.given.proof_support.predicate_inputs key ~equal:String.equal
   with

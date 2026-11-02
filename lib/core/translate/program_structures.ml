@@ -39,7 +39,8 @@ let rec shared_for_destination ~(shared : shared)
   | Module_context.Flat -> shared
   | Module_context.Worker group ->
       List.Assoc.find_exn generic_shared group.Generic_modules.name ~equal:String.equal
-  | Module_context.Function_worker (_, parent) ->
+  | Module_context.Function_worker (_, parent)
+  | Module_context.Generic_predicate (_, parent) ->
       shared_for_destination ~shared ~generic_shared parent
 
 let shared_for_proof ~(declaration_context : string -> Module_context.t)
@@ -130,9 +131,9 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     all views ~f:(fun ((p : S.predicate), _, param_types) ->
         let at = p.pred_name.pid_loc in
         let structure = List.hd_exn param_types in
-        let* anchor =
+        let* allocation =
           match Option.map (anchor types structure) ~f:fst with
-          | Some anchor -> Ok anchor
+          | Some tag -> Ok tag
           | None ->
               error at
                 "The structure of a view is a reference: an atomic, a ref or a record \
@@ -144,7 +145,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
             (declaration_context p.pred_name.pid_str)
             (view_field p.pred_name.pid_str)
         in
-        Ok (anchor, { View_storage.field; value_type = typ }))
+        Ok (allocation, { View_storage.field; value_type = typ }))
   in
   let resolve_function ~environment (id : S.id) =
     match Source.value_path environment (S.Qid id) with
@@ -690,12 +691,12 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         Ok (st, members))
   in
   let history_fields =
-    List.filter_map structures ~f:(fun st ->
-        Option.some_if (has_history st)
-          (let l = R.Loc.none in
-           ( Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst,
-             (member_name st "history", Fixed (history_elements ~loc:l history st).initial)
-           )))
+    List.map (List.filter structures ~f:has_history) ~f:(fun st ->
+        let tag = Option.value_map (anchor types st.structure_type) ~default:"" ~f:fst in
+        let l = R.Loc.none in
+        ( tag,
+          (member_name st "history", Fixed (history_elements ~loc:l history st).initial)
+        ))
   in
   let allocated_fields =
     List.map view_fields ~f:(fun (anchor, view) ->

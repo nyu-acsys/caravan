@@ -15,7 +15,7 @@ let predicate_parameters ~lookup ~bound terms =
       match head.term_desc with
       | Tvar (Qid id) when List.mem bound id.pid_str ~equal:String.equal -> []
       | Tvar name ->
-          begin match lookup name with
+          begin match lookup name arguments with
           | Some types when List.length arguments <= List.length types ->
               List.filter_map
                 (List.zip_exn arguments (List.take types (List.length arguments)))

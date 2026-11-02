@@ -407,27 +407,27 @@ let run (source : Source.t) : (t, error) Result.t =
   (* The abstract types of the libraries. *)
   let* library_types =
     all libraries ~f:(fun (lib : Library_modules.t) ->
-        all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
-            match item.psig_desc with
-            | Psig_type (_, decls) ->
-                all decls ~f:(fun (decl : Parsetree.type_declaration) ->
-                    match (decl.ptype_kind, decl.ptype_manifest, decl.ptype_params) with
-                    | Ptype_abstract, None, [] ->
-                        Ok
-                          ( Datatypes.library_type ~library:lib.library_name
-                              ~library_id:lib.library_id ~at:decl.ptype_loc
-                              decl.ptype_name.txt
-                          |> Datatypes.with_abstract_domain
-                          |> fun descriptor ->
-                            Datatypes.with_paths descriptor
-                              [ Path.Pdot (lib.library_path, decl.ptype_name.txt) ] )
-                    | _ ->
-                        unsupported decl.ptype_loc
-                          "A type of a library other than an abstract one without \
-                           parameters")
-            | _ -> Ok []))
+        let* declarations = Library_modules.abstract_types lib in
+        Ok
+          (List.map declarations ~f:(fun declaration ->
+               let descriptor =
+                 Datatypes.library_type ~library:lib.library_name
+                   ~library_id:lib.library_id ~at:declaration.Typedtree.typ_loc
+                   declaration.typ_name.txt
+               in
+               let descriptor =
+                 {
+                   descriptor with
+                   parameters =
+                     List.map declaration.typ_params ~f:(fun (parameter, _) ->
+                         parameter.Typedtree.ctyp_type);
+                 }
+               in
+               Datatypes.with_abstract_domain descriptor |> fun descriptor ->
+               Datatypes.with_paths descriptor
+                 [ Path.Pdot (lib.library_path, declaration.typ_name.txt) ])))
   in
-  let types = List.concat (List.concat library_types) @ types @ source.proof_types in
+  let types = List.concat library_types @ types @ source.proof_types in
   let types =
     List.map types ~f:(fun data ->
         let declared =

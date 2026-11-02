@@ -271,9 +271,11 @@ let public_projection inventory scopes =
   substitution
 
 let parameter_types environment parameters =
-  List.map parameters ~f:(fun (id, pty) ->
-      Source.ocaml_type environment ~at:id.S.pid_loc pty)
-  |> Result.all
+  Source.ocaml_types environment
+    ~at:
+      (Option.value_map (List.hd parameters) ~default:Location.none ~f:(fun (id, _) ->
+           id.S.pid_loc))
+    (List.map parameters ~f:snd)
 
 let state_entry scopes entries ~scope ~environment (name : S.qualid) =
   let candidate =

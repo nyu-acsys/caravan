@@ -648,7 +648,8 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
   in
   let* variables =
     List.fold_result
-      (Spec_arguments.predicate_parameters ~lookup:predicates
+      (Spec_arguments.predicate_parameters
+         ~lookup:(fun q _ -> predicates q)
          ~bound:(List.map variables ~f:fst) terms)
       ~init:variables
       ~f:(fun variables (id, typ) ->

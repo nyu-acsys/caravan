@@ -304,6 +304,7 @@ and predicate_application env ~unfold t witnesses make =
       let raven, types =
         List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal
       in
+      let* raven = predicate_target env ~at:t.term_loc ~key ~target:raven args in
       let* args =
         predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
       in

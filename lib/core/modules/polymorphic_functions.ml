@@ -30,12 +30,13 @@ let all_variables typ =
   let _, variables = visit (Set.empty (module Int), []) typ in
   List.rev variables
 
-let discover ?(excluded = []) ~at typ =
+let discover ?(excluded = []) ?(expand = Fn.id) ~at typ =
   let excluded = List.concat_map excluded ~f:all_variables in
   let unsupported () =
     Report.unsupported at "Higher-order or explicitly polymorphic function types"
   in
   let rec value (seen, variables) typ =
+    let typ = expand typ in
     let id = Types.get_id typ in
     if Set.mem seen id then Ok (seen, variables)
     else
@@ -58,6 +59,7 @@ let discover ?(excluded = []) ~at typ =
           unsupported ()
   in
   let rec function_type state typ =
+    let typ = expand typ in
     match Types.get_desc typ with
     | Tarrow (_, argument, result, _) ->
         let* state = value state argument in
@@ -92,8 +94,8 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
           Poly.equal label label' && equal seen a a' && equal seen b b'
       | _ -> false
   and equal_list seen xs ys = List.equal (equal seen) xs ys in
-  let* declared = discover ~at declaration in
-  let* _ = discover ~at occurrence in
+  let* declared = discover ~expand ~at declaration in
+  let* _ = discover ~expand ~at occurrence in
   if List.length declared.variables <> List.length scheme.variables then mismatch ()
   else
     let slot variables typ =
@@ -127,6 +129,7 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
     if not (aligned [] scheme.typ declaration) then mismatch ()
     else
       let rec match_type seen bindings declaration occurrence =
+        let source_occurrence = occurrence in
         let declaration = mono declaration and occurrence = mono occurrence in
         let pair = (Types.get_id declaration, Types.get_id occurrence) in
         match
@@ -135,7 +138,7 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
         with
         | Some (slot, _) ->
             begin match List.Assoc.find bindings slot ~equal:Int.equal with
-            | None -> Ok ((slot, occurrence) :: bindings)
+            | None -> Ok ((slot, source_occurrence) :: bindings)
             | Some previous when equal [] previous occurrence -> Ok bindings
             | Some _ -> mismatch ()
             end

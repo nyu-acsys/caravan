@@ -1,35 +1,35 @@
-(** Treiber's lock-free stack, of integers, after Saturn's. *)
+(** Treiber's lock-free stack, after Saturn's. *)
 
-type t
+type 'a t
 
-(*@ predicate stack (t : t) (xs [@implicit] : int list) *)
+(*@ predicate stack (t : 'a t) (xs [@implicit] : 'a list) *)
 
-val create : unit -> t
+val create : unit -> 'a t
 (*@ t = create ()
     ensures stack t [] *)
 
-val of_list : int list -> t
+val of_list : 'a list -> 'a t
 (*@ t = of_list xs
     ensures stack t xs *)
 
-val is_empty : t -> bool
+val is_empty : 'a t -> bool
 (*@ b = atomic is_empty t
     atomic requires stack t xs
     atomic ensures b = (xs = []) && stack t xs *)
 
-val push : t -> int -> unit
+val push : 'a t -> 'a -> unit
 (*@ atomic push t v
     atomic requires stack t xs
     atomic ensures stack t (v :: xs) *)
 
-val pop_opt : t -> int option
+val pop_opt : 'a t -> 'a option
 (*@ r = atomic pop_opt t
     atomic requires stack t xs
     atomic ensures match xs with
       | [] -> r = None && stack t []
-      | x :: xs' -> r = Some x && stack t xs' *)
+      | x :: xs' -> r === Some x && stack t xs' *)
 
-val pop_all : t -> int list
+val pop_all : 'a t -> 'a list
 (*@ r = atomic pop_all t
     atomic requires stack t xs
-    atomic ensures r = xs && stack t [] *)
+    atomic ensures r === xs && stack t [] *)

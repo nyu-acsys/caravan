@@ -25,6 +25,28 @@ let environment (source : Source.t) library =
         (Report.error Type library.library.scope.location
            ("Cannot resolve imported module " ^ library.source_name))
 
+(** Source declarations retain the compiler variables of parameterized abstract types. *)
+let abstract_types library =
+  match library.library.typed_signature with
+  | None ->
+      Report.unsupported library.library.scope.location
+        "An imported interface without a typed signature"
+  | Some signature ->
+      List.fold_result signature.sig_items ~init:[] ~f:(fun declarations item ->
+          match item.Typedtree.sig_desc with
+          | Tsig_type (_, types) ->
+              let* types =
+                List.map types ~f:(fun declaration ->
+                    match (declaration.Typedtree.typ_kind, declaration.typ_manifest) with
+                    | Ttype_abstract, None -> Ok declaration
+                    | _ ->
+                        Report.unsupported declaration.typ_loc
+                          "A library type other than an abstract type")
+                |> Result.all
+              in
+              Ok (declarations @ types)
+          | _ -> Ok declarations)
+
 let contains (outer : Location.t) (inner : Location.t) =
   outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum

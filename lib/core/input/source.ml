@@ -827,6 +827,39 @@ let ocaml_type (env : Env.t) ~(at : Location.t) (t : S.pty) :
     | Some error -> Error error
     | None -> Error (Report.error Type at (Stdlib.Printexc.to_string exn)))
 
+(** One scheme preserves the sharing of type variables across declaration parameters. *)
+let ocaml_types env ~at types =
+  match types with
+  | [] -> Ok []
+  | _ -> (
+      try
+        let core =
+          match types with
+          | [ typ ] -> core_type ~at typ
+          | _ ->
+              Ast_helper.Typ.tuple ~loc:at
+                (List.map types ~f:(fun typ -> (None, core_type ~at typ)))
+        in
+        let typed =
+          Typetexp.TyVarEnv.with_local_scope (fun () ->
+              Typetexp.transl_type_scheme env core)
+        in
+        begin match types with
+        | [ _ ] -> Ok [ typed.ctyp_type ]
+        | _ ->
+            begin match Types.get_desc typed.ctyp_type with
+            | Ttuple components -> Ok (List.map components ~f:snd)
+            | _ ->
+                Error
+                  (Report.error Type at "Expected a tuple of declaration parameter types")
+            end
+        end
+      with exn ->
+        begin match Report.of_exn exn with
+        | Some error -> Error error
+        | None -> Error (Report.error Type at (Stdlib.Printexc.to_string exn))
+        end)
+
 (** The opaque OCaml reference type of proof-only storage. *)
 let ghost_type env ~at =
   ocaml_type env ~at

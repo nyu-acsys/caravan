@@ -1,5 +1,5 @@
 (* The stack owns its atomic, which holds its contents. *)
-predicate stack (t : t) (xs [@implicit] : int list) = own t xs
+predicate stack (t : 'a t) (xs [@implicit] : 'a list) = own t xs
 
 proof create = on return fold stack t []
 

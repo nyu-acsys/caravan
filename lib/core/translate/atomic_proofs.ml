@@ -126,41 +126,48 @@ and owned_names (t : S.term) =
   | None, (Tattr (_, t) | Tcast (t, _)) -> owned_names t
   | None, _ -> []
 
-(** Where the ghost fields of a structure of type [t] go: on its reference, or, for an
-    immutable record, on its first atomic. The field whose allocation allocates them, and
-    the reference, given the structure. *)
-let anchor (types : Datatypes.t list) (t : Types.type_expr) :
-    (string * (loc:R.Loc.t -> R.Expr.t -> R.Expr.t)) option =
+(** The reference holding a structure's ghost fields and its allocation kind. *)
+let anchor_source (types : Datatypes.t list) (t : Types.type_expr) =
   let itself ~loc:_ e = e in
   match Datatypes.desc types t with
-  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p ->
-      Option.map (Datatypes.cell_name ~prefix:"atomic_" ~suffix:"" types elt)
-        ~f:(fun field -> (field, itself))
-  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
-      Option.map (Datatypes.cell_name ~prefix:"ref_" ~suffix:"_contents" types elt)
-        ~f:(fun field -> (field, itself))
+  | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p -> Some (`Atomic elt, itself)
+  | Tconstr (p, [ elt ], _) when Datatypes.is_ref p -> Some (`Reference elt, itself)
   | Tconstr (p, [], _) ->
       begin match Datatypes.find types p with
-      | Some { heap = Some (f :: _); _ } -> Some (f.raven_field, itself)
+      | Some { heap = Some (f :: _); _ } -> Some (`Field f.raven_field, itself)
       | Some { heap = None; ctors = [ { ocaml = ""; fields; args; _ } ]; _ } ->
           List.find_map (List.zip_exn fields args) ~f:(fun (label, a) ->
               match Datatypes.desc types a with
               | Tconstr (q, [ elt ], _) when Datatypes.is_atomic q ->
-                  Option.map (Datatypes.cell_name ~prefix:"atomic_" ~suffix:"" types elt)
-                    ~f:(fun field ->
-                      ( field,
-                        fun ~loc e -> R.Expr.field ~loc e (qualified_name ~loc label) ))
+                  Some
+                    ( `Atomic elt,
+                      fun ~loc e -> R.Expr.field ~loc e (qualified_name ~loc label) )
               | _ -> None)
       | _ -> None
       end
   | _ -> None
+
+let anchor_location types t = Option.map (anchor_source types t) ~f:snd
+
+let anchor types t =
+  Option.bind (anchor_source types t) ~f:(fun (source, location) ->
+      let tag =
+        match source with
+        | `Atomic elt -> Datatypes.allocation_tag ~prefix:"atomic_" ~suffix:"" types elt
+        | `Reference elt ->
+            Datatypes.allocation_tag ~prefix:"ref_" ~suffix:"_contents" types elt
+        | `Field field -> Some field
+      in
+      Option.map tag ~f:(fun tag -> (tag, location)))
 
 (** The reference holding the ghost fields of the structure [e], the first argument of the
     predicate [pred]. *)
 let anchored ctx ~loc ~pred (e : R.Expr.t) =
   match List.Assoc.find ctx.given.preds pred ~equal:String.equal with
   | Some (_, t :: _) ->
-      begin match anchor ctx.given.types t with Some (_, at) -> at ~loc e | None -> e
+      begin match anchor_location ctx.given.types t with
+      | Some at -> at ~loc e
+      | None -> e
       end
   | _ -> e
 
@@ -1609,15 +1616,14 @@ let no_loop_before_linearizing ~at =
         (unsupported at
            "A loop in a function with an atomic contract, before it linearizes,")
 
-(** The statements declaring arbitrary values for the ghost fields of the views that an
-    allocation of [fields] allocates, and these fields with their values: a view's value
-    is set when the structure's invariant is established. *)
-let view_allocation ctx ~loc:l (fields : string list) =
+(** The ghost fields attached to these source allocation tags, with their initial values.
+    A view's value is set when its invariant is established. *)
+let view_allocation ctx ~loc:l (tags : string list) =
   let open State.Syntax in
   let views =
-    List.concat_map fields ~f:(fun field ->
+    List.concat_map tags ~f:(fun tag ->
         Option.value
-          (List.Assoc.find ctx.given.shared.anchors field ~equal:String.equal)
+          (List.Assoc.find ctx.given.shared.anchors tag ~equal:String.equal)
           ~default:[])
   in
   let+ allocated =

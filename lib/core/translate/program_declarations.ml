@@ -19,6 +19,7 @@ type t = {
   checked_operations : Program_items.checked_operation list;
   pure : Procedures.func list;
   polymorphic_functions : Polymorphic_functions.t list;
+  generic_predicates : Generic_predicates.t list;
   runtime_destinations : Module_context.destination list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
   atomic_operations : (Source.proof_au * Procedures.func) list;
@@ -116,6 +117,12 @@ let function_types polymorphic_functions f types =
             ~parameter:("A" ^ Int.to_string index)
             ~at:worker.loc)
       @ types
+
+let predicate_destination ~generic_predicates ~declaration_context key =
+  let parent = (declaration_context key).Module_context.destination in
+  match Generic_predicates.find generic_predicates key with
+  | None -> parent
+  | Some predicate -> Module_context.Generic_predicate (predicate, parent)
 
 let worker_member polymorphic_functions f target =
   match function_worker polymorphic_functions f with
@@ -578,7 +585,10 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           | Some (_, false) -> false
           | Some (_, true) | None -> true
         in
-        let* scheme = Polymorphic_functions.discover ~at:f.loc f.scheme_type in
+        let* scheme =
+          Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
+            f.scheme_type
+        in
         if (not representative) || List.is_empty scheme.variables then Ok None
         else
           let source_binding =
@@ -1072,6 +1082,45 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         Ok (p.pred_name.pid_str, List.length ts - implicit))
   in
   let predicates = predicates @ scoped_predicates in
+  let* generic_predicates =
+    all predicates ~f:(fun (at, predicate, definition, parameters) ->
+        let key = predicate.S.pred_name.pid_str in
+        let context =
+          Program_scopes.declaration_context ~module_contexts
+            ~unapplied_proofs:scopes.unapplied_proofs key
+        in
+        let* implicit = implicit_parameters predicate in
+        let* worker =
+          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key ~at
+            ~explicit:(List.length parameters - implicit)
+            parameters
+        in
+        if List.is_empty worker.variables then Ok None
+        else if Option.is_some context.identity then
+          unsupported at "Polymorphic predicates in source modules"
+        else
+          match definition with
+          | Body body ->
+              let environment = Source.annotation_env source context.scope.environment in
+              let* () =
+                if
+                  List.exists (term_references [] body) ~f:(fun q ->
+                      Option.exists (Source.value_path environment q) ~f:(fun path ->
+                          List.exists polymorphic_functions ~f:(fun function_ ->
+                              List.exists function_.paths ~f:(Path.same path))))
+                then
+                  unsupported at "A source polymorphic function in a predicate definition"
+                else Ok ()
+              in
+              let name =
+                String.concat ~sep:"."
+                  (context.namespace @ [ Fresh_names.fresh ("PolyPredicate$" ^ key) ])
+              in
+              Ok (Some { worker with name })
+          | Direct_invariant _ | Invariant _ | View _ ->
+              unsupported at "A polymorphic invariant or view")
+  in
+  let generic_predicates = List.filter_opt generic_predicates in
   (* The abstract predicates of the libraries, by their qualified names, as [Cell.holds],
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
@@ -1089,12 +1138,76 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
               | None -> Ok ()
             in
             let* types =
-              all p.pred_params ~f:(fun (_, t) ->
-                  Source.ocaml_type environment ~at:a.loc t)
+              Source.ocaml_types environment ~at:a.loc (List.map p.pred_params ~f:snd)
             in
             Ok (lib, p, types)))
   in
   let library_preds = List.concat library_preds in
+  let* imported_predicates =
+    all library_preds ~f:(fun (lib, predicate, parameters) ->
+        let key = lib.Library_modules.source_name ^ "." ^ predicate.S.pred_name.pid_str in
+        let* implicit = implicit_parameters predicate in
+        let* worker =
+          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key
+            ~at:predicate.pred_name.pid_loc
+            ~explicit:(List.length parameters - implicit)
+            parameters
+        in
+        if List.is_empty worker.variables then Ok None
+        else
+          Ok
+            (Some
+               {
+                 worker with
+                 name =
+                   lib.library_name ^ "."
+                   ^ Fresh_names.fresh ("PolyPredicate$" ^ predicate.pred_name.pid_str);
+               }))
+  in
+  let generic_predicates = generic_predicates @ List.filter_opt imported_predicates in
+  let* imported_functions =
+    all libraries ~f:(fun lib ->
+        match lib.Library_modules.library.typed_signature with
+        | None ->
+            unsupported lib.library.scope.location
+              "An imported interface without typed declarations"
+        | Some signature ->
+            all signature.sig_items ~f:(fun item ->
+                match item.Typedtree.sig_desc with
+                | Tsig_value value ->
+                    let path = Path.Pdot (lib.library_path, value.val_name.txt) in
+                    let declaration = Env.find_value path source.env in
+                    let* scheme =
+                      Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                        ~at:value.val_loc declaration.val_type
+                    in
+                    if List.is_empty scheme.variables then Ok None
+                    else if
+                      not
+                        (match Datatypes.desc types declaration.val_type with
+                        | Tarrow _ -> true
+                        | _ -> false)
+                    then
+                      unsupported value.val_loc
+                        "Polymorphic values in imported interfaces"
+                    else
+                      Ok
+                        (Some
+                           Polymorphic_functions.
+                             {
+                               id = value.val_id;
+                               paths = [ path ];
+                               scheme;
+                               name =
+                                 lib.library_name ^ "."
+                                 ^ Fresh_names.fresh ("Poly$" ^ value.val_name.txt);
+                               loc = value.val_loc;
+                             })
+                | _ -> Ok None))
+  in
+  let polymorphic_functions =
+    polymorphic_functions @ List.filter_opt (List.concat imported_functions)
+  in
   Ok
     {
       source;
@@ -1107,6 +1220,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       checked_operations;
       pure;
       polymorphic_functions;
+      generic_predicates;
       runtime_destinations;
       procedure_signatures;
       atomic_operations;

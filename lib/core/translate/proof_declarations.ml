@@ -119,10 +119,12 @@ let action_checks ctx (st : structure) =
 
 (** The context translating the specifications of declarations, outside functions. *)
 let spec_context types ~shared ~ocaml_env ~preds ~spec_funcs
-    ?(proof_support = empty_proof_support) () =
+    ?(proof_support = empty_proof_support) ?(generic_predicates = [])
+    ?(primitive_namespace = []) () =
   {
     given =
-      declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support ();
+      declaration_inputs types ~shared ~env:ocaml_env ~preds ~spec_funcs ~proof_support
+        ~generic_predicates ~primitive_namespace ();
     au = None;
   }
 
@@ -178,7 +180,8 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
 
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof_support
-    ~predicate_bodies ?member_name declaration =
+    ~predicate_bodies ?member_name ?(primitive_namespace = []) ?(generic_predicates = [])
+    declaration =
   match declaration with
   | S.Proof_lemma
       {
@@ -191,7 +194,10 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         lemma_body;
       } ->
       let ctx =
-        let base = spec_context types ~shared ~ocaml_env ~preds ~spec_funcs () in
+        let base =
+          spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~primitive_namespace
+            ~generic_predicates ()
+        in
         {
           base with
           given = { base.given with proof_lemmas; proof_support; predicate_bodies };
@@ -278,9 +284,12 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
 (** The predicate [p], declared at [at], whose parameters have the OCaml types
     [param_types], defined as [def]. Each stateful invariant holds half of its views. *)
 let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declaration_name
-    ~at ~structures (p : S.predicate) (def : definition) param_types :
-    R.Callable.t State.t =
-  let ctx = spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support () in
+    ?(generic_predicates = []) ?(primitive_namespace = []) ~at ~structures
+    (p : S.predicate) (def : definition) param_types : R.Callable.t State.t =
+  let ctx =
+    spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
+      ~generic_predicates ~primitive_namespace ()
+  in
   State.in_procedure
   @@
   let open State.Syntax in
@@ -306,8 +315,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
         formula env (S.mk_term (Tvar (Qid (S.mk_id ~loc:at structure))) at)
       in
       let structure =
-        match anchor types structure_type with
-        | Some (_, at) -> at ~loc:l structure
+        match anchor_location types structure_type with
+        | Some at -> at ~loc:l structure
         | None -> structure
       in
       let _, raven, _, _ = List.hd_exn value in
@@ -487,8 +496,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let body = List.reduce_exn (body @ waiting) ~f:(bin And) in
       let _, structure, _, _ = List.hd_exn params in
       let anchored e =
-        match anchor types st.structure_type with
-        | Some (_, at) -> at ~loc:l e
+        match anchor_location types st.structure_type with
+        | Some at -> at ~loc:l e
         | None -> e
       in
       let* halves =
@@ -677,9 +686,7 @@ let predicates (source : Source.t) =
   in
   let proof = List.filter_opt proof in
   let typed (at, (p : S.predicate), def) =
-    let* types =
-      all p.pred_params ~f:(fun (_, t) -> Source.ocaml_type source.env ~at t)
-    in
+    let* types = Source.ocaml_types source.env ~at (List.map p.pred_params ~f:snd) in
     let* _ = implicit_parameters p in
     Ok (at, p, def, types)
   in
@@ -704,11 +711,7 @@ let predicates (source : Source.t) =
     List.filter defined ~f:(fun (_, p, _, _) -> String.equal (name p) x)
   in
   let same_types a b =
-    List.length a = List.length b
-    && List.for_all2_exn a b ~f:(fun a b ->
-        String.equal
-          (Stdlib.Format.asprintf "%a" Printtyp.type_expr a)
-          (Stdlib.Format.asprintf "%a" Printtyp.type_expr b))
+    List.length a = List.length b && Ctype.is_equal source.env true a b
   in
   let is_invariant = function
     | Direct_invariant _ | Invariant _ -> true
@@ -776,12 +779,13 @@ let pure_logical_body env (t : S.term) =
 
 (** Nonrecursive logical definitions are checked with the rest of the proof. *)
 let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?member_name
-    ~as_value declaration =
+    ?(primitive_namespace = []) ?(generic_predicates = []) ~as_value declaration =
   match declaration with
   | S.Proof_function { function_name; function_params; function_result; function_body } ->
       let l = loc function_name.pid_loc in
       let ctx =
-        spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ()
+        spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
+          ~primitive_namespace ~generic_predicates ()
       in
       State.in_procedure
       @@
@@ -832,14 +836,14 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
   | _ -> State.of_result (error Location.none "Expected a logical function declaration")
 
 let scoped_contract_context types ~shared ~environment ~proof_support ~preds ~spec_funcs
-    ~own_preds ~own_inputs () =
+    ~own_preds ~own_inputs ?(primitive_namespace = []) ?(generic_predicates = []) () =
   let proof_support =
     { proof_support with predicate_inputs = own_inputs @ proof_support.predicate_inputs }
   in
   spec_context types ~shared ~ocaml_env:environment ~proof_support
     ~preds:(own_preds @ preds)
     ~spec_funcs:(List.map own_preds ~f:(fun (p, (raven, _)) -> (p, raven)) @ spec_funcs)
-    ()
+    ~primitive_namespace ~generic_predicates ()
 
 let check_adapter_shape ~at (contract : S.contract option) =
   match contract with

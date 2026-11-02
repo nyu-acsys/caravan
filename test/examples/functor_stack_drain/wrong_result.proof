@@ -1,0 +1,6 @@
+module Integer_stack = struct
+  predicate stack (t : t) (xs [@implicit] : int list) =
+    Treiber_stack.stack t xs
+
+  module Pop = Ghost.AU (struct let operation = pop_opt end)
+end

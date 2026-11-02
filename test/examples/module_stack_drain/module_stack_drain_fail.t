@@ -3,9 +3,9 @@
   5 |     match Stack.pop_opt stack with None -> [] | Some value -> value :: drain stack
                                                                                         ^
   Verification Error: A postcondition may not hold at this return point.
-  File "wrong_result.ml", line 8, columns 38-49:
-  8 |       ensures Stack.stack stack [] && result = [] *)
-                                            ^^^^^^^^^^^
+  File "wrong_result.ml", line 8, columns 38-51:
+  8 |       ensures Stack.stack stack [] && result === [] *)
+                                            ^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
   [1]
 
@@ -15,7 +15,7 @@
                                                                                         ^
   Verification Error: A postcondition may not hold at this return point.
   File "wrong_contents.ml", line 8, columns 14-34:
-  8 |       ensures Stack.stack stack xs && result = xs *)
+  8 |       ensures Stack.stack stack xs && result === xs *)
                     ^^^^^^^^^^^^^^^^^^^^
   Related Location: This predicate may not hold.
   [1]

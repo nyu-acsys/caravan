@@ -719,8 +719,8 @@ let structure_members ~(history : History.encoding) types (st : structure) ~at :
   let history_field = member_name st "history" in
   let* structure_typ = Datatypes.typ types ~at st.structure_type in
   let* anchored =
-    match anchor types st.structure_type with
-    | Some (_, at) ->
+    match anchor_location types st.structure_type with
+    | Some at ->
         Ok
           (fun e ->
             R.Expr.field ~loc:l (at ~loc:l e) (qualified_name ~loc:l history_field))
@@ -1072,8 +1072,8 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
         ("view_" ^ v, v, view_field, t, typ))
   in
   let anchored e =
-    match anchor ctx.given.types st.structure_type with
-    | Some (_, at) -> at ~loc:l e
+    match anchor_location ctx.given.types st.structure_type with
+    | Some at -> at ~loc:l e
     | None -> e
   in
   let structure = List.hd_exn args in

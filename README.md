@@ -22,11 +22,13 @@ of polymorphic implementations are supported.
 Named first-order functions can be polymorphic: type arguments are inferred from
 OCaml's generalized types, and each generic body is verified once. This includes
 functions in static modules and supported source functors, recursive functions,
-and pure functions used in contracts. Lists, options and tuples retain their
-source-value constraints at each instantiation. Higher-order parameters, explicitly
-quantified source annotations, generalized local functions and local helpers in
-generic bodies remain unsupported, as do polymorphic mutable payloads and
-ordering on generic values.
+and pure functions used in contracts. Lists, options, tuples, references and atomics
+retain their source-value constraints at each instantiation. Parameterized type
+aliases and generic ownership predicates work with imported function contracts;
+the Saturn Treiber stack and its drain clients use this support. Higher-order
+parameters, explicitly quantified source annotations, generalized local functions
+and local helpers in generic bodies remain unsupported, as do parameterized record and variant
+definitions and ordering on generic values.
 
 Functions and monomorphic types can be grouped in `module ... = struct ... end`,
 including nested modules. Calls and annotations resolve names in their enclosing

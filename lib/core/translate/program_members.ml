@@ -9,7 +9,8 @@ open Program_items
 open Proof_declarations
 
 type t = {
-  library_modules : R.Member.t list;
+  library_modules : (Library_modules.t * R.Member.t list) list;
+  library_worker_members : (string * R.Member.t list) list;
   publication_members : (Module_inventory.checked_binding * R.Callable.t) list;
       (** The pure functions that checked operations call, published as procedures, latest
           first. *)
@@ -75,6 +76,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     procedure_signatures;
     pure;
     polymorphic_functions;
+    generic_predicates;
     runtime_destinations;
     scoped_proofs;
     source;
@@ -181,7 +183,17 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   (* Each library's module, trusted: its abstract predicates, and its values, as functions
      without arguments, and functions, as procedures with their contracts. *)
-  let* library_modules, state =
+  let library_polymorphic_functions =
+    List.filter polymorphic_functions ~f:(fun worker ->
+        not
+          (List.exists funcs ~f:(fun f -> Ident.same worker.Polymorphic_functions.id f.id)))
+  in
+  let library_registry =
+    Path_bindings.of_list
+      (List.concat_map library_polymorphic_functions ~f:(fun worker ->
+           List.map worker.paths ~f:(fun path -> (path, worker))))
+  in
+  let* library_emissions, state =
     State.run_from state
     @@ State.all libraries ~f:(fun (lib : Library_modules.t) ->
         let l = loc Location.none in
@@ -190,6 +202,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             (List.filter library_preds ~f:(fun ((lib' : Library_modules.t), _, _) ->
                  String.equal lib'.library_name lib.library_name))
             ~f:(fun (_, (p : S.predicate), param_types) ->
+              let worker =
+                Generic_predicates.find generic_predicates
+                  (lib.source_name ^ "." ^ p.pred_name.pid_str)
+              in
+              let types =
+                Option.value_map worker ~default:types ~f:(fun worker ->
+                    Generic_predicates.types worker types)
+              in
               let* params =
                 all (List.zip_exn p.pred_params param_types) ~f:(fun ((x, _), t) ->
                     let* typ = Datatypes.typ types ~at:x.S.pid_loc t in
@@ -200,13 +220,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 List.split_n params (List.length params - implicit)
               in
               let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
-              Ok
-                (R.Member.free
-                   (R.Member.callable
-                      (R.Callable.func ~loc:l ~kind ~formals:(List.map explicit ~f:snd)
-                         ~returns:(List.map implicit ~f:snd)
-                         (ident ~loc:l p.pred_name.pid_str)
-                         None))))
+              let member =
+                R.Member.free
+                  (R.Member.callable
+                     (R.Callable.func ~loc:l ~kind ~formals:(List.map explicit ~f:snd)
+                        ~returns:(List.map implicit ~f:snd)
+                        (ident ~loc:l p.pred_name.pid_str)
+                        None))
+              in
+              Ok (member, worker))
         in
         let open State.Syntax in
         let* environment = State.of_result (Library_modules.environment source lib) in
@@ -226,7 +248,19 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         in
         let ctx =
           scoped_contract_context types ~shared ~environment ~proof_support ~preds
-            ~spec_funcs ~own_preds ~own_inputs ()
+            ~primitive_namespace:[ lib.library_name ] ~generic_predicates ~spec_funcs
+            ~own_preds ~own_inputs ()
+        in
+        let ctx =
+          {
+            ctx with
+            given =
+              {
+                ctx.given with
+                generic_predicates;
+                polymorphic_functions = library_registry;
+              };
+          }
         in
         let* pred_members = State.of_result pred_members in
         let* contracts = State.of_result (interface_contracts lib.library) in
@@ -238,6 +272,31 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   let at = vd.pval_loc in
                   let x = vd.pval_name.txt in
                   let value = Env.find_value (Pdot (lib.library_path, x)) source.env in
+                  let worker =
+                    Path_bindings.find library_registry (Pdot (lib.library_path, x))
+                  in
+                  let ctx =
+                    match worker with
+                    | None -> ctx
+                    | Some worker ->
+                        let types =
+                          List.mapi worker.scheme.variables ~f:(fun index variable ->
+                              Datatypes.variable_type ~variable
+                                ~owner:(String.split worker.name ~on:'.')
+                                ~parameter:("A" ^ Int.to_string index)
+                                ~at:worker.loc)
+                          @ types
+                        in
+                        {
+                          ctx with
+                          given =
+                            {
+                              ctx.given with
+                              types;
+                              primitive_namespace = String.split worker.name ~on:'.';
+                            };
+                        }
+                  in
                   let rec arrows (t : Types.type_expr) =
                     match Types.get_desc t with
                     | Tarrow (Nolabel, a, r, _) ->
@@ -251,19 +310,39 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     Option.map (List.Assoc.find contracts x ~equal:String.equal) ~f:fst
                   in
                   let+ member = library_function ctx ~at ~name:x ~args ~result contract in
-                  [ R.Member.free (R.Member.callable member) ]
-              | Psig_type _ | Psig_attribute _ -> State.return []
+                  let member = R.Member.free (R.Member.callable member) in
+                  begin match worker with
+                  | None -> ([ member ], [])
+                  | Some worker -> ([], [ (worker.name, [ member ]) ])
+                  end
+              | Psig_type _ | Psig_attribute _ -> State.return ([], [])
               | _ ->
                   State.of_result
                     (unsupported item.psig_loc "This item of a library's interface"))
         in
-        R.Member.module_ ~loc:l
-          (ident ~loc:l lib.library_name)
-          (pred_members @ List.concat value_members))
+        let ordinary_predicates =
+          List.filter_map pred_members ~f:(function
+            | member, None -> Some member
+            | _, Some _ -> None)
+        in
+        let predicate_workers =
+          List.filter_map pred_members ~f:(function
+            | member, Some worker -> Some (worker.name, [ member ])
+            | _, None -> None)
+        in
+        ( lib,
+          ordinary_predicates @ List.concat_map value_members ~f:fst,
+          predicate_workers @ List.concat_map value_members ~f:snd ))
+  in
+  let library_modules =
+    List.map library_emissions ~f:(fun (library, members, _) -> (library, members))
+  in
+  let library_worker_members =
+    List.concat_map library_emissions ~f:(fun (_, _, workers) -> workers)
   in
   (* The context of the requested [operation] of [view], with its arguments' and result's
      types. *)
-  let view_operation_context (view : checked_view) operation =
+  let view_operation_context ?(primitive_namespace = []) (view : checked_view) operation =
     let signature = operation.operation_signature in
     let* () =
       check_adapter_shape ~at:signature.site.item_loc operation.operation_contract
@@ -300,7 +379,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     let ctx =
       scoped_contract_context view.view_types ~shared ~environment
         ~proof_support:{ proof_support with strict_source_types = true }
-        ~preds ~spec_funcs ~own_preds ~own_inputs:(List.filter_opt own_inputs) ()
+        ~preds ~spec_funcs ~own_preds ~own_inputs:(List.filter_opt own_inputs)
+        ~primitive_namespace ~generic_predicates ()
     in
     let predicates q =
       let env =
@@ -338,9 +418,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   (* The contract of [operation] as [view] requests it, with its context and that
      context's own state. *)
-  let prepare_view_operation view operation =
+  let prepare_view_operation ?(primitive_namespace = []) view operation =
     let open State.Syntax in
-    let* ctx, args, result = State.of_result (view_operation_context view operation) in
+    let* ctx, args, result =
+      State.of_result (view_operation_context ~primitive_namespace view operation)
+    in
     let+ expected, local =
       State.within State.new_local
         (prepare_callable ~validate:true ctx
@@ -536,6 +618,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          in
                          let actual_ctx =
                            scoped_contract_context types ~shared ~environment
+                             ~primitive_namespace:[ lib.library_name ] ~generic_predicates
                              ~proof_support ~preds ~spec_funcs ~own_preds ~own_inputs ()
                          in
                          let+ prepared =
@@ -901,19 +984,31 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          group.representative.argument)
                   then State.return None
                   else
-                    let+ _, _, _, _, prepared = prepare_view_operation view operation in
+                    let+ _, _, _, _, prepared =
+                      prepare_view_operation
+                        ~primitive_namespace:(String.split group.interface ~on:'.')
+                        view operation
+                    in
                     Some
                       (R.Member.callable
                          (prepared_member ~at:operation.operation_signature.site.item_loc
                             ~name:operation.operation_member None prepared)))
             in
-            let* requests =
-              State.gets (fun (state : State.state) -> state.tables.domains)
+            let* requests, dictionaries, instances =
+              State.gets (fun (state : State.state) ->
+                  ( state.tables.domains,
+                    state.tables.dictionaries,
+                    state.tables.function_instances ))
             in
             let* domains =
               State.of_result
-                (all requests ~f:(fun request ->
-                     Datatypes.domain_members request.domain_types [ request.domain_type ]))
+                (Result.all
+                   (List.map requests ~f:(fun request ->
+                        Datatypes.domain_members request.domain_types
+                          [ request.domain_type ])
+                   @ List.map dictionaries ~f:(fun request ->
+                       Datatypes.domain_members ~dictionaries:true request.domain_types
+                         [ request.domain_type ])))
             in
             let namespace = String.split group.interface ~on:'.' in
             let domains =
@@ -925,6 +1020,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     member)
             in
             let l = loc group.representative.argument.site.item_loc in
+            let instances =
+              List.filter_map instances ~f:(fun instance ->
+                  Option.some_if
+                    (List.equal String.equal instance.instance_namespace namespace)
+                    (Value_instances.member ~loc:l instance))
+            in
             let carriers =
               Option.value_map group.world ~default:[] ~f:(fun world ->
                   List.map group.representative.argument.expected.signature_ghost_modules
@@ -948,7 +1049,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               @ [
                   R.Member.module_ ~loc:l ~interface:true
                     (ident ~loc:l (Qualified_name.of_string group.interface).name)
-                    (types @ domains @ resources @ ghost_modules
+                    (types @ domains @ resources @ ghost_modules @ instances
                    @ List.filter_opt operations);
                 ])))
   in
@@ -1018,7 +1119,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let ctx =
           spec_context types
             ~shared:(shared_for_proof st.invariant)
-            ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support ()
+            ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
+            ~primitive_namespace:(declaration_context st.invariant).namespace
+            ~generic_predicates ()
         in
         State.map
           (State.in_procedure (action_checks ctx st))
@@ -1038,12 +1141,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     (pending_members
                        (spec_context types
                           ~shared:(shared_for_proof st.invariant)
-                          ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support ())
+                          ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
+                          ~primitive_namespace:
+                            (declaration_context st.invariant).namespace
+                          ~generic_predicates ())
                        st p helped
                        ~helped_proc:
                          (match owner_destination st.invariant with
                          | Module_context.Flat -> proc_name helped
-                         | Module_context.Worker _ | Module_context.Function_worker _ ->
+                         | Module_context.Worker _ | Module_context.Function_worker _
+                         | Module_context.Generic_predicate _ ->
                              body_proc_name helped))
               | None ->
                   State.of_result
@@ -1059,12 +1166,26 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let preds, spec_funcs, proof_support =
           proof_context_for ~preds ~spec_funcs ~proof_support p.pred_name.pid_str
         in
+        let worker = Generic_predicates.find generic_predicates p.pred_name.pid_str in
+        let types =
+          Option.value_map worker ~default:types ~f:(fun worker ->
+              Generic_predicates.types worker types)
+        in
+        let declaration_name =
+          match worker with
+          | Some worker -> Some (Generic_predicates.member worker)
+          | None -> definition_member_name p.pred_name.pid_str
+        in
+        let primitive_namespace =
+          Option.value_map worker
+            ~default:(declaration_context p.pred_name.pid_str).namespace ~f:(fun worker ->
+              String.split worker.name ~on:'.')
+        in
         predicate types
           ~shared:(shared_for_proof p.pred_name.pid_str)
           ~ocaml_env:(declaration_environment p.pred_name.pid_str)
-          ~preds ~spec_funcs ~proof_support
-          ?declaration_name:(definition_member_name p.pred_name.pid_str)
-          ~at ~structures p def param_types)
+          ~preds ~spec_funcs ~proof_support ?declaration_name ~generic_predicates
+          ~primitive_namespace ~at ~structures p def param_types)
   in
   let predicate_bodies =
     List.filter_map predicates ~f:(fun (_, p, definition, _) ->
@@ -1186,6 +1307,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           module_lemmas (declaration_context declaration_name) ~project:Fn.id lemmas
         in
         proof_lemma types ~shared
+          ~primitive_namespace:(declaration_context declaration_name).namespace
+          ~generic_predicates
           ~ocaml_env:(declaration_environment declaration_name)
           ~preds ~spec_funcs ~proof_lemmas:lemmas ~proof_support
           ~predicate_bodies:(body_contexts scope)
@@ -1276,6 +1399,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
              | _ -> Ok ())
              ~f:(fun () ->
                proof_function types ~shared
+                 ~primitive_namespace:(declaration_context declaration_name).namespace
+                 ~generic_predicates
                  ~ocaml_env:(declaration_environment declaration_name)
                  ~preds ~spec_funcs
                  ~proof_support:{ proof_support with logical_functions }
@@ -1297,7 +1422,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let namespace =
           Module_context.namespace
             (match destination with
-            | Module_context.Function_worker (_, parent) -> parent
+            | Module_context.Function_worker (_, parent)
+            | Module_context.Generic_predicate (_, parent) ->
+                parent
             | Flat | Worker _ -> destination)
         in
         let* layouts =
@@ -1315,6 +1442,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           | Module_context.Function_worker (worker, _) ->
               let f = List.find_exn funcs ~f:(fun f -> Ident.same worker.id f.id) in
               Program_declarations.function_types polymorphic_functions f body_types
+          | Module_context.Generic_predicate (worker, _) ->
+              Generic_predicates.types worker body_types
           | Flat | Worker _ -> body_types
         in
         let stages = List.concat_map groups ~f:Generic_modules.parameter_groups in
@@ -1382,36 +1511,36 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let polymorphic_registry destination =
     let current_groups = Module_context.groups destination in
     Path_bindings.of_list
-      (List.concat_map funcs ~f:(fun candidate ->
-           let worker =
-             match Generic_modules.member generics candidate.id with
-             | None ->
-                 Program_declarations.function_worker polymorphic_functions candidate
-             | Some (group, application, stem) ->
-                 let source =
-                   List.find_map group.body_members ~f:(fun (source, target) ->
-                       Option.some_if (String.equal stem target) source)
-                 in
-                 let representative =
-                   Option.bind source ~f:(fun source ->
-                       List.Assoc.find group.representative.body_members source
-                         ~equal:String.equal)
-                 in
-                 Option.bind representative ~f:(fun id ->
-                     List.find polymorphic_functions ~f:(fun worker ->
-                         Ident.same worker.Polymorphic_functions.id id))
-                 |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
-                     if List.exists current_groups ~f:(phys_equal group) then worker
-                     else
-                       {
-                         worker with
-                         name =
-                           application.name ^ "."
-                           ^ (Qualified_name.of_string worker.name).name;
-                       })
-           in
-           Option.value_map worker ~default:[] ~f:(fun worker ->
-               List.map candidate.paths ~f:(fun path -> (path, worker)))))
+      (library_registry.entries
+      @ List.concat_map funcs ~f:(fun candidate ->
+          let worker =
+            match Generic_modules.member generics candidate.id with
+            | None -> Program_declarations.function_worker polymorphic_functions candidate
+            | Some (group, application, stem) ->
+                let source =
+                  List.find_map group.body_members ~f:(fun (source, target) ->
+                      Option.some_if (String.equal stem target) source)
+                in
+                let representative =
+                  Option.bind source ~f:(fun source ->
+                      List.Assoc.find group.representative.body_members source
+                        ~equal:String.equal)
+                in
+                Option.bind representative ~f:(fun id ->
+                    List.find polymorphic_functions ~f:(fun worker ->
+                        Ident.same worker.Polymorphic_functions.id id))
+                |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
+                    if List.exists current_groups ~f:(phys_equal group) then worker
+                    else
+                      {
+                        worker with
+                        name =
+                          application.name ^ "."
+                          ^ (Qualified_name.of_string worker.name).name;
+                      })
+          in
+          Option.value_map worker ~default:[] ~f:(fun worker ->
+              List.map candidate.paths ~f:(fun path -> (path, worker)))))
   in
   let polymorphic_registries =
     if List.is_empty polymorphic_functions then []
@@ -1503,6 +1632,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               func data ~shared:(body_shared f) ~ocaml_env:f.environment ~preds:predicates
                 ~funcs:pure_functions ~spec_funcs ~proof_support ~declaration_name
                 ~primitive_namespace ~polymorphic_functions:(body_polymorphic_registry f)
+                ~generic_predicates
                 ?current_polymorphic:
                   (Program_declarations.function_worker polymorphic_functions f)
                 f
@@ -1531,6 +1661,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
                      ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace
                      ~polymorphic_functions:(body_polymorphic_registry f)
+                     ~generic_predicates
                      ?current_polymorphic:
                        (Program_declarations.function_worker polymorphic_functions f)
                      ())
@@ -1577,6 +1708,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   Ok
     ( {
         library_modules;
+        library_worker_members;
         publication_members;
         generic_interfaces;
         checked_module_members;

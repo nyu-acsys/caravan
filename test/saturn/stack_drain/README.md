@@ -2,7 +2,7 @@
 
 Adapted from `Test.drain` in Saturn's
 [stack tutorial](https://github.com/ocaml-multicore/saturn/blob/50d8d9d0a99b40434ab05bee49200cd5ffa028f5/doc/motivation.md).
-The client is specialized to integers, lifted out of the tutorial's functor,
+The client is polymorphic, lifted out of the tutorial's functor,
 and calls `Treiber_stack.pop_opt` in place of `Stack.pop`. The recursive helper
 is the exported `drain` function. The algorithm is unchanged.
 

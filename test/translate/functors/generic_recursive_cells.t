@@ -1,4 +1,4 @@
-Recursive atomic payloads share one worker and retain their layout fields in clients.
+Recursive atomic payloads share one worker and one constrained cell family.
 
   $ caravan --shh generic_recursive_cells.ml
   Verification successful.
@@ -9,5 +9,5 @@ Recursive atomic payloads share one worker and retain their layout fields in cli
   1
   $ grep -c '^[[:space:]]*proc method_create(' emitted.rav
   1
-  $ grep -c '^[[:space:]]*field atomic_.*: .*Data_node.T' emitted.rav
+  $ grep -c '^[[:space:]]*field atomic[^:]*: V.Carrier where V.holds' emitted.rav
   1

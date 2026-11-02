@@ -1,6 +1,6 @@
-(* Saturn's Treiber stack, of integers. *)
+(* Saturn's Treiber stack. *)
 
-type t = int list Atomic.t
+type 'a t = 'a list Atomic.t
 
 let create () = Atomic.make_contended []
 let of_list list = Atomic.make_contended list

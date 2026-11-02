@@ -35,14 +35,13 @@ Immediate constants cannot specialize generic operands through equality.
   $ grep -q 'Type Error:' generic_bad_equality.out
   $ ! grep -q 'Internal Error:' generic_bad_equality.out
 
-Polymorphic ordering and mutable payloads need additional type capabilities.
+Polymorphic ordering remains unsupported; generic mutable storage is supported.
 
   $ caravan --shh ordering.ml > ordering.out 2>&1
   [1]
   $ grep -q 'Ordering on polymorphic values' ordering.out
-  $ caravan --shh storage.ml > storage.out 2>&1
-  [1]
-  $ grep -q 'Mutable storage with polymorphic payload types' storage.out
+  $ caravan --shh storage.ml
+  Verification successful.
 
 Explicit quantified source annotations are rejected until their binder mapping
 is supported. Generic proof obligations still reject false contracts.

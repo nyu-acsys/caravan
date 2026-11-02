@@ -4,4 +4,8 @@ module Make () = struct
   invariant is_cell (cell : t) (s : state) = own cell s.value
 
   view contents (cell : t) = s.value
+
+  lemma preserve_storage (cell : t) (value : node)
+    requires (own cell value)
+    ensures (own cell value) = ()
 end

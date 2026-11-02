@@ -11,6 +11,7 @@ let mod_ = "ocaml_mod"
 let in_range = "ocaml_int"
 let wrap = "ocaml_wrap"
 let value_interface = "Ocaml$Value"
+let cell_family = "Ocaml$Cells"
 let value_int = "Ocaml$IntValue"
 let value_list = "Ocaml$ListValue"
 let value_option = "Ocaml$OptionValue"
@@ -28,6 +29,19 @@ let func name ret body =
     ~formals:[ int_var "a"; int_var "b" ]
     ~returns:[ int_var ret ]
     (R.Ident.make ~loc name) (Some body)
+
+let cell_members =
+  let value name = R.Name.make ~loc ~path:[ "V" ] name in
+  let carrier = R.Type.named ~loc (value "Carrier") [] in
+  let field name =
+    R.Member.field ~loc ~where:(value "holds") (R.Ident.make ~loc name) carrier
+  in
+  [
+    R.Member.module_ ~loc
+      ~params:[ (R.Ident.make ~loc "V", R.Name.make ~loc value_interface) ]
+      (R.Ident.make ~loc cell_family)
+      [ field "ref_contents"; field "atomic" ];
+  ]
 
 let value_signature =
   let carrier = R.Type.named ~loc (R.Name.make ~loc "Carrier") [] in

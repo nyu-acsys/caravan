@@ -392,10 +392,14 @@ and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
   | _ when Option.is_some (atomic_name path) ->
       atomic ctx e (Option.value_exn (atomic_name path)) args
   | Some "ref", [ v ] ->
+      let allocation =
+        Datatypes.allocation_tag ~prefix:"ref_" ~suffix:"_contents" ctx.given.types
+          v.exp_type
+      in
       let* field = State.ref_field ctx.given ~at v.exp_type in
       let* stmts, v = expr ctx v in
       let* x = State.fresh "tmp" in
-      let* views, view_args = view_allocation ctx ~loc:l [ field ] in
+      let* views, view_args = view_allocation ctx ~loc:l (Option.to_list allocation) in
       let+ explicit = allocation_initializers ctx e in
       let init =
         R.Stmt.new_rhs ((qualified_name ~loc:l field, Some v) :: (view_args @ explicit))
@@ -494,8 +498,11 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   let primitive op = State.primitive ctx.given ~at elt op in
   match (op, values) with
   | ("make" | "make_contended"), [ v ] ->
+      let allocation =
+        Datatypes.allocation_tag ~prefix:"atomic_" ~suffix:"" ctx.given.types elt
+      in
       let* x = State.fresh "tmp" in
-      let* views, view_args = view_allocation ctx ~loc:l [ field ] in
+      let* views, view_args = view_allocation ctx ~loc:l (Option.to_list allocation) in
       let+ explicit = allocation_initializers ctx e in
       let init =
         R.Stmt.new_rhs ((qualified_name ~loc:l field, Some v) :: (view_args @ explicit))
