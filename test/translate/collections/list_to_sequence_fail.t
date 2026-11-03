@@ -1,3 +1,22 @@
+Sequence builtins reject lists, whose own functions or conversion apply instead.
+
+  $ caravan --shh sequence_builtin_on_list.ml
+  [Error] File "sequence_builtin_on_list.ml", line 3, columns 39-40:
+  3 | (*@ r = rev_onto xs acc ensures length r = length xs + length acc *)
+                                             ^
+  Type Error: length applies to sequences; use List.length for lists.
+  [1]
+
+  $ caravan --shh sequence_slice_on_list.ml
+  [Error] File "sequence_slice_on_list.ml", line 2, columns 31-32:
+  2 | (*@ r = keep xs ensures drop 1 r = drop 1 xs *)
+                                     ^
+  Type Error: drop applies to sequences; convert a list with to_sequence.
+  [1]
+
+  $ caravan --shh list_length.ml
+  Verification successful.
+
 The conversion only accepts lists.
 
   $ caravan --shh list_to_sequence_wrong_input.ml

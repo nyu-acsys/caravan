@@ -1325,6 +1325,19 @@ and application env (t : S.term) =
         let+ args = State.all args ~f:(formula env) in
         R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "of_list") args
   | Tvar (Qid { pid_str = ("length" | "last" | "drop" | "take") as f; _ }), args -> begin
+      (* The builtins apply to sequences; a list would reach Raven ill-typed. *)
+      let* () =
+        match List.last args with
+        | Some sequence when is_list_term env sequence ->
+            State.of_result
+              (error sequence.term_loc
+                 (if String.equal f "length" then
+                    "length applies to sequences; use List.length for lists"
+                  else
+                    Printf.sprintf
+                      "%s applies to sequences; convert a list with to_sequence" f))
+        | _ -> State.return ()
+      in
       let* args = State.all args ~f:(formula env) in
       let length s =
         R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "length") [ s ]
