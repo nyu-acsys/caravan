@@ -1682,6 +1682,48 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             in
             Some (f, member))
   in
+  (* The procedures that may raise, with what they may raise. *)
+  let translated =
+    List.filter_map funcs ~f:(fun f ->
+        match body_owner f with
+        | Some (_, false) -> None
+        | _ ->
+            let _, _, functions, _, _, _ = body_context f in
+            Some (proc_name f, f, functions))
+  in
+  let resolve name path =
+    Option.bind
+      (List.find translated ~f:(fun (n, _, _) -> String.equal n name))
+      ~f:(fun (_, _, functions) -> resolved_call functions (library_paths libraries) path)
+  in
+  let raising =
+    Exceptions.raise_sets
+      (List.map translated ~f:(fun (name, f, _) -> (name, f.contract, f.body)))
+      ~resolve
+  in
+  (* By the names calls use, and by the procedures' own, as a worker's. *)
+  let raising =
+    raising
+    @ List.filter_map translated ~f:(fun (name, f, _) ->
+        Option.map (List.Assoc.find raising name ~equal:String.equal) ~f:(fun set ->
+            (body_proc_name f, set)))
+  in
+  let* _ =
+    all translated ~f:(fun (name, f, _) ->
+        match
+          List.find (Exceptions.uses f.body) ~f:(fun (use, in_loop) ->
+              in_loop
+              &&
+              match use with
+              | Raise _ -> true
+              | Call (path, _) ->
+                  Option.exists (resolve name path) ~f:(fun callee ->
+                      List.Assoc.mem raising callee ~equal:String.equal))
+        with
+        | Some ((Raise (_, at) | Call (_, at)), _) ->
+            unsupported at "Raising an exception in a loop"
+        | None -> Ok ())
+  in
   let* procs, state =
     State.run_from state
     @@ State.all funcs ~f:(fun f ->
@@ -1715,6 +1757,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   past_returns;
                   ghost_args;
                   procedure_signatures;
+                  raising;
                   libraries = library_paths libraries;
                   annotations;
                   proof_lemmas =

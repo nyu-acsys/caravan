@@ -538,7 +538,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Tsig_recmodule _ -> unavailable item.sig_loc "Recursive signature modules"
             | Tsig_typesubst _ | Tsig_modsubst _ | Tsig_modtypesubst _ ->
                 unavailable item.sig_loc "A substitution in a module signature"
-            | Tsig_typext _ | Tsig_exception _ | Tsig_class _ | Tsig_class_type _ ->
+            | Tsig_exception _ -> Ok view
+            | Tsig_typext _ | Tsig_class _ | Tsig_class_type _ ->
                 unavailable item.sig_loc "This module signature item"
           in
           items ghost_declarations view rest
@@ -1528,7 +1529,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | Tstr_recmodule _ -> unavailable item.str_loc "Recursive module bindings"
             | Tstr_eval _ -> unavailable item.str_loc "A module initializer"
             | Tstr_primitive _ -> unavailable item.str_loc "An external value declaration"
-            | Tstr_typext _ | Tstr_exception _ | Tstr_class _ | Tstr_class_type _ ->
+            (* Exceptions are the constructors of one type; see [Exceptions]. *)
+            | Tstr_exception _ -> Ok view
+            | Tstr_typext _ | Tstr_class _ | Tstr_class_type _ ->
                 unavailable item.str_loc "This module structure item"
           in
           items view rest

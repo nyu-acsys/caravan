@@ -219,7 +219,19 @@ module State_monad = struct
   }
   (** What each arm of a branch starts from. *)
 
+  (** The exceptions a function may raise: those named, or any. *)
+  type raise_set = Raises of string list | Raises_any
+
+  type exit = {
+    results : R.Expr.t list;
+        (** The function's return values before its outcome, returned as they are when it
+            raises. *)
+    allowed : raise_set;
+  }
+  (** How a function that may raise leaves when it raises. *)
+
   type carried = {
+    exit : exit option;
     ghost_returns : (string * string * Types.type_expr) list;
     proof_state : (R.Expr.t * Types.type_expr) option;
     outline_exports : (string * (R.Expr.t * Types.type_expr)) list;
@@ -431,6 +443,7 @@ module State_monad = struct
       facts = [];
       invariants = [];
       au_results = None;
+      exit = None;
     }
 
   let empty_names = { used = Set.empty (module String); bound = []; scope = [] }
@@ -1005,6 +1018,8 @@ type inputs = {
           parameter that a precondition makes a field of it, with the field, as [tail] in
           [requires tail = q.tail], by which calls find the ghost argument. *)
   procedure_signatures : (string * procedure_signature) list;
+  raising : (string * State_monad.raise_set) list;
+      (** The procedures that may raise, by name, with what they may raise. *)
   libraries : string list Path_bindings.t;
       (** The modules of the libraries, with their names: trusted Raven modules. *)
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
@@ -1064,6 +1079,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     access_proofs = [];
     return_proofs = [];
     procedure_signatures = [];
+    raising = [];
     initializations = [];
     linearizations = [];
     shared;
@@ -2122,6 +2138,55 @@ let opaque_module_types env =
   env.ctx.given.proof_support.strict_source_types
   || List.exists env.ctx.given.types ~f:(fun data ->
       List.exists data.Datatypes.paths ~f:(opaque_module_path env))
+
+(** The OCaml type of a function's outcome: the exception it raised, if any. *)
+let outcome_type = Predef.type_option Predef.type_exn
+
+(** The outcome of raising nothing, or the exception [e], of the Raven type [typ]. *)
+let no_exception ~loc typ =
+  R.Expr.annotated
+    (R.Expr.call ~loc
+       (Datatypes.ctor_name ~loc Datatypes.option (List.hd_exn Datatypes.option.ctors))
+       [])
+    typ
+
+let raised_exception ~loc typ e =
+  R.Expr.annotated
+    (R.Expr.call ~loc
+       (Datatypes.ctor_name ~loc Datatypes.option (List.last_exn Datatypes.option.ctors))
+       [ e ])
+    typ
+
+let raise_set_names = function
+  | State.Raises names -> String.concat ~sep:", " names
+  | Raises_any -> "any exception"
+
+(** The statements leaving the function at [at] with the outcome [outcome], an exception
+    of [set]: returning its values as they are, if its contract allows [set]. *)
+let propagate ~(at : Location.t) outcome set =
+  let open State.Syntax in
+  let* exit = State.gets (fun (s : State.state) -> s.carried.exit) in
+  let undeclared () =
+    State.of_result
+      (error at
+         (Printf.sprintf
+            "This may raise %s, which the contract of the function does not declare: add \
+             a raises clause"
+            (raise_set_names set)))
+  in
+  match exit with
+  | None -> undeclared ()
+  | Some exit ->
+      let allowed =
+        match (exit.allowed, set) with
+        | Raises_any, _ -> true
+        | Raises _, Raises_any -> false
+        | Raises allowed, Raises raised ->
+            List.for_all raised ~f:(List.mem allowed ~equal:String.equal)
+      in
+      if allowed then
+        State.return [ R.Stmt.return ~loc:(loc at) (exit.results @ [ outcome ]) ]
+      else undeclared ()
 
 (** An arbitrary carrier value, without a source admissibility assumption. *)
 let raw_default ctx ~at typ =

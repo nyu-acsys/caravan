@@ -41,6 +41,8 @@ let items source (inventory : Module_inventory.t) =
         in
         Ok { data with heap })
   in
+  let* exceptions = Exceptions.datatype inventory.structure in
+  let data = data @ Option.to_list exceptions in
   let same_scope (a : Module_inventory.value) (b : Module_inventory.value) =
     let a = a.site.scope.location and b = b.site.scope.location in
     a.loc_start.pos_cnum = b.loc_start.pos_cnum && a.loc_end.pos_cnum = b.loc_end.pos_cnum

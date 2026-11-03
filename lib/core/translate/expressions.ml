@@ -252,6 +252,23 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       (scrutinee_stmts @ naming @ fst stmts, snd stmts)
   | Texp_match (_, _, _ :: _, _) -> State.of_result (unsupported at "An effect handler")
+  | Texp_apply _ when Option.is_some (Exceptions.raised_argument e) ->
+      let argument = Option.value_exn (Exceptions.raised_argument e) in
+      let* stmts, v = expr ctx argument in
+      let set =
+        match Exceptions.named argument with
+        | Some name -> State.Raises [ name ]
+        | None -> State.Raises_any
+      in
+      let* outcome = State.typ ctx ~at outcome_type in
+      let* leave = propagate ~at (raised_exception ~loc:l outcome v) set in
+      (* The raise's value, which no code after it reads. *)
+      if is_unit e.exp_type then State.return (stmts @ leave, unit_value ~loc:l)
+      else
+        let* typ = State.typ ctx ~at e.exp_type in
+        let+ x = State.fresh "unreachable" in
+        ( stmts @ leave @ R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
+          R.Expr.var ~loc:l (name ~loc:l x) )
   | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
       let* args = State.of_result (plain_args ~at args) in
       apply ctx e path declaration callee.exp_type args
@@ -987,8 +1004,34 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
           R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven) ))
   in
   let public_values = List.map public ~f:fst in
-  let ghost_decls = List.concat_map public ~f:snd @ ghost_decls in
-  let ghosts = public_values @ ghosts in
+  (* A callee that may raise returns its outcome last, which the caller propagates. *)
+  let* outcome =
+    match List.Assoc.find ctx.given.raising f ~equal:String.equal with
+    | None -> State.return None
+    | Some set ->
+        let* typ = State.typ ctx ~at:e.exp_loc outcome_type in
+        let* x = State.fresh "raised" in
+        let v = R.Expr.var ~loc:l (name ~loc:l x) in
+        let+ leave = propagate ~at:e.exp_loc v set in
+        Some
+          ( R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
+            v,
+            [
+              R.Stmt.if_ ~loc:l
+                (R.Expr.binary ~loc:l Neq v (no_exception ~loc:l typ))
+                leave [];
+            ] )
+  in
+  let ghost_decls =
+    List.concat_map public ~f:snd @ ghost_decls
+    @ Option.value_map outcome ~default:[] ~f:(fun (decl, _, _) -> decl)
+  in
+  let ghosts =
+    public_values @ ghosts @ Option.to_list (Option.map outcome ~f:(fun (_, v, _) -> v))
+  in
+  let propagation =
+    Option.value_map outcome ~default:[] ~f:(fun (_, _, leave) -> leave)
+  in
   if is_unit e.exp_type && not returns_value then
     let+ closing = closing (unit_value ~loc:l) in
     let call =
@@ -996,7 +1039,7 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
       | [] -> [ R.Stmt.call ~loc:l callee ]
       | _ -> ghost_decls @ [ R.Stmt.assign ~loc:l ghosts (R.Stmt.expr_rhs callee) ]
     in
-    (stmts @ opening @ call @ closing, unit_value ~loc:l, public_values)
+    (stmts @ opening @ call @ propagation @ closing, unit_value ~loc:l, public_values)
   else
     let* typ = State.typ ctx ~at:e.exp_loc e.exp_type in
     let* x = State.fresh "tmp" in
@@ -1010,7 +1053,7 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
           @ [ R.Stmt.assign ~loc:l (v :: ghosts) (R.Stmt.expr_rhs callee) ]
     in
     let+ closing = closing v in
-    (stmts @ opening @ def @ closing, v, public_values)
+    (stmts @ opening @ def @ propagation @ closing, v, public_values)
 
 (** The constructor argument [arg], with value [value], named and checked admissible if it
     is a nested constructor application. A literal's admissibility is then established one

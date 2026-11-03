@@ -1175,6 +1175,67 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
               ])
       end
 
+(** The name of a function's outcome in the terms of its contract. *)
+let outcome_name = "caravan$raised"
+
+let outcome_term ~at = S.mk_term (Tvar (Qid (S.mk_id ~loc:at outcome_name))) at
+let pattern ~at desc = { S.pat_desc = desc; pat_loc = at }
+
+let constructor_pattern ~at name argument =
+  pattern ~at (Pconstr (Qid (S.mk_id ~loc:at name), argument))
+
+(** The postcondition [t] of a function that may raise, holding when it returns. *)
+let on_return (t : S.term) =
+  let at = t.term_loc in
+  S.mk_term
+    (Tmatch
+       ( outcome_term ~at,
+         [
+           (constructor_pattern ~at "None" None, t);
+           (pattern ~at Pwild, S.mk_term Ttrue at);
+         ] ))
+    at
+
+(** The postconditions of a function that may raise the exceptions [set], with the
+    [raises] clauses of [contract]: what holds when it raises each, and that it raises no
+    other. *)
+let raises_postconditions types ~at contract set =
+  let some p = constructor_pattern ~at "Some" (Some p) in
+  let true_ = S.mk_term Ttrue at in
+  let clauses = Option.value_map contract ~default:[] ~f:(fun c -> c.S.raises) in
+  let holds =
+    List.filter_map clauses ~f:(fun (p, post) ->
+        Option.map post ~f:(fun post ->
+            S.mk_term
+              (Tmatch (outcome_term ~at, [ (some p, post); (pattern ~at Pwild, true_) ]))
+              at))
+  in
+  let raised =
+    match (clauses, set) with
+    | _ :: _, _ -> Some (List.map clauses ~f:fst)
+    | [], State.Raises names ->
+        Some
+          (List.map names ~f:(fun name ->
+               let argument =
+                 match Datatypes.find_ctor types name with
+                 | Some (_, { fields = _ :: _; _ }) -> Some (pattern ~at Pwild)
+                 | _ -> None
+               in
+               constructor_pattern ~at name argument))
+    | [], Raises_any -> None
+  in
+  let only =
+    Option.map raised ~f:(fun patterns ->
+        S.mk_term
+          (Tmatch
+             ( outcome_term ~at,
+               (constructor_pattern ~at "None" None, true_)
+               :: List.map patterns ~f:(fun p -> (some p, true_))
+               @ [ (pattern ~at Pwild, S.mk_term Tfalse at) ] ))
+          at)
+  in
+  holds @ Option.to_list only
+
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
@@ -1246,6 +1307,35 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   in
   let* _, env, implicit, ghosts =
     contract_env ctx ~spec_funcs:ctx.given.spec_funcs f formals ~result
+  in
+  (* A function that may raise returns its outcome, the exception it raised, last. *)
+  let* raising =
+    match List.Assoc.find ctx.given.raising proc_name ~equal:String.equal with
+    | None -> State.return None
+    | Some set ->
+        let+ typ = State.typ ctx ~at:f.loc outcome_type in
+        Some (set, typ)
+  in
+  let* raised = State.fresh "raised" in
+  let raised_var = R.Expr.var ~loc:l (name ~loc:l raised) in
+  let* () =
+    State.of_result
+      begin match raising with
+      | None -> Ok ()
+      | Some _ when pure -> unsupported f.loc "A pure function that may raise"
+      | Some _ when Option.exists f.contract ~f:(fun c -> c.atomic) ->
+          unsupported f.loc "A function with an atomic contract that may raise"
+      | Some _ -> Ok ()
+      end
+  in
+  let env =
+    match raising with
+    | None -> env
+    | Some _ ->
+        {
+          (bind env outcome_name (Raven raised)) with
+          var_types = (outcome_name, outcome_type) :: env.var_types;
+        }
   in
   let* env =
     specialize_shared env
@@ -1319,7 +1409,19 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let in_range = List.filter_map formals ~f:(fun (_, range, _) -> range) in
   let* () = State.note_domain ctx.given.types f.body.exp_type in
   let result_in_range =
-    if List.is_empty returns then None else value_spec ctx ~loc:l f.body.exp_type result
+    if List.is_empty returns then None
+    else
+      match raising with
+      | None -> value_spec ctx ~loc:l f.body.exp_type result
+      | Some (_, outcome_typ) ->
+          Option.map
+            (Datatypes.admissible ~loc:l ctx.given.types f.body.exp_type
+               (R.Expr.var ~loc:l (name ~loc:l result)))
+            ~f:(fun admissible ->
+              R.Spec.make
+                (R.Expr.binary ~loc:l Impl
+                   (R.Expr.binary ~loc:l Eq raised_var (no_exception ~loc:l outcome_typ))
+                   admissible))
   in
   let pres = Option.value_map f.contract ~default:[] ~f:(fun c -> c.requires) in
   let* requires = specs pres in
@@ -1379,6 +1481,17 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   in
   let* past_params = State.all past_pres ~f:witnesses in
   let* past_results = State.all past_posts ~f:witnesses in
+  let* () =
+    match (raising, past_results) with
+    | Some _, _ :: _ ->
+        State.of_result
+          (unsupported f.loc "A function that may raise with facts about later states")
+    | _ -> State.return ()
+  in
+  let outcome_returns =
+    Option.value_map raising ~default:[] ~f:(fun (_, outcome_typ) ->
+        [ R.Var.make ~loc:l (ident ~loc:l raised) outcome_typ ])
+  in
   let past_formals = List.concat_map past_params ~f:(fun ((_, _, _, d, _), _) -> d) in
   let past_returns = List.concat_map past_results ~f:(fun ((_, _, _, d, _), _) -> d) in
   let* () =
@@ -1421,7 +1534,15 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
      [ensures own c.count j]. *)
   let postconditions = contract_postconditions env ~at:f.loc in
   let* ensures =
-    postconditions (Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures))
+    let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
+    match raising with
+    | None -> postconditions posts
+    | Some (set, _) ->
+        let* normal = postconditions (List.map posts ~f:on_return) in
+        let+ exceptional =
+          postconditions (raises_postconditions ctx.given.types ~at:f.loc f.contract set)
+        in
+        normal @ exceptional
   in
   let atomic_posts =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
@@ -1482,12 +1603,36 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
          (Ident.name f.id));
     State.return
       (R.Callable.proc ~loc:l ~formals:all_formals
-         ~returns:(returns @ ghost_return_vars @ past_returns)
+         ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
          ~requires ~ensures
          (ident ~loc:l (Option.value declaration_name ~default:proc_name))
          None)
   end
   else
+    (* Raising leaves the function with its other results as they are. *)
+    let* () =
+      State.modify_carried (fun c ->
+          {
+            c with
+            exit =
+              Option.map raising ~f:(fun (allowed, _) ->
+                  {
+                    State.results =
+                      (if List.is_empty returns then []
+                       else [ R.Expr.var ~loc:l (name ~loc:l result) ])
+                      @ List.map ghost_returns ~f:(fun (_, raven, _) ->
+                          R.Expr.var ~loc:l (name ~loc:l raven));
+                    allowed;
+                  });
+          })
+    in
+    let no_outcome =
+      Option.value_map raising ~default:[] ~f:(fun (_, outcome_typ) ->
+          [
+            R.Stmt.assign ~loc:l [ raised_var ]
+              (R.Stmt.expr_rhs (no_exception ~loc:l outcome_typ));
+          ])
+    in
     let* first = ghost ctx ~after:f.loc.loc_start ~before:f.body.exp_loc.loc_start in
     let* stmts, v = expr ~tail:true ~keep_scope:true ctx f.body in
     let* finish = finish_arm ctx ~tail:true v in
@@ -1601,10 +1746,11 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                    (R.Expr.tuple ~loc:l [ position.pos_snapshot; position.pos_k ]))))
     in
     let body =
-      bind_au @ bound @ first @ stmts @ assignment @ establish @ last @ history_returns
+      no_outcome @ bind_au @ bound @ first @ stmts @ assignment @ establish @ last
+      @ history_returns
     in
     R.Callable.proc ~loc:l ~formals:all_formals
-      ~returns:(returns @ ghost_return_vars @ past_returns)
+      ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
       ~requires ~ensures
       (ident ~loc:l (Option.value declaration_name ~default:proc_name))
       (Some body)

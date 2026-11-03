@@ -66,6 +66,7 @@
         "predicate", PREDICATE;
         "proof", PROOF;
         "pure", PURE;
+        "raises", RAISES;
         "requires", REQUIRES;
         "returning", RETURNING;
         "returns", RETURNS;
