@@ -211,6 +211,8 @@ module State_monad = struct
 
   type path = {
     opened : (string * opened) list;
+    unfolded : (string * string list) list;
+        (** The parts of each open invariant unfolded with it, by their predicates. *)
     snapshots : (string * opened list) list;
     positions : position list;
     au : au_path option;
@@ -415,7 +417,8 @@ module State_monad = struct
         let* acc = f init x in
         fold rest ~init:acc ~f
 
-  let empty_path = { opened = []; snapshots = []; positions = []; au = None }
+  let empty_path =
+    { opened = []; unfolded = []; snapshots = []; positions = []; au = None }
 
   let empty_carried =
     {
@@ -540,9 +543,14 @@ type au = {
       (** The ghost results witnessing facts about earlier states, which the update
           commits with. *)
   has_result : bool;
-  open_ : at:Location.t -> unfold:bool -> (R.Stmt.t list * R.Expr.t list) State_monad.t;
-      (** Opens the atomic update for the step at [at]: the statements, unfolding the
-          atomic precondition's predicates if [unfold], and the values of the implicit
+  open_ :
+    contents:Types.type_expr option ->
+    at:Location.t ->
+    unfold:bool ->
+    (R.Stmt.t list * R.Expr.t list) State_monad.t;
+      (** Opens the atomic update for the step at [at], on atomics with contents of type
+          [contents] if known: the statements, unfolding the atomic precondition's
+          predicates and the invariants if [unfold], and the values of the implicit
           parameters. *)
   close : au_close -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
       (** Closes the open update, committing with the function's result [value]. *)
@@ -706,6 +714,22 @@ type declaration_context = {
   declaration_support : proof_support;
 }
 
+(** What a part of an invariant owns: atomics with contents of a type, only ghost state,
+    or resources it does not say. *)
+type part_owns = Atomics of Types.type_expr | Ghost | Unknown
+
+type part = {
+  part_pred : string;  (** The predicate holding it. *)
+  part_source : [ `Conjunct of int | `Pending of string ];
+      (** Its conjunct of the invariant's body, by position, or its pending field. *)
+  part_uses : string list;
+      (** The invariant's existentials it mentions, its predicate's parameters after the
+          invariant's. *)
+  part_owns : part_owns;
+}
+(** A quantified ownership of an invariant, held in a predicate that the steps unfold only
+    when they need it, keeping its instances out of the other steps' proofs. *)
+
 type structure = {
   generic : Generic_parameters.t option;
   context : declaration_context;
@@ -725,6 +749,7 @@ type structure = {
       (** The invariant's parameters but the state, with their types. *)
   structure_type : Types.type_expr;
   views : (S.predicate * S.term) list;  (** The views, with their values. *)
+  parts : part list;
   at : Location.t;  (** The invariant's definition. *)
 }
 (** A structure whose invariant has a ghost state: the invariant, its state variable, the
@@ -774,6 +799,23 @@ let generated_module_member ~loc module_name member =
 
 (** The names of the members generated for the pending field [p] of [st]. *)
 let pending_name st (p : pending) suffix = member_name st (p.pending_field ^ "_" ^ suffix)
+
+(** The values of the existentials of [st]'s invariant in the state [opened], by name. *)
+let opened_bindings st (opened : opened) =
+  List.map2_exn st.fields opened.values ~f:(fun (_, raven, _, _, _) v -> (raven, v))
+  @ List.filter_map st.chains ~f:(fun (field, raven) ->
+      Option.map (List.Assoc.find opened.indices field ~equal:String.equal) ~f:(fun v ->
+          (raven, v)))
+  @ List.filter_map st.pendings ~f:(fun p ->
+      Option.map (List.Assoc.find opened.indices p.pending_field ~equal:String.equal)
+        ~f:(fun v -> (p.pending_on, v)))
+
+(** The arguments of [part]'s predicate for the invariant's arguments [args] and the
+    existentials' values [bindings]. *)
+let part_args part ~args bindings =
+  args
+  @ List.map part.part_uses ~f:(fun x ->
+      List.Assoc.find_exn bindings x ~equal:String.equal)
 
 type past = { inv : string; field : string; element : S.term }
 (** A fact about an earlier state of a structure, [past (mem e s.f)]: [e] was in the field

@@ -700,6 +700,107 @@ let chain_of ~state (t : S.term) =
       end
   | _ -> None
 
+(** The direct subterms of [t]. *)
+let subterms (t : S.term) =
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
+  | Tfield (t, _)
+  | Tquant (_, _, t)
+  | Tcomprehension (_, t)
+  | Tattr (_, t)
+  | Tcast (t, _)
+  | Told t ->
+      [ t ]
+  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) -> [ a; b ]
+  | Tif (a, b, c) -> [ a; b; c ]
+  | Tmatch (t, cases) -> t :: List.map cases ~f:snd
+  | Ttuple ts -> ts
+  | Trecord (base, fields) -> Option.to_list base @ List.map fields ~f:snd
+
+(** The fields of the state [state] that [t] mentions, as [s.f]. *)
+let rec state_fields ~state (t : S.term) =
+  match t.term_desc with
+  | Tfield ({ term_desc = Tvar (Qid { pid_str = s; _ }); _ }, Qid { pid_str = f; _ })
+    when String.equal s state ->
+      [ f ]
+  | _ -> List.concat_map (subterms t) ~f:(state_fields ~state)
+
+let rec mentions_own (t : S.term) =
+  match t.term_desc with
+  | Tvar (Qid { pid_str = "own"; _ }) -> true
+  | _ -> List.exists (subterms t) ~f:mentions_own
+
+(** The parts of [st]'s invariant, whose body is [body]: its conjuncts that own resources
+    by quantifying, and the registrations of its pending fields. Only an invariant with a
+    history has them, as its steps say how the existentials that the parts mention change.
+*)
+let invariant_parts types (st : structure) body =
+  if not (has_history st) then []
+  else
+    let existential field = st.state ^ "_" ^ field in
+    (* In the order of the invariant's existentials. *)
+    let ordered uses =
+      List.filter
+        (List.map st.fields ~f:(fun (_, raven, _, _, _) -> raven)
+        @ List.map st.pendings ~f:(fun p -> p.pending_on)
+        @ List.map st.chains ~f:snd)
+        ~f:(List.mem uses ~equal:String.equal)
+    in
+    let contents field =
+      match List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field) with
+      | Some (_, _, _, t, _) -> (
+          match Datatypes.desc types t with
+          | Tconstr (_, [ atomic ], _) -> (
+              match Datatypes.desc types atomic with
+              | Tconstr (_, [ contents ], _) -> Atomics contents
+              | _ -> Unknown)
+          | _ -> Unknown)
+      | None -> Unknown
+    in
+    let conjunct_parts =
+      List.filter_mapi (conjuncts body) ~f:(fun n t ->
+          let mentioned = List.map (state_fields ~state:st.state t) ~f:existential in
+          match (chain_of ~state:st.state t, t.term_desc) with
+          | Some (_, _, field, _), _
+            when List.Assoc.mem st.chains field ~equal:String.equal ->
+              Some
+                {
+                  part_pred = member_name st ("owns_" ^ field);
+                  part_source = `Conjunct n;
+                  part_uses =
+                    ordered
+                      (List.Assoc.find_exn st.chains field ~equal:String.equal
+                      :: existential field :: mentioned);
+                  part_owns = contents field;
+                }
+          | _, Tquant (Tforall, _, _) when mentions_own t ->
+              Some
+                {
+                  part_pred = member_name st ("part_" ^ Int.to_string n);
+                  part_source = `Conjunct n;
+                  part_uses = ordered mentioned;
+                  part_owns = Unknown;
+                }
+          | _ -> None)
+    in
+    let pending_parts =
+      List.map st.pendings ~f:(fun p ->
+          let helping_state, helping_key, _ = p.helping in
+          {
+            part_pred = pending_name st p "registrations";
+            part_source = `Pending p.pending_field;
+            part_uses =
+              ordered
+                (existential p.pending_field :: p.pending_on
+                 :: List.concat_map st.chains ~f:(fun (field, index) ->
+                     [ index; existential field ])
+                @ List.map (state_fields ~state:helping_state helping_key) ~f:existential
+                );
+            part_owns = Ghost;
+          })
+    in
+    conjunct_parts @ pending_parts
+
 (** The members generated for the state of [st]: the state of its growing fields as a data
     type and its order, with transitivity; and, if it has a history, the history as a
     resource algebra in the encoding [history], with what defines it, its ghost field, and

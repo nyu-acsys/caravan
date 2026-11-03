@@ -18,7 +18,8 @@ type t = {
   checked_module_members : R.Member.t list list;
   action_check_lists : (structure * R.Member.t list) list;
   pending_member_lists : (structure * R.Member.t list) list;
-  pred_members : R.Callable.t list;
+  pred_members : (R.Callable.t * R.Callable.t list) list;
+      (** The predicates, each with the predicates holding parts of it. *)
   lemma_members : R.Callable.t list;
   logical_members : R.Member.t list;
   pure_funcs : (Procedures.func * R.Callable.t) list;

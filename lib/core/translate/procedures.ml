@@ -777,7 +777,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
     | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
   in
-  let open_ ~at ~unfold:with_unfold =
+  let open_ ~contents ~at ~unfold:with_unfold =
     let open State.Syntax in
     let l = loc at in
     let* decls = implicit_values ~at ~const:(Some false) in
@@ -786,7 +786,8 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
       if with_unfold then each pres ~at unfold (opened values) else State.return []
     in
     let+ invariants =
-      if with_unfold then use_invariants ctx ~at ~fold:false else State.return []
+      if with_unfold then use_invariants ?contents ctx ~at ~fold:false
+      else State.return []
     in
     (invariants @ List.concat_map decls ~f:fst @ [ opening ~l values ] @ unfolds, values)
   in
@@ -1151,8 +1152,20 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
               ]
             else []
           in
+          (* The parts of the invariant, in the initial state. *)
+          let bindings =
+            List.map values ~f:(fun (raven, v, _) -> (raven, v))
+            @ List.map2_exn st.chains indices ~f:(fun (_, index) (_, v) -> (index, v))
+            @ List.map2_exn st.pendings ons ~f:(fun p (_, v) -> (p.pending_on, v))
+          in
+          let parts =
+            List.map st.parts ~f:(fun part ->
+                R.Stmt.fold ~loc:l
+                  (qualified_name ~loc:l part.part_pred)
+                  (part_args part ~args bindings))
+          in
           State.return
-            (List.concat index_statements @ history
+            (List.concat index_statements @ history @ parts
             @ [
                 R.Stmt.fold ~loc:l
                   ~witnesses:

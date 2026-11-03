@@ -306,10 +306,10 @@ let program ?(history = History.default) (source : Source.t) :
       pred_members
   in
   let emitted_predicates destination =
-    List.filter_map predicate_members ~f:(fun (key, member) ->
-        Option.some_if
-          (Module_context.same_destination destination (predicate_destination key))
-          member)
+    List.concat_map predicate_members ~f:(fun (key, (member, parts)) ->
+        if Module_context.same_destination destination (predicate_destination key) then
+          member :: parts
+        else [])
   in
   let proof_lemma_members =
     List.zip_exn
@@ -322,9 +322,16 @@ let program ?(history = History.default) (source : Source.t) :
       logical_members
   in
   let proof_members =
-    List.map (predicate_members @ proof_lemma_members) ~f:(fun (name, member) ->
+    List.concat_map predicate_members ~f:(fun (name, (member, parts)) ->
+        List.map (member :: parts) ~f:(fun member -> (name, R.Member.callable member)))
+    @ List.map proof_lemma_members ~f:(fun (name, member) ->
         (name, R.Member.callable member))
     @ logical_members
+  in
+  (* A proof member's callables: a predicate's come with its parts'. *)
+  let members_named backend =
+    List.filter_map proof_members ~f:(fun (name, member) ->
+        Option.some_if (String.equal name backend) member)
   in
   let* definition_modules =
     all
@@ -344,16 +351,15 @@ let program ?(history = History.default) (source : Source.t) :
           R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "T") (Some representation)
         in
         let members =
-          List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
-              Option.bind
+          List.concat_map source.proof_scopes.declarations ~f:(fun entry ->
+              Option.value_map ~default:[]
                 (List.find scoped_proofs.bindings ~f:(fun binding ->
                      Ident.same binding.entry.id entry.id
                      && (match binding.kind with Function _ -> true | _ -> false)
                      && Option.exists (definition_resource binding.entry.scope)
                           ~f:(fun owner ->
                             Ident.same owner.resource_id resource.resource_id)))
-                ~f:(fun binding ->
-                  List.Assoc.find proof_members binding.backend ~equal:String.equal))
+                ~f:(fun binding -> members_named binding.backend))
         in
         let interface =
           qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
@@ -373,8 +379,8 @@ let program ?(history = History.default) (source : Source.t) :
         else
           Option.bind (proof_implementation resource) ~f:(fun backend ->
               let members =
-                List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
-                    Option.bind
+                List.concat_map source.proof_scopes.declarations ~f:(fun entry ->
+                    Option.value_map ~default:[]
                       (List.find scoped_proofs.bindings ~f:(fun binding ->
                            Ident.same binding.entry.id entry.id
                            && (match binding.kind with
@@ -383,8 +389,7 @@ let program ?(history = History.default) (source : Source.t) :
                            && Option.exists (definition_resource binding.entry.scope)
                                 ~f:(fun owner ->
                                   Ident.same owner.resource_id resource.resource_id)))
-                      ~f:(fun binding ->
-                        List.Assoc.find proof_members binding.backend ~equal:String.equal))
+                      ~f:(fun binding -> members_named binding.backend))
               in
               Option.some_if
                 (not (List.is_empty members))

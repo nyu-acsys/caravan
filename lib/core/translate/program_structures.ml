@@ -393,7 +393,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
             (List.filter_map (conjuncts body) ~f:(fun t ->
                  Option.map (chain_of ~state t) ~f:(fun (_, _, field, _) -> field)))
         in
-        Ok
+        let st =
           {
             generic = generic p.pred_name.pid_str;
             context;
@@ -442,8 +442,11 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                           ~environment predicates (view, value, view_types))
                        p.pred_name.pid_str ~equal:String.equal)
                     (view, value));
+            parts = [];
             at;
-          })
+          }
+        in
+        Ok { st with parts = invariant_parts types st body })
   in
   let* _ =
     all actions ~f:(fun (_, action) ->

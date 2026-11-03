@@ -305,7 +305,8 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
     [param_types], defined as [def]. Each stateful invariant holds half of its views. *)
 let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declaration_name
     ?(generic_predicates = []) ?(primitive_namespace = []) ~at ~structures
-    (p : S.predicate) (def : definition) param_types : R.Callable.t State.t =
+    (p : S.predicate) (def : definition) param_types :
+    (R.Callable.t * R.Callable.t list) State.t =
   let ctx =
     spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support
       ~generic_predicates ~primitive_namespace ()
@@ -320,13 +321,14 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
   match def with
   | Direct_invariant body ->
       let+ body = quantified env body in
-      R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body)
+      (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body), [])
   | Body body ->
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      R.Callable.func ~loc:l ~kind:Pred ~inline:p.pred_inline ~formals:(vars explicit)
-        ~returns:(vars implicit) name (Some body)
+      ( R.Callable.func ~loc:l ~kind:Pred ~inline:p.pred_inline ~formals:(vars explicit)
+          ~returns:(vars implicit) name (Some body),
+        [] )
   | View _ ->
       (* Half of the view's ghost field, on the structure, its first parameter. *)
       let inputs, value = List.split_n params (List.length params - 1) in
@@ -341,11 +343,12 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       in
       let _, raven, _, _ = List.hd_exn value in
       let field = view_field_in ctx.given.shared p.pred_name.pid_str in
-      R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value) name
-        (Some
-           (View_storage.own ~loc:l ~field structure
-              (R.Expr.var ~loc:l (R.Name.make ~loc:l raven))
-              0.5))
+      ( R.Callable.func ~loc:l ~kind:Pred ~formals:(vars inputs) ~returns:(vars value) name
+          (Some
+             (View_storage.own ~loc:l ~field structure
+                (R.Expr.var ~loc:l (R.Name.make ~loc:l raven))
+                0.5)),
+        [] )
   | Invariant { state; body; _ } ->
       (* The state's fields are existentials, as are the index maps of the fields owned by
          index; its views hold the other halves of their ghost fields, and its history
@@ -435,15 +438,71 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                (R.Expr.own ~loc:l
                   [ R.Expr.field ~loc:l (var c) (qualified_name ~loc:l field); value ]))
         in
-        bin And wf owned
+        (wf, owned)
+      in
+      let* on_types =
+        State.all st.pendings ~f:(fun p ->
+            let+ key = State.typ ctx ~at p.key_type in
+            (p.pending_on, R.Type.map ~loc:l (R.Type.ref ~loc:l) key))
+      in
+      let existential_types =
+        List.map st.fields ~f:(fun (_, raven, typ, _, _) -> (raven, typ))
+        @ on_types
+        @ List.map st.chains ~f:(fun (field, raven) ->
+            let elt_typ =
+              match
+                List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
+              with
+              | Some (_, _, _, t, _) ->
+                  begin match Datatypes.desc types t with
+                  | Tconstr (_, [ elt ], _) -> Result.ok (typ ctx ~at elt)
+                  | _ -> None
+                  end
+              | None -> None
+            in
+            ( raven,
+              R.Type.map ~loc:l
+                (Option.value elt_typ ~default:(R.Type.ref ~loc:l))
+                (R.Type.int ~loc:l) ))
+      in
+      let existential x =
+        R.Var.make ~loc:l (ident ~loc:l x)
+          (List.Assoc.find_exn existential_types x ~equal:String.equal)
+      in
+      let existentials = List.map existential_types ~f:(fun (x, _) -> existential x) in
+      (* A part of the invariant is held in its predicate, over the invariant's parameters
+         and the existentials it mentions. *)
+      (* The conjunct [e], or the call of the predicate of the part from [source], with
+         that predicate. *)
+      let held source e =
+        match List.find st.parts ~f:(fun part -> Poly.equal part.part_source source) with
+        | None -> (e, None)
+        | Some part ->
+            ( R.Expr.call ~loc:l
+                (qualified_name ~loc:l part.part_pred)
+                (List.map params ~f:(fun (_, raven, _, _) -> var raven)
+                @ List.map part.part_uses ~f:var),
+              Some
+                (R.Callable.func ~loc:l ~kind:Pred
+                   ~formals:(vars params @ List.map part.part_uses ~f:existential)
+                   (generated_ident ~loc:l part.part_pred)
+                   (Some e)) )
       in
       let* body =
-        State.all (conjuncts body) ~f:(fun t ->
+        State.all
+          (List.mapi (conjuncts body) ~f:(fun n t -> (n, t)))
+          ~f:(fun (n, t) ->
             match chain_of ~state t with
             | Some ((_, _, field, _) as owned)
               when List.Assoc.mem st.chains field ~equal:String.equal ->
-                chain owned
-            | _ -> quantified state_env t)
+                (* The positions are facts of the invariant; only the ownership is a
+                   part. *)
+                let+ wf, owned = chain owned in
+                let owned, part = held (`Conjunct n) owned in
+                (bin And wf owned, part)
+            | _ ->
+                let+ e = quantified state_env t in
+                held (`Conjunct n) e)
       in
       (* The registered calls, each waiting on a key, helped once the key is not the one
          that the helping action helps any more, and their registrations. *)
@@ -502,14 +561,16 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                 (qualified_name ~loc:l (pending_name st p "registration"))
                 (hc :: List.map params ~f:(fun (_, raven, _, _) -> var raven))
             in
-            R.Expr.forall ~loc:l
-              [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
-              (bin Impl (bin In hc registrations)
-                 (List.reduce_exn ~f:(bin And)
-                    ((half "watched" key :: membership)
-                    @ [ half "linked" (bin Neq key helped_key); registered ]))))
+            held (`Pending p.pending_field)
+              (R.Expr.forall ~loc:l
+                 [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+                 (bin Impl (bin In hc registrations)
+                    (List.reduce_exn ~f:(bin And)
+                       ((half "watched" key :: membership)
+                       @ [ half "linked" (bin Neq key helped_key); registered ])))))
       in
-      let body = List.reduce_exn (body @ waiting) ~f:(bin And) in
+      let body, parts = List.unzip (body @ waiting) in
+      let body = List.reduce_exn body ~f:(bin And) in
       let _, structure, _, _ = List.hd_exn params in
       let anchored e =
         match anchor_location types st.structure_type with
@@ -553,37 +614,12 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
         else []
       in
       let body = List.fold (halves @ history) ~init:body ~f:(bin And) in
-      let+ ons =
-        State.all st.pendings ~f:(fun p ->
-            let+ key = State.typ ctx ~at p.key_type in
-            R.Var.make ~loc:l (ident ~loc:l p.pending_on)
-              (R.Type.map ~loc:l (R.Type.ref ~loc:l) key))
-      in
-      let existentials =
-        List.map st.fields ~f:(fun (_, raven, typ, _, _) ->
-            R.Var.make ~loc:l (ident ~loc:l raven) typ)
-        @ ons
-        @ List.map st.chains ~f:(fun (field, raven) ->
-            let elt_typ =
-              match
-                List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
-              with
-              | Some (_, _, _, t, _) ->
-                  begin match Datatypes.desc types t with
-                  | Tconstr (_, [ elt ], _) -> Result.ok (typ ctx ~at elt)
-                  | _ -> None
-                  end
-              | None -> None
-            in
-            R.Var.make ~loc:l (ident ~loc:l raven)
-              (R.Type.map ~loc:l
-                 (Option.value elt_typ ~default:(R.Type.ref ~loc:l))
-                 (R.Type.int ~loc:l)))
-      in
       let body =
         match existentials with [] -> body | _ -> R.Expr.exists ~loc:l existentials body
       in
-      R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body)
+      State.return
+        ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body),
+          List.filter_opt parts )
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A

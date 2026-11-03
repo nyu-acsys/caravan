@@ -497,7 +497,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   in
   (* The result of [f] applied to the atomic and [args], in a variable, a step that
      linearizes the function by default as [default] says. *)
-  let result ?(default = `Commit) ?op f atomic args =
+  let result ?(default = `Commit) ?op ~contents f atomic args =
     let* typ = State.typ ctx ~at e.exp_type in
     let* x = State.fresh "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -507,7 +507,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     let* how = how default in
     let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
     let+ step =
-      linearize ?step ~value:v ~access_type:e.exp_type ctx ~at how
+      linearize ?step ~value:v ~access_type:e.exp_type ~contents ctx ~at how
         (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
     in
     (step, v)
@@ -547,7 +547,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let* how = how `Abort in
       let value = R.Expr.var ~loc:l (name ~loc:l x) in
       let* step =
-        linearize ~value ~access_type:e.exp_type ctx ~at how
+        linearize ~value ~access_type:e.exp_type ~contents:elt ctx ~at how
           (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
       in
       let+ () = record_read ctx ~atomic:a value in
@@ -555,23 +555,25 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   | "set", [ a; v ] ->
       let* how = how `Commit in
       let+ step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
+        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx ~at
+          how
           [ write ~loc:l a field v ]
       in
       (stmts @ step, unit_value ~loc:l)
   | "exchange", [ a; v ] ->
       let* f = primitive Exchange in
-      let+ reading, r = result f a [ v ] in
+      let+ reading, r = result ~contents:elt f a [ v ] in
       (stmts @ reading, r)
   | "compare_and_set", [ a; old_val; new_val ] ->
       let* f = primitive Compare_and_set in
       let+ reading, r =
-        result ~default:`Cas ~op:("compare_and_set", field) f a [ old_val; new_val ]
+        result ~default:`Cas ~op:("compare_and_set", field) ~contents:elt f a
+          [ old_val; new_val ]
       in
       (stmts @ reading, r)
   | "fetch_and_add", [ a; n ] ->
       let* f = primitive Fetch_and_add in
-      let+ reading, r = result f a [ n ] in
+      let+ reading, r = result ~contents:elt f a [ n ] in
       (stmts @ reading, r)
   | (("incr" | "decr") as op), [ a ] ->
       let* f = primitive Fetch_and_add in
@@ -580,7 +582,8 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
       let* how = how `Commit in
       let+ step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ctx ~at how
+        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx ~at
+          how
           (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
       in
       (stmts @ step, unit_value ~loc:l)
