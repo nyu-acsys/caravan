@@ -11,7 +11,7 @@ bug-reports: "https://github.com/nyu-acsys/caravan/issues"
 depends: [
   "ocaml" {>= "5.5.0"}
   "dune" {>= "3.12" & >= "3.12"}
-  "raven-ivl" {>= "1.5.0"}
+  "raven-ivl" {>= "1.6.1"}
   "menhir" {build & >= "20220210"}
   "ocamlformat" {with-dev-setup & >= "0.29.0"}
   "base" {>= "0.14"}

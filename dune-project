@@ -21,7 +21,7 @@
   (dune
    (>= 3.12))
   (raven-ivl
-   (>= 1.5.0))
+   (>= 1.6.1))
   (menhir
    (and
     :build
