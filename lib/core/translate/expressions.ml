@@ -129,9 +129,15 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       begin match occurrence_constructor ctx.given.types e.exp_type cstr with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (d, c) ->
-          let* stmts, args = operands ctx args in
-          let+ value = constructor_value ctx ~at ~result_type:e.exp_type d c args in
-          (stmts, value)
+          let* stmts, values = operands ctx args in
+          let* named =
+            State.all (List.zip_exn args values) ~f:(fun (arg, value) ->
+                established ctx arg value)
+          in
+          let+ value =
+            constructor_value ctx ~at ~result_type:e.exp_type d c (List.map named ~f:snd)
+          in
+          (stmts @ List.concat_map named ~f:fst, value)
       end
   | Texp_tuple components ->
       let+ stmts, components = operands ctx (List.map components ~f:snd) in
@@ -989,6 +995,24 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
     in
     let+ closing = closing v in
     (stmts @ opening @ def @ closing, v, public_values)
+
+(** The constructor argument [arg], with value [value], named and checked admissible if it
+    is a nested constructor application. A literal's admissibility is then established one
+    constructor at a time, as the solver unfolds a recursive predicate only to a bounded
+    depth. *)
+and established ctx (arg : Typedtree.expression) value =
+  let l = loc arg.exp_loc in
+  match arg.exp_desc with
+  | Texp_construct (_, _, _ :: _)
+    when Option.is_some (Datatypes.admissible ~loc:l ctx.given.types arg.exp_type value)
+    ->
+      let* typ = State.typ ctx ~at:arg.exp_loc arg.exp_type in
+      let* () = State.note_domain ctx.given.types arg.exp_type in
+      let+ x = State.fresh "tmp" in
+      ( R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
+        @ assert_admissible ctx ~loc:l arg.exp_type x,
+        R.Expr.var ~loc:l (name ~loc:l x) )
+  | _ -> State.return ([], value)
 
 (** The statements evaluating [args], right to left as OCaml does, and their values. *)
 and operands ctx (args : Typedtree.expression list) =

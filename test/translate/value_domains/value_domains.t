@@ -14,6 +14,14 @@ Source quantifiers use the same domain, while proof mathematics stays unrestrict
   $ caravan --shh ghost_math.ml
   Verification successful.
 
+A long literal establishes its admissibility one constructor at a time.
+
+  $ caravan --shh long_literal.ml
+  Verification successful.
+  $ caravan --shh --emit-rav long_literal.ml > long_literal.rav
+  $ raven --shh long_literal.rav
+  Verification successful.
+
 A raw logical application outside the input domain gains no result-bound guarantee.
 
   $ caravan --shh invalid_pure_result.ml > invalid_pure_result.out 2>&1
