@@ -98,14 +98,14 @@ let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
   let* _, variables = List.fold_result additional ~init:state ~f:value in
   Ok { typ; variables = List.rev variables }
 
-let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
-  let mismatch () =
-    Report.unsupported at "This polymorphic function occurrence or signature alias"
-  in
-  let rec mono typ =
-    let typ = expand typ in
-    match Types.get_desc typ with Tpoly (body, []) -> mono body | _ -> typ
-  in
+(** [typ] after [expand], without trivial [Tpoly] wrappers. *)
+let rec monomorphic ~expand typ =
+  let typ = expand typ in
+  match Types.get_desc typ with Tpoly (body, []) -> monomorphic ~expand body | _ -> typ
+
+(** Whether [left] and [right] are the same type, structurally after [expand]. *)
+let same_type ?(expand = Fn.id) left right =
+  let mono = monomorphic ~expand in
   let rec equal seen left right =
     let left = mono left and right = mono right in
     let pair = (Types.get_id left, Types.get_id right) in
@@ -113,15 +113,23 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
     else
       let seen = pair :: seen in
       match (Types.get_desc left, Types.get_desc right) with
-      | Tconstr (p, xs, _), Tconstr (q, ys, _) -> Path.same p q && equal_list seen xs ys
+      | Tconstr (p, xs, _), Tconstr (q, ys, _) ->
+          Path.same p q && List.equal (equal seen) xs ys
       | Ttuple xs, Ttuple ys ->
-          equal_list seen (List.map xs ~f:snd) (List.map ys ~f:snd)
-          && List.equal (Option.equal String.equal) (List.map xs ~f:fst)
-               (List.map ys ~f:fst)
+          List.equal (Option.equal String.equal) (List.map xs ~f:fst) (List.map ys ~f:fst)
+          && List.equal (equal seen) (List.map xs ~f:snd) (List.map ys ~f:snd)
       | Tarrow (label, a, b, _), Tarrow (label', a', b', _) ->
           Poly.equal label label' && equal seen a a' && equal seen b b'
       | _ -> false
-  and equal_list seen xs ys = List.equal (equal seen) xs ys in
+  in
+  equal [] left right
+
+let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
+  let mismatch () =
+    Report.unsupported at "This polymorphic function occurrence or signature alias"
+  in
+  let mono = monomorphic ~expand in
+  let equal = same_type ~expand in
   let* declared = discover ~expand ~at declaration in
   let* _ = discover ~expand ~at occurrence in
   let* native = discover ~expand ~at scheme.typ in
@@ -172,7 +180,7 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
         | Some (slot, _) ->
             begin match List.Assoc.find bindings slot ~equal:Int.equal with
             | None -> Ok ((slot, source_occurrence) :: bindings)
-            | Some previous when equal [] previous occurrence -> Ok bindings
+            | Some previous when equal previous occurrence -> Ok bindings
             | Some _ -> mismatch ()
             end
         | None when List.mem seen pair ~equal:Poly.equal -> Ok bindings
@@ -189,7 +197,7 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
               when Poly.equal label label' ->
                 let* bindings = match_type seen bindings a a' in
                 match_type seen bindings b b'
-            | _ when equal [] declaration occurrence -> Ok bindings
+            | _ when equal declaration occurrence -> Ok bindings
             | _ -> mismatch ()
             end
       and match_list seen bindings xs ys =
@@ -227,22 +235,7 @@ let instantiate_worker ?(expand = Fn.id) ~at worker ~declaration ~occurrence =
           (Datatypes.substitution restriction.source.variables arguments)
       in
       let restricted = List.map restriction.arguments ~f:substitute in
-      let rec equal seen left right =
-        let left = expand left and right = expand right in
-        let pair = (Types.get_id left, Types.get_id right) in
-        if Types.eq_type left right || List.mem seen pair ~equal:Poly.equal then true
-        else
-          let seen = pair :: seen in
-          match (Types.get_desc left, Types.get_desc right) with
-          | Tconstr (left, xs, _), Tconstr (right, ys, _) ->
-              Path.same left right && List.equal (equal seen) xs ys
-          | Ttuple xs, Ttuple ys ->
-              List.equal (Option.equal String.equal) (List.map xs ~f:fst)
-                (List.map ys ~f:fst)
-              && List.equal (equal seen) (List.map xs ~f:snd) (List.map ys ~f:snd)
-          | _ -> false
-      in
-      if not (List.equal (equal []) arguments restricted) then
+      if not (List.equal (same_type ~expand) arguments restricted) then
         Error
           (Report.error Report.Type at
              "This call does not satisfy the helper's continuation type instance")
