@@ -619,12 +619,16 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
           in
           let+ stmts, v =
             branch ctx e (fun target ->
-                let target = Option.value_exn target in
+                let+ target =
+                  State.of_result
+                    (Report.expect ~at:e.exp_loc
+                       "The variable of a Boolean operator's value" target)
+                in
                 let arm = function
                   | `Rhs -> b_stmts @ [ assign target b ]
                   | `Value v -> [ assign target (R.Expr.bool ~loc:l v) ]
                 in
-                State.return [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
+                [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
           in
           (a_stmts @ stmts, v)
     | Some ((Eq | Neq) as op), _, [ a; b ]
@@ -706,15 +710,15 @@ and call ?actual_target ?type_instance ctx (e : Typedtree.expression) f
         | Some _ when List.is_empty signature.procedure_parameters ->
             State.return (Some signature)
         | Some (_, arguments) ->
-            if List.length signature.procedure_parameters <> List.length arguments then
-              State.of_result (unsupported e.exp_loc "This generic ghost-call signature")
-            else
-              State.return
-                (Some
-                   (map_procedure_types signature ~f:(fun typ ->
-                        Option.value_exn
-                          (Datatypes.instantiate_alias signature.procedure_parameters
-                             arguments typ))))
+            begin match
+              Datatypes.substitution signature.procedure_parameters arguments
+            with
+            | None ->
+                State.of_result
+                  (unsupported e.exp_loc "This generic ghost-call signature")
+            | Some substitute ->
+                State.return (Some (map_procedure_types signature ~f:substitute))
+            end
         end
   in
   let inputs = Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_inputs) in
@@ -845,18 +849,27 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
             ~invariant:inv ~field
         in
         let inv = st.invariant in
+        let* argument =
+          State.of_result
+            (Report.expect ~at:e.exp_loc "The argument a past fact is about"
+               (List.nth args i))
+        in
         match
           ( List.Assoc.find path.snapshots inv ~equal:String.equal,
-            known_position path.positions inv field (List.nth_exn args i) )
+            known_position path.positions inv field argument )
         with
         | _, Some p -> State.return [ p.pos_snapshot; p.pos_k ]
         | Some (latest :: _), None ->
-            let index = List.Assoc.find_exn latest.indices field ~equal:String.equal in
-            State.return
-              [
-                state_of ~loc:l st (grown st latest.values);
-                R.Expr.index ~loc:l index (List.nth_exn args i);
-              ]
+            let+ index =
+              State.of_result
+                (Report.expect ~at:e.exp_loc
+                   ("The snapshot index of field " ^ field)
+                   (List.Assoc.find latest.indices field ~equal:String.equal))
+            in
+            [
+              state_of ~loc:l st (grown st latest.values);
+              R.Expr.index ~loc:l index argument;
+            ]
         | _ ->
             State.of_result
               (error e.exp_loc

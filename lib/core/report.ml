@@ -3,7 +3,7 @@
 open Base
 module R = Raven_api
 
-type kind = Syntax | Type | Unsupported
+type kind = Syntax | Type | Unsupported | Internal
 
 type error = {
   kind : kind;
@@ -36,7 +36,11 @@ let to_diagnostic (e : error) : R.Diagnostic.t =
   {
     severity = Error;
     kind =
-      (match e.kind with Syntax -> Syntax | Type -> Type | Unsupported -> Unsupported);
+      (match e.kind with
+      | Syntax -> Syntax
+      | Type -> Type
+      | Unsupported -> Unsupported
+      | Internal -> Internal);
     code = None;
     loc = loc e.loc;
     message = e.message;
@@ -58,3 +62,18 @@ let warn (at : Location.t) message =
     { severity = Warning; kind = Other; code = None; loc = loc at; message; related = [] }
 
 let unsupported loc what = Error (error Unsupported loc (what ^ " is not supported yet"))
+
+(** A broken invariant of Caravan's own, stated by [message], noticed at [loc]. *)
+let internal loc message = Error (error Internal loc ("A bug in Caravan: " ^ message))
+
+(** [value], or the internal error that [what] is missing. *)
+let expect ~at what = function
+  | Some value -> Ok value
+  | None -> internal at (what ^ " is missing")
+
+(** The pairs of [left] and [right], or the internal error that [what] differ in length.
+*)
+let zip ~at what left right =
+  match List.zip left right with
+  | Ok pairs -> Ok pairs
+  | Unequal_lengths -> internal at (what ^ " differ in length")

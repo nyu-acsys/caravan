@@ -226,19 +226,25 @@ let specialize_shared env ~terms =
           let* view_data =
             State.all st.views ~f:(fun ((view : S.predicate), value) ->
                 let key = view.pred_name.pid_str in
-                let target, parameters =
-                  List.Assoc.find_exn st.context.declaration_predicates key
-                    ~equal:String.equal
+                let at = view.pred_name.pid_loc in
+                let* target, parameters =
+                  State.of_result
+                    (Report.expect ~at
+                       ("The declaration of view " ^ key)
+                       (List.Assoc.find st.context.declaration_predicates key
+                          ~equal:String.equal))
                 in
                 let target = rebase target in
                 let parameters = List.map parameters ~f:project in
                 let old_field = view_field_in shared key in
                 let field = rebase old_field in
-                let+ typ =
+                let* value_type =
                   State.of_result
-                    (Datatypes.typ env.data ~at:view.pred_name.pid_loc
-                       (List.last_exn parameters))
+                    (Report.expect ~at
+                       ("The value parameter of view " ^ key)
+                       (List.last parameters))
                 in
+                let+ typ = State.of_result (Datatypes.typ env.data ~at value_type) in
                 ( { view with pred_name = { view.pred_name with pid_str = target } },
                   value,
                   parameters,

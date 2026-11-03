@@ -989,8 +989,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
               (Program_declarations.source_function_projection ~generics context f)
             (preds, spec_funcs, proof_support)
         in
-        let signature =
-          List.Assoc.find_exn procedure_signatures (proc_name f) ~equal:String.equal
+        let* signature =
+          State.of_result
+            (Report.expect ~at:f.loc
+               ("The signature of procedure " ^ proc_name f)
+               (List.Assoc.find procedure_signatures (proc_name f) ~equal:String.equal))
         in
         let groups =
           Option.value_map (au_plan au_source) ~default:[] ~f:(fun plan ->
@@ -1126,7 +1129,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                  match signature.au_generic with
                  | None -> State.return signature
                  | Some generic ->
-                     let declaration = List.hd_exn generic.parameters in
+                     let* declaration =
+                       State.of_result
+                         (Report.expect ~at:au_source.au_at
+                            "The operation type of a generic AU"
+                            (List.hd generic.parameters))
+                     in
                      let* arguments =
                        State.of_result
                          (Polymorphic_functions.instantiate
@@ -1134,10 +1142,13 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                             { typ = declaration; variables = generic.variables }
                             ~declaration ~occurrence:signature.au_source.au_operation_type)
                      in
-                     State.return
-                       (map_atomic_types signature ~f:(fun typ ->
-                            Option.value_exn
-                              (Datatypes.instantiate_alias generic.variables arguments typ)))
+                     let+ substitute =
+                       State.of_result
+                         (Report.expect ~at:au_source.au_at
+                            "A type argument for each parameter of the AU signature"
+                            (Datatypes.substitution generic.variables arguments))
+                     in
+                     map_atomic_types signature ~f:substitute
                in
                State.return
                  {

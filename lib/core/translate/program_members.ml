@@ -1442,24 +1442,34 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                         else Ok ()))
              | _ -> Ok ())
              ~f:(fun () ->
-               proof_function types ~shared
-                 ~polymorphic_functions:
-                   (polymorphic_registry
-                      (declaration_context declaration_name).destination)
-                 ~signature:
-                   (List.Assoc.find_exn all_logical_functions declaration_name
-                      ~equal:String.equal)
-                 ~primitive_namespace:(callable_namespace declaration_name)
-                 ~generic_predicates
-                 ~ocaml_env:(declaration_environment declaration_name)
-                 ~preds ~spec_funcs
-                 ~proof_support:{ proof_support with logical_functions }
-                 ?member_name:(callable_member declaration_name)
-                 ~as_value:
-                   (match declaration with
-                   | S.Proof_function { function_params = []; _ } -> true
-                   | _ -> false)
-                 declaration))
+               let at =
+                 match declaration with
+                 | S.Proof_function { function_name; _ } -> function_name.pid_loc
+                 | _ -> Location.none
+               in
+               State.bind
+                 (State.of_result
+                    (Report.expect ~at
+                       ("The signature of logical function " ^ declaration_name)
+                       (List.Assoc.find all_logical_functions declaration_name
+                          ~equal:String.equal)))
+                 ~f:(fun signature ->
+                   proof_function types ~shared
+                     ~polymorphic_functions:
+                       (polymorphic_registry
+                          (declaration_context declaration_name).destination)
+                     ~signature
+                     ~primitive_namespace:(callable_namespace declaration_name)
+                     ~generic_predicates
+                     ~ocaml_env:(declaration_environment declaration_name)
+                     ~preds ~spec_funcs
+                     ~proof_support:{ proof_support with logical_functions }
+                     ?member_name:(callable_member declaration_name)
+                     ~as_value:
+                       (match declaration with
+                       | S.Proof_function { function_params = []; _ } -> true
+                       | _ -> false)
+                     declaration)))
   in
   let pure_functions =
     Path_bindings.of_list
@@ -1487,14 +1497,18 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               Generic_modules.worker_types group ~owner:namespace)
           @ types
         in
-        let body_types =
+        let* body_types =
           match destination with
           | Module_context.Function_worker (worker, _) ->
-              let f = List.find_exn funcs ~f:(fun f -> Ident.same worker.id f.id) in
-              Program_declarations.function_types polymorphic_functions f body_types
+              let* f =
+                Report.expect ~at:worker.loc
+                  ("The function of worker " ^ worker.name)
+                  (List.find funcs ~f:(fun f -> Ident.same worker.id f.id))
+              in
+              Ok (Program_declarations.function_types polymorphic_functions f body_types)
           | Module_context.Proof_worker (worker, _) ->
-              Generic_predicates.types worker body_types
-          | Flat | Worker _ -> body_types
+              Ok (Generic_predicates.types worker body_types)
+          | Flat | Worker _ -> Ok body_types
         in
         let stages = List.concat_map groups ~f:Generic_modules.parameter_groups in
         let predicate_overrides =

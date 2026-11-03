@@ -1062,13 +1062,18 @@ let program ?(history = History.default) (source : Source.t) :
     all (List.rev family_types) ~f:(Datatypes.value_family_members types)
   in
   let value_factory_templates = List.concat_map value_family_parts ~f:snd in
-  let dictionary_for binding id =
+  let dictionary_for ~at binding id =
     let concrete = checked_raw_types types binding in
-    Option.value_exn
+    Report.expect ~at
+      ("The value dictionary of type " ^ Ident.name id)
       (Datatypes.dictionary_name concrete (Ctype.newconstr (Path.Pident id) []))
   in
+  let* paired_generics =
+    Report.zip ~at:Location.none "The generic module groups and their interfaces" generics
+      generic_interfaces
+  in
   let* generic_implementation_templates =
-    all generics ~f:(fun group ->
+    all paired_generics ~f:(fun (group, interface) ->
         let l = loc group.representative.template.mod_loc in
         let q = qualified_name ~loc:l in
         let* ra_data =
@@ -1298,12 +1303,7 @@ let program ?(history = History.default) (source : Source.t) :
                               then Prelude.value_interface
                               else "Library.Type") )))
                   (ident ~loc:l world)
-                  (world_domains
-                  @ List.nth_exn generic_interfaces
-                      (List.findi_exn generics ~f:(fun _ candidate ->
-                           phys_equal candidate group)
-                      |> fst)
-                  @ [ shape; factory; worker ]),
+                  (world_domains @ interface @ [ shape; factory; worker ]),
                 family_templates @ layout_templates,
                 List.filter family_members ~f:(fun (name, _) ->
                     List.is_empty (Qualified_name.of_string name).path) ))
@@ -1365,12 +1365,10 @@ let program ?(history = History.default) (source : Source.t) :
                                      ref Types.Mnil ))
                             in
                             if Option.is_none declaration.typ_manifest then
-                              Ok
-                                (R.Type.named ~loc:l
-                                   (q
-                                      (dictionary_for parameter.argument
-                                         declaration.typ_id))
-                                   [])
+                              Result.map
+                                (dictionary_for ~at:declaration.typ_loc parameter.argument
+                                   declaration.typ_id) ~f:(fun dictionary ->
+                                  R.Type.named ~loc:l (q dictionary) [])
                             else Datatypes.typ concrete ~at:declaration.typ_loc t)
                         |> Result.bind ~f:(fun ordinary ->
                             all parameter.argument.expected.signature_ghost_modules
@@ -1421,9 +1419,17 @@ let program ?(history = History.default) (source : Source.t) :
   let generic_instances = List.concat generic_instances in
   (* The modules of the checked bindings, each followed by the declarations that the layouts
      it makes available let through. *)
-  let _, native_blocks, pending, _ =
-    List.fold
-      (List.zip_exn checked_modules checked_module_members)
+  let* checked_pairs =
+    Report.zip ~at:Location.none "The checked modules and their members" checked_modules
+      checked_module_members
+  in
+  let checked_module ~what binding =
+    Report.expect ~at:Location.none what
+      (List.find checked_pairs ~f:(fun (view, _) ->
+           phys_equal view.Checked_modules.binding binding))
+  in
+  let* _, native_blocks, pending, _ =
+    List.fold_result checked_pairs
       ~init:
         ( [],
           [],
@@ -1434,7 +1440,7 @@ let program ?(history = History.default) (source : Source.t) :
           [] )
       ~f:(fun (emitted, blocks, pending, available) (view, members) ->
         let binding = view.Checked_modules.binding in
-        if deferred_native_binding binding then (emitted, blocks, pending, available)
+        if deferred_native_binding binding then Ok (emitted, blocks, pending, available)
         else
           let attached =
             List.concat_map generics ~f:(fun group ->
@@ -1449,37 +1455,33 @@ let program ?(history = History.default) (source : Source.t) :
                             argument)))
           in
           let rec attach (emitted, attached) argument =
-            if List.mem emitted argument ~equal:phys_equal then (emitted, attached)
+            if List.mem emitted argument ~equal:phys_equal then Ok (emitted, attached)
             else
-              let view =
-                List.find_exn checked_modules ~f:(fun view ->
-                    phys_equal view.Checked_modules.binding argument)
+              let* view, _ =
+                checked_module ~what:"The checked module of a functor argument" argument
               in
               let dependency =
                 Option.bind view.target ~f:(fun target ->
                     List.find checked_modules ~f:(fun candidate ->
                         String.equal candidate.Checked_modules.name target))
               in
-              let emitted, attached =
-                Option.value_map dependency ~default:(emitted, attached)
-                  ~f:(fun dependency -> attach (emitted, attached) dependency.binding)
+              let* emitted, attached =
+                match dependency with
+                | None -> Ok (emitted, attached)
+                | Some dependency -> attach (emitted, attached) dependency.binding
               in
-              (argument :: emitted, argument :: attached)
+              Ok (argument :: emitted, argument :: attached)
           in
-          let _, attached = List.fold attached ~init:(emitted, []) ~f:attach in
+          let* _, attached = List.fold_result attached ~init:(emitted, []) ~f:attach in
           let attached = List.rev attached in
-          let attached_members =
-            List.concat_map attached ~f:(fun argument ->
-                snd
-                  (List.find_exn (List.zip_exn checked_modules checked_module_members)
-                     ~f:(fun (view, _) ->
-                       phys_equal view.Checked_modules.binding argument)))
+          let* attached_views =
+            all attached
+              ~f:(checked_module ~what:"The checked module of a functor argument")
           in
+          let attached_members = List.concat_map attached_views ~f:snd in
           let prefix =
-            List.concat_map
-              (List.zip_exn generics
-                 (List.zip_exn generic_interfaces generic_implementations))
-              ~f:(fun (group, (interface, implementation)) ->
+            List.concat_map (List.zip_exn paired_generics generic_implementations)
+              ~f:(fun ((group, interface), implementation) ->
                 if phys_equal group.representative.argument binding then
                   match group.Generic_modules.world with
                   | None -> interface @ [ implementation ]
@@ -1524,20 +1526,17 @@ let program ?(history = History.default) (source : Source.t) :
           in
           let available =
             view.name
-            :: List.fold attached ~init:available ~f:(fun available binding ->
-                let view =
-                  List.find_exn checked_modules ~f:(fun view ->
-                      phys_equal view.Checked_modules.binding binding)
-                in
-                view.name :: available)
+            :: List.fold attached_views ~init:available ~f:(fun available (view, _) ->
+                view.Checked_modules.name :: available)
           in
           let after_instances, pending = take_available ~available pending in
-          ( (binding :: attached) @ emitted,
-            (before_setup @ prefix @ setup @ declarations @ publications
-           @ attached_members @ members @ instances @ after_instances)
-            :: blocks,
-            pending,
-            available ))
+          Ok
+            ( (binding :: attached) @ emitted,
+              (before_setup @ prefix @ setup @ declarations @ publications
+             @ attached_members @ members @ instances @ after_instances)
+              :: blocks,
+              pending,
+              available ))
   in
   let native_modules = List.concat (List.rev native_blocks) in
   let pending_declarations, pending_domains, pending_workers, pending_fields = pending in

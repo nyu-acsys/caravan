@@ -25,7 +25,11 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
   match signature.au_generic with
   | None -> Ok (signature, None)
   | Some generic ->
-      let inputs, outputs = Option.value_exn (atomic_inputs signature method_) in
+      let* inputs, outputs =
+        Report.expect ~at
+          ("The signature of AU method " ^ method_)
+          (atomic_inputs signature method_)
+      in
       if List.length actuals <> List.length inputs then
         error at
           (Printf.sprintf "AU method %s expects %d arguments" method_ (List.length inputs))
@@ -50,11 +54,11 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
               Ok current.scheme.variables
           | Error error, _, _, _ -> Error error
         in
-        let instantiated =
-          map_atomic_types signature ~f:(fun typ ->
-              Option.value_exn
-                (Datatypes.instantiate_alias generic.variables arguments typ))
+        let* substitute =
+          Report.expect ~at "A type argument for each parameter of the AU signature"
+            (Datatypes.substitution generic.variables arguments)
         in
+        let instantiated = map_atomic_types signature ~f:substitute in
         Ok ({ instantiated with au_generic = None }, Some (generic, arguments))
 
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
@@ -1095,7 +1099,12 @@ and application env (t : S.term) =
       begin match (method_, atomic_inputs signature method_) with
       | ("pending" | "committed"), Some _ ->
           let* signature = instantiate_atomic_signature env ~at signature method_ args in
-          let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
+          let* inputs, _ =
+            State.of_result
+              (Report.expect ~at
+                 ("The signature of AU method " ^ method_)
+                 (atomic_inputs signature method_))
+          in
           let+ values = typed_arguments env ~at inputs args in
           let values = atomic_arguments ~loc:l signature method_ values in
           let procedure = qualified_name ~loc:l signature.au_procedure in

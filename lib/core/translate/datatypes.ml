@@ -442,11 +442,12 @@ let is_collection types p kind =
   | Sequence, Some Sequence | FinSet, Some FinSet | Set, Some Set | Map, Some Map -> true
   | _ -> false
 
-(** Applies abbreviation parameters without linking or modifying compiler types. *)
-let instantiate_alias parameters arguments body =
+(** The substitution of [arguments] for [parameters], unless they differ in number. It
+    applies abbreviation parameters without linking or modifying compiler types. *)
+let substitution parameters arguments =
   match List.zip parameters arguments with
   | Unequal_lengths -> None
-  | Ok [] -> Some body
+  | Ok [] -> Some Fn.id
   | Ok bindings ->
       let rec substitute typ =
         match
@@ -461,7 +462,10 @@ let instantiate_alias parameters arguments body =
             | _ -> typ
             end
       in
-      Some (substitute body)
+      Some substitute
+
+let instantiate_alias parameters arguments body =
+  Option.map (substitution parameters arguments) ~f:(fun substitute -> substitute body)
 
 let alias_body types typ =
   match Types.get_desc typ with

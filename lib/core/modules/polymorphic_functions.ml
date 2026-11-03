@@ -222,9 +222,9 @@ let instantiate_worker ?(expand = Fn.id) ~at worker ~declaration ~occurrence =
       let* arguments =
         instantiate ~expand ~at restriction.source ~declaration ~occurrence
       in
-      let substitute typ =
-        Option.value_exn
-          (Datatypes.instantiate_alias restriction.source.variables arguments typ)
+      let* substitute =
+        Report.expect ~at "A type argument for each variable of the helper's instance"
+          (Datatypes.substitution restriction.source.variables arguments)
       in
       let restricted = List.map restriction.arguments ~f:substitute in
       let rec equal seen left right =

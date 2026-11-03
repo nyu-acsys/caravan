@@ -115,8 +115,9 @@ let unfold_result_types env (t : S.term) witnesses =
       with
       | None -> Ok None
       | Some body ->
-          let target =
-            fst (List.Assoc.find_exn env.ctx.given.preds key ~equal:String.equal)
+          let* target, _ =
+            Report.expect ~at:t.term_loc ("The predicate " ^ key)
+              (List.Assoc.find env.ctx.given.preds key ~equal:String.equal)
           in
           let* instance = predicate_instance env ~at:t.term_loc ~key ~target args in
           let variables =
@@ -485,10 +486,15 @@ let instantiate_proof_call_signature ?expected env t signature =
   match head.S.term_desc with
   | Tvar q when Option.is_some (atomic_proof_signature env t) ->
       let atomic, method_ = Option.value_exn (atomic_method env q) in
-      let+ atomic =
+      let* atomic =
         instantiate_atomic_signature env ~at:t.term_loc ?expected atomic method_ args
       in
-      let inputs, outputs = Option.value_exn (atomic_inputs atomic method_) in
+      let+ inputs, outputs =
+        State.of_result
+          (Report.expect ~at:t.term_loc
+             ("The signature of " ^ method_ ^ " of the instantiated atomic update")
+             (atomic_inputs atomic method_))
+      in
       { signature with lemma_inputs = inputs; lemma_outputs = outputs }
   | _ -> instantiate_proof_signature env ~at:t.term_loc ?expected signature args
 

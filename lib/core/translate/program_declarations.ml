@@ -154,8 +154,10 @@ let specialize_continuations (scopes : Program_scopes.t) =
     all scopes.funcs ~f:(fun f ->
         match (f.role, f.lexical_owner) with
         | Some _, Some owner ->
-            let outer =
-              List.find_exn scopes.funcs ~f:(fun outer -> Ident.same outer.id owner)
+            let* outer =
+              Report.expect ~at:f.loc
+                ("The lexical owner of " ^ Ident.name f.id)
+                (List.find scopes.funcs ~f:(fun outer -> Ident.same outer.id owner))
             in
             let* local =
               Polymorphic_functions.discover ~excluded:[ outer.scheme_type ]
@@ -180,8 +182,9 @@ let specialize_continuations (scopes : Program_scopes.t) =
               if List.is_empty specialization then Ok f
               else
                 let parameters, arguments = List.unzip specialization in
-                let project typ =
-                  Option.value_exn (Datatypes.instantiate_alias parameters arguments typ)
+                let* project =
+                  Report.expect ~at:f.loc "A type argument for each specialized variable"
+                    (Datatypes.substitution parameters arguments)
                 in
                 let mapper = Source_type_map.typed_mapper ~f:project in
                 let params =

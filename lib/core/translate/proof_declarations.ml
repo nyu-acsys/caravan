@@ -195,8 +195,11 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         lemma_body;
       } ->
       let open State.Syntax in
-      let signature =
-        List.Assoc.find_exn proof_lemmas lemma_name.pid_str ~equal:String.equal
+      let* signature =
+        State.of_result
+          (Report.expect ~at:lemma_name.pid_loc
+             ("The signature of lemma " ^ lemma_name.pid_str)
+             (List.Assoc.find proof_lemmas lemma_name.pid_str ~equal:String.equal))
       in
       let* rebound =
         State.of_result
@@ -452,7 +455,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             let key = R.Expr.index ~loc:l on hc in
             let helping_state, helping_key, _ = p.helping in
             let* membership_chains =
-              State.all st.chains ~f:(fun (field, _) ->
+              State.all st.chains ~f:(fun (field, chain) ->
                   match
                     List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field)
                   with
@@ -465,7 +468,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                                    Ctype.is_equal state_env.ctx.given.env false
                                      [ element ] [ p.key_type ]))
                           in
-                          Option.some_if equal (field, entries)
+                          Option.some_if equal (chain, entries)
                       | _ -> State.return None
                       end
                   | None -> State.return None)
@@ -485,12 +488,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             in
             (* A key that is an entry of a field owned by index is at its position. *)
             let membership =
-              List.map (List.filter_opt membership_chains) ~f:(fun (field, entries) ->
-                  let index =
-                    R.Expr.index ~loc:l
-                      (var (List.Assoc.find_exn st.chains field ~equal:String.equal))
-                      key
-                  in
+              List.map (List.filter_opt membership_chains) ~f:(fun (chain, entries) ->
+                  let index = R.Expr.index ~loc:l (var chain) key in
                   List.reduce_exn ~f:(bin And)
                     [
                       bin Leq (R.Expr.int ~loc:l 0) index;
@@ -822,10 +821,12 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
         State.of_result
           (match signature with
           | Some signature ->
-              Ok
-                ( signature.lemma_inputs,
-                  List.hd_exn signature.lemma_outputs,
-                  signature.lemma_generic )
+              Result.map
+                (Report.expect ~at:function_name.pid_loc
+                   ("The result of function " ^ function_name.pid_str)
+                   (List.hd signature.lemma_outputs))
+                ~f:(fun output ->
+                  (signature.lemma_inputs, output, signature.lemma_generic))
           | None ->
               Result.map
                 (Source.ocaml_types ocaml_env ~at:function_name.pid_loc
@@ -846,8 +847,14 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
       in
       State.in_procedure
       @@
+      let* typed_params =
+        State.of_result
+          (Report.zip ~at:function_name.pid_loc
+             ("The parameters and input types of function " ^ function_name.pid_str)
+             function_params inputs)
+      in
       let* params =
-        State.all (List.zip_exn function_params inputs) ~f:(fun ((id, _), ty) ->
+        State.all typed_params ~f:(fun ((id, _), ty) ->
             let* raven_type = State.typ ctx ~at:id.S.pid_loc ty in
             let+ raven = State.fresh id.pid_str in
             (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
