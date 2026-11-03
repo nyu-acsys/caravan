@@ -1,15 +1,15 @@
 (* The cells ever linked, their values, the indices of the head's and the tail's cells,
    and the is_empty calls waiting for a cell to be linked. Cells are never unlinked:
    popping moves the head. *)
-type state = {
-  cells : node Atomic.t sequence [@grows];
-  values : bool sequence [@grows];
+type 'a state = {
+  cells : 'a node Atomic.t sequence [@grows];
+  values : 'a sequence [@grows];
   head : integer [@grows];
   tail : integer;
-  waiting : node Atomic.t pending [@helps is_empty];
+  waiting : 'a node Atomic.t pending [@helps is_empty];
 }
 
-invariant is_queue (q : t) (s : state) =
+invariant is_queue (q : 'a t) (s : 'a state) =
   length s.cells = length s.values + 1
   && 0 <= s.head && s.head < length s.cells
   && 0 <= s.tail && s.tail < length s.cells
@@ -19,7 +19,7 @@ invariant is_queue (q : t) (s : state) =
         own s.cells.(i) (Next (s.values.(i), s.cells.(i + 1))))
   && own s.cells.(length s.values) Nil
 
-view queue (q : t) = drop s.head s.values
+view queue (q : 'a t) = drop s.head s.values
 
 (* Popping moves the head on, by a compare_and_set from its cell to the next. *)
 action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1)
@@ -35,18 +35,18 @@ action link v c = compare_and_set s.cells.(length s.values) Nil (Next (v, c))
 action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }
 
 
-predicate built_chain (first : node Atomic.t) (limit : node Atomic.t)
-    (items : bool list) (cells [@implicit] : node Atomic.t list) =
+predicate built_chain (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells [@implicit] : 'a node Atomic.t list) =
   match items with
   | [] -> first == limit && cells === [limit]
   | value :: tail ->
-      exists next : node Atomic.t, rest : node Atomic.t list.
+      exists next : 'a node Atomic.t, rest : 'a node Atomic.t list.
       cells === first :: rest && own first (Next (value, next))
       && built_chain next limit tail rest
 
-lemma built_excludes_owned (first : node Atomic.t) (limit : node Atomic.t)
-    (items : bool list) (cells : node Atomic.t list) (other : node Atomic.t)
-    (contents : node)
+lemma built_excludes_owned (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t list) (other : 'a node Atomic.t)
+    (contents : 'a node)
   requires (built_chain first limit items cells && own limit Nil && own other contents)
   ensures (built_chain first limit items cells && own limit Nil && own other contents)
   ensures (forall i : integer. 0 <= i && i < length (to_sequence cells) ->
@@ -62,10 +62,10 @@ lemma built_excludes_owned (first : node Atomic.t) (limit : node Atomic.t)
       built_excludes_owned next limit tail rest other contents;
       fold built_chain first limit items cells {next = next; rest = rest}
 
-lemma expose_built_chain (head : node Atomic.t Atomic.t option)
-    (limit : node Atomic.t) (items : bool list)
-    (first [@implicit] : node Atomic.t) (cells [@implicit] : node Atomic.t list)
-  returns (cell_list : node Atomic.t list)
+lemma expose_built_chain (head : 'a node Atomic.t Atomic.t option)
+    (limit : 'a node Atomic.t) (items : 'a list)
+    (first [@implicit] : 'a node Atomic.t) (cells [@implicit] : 'a node Atomic.t list)
+  returns (cell_list : 'a node Atomic.t list)
   requires (match head with None -> true | Some head -> own head first)
   requires (own limit Nil && built_chain first limit items cells)
   ensures (match head with None -> true | Some head -> own head first)

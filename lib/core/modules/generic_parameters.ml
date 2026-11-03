@@ -54,6 +54,10 @@ let rebind ~expand ~at declaration parameters =
 
 let instantiate ?environment ~expand ~at predicate actuals =
   let canonical typ =
+    let typ =
+      Option.value_map environment ~default:typ ~f:(fun environment ->
+          Ctype.expand_head environment (Compiler_types.scheme_structure typ))
+    in
     match (environment, Types.get_desc typ) with
     | Some environment, Tconstr (path, arguments, _) ->
         begin match Env.try_normalize_type_path None environment path with

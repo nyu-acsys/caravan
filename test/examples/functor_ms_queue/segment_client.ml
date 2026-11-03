@@ -1,5 +1,5 @@
 let empty () =
-  let q = Alias.create () in
+  let q : int Alias.t = Alias.create () in
   assert (Alias.is_empty q);
   assert (Alias.pop_opt q = None)
 
@@ -20,6 +20,6 @@ let longer () =
   assert (Alias.is_empty q)
 
 let empty_of_list () =
-  let q = Alias.of_list [] in
+  let q : int Alias.t = Alias.of_list [] in
   assert (Alias.is_empty q);
   assert (Alias.pop_opt q = None)

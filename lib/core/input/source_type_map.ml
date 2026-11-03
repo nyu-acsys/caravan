@@ -60,6 +60,74 @@ end
 
 open Group
 
+(** Apply an immutable type substitution to a supported runtime tree. *)
+let typed_mapper ~f =
+  let open Typedtree in
+  let label (label : Data_types.label_description) =
+    { label with lbl_res = f label.lbl_res; lbl_arg = f label.lbl_arg }
+  in
+  let constructor (constructor : Data_types.constructor_description) =
+    {
+      constructor with
+      cstr_res = f constructor.cstr_res;
+      cstr_args = List.map constructor.cstr_args ~f;
+      cstr_existentials = List.map constructor.cstr_existentials ~f;
+    }
+  in
+  let pat : type k.
+      Tast_mapper.mapper -> k Typedtree.general_pattern -> k Typedtree.general_pattern =
+   fun mapper pattern ->
+    let pattern = Tast_mapper.default.pat mapper pattern in
+    let pat_desc : k Typedtree.pattern_desc =
+      match pattern.pat_desc with
+      | Tpat_construct (name, description, patterns, extra) ->
+          Tpat_construct (name, constructor description, patterns, extra)
+      | Tpat_record (fields, closed) ->
+          Tpat_record
+            ( List.map fields ~f:(fun (name, description, pattern) ->
+                  (name, label description, pattern)),
+              closed )
+      | description -> description
+    in
+    { pattern with pat_desc; pat_type = f pattern.pat_type }
+  in
+  {
+    Tast_mapper.default with
+    pat;
+    typ =
+      (fun mapper typ ->
+        let typ = Tast_mapper.default.typ mapper typ in
+        { typ with ctyp_type = f typ.ctyp_type });
+    expr =
+      (fun mapper expression ->
+        let expression = Tast_mapper.default.expr mapper expression in
+        let exp_desc =
+          match expression.exp_desc with
+          | Texp_ident (path, name, description) ->
+              Texp_ident
+                (path, name, { description with val_type = f description.val_type })
+          | Texp_construct (name, description, arguments) ->
+              Texp_construct (name, constructor description, arguments)
+          | Texp_field (record, name, description) ->
+              Texp_field (record, name, label description)
+          | Texp_setfield (record, name, description, value) ->
+              Texp_setfield (record, name, label description, value)
+          | Texp_record record ->
+              let fields =
+                Array.map record.fields ~f:(fun (description, value) ->
+                    let value =
+                      match value with
+                      | Typedtree.Kept (typ, mutable_) -> Typedtree.Kept (f typ, mutable_)
+                      | Overridden _ -> value
+                    in
+                    (label description, value))
+              in
+              Texp_record { record with fields }
+          | description -> description
+        in
+        { expression with exp_desc; exp_type = f expression.exp_type });
+  }
+
 let label (label : Types.label_declaration) =
   let+ ld_type = typ label.ld_type in
   { label with ld_type }

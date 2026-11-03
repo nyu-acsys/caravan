@@ -1,8 +1,8 @@
-(* Saturn's Michael-Scott queue, of integers: creation, push and pop, and
+(* Saturn's Michael-Scott queue: creation, push and pop, and
    moving the tail on by a cell. *)
 
-type node = Nil | Next of bool * node Atomic.t
-type t = { head : node Atomic.t Atomic.t; tail : node Atomic.t Atomic.t }
+type 'a node = Nil | Next of 'a * 'a node Atomic.t
+type 'a t = { head : 'a node Atomic.t Atomic.t; tail : 'a node Atomic.t Atomic.t }
 
 let create () =
   let next = Atomic.make Nil in
@@ -15,7 +15,7 @@ let rec fix_tail tail new_tail =
   let old_tail = Atomic.get tail in
   if Atomic.get new_tail == Nil && not (Atomic.compare_and_set tail old_tail new_tail)
   then fix_tail tail new_tail
-(*@ fix_tail [q : t] tail new_tail
+(*@ fix_tail [q : 'a t] tail new_tail
     requires is_queue q
     requires tail == q.tail
     requires past (mem new_tail s.cells) *)

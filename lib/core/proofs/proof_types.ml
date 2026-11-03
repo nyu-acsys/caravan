@@ -319,6 +319,11 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             in
             let arrow args result =
               List.fold_right args ~init:result ~f:(fun arg result ->
+                  let arg =
+                    match Types.get_desc arg with
+                    | Tpoly _ -> arg
+                    | _ -> Btype.newgenty (Tpoly (arg, []))
+                  in
                   Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
             in
             let value (name, args, result) =

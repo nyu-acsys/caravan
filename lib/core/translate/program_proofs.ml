@@ -355,10 +355,11 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
   let parameters = List.Assoc.find_exn module_parameters context ~equal:phys_equal in
   let preds =
     List.map preds ~f:(fun (key, (backend, ts)) ->
-        (key, (target backend, List.map ts ~f:project)))
+        (key, (target backend, Compiler_types.map_group ts ~f:project)))
   in
   let preds =
-    List.map parameters ~f:(fun (_, key, ts, _) -> (key, (key, List.map ts ~f:project)))
+    List.map parameters ~f:(fun (_, key, ts, _) ->
+        (key, (key, Compiler_types.map_group ts ~f:project)))
     @ preds
   in
   let spec_funcs =
@@ -396,12 +397,19 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
             map_atomic_types signature ~f:project);
       logical_functions =
         List.map support.logical_functions ~f:(fun (key, signature) ->
+            let inputs, outputs =
+              List.split_n
+                (Compiler_types.map_group
+                   (signature.lemma_inputs @ signature.lemma_outputs)
+                   ~f:project)
+                (List.length signature.lemma_inputs)
+            in
             ( key,
               {
                 signature with
                 lemma_raven = target signature.lemma_raven;
-                lemma_inputs = List.map signature.lemma_inputs ~f:project;
-                lemma_outputs = List.map signature.lemma_outputs ~f:project;
+                lemma_inputs = inputs;
+                lemma_outputs = outputs;
               } ));
       predicate_inputs =
         List.map parameters ~f:(fun (_, key, _, inputs) -> (key, inputs))
@@ -969,8 +977,16 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
             preds spec_funcs proof_support
         in
         let preds, spec_funcs, proof_support =
-          let context = asset_context au_source.Source.au_scope in
-          module_context context ~projection:context.projection
+          let context =
+            Program_declarations.body_module_context
+              ~module_contexts:scopes.module_contexts
+              ~context_for_group:
+                (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
+              ~generics f
+          in
+          module_context context
+            ~projection:
+              (Program_declarations.source_function_projection ~generics context f)
             (preds, spec_funcs, proof_support)
         in
         let signature =

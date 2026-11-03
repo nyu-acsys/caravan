@@ -565,6 +565,7 @@ type lemma_signature = {
 
 type procedure_signature = {
   procedure_parameters : Types.type_expr list;
+  procedure_variables : (string * Types.type_expr) list;
   procedure_inputs : (string * Types.type_expr) list;
   procedure_outputs : (string * Types.type_expr) list;
   procedure_result : Types.type_expr;
@@ -579,12 +580,14 @@ let map_procedure_types signature ~f =
   in
   let schema =
     let+ procedure_parameters = list signature.procedure_parameters ~f:typ
+    and+ procedure_variables = list signature.procedure_variables ~f:named
     and+ procedure_inputs = list signature.procedure_inputs ~f:named
     and+ procedure_outputs = list signature.procedure_outputs ~f:named
     and+ procedure_result = typ signature.procedure_result in
     {
       signature with
       procedure_parameters;
+      procedure_variables;
       procedure_inputs;
       procedure_outputs;
       procedure_result;
@@ -1037,15 +1040,34 @@ let assert_admissible ctx ~loc typ variable =
 
 let typ ctx ~at t = Datatypes.typ ctx.given.types ~at t
 
-let source_type (given : inputs) ~at annotation =
+let source_type_variables (given : inputs) =
+  Option.bind given.current_procedure ~f:(fun procedure ->
+      List.Assoc.find given.procedure_signatures procedure ~equal:String.equal)
+  |> Option.value_map ~default:[] ~f:(fun signature -> signature.procedure_variables)
+
+(** Resolve local annotation variables through the expected value type. *)
+let source_type ?expected (given : inputs) ~at annotation =
   let variables =
-    List.filter_map given.types ~f:(fun data ->
+    source_type_variables given
+    @ List.filter_map given.types ~f:(fun data ->
         Option.bind data.Datatypes.variable ~f:(fun variable ->
             match Types.get_desc variable with
             | Tvar (Some name) -> Some (name, variable)
             | _ -> None))
   in
-  Source.ocaml_type ~variables given.env ~at annotation
+  match (Source.ocaml_type ~variables given.env ~at annotation, expected) with
+  | Ok typ, _ -> Ok typ
+  | Error error, None -> Error error
+  | Error _, Some expected ->
+      let id = S.mk_id ~loc:at "caravan$annotated_value" in
+      let value = S.mk_term (Tvar (Qid id)) at in
+      let term = S.mk_term (Tcast (value, annotation)) at in
+      let* () =
+        Source.check_logical_expression ~type_variables:variables given.env ~functions:[]
+          ~variables:[ (id.pid_str, expected) ]
+          ~expected term
+      in
+      Ok expected
 
 (** The explicit state, with the operations that use a context's inputs. *)
 module State = struct
@@ -1156,9 +1178,9 @@ module State = struct
     | Some worker ->
         let* arguments =
           of_result
-            (Polymorphic_functions.instantiate
+            (Polymorphic_functions.instantiate_worker
                ~expand:(Datatypes.expand ctx.given.types)
-               ~at worker.scheme ~declaration ~occurrence)
+               ~at worker ~declaration ~occurrence)
         in
         let stem = (Qualified_name.of_string target).name in
         let recursive =
@@ -1166,9 +1188,17 @@ module State = struct
               String.equal current.name worker.name)
         in
         if recursive then
+          let same_dictionary index formal actual =
+            Polymorphic_functions.same_variable formal actual
+            || Option.value_map (Datatypes.dictionary_name ctx.given.types actual)
+                 ~default:false ~f:(fun dictionary ->
+                   String.equal dictionary (worker.name ^ ".A" ^ Int.to_string index))
+          in
           if
-            List.equal Polymorphic_functions.same_variable worker.scheme.variables
-              (List.map arguments ~f:(Datatypes.expand ctx.given.types))
+            List.length worker.scheme.variables = List.length arguments
+            && List.for_alli (List.zip_exn worker.scheme.variables arguments)
+                 ~f:(fun index (formal, actual) ->
+                   same_dictionary index formal (Datatypes.expand ctx.given.types actual))
           then return (worker.name ^ "." ^ stem, Some (worker, arguments))
           else of_result (unsupported at "Polymorphic recursion")
         else
@@ -1972,8 +2002,9 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
                           List.Assoc.find env.var_types id.pid_str ~equal:String.equal
                       | _ ->
                           Result.ok
-                            (Source.infer_logical_expression env.ctx.given.env
-                               ~functions:(List.map env.funcs ~f:fst)
+                            (Source.infer_logical_expression
+                               ~type_variables:(source_type_variables env.ctx.given)
+                               env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                                ~variables:env.var_types argument))
                 in
                 match

@@ -1105,6 +1105,18 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     );
                 ]))
   in
+  let polymorphic_registry destination =
+    let current_groups = Module_context.groups destination in
+    Path_bindings.of_list
+      (library_registry.entries
+      @ List.concat_map funcs ~f:(fun candidate ->
+          let worker =
+            Program_declarations.applied_function_worker ~generics ~polymorphic_functions
+              ~groups:current_groups ~canonical:(canonical_member shared) candidate
+          in
+          Option.value_map worker ~default:[] ~f:(fun worker ->
+              List.map candidate.paths ~f:(fun path -> (path, worker)))))
+  in
   (* The checks that the actions keep the histories' orders. *)
   let* action_check_lists, state =
     State.run_from state
@@ -1133,12 +1145,26 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* pending_member_lists, state =
     State.run_from state
     @@ State.all structures ~f:(fun st ->
+        let types =
+          Option.value_map st.generic ~default:types ~f:(fun worker ->
+              Generic_parameters.types worker types)
+        in
         let members =
           State.all st.pendings ~f:(fun p ->
               match List.find funcs ~f:(fun f -> Ident.same f.id p.helped) with
               | Some helped ->
                   let preds, spec_funcs, proof_support =
-                    proof_context_for ~preds ~spec_funcs ~proof_support st.invariant
+                    ( st.context.declaration_predicates,
+                      st.context.declaration_functions,
+                      st.context.declaration_support )
+                  in
+                  let helped_declaration =
+                    match (declaration_context st.invariant).worker with
+                    | None -> helped.scheme_type
+                    | Some plan ->
+                        Subst.type_expr
+                          (Generic_proofs.source_projection plan)
+                          helped.scheme_type
                   in
                   State.in_procedure
                     (pending_members
@@ -1146,9 +1172,13 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           ~shared:(shared_for_proof st.invariant)
                           ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
                           ~primitive_namespace:
-                            (declaration_context st.invariant).namespace
+                            (Option.value_map st.generic
+                               ~default:(declaration_context st.invariant).namespace
+                               ~f:(fun worker -> String.split worker.name ~on:'.'))
+                          ~polymorphic_functions:
+                            (polymorphic_registry (owner_destination st.invariant))
                           ~generic_predicates ())
-                       st p helped
+                       st p helped ~helped_declaration
                        ~helped_proc:
                          (match owner_destination st.invariant with
                          | Module_context.Flat -> proc_name helped
@@ -1162,18 +1192,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           (Ident.name p.helped))))
         in
         State.map members ~f:(fun members -> (st, List.concat members)))
-  in
-  let polymorphic_registry destination =
-    let current_groups = Module_context.groups destination in
-    Path_bindings.of_list
-      (library_registry.entries
-      @ List.concat_map funcs ~f:(fun candidate ->
-          let worker =
-            Program_declarations.applied_function_worker ~generics ~polymorphic_functions
-              ~groups:current_groups ~canonical:(canonical_member shared) candidate
-          in
-          Option.value_map worker ~default:[] ~f:(fun worker ->
-              List.map candidate.paths ~f:(fun path -> (path, worker)))))
   in
   let* pred_members, state =
     State.run_from state
@@ -1609,7 +1627,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             {
               original.Typedtree.typ_type with
               type_kind = Types.Type_abstract Types.Definition;
-              type_manifest = Some (Ctype.newconstr (Path.Pident target.typ_id) []);
+              type_manifest =
+                Some
+                  (Ctype.newconstr (Path.Pident target.typ_id)
+                     original.typ_type.type_params
+                  |> Compiler_types.scheme_structure);
               type_private = Asttypes.Public;
             }
           in

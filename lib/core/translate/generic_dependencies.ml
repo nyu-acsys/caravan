@@ -168,26 +168,36 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
             || Path.same path (Path.Pident worker.id))
             worker.name)
     in
-    Option.first_some direct
-      (List.find_map scopes.funcs ~f:(fun func ->
-           if not (List.exists func.Procedures.paths ~f:(Path.same path)) then None
-           else
-             Option.bind (Generic_modules.member scopes.generics func.id)
-               ~f:(fun (group, _, stem) ->
-                 let source =
-                   List.find_map group.body_members ~f:(fun (source, target) ->
-                       Option.some_if (String.equal stem target) source)
-                 in
-                 let representative =
-                   Option.bind source ~f:(fun source ->
-                       List.Assoc.find group.representative.body_members source
-                         ~equal:String.equal)
-                 in
-                 Option.bind representative ~f:(fun id ->
-                     List.find_map decls.polymorphic_functions ~f:(fun worker ->
-                         Option.some_if
-                           (Ident.same worker.Polymorphic_functions.id id)
-                           worker.name)))))
+    let applied =
+      List.find_map scopes.funcs ~f:(fun func ->
+          if not (List.exists func.Procedures.paths ~f:(Path.same path)) then None
+          else
+            Option.bind (Generic_modules.member scopes.generics func.id)
+              ~f:(fun (group, _, stem) ->
+                let source =
+                  List.find_map group.body_members ~f:(fun (source, target) ->
+                      Option.some_if (String.equal stem target) source)
+                in
+                let representative =
+                  Option.bind source ~f:(fun source ->
+                      List.Assoc.find group.representative.body_members source
+                        ~equal:String.equal)
+                in
+                Option.bind representative ~f:(fun id ->
+                    List.find_map decls.polymorphic_functions ~f:(fun worker ->
+                        Option.some_if
+                          (Ident.same worker.Polymorphic_functions.id id)
+                          worker.name))))
+    in
+    let template =
+      List.find_map scopes.generic_proofs ~f:(fun plan ->
+          Option.bind (Generic_proofs.function_id plan path) ~f:(fun id ->
+              List.find_map decls.polymorphic_functions ~f:(fun worker ->
+                  Option.some_if
+                    (Ident.same worker.Polymorphic_functions.id id)
+                    worker.name)))
+    in
+    Option.first_some direct (Option.first_some applied template)
   in
   let worker_key key =
     List.find_map workers ~f:(fun worker ->
@@ -326,13 +336,29 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
           @ types_dependencies binding.private_types
           @ dependencies
     in
+    let helping =
+      List.concat_map decls.predicates ~f:(fun (_, predicate, definition, _) ->
+          match definition with
+          | Program_items.Invariant { fields; field_environment; _ }
+            when Option.exists
+                   (Generic_predicates.find decls.generic_predicates
+                      predicate.S.pred_name.pid_str) ~f:(fun owner ->
+                     String.equal owner.name worker.name) ->
+              List.filter_map fields ~f:(fun field ->
+                  Option.bind field.S.sf_helps ~f:(fun operation ->
+                      Option.bind
+                        (Source.value_path field_environment
+                           (S.Qid (S.mk_id ~loc:field.sf_name.pid_loc operation)))
+                        ~f:runtime_path))
+          | Invariant _ | Body _ | Direct_invariant _ | View _ -> [])
+    in
     Generic_families.
       {
         name = worker.name;
         scope = context.namespace;
         variables = worker.variables;
         at = worker.loc;
-        dependencies;
+        dependencies = helping @ dependencies;
       }
   in
   let runtime_nodes =
@@ -345,7 +371,7 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let dependencies =
           Option.value_map func ~default:dependencies ~f:(fun func ->
               let scope =
-                Proof_scopes.find_namespace source.proof_scopes func.namespace
+                Proof_bindings.scope_for_location scopes.scoped_proofs func.loc
               in
               let terms = Option.value_map func.contract ~default:[] ~f:contract_terms in
               let refs =

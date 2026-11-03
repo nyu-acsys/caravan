@@ -30,7 +30,7 @@ let rec determined typ =
   | _ -> true
 
 let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = [])
-    ?(predicates = fun _ -> None) ~environment ~variables terms =
+    ?(predicates = fun _ -> None) ?annotation ~environment ~variables terms =
   let at =
     Option.value_map (List.hd terms) ~default:Location.none ~f:(fun term ->
         term.S.term_loc)
@@ -629,8 +629,12 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
             Ok (Some first)
         end
     | Tcast (value, typ) ->
-        let* expected = Source.ocaml_type environment ~at:term.term_loc typ in
         let* actual = walk variables value in
+        let* expected =
+          match annotation with
+          | None -> Source.ocaml_type environment ~at:term.term_loc typ
+          | Some annotation -> annotation ~at:term.term_loc ~expected:actual typ
+        in
         let* () = require ~at:term.term_loc expected actual in
         Ok (Some expected)
     | Ttuple values ->

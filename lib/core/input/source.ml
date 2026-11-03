@@ -83,28 +83,27 @@ let annotation_env ?at source lexical_env =
               | Unit | Named (None, _, _) -> None)
           in
           let substitution, changed =
-            match parameter_projection with
-            | [] -> (Subst.identity, false)
-            | _ :: _ ->
-                let substitution =
-                  List.fold parameter_projection ~init:Subst.identity
-                    ~f:(fun substitution (parameter, path) ->
-                      Subst.add_module parameter path substitution)
-                in
-                List.fold (source_type_ids scope.structure) ~init:(substitution, true)
-                  ~f:(fun (substitution, changed) (id, name) ->
-                    try
-                      let original =
-                        Env.find_type (Pident id) scope.structure.str_final_env
-                      in
-                      begin match
-                        matching_type name original.type_loc (Env.summary lexical_env)
-                      with
-                      | Some path when not (Path.same path (Pident id)) ->
-                          (Subst.add_type id path substitution, true)
-                      | Some _ | None -> (substitution, changed)
-                      end
-                    with Stdlib.Not_found -> (substitution, changed))
+            let substitution =
+              List.fold parameter_projection ~init:Subst.identity
+                ~f:(fun substitution (parameter, path) ->
+                  Subst.add_module parameter path substitution)
+            in
+            List.fold
+              (source_type_ids scope.structure)
+              ~init:(substitution, not (List.is_empty parameter_projection))
+              ~f:(fun (substitution, changed) (id, name) ->
+                try
+                  let original =
+                    Env.find_type (Pident id) scope.structure.str_final_env
+                  in
+                  begin match
+                    matching_type name original.type_loc (Env.summary lexical_env)
+                  with
+                  | Some path when not (Path.same path (Pident id)) ->
+                      (Subst.add_type id path substitution, true)
+                  | Some _ | None -> (substitution, changed)
+                  end
+                with Stdlib.Not_found -> (substitution, changed))
           in
           let bindings =
             if not changed then bindings
@@ -119,6 +118,18 @@ let annotation_env ?at source lexical_env =
                 | Sig_value (id, description, visibility) ->
                     Sig_value
                       (id, Subst.value_description substitution description, visibility)
+                | Sig_module (id, presence, declaration, rec_status, visibility) ->
+                    Sig_module
+                      ( id,
+                        presence,
+                        Subst.module_declaration Keep substitution declaration,
+                        rec_status,
+                        visibility )
+                | Sig_modtype (id, declaration, visibility) ->
+                    Sig_modtype
+                      ( id,
+                        Subst.modtype_declaration Keep substitution declaration,
+                        visibility )
                 | item -> item)
           in
           add_spec_bindings ~source_modules bindings env)
@@ -822,8 +833,8 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
 
 (** The OCaml type that the type [t] of an annotation at [at] denotes in [env]. The
     compiler's type checker reports errors by raising. *)
-let ocaml_type ?(variables = []) (env : Env.t) ~(at : Location.t) (t : S.pty) :
-    (Types.type_expr, Report.error) Result.t =
+let ocaml_type ?(variables = []) ?(closed = true) (env : Env.t) ~(at : Location.t)
+    (t : S.pty) : (Types.type_expr, Report.error) Result.t =
   try
     let env, aliases =
       List.fold variables ~init:(env, []) ~f:(fun (env, aliases) (name, variable) ->
@@ -857,8 +868,8 @@ let ocaml_type ?(variables = []) (env : Env.t) ~(at : Location.t) (t : S.pty) :
     in
     let typed =
       Typetexp.TyVarEnv.with_local_scope (fun () ->
-          Typetexp.transl_simple_type env ~closed:true
-            (mapper.typ mapper (core_type ~at t)))
+          if not closed then Typetexp.TyVarEnv.reset ();
+          Typetexp.transl_simple_type env ~closed (mapper.typ mapper (core_type ~at t)))
     in
     let rec restore typ =
       match Types.get_desc typ with
@@ -922,6 +933,12 @@ let logical_check_signature =
    val equal : 'a -> 'a -> bool\n\
    val not_equal : 'a -> 'a -> bool\n\
    val to_sequence : 'a list -> 'a sequence\n\
+   val sequence_index : 'a sequence -> integer -> 'a\n\
+   val sequence_length : 'a sequence -> integer\n\
+   val sequence_last : 'a sequence -> 'a\n\
+   val sequence_drop : integer -> 'a sequence -> 'a sequence\n\
+   val sequence_take : integer -> 'a sequence -> 'a sequence\n\
+   val sequence_append : 'a sequence -> 'a sequence -> 'a sequence\n\
    module Set : sig\n\
    val empty : 'a set\n\
    val singleton : 'a -> 'a set\n\
@@ -999,6 +1016,12 @@ let logical_builtin_path ~functions = function
   | Qid { pid_str = "to_sequence"; _ }
     when not (List.mem functions "to_sequence" ~equal:String.equal) ->
       Some [ "to_sequence" ]
+  | Qid { pid_str = "++"; _ } when not (List.mem functions "++" ~equal:String.equal) ->
+      Some [ "sequence_append" ]
+  | Qid { pid_str = "([])"; _ } -> Some [ "sequence_index" ]
+  | Qid { pid_str = ("length" | "last" | "drop" | "take") as operation; _ }
+    when not (List.mem functions operation ~equal:String.equal) ->
+      Some [ "sequence_" ^ operation ]
   | Qid { pid_str = "==="; _ } -> Some [ "equal" ]
   | Qid { pid_str = "=/="; _ } -> Some [ "not_equal" ]
   | Qid { pid_str = "->" | "<->"; _ } -> Some [ "implies" ]
@@ -1054,6 +1077,15 @@ let shadow_logical_functions names functions =
         (List.exists names ~f:(fun name ->
              String.is_prefix function_ ~prefix:(name ^ "."))))
 
+let rec logical_list_literal (term : S.term) =
+  match term.term_desc with
+  | Tvar (Qid { pid_str = "[]"; _ }) -> true
+  | Tapply
+      ( { term_desc = Tapply ({ term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, _); _ },
+        tail ) ->
+      logical_list_literal tail
+  | _ -> false
+
 let rec logical_expression ~functions ~is_list (term : S.term) =
   let loc = term.term_loc in
   let exp = logical_expression ~functions ~is_list in
@@ -1081,6 +1113,25 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
       Ok
         (Ast_helper.Exp.ident ~loc
            { txt = Lident (record_field record.pid_str field.pid_str); loc })
+  | Tapply
+      ( {
+          term_desc =
+            Tapply
+              ({ term_desc = Tvar (Qid ({ pid_str = "++"; _ } as operator)); _ }, left);
+          _;
+        },
+        right )
+    when Option.is_some (logical_builtin_path ~functions (Qid operator)) ->
+      let operand term =
+        let* value = exp term in
+        Ok
+          (if logical_list_literal term then
+             apply (logical_helper ~loc:term.term_loc [ "to_sequence" ]) [ value ]
+           else value)
+      in
+      let* left = operand left in
+      let* right = operand right in
+      Ok (apply (logical_helper ~loc [ "sequence_append" ]) [ left; right ])
   | Tapply
       ( {
           term_desc = Tapply ({ term_desc = Tvar (Qid { pid_str = "::"; _ }); _ }, head);
@@ -1187,8 +1238,8 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Tattr (_, value) | Told value -> exp value
 
 (** Types logical expressions before Raven erases reference element types. *)
-let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
-    ?expected (term : S.term) =
+let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) env
+    ~functions ~variables ?expected (term : S.term) =
   try
     Ctype.with_local_level (fun () ->
         let rec free_variables (seen, found) typ =
@@ -1202,7 +1253,9 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
         in
         let _, free =
           List.fold
-            (List.map variables ~f:snd @ Option.to_list expected)
+            (List.map variables ~f:snd
+            @ List.map type_variables ~f:snd
+            @ Option.to_list expected)
             ~init:(Set.empty (module Int), [])
             ~f:free_variables
         in
@@ -1253,6 +1306,21 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
                 | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
                 end
         in
+        let env, annotation_aliases =
+          List.fold type_variables ~init:(env, [])
+            ~f:(fun (env, aliases) (name, original) ->
+              let id =
+                Ident.create_scoped ~scope
+                  (Compiler_types.internal_name ~at:term.term_loc
+                     ("logical_annotation_" ^ name))
+              in
+              let declaration = Ctype.new_local_type ~loc:term.term_loc Definition in
+              let declaration =
+                { declaration with type_manifest = Some (freeze original) }
+              in
+              ( Env.add_type ~check:false id declaration env,
+                (name, Path.Pident id, original) :: aliases ))
+        in
         let rec restore typ =
           match Types.get_desc typ with
           | Tconstr (path, [], _) ->
@@ -1260,7 +1328,12 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
                 List.find substitutions ~f:(fun (_, frozen, _) -> Path.same path frozen)
               with
               | Some (variable, _, _) -> variable
-              | None -> typ
+              | None ->
+                  Option.value_map
+                    (List.find annotation_aliases ~f:(fun (_, alias, _) ->
+                         Path.same path alias))
+                    ~default:typ
+                    ~f:(fun (_, _, original) -> original)
               end
           | Tvar _ | Tunivar _ -> typ
           | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
@@ -1269,6 +1342,24 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
         let expected = Option.map expected ~f:freeze in
         let functions = List.map variables ~f:fst @ functions in
         let* expression = logical_expression ~functions ~is_list term in
+        let expression =
+          if
+            logical_list_literal term
+            && Option.exists expected ~f:(fun typ ->
+                match
+                  Types.get_desc
+                    (Ctype.expand_head env (Compiler_types.scheme_structure typ))
+                with
+                | Tconstr (path, [ _ ], _) ->
+                    let sequence, _ = Env.find_type_by_name (Lident "sequence") env in
+                    Path.same path sequence
+                | _ -> false)
+          then
+            Ast_helper.Exp.apply ~loc:term.term_loc
+              (logical_helper ~loc:term.term_loc [ "to_sequence" ])
+              [ (Asttypes.Nolabel, expression) ]
+          else expression
+        in
         let mapper =
           {
             Ast_mapper.default_mapper with
@@ -1277,10 +1368,13 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
                 match typ.Parsetree.ptyp_desc with
                 | Ptyp_var name ->
                     let path =
-                      List.find_map substitutions ~f:(fun (variable, path, _) ->
-                          match Types.get_desc variable with
-                          | Tvar (Some bound) when String.equal bound name -> Some path
-                          | _ -> None)
+                      Option.first_some
+                        (List.find_map annotation_aliases ~f:(fun (bound, path, _) ->
+                             Option.some_if (String.equal bound name) path))
+                        (List.find_map substitutions ~f:(fun (variable, path, _) ->
+                             match Types.get_desc variable with
+                             | Tvar (Some bound) when String.equal bound name -> Some path
+                             | _ -> None))
                     in
                     begin match path with
                     | Some (Pident id) ->
@@ -1296,7 +1390,8 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
           }
         in
         let expression =
-          if List.is_empty substitutions then expression
+          if List.is_empty substitutions && List.is_empty annotation_aliases then
+            expression
           else mapper.expr mapper expression
         in
         let env =
@@ -1341,6 +1436,11 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
               (env, application)
         in
         let typed = Typecore.type_expression env expression in
+        let typed =
+          match (expected, typed.Typedtree.exp_desc) with
+          | Some _, Texp_apply (_, [ (_, Arg expression) ]) -> expression
+          | _ -> typed
+        in
         let partial_match = ref None in
         let default = Tast_iterator.default_iterator in
         let iterator =
@@ -1358,7 +1458,8 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
         in
         iterator.expr iterator typed;
         match !partial_match with
-        | None when List.is_empty substitutions -> Ok typed
+        | None when List.is_empty substitutions && List.is_empty annotation_aliases ->
+            Ok typed
         | None ->
             let mapper =
               {
@@ -1376,20 +1477,178 @@ let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variabl
     | Some error -> Error error
     | None -> Error (Report.error Type term.term_loc (Stdlib.Printexc.to_string exn)))
 
-let type_logical_expression ?is_list env ~functions ~variables ?expected term =
-  Result.map (typed_logical_expression ?is_list env ~functions ~variables ?expected term)
-    ~f:(fun expression -> expression.Typedtree.exp_type)
+let type_logical_expression ?is_list ?type_variables env ~functions ~variables ?expected
+    term =
+  Result.map
+    (typed_logical_expression ?is_list ?type_variables env ~functions ~variables ?expected
+       term) ~f:(fun expression -> expression.Typedtree.exp_type)
 
-let infer_typed_logical_expression ?is_list env ~functions ~variables term =
-  typed_logical_expression ?is_list env ~functions ~variables term
+let infer_typed_logical_expression ?is_list ?type_variables env ~functions ~variables term
+    =
+  typed_logical_expression ?is_list ?type_variables env ~functions ~variables term
 
-let infer_logical_expression ?is_list env ~functions ~variables term :
+let infer_logical_expression ?is_list ?type_variables env ~functions ~variables term :
     (Types.type_expr, Report.error) Result.t =
-  type_logical_expression ?is_list env ~functions ~variables term
+  type_logical_expression ?is_list ?type_variables env ~functions ~variables term
 
-let check_logical_expression ?is_list env ~functions ~variables ~expected term =
-  Result.map (type_logical_expression ?is_list env ~functions ~variables ~expected term)
-    ~f:(fun _ -> ())
+let check_logical_expression ?is_list ?type_variables env ~functions ~variables ~expected
+    term =
+  Result.map
+    (type_logical_expression ?is_list ?type_variables env ~functions ~variables ~expected
+       term) ~f:(fun _ -> ())
+
+(** Infer annotation variables through contract constraints without changing the native
+    function's generalized variables. *)
+let infer_ghost_bindings ?(flexible = []) env ~at ~parameters ~variables ~constraints
+    declarations =
+  let original_parameters = parameters in
+  let original_variables = variables in
+  let replacements =
+    List.map flexible ~f:(fun variable ->
+        let name = match Types.get_desc variable with Tvar name -> name | _ -> None in
+        (variable, Ctype.newvar ?name ()))
+  in
+  let rec project typ =
+    match List.Assoc.find replacements typ ~equal:Types.eq_type with
+    | Some replacement -> replacement
+    | None -> (
+        match Types.get_desc typ with
+        | Tvar _ | Tunivar _ -> typ
+        | desc -> Ctype.newty (Btype.copy_type_desc project desc))
+  in
+  let parameters = List.map parameters ~f:project in
+  let variables = List.map variables ~f:(fun (name, typ) -> (name, project typ)) in
+  let named =
+    List.filter_map parameters ~f:(fun typ ->
+        match Types.get_desc typ with Tvar (Some name) -> Some (name, typ) | _ -> None)
+  in
+  let rec free_variables (seen, found) typ =
+    let id = Types.get_id typ in
+    if Set.mem seen id then (seen, found)
+    else
+      let seen = Set.add seen id in
+      match Types.get_desc typ with
+      | Tvar _ | Tunivar _ -> (seen, typ :: found)
+      | _ -> Btype.fold_type_expr free_variables (seen, found) typ
+  in
+  let variables_of types =
+    List.fold types ~init:(Set.empty (module Int), []) ~f:free_variables |> snd
+  in
+  let split_types count typ =
+    if Int.equal count 1 then Ok [ typ ]
+    else
+      match Types.get_desc typ with
+      | Ttuple fields when Int.equal (List.length fields) count ->
+          Ok (List.map fields ~f:snd)
+      | _ -> Error (Report.error Type at "Expected jointly inferred ghost types")
+  in
+  match declarations with
+  | [] when List.is_empty flexible -> Ok ([], named, [])
+  | _ ->
+      let annotation =
+        match List.map declarations ~f:snd with
+        | [] -> S.PTtyapp (Qid (S.mk_id ~loc:at "unit"), [])
+        | [ annotation ] -> annotation
+        | annotations -> S.PTtuple annotations
+      in
+      let* parsed = ocaml_type ~variables:named ~closed:false env ~at annotation in
+      let* types =
+        if List.is_empty declarations then Ok []
+        else split_types (List.length declarations) parsed
+      in
+      let annotations = List.zip_exn (List.map declarations ~f:fst) types in
+      let aliases =
+        variables_of types
+        |> List.filter_map ~f:(fun typ ->
+            match Types.get_desc typ with
+            | Tvar (Some name) -> Some (name, typ)
+            | _ -> None)
+        |> List.dedup_and_sort ~compare:(fun (left, _) (right, _) ->
+            String.compare left right)
+      in
+      let inferred_variables = variables_of types in
+      if
+        List.is_empty flexible
+        && List.for_all inferred_variables ~f:(fun variable ->
+            List.exists original_parameters ~f:(Types.eq_type variable))
+      then Ok (annotations, aliases, [])
+      else
+        let alias_bindings =
+          List.mapi aliases ~f:(fun i (_, typ) ->
+              ("caravan$ghost_type$" ^ Int.to_string i, typ))
+        in
+        let flexible_bindings =
+          List.mapi replacements ~f:(fun i (_, typ) ->
+              ("caravan$native_type$" ^ Int.to_string i, typ))
+        in
+        let bindings =
+          List.map annotations ~f:(fun (id, typ) -> (id.S.pid_str, typ))
+          @ alias_bindings @ flexible_bindings
+        in
+        let value name = S.mk_term (Tvar (Qid (S.mk_id ~loc:at name))) at in
+        let result =
+          match List.map bindings ~f:(fun (name, _) -> value name) with
+          | [ result ] -> result
+          | results -> S.mk_term (Ttuple results) at
+        in
+        let term =
+          List.fold_right constraints ~init:result ~f:(fun constraint_ result ->
+              S.mk_term
+                (Tlet
+                   ( { S.pat_desc = Pwild; pat_loc = constraint_.S.term_loc },
+                     constraint_,
+                     result ))
+                at)
+        in
+        let* inferred =
+          infer_logical_expression env ~functions:[] ~variables:(bindings @ variables)
+            term
+        in
+        let* inferred = split_types (List.length bindings) inferred in
+        let ghosts, inferred = List.split_n inferred (List.length declarations) in
+        let solved_aliases, solved_flexible =
+          List.split_n inferred (List.length aliases)
+        in
+        let unconstrained =
+          List.zip_exn flexible solved_flexible
+          |> List.filter ~f:(fun (_, typ) ->
+              match Types.get_desc typ with
+              | Tvar _ | Tunivar _ -> Types.get_level typ <> Btype.generic_level
+              | _ -> false)
+        in
+        let rec restore_native typ =
+          match
+            List.find unconstrained ~f:(fun (_, inferred) -> Types.eq_type typ inferred)
+          with
+          | Some (original, _) -> original
+          | None -> (
+              match Types.get_desc typ with
+              | Tvar _ | Tunivar _ -> typ
+              | desc -> Ctype.newty (Btype.copy_type_desc restore_native desc))
+        in
+        let ghosts = List.map ghosts ~f:restore_native in
+        let solved_aliases = List.map solved_aliases ~f:restore_native in
+        let solved_flexible = List.map solved_flexible ~f:restore_native in
+        let allowed =
+          variables_of (original_parameters @ List.map original_variables ~f:snd)
+        in
+        let unresolved =
+          List.find (variables_of ghosts) ~f:(fun variable ->
+              not (List.exists allowed ~f:(Types.eq_type variable)))
+        in
+        let* () =
+          match unresolved with
+          | None -> Ok ()
+          | Some _ ->
+              Error
+                (Report.error Type at
+                   "A ghost annotation's type variable cannot be inferred from the \
+                    runtime parameters and contract")
+        in
+        Ok
+          ( List.zip_exn (List.map declarations ~f:fst) ghosts,
+            List.zip_exn (List.map aliases ~f:fst) solved_aliases,
+            List.zip_exn flexible solved_flexible )
 
 let check_logical_function env ~functions = function
   | S.Proof_function { function_params; function_result; function_body; function_name } ->

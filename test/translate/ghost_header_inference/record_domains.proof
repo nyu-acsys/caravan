@@ -1,0 +1,5 @@
+type 'a snapshot = { items : 'a list; logical_count : integer; native_count : int }
+
+lemma mathematical_witness (items : 'a list)
+  ensures (exists state : 'a snapshot.
+    state.items === items && state.logical_count = max_int + 1 && state.native_count = 0) = ()

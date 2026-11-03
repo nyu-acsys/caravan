@@ -9,7 +9,8 @@ The emitted history proof, including its dynamic initializer, is standalone Rave
   $ raven --shh --typeonly emitted.rav
   Verification successful.
 
-Clients use the interface to initialize and exercise empty, singleton, and longer queues.
+Clients use the polymorphic interface for empty, singleton, longer and mixed integer/boolean
+queues, and a generic round trip.
 
   $ mkdir client
   $ cp michael_scott_queue.mli of_list_client.ml client/
@@ -36,7 +37,7 @@ The builder must return its designated terminal cell.
 
   $ mkdir wrong_terminal
   $ cp michael_scott_queue.mli michael_scott_queue.proof wrong_terminal/
-  $ sed 's/| \[\] -> tail_/| [] -> let _ = tail_ in Atomic.make Nil/' michael_scott_queue.ml > wrong_terminal/michael_scott_queue.ml
+  $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue.ml > wrong_terminal/michael_scott_queue.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue.ml
   [Error] File "wrong_terminal/michael_scott_queue.ml", line 76, columns 13-40:
   76 |     (*@ fold built_chain result tail_ xs *)

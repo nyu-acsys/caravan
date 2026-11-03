@@ -544,7 +544,9 @@ let action_parameter_types env (a : action) =
         let ctor_args =
           match ctor_args with [ { term_desc = Ttuple ts; _ } ] -> ts | _ -> ctor_args
         in
-        match find_constructor env (S.Qid (S.mk_id ~loc:pattern.term_loc c)) with
+        match
+          find_constructor ~occurrence:t env (S.Qid (S.mk_id ~loc:pattern.term_loc c))
+        with
         | Some (_, ctor) when List.length ctor.args = List.length ctor_args ->
             List.concat (List.map2_exn ctor_args ctor.args ~f:typed)
         | _ -> []
@@ -614,6 +616,15 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
     State.all (List.zip_exn st.fields opened.values) ~f:(fun ((f, _, _, t, _), v) ->
         match List.Assoc.find p.performed.update f ~equal:String.equal with
         | Some term ->
+            let* () =
+              State.of_result
+                (Source.check_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   ~is_list:(is_list_term env) env.ctx.given.env
+                   ~functions:(List.map env.funcs ~f:fst)
+                   ~variables:(Logical_context.variables env)
+                   ~expected:t term)
+            in
             let* () =
               State.of_result
                 (Signature_contract.terms ~expected:t ~logical_types:env.data
@@ -1329,12 +1340,20 @@ let step_performings ctx ~at ~op ~field ~location args =
                         | None -> State.return true
                       in
                       let condition =
+                        let contents_type =
+                          Option.bind (term_type env loc_pattern) ~f:(fun typ ->
+                              match Datatypes.desc env.data typ with
+                              | Tconstr (path, [ contents ], _)
+                                when Datatypes.is_atomic path ->
+                                  Some contents
+                              | _ -> None)
+                        in
                         let* location_pattern = atomic_of env loc_pattern in
                         let* equalities =
                           State.all (List.zip_exn patterns args) ~f:(fun (p, actual) ->
                               match p with
                               | Some p ->
-                                  let+ p = formula env p in
+                                  let+ p = expected_formula env contents_type p in
                                   Some (R.Expr.binary ~loc:l Eq p actual)
                               | None -> State.return None)
                         in

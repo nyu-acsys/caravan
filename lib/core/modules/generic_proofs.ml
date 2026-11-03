@@ -239,14 +239,14 @@ let owner plans scope =
           || Option.is_some scope.definition
              && Option.equal Path.same plan.scope.owner scope.parent))
 
-let projection plan =
-  List.fold (runtime_types plan)
-    ~init:
-      (parameter_substitution plan (fun _ parameter ->
-           Path.Pident parameter.instance.parameter))
+let projection ?instance plan =
+  let instance =
+    Option.value instance ~default:plan.group.Generic_modules.representative
+  in
+  List.fold (runtime_types plan) ~init:(private_substitution plan instance)
     ~f:(fun substitution source ->
-      Option.value_map (matching_type source plan.group.representative.declarations)
-        ~default:substitution ~f:(fun target ->
+      Option.value_map (matching_type source instance.declarations) ~default:substitution
+        ~f:(fun target ->
           Subst.add_type source.Typedtree.typ_id (Path.Pident target.Typedtree.typ_id)
             substitution))
 

@@ -27,6 +27,7 @@ let callable_location = function
 let program ?(history = History.default) (source : Source.t) :
     (R.Program.t * origin list, error) Result.t =
   let* scopes = Program_scopes.run source in
+  let* scopes = Program_declarations.specialize_continuations scopes in
   let {
     Program_scopes.annotations;
     linearizations;

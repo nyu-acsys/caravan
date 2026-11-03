@@ -1,10 +1,9 @@
-Combining independent local generalization with captured outer type parameters
-remains explicitly guarded.
+Independent local and captured type parameters cannot be cast to one another.
 
-  $ caravan --shh mixed.ml > mixed.out 2>&1
+  $ caravan --shh mixed_cast.ml > mixed_cast.out 2>&1
   [1]
-  $ grep -q 'Generalized local functions with captured type parameters' mixed.out
-  $ ! grep -q 'Internal Error:' mixed.out
+  $ grep -q 'Type Error:' mixed_cast.out
+  $ ! grep -q 'Internal Error:' mixed_cast.out
 
 Helper annotations cannot specialize an enclosing universally quantified type.
 

@@ -815,6 +815,12 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     in
     let selected_fields =
       List.filter allocated_fields ~f:(fun (_, (field, _)) ->
+          let generic_template =
+            List.exists decls.generic_predicate_workers ~f:(fun worker ->
+                String.is_prefix field ~prefix:(worker.Generic_parameters.name ^ "."))
+          in
+          (not generic_template)
+          &&
           match field_group field with
           | None -> true
           | Some owner -> Option.exists group ~f:(phys_equal owner))
@@ -850,25 +856,30 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     let context = proof_context scope preds spec_funcs proof_support in
     let owner = body_module_context f in
     let predicates, _, support =
-      module_context owner ~projection:owner.projection context
+      module_context owner
+        ~projection:(Program_declarations.source_function_projection ~generics owner f)
+        context
     in
     let selected_shared = if symbolic then body_shared f else shared in
-    let predicates =
+    let project_backend backend =
       match (symbolic, body_owner f) with
       | false, Some (group, _) ->
           let _, application, _ =
             Option.value_exn (Generic_modules.member generics f.id)
           in
           let target = (canonical_application group application).name in
-          List.map predicates ~f:(fun (key, (backend, types)) ->
-              let backend =
-                Option.value_map
-                  (String.chop_prefix backend ~prefix:(group.name ^ "."))
-                  ~default:backend
-                  ~f:(fun suffix -> target ^ "." ^ suffix)
-              in
-              (key, (backend, types)))
-      | _ -> predicates
+          Option.value_map
+            (String.chop_prefix backend ~prefix:(group.name ^ "."))
+            ~default:backend
+            ~f:(fun suffix -> target ^ "." ^ suffix)
+      | _ -> backend
+    in
+    let predicate_target key backend =
+      (match generic key with
+        | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
+        | None -> backend)
+      |> project_backend
+      |> canonical_member selected_shared
     in
     let structures = selected_shared.structures in
     let references =
@@ -885,10 +896,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
           in
           Option.map key ~f:(fun key ->
               Option.value_map (List.Assoc.find predicates key ~equal:String.equal)
-                ~default:key ~f:(fun (backend, _) ->
-                  match generic key with
-                  | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
-                  | None -> canonical_member selected_shared backend)))
+                ~default:key ~f:(fun (backend, _) -> predicate_target key backend)))
     in
     let selected =
       List.filter structures ~f:(fun st ->
@@ -898,9 +906,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                 (Option.value_map
                    (List.Assoc.find predicates p.S.pred_name.pid_str ~equal:String.equal)
                    ~default:p.pred_name.pid_str ~f:(fun (backend, _) ->
-                     match generic p.pred_name.pid_str with
-                     | Some worker -> worker.name ^ "." ^ Generic_parameters.member worker
-                     | None -> canonical_member selected_shared backend))
+                     predicate_target p.pred_name.pid_str backend))
                 ~equal:String.equal))
     in
     if not (List.is_empty selected) then selected
@@ -971,13 +977,29 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
               let context = proof_context scope preds spec_funcs proof_support in
               let owner = body_module_context f in
               let preds, spec_funcs, proof_support =
-                module_context owner ~projection:owner.projection context
+                module_context owner
+                  ~projection:
+                    (Program_declarations.source_function_projection ~generics owner f)
+                  context
+              in
+              let* scheme =
+                Polymorphic_functions.discover
+                  ~additional:(Program_declarations.parameter_types f)
+                  ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+              in
+              (* Application contracts are checked even when their body is shared. *)
+              let contract_types =
+                List.mapi scheme.variables ~f:(fun index variable ->
+                    Datatypes.variable_type ~variable
+                      ~owner:(String.split (proc_name f) ~on:'.')
+                      ~parameter:("A" ^ Int.to_string index)
+                      ~at:f.loc)
+                @ types
               in
               let ctx =
-                Proof_declarations.spec_context
-                  (Program_declarations.function_types decls.polymorphic_functions f types)
-                  ~shared:(body_shared f) ~ocaml_env:f.environment ~preds ~spec_funcs
-                  ~proof_support ~generic_predicates:decls.generic_predicates ()
+                Proof_declarations.spec_context contract_types ~shared:(body_shared f)
+                  ~ocaml_env:f.environment ~preds ~spec_funcs ~proof_support
+                  ~generic_predicates:decls.generic_predicates ()
               in
               let computation =
                 let open State.Syntax in
@@ -1047,11 +1069,12 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
     entries
     @ List.filter_map funcs ~f:(fun f ->
         match body_owner f with
-        | Some (_, true) ->
+        | (Some (_, true) | None) when not (String.equal (proc_name f) (body_proc_name f))
+          ->
             Option.map
               (List.Assoc.find entries (proc_name f) ~equal:String.equal)
               ~f:(fun value -> (body_proc_name f, project f value))
-        | _ -> None)
+        | Some _ | None -> None)
   in
   let pasts =
     with_body_pasts pasts (fun f clauses ->

@@ -1,7 +1,7 @@
 (** Michael-Scott queue with an explicit segment proof. *)
-type node = Nil | Next of int * node Atomic.t
+type 'a node = Nil | Next of 'a * 'a node Atomic.t
 
-type t = { head : node Atomic.t Atomic.t; tail : node Atomic.t Atomic.t }
+type 'a t = { head : 'a node Atomic.t Atomic.t; tail : 'a node Atomic.t Atomic.t }
 
 let create () =
   let next = Atomic.make Nil in

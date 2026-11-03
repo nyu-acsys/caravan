@@ -14,3 +14,12 @@ Capture-free generalized helpers reuse the ordinary generic worker mechanism.
   $ caravan --shh --emit-rav generalized.ml > generalized.rav
   $ raven --shh generalized.rav
   Verification successful.
+
+Generalized helpers retain independent argument dictionaries and captured lexical
+dictionaries, including captures absent from the helper's native arrow type.
+
+  $ caravan --shh mixed.ml
+  Verification successful.
+  $ caravan --shh --emit-rav mixed.ml > mixed.rav
+  $ raven --shh mixed.rav
+  Verification successful.

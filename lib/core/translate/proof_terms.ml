@@ -197,19 +197,35 @@ let record_existential env (t : S.term) =
 (** A fold's witness [value] for the existential [id], one per field of a record. *)
 let expand_witness env (t : S.term) ((id : S.id), (value : S.term)) =
   match existential_record env t id with
-  | None -> Ok [ (id, value) ]
+  | None ->
+      let expected =
+        match record_existential env t with
+        | Some (record, (_, (_, _, fields))) ->
+            List.find_map fields ~f:(fun (label, typ) ->
+                Option.some_if
+                  (String.equal id.pid_str (existential_field record.pid_str label))
+                  typ)
+        | None ->
+            begin match unfold_result_types env t [ id ] with
+            | Ok (Some [ typ ]) -> typ
+            | Ok _ | Error _ -> None
+            end
+      in
+      Ok [ (id, value, expected) ]
   | Some (ty, (_, _, fields)) ->
       let* () =
-        Source.check_logical_expression env.ctx.given.env
-          ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected:ty
-          value
+        Source.check_logical_expression
+          ~type_variables:(source_type_variables env.ctx.given)
+          env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+          ~variables:env.var_types ~expected:ty value
       in
       Ok
-        (List.map fields ~f:(fun (label, _) ->
+        (List.map fields ~f:(fun (label, typ) ->
              ( S.mk_id ~loc:id.pid_loc (existential_field id.pid_str label),
                S.mk_term
                  (Tfield (value, Qid (S.mk_id ~loc:value.term_loc label)))
-                 value.term_loc )))
+                 value.term_loc,
+               Some typ )))
 
 (** The witnesses that a fold's last argument [t] gives, if it is a witness record [w] or
     one updated, [{ w with f = e }]: its fields, as [w.f], or their updates. *)
@@ -334,13 +350,14 @@ and predicate_application env ~unfold t witnesses make =
         predicate_arguments env ~at:t.term_loc ~display:(qualid_key q) key types args
       in
       let* witnesses =
-        if unfold then State.return witnesses
+        if unfold then
+          State.return (List.map witnesses ~f:(fun (id, value) -> (id, value, None)))
         else
           State.of_result
             (Result.map ~f:List.concat (all witnesses ~f:(expand_witness env t)))
       in
       let+ witnesses =
-        State.all witnesses ~f:(fun (id, t) ->
+        State.all witnesses ~f:(fun (id, t, expected) ->
             if unfold then
               State.of_result
                 begin match
@@ -365,7 +382,7 @@ and predicate_application env ~unfold t witnesses make =
                 | _ -> error t.term_loc "An unfold binding names an existential variable"
                 end
             else
-              let+ value = formula env t in
+              let+ value = expected_formula env expected t in
               (ident ~loc:(loc id.pid_loc) id.pid_str, value))
       in
       let l = loc t.S.term_loc in
@@ -497,14 +514,12 @@ let ghost_fpu env t =
           let* location = location_of ~expected:field.field_value env location in
           let value t =
             let* () =
-              match term_type env t with
-              | Some actual
-                when not
-                       (Ctype.is_equal env.ctx.given.env false [ field.field_value ]
-                          [ actual ]) ->
-                  State.of_result
-                    (error t.S.term_loc "This update uses a different resource type")
-              | _ -> State.return ()
+              State.of_result
+                (Source.check_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                   ~variables:(Logical_context.variables env)
+                   ~expected:field.field_value t)
             in
             expected_formula env (Some field.field_value) t
           in
@@ -539,9 +554,14 @@ let ghost_initializers env ~owner t =
             | Some field ->
                 let* instance, field =
                   State.of_result
-                    (Generic_fields.specialize ~types:env.data
-                       ~environment:env.ctx.given.env ~at ~owner:(Some owner)
-                       ~value:(term_type env value) field)
+                    (let specialize value =
+                       Generic_fields.specialize ~types:env.data
+                         ~environment:env.ctx.given.env ~at ~owner:(Some owner) ~value
+                         field
+                     in
+                     match specialize None with
+                     | Ok _ as field -> field
+                     | Error _ -> specialize (term_type env value))
                 in
                 let* field =
                   match instance with
@@ -569,9 +589,10 @@ let ghost_initializers env ~owner t =
                 in
                 let* () =
                   State.of_result
-                    (Source.check_logical_expression env.ctx.given.env
-                       ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
-                       ~expected:field.field_value value)
+                    (Source.check_logical_expression
+                       ~type_variables:(source_type_variables env.ctx.given)
+                       env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                       ~variables:env.var_types ~expected:field.field_value value)
                 in
                 let+ value = expected_formula env (Some field.field_value) value in
                 ( ghost_field_name field,
@@ -647,8 +668,10 @@ and proof_value_type ?expected env (t : S.term) =
           | None ->
               State.of_result
                 (Result.map
-                   (Source.infer_logical_expression env.ctx.given.env
-                      ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types t)
+                   (Source.infer_logical_expression
+                      ~type_variables:(source_type_variables env.ctx.given)
+                      env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                      ~variables:env.var_types t)
                    ~f:Option.some)))
 
 let proof_pattern_parts (p : S.pat) = match p.pat_desc with Ptuple ps -> ps | _ -> [ p ]
@@ -887,6 +910,76 @@ let witness_binding :
   in
   (declarations @ unfold @ rest, value)
 
+let join_proof_result_types ?expected env ~at branches =
+  let open State.Syntax in
+  let fallback = List.find_map branches ~f:Fn.id in
+  let candidates =
+    List.filter_map branches ~f:(fun branch ->
+        Option.bind branch ~f:(fun types ->
+            Option.map (Option.all types) ~f:(fun values ->
+                let typ =
+                  match values with
+                  | [] -> Predef.type_unit
+                  | [ typ ] -> typ
+                  | types ->
+                      Btype.newgenty (Ttuple (List.map types ~f:(fun typ -> (None, typ))))
+                in
+                (List.length values, typ))))
+  in
+  match candidates with
+  | [] -> State.return fallback
+  | (arity, _) :: _ ->
+      let types = List.map candidates ~f:snd @ Option.to_list expected in
+      let bound =
+        List.concat_map
+          (List.map env.var_types ~f:snd @ Option.to_list expected
+          @ List.filter_map env.data ~f:(fun data -> data.Datatypes.variable))
+          ~f:Polymorphic_functions.all_variables
+      in
+      let flexible =
+        List.concat_map types ~f:Polymorphic_functions.all_variables
+        |> List.filter ~f:(fun variable ->
+            not (List.exists bound ~f:(Types.eq_type variable)))
+        |> List.dedup_and_sort ~compare:(fun left right ->
+            Int.compare (Types.get_id left) (Types.get_id right))
+        |> List.map ~f:(fun variable -> (variable, Ctype.newvar ()))
+      in
+      let rec instantiate typ =
+        match List.Assoc.find flexible typ ~equal:Types.eq_type with
+        | Some variable -> variable
+        | None -> (
+            match Types.get_desc typ with
+            | Tvar _ | Tunivar _ -> typ
+            | desc -> Ctype.newty (Btype.copy_type_desc instantiate desc))
+      in
+      let types = List.map types ~f:instantiate in
+      let variables =
+        List.mapi types ~f:(fun i typ -> ("caravan$proof_branch$" ^ Int.to_string i, typ))
+      in
+      let values =
+        List.map variables ~f:(fun (name, _) ->
+            S.mk_term (Tvar (Qid (S.mk_id ~loc:at name))) at)
+      in
+      let expression =
+        List.reduce_exn values ~f:(fun left right ->
+            S.mk_term (Tif (S.mk_term Ttrue at, left, right)) at)
+      in
+      let* inferred =
+        State.of_result
+          (Source.infer_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             env.ctx.given.env ~functions:[] ~variables:(variables @ env.var_types)
+             expression)
+      in
+      if Int.equal arity 0 then State.return (Some [])
+      else if Int.equal arity 1 then State.return (Some [ Some inferred ])
+      else
+        begin match Datatypes.desc env.data inferred with
+        | Ttuple fields when Int.equal (List.length fields) arity ->
+            State.return (Some (List.map fields ~f:(fun (_, typ) -> Some typ)))
+        | _ -> State.of_result (error at "Proof branches return incompatible values")
+        end
+
 let rec proof_result_types ?expected env (body : S.proof_expr) =
   let open State.Syntax in
   match body.proof_desc with
@@ -903,18 +996,15 @@ let rec proof_result_types ?expected env (body : S.proof_expr) =
       State.of_result (unfold_result_types env predicate witnesses)
   | Proof_seq (_, body) -> proof_result_types ?expected env body
   | Proof_if (_, yes, no) ->
-      let* types = proof_result_types ?expected env yes in
-      begin match types with
-      | Some _ -> State.return types
-      | None -> proof_result_types ?expected env no
-      end
+      let* yes = proof_result_types ?expected env yes in
+      let* no = proof_result_types ?expected env no in
+      join_proof_result_types ?expected env ~at:body.proof_loc [ yes; no ]
   | Proof_match (_, []) ->
       State.of_result (error body.proof_loc "A match needs at least one case")
   | Proof_match (scrutinee, cases) ->
       let* scrutinee_type = proof_value_type env scrutinee in
-      let rec infer = function
-        | [] -> State.return None
-        | (p, body) :: rest ->
+      let* branches =
+        State.all cases ~f:(fun (p, body) ->
             let types =
               Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p)
             in
@@ -923,11 +1013,9 @@ let rec proof_result_types ?expected env (body : S.proof_expr) =
                 ~init:{ env with var_types = types @ env.var_types }
                 ~f:(fun env (x, _) -> bind env x (Raven x))
             in
-            let* types = proof_result_types ?expected branch_env body in
-            begin match types with Some _ -> State.return types | None -> infer rest
-            end
+            proof_result_types ?expected branch_env body)
       in
-      infer cases
+      join_proof_result_types ?expected env ~at:body.proof_loc branches
   | Proof_let (pattern, rhs, body) ->
       let* binding_expected = State.of_result (proof_binding_expected_type env pattern) in
       let* inferred = proof_result_types ?expected:binding_expected env rhs in
@@ -954,8 +1042,10 @@ let rec proof_expression env targets (body : S.proof_expr) =
   in
   let check_logical ~expected value =
     State.of_result
-      (Source.check_logical_expression env.ctx.given.env
-         ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types ~expected value)
+      (Source.check_logical_expression
+         ~type_variables:(source_type_variables env.ctx.given)
+         env.ctx.given.env ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
+         ~expected value)
   in
   match body.proof_desc with
   | Proof_value t when is_ghost_fpu t ->
@@ -1383,9 +1473,10 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
     | Some ty ->
         let* () =
           State.of_result
-            (Source.check_logical_expression env.ctx.given.env
-               ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
-               ~expected:ty state)
+            (Source.check_logical_expression
+               ~type_variables:(source_type_variables env.ctx.given)
+               env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+               ~variables:env.var_types ~expected:ty state)
         in
         let* value = expected_formula env (Some ty) state in
         let* raven = State.fresh "proof_state" in
@@ -1477,9 +1568,10 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
         let argument = Option.value_exn (operation_argument visible rhs) in
         let* () =
           State.of_result
-            (Source.check_logical_expression env.ctx.given.env
-               ~functions:(List.map env.funcs ~f:fst) ~variables:env.var_types
-               ~expected:(packed_type input_types) argument)
+            (Source.check_logical_expression
+               ~type_variables:(source_type_variables env.ctx.given)
+               env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+               ~variables:env.var_types ~expected:(packed_type input_types) argument)
         in
         let* argument = expected_formula env (Some (packed_type input_types)) argument in
         let arguments = unpacked_value ~loc:(loc rhs.proof_loc) input_types argument in

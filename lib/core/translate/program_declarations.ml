@@ -144,6 +144,70 @@ let function_worker polymorphic_functions (f : func) =
   List.find polymorphic_functions ~f:(fun worker ->
       Ident.same worker.Polymorphic_functions.id f.id)
 
+let parameter_types (f : func) =
+  List.filter_map f.params ~f:(fun parameter ->
+      match parameter.Typedtree.fp_kind with
+      | Tparam_pat pattern | Tparam_optional_default (pattern, _) -> Some pattern.pat_type)
+
+let specialize_continuations (scopes : Program_scopes.t) =
+  let* funcs =
+    all scopes.funcs ~f:(fun f ->
+        match (f.role, f.lexical_owner) with
+        | Some _, Some owner ->
+            let outer =
+              List.find_exn scopes.funcs ~f:(fun outer -> Ident.same outer.id owner)
+            in
+            let* local =
+              Polymorphic_functions.discover ~excluded:[ outer.scheme_type ]
+                ~expand:(Datatypes.expand scopes.types)
+                ~at:f.loc f.scheme_type
+            in
+            if List.is_empty local.variables then Ok f
+            else
+              let* source_scheme =
+                Polymorphic_functions.discover ~additional:(parameter_types f)
+                  ~expand:(Datatypes.expand scopes.types)
+                  ~at:f.loc f.scheme_type
+              in
+              let* _, _, _, specialization =
+                Procedures.ghost_signature ~flexible:local.variables
+                  ~parameters:source_scheme.variables f
+              in
+              let specialization =
+                List.filter specialization ~f:(fun (left, right) ->
+                    not (Types.eq_type left right))
+              in
+              if List.is_empty specialization then Ok f
+              else
+                let parameters, arguments = List.unzip specialization in
+                let project typ =
+                  Option.value_exn (Datatypes.instantiate_alias parameters arguments typ)
+                in
+                let mapper = Source_type_map.typed_mapper ~f:project in
+                let params =
+                  List.map f.params ~f:(fun parameter ->
+                      let fp_kind =
+                        match parameter.Typedtree.fp_kind with
+                        | Tparam_pat pattern ->
+                            Typedtree.Tparam_pat (mapper.pat mapper pattern)
+                        | Tparam_optional_default (pattern, default) ->
+                            Tparam_optional_default
+                              (mapper.pat mapper pattern, mapper.expr mapper default)
+                      in
+                      { parameter with fp_kind })
+                in
+                Ok
+                  {
+                    f with
+                    params;
+                    body = mapper.expr mapper f.body;
+                    scheme_type = project f.scheme_type;
+                    source_scheme = Some source_scheme;
+                  }
+        | None, _ | Some _, None -> Ok f)
+  in
+  Ok { scopes with funcs }
+
 let applied_function_worker ~generics ~polymorphic_functions ~groups ~canonical (f : func)
     =
   match Generic_modules.member generics f.id with
@@ -249,6 +313,19 @@ let body_module_context ~(module_contexts : Module_context.registry)
   match body_owner f with
   | Some (group, _) -> context_for_group group
   | None -> Module_context.for_location module_contexts f.loc
+
+(** Source-only contract analyses use the native type identities of this application. *)
+let source_function_projection ~generics (context : Module_context.t) f =
+  match context.worker with
+  | None -> context.projection
+  | Some plan ->
+      begin match
+        Generic_modules.member generics (Option.value f.lexical_owner ~default:f.id)
+      with
+      | Some (group, application, _) when phys_equal group plan.group ->
+          Generic_proofs.projection ~instance:application.source plan
+      | Some _ | None -> context.projection
+      end
 
 let body_destination ?(polymorphic_functions = []) ~(generics : Generic_modules.t list)
     ~(module_contexts : Module_context.registry)
@@ -723,71 +800,95 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   in
   let proc_name = proc_name ~procedures in
   let* polymorphic_functions =
-    all funcs ~f:(fun f ->
-        let representative =
-          match body_owner ~generics f with
-          | Some (_, false) -> false
-          | Some (_, true) | None -> true
-        in
-        let excluded =
-          Option.to_list
-            (Option.bind f.lexical_owner ~f:(fun id ->
-                 Option.map
-                   (List.find funcs ~f:(fun outer -> Ident.same outer.id id))
-                   ~f:(fun outer -> outer.scheme_type)))
-        in
-        let* scheme =
-          Polymorphic_functions.discover ~excluded ~expand:(Datatypes.expand types)
-            ~at:f.loc f.scheme_type
-        in
-        let inherited = List.concat_map excluded ~f:Polymorphic_functions.all_variables in
-        let captured_types =
-          f.scheme_type
-          :: List.filter_map f.params ~f:(fun parameter ->
-              match parameter.Typedtree.fp_kind with
-              | Tparam_pat pattern | Tparam_optional_default (pattern, _) ->
-                  Some pattern.pat_type)
-        in
-        let captures_type =
-          List.exists captured_types ~f:(fun typ ->
-              List.exists (Polymorphic_functions.all_variables typ) ~f:(fun variable ->
-                  List.mem inherited variable ~equal:Polymorphic_functions.same_variable))
-        in
-        if (not representative) || List.is_empty scheme.variables then Ok None
-        else if Option.is_some f.lexical_owner && captures_type then
-          unsupported f.loc "Generalized local functions with captured type parameters"
-        else
-          let source_binding =
-            Option.is_some f.lexical_owner
-            || List.exists inventory.values ~f:(fun entry ->
-                match entry.Module_inventory.binding.vb_pat.pat_desc with
-                | Tpat_var (id, _, _) -> Ident.same id f.id
-                | _ -> false)
+    List.fold_result funcs ~init:[] ~f:(fun discovered f ->
+        let* worker =
+          let representative =
+            match body_owner ~generics f with
+            | Some (_, false) -> false
+            | Some (_, true) | None -> true
           in
-          let* () =
-            if source_binding then Ok ()
-            else unsupported f.loc "Generalized local functions"
+          let excluded =
+            Option.to_list
+              (Option.bind f.lexical_owner ~f:(fun id ->
+                   Option.map
+                     (List.find funcs ~f:(fun outer -> Ident.same outer.id id))
+                     ~f:(fun outer -> outer.scheme_type)))
           in
-          let context =
-            body_module_context ~module_contexts
-              ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
-              ~generics f
+          let* scheme =
+            Polymorphic_functions.discover ~excluded ~expand:(Datatypes.expand types)
+              ~at:f.loc f.scheme_type
           in
-          let name =
-            String.concat ~sep:"."
-              (context.namespace @ [ Fresh_names.fresh ("Poly$" ^ f.raven_name) ])
+          let share_parent =
+            List.is_empty scheme.variables && Option.is_some f.source_scheme
           in
-          Ok
-            (Some
-               Polymorphic_functions.
-                 {
-                   id = f.id;
-                   paths = f.paths;
-                   scheme;
-                   name = Generic_family_plan.runtime family_plan f.id name;
-                   loc = f.loc;
-                 }))
-    |> Result.map ~f:List.filter_opt
+          if (not representative) || (List.is_empty scheme.variables && not share_parent)
+          then Ok None
+          else
+            let* scheme =
+              Polymorphic_functions.discover ~additional:(parameter_types f)
+                ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+            in
+            let parent =
+              Option.bind f.lexical_owner ~f:(fun owner ->
+                  List.find discovered ~f:(fun worker ->
+                      Ident.same worker.Polymorphic_functions.id owner))
+            in
+            let scheme =
+              match (share_parent, parent) with
+              | true, Some parent -> { scheme with variables = parent.scheme.variables }
+              | _ -> scheme
+            in
+            let* restriction =
+              match f.source_scheme with
+              | None -> Ok None
+              | Some source ->
+                  let* arguments =
+                    Polymorphic_functions.instantiate ~expand:(Datatypes.expand types)
+                      ~at:f.loc source ~declaration:source.typ ~occurrence:f.scheme_type
+                  in
+                  Ok (Some Polymorphic_functions.{ source; arguments })
+            in
+            let source_binding =
+              Option.is_some f.lexical_owner
+              || List.exists inventory.values ~f:(fun entry ->
+                  match entry.Module_inventory.binding.vb_pat.pat_desc with
+                  | Tpat_var (id, _, _) -> Ident.same id f.id
+                  | _ -> false)
+            in
+            let* () =
+              if source_binding then Ok ()
+              else unsupported f.loc "Generalized local functions"
+            in
+            let context =
+              body_module_context ~module_contexts
+                ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
+                ~generics f
+            in
+            let proposed =
+              String.concat ~sep:"."
+                (context.namespace @ [ Fresh_names.fresh ("Poly$" ^ f.raven_name) ])
+            in
+            let name =
+              match (share_parent, parent) with
+              | true, Some parent -> parent.Polymorphic_functions.name
+              | _ -> proposed
+            in
+            Ok
+              (Some
+                 Polymorphic_functions.
+                   {
+                     id = f.id;
+                     paths = f.paths;
+                     scheme;
+                     restriction;
+                     name = Generic_family_plan.runtime family_plan f.id name;
+                     loc = f.loc;
+                   })
+        in
+        Ok
+          (Option.value_map worker ~default:discovered ~f:(fun worker ->
+               worker :: discovered)))
+    |> Result.map ~f:List.rev
   in
   let* () =
     List.fold_result funcs ~init:() ~f:(fun () f ->
@@ -808,13 +909,19 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             else Ok ())
   in
   let runtime_destinations =
-    Module_context.Flat
-    :: List.map generics ~f:(fun group -> Module_context.Worker group)
-    @ List.filter_map funcs ~f:(fun f ->
-        Option.map (function_worker polymorphic_functions f) ~f:(fun _ ->
-            body_destination ~polymorphic_functions ~generics ~module_contexts
-              ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
-              f))
+    let destinations =
+      Module_context.Flat
+      :: List.map generics ~f:(fun group -> Module_context.Worker group)
+      @ List.filter_map funcs ~f:(fun f ->
+          Option.map (function_worker polymorphic_functions f) ~f:(fun _ ->
+              body_destination ~polymorphic_functions ~generics ~module_contexts
+                ~context_for_group:(Program_scopes.context_for_group ~module_contexts)
+                f))
+    in
+    List.fold destinations ~init:[] ~f:(fun unique destination ->
+        if List.exists unique ~f:(Module_context.same_destination destination) then unique
+        else destination :: unique)
+    |> List.rev
   in
   let with_body_names lifted_argument =
     with_body_names ~polymorphic_functions ~funcs ~procedures ~generics
@@ -832,27 +939,22 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           | _ -> Ok ()
         in
         let* scheme =
-          Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
-            f.scheme_type
+          Polymorphic_functions.discover ~additional:(parameter_types f)
+            ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
         in
-        let procedure_parameters = scheme.variables in
-        let variables =
-          List.filter_map procedure_parameters ~f:(fun typ ->
-              match Types.get_desc typ with
-              | Tvar (Some name) -> Some (name, typ)
-              | _ -> None)
+        let procedure_parameters =
+          Option.value_map (function_worker polymorphic_functions f)
+            ~default:scheme.variables ~f:(fun worker ->
+              worker.Polymorphic_functions.scheme.variables)
         in
-        let declared xs =
-          all xs ~f:(fun (id, pty) ->
-              let* t = Source.ocaml_type ~variables f.environment ~at:id.S.pid_loc pty in
-              Ok (id.pid_str, t))
+        let* procedure_inputs, procedure_outputs, procedure_variables, _ =
+          Procedures.ghost_signature ~parameters:procedure_parameters f
         in
-        let* procedure_inputs = declared (ghost_params f) in
-        let* procedure_outputs = declared outputs in
         Ok
           ( proc_name f,
             {
               procedure_parameters;
+              procedure_variables;
               procedure_inputs;
               procedure_outputs;
               procedure_result = f.body.exp_type;
@@ -1401,10 +1503,6 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             parameters
         in
         if List.is_empty worker.variables then Ok None
-        else if
-          Option.is_some context.identity
-          && match definition with Body _ -> true | _ -> false
-        then unsupported at "Polymorphic predicates in source modules"
         else
           match definition with
           | Body body ->
@@ -1421,7 +1519,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               in
               let name =
                 String.concat ~sep:"."
-                  (context.namespace @ [ Fresh_names.fresh ("PolyPredicate$" ^ key) ])
+                  (context.namespace
+                  @ [
+                      Fresh_names.fresh
+                        ("PolyPredicate$" ^ (Qualified_name.of_string key).name);
+                    ])
               in
               Ok
                 (Some
@@ -1610,6 +1712,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                                id = value.val_id;
                                paths = [ path ];
                                scheme;
+                               restriction = None;
                                name =
                                  lib.library_name ^ "."
                                  ^ Fresh_names.fresh ("Poly$" ^ value.val_name.txt);

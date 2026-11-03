@@ -15,6 +15,7 @@ type func = {
   environment : Env.t;
   signature_sites : Module_inventory.signature_value list;
   scheme_type : Types.type_expr;
+  source_scheme : Polymorphic_functions.scheme option;
   lexical_owner : Ident.t option;
   raven_name : string;
   params : Typedtree.function_param list;
@@ -138,6 +139,108 @@ let contract_names (f : func) (header : S.header option) n =
         let* args = all h.hd_args ~f:arg in
         Ok (result, args)
 
+(** Ghost header variables are inferred from the native signature and checked contract
+    expressions, independently of the compiler's choice of variable names. *)
+let ghost_signature ?(flexible = []) ~parameters (f : func) =
+  let inputs = ghost_params f in
+  let outputs = ghost_results f in
+  let declarations = inputs @ outputs in
+  let header = Option.bind f.contract ~f:(fun contract -> contract.S.header) in
+  let* result_name, argument_names = contract_names f header (List.length f.params) in
+  let parameters_named =
+    List.concat_map (List.zip_exn argument_names f.params) ~f:(fun (name, parameter) ->
+        match parameter.Typedtree.fp_kind with
+        | Tparam_pat pattern | Tparam_optional_default (pattern, _) ->
+            Option.to_list (Option.map name ~f:(fun name -> (name, pattern.pat_type)))
+            @ List.map (Typedtree.pat_bound_idents_full pattern)
+                ~f:(fun (_, name, typ, _) -> (name.txt, typ)))
+  in
+  let variables = (result_name, f.body.exp_type) :: parameters_named in
+  let known_names = List.map declarations ~f:(fun (id, _) -> id.S.pid_str) in
+  let known q =
+    match q with
+    | S.Qid id
+      when List.Assoc.mem variables id.pid_str ~equal:String.equal
+           || List.mem known_names id.pid_str ~equal:String.equal ->
+        true
+    | _ ->
+        Option.is_some (Source.value_path f.environment q)
+        || Option.is_some (Source.constructor f.environment q)
+        || Option.is_some (Source.logical_builtin_path ~functions:[] q)
+  in
+  let witness = function
+    | S.Qid id when not (String.is_empty id.pid_str) ->
+        Char.is_lowercase id.pid_str.[0] || Char.equal id.pid_str.[0] '_'
+    | _ -> false
+  in
+  let rec functions_known bound (term : S.term) =
+    let check = functions_known bound in
+    let rec callable (callee : S.term) =
+      match callee.term_desc with
+      | Tvar (Qid id) when List.mem bound id.pid_str ~equal:String.equal -> true
+      | Tvar q -> known q
+      | Tapply (callee, argument) -> callable callee && check argument
+      | _ -> check callee
+    in
+    match term.term_desc with
+    | Tapply (callee, argument) -> callable callee && check argument
+    | Tinfix (left, _, right) -> check left && check right
+    | Tif (condition, yes, no) -> check condition && check yes && check no
+    | Tquant (_, binders, body) ->
+        functions_known (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+    | Tcomprehension ((id, _), body) -> functions_known (id.pid_str :: bound) body
+    | Tlet (pattern, rhs, body) ->
+        check rhs && functions_known (pat_names pattern @ bound) body
+    | Tmatch (value, cases) ->
+        check value
+        && List.for_all cases ~f:(fun (pattern, body) ->
+            functions_known (pat_names pattern @ bound) body)
+    | Ttuple values -> List.for_all values ~f:check
+    | Trecord (base, fields) -> List.for_all (S.record_terms base fields) ~f:check
+    | Tattr (_, value) | Tcast (value, _) | Told value | Tfield (value, _) -> check value
+    | Ttrue | Tfalse | Tconst _ | Tvar _ -> true
+  in
+  let rec constraints (term : S.term) =
+    if
+      functions_known [] term
+      && List.for_all (term_references [] term) ~f:(fun q -> known q || witness q)
+    then [ term ]
+    else
+      match term.term_desc with
+      | Tinfix (left, { pid_str = "&&"; _ }, right)
+      | Tapply
+          ( {
+              term_desc =
+                Tapply ({ term_desc = Tvar (Qid { pid_str = "&&"; _ }); _ }, left);
+              _;
+            },
+            right ) ->
+          constraints left @ constraints right
+      | Tattr (_, term) -> constraints term
+      | _ -> []
+  in
+  let terms =
+    Option.value_map f.contract ~default:[] ~f:(fun contract ->
+        contract.requires @ contract.atomic_requires @ contract.ensures
+        @ contract.atomic_ensures)
+  in
+  let constraints = List.concat_map terms ~f:constraints in
+  let witnesses =
+    List.concat_map constraints ~f:(term_references [])
+    |> List.filter_map ~f:(function
+      | S.Qid id as q when not (known q) -> Some id.pid_str
+      | _ -> None)
+    |> List.dedup_and_sort ~compare:String.compare
+    |> List.map ~f:(fun name -> (name, Ctype.newvar ()))
+  in
+  let* declarations, variables, specialization =
+    Source.infer_ghost_bindings ~flexible f.environment ~at:f.loc ~parameters
+      ~variables:(variables @ witnesses) ~constraints declarations
+  in
+  let inputs, outputs = List.split_n declarations (List.length inputs) in
+  let named = List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ)) in
+  Ok (named inputs, named outputs, variables, specialization)
+
 (** The parameters of [f]: their OCaml and Raven names, unless unit, their range, and
     their declarations. A parameter that is a pattern, as [{ tail; _ }], is named as
     [names], those of the contract, name it, and binds its variables at the start of the
@@ -232,6 +335,18 @@ let pattern_params ctx (f : func) formals =
     names of the result, [result], and of the parameters, [formals]. *)
 let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
   let open State.Syntax in
+  let signature =
+    Option.bind ctx.given.current_procedure ~f:(fun procedure ->
+        List.Assoc.find ctx.given.procedure_signatures procedure ~equal:String.equal)
+  in
+  let declared_type select id annotation =
+    match
+      Option.bind signature ~f:(fun signature ->
+          List.Assoc.find (select signature) id.S.pid_str ~equal:String.equal)
+    with
+    | Some typ -> Ok typ
+    | None -> source_type ctx.given ~at:id.pid_loc annotation
+  in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
   let* result_name, arg_names =
     State.of_result (contract_names f header (List.length formals))
@@ -283,7 +398,10 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                     id.pid_str))
           else State.return ()
         in
-        let* t = State.of_result (source_type ctx.given ~at:id.pid_loc pty) in
+        let* t =
+          State.of_result
+            (declared_type (fun signature -> signature.procedure_inputs) id pty)
+        in
         let+ raven = State.fresh id.pid_str in
         (id.pid_str, raven, t))
   in
@@ -308,7 +426,10 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                     id.pid_str))
           else State.return ()
         in
-        let* t = State.of_result (source_type ctx.given ~at:id.pid_loc pty) in
+        let* t =
+          State.of_result
+            (declared_type (fun signature -> signature.procedure_outputs) id pty)
+        in
         let+ raven = State.fresh id.pid_str in
         (id.pid_str, raven, t))
   in

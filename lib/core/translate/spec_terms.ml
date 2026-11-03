@@ -103,7 +103,9 @@ let rec term_type env (t : S.term) =
       | None -> List.hd signature.lemma_outputs
       | Some _ ->
           Result.ok
-            (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+            (Source.infer_logical_expression
+               ~type_variables:(source_type_variables env.ctx.given)
+               ~is_list:(is_list_term env) env.ctx.given.env
                ~functions:(List.map env.funcs ~f:fst)
                ~variables:(Logical_context.variables env)
                t)
@@ -111,19 +113,24 @@ let rec term_type env (t : S.term) =
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (collection_builtin env q)
     ->
       Result.ok
-        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+        (Source.infer_logical_expression
+           ~type_variables:(source_type_variables env.ctx.given)
+           ~is_list:(is_list_term env) env.ctx.given.env
            ~functions:(List.map env.funcs ~f:fst)
            ~variables:(Logical_context.variables env)
            t)
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
       Result.ok
-        (Source.infer_logical_expression env.ctx.given.env
-           ~functions:(List.map env.funcs ~f:fst)
+        (Source.infer_logical_expression
+           ~type_variables:(source_type_variables env.ctx.given)
+           env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
            ~variables:(Logical_context.variables env)
            t)
   | _, ({ term_desc = Tvar (Qid { pid_str = "to_sequence"; _ }); _ }, [ _ ]) ->
       Result.ok
-        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+        (Source.infer_logical_expression
+           ~type_variables:(source_type_variables env.ctx.given)
+           ~is_list:(is_list_term env) env.ctx.given.env
            ~functions:(List.map env.funcs ~f:fst)
            ~variables:(Logical_context.variables env)
            t)
@@ -145,8 +152,9 @@ let rec term_type env (t : S.term) =
   | Trecord (Some base, _), _ -> term_type env base
   | Trecord (None, _), _ ->
       Result.ok
-        (Source.infer_logical_expression env.ctx.given.env
-           ~functions:(List.map env.funcs ~f:fst)
+        (Source.infer_logical_expression
+           ~type_variables:(source_type_variables env.ctx.given)
+           env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
            ~variables:(Logical_context.variables env)
            t)
   | Tfield (base, Qid { pid_str = f; _ }), _ ->
@@ -215,8 +223,9 @@ and equality_term_type env (t : S.term) =
   match term_type env t with
   | Some ty -> Ok ty
   | None ->
-      Source.infer_logical_expression env.ctx.given.env
-        ~functions:(List.map env.funcs ~f:fst)
+      Source.infer_logical_expression
+        ~type_variables:(source_type_variables env.ctx.given)
+        env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
         ~variables:(Logical_context.variables env)
         t
 
@@ -354,7 +363,9 @@ let equality_check env (id : S.id) operator a b =
           let application = S.mk_term (Tapply (operator, a)) a.term_loc in
           let comparison = S.mk_term (Tapply (application, b)) id.pid_loc in
           begin match
-            Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+            Source.check_logical_expression
+              ~type_variables:(source_type_variables env.ctx.given)
+              ~is_list:(is_list_term env) env.ctx.given.env
               ~functions:(List.map env.funcs ~f:fst)
               ~variables:(Logical_context.variables env)
               ~expected:Predef.type_bool comparison
@@ -429,6 +440,12 @@ let instantiate_atomic_signature env ~at ?expected signature method_ args =
 
 let instantiate_proof_signature env ~at ?expected ?term signature args =
   let open State.Syntax in
+  let signature =
+    {
+      signature with
+      lemma_raven = canonical_member env.ctx.given.shared signature.lemma_raven;
+    }
+  in
   match signature.lemma_generic with
   | None ->
       let+ () = State.note_call env.ctx.given signature.lemma_raven in
@@ -454,6 +471,9 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
                 (target.path @ [ (Qualified_name.of_string worker.name).name ]);
           }
       in
+      let worker =
+        { worker with name = canonical_member env.ctx.given.shared worker.name }
+      in
       let supplied = List.map args ~f:(term_type env) in
       let omitted =
         List.init
@@ -461,9 +481,19 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
           ~f:(fun _ -> None)
       in
       let infer result =
-        Generic_parameters.instantiate ~environment:env.ctx.given.env
-          ~expand:(Datatypes.expand env.data) ~at worker
-          (supplied @ omitted @ expected_outputs env signature.lemma_outputs result)
+        let outputs = expected_outputs env signature.lemma_outputs result in
+        let instantiate supplied =
+          Generic_parameters.instantiate ~environment:env.ctx.given.env
+            ~expand:(Datatypes.expand env.data) ~at worker (supplied @ outputs)
+        in
+        let supplied = supplied @ omitted in
+        match result with
+        | Some _ ->
+            begin match instantiate (List.map supplied ~f:(fun _ -> None)) with
+            | Ok _ as inferred -> inferred
+            | Error _ -> instantiate supplied
+            end
+        | None -> instantiate supplied
       in
       let* arguments =
         State.of_result
@@ -471,8 +501,10 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
           | Ok arguments, _, _ -> Ok arguments
           | Error _, None, Some term ->
               begin match
-                Source.infer_logical_expression ~is_list:(is_list_term env)
-                  env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                Source.infer_logical_expression
+                  ~type_variables:(source_type_variables env.ctx.given)
+                  ~is_list:(is_list_term env) env.ctx.given.env
+                  ~functions:(List.map env.funcs ~f:fst)
                   ~variables:(Logical_context.variables env)
                   term
               with
@@ -562,8 +594,13 @@ open State.Syntax
 
 (** A generalized field is selected by its owner and stored value together. *)
 let specialize_ghost_field env ~at ?expected field owner =
-  Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env ~at
-    ~owner:(term_type env owner) ~value:expected field
+  let specialize value =
+    Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env ~at
+      ~owner:(term_type env owner) ~value field
+  in
+  match specialize None with
+  | Ok _ as specialized -> specialized
+  | Error _ -> specialize expected
 
 let instantiate_ghost_field env ~at ?expected field owner =
   let open State.Syntax in
@@ -705,7 +742,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       in
       let rec mathematical_record typ =
         match Types.get_desc typ with
-        | Tconstr (path, [], _) ->
+        | Tconstr (path, _, _) ->
             begin match Datatypes.find env.data path with
             | Some data when data.mathematical -> true
             | Some { alias = Some typ; _ } -> mathematical_record typ
@@ -857,9 +894,48 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
 
 (** The formula [t], a sequence if it is a list literal and [expected] is a sequence type,
     as [[]] in [queue q []]. *)
-and collection_application env ~at (module_name, function_name) args =
+and collection_application ?expected env ~at (module_name, function_name) args =
   let l = loc at in
-  let* args = State.all args ~f:(fun t -> formula env t) in
+  let* args =
+    match expected with
+    | None -> State.all args ~f:(fun t -> formula env t)
+    | Some expected ->
+        let callee =
+          S.mk_term
+            (Tvar
+               (Qdot (Qid (S.mk_id ~loc:at module_name), S.mk_id ~loc:at function_name)))
+            at
+        in
+        let term =
+          List.fold args ~init:callee ~f:(fun callee argument ->
+              S.mk_term (Tapply (callee, argument)) at)
+        in
+        let* typed =
+          State.of_result
+            (Source.typed_logical_expression ~expected
+               ~type_variables:(source_type_variables env.ctx.given)
+               ~is_list:(is_list_term env) env.ctx.given.env
+               ~functions:(List.map env.funcs ~f:fst)
+               ~variables:(Logical_context.variables env)
+               term)
+        in
+        let rec arguments (expression : Typedtree.expression) =
+          match expression.exp_desc with
+          | Texp_apply (callee, actuals) ->
+              arguments callee
+              @ List.filter_map actuals ~f:(function
+                | _, Arg expression -> Some expression.exp_type
+                | _, Omitted _ -> None)
+          | _ -> []
+        in
+        let types = arguments typed in
+        if List.length types <> List.length args then
+          State.of_result
+            (error at "This logical collection application has unexpected arguments")
+        else
+          State.all (List.zip_exn types args) ~f:(fun (typ, argument) ->
+              expected_formula env (Some typ) argument)
+  in
   match (module_name, function_name, args) with
   | ("Finset" | "Set"), "empty", [] -> State.return (R.Expr.set ~loc:l [])
   | ("Finset" | "Set"), "singleton", [ x ] -> State.return (R.Expr.set ~loc:l [ x ])
@@ -886,6 +962,8 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
     | Some expected when opaque_module_types env ->
         State.of_result
           (Signature_contract.terms ~expected ~logical_types:env.data
+             ~annotation:(fun ~at ~expected typ ->
+               source_type ?expected env.ctx.given ~at typ)
              ~predicates:(fun q ->
                Option.map
                  (List.Assoc.find env.ctx.given.preds (logical_key env q)
@@ -904,9 +982,55 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
     | _ -> false
   in
   match (expected, literal t) with
+  | Some _, _
+    when match t.term_desc with
+         | Tfield ({ term_desc = Trecord _; _ }, Qid _) -> true
+         | _ -> false ->
+      begin match t.term_desc with
+      | Tfield ({ term_desc = Trecord (base, updates); _ }, Qid field) ->
+          begin match
+            List.find updates ~f:(fun ((id : S.id), _) ->
+                String.equal id.pid_str field.pid_str)
+          with
+          | Some (_, value) -> expected_formula env expected value
+          | None ->
+              begin match base with
+              | Some base ->
+                  expected_formula env expected
+                    (S.mk_term (Tfield (base, Qid field)) t.term_loc)
+              | None -> formula env t
+              end
+          end
+      | _ -> formula env t
+      end
+  | Some expected, _ when match t.term_desc with Tcast _ -> true | _ -> false ->
+      begin match t.term_desc with
+      | Tcast (value, annotation) ->
+          let* typ =
+            State.of_result
+              (source_type ~expected env.ctx.given ~at:t.term_loc annotation)
+          in
+          let* raven_type = State.typ env.ctx ~at:t.term_loc typ in
+          let+ value = expected_formula env (Some typ) value in
+          R.Expr.annotated value raven_type
+      | _ -> formula env t
+      end
   | Some ty, Some elements when is_sequence ty ->
       let+ elements = State.all elements ~f:(formula env) in
       R.Expr.seq ~loc:(loc t.term_loc) elements
+  | Some expected, _
+    when begin match fst (spine t []) with
+         | { term_desc = Tvar q; _ } -> Option.is_some (collection_builtin env q)
+         | _ -> false
+         end ->
+      let head, args = spine t [] in
+      begin match head.term_desc with
+      | Tvar q ->
+          collection_application ~expected env ~at:t.term_loc
+            (Option.value_exn (collection_builtin env q))
+            args
+      | _ -> formula env t
+      end
   | Some expected, _
     when begin match fst (spine t []) with
          | { term_desc = Tvar q; _ } ->
@@ -945,7 +1069,9 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
          | _ -> false ->
       let* () =
         State.of_result
-          (Source.check_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+          (Source.check_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             ~is_list:(is_list_term env) env.ctx.given.env
              ~functions:(List.map env.funcs ~f:fst)
              ~variables:(Logical_context.variables env)
              ~expected t)
@@ -1003,8 +1129,10 @@ and application env (t : S.term) =
         | Some path when Path_bindings.mem registry path ->
             let* expression =
               State.of_result
-                (Source.infer_typed_logical_expression ~is_list:(is_list_term env)
-                   env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                (Source.infer_typed_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   ~is_list:(is_list_term env) env.ctx.given.env
+                   ~functions:(List.map env.funcs ~f:fst)
                    ~variables:(Logical_context.variables env)
                    t)
             in
@@ -1049,8 +1177,9 @@ and application env (t : S.term) =
         match (ghost_projection env location, expected) with
         | Some _, Some expected ->
             State.of_result
-              (Source.check_logical_expression env.ctx.given.env
-                 ~functions:(List.map env.funcs ~f:fst)
+              (Source.check_logical_expression
+                 ~type_variables:(source_type_variables env.ctx.given)
+                 env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                  ~variables:(Logical_context.variables env)
                  ~expected v)
         | _ -> State.return ()
@@ -1075,8 +1204,9 @@ and application env (t : S.term) =
             in
             let* () =
               State.of_result
-                (Source.check_logical_expression env.ctx.given.env
-                   ~functions:(List.map env.funcs ~f:fst)
+                (Source.check_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                    ~variables:(Logical_context.variables env)
                    ~expected:permission_type fraction)
             in
@@ -1127,8 +1257,10 @@ and application env (t : S.term) =
               | "=" | "<>" | "==" | "!=" | "===" | "=/=" | "&&" | "||" | "/\\" | "\\/"
               | "->" | "<->"
                 when generic_operands env [ a; b ] ->
-                  Source.check_logical_expression ~is_list:(is_list_term env)
-                    env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                  Source.check_logical_expression
+                    ~type_variables:(source_type_variables env.ctx.given)
+                    ~is_list:(is_list_term env) env.ctx.given.env
+                    ~functions:(List.map env.funcs ~f:fst)
                     ~variables:(Logical_context.variables env)
                     ~expected:Predef.type_bool t
               | _ -> Ok ())
@@ -1174,7 +1306,9 @@ and application env (t : S.term) =
       else
         let* _ =
           State.of_result
-            (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+            (Source.infer_logical_expression
+               ~type_variables:(source_type_variables env.ctx.given)
+               ~is_list:(is_list_term env) env.ctx.given.env
                ~functions:(List.map env.funcs ~f:fst)
                ~variables:(Logical_context.variables env)
                t)
@@ -1234,21 +1368,11 @@ and typed_arguments env ~at inputs args =
                  ~variables:(Logical_context.variables env)
                  [ value ]
              else
-               Source.check_logical_expression ~is_list env.ctx.given.env
-                 ~functions:(List.map env.funcs ~f:fst)
+               Source.check_logical_expression
+                 ~type_variables:(source_type_variables env.ctx.given)
+                 ~is_list env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                  ~variables:(Logical_context.variables env)
                  ~expected:ty value)
-        in
-        let* () =
-          match term_type env value with
-          | Some actual
-            when (not sequence)
-                 && not (Ctype.is_equal env.ctx.given.env false [ ty ] [ actual ]) ->
-              State.of_result
-                (error value.term_loc
-                   (Stdlib.Format.asprintf "Expected logical type %a but found %a"
-                      Printtyp.type_expr ty Printtyp.type_expr actual))
-          | _ -> State.return ()
         in
         let* value = expected_formula env (Some ty) value in
         let+ raven_type = State.typ env.ctx ~at ty in
@@ -1349,8 +1473,9 @@ and location_of ?expected env (t : S.term) =
       in
       let* () =
         State.of_result
-          (Source.check_logical_expression env.ctx.given.env
-             ~functions:(List.map env.funcs ~f:fst)
+          (Source.check_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
              ~variables:(Logical_context.variables env)
              ~expected:field.field_owner owner)
       in
@@ -1454,8 +1579,9 @@ and constructor ?expected env (t : S.term) args =
         | None ->
             State.map ~f:Option.some
               (State.of_result
-                 (Source.infer_logical_expression env.ctx.given.env
-                    ~functions:(List.map env.funcs ~f:fst)
+                 (Source.infer_logical_expression
+                    ~type_variables:(source_type_variables env.ctx.given)
+                    env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                     ~variables:(Logical_context.variables env)
                     t))
       in
@@ -1489,8 +1615,9 @@ and record ?expected env (t : S.term) base updates =
     | None, None ->
         State.map ~f:Option.some
           (State.of_result
-             (Source.infer_logical_expression env.ctx.given.env
-                ~functions:(List.map env.funcs ~f:fst)
+             (Source.infer_logical_expression
+                ~type_variables:(source_type_variables env.ctx.given)
+                env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
                 ~variables:(Logical_context.variables env)
                 t))
   in

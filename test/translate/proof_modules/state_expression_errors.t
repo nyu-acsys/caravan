@@ -6,7 +6,8 @@ Invalid action updates report their source error instead of keeping the old stat
   $ caravan --shh wrong_type/ra_view.ml > wrong_type/error 2>&1
   [1]
   $ grep 'Type Error:' wrong_type/error
-  Type Error: This specification has type bool, but int is required.
+  Type Error: This expression should not be a boolean literal, the expected type is
+  $ grep -q 'int' wrong_type/error
 
   $ mkdir unknown_value
   $ cp ra_view.ml ra_view.mli unknown_value/
@@ -14,7 +15,7 @@ Invalid action updates report their source error instead of keeping the old stat
   $ caravan --shh unknown_value/ra_view.ml > unknown_value/error 2>&1
   [1]
   $ grep 'Type Error:' unknown_value/error
-  Type Error: Unbound name missing.
+  Type Error: Unbound value missing.
 
 A lexical binding cannot reuse a projection of the shadowed state.
 

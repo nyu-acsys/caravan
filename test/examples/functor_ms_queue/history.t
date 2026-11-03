@@ -29,7 +29,7 @@ The result signature hides implementation helpers.
 A queue from one fresh application cannot be passed to the other.
 
   $ cat history_queue.ml > crossed.ml
-  $ echo 'let crossed (q : First.t) = Second.pop_opt q' >> crossed.ml
+  $ echo "let crossed (q : 'a First.t) = Second.pop_opt q" >> crossed.ml
   $ ! caravan --shh -I ../../saturn/backoff crossed.ml > crossed.out 2>&1
   $ grep -q 'Type Error:' crossed.out
   $ ! grep -q 'Internal Error:' crossed.out

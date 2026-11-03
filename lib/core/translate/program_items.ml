@@ -159,6 +159,7 @@ let items source (inventory : Module_inventory.t) =
                    Source.annotation_env source ~at:site.item_loc site.environment;
                  signature_sites = entry.signatures;
                  scheme_type = vb.vb_pat.pat_type;
+                 source_scheme = None;
                  lexical_owner = None;
                  raven_name = Fresh_names.fresh base;
                  params;
@@ -423,6 +424,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           environment = Source.annotation_env source ~at:rest.exp_loc rest.exp_env;
           signature_sites = [];
           scheme_type = vb.vb_pat.pat_type;
+          source_scheme = None;
           lexical_owner = Some outer.id;
           raven_name =
             (if List.is_empty outer.namespace then Ident.name id
@@ -966,7 +968,8 @@ let rec without_predicates env (t : S.term) : S.term =
     [helped_proc], wait: the ghost fields of a registration, the predicate holding its
     call's update until the call retires, committed with the result once helped, and the
     lemma helping the registrations waiting on a key. *)
-let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_proc =
+let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_proc
+    ~helped_declaration =
   let at = st.at in
   let l = loc at in
   let n x = R.Name.make ~loc:l x in
@@ -977,7 +980,6 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let decl ?(ghost = false) x t = R.Var.make ~loc:l ~ghost (ident ~loc:l x) t in
   let open State.Syntax in
   let* key_typ = State.typ ctx ~at p.key_type in
-  let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
   let bool_typ = R.Type.bool ~loc:l and ref_typ = R.Type.ref ~loc:l in
   let* params =
     State.all st.params ~f:(fun (x, t) ->
@@ -1009,8 +1011,23 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       vars = List.map params ~f:(fun (x, _, _) -> (x, Raven x));
     }
   in
-  let _, _, result = p.helping in
-  let* result = formula env result in
+  let _, _, result_term = p.helping in
+  let* result_type =
+    match term_type env result_term with
+    | Some typ -> State.return typ
+    | None -> State.of_result (error at "Cannot infer the helped result's type")
+  in
+  let occurrence =
+    List.fold_right st.params ~init:result_type ~f:(fun (_, argument) result ->
+        Btype.newgenty
+          (Tarrow (Nolabel, Btype.newgenty (Tpoly (argument, [])), result, Types.commu_ok)))
+  in
+  let* helped_proc =
+    State.polymorphic_call ctx ~at ~path:(List.hd_exn helped.paths)
+      ~declaration:helped_declaration ~occurrence ~target:helped_proc
+  in
+  let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
+  let* result = formula env result_term in
   let registration = pending_name st p "registration" in
   let registered hc =
     R.Expr.call ~loc:l (qualified_name ~loc:l registration) (hc :: args)
@@ -1105,7 +1122,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let post_env =
     {
       (bind post_env result_name (Value result)) with
-      var_types = (result_name, helped.body.exp_type) :: post_env.var_types;
+      var_types = (result_name, result_type) :: post_env.var_types;
     }
   in
   let+ posts =

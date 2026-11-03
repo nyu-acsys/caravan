@@ -5,11 +5,13 @@ open Base
 let ( let* ) result f = Result.bind result ~f
 
 type scheme = { typ : Types.type_expr; variables : Types.type_expr list }
+type restriction = { source : scheme; arguments : Types.type_expr list }
 
 type t = {
   id : Ident.t;
   paths : Path.t list;
   scheme : scheme;
+  restriction : restriction option;
   name : string;
   loc : Location.t;
 }
@@ -55,7 +57,7 @@ let all_variables typ =
   let _, variables = visit (Set.empty (module Int), []) typ in
   List.rev variables
 
-let discover ?(excluded = []) ?(expand = Fn.id) ~at typ =
+let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
   let excluded = List.concat_map excluded ~f:all_variables in
   let unsupported () =
     Report.unsupported at "Higher-order or explicitly polymorphic function types"
@@ -92,7 +94,8 @@ let discover ?(excluded = []) ?(expand = Fn.id) ~at typ =
     | Tpoly (body, []) -> function_type state body
     | _ -> value state typ
   in
-  let* _, variables = function_type (Set.empty (module Int), []) typ in
+  let* state = function_type (Set.empty (module Int), []) typ in
+  let* _, variables = List.fold_result additional ~init:state ~f:value in
   Ok { typ; variables = List.rev variables }
 
 let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
@@ -121,7 +124,12 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
   and equal_list seen xs ys = List.equal (equal seen) xs ys in
   let* declared = discover ~expand ~at declaration in
   let* _ = discover ~expand ~at occurrence in
-  if List.length declared.variables <> List.length scheme.variables then mismatch ()
+  let* native = discover ~expand ~at scheme.typ in
+  let inferred =
+    List.filter native.variables ~f:(fun variable ->
+        List.mem scheme.variables variable ~equal:same_variable)
+  in
+  if List.length declared.variables <> List.length inferred then mismatch ()
   else
     let slot variables typ =
       List.findi variables ~f:(fun _ variable -> same_variable typ variable)
@@ -130,13 +138,13 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
     let rec aligned seen original declaration =
       let original = mono original and declaration = mono declaration in
       let pair = (Types.get_id original, Types.get_id declaration) in
-      match slot scheme.variables original with
+      match slot inferred original with
       | Some index ->
           Option.equal Int.equal (Some index) (slot declared.variables declaration)
       | None -> (
           let contains_slot =
             List.exists (all_variables original) ~f:(fun variable ->
-                Option.is_some (slot scheme.variables variable))
+                Option.is_some (slot inferred variable))
           in
           if (not contains_slot) || List.mem seen pair ~equal:Poly.equal then true
           else
@@ -193,8 +201,49 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
         | [], _ :: _ | _ :: _, [] -> mismatch ()
       in
       let* bindings = match_type [] [] declaration occurrence in
-      List.mapi scheme.variables ~f:(fun slot _ ->
-          match List.Assoc.find bindings slot ~equal:Int.equal with
-          | Some typ -> Ok typ
-          | None -> mismatch ())
+      List.map scheme.variables ~f:(fun variable ->
+          match slot inferred variable with
+          | Some slot ->
+              begin match List.Assoc.find bindings slot ~equal:Int.equal with
+              | Some typ -> Ok typ
+              | None -> mismatch ()
+              end
+          (* Lifted captures retain the lexical caller's dictionary. Their variables
+             do not occur in the native arrow type matched above. *)
+          | None -> Ok variable)
       |> Result.all
+
+(** Continuation contracts may select an instance of an OCaml-generalized helper. Every
+    occurrence must satisfy that instance before selecting its worker. *)
+let instantiate_worker ?(expand = Fn.id) ~at worker ~declaration ~occurrence =
+  match worker.restriction with
+  | None -> instantiate ~expand ~at worker.scheme ~declaration ~occurrence
+  | Some restriction ->
+      let* arguments =
+        instantiate ~expand ~at restriction.source ~declaration ~occurrence
+      in
+      let substitute typ =
+        Option.value_exn
+          (Datatypes.instantiate_alias restriction.source.variables arguments typ)
+      in
+      let restricted = List.map restriction.arguments ~f:substitute in
+      let rec equal seen left right =
+        let left = expand left and right = expand right in
+        let pair = (Types.get_id left, Types.get_id right) in
+        if Types.eq_type left right || List.mem seen pair ~equal:Poly.equal then true
+        else
+          let seen = pair :: seen in
+          match (Types.get_desc left, Types.get_desc right) with
+          | Tconstr (left, xs, _), Tconstr (right, ys, _) ->
+              Path.same left right && List.equal (equal seen) xs ys
+          | Ttuple xs, Ttuple ys ->
+              List.equal (Option.equal String.equal) (List.map xs ~f:fst)
+                (List.map ys ~f:fst)
+              && List.equal (equal seen) (List.map xs ~f:snd) (List.map ys ~f:snd)
+          | _ -> false
+      in
+      if not (List.equal (equal []) arguments restricted) then
+        Error
+          (Report.error Report.Type at
+             "This call does not satisfy the helper's continuation type instance")
+      else Ok (List.map worker.scheme.variables ~f:substitute)
