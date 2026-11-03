@@ -1122,11 +1122,11 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                       (ident ~loc:l index, R.Expr.var ~loc:l (name ~loc:l target)) ))
           in
           let index_statements, indices = List.unzip indexed in
-          (* The keys of no registrations. *)
-          let ons =
-            List.map st.pendings ~f:(fun p ->
-                ( ident ~loc:l p.pending_on,
-                  R.Expr.map_literal ~loc:l [] (R.Expr.null ~loc:l) ))
+          (* The keys of no registrations: an arbitrary key of the declared type. *)
+          let* ons =
+            State.all st.pendings ~f:(fun p ->
+                let+ key = raw_default ctx ~at p.key_type in
+                (ident ~loc:l p.pending_on, R.Expr.map_literal ~loc:l [] key))
           in
           let history =
             if has_history st then
