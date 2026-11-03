@@ -177,7 +177,7 @@ type return_adapter = {
 }
 
 type proof_module_argument =
-  | Proof_type_argument of pty
+  | Proof_type_argument of { type_params : id list; type_body : pty }
   | Proof_module_argument of qualid
 
 type proof_module_parameter =

@@ -304,7 +304,69 @@ module State_monad = struct
 
   open Syntax
 
+  let note_families types requested =
+    let instances = Datatypes.family_dependencies types requested in
+    let* () =
+      match
+        List.find instances ~f:(fun instance ->
+            List.is_prefix instance.Datatypes.family_namespace
+              ~prefix:(String.split instance.family_worker ~on:'.')
+              ~equal:String.equal
+            && not (String.equal instance.family_name instance.family_worker))
+      with
+      | None -> return ()
+      | Some instance ->
+          let at =
+            Option.value_map
+              (List.find types ~f:(fun data ->
+                   Option.exists data.Datatypes.family ~f:(fun family ->
+                       String.equal family.worker instance.family_worker)))
+              ~default:Location.none
+              ~f:(fun data -> data.Datatypes.at)
+          in
+          of_result (unsupported at "A nonregular cyclic generic family")
+    in
+    modify (fun state ->
+        let function_instances =
+          List.fold instances ~init:state.tables.function_instances
+            ~f:(fun previous instance ->
+              if
+                String.equal instance.Datatypes.family_name instance.family_worker
+                || List.exists previous ~f:(fun previous ->
+                    String.equal
+                      (String.concat ~sep:"."
+                         (previous.instance_namespace @ [ previous.instance_name ]))
+                      instance.family_name)
+              then previous
+              else
+                previous
+                @ [
+                    {
+                      instance_namespace = instance.family_namespace;
+                      instance_name = (Qualified_name.of_string instance.family_name).name;
+                      instance_worker = instance.family_worker;
+                      instance_arguments = instance.family_arguments;
+                    };
+                  ])
+        in
+        let dictionaries =
+          List.fold
+            (requested @ Datatypes.family_argument_types types requested)
+            ~init:state.tables.dictionaries
+            ~f:(fun previous typ ->
+              if List.is_empty instances then previous
+              else if
+                List.exists previous ~f:(fun request ->
+                    Option.equal String.equal
+                      (Datatypes.dictionary_name request.domain_types request.domain_type)
+                      (Datatypes.dictionary_name types typ))
+              then previous
+              else previous @ [ { domain_types = types; domain_type = typ } ])
+        in
+        { state with tables = { state.tables with function_instances; dictionaries } })
+
   let note_domain types typ =
+    let* () = note_families types [ typ ] in
     match Datatypes.constraint_name types typ with
     | None -> return ()
     | Some name when String.equal name Prelude.in_range -> return ()
@@ -502,10 +564,33 @@ type lemma_signature = {
 }
 
 type procedure_signature = {
+  procedure_parameters : Types.type_expr list;
   procedure_inputs : (string * Types.type_expr) list;
   procedure_outputs : (string * Types.type_expr) list;
   procedure_result : Types.type_expr;
+  procedure_returns_value : bool;
 }
+
+let map_procedure_types signature ~f =
+  let open Source_type_map.Group in
+  let named (name, value) =
+    let+ value = typ value in
+    (name, value)
+  in
+  let schema =
+    let+ procedure_parameters = list signature.procedure_parameters ~f:typ
+    and+ procedure_inputs = list signature.procedure_inputs ~f:named
+    and+ procedure_outputs = list signature.procedure_outputs ~f:named
+    and+ procedure_result = typ signature.procedure_result in
+    {
+      signature with
+      procedure_parameters;
+      procedure_inputs;
+      procedure_outputs;
+      procedure_result;
+    }
+  in
+  run schema ~f
 
 type atomic_shape = {
   inputs : Types.type_expr list;
@@ -516,6 +601,7 @@ type atomic_shape = {
 
 type atomic_signature = {
   au_key : string;
+  au_generic : Generic_parameters.t option;
   au_owner : Path.t option;
   au_private : atomic_shape;
   au_token : Types.type_expr;
@@ -523,9 +609,55 @@ type atomic_signature = {
   au_procedure : string;
   au_inputs : Types.type_expr list;
   au_result : Types.type_expr;
+  au_returns_value : bool;
   au_ghost_outputs : Types.type_expr list;
   au_implicit : Types.type_expr list;
 }
+
+let atomic_source_types (au : Source.proof_au) =
+  let open Source_type_map.Group in
+  let+ au_parameters = list au.au_parameters ~f:typ
+  and+ au_operation_type = typ au.au_operation_type
+  and+ au_token = typ au.au_token in
+  { au with au_parameters; au_operation_type; au_token }
+
+let map_atomic_source_types au ~f = Source_type_map.Group.run (atomic_source_types au) ~f
+
+let map_atomic_types signature ~f =
+  let open Source_type_map.Group in
+  let shape (shape : atomic_shape) =
+    let+ inputs = list shape.inputs ~f:typ
+    and+ result = typ shape.result
+    and+ ghost_outputs = list shape.ghost_outputs ~f:typ
+    and+ implicit = list shape.implicit ~f:typ in
+    { inputs; result; ghost_outputs; implicit }
+  in
+  let schema =
+    let+ au_generic =
+      option signature.au_generic ~f:(fun generic ->
+          let+ parameters = list generic.Generic_parameters.parameters ~f:typ
+          and+ variables = list generic.variables ~f:typ in
+          { generic with parameters; variables })
+    and+ au_source = atomic_source_types signature.au_source
+    and+ au_private = shape signature.au_private
+    and+ au_token = typ signature.au_token
+    and+ au_inputs = list signature.au_inputs ~f:typ
+    and+ au_result = typ signature.au_result
+    and+ au_ghost_outputs = list signature.au_ghost_outputs ~f:typ
+    and+ au_implicit = list signature.au_implicit ~f:typ in
+    {
+      signature with
+      au_generic;
+      au_source;
+      au_private;
+      au_token;
+      au_inputs;
+      au_result;
+      au_ghost_outputs;
+      au_implicit;
+    }
+  in
+  run schema ~f
 
 type proof_support = {
   runtime_functions : Qualified_name.t Path_bindings.t;
@@ -864,6 +996,7 @@ type context = {
 let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     ?(primitive_namespace = []) ?(polymorphic_functions = Path_bindings.empty)
     ?(generic_predicates = []) ?current_polymorphic () =
+  let types = Generic_assets.types proof_support.resources types in
   {
     types;
     primitive_namespace;
@@ -918,6 +1051,11 @@ let source_type (given : inputs) ~at annotation =
 module State = struct
   include State_monad
 
+  let typ ctx ~at source =
+    let open Syntax in
+    let* () = note_families ctx.given.types [ source ] in
+    of_result (typ ctx ~at source)
+
   (** Records a check the translation generates. *)
   let record_origin origin = modify (fun s -> { s with origins = origin :: s.origins })
 
@@ -935,6 +1073,7 @@ module State = struct
           })
 
   let value_instance_given (given : inputs) ~at ~target ~arguments =
+    let* () = note_families given.types arguments in
     let* dictionaries =
       all arguments ~f:(fun argument ->
           match Datatypes.dictionary_name given.types argument with
@@ -964,47 +1103,56 @@ module State = struct
               return dictionary)
     in
     let namespace = given.primitive_namespace in
-    let* instances = gets (fun state -> state.tables.function_instances) in
-    let* instance =
-      match
-        List.find instances ~f:(fun instance ->
-            List.equal String.equal namespace instance.instance_namespace
-            && String.equal target instance.instance_worker
-            && List.equal String.equal dictionaries instance.instance_arguments)
-      with
-      | Some instance -> return instance.instance_name
-      | None ->
-          let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
-          let* instance_name = fresh base in
-          let instance =
-            {
-              instance_namespace = namespace;
-              instance_name;
-              instance_worker = target;
-              instance_arguments = dictionaries;
-            }
-          in
-          let* () =
-            modify (fun state ->
-                {
-                  state with
-                  tables =
-                    {
-                      state.tables with
-                      function_instances = state.tables.function_instances @ [ instance ];
-                    };
-                })
-          in
-          return instance_name
+    let self = String.concat ~sep:"." namespace in
+    let self_arguments =
+      List.mapi arguments ~f:(fun index _ -> self ^ ".A" ^ Int.to_string index)
     in
-    return (String.concat ~sep:"." (namespace @ [ instance ]))
+    if String.equal target self then
+      if List.equal String.equal dictionaries self_arguments then return self
+      else of_result (unsupported at "A nonregular cyclic generic family")
+    else
+      let* instances = gets (fun state -> state.tables.function_instances) in
+      let* instance =
+        match
+          List.find instances ~f:(fun instance ->
+              List.equal String.equal namespace instance.instance_namespace
+              && String.equal target instance.instance_worker
+              && List.equal String.equal dictionaries instance.instance_arguments)
+        with
+        | Some instance -> return instance.instance_name
+        | None ->
+            let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
+            let* instance_name = fresh base in
+            let instance =
+              {
+                instance_namespace = namespace;
+                instance_name;
+                instance_worker = target;
+                instance_arguments = dictionaries;
+              }
+            in
+            let* () =
+              modify (fun state ->
+                  {
+                    state with
+                    tables =
+                      {
+                        state.tables with
+                        function_instances =
+                          state.tables.function_instances @ [ instance ];
+                      };
+                  })
+            in
+            return instance_name
+      in
+      return (String.concat ~sep:"." (namespace @ [ instance ]))
 
   let value_instance ctx ~at ~target ~arguments =
     value_instance_given ctx.given ~at ~target ~arguments
 
-  let polymorphic_call ctx ~at ~path ~declaration ~occurrence ~target =
+  let polymorphic_application ctx ~at ~path ~declaration ~occurrence ~target =
     match Path_bindings.find ctx.given.polymorphic_functions path with
-    | None -> return target
+    | None -> return (target, None)
     | Some worker ->
         let* arguments =
           of_result
@@ -1021,11 +1169,17 @@ module State = struct
           if
             List.equal Polymorphic_functions.same_variable worker.scheme.variables
               (List.map arguments ~f:(Datatypes.expand ctx.given.types))
-          then return (worker.name ^ "." ^ stem)
+          then return (worker.name ^ "." ^ stem, Some (worker, arguments))
           else of_result (unsupported at "Polymorphic recursion")
         else
           let+ instance = value_instance ctx ~at ~target:worker.name ~arguments in
-          instance ^ "." ^ stem
+          (instance ^ "." ^ stem, Some (worker, arguments))
+
+  let polymorphic_call ctx ~at ~path ~declaration ~occurrence ~target =
+    let+ target, _ =
+      polymorphic_application ctx ~at ~path ~declaration ~occurrence ~target
+    in
+    target
 
   let cell_field (given : inputs) ~at elt field =
     let+ instance =
@@ -1484,6 +1638,7 @@ let logical_key env q =
 let occurrence_constructor types occurrence
     (description : Data_types.constructor_description) =
   Option.bind (Datatypes.find_cstr types description) ~f:(fun (data, constructor) ->
+      let data = Option.value (Datatypes.instantiated types occurrence) ~default:data in
       match (Types.get_desc description.cstr_res, Datatypes.desc types occurrence) with
       | Tconstr (_, parameters, _), Tconstr (_, arguments, _) ->
           Option.map
@@ -1543,7 +1698,7 @@ let atomic_arguments ~loc:l signature method_ values =
       let inputs = R.Expr.tuple ~loc:l inputs in
       if List.mem [ "commit"; "committed" ] method_ ~equal:String.equal then
         let outputs =
-          if is_unit signature.au_result then List.drop outputs 1 else outputs
+          if signature.au_returns_value then outputs else List.drop outputs 1
         in
         [ token; inputs; R.Expr.tuple ~loc:l outputs ]
       else [ token; inputs ]
@@ -1558,13 +1713,23 @@ let resource_operation env = function
   | S.Qdot (parent, operation) ->
       Option.bind (resource_module env parent) ~f:(fun resource ->
           List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
+              let generic =
+                Generic_assets.operation_worker resource ~name ~inputs ~result
+              in
+              let target =
+                Option.value_map generic
+                  ~default:(resource.resource_backend ^ "." ^ name)
+                  ~f:(fun worker ->
+                    worker.Generic_parameters.name ^ "."
+                    ^ Generic_parameters.member worker)
+              in
               Option.some_if
                 (String.equal name operation.pid_str)
                 {
-                  lemma_raven = resource.resource_backend ^ "." ^ name;
+                  lemma_raven = target;
                   lemma_constant =
                     List.mem resource.resource_constants name ~equal:String.equal;
-                  lemma_generic = None;
+                  lemma_generic = generic;
                   lemma_inputs = inputs;
                   lemma_implicit_count = 0;
                   lemma_outputs = [ result ];
@@ -1837,7 +2002,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
               (error (name_loc terms x ~default:at) (Printf.sprintf "Unbound name %s" x))
         | Some t ->
             let l = loc at in
-            let* typ = State.of_result (typ env.ctx ~at t) in
+            let* typ = State.typ env.ctx ~at t in
             let+ raven = State.fresh x in
             Some (x, raven, t, typ, l))
   in

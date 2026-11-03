@@ -164,10 +164,11 @@ let rec same_destination left right =
   | Flat, Flat -> true
   | Worker left, Worker right -> phys_equal left right
   | Function_worker (left, left_parent), Function_worker (right, right_parent) ->
-      Ident.same left.id right.id
-      && String.equal left.name right.name
-      && same_destination left_parent right_parent
+      String.equal left.name right.name && same_destination left_parent right_parent
   | Proof_worker (left, left_parent), Proof_worker (right, right_parent) ->
+      String.equal left.name right.name && same_destination left_parent right_parent
+  | Function_worker (left, left_parent), Proof_worker (right, right_parent)
+  | Proof_worker (right, right_parent), Function_worker (left, left_parent) ->
       String.equal left.name right.name && same_destination left_parent right_parent
   | (Flat | Worker _ | Function_worker _ | Proof_worker _), _ -> false
 

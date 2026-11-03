@@ -4,6 +4,9 @@
 open Base
 include Source_core
 
+let map_resource_types = Source_type_map.resource
+let map_field_types = Source_type_map.field
+
 let annotation_env ?at source lexical_env =
   let source_modules =
     source_module_ids source.typed
@@ -853,7 +856,9 @@ let ocaml_type ?(variables = []) (env : Env.t) ~(at : Location.t) (t : S.pty) :
       }
     in
     let typed =
-      Typetexp.transl_simple_type env ~closed:true (mapper.typ mapper (core_type ~at t))
+      Typetexp.TyVarEnv.with_local_scope (fun () ->
+          Typetexp.transl_simple_type env ~closed:true
+            (mapper.typ mapper (core_type ~at t)))
     in
     let rec restore typ =
       match Types.get_desc typ with
@@ -1185,164 +1190,187 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
 let typed_logical_expression ?(is_list = fun _ -> false) env ~functions ~variables
     ?expected (term : S.term) =
   try
-    let rec free_variables (seen, found) typ =
-      let id = Types.get_id typ in
-      if Set.mem seen id then (seen, found)
-      else
-        let seen = Set.add seen id in
-        match Types.get_desc typ with
-        | Tvar _ when Types.get_level typ = Btype.generic_level -> (seen, typ :: found)
-        | _ -> Btype.fold_type_expr free_variables (seen, found) typ
-    in
-    let _, free =
-      List.fold
-        (List.map variables ~f:snd @ Option.to_list expected)
-        ~init:(Set.empty (module Int), [])
-        ~f:free_variables
-    in
-    let env, substitutions =
-      List.fold free ~init:(env, []) ~f:(fun (env, substitutions) variable ->
-          let id =
-            Ident.create_local
-              (Compiler_types.internal_name ~at:term.term_loc
-                 ("logical_type_" ^ Int.to_string (Types.get_id variable)))
-          in
-          let declaration = Ctype.new_local_type ~loc:term.term_loc Definition in
-          let path = Path.Pident id in
-          ( Env.add_type ~check:false id declaration env,
-            (variable, path, Ctype.newconstr path []) :: substitutions ))
-    in
-    (* Generalized source variables are rigid; inference placeholders stay flexible. *)
-    let rec freeze typ =
-      if List.is_empty substitutions then typ
-      else
-        match
-          List.find substitutions ~f:(fun (variable, _, _) -> Types.eq_type variable typ)
-        with
-        | Some (_, _, frozen) -> frozen
-        | None ->
-            begin match Types.get_desc typ with
-            | Tvar _ | Tunivar _ -> typ
-            | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
-            end
-    in
-    let rec restore typ =
-      match Types.get_desc typ with
-      | Tconstr (path, [], _) ->
-          begin match
-            List.find substitutions ~f:(fun (_, frozen, _) -> Path.same path frozen)
-          with
-          | Some (variable, _, _) -> variable
-          | None -> typ
-          end
-      | Tvar _ | Tunivar _ -> typ
-      | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
-    in
-    let variables = List.map variables ~f:(fun (name, typ) -> (name, freeze typ)) in
-    let expected = Option.map expected ~f:freeze in
-    let functions = List.map variables ~f:fst @ functions in
-    let* expression = logical_expression ~functions ~is_list term in
-    let mapper =
-      {
-        Ast_mapper.default_mapper with
-        typ =
-          (fun self typ ->
-            match typ.Parsetree.ptyp_desc with
-            | Ptyp_var name ->
-                let path =
-                  List.find_map substitutions ~f:(fun (variable, path, _) ->
-                      match Types.get_desc variable with
-                      | Tvar (Some bound) when String.equal bound name -> Some path
-                      | _ -> None)
-                in
-                begin match path with
-                | Some (Pident id) ->
-                    {
-                      typ with
-                      ptyp_desc =
-                        Ptyp_constr
-                          ({ txt = Lident (Ident.name id); loc = typ.ptyp_loc }, []);
-                    }
-                | Some (Pdot _ | Papply _ | Pextra_ty _) | None -> typ
+    Ctype.with_local_level (fun () ->
+        let rec free_variables (seen, found) typ =
+          let id = Types.get_id typ in
+          if Set.mem seen id then (seen, found)
+          else
+            let seen = Set.add seen id in
+            match Types.get_desc typ with
+            | Tvar _ -> (seen, typ :: found)
+            | _ -> Btype.fold_type_expr free_variables (seen, found) typ
+        in
+        let _, free =
+          List.fold
+            (List.map variables ~f:snd @ Option.to_list expected)
+            ~init:(Set.empty (module Int), [])
+            ~f:free_variables
+        in
+        let scope = Ctype.create_scope () in
+        let env, substitutions =
+          List.fold
+            (List.filter free ~f:(fun variable ->
+                 Types.get_level variable = Btype.generic_level))
+            ~init:(env, [])
+            ~f:(fun (env, substitutions) variable ->
+              let id =
+                Ident.create_scoped ~scope
+                  (Compiler_types.internal_name ~at:term.term_loc
+                     ("logical_type_" ^ Int.to_string (Types.get_id variable)))
+              in
+              let declaration = Ctype.new_local_type ~loc:term.term_loc Definition in
+              let path = Path.Pident id in
+              ( Env.add_type ~check:false id declaration env,
+                (variable, path, Ctype.newconstr path []) :: substitutions ))
+        in
+        let placeholders =
+          if List.is_empty substitutions then []
+          else
+            List.filter_map free ~f:(fun variable ->
+                if Types.get_level variable = Btype.generic_level then None
+                else
+                  let name =
+                    match Types.get_desc variable with Tvar name -> name | _ -> None
+                  in
+                  Some (variable, Ctype.newvar ?name ()))
+        in
+        (* Inference placeholders share the scope of the rigid source variables. *)
+        let rec freeze typ =
+          if List.is_empty substitutions then typ
+          else
+            match
+              List.find substitutions ~f:(fun (variable, _, _) ->
+                  Types.eq_type variable typ)
+            with
+            | Some (_, _, frozen) -> frozen
+            | None ->
+                begin match Types.get_desc typ with
+                | Tvar _ ->
+                    Option.value
+                      (List.Assoc.find placeholders typ ~equal:Types.eq_type)
+                      ~default:typ
+                | Tunivar _ -> typ
+                | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
                 end
-            | _ -> Ast_mapper.default_mapper.typ self typ);
-      }
-    in
-    let expression =
-      if List.is_empty substitutions then expression else mapper.expr mapper expression
-    in
-    let env =
-      (Typemod.type_interface env
-         (Parse.interface (Lexing.from_string logical_check_signature)))
-        .sig_final_env
-    in
-    let add env name typ =
-      Env.add_value (Ident.create_local name)
-        {
-          Types.val_type = typ;
-          val_kind = Val_reg;
-          val_loc = term.term_loc;
-          val_attributes = [];
-          val_uid = Shape.Uid.internal_not_actually_unique;
-        }
-        env
-    in
-    let env =
-      List.fold_right variables ~init:env ~f:(fun (name, typ) env -> add env name typ)
-    in
-    let env, expression =
-      match expected with
-      | None -> (env, expression)
-      | Some expected ->
-          let name = "caravan$logical$expected" in
-          let argument =
-            match Types.get_desc expected with
-            | Tpoly _ -> expected
-            | _ -> Btype.newgenty (Tpoly (expected, []))
-          in
-          let expected =
-            Ctype.newty (Tarrow (Nolabel, argument, Predef.type_unit, Types.commu_ok))
-          in
-          let env = add env name expected in
-          let application =
-            Ast_helper.Exp.apply ~loc:term.term_loc
-              (Ast_helper.Exp.ident ~loc:term.term_loc
-                 { txt = Lident name; loc = term.term_loc })
-              [ (Nolabel, expression) ]
-          in
-          (env, application)
-    in
-    let typed = Typecore.type_expression env expression in
-    let partial_match = ref None in
-    let default = Tast_iterator.default_iterator in
-    let iterator =
-      {
-        default with
-        expr =
-          (fun self expression ->
-            begin match (expression.Typedtree.exp_desc, !partial_match) with
-            | Texp_match (_, _, _, Partial), None ->
-                partial_match := Some expression.exp_loc
-            | _ -> ()
-            end;
-            default.expr self expression);
-      }
-    in
-    iterator.expr iterator typed;
-    match !partial_match with
-    | None when List.is_empty substitutions -> Ok typed
-    | None ->
+        in
+        let rec restore typ =
+          match Types.get_desc typ with
+          | Tconstr (path, [], _) ->
+              begin match
+                List.find substitutions ~f:(fun (_, frozen, _) -> Path.same path frozen)
+              with
+              | Some (variable, _, _) -> variable
+              | None -> typ
+              end
+          | Tvar _ | Tunivar _ -> typ
+          | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
+        in
+        let variables = List.map variables ~f:(fun (name, typ) -> (name, freeze typ)) in
+        let expected = Option.map expected ~f:freeze in
+        let functions = List.map variables ~f:fst @ functions in
+        let* expression = logical_expression ~functions ~is_list term in
         let mapper =
           {
-            Tast_mapper.default with
-            expr =
-              (fun self expression ->
-                let expression = Tast_mapper.default.expr self expression in
-                { expression with exp_type = restore expression.exp_type });
+            Ast_mapper.default_mapper with
+            typ =
+              (fun self typ ->
+                match typ.Parsetree.ptyp_desc with
+                | Ptyp_var name ->
+                    let path =
+                      List.find_map substitutions ~f:(fun (variable, path, _) ->
+                          match Types.get_desc variable with
+                          | Tvar (Some bound) when String.equal bound name -> Some path
+                          | _ -> None)
+                    in
+                    begin match path with
+                    | Some (Pident id) ->
+                        {
+                          typ with
+                          ptyp_desc =
+                            Ptyp_constr
+                              ({ txt = Lident (Ident.name id); loc = typ.ptyp_loc }, []);
+                        }
+                    | Some (Pdot _ | Papply _ | Pextra_ty _) | None -> typ
+                    end
+                | _ -> Ast_mapper.default_mapper.typ self typ);
           }
         in
-        Ok (mapper.expr mapper typed)
-    | Some at -> Error (Report.error Type at "A logical match must be exhaustive")
+        let expression =
+          if List.is_empty substitutions then expression
+          else mapper.expr mapper expression
+        in
+        let env =
+          (Typemod.type_interface env
+             (Parse.interface (Lexing.from_string logical_check_signature)))
+            .sig_final_env
+        in
+        let add env name typ =
+          Env.add_value (Ident.create_local name)
+            {
+              Types.val_type = typ;
+              val_kind = Val_reg;
+              val_loc = term.term_loc;
+              val_attributes = [];
+              val_uid = Shape.Uid.internal_not_actually_unique;
+            }
+            env
+        in
+        let env =
+          List.fold_right variables ~init:env ~f:(fun (name, typ) env -> add env name typ)
+        in
+        let env, expression =
+          match expected with
+          | None -> (env, expression)
+          | Some expected ->
+              let name = "caravan$logical$expected" in
+              let argument =
+                match Types.get_desc expected with
+                | Tpoly _ -> expected
+                | _ -> Btype.newgenty (Tpoly (expected, []))
+              in
+              let expected =
+                Ctype.newty (Tarrow (Nolabel, argument, Predef.type_unit, Types.commu_ok))
+              in
+              let env = add env name expected in
+              let application =
+                Ast_helper.Exp.apply ~loc:term.term_loc
+                  (Ast_helper.Exp.ident ~loc:term.term_loc
+                     { txt = Lident name; loc = term.term_loc })
+                  [ (Nolabel, expression) ]
+              in
+              (env, application)
+        in
+        let typed = Typecore.type_expression env expression in
+        let partial_match = ref None in
+        let default = Tast_iterator.default_iterator in
+        let iterator =
+          {
+            default with
+            expr =
+              (fun self expression ->
+                begin match (expression.Typedtree.exp_desc, !partial_match) with
+                | Texp_match (_, _, _, Partial), None ->
+                    partial_match := Some expression.exp_loc
+                | _ -> ()
+                end;
+                default.expr self expression);
+          }
+        in
+        iterator.expr iterator typed;
+        match !partial_match with
+        | None when List.is_empty substitutions -> Ok typed
+        | None ->
+            let mapper =
+              {
+                Tast_mapper.default with
+                expr =
+                  (fun self expression ->
+                    let expression = Tast_mapper.default.expr self expression in
+                    { expression with exp_type = restore expression.exp_type });
+              }
+            in
+            Ok (mapper.expr mapper typed)
+        | Some at -> Error (Report.error Type at "A logical match must be exhaustive"))
   with exn -> (
     match Report.of_exn exn with
     | Some error -> Error error

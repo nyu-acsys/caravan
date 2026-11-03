@@ -1,0 +1,7 @@
+module Read = Ghost.AU (struct let operation = read end)
+
+let saved : ('a Atomic.t, 'a Read.token option) Ghost.field = Ghost.field ()
+
+invariant guarded (cell : 'a Atomic.t) =
+  exists value : 'a, remembered : 'a Read.token option.
+    own cell value && own (Ghost.at saved cell) remembered

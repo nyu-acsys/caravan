@@ -29,6 +29,7 @@ type proof_resource = {
   resource_environment : Env.t;
   resource_functor : string list;
   resource_arguments : proof_module_argument list;
+  resource_parameters : Types.type_expr list;
   resource_is_ra : bool;
   resource_interfaces : string list list;
   resource_alias_of : Path.t option;
@@ -62,6 +63,8 @@ type proof_field = {
   field_environment : Env.t;
   field_owner : Types.type_expr;
   field_value : Types.type_expr;
+  field_parameters : Types.type_expr list;
+  field_family : string option;
   field_resource : Path.t option;
   field_at : Location.t;
 }
@@ -75,6 +78,7 @@ type proof_au = {
   au_operation : S.qualid;
   au_operation_path : Path.t;
   au_operation_type : Types.type_expr;
+  au_parameters : Types.type_expr list;
   au_token : Types.type_expr;
   au_token_path : Path.t;
   au_token_paths : Path.t list;

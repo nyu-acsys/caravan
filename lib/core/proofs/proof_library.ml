@@ -95,9 +95,10 @@ let accepts_type_argument signatures path =
       | _ -> false)
   | None -> false
 
-let ocaml_type ~at ~(signature : L.module_signature) ~substitutions typ =
-  let named name =
-    Ast_helper.Typ.constr ~loc:at { txt = Longident.Lident name; loc = at } []
+let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
+    ~substitutions typ =
+  let named ?(arguments = []) name =
+    Ast_helper.Typ.constr ~loc:at { txt = Longident.Lident name; loc = at } arguments
   in
   let unsupported message = Error (Report.error Unsupported at message) in
   let rec convert = function
@@ -147,7 +148,7 @@ let ocaml_type ~at ~(signature : L.module_signature) ~substitutions typ =
             unsupported ("Parameterized Raven library type " ^ String.concat ~sep:"." path)
         in
         begin match path with
-        | [ "T" ] -> Ok (named "t")
+        | [ "T" ] -> Ok (named ~arguments:family_arguments "t")
         | [ parameter; "T" ] | [ parameter ] ->
             begin match List.Assoc.find substitutions parameter ~equal:String.equal with
             | Some typ -> Ok typ
@@ -155,7 +156,8 @@ let ocaml_type ~at ~(signature : L.module_signature) ~substitutions typ =
                 if
                   List.exists signature.types ~f:(fun member ->
                       String.equal member.name parameter)
-                then Ok (named (String.uncapitalize parameter))
+                then
+                  Ok (named ~arguments:family_arguments (String.uncapitalize parameter))
                 else
                   unsupported
                     ("Unsupported Raven library type " ^ String.concat ~sep:"." path)
@@ -166,9 +168,9 @@ let ocaml_type ~at ~(signature : L.module_signature) ~substitutions typ =
   in
   convert typ
 
-let operation_type ~at ~(signature : L.module_signature) ~substitutions
-    (operation : L.operation) =
-  let convert = ocaml_type ~at ~signature ~substitutions in
+let operation_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
+    ~substitutions (operation : L.operation) =
+  let convert = ocaml_type ~family_arguments ~at ~signature ~substitutions in
   let* inputs = Result.all (List.map operation.inputs ~f:(fun (_, typ) -> convert typ)) in
   let* outputs =
     Result.all (List.map operation.outputs ~f:(fun (_, typ) -> convert typ))

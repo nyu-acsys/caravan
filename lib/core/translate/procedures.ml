@@ -150,7 +150,7 @@ let formals ?(names = []) ctx (f : func) =
       match p.fp_kind with
       | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
-          let* typ = State.of_result (typ ctx ~at:pat_loc pat_type) in
+          let* typ = State.typ ctx ~at:pat_loc pat_type in
           let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.bind_name ~typ:pat_type id in
           ( Some (Ident.name id, x),
@@ -164,7 +164,7 @@ let formals ?(names = []) ctx (f : func) =
       | Tparam_pat
           { pat_desc = Tpat_any | Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
-          let* typ = State.of_result (typ ctx ~at:pat_loc pat_type) in
+          let* typ = State.typ ctx ~at:pat_loc pat_type in
           let contract_name = Option.join (List.nth names i) in
           let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.fresh (Option.value contract_name ~default:"arg") in
@@ -194,7 +194,7 @@ let pattern_params ctx (f : func) formals =
             | None ->
                 let* stmts =
                   State.all binds ~f:(fun (id, value, t) ->
-                      let* typ = State.of_result (typ ctx ~at:pat_loc t) in
+                      let* typ = State.typ ctx ~at:pat_loc t in
                       let* () = State.note_domain ctx.given.types t in
                       let+ y = State.bind_name ~typ:t id in
                       R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
@@ -283,7 +283,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                     id.pid_str))
           else State.return ()
         in
-        let* t = State.of_result (Source.ocaml_type ctx.given.env ~at:id.pid_loc pty) in
+        let* t = State.of_result (source_type ctx.given ~at:id.pid_loc pty) in
         let+ raven = State.fresh id.pid_str in
         (id.pid_str, raven, t))
   in
@@ -308,7 +308,7 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
                     id.pid_str))
           else State.return ()
         in
-        let* t = State.of_result (Source.ocaml_type ctx.given.env ~at:id.pid_loc pty) in
+        let* t = State.of_result (source_type ctx.given ~at:id.pid_loc pty) in
         let+ raven = State.fresh id.pid_str in
         (id.pid_str, raven, t))
   in
@@ -512,7 +512,7 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
           (List.fold_right requires ~init:post ~f:(fun pre post ->
                R.Expr.binary ~loc:l Impl pre post)))
   in
-  let* result_typ = State.of_result (typ ctx ~at:f.body.exp_loc f.body.exp_type) in
+  let* result_typ = State.typ ctx ~at:f.body.exp_loc f.body.exp_type in
   let* () = State.note_domain ctx.given.types f.body.exp_type in
   let* bindings =
     State.all (List.zip_exn f.params formals)
@@ -646,7 +646,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
     let open State.Syntax in
     let l = loc at in
     State.all implicit ~f:(fun (x, _, t, _) ->
-        let* typ = State.of_result (typ ctx ~at t) in
+        let* typ = State.typ ctx ~at t in
         let+ v = State.fresh x in
         ( R.Stmt.local ~loc:l ~ghost:true ?const ~typ (ident ~loc:l v),
           R.Expr.var ~loc:l (name ~loc:l v) ))
@@ -1107,7 +1107,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* returns =
     if is_unit f.body.exp_type then State.return []
     else
-      let+ typ = State.of_result (typ ctx ~at:f.body.exp_loc f.body.exp_type) in
+      let+ typ = State.typ ctx ~at:f.body.exp_loc f.body.exp_type in
       [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
   let* _, env, implicit, ghosts =
@@ -1134,12 +1134,12 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* () = State.modify_carried (fun c -> { c with ghost_returns }) in
   let* ghost_return_vars =
     State.all ghost_returns ~f:(fun (_, raven, t) ->
-        let+ typ = State.of_result (typ ctx ~at:f.loc t) in
+        let+ typ = State.typ ctx ~at:f.loc t in
         R.Var.make ~loc:l ~ghost:true (ident ~loc:l raven) typ)
   in
   let* ghost_formals =
     State.all ghosts ~f:(fun (_, raven, t) ->
-        let+ typ = State.of_result (typ ctx ~at:f.loc t) in
+        let+ typ = State.typ ctx ~at:f.loc t in
         R.Var.make ~loc:l ~ghost:true (ident ~loc:l raven) typ)
   in
   (* A parameter that a precondition makes a field of a ghost parameter is one. *)

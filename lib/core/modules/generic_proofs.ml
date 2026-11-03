@@ -571,6 +571,7 @@ let resource_applications source inventory plans =
               let project_type = Subst.type_expr projection in
               let project_path = Subst.module_path projection in
               List.map (resources source plan) ~f:(fun resource ->
+                  let resource = Source.map_resource_types resource ~f:project_type in
                   let owner = Path.Pdot (path, resource.resource_name) in
                   let rec project (resource : Source.proof_resource) =
                     let leaf =
@@ -597,27 +598,20 @@ let resource_applications source inventory plans =
                           Some
                             Qualified_name.
                               { path = String.split backend ~on:'.'; name = "T" };
-                        alias = Option.map data.alias ~f:project_type;
                       }
                     in
                     {
                       resource with
                       Source.resource_backend = backend;
                       resource_path = owner;
-                      resource_type = project_type resource.resource_type;
-                      resource_representation =
-                        Option.map resource.resource_representation ~f:project_type;
+                      resource_application =
+                        Some (instance.source.identity, resource.resource_id);
                       resource_alias_of =
                         Option.map resource.resource_alias_of ~f:project_path;
                       resource_arguments =
                         List.map resource.resource_arguments ~f:(function
-                          | Source.Type_argument typ ->
-                              Source.Type_argument (project_type typ)
+                          | Source.Type_argument _ as argument -> argument
                           | Module_argument path -> Module_argument (project_path path));
-                      resource_operations =
-                        List.map resource.resource_operations
-                          ~f:(fun (name, inputs, output) ->
-                            (name, List.map inputs ~f:project_type, project_type output));
                       resource_descriptor = descriptor "t" resource.resource_descriptor;
                       resource_aliases =
                         List.map resource.resource_aliases ~f:(fun alias ->

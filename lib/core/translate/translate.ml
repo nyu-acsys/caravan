@@ -56,7 +56,41 @@ let program ?(history = History.default) (source : Source.t) :
   let scoped_binding =
     Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs
   in
-  let* decls = Program_declarations.run scopes in
+  let* decls, proofs, state =
+    let* decls = Program_declarations.run scopes in
+    let* proofs, state = Program_proofs.run scopes decls State.initial in
+    let* dependencies = Generic_dependencies.create scopes decls proofs in
+    if
+      List.exists dependencies.families.groups ~f:(fun group ->
+          List.length group.Generic_families.members > 1)
+    then
+      let normalize = Generic_families.normalize_name dependencies.families in
+      let assets =
+        List.map (decls.generic_resource_workers @ decls.generic_model_workers) ~f:fst
+        @ List.filter_map decls.source.proof_fields ~f:(fun field ->
+            Option.some_if
+              (not (List.is_empty field.Source.field_parameters))
+              (Generic_fields.worker field))
+      in
+      let family_plan =
+        Generic_family_plan.
+          {
+            runtime =
+              List.map decls.polymorphic_functions ~f:(fun worker ->
+                  (worker.Polymorphic_functions.id, normalize worker.name));
+            proofs =
+              List.map (decls.generic_predicates @ proofs.generic_callables)
+                ~f:(fun worker -> (worker.Generic_parameters.key, normalize worker.name));
+            assets =
+              List.map assets ~f:(fun worker ->
+                  (worker.Generic_parameters.key, normalize worker.name));
+          }
+      in
+      let* decls = Program_declarations.run ~family_plan scopes in
+      let* proofs, state = Program_proofs.run ~family_plan scopes decls State.initial in
+      Ok (decls, proofs, state)
+    else Ok (decls, proofs, state)
+  in
   let {
     Program_declarations.source;
     all_resources;
@@ -75,6 +109,8 @@ let program ?(history = History.default) (source : Source.t) :
     resource_types;
     types;
     native_resource_members;
+    generic_resource_workers;
+    generic_model_workers;
     imported_resource_members;
     public_resource_members;
     deferred_native_resource_members;
@@ -103,7 +139,6 @@ let program ?(history = History.default) (source : Source.t) :
       ~context_for_group:
         (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
   in
-  let* proofs, state = Program_proofs.run scopes decls State.initial in
   let {
     Program_proofs.checked_views;
     checked_resource_entries;
@@ -288,11 +323,62 @@ let program ?(history = History.default) (source : Source.t) :
              resource.Source.resource_scope)
           member)
   in
+  let* (), state =
+    State.run_from state
+      (State.map
+         (State.all source.proof_resources ~f:(fun resource ->
+              match Generic_assets.resource_worker resource with
+              | None -> State.return ()
+              | Some worker ->
+                  let local_resources =
+                    List.filter all_resources ~f:(fun candidate ->
+                        Option.is_none candidate.Source.resource_application
+                        && Option.equal Path.same candidate.resource_scope
+                             resource.resource_scope)
+                  in
+                  let resources = local_resources @ all_resources in
+                  let data =
+                    Generic_parameters.types worker
+                      (Generic_assets.types local_resources types)
+                  in
+                  State.map
+                    (State.all
+                       (Generic_assets.argument_types resources resource)
+                       ~f:(State.note_domain data))
+                    ~f:(fun _ -> ())))
+         ~f:(fun _ -> ()))
+  in
+  let* (), state =
+    State.run_from state
+      (State.map
+         (State.all types ~f:(fun data ->
+              match data.Datatypes.family with
+              | Some _ when not (List.is_empty data.ctors) ->
+                  let worker = Generic_models.worker data in
+                  let types = Generic_parameters.types worker types in
+                  State.map
+                    (State.all
+                       (List.concat_map data.ctors ~f:(fun ctor -> ctor.Datatypes.args))
+                       ~f:(State.note_domain types))
+                    ~f:(fun _ -> ())
+              | _ -> State.return ()))
+         ~f:(fun _ -> ()))
+  in
+  let generic_fields =
+    List.filter_map source.proof_fields ~f:(fun field ->
+        Option.some_if
+          (not (List.is_empty field.Source.field_parameters))
+          (Generic_fields.worker field))
+  in
   let emitted_fields destination fields =
     List.filter_map fields ~f:(fun (field, member) ->
         Option.some_if
-          (Module_context.emits_owner module_contexts ~destination
-             field.Source.field_scope)
+          (if List.is_empty field.Source.field_parameters then
+             Module_context.emits_owner module_contexts ~destination field.field_scope
+           else
+             List.equal String.equal
+               (Module_context.namespace destination)
+               (String.split (Generic_fields.worker field).name ~on:'.'))
           member)
   in
   let raw_resource_field field =
@@ -301,57 +387,99 @@ let program ?(history = History.default) (source : Source.t) :
         resource.Source.resource_is_ra
         && same_named_type field.field_value resource.resource_type)
   in
-  let* explicit_fields =
-    all source.proof_fields ~f:(fun field ->
-        let l = loc field.Source.field_at in
-        let* value_type =
-          match field.field_resource with
-          | None ->
-              begin match
-                List.find all_resource_views ~f:(fun resource ->
-                    resource.resource_is_ra
-                    && same_named_type field.field_value resource.resource_type)
-              with
-              | None -> Datatypes.typ types ~at:field.field_at field.field_value
-              | Some resource ->
-                  Ok
-                    (R.Type.named ~loc:l
-                       (qualified_name ~loc:l resource.resource_backend)
-                       [])
-              end
-          | Some owner ->
-              begin match
-                List.find all_resource_views ~f:(fun resource ->
-                    Source.resource_has_path resource owner)
-              with
-              | None -> error field.field_at "Unknown resource algebra for field"
-              | Some resource ->
-                  let private_representation =
-                    resource.resource_definition
-                    && Option.exists resource.resource_representation ~f:(fun rep ->
-                        same_named_type field.field_value rep)
-                  in
-                  let* backend =
-                    if private_representation then
-                      match implementation resource with
-                      | Some backend -> Ok backend
-                      | None ->
-                          error field.field_at "Missing resource algebra implementation"
-                    else Ok resource.resource_backend
-                  in
-                  if resource.resource_is_ra then
-                    Ok (R.Type.named ~loc:l (qualified_name ~loc:l backend) [])
-                  else error field.field_at "The field resource is not a resource algebra"
-              end
-        in
-        Ok
-          ( field,
-            let field_name = (Qualified_name.of_string (ghost_field_name field)).name in
-            if raw_resource_field field then
-              R.Member.field ~ghost:true ~loc:l (ident ~loc:l field_name) value_type
-            else
-              Datatypes.field_member ~ghost:true types ~loc:l field_name value_type
-                field.field_value ))
+  let resource_field_type types resources (field : Source.proof_field) resource =
+    let resource =
+      Generic_assets.local_resource ~scope:field.field_scope resources resource
+    in
+    let arguments =
+      match Datatypes.desc types field.field_value with
+      | Tconstr (_, arguments, _) -> arguments
+      | _ -> []
+    in
+    match Generic_assets.native_module types resource arguments with
+    | Some backend ->
+        let l = loc field.field_at in
+        Ok (R.Type.named ~loc:l (qualified_name ~loc:l backend) [])
+    | None -> error field.field_at "This resource field type instance cannot be inferred"
+  in
+  let* explicit_fields, state =
+    State.run_from state
+      (State.all source.proof_fields ~f:(fun field ->
+           let local_resources =
+             List.filter all_resource_views ~f:(fun resource ->
+                 Option.is_none resource.Source.resource_application
+                 && Option.equal Path.same resource.resource_scope
+                      field.Source.field_scope)
+           in
+           let resources = local_resources @ all_resource_views in
+           let types = Generic_assets.types local_resources types in
+           let types =
+             if List.is_empty field.Source.field_parameters then types
+             else Generic_parameters.types (Generic_fields.worker field) types
+           in
+           let open State.Syntax in
+           let* () = State.note_domain types field.field_value in
+           let l = loc field.Source.field_at in
+           let computation =
+             let ( let* ) = Result.( >>= ) in
+             let* value_type =
+               match field.field_resource with
+               | None ->
+                   begin match
+                     List.find resources ~f:(fun resource ->
+                         resource.resource_is_ra
+                         && same_named_type field.field_value resource.resource_type)
+                   with
+                   | None -> Datatypes.typ types ~at:field.field_at field.field_value
+                   | Some resource when not (List.is_empty resource.resource_parameters)
+                     ->
+                       resource_field_type types resources field resource
+                   | Some resource ->
+                       Ok
+                         (R.Type.named ~loc:l
+                            (qualified_name ~loc:l resource.resource_backend)
+                            [])
+                   end
+               | Some owner ->
+                   begin match Generic_assets.find_resource resources owner with
+                   | None -> error field.field_at "Unknown resource algebra for field"
+                   | Some resource when not (List.is_empty resource.resource_parameters)
+                     ->
+                       resource_field_type types resources field resource
+                   | Some resource ->
+                       let private_representation =
+                         resource.resource_definition
+                         && Option.exists resource.resource_representation ~f:(fun rep ->
+                             same_named_type field.field_value rep)
+                       in
+                       let* backend =
+                         if private_representation then
+                           match implementation resource with
+                           | Some backend -> Ok backend
+                           | None ->
+                               error field.field_at
+                                 "Missing resource algebra implementation"
+                         else Ok resource.resource_backend
+                       in
+                       if resource.resource_is_ra then
+                         Ok (R.Type.named ~loc:l (qualified_name ~loc:l backend) [])
+                       else
+                         error field.field_at
+                           "The field resource is not a resource algebra"
+                   end
+             in
+             Ok
+               ( field,
+                 let field_name =
+                   (Qualified_name.of_string (ghost_field_name field)).name
+                 in
+                 if raw_resource_field field then
+                   R.Member.field ~ghost:true ~loc:l (ident ~loc:l field_name) value_type
+                 else
+                   Datatypes.field_member ~ghost:true types ~loc:l field_name value_type
+                     field.field_value )
+           in
+           State.of_result computation))
   in
   let field_domain_types =
     List.concat_map types ~f:(fun data ->
@@ -436,10 +564,19 @@ let program ?(history = History.default) (source : Source.t) :
           [ request.domain_type ])
     @ Datatypes.value_templates types field_domain_types
   in
+  let family_domain_names =
+    List.concat_map domain_requests ~f:(fun request ->
+        Datatypes.family_domain_dependencies ~dictionaries:true request.domain_types
+          [ request.domain_type ]
+        |> List.filter_map ~f:(fun (name, families) ->
+            Option.some_if (not (List.is_empty families)) name))
+    |> Set.of_list (module String)
+  in
   let root_domain_declarations =
     List.filter_map value_domains ~f:(fun (name, member) ->
         Option.some_if
-          (List.is_empty (Qualified_name.of_string name).path)
+          (List.is_empty (Qualified_name.of_string name).path
+          && not (Set.mem family_domain_names name))
           ( List.filter_map domain_groups ~f:(fun (dependencies, members) ->
                 Option.some_if
                   (List.exists members ~f:(fun (candidate, _) ->
@@ -469,8 +606,10 @@ let program ?(history = History.default) (source : Source.t) :
     captured && not final
   in
   let candidates =
-    List.map (generic_predicate_workers @ generic_callables) ~f:(fun worker ->
-        Proof_worker worker)
+    List.map
+      (generic_predicate_workers @ generic_callables @ generic_fields
+      @ List.map (generic_resource_workers @ generic_model_workers) ~f:fst)
+      ~f:(fun worker -> Proof_worker worker)
     @ List.map polymorphic_functions ~f:(fun worker -> Runtime_worker worker)
     |> List.dedup_and_sort ~compare:(fun left right ->
         String.compare (callable_name left) (callable_name right))
@@ -627,14 +766,6 @@ let program ?(history = History.default) (source : Source.t) :
     ( declarations @ domains @ workers @ fields,
       (pending_declarations, pending_domains, pending_workers, pending_fields) )
   in
-  let domains_in namespace =
-    if List.is_empty namespace then []
-    else
-      List.filter_map value_domains ~f:(fun (name, member) ->
-          Option.some_if
-            (List.equal String.equal (Qualified_name.of_string name).path namespace)
-            member)
-  in
   let instance_member ~at instance = Value_instances.member ~loc:at instance in
   let root_cells =
     List.filter_map state.tables.function_instances ~f:(fun instance ->
@@ -668,6 +799,31 @@ let program ?(history = History.default) (source : Source.t) :
          ~equal:String.equal)
       ~default:[]
   in
+  let support_instances =
+    List.filter state.tables.function_instances ~f:(fun instance ->
+        not
+          (List.is_empty instance.instance_namespace
+          && String.equal instance.instance_worker Prelude.cell_family))
+  in
+  let support_domains =
+    List.filter value_domains ~f:(fun (name, _) ->
+        (not (List.is_empty (Qualified_name.of_string name).path))
+        || Set.mem family_domain_names name)
+  in
+  let namespaces =
+    List.map support_domains ~f:(fun (name, _) -> (Qualified_name.of_string name).path)
+    @ List.map support_instances ~f:(fun instance -> instance.instance_namespace)
+    |> List.dedup_and_sort ~compare:(List.compare String.compare)
+  in
+  let domain_dependencies = Generic_support.domain_dependencies domain_requests in
+  let* support_members =
+    all namespaces ~f:(fun namespace ->
+        let* members =
+          Generic_support.order ~namespace ~at:Location.none ~domains:support_domains
+            ~domain_dependencies ~instances:support_instances
+        in
+        Ok (namespace, members))
+  in
   let rec emit_context_members ?namespace ?(library = false) destination ~at
       ~representations ~native_resources ~applications ~late_members =
     let namespace =
@@ -696,7 +852,6 @@ let program ?(history = History.default) (source : Source.t) :
       State.primitives_in state.tables namespace
       |> List.map ~f:(fun primitive -> primitive.State.member)
     in
-    let domains = domains_in namespace in
     let defaults =
       List.filter_map state.tables.defaults ~f:(fun request ->
           Option.some_if
@@ -714,24 +869,38 @@ let program ?(history = History.default) (source : Source.t) :
              || List.is_empty (Map.find_exn worker_dependencies (callable_name worker))))
       |> List.map ~f:(emit_callable_worker destination)
     in
-    let function_instances =
-      List.filter_map state.tables.function_instances ~f:(fun instance ->
-          Option.some_if
-            (List.equal String.equal instance.instance_namespace namespace
-            && not
-                 (List.is_empty namespace
-                 && String.equal instance.instance_worker Prelude.cell_family))
-            (instance_member ~at instance))
+    let support =
+      Option.value
+        (List.Assoc.find support_members namespace ~equal:(List.equal String.equal))
+        ~default:[]
+    in
+    let token_members =
+      List.concat_map token_types ~f:(fun data ->
+          match (data.Datatypes.family, data.atomic_procedure) with
+          | Some family, Some procedure
+            when List.equal String.equal namespace (String.split family.worker ~on:'.') ->
+              let carrier =
+                R.Type.atomic_token ~loc:at (qualified_name ~loc:at procedure)
+              in
+              [
+                R.Member.type_ ~loc:at (ident ~loc:at family.member) (Some carrier);
+                Prelude.value_dictionary ~loc:at ~name:family.dictionary ~carrier
+                  ~unrestricted:(R.Expr.bool ~loc:at true)
+                  ~body:(R.Expr.bool ~loc:at true);
+              ]
+          | _ -> [])
+    in
+    let family_resources =
+      List.concat_map (generic_resource_workers @ generic_model_workers)
+        ~f:(fun (worker, members) ->
+          if
+            List.equal String.equal namespace
+              (String.split worker.Generic_parameters.name ~on:'.')
+          then members
+          else [])
     in
     let stages =
-      if library then
-        [
-          `Value_domains;
-          `Function_workers;
-          `Function_instances;
-          `Primitives;
-          `Late_members;
-        ]
+      if library then [ `Function_workers; `Value_domains; `Primitives; `Late_members ]
       else
         match destination with
         | Module_context.Flat ->
@@ -743,7 +912,6 @@ let program ?(history = History.default) (source : Source.t) :
               `Function_workers;
               `Applications;
               `Value_domains;
-              `Function_instances;
               `View_fields;
               `Fields;
               `Proof_definitions;
@@ -763,9 +931,8 @@ let program ?(history = History.default) (source : Source.t) :
               `Native_resources;
               `Public_resources;
               `Applications;
-              `Value_domains;
               `Function_workers;
-              `Function_instances;
+              `Value_domains;
               `Primitives;
               `Pure_functions;
               `Fields;
@@ -778,36 +945,33 @@ let program ?(history = History.default) (source : Source.t) :
               `Logical_functions;
               `Procedures;
             ]
-        | Module_context.Function_worker _ ->
+        | Module_context.Function_worker _ | Module_context.Proof_worker _ ->
             [
-              `Value_domains;
+              `Token_types;
               `Function_workers;
-              `Function_instances;
-              `Primitives;
-              `Pure_functions;
-              `Procedures;
-            ]
-        | Module_context.Proof_worker _ ->
-            [
               `Value_domains;
-              `Function_instances;
+              `Family_assets;
               `Primitives;
+              `Fields;
               `View_fields;
               `State;
               `Predicates;
               `Logical_functions;
               `Lemmas;
+              `Pure_functions;
+              `Procedures;
             ]
     in
     List.concat_map stages ~f:(function
+      | `Token_types -> token_members
+      | `Family_assets -> family_resources
       | `Representations -> representations
       | `Definitions -> emitted_assets destination definition_modules
       | `Native_resources -> native_resources
       | `Public_resources -> emitted_assets destination public_resource_members
       | `Applications -> applications
       | `Function_workers -> function_workers
-      | `Function_instances -> function_instances
-      | `Value_domains -> domains @ defaults
+      | `Value_domains -> support @ defaults
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
       | `Proof_definitions -> emitted_assets destination definition_proof_modules

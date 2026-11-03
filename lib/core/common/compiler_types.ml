@@ -15,6 +15,12 @@ let map_group types ~f =
       | Ttuple fields -> List.map fields ~f:snd
       | _ -> failwith "A type projection must preserve tuple structure")
 
+(** Fresh generic structure lets compiler instantiation reach quantified variables. *)
+let rec scheme_structure typ =
+  match Types.get_desc typ with
+  | Tvar _ | Tunivar _ -> typ
+  | desc -> Btype.newgenty (Btype.copy_type_desc scheme_structure desc)
+
 let prefix = "$caravan_"
 
 let internal_name ~(at : Location.t) member =

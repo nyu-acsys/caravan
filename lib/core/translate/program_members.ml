@@ -1169,31 +1169,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
       (library_registry.entries
       @ List.concat_map funcs ~f:(fun candidate ->
           let worker =
-            match Generic_modules.member generics candidate.id with
-            | None -> Program_declarations.function_worker polymorphic_functions candidate
-            | Some (group, application, stem) ->
-                let source =
-                  List.find_map group.body_members ~f:(fun (source, target) ->
-                      Option.some_if (String.equal stem target) source)
-                in
-                let representative =
-                  Option.bind source ~f:(fun source ->
-                      List.Assoc.find group.representative.body_members source
-                        ~equal:String.equal)
-                in
-                Option.bind representative ~f:(fun id ->
-                    List.find polymorphic_functions ~f:(fun worker ->
-                        Ident.same worker.Polymorphic_functions.id id))
-                |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
-                    if List.exists current_groups ~f:(phys_equal group) then worker
-                    else
-                      {
-                        worker with
-                        name =
-                          canonical_member shared
-                            (application.name ^ "."
-                           ^ (Qualified_name.of_string worker.name).name);
-                      })
+            Program_declarations.applied_function_worker ~generics ~polymorphic_functions
+              ~groups:current_groups ~canonical:(canonical_member shared) candidate
           in
           Option.value_map worker ~default:[] ~f:(fun worker ->
               List.map candidate.paths ~f:(fun path -> (path, worker)))))
@@ -1610,7 +1587,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     let body_proof_support =
       { proof_support with runtime_functions = plan.logical_calls }
     in
-    ( plan.body_types,
+    ( Program_declarations.function_types polymorphic_functions f plan.body_types,
       plan.predicate_overrides @ preds,
       plan.calls,
       plan.pure_calls,

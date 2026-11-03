@@ -976,12 +976,12 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let half e f v = R.Expr.own ~loc:l [ field e f; v; R.Expr.real ~loc:l 0.5 ] in
   let decl ?(ghost = false) x t = R.Var.make ~loc:l ~ghost (ident ~loc:l x) t in
   let open State.Syntax in
-  let* key_typ = State.of_result (typ ctx ~at p.key_type) in
+  let* key_typ = State.typ ctx ~at p.key_type in
   let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
   let bool_typ = R.Type.bool ~loc:l and ref_typ = R.Type.ref ~loc:l in
   let* params =
     State.all st.params ~f:(fun (x, t) ->
-        let+ typ = State.of_result (typ ctx ~at t) in
+        let+ typ = State.typ ctx ~at t in
         (x, t, decl x typ))
   in
   let args = List.map params ~f:(fun (x, _, _) -> var x) in
@@ -1070,7 +1070,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
               State.return (List.last_exn types)
           | _ -> State.of_result (error at (Printf.sprintf "The view %s has no value" v))
         in
-        let+ typ = State.of_result (typ ctx ~at t) in
+        let+ typ = State.typ ctx ~at t in
         let view_field = view_field_in ctx.given.shared v in
         ("view_" ^ v, v, view_field, t, typ))
   in
@@ -1228,7 +1228,7 @@ let pred_params ctx ~at (p : S.predicate) param_types =
   let l = loc at in
   let+ params =
     State.all (List.zip_exn p.pred_params param_types) ~f:(fun ((id, _), t) ->
-        let* typ = State.of_result (typ ctx ~at t) in
+        let* typ = State.typ ctx ~at t in
         let+ raven = State.fresh id.S.pid_str in
         (id.pid_str, raven, t, R.Var.make ~loc:(loc id.pid_loc) (ident ~loc:l raven) typ))
   in
@@ -1357,13 +1357,13 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
     State.modify (fun (s : State.state) ->
         { s with names = { s.names with used = Set.add s.names.used "r" } })
   in
-  let* result_typ = State.of_result (typ ctx ~at result) in
+  let* result_typ = State.typ ctx ~at result in
   let* () = State.note_domain ctx.given.types result in
   let* result_name, names = State.of_result header_names in
   let* params =
     State.all (List.zip_exn names args) ~f:(fun (n, t) ->
         let* raven = State.fresh (Option.value n ~default:"x") in
-        let* typ = State.of_result (typ ctx ~at t) in
+        let* typ = State.typ ctx ~at t in
         let+ () = State.note_domain ctx.given.types t in
         (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
@@ -1528,7 +1528,7 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result contract =
   | [], None ->
       let open State.Syntax in
       let* () = State.note_domain ctx.given.types result in
-      let+ result_type = State.of_result (typ ctx ~at result) in
+      let+ result_type = State.typ ctx ~at result in
       let l = loc at in
       R.Callable.func ~loc:l
         ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]

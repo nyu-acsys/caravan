@@ -383,10 +383,10 @@ step_action:
 ;
 
 proof_module_argument:
-| LEFTPAR STRUCT TYPE t = lident EQUAL ty = typ END RIGHTPAR
+| LEFTPAR STRUCT TYPE ps = loption(type_parameters) t = lident EQUAL ty = typ END RIGHTPAR
     { if t.pid_str <> "t" then
         raise (Syntax_error (t.pid_loc, "A type argument must define type t"));
-      Proof_type_argument ty }
+      Proof_type_argument { type_params = ps; type_body = ty } }
 | LEFTPAR a = uqualid RIGHTPAR
     { Proof_module_argument a }
 ;

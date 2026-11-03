@@ -29,6 +29,8 @@ type t = {
   resource_types : Datatypes.t list;
   types : Datatypes.t list;
   native_resource_members : (Base.string * Translate_context.R.Member.t) list;
+  generic_resource_workers : (Generic_parameters.t * R.Member.t list) list;
+  generic_model_workers : (Generic_parameters.t * R.Member.t list) list;
   imported_resource_members : Translate_context.R.Member.t list;
   public_resource_members : (Source.proof_resource * Translate_context.R.Member.t) list;
   deferred_native_resource_members : Translate_context.R.Member.t list;
@@ -141,6 +143,32 @@ let proc_name ~(procedures : (Ident.t * string) list) (f : func) =
 let function_worker polymorphic_functions (f : func) =
   List.find polymorphic_functions ~f:(fun worker ->
       Ident.same worker.Polymorphic_functions.id f.id)
+
+let applied_function_worker ~generics ~polymorphic_functions ~groups ~canonical (f : func)
+    =
+  match Generic_modules.member generics f.id with
+  | None -> function_worker polymorphic_functions f
+  | Some (group, application, stem) ->
+      let source =
+        List.find_map group.body_members ~f:(fun (source, target) ->
+            Option.some_if (String.equal stem target) source)
+      in
+      let representative =
+        Option.bind source ~f:(fun source ->
+            List.Assoc.find group.representative.body_members source ~equal:String.equal)
+      in
+      Option.bind representative ~f:(fun id ->
+          List.find polymorphic_functions ~f:(fun worker ->
+              Ident.same worker.Polymorphic_functions.id id))
+      |> Option.map ~f:(fun (worker : Polymorphic_functions.t) ->
+          if List.exists groups ~f:(phys_equal group) then worker
+          else
+            {
+              worker with
+              name =
+                canonical
+                  (application.name ^ "." ^ (Qualified_name.of_string worker.name).name);
+            })
 
 let enclosing_worker polymorphic_functions (f : func) =
   match function_worker polymorphic_functions f with
@@ -260,13 +288,26 @@ let au_plan ~(asset_context : Path.t option -> Module_context.t) (au : Source.pr
   let asset_worker = asset_worker ~asset_context in
   if Option.is_none au.au_application then asset_worker au.au_scope else None
 
-let au_procedure ~(procedures : (Ident.t * string) list)
+let au_procedure ~polymorphic_functions ~(procedures : (Ident.t * string) list)
     ~(generics : Generic_modules.t list) ~(generic_procedures : (string * string) list)
     ~(asset_context : Path.t option -> Module_context.t) au f =
   let proc_name = proc_name ~procedures in
-  let body_proc_name = body_proc_name ~generics ~generic_procedures ~procedures in
+  let body_proc_name =
+    body_proc_name ~polymorphic_functions ~generics ~generic_procedures ~procedures
+  in
   let au_plan = au_plan ~asset_context in
-  match au_plan au with Some _ -> body_proc_name f | None -> proc_name f
+  let plan = au_plan au in
+  let groups =
+    Option.value_map plan ~default:[] ~f:(fun plan -> [ plan.Generic_proofs.group ])
+  in
+  match
+    applied_function_worker ~generics ~polymorphic_functions ~groups ~canonical:Fn.id f
+  with
+  | Some worker -> worker.name ^ "." ^ (Qualified_name.of_string (body_proc_name f)).name
+  | None -> (
+      match (enclosing_worker polymorphic_functions f, plan) with
+      | Some _, _ | _, Some _ -> body_proc_name f
+      | None, None -> proc_name f)
 
 let au_application_view ~(untyped_scoped_proofs : Proof_bindings.t) (au : Source.proof_au)
     =
@@ -288,7 +329,8 @@ let take_declarations ~available pending =
   in
   (List.concat_map ready ~f:snd, pending)
 
-let run (scopes : Program_scopes.t) : (t, error) Result.t =
+let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
+    (t, error) Result.t =
   let {
     Program_scopes.funcs;
     generic_proof_types;
@@ -307,6 +349,19 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   in
   let asset_context =
     Program_scopes.asset_context ~module_contexts:scopes.module_contexts
+  in
+  let decorate_resource resource =
+    let resource = Generic_assets.decorate_resource resource in
+    match resource.Source.resource_descriptor.family with
+    | None -> resource
+    | Some family ->
+        let worker =
+          Generic_family_plan.asset family_plan resource.resource_backend family.worker
+        in
+        let resource_descriptor =
+          { resource.resource_descriptor with family = Some { family with worker } }
+        in
+        Generic_assets.decorate_resource { resource with resource_descriptor }
   in
   let source =
     let project_descriptor context backend abstract_member descriptor =
@@ -353,25 +408,29 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                   ( Option.to_list parameter.original @ [ parameter.instance.parameter ],
                     resource.resource_name ))
             in
-            {
-              resource with
-              resource_backend = backend;
-              resource_descriptor =
-                project_descriptor context backend abstract_member
-                  resource.resource_descriptor;
-              resource_aliases =
-                List.map resource.resource_aliases
-                  ~f:(project_descriptor context backend None);
-              resource_public =
-                Option.map resource.resource_public ~f:(fun public ->
-                    let backend = Module_context.member context public.resource_backend in
-                    {
-                      public with
-                      resource_backend = backend;
-                      resource_descriptor =
-                        project_descriptor context backend None public.resource_descriptor;
-                    });
-            });
+            decorate_resource
+              {
+                resource with
+                resource_backend = backend;
+                resource_descriptor =
+                  project_descriptor context backend abstract_member
+                    resource.resource_descriptor;
+                resource_aliases =
+                  List.map resource.resource_aliases
+                    ~f:(project_descriptor context backend None);
+                resource_public =
+                  Option.map resource.resource_public ~f:(fun public ->
+                      let backend =
+                        Module_context.member context public.resource_backend
+                      in
+                      {
+                        public with
+                        resource_backend = backend;
+                        resource_descriptor =
+                          project_descriptor context backend None
+                            public.resource_descriptor;
+                      });
+              });
       proof_fields =
         List.map unprojected_source.proof_fields ~f:(fun field ->
             let context = asset_context field.Source.field_scope in
@@ -383,6 +442,35 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   in
   let resource_views resource =
     resource :: Option.to_list resource.Source.resource_public
+  in
+  let source =
+    {
+      source with
+      proof_fields =
+        List.map source.proof_fields ~f:(fun field ->
+            if List.is_empty field.Source.field_parameters then field
+            else
+              {
+                field with
+                field_family =
+                  Some
+                    (Generic_family_plan.asset family_plan field.field_backend
+                       (Generic_fields.worker field).name);
+              });
+    }
+  in
+  let application_context path =
+    let application =
+      List.find_map generics ~f:(fun group ->
+          List.find group.Generic_modules.applications ~f:(fun application ->
+              List.mem
+                (Generic_proofs.application_paths source inventory application.source)
+                path ~equal:Path.same))
+    in
+    Option.value_map application ~default:(asset_context (Some path))
+      ~f:(fun application ->
+        Module_context.for_location module_contexts
+          application.source.argument.site.item_loc)
   in
   let application_resources =
     Generic_proofs.resource_applications source inventory generic_proofs
@@ -403,6 +491,18 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                     Option.value_map view.resource_public ~default:public ~f:(fun view ->
                         { public with resource_id = view.resource_id }));
             })
+    |> List.map ~f:(fun resource ->
+        let resource = decorate_resource resource in
+        let namespace =
+          (Qualified_name.of_string resource.Source.resource_backend).path
+        in
+        let owner =
+          match resource.resource_path with
+          | Path.Pdot (owner, _) -> owner
+          | Pident _ | Papply _ | Pextra_ty _ -> resource.resource_path
+        in
+        Generic_assets.rebase_resource ~namespace
+          ~scope:(application_context owner).namespace resource)
   in
   let all_resources =
     application_resources
@@ -469,14 +569,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           else
             let resource = resource_view ~scope resource in
             let project = project resource.resource_scope in
-            Some
-              {
-                resource with
-                resource_type = project resource.resource_type;
-                resource_operations =
-                  List.map resource.resource_operations ~f:(fun (name, inputs, output) ->
-                      (name, List.map inputs ~f:project, project output));
-              })
+            Some (Source.map_resource_types resource ~f:project))
     in
     let fields =
       List.filter_map source.proof_fields ~f:(fun field ->
@@ -489,12 +582,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           if not (visible binding) then None
           else
             let project = project field.field_scope in
-            Some
-              {
-                field with
-                field_owner = project field.field_owner;
-                field_value = project field.field_value;
-              })
+            Some (Source.map_field_types field ~f:project))
     in
     let application_resources =
       List.filter_map application_resources ~f:(fun resource ->
@@ -524,12 +612,14 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                 ~f:(fun field ->
                   let prefix = (Qualified_name.of_string view.backend).path in
                   let leaf = (Qualified_name.of_string field.field_backend).name in
+                  let field = Source.map_field_types field ~f:view.project_type in
                   {
                     field with
                     field_path = Path.Pdot (view.path, field.field_name);
                     field_backend = String.concat ~sep:"." (prefix @ [ leaf ]);
-                    field_owner = view.project_type field.field_owner;
-                    field_value = view.project_type field.field_value;
+                    field_family =
+                      Option.map field.field_family
+                        ~f:(Generic_assets.rebase_worker ~namespace:prefix);
                     field_resource =
                       Option.map field.field_resource ~f:(fun owner ->
                           match
@@ -690,7 +780,13 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
           Ok
             (Some
                Polymorphic_functions.
-                 { id = f.id; paths = f.paths; scheme; name; loc = f.loc }))
+                 {
+                   id = f.id;
+                   paths = f.paths;
+                   scheme;
+                   name = Generic_family_plan.runtime family_plan f.id name;
+                   loc = f.loc;
+                 }))
     |> Result.map ~f:List.filter_opt
   in
   let* () =
@@ -735,21 +831,39 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
               unsupported id.pid_loc "Ghost results require a manual function proof"
           | _ -> Ok ()
         in
+        let* scheme =
+          Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
+            f.scheme_type
+        in
+        let procedure_parameters = scheme.variables in
+        let variables =
+          List.filter_map procedure_parameters ~f:(fun typ ->
+              match Types.get_desc typ with
+              | Tvar (Some name) -> Some (name, typ)
+              | _ -> None)
+        in
         let declared xs =
           all xs ~f:(fun (id, pty) ->
-              let* t = Source.ocaml_type f.environment ~at:id.S.pid_loc pty in
+              let* t = Source.ocaml_type ~variables f.environment ~at:id.S.pid_loc pty in
               Ok (id.pid_str, t))
         in
         let* procedure_inputs = declared (ghost_params f) in
         let* procedure_outputs = declared outputs in
         Ok
           ( proc_name f,
-            { procedure_inputs; procedure_outputs; procedure_result = f.body.exp_type } ))
+            {
+              procedure_parameters;
+              procedure_inputs;
+              procedure_outputs;
+              procedure_result = f.body.exp_type;
+              procedure_returns_value = not (is_unit f.body.exp_type);
+            } ))
   in
   let procedure_signatures = with_body_names procedure_signatures in
   let au_plan = au_plan ~asset_context in
   let au_procedure =
-    au_procedure ~procedures ~generics ~generic_procedures ~asset_context
+    au_procedure ~polymorphic_functions ~procedures ~generics ~generic_procedures
+      ~asset_context
   in
   let applied_atomic_operation (au : Source.proof_au) =
     let ( let* ) value f = Option.bind value ~f in
@@ -795,10 +909,44 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
   in
   let token_types =
     List.map atomic_operations ~f:(fun (au, f) ->
-        Datatypes.with_paths
-          (Datatypes.atomic_token ~path:au.Source.au_token_path
-             ~procedure:(au_procedure au f) ~at:au.au_at)
-          au.au_token_paths)
+        let data =
+          Datatypes.with_paths
+            (Datatypes.atomic_token ~path:au.Source.au_token_path
+               ~procedure:(au_procedure au f) ~at:au.au_at)
+            au.au_token_paths
+        in
+        let groups =
+          Option.value_map (au_plan au) ~default:[] ~f:(fun plan ->
+              [ plan.Generic_proofs.group ])
+        in
+        match
+          applied_function_worker ~generics ~polymorphic_functions ~groups
+            ~canonical:Fn.id f
+        with
+        | None -> data
+        | Some worker ->
+            let scope =
+              match (au.au_application, Generic_modules.member generics f.id) with
+              | Some _, Some (_, application, _) ->
+                  (Module_context.for_location module_contexts
+                     application.source.argument.site.item_loc)
+                    .namespace
+              | Some _, None | None, _ -> (Qualified_name.of_string worker.name).path
+            in
+            let member = "Token$" ^ au.au_name in
+            {
+              data with
+              parameters = au.au_parameters;
+              mathematical = true;
+              family =
+                Some
+                  {
+                    Datatypes.worker = worker.name;
+                    member;
+                    dictionary = "Values$" ^ member;
+                    scope;
+                  };
+            })
   in
   let generic_models = Generic_proofs.model_types source inventory generic_proofs in
   let generic_model data =
@@ -847,6 +995,24 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
     @ source.logical_types
     @ match source.sequence with Pident id -> [ Datatypes.sequence id ] | _ -> []
   in
+  let dependent_models =
+    List.filter data_types ~f:(Generic_models.dependent types)
+    |> List.map ~f:(Generic_models.decorate family_plan)
+  in
+  let types =
+    dependent_models
+    @ List.filter types ~f:(fun data ->
+        not
+          (List.exists dependent_models ~f:(fun model ->
+               String.equal (Generic_models.name model) (Generic_models.name data))))
+  in
+  let data_types =
+    List.filter data_types ~f:(fun data ->
+        not
+          (List.exists dependent_models ~f:(fun model ->
+               String.equal (Generic_models.name model) (Generic_models.name data))))
+  in
+  let* generic_model_workers = all dependent_models ~f:(Generic_models.members types) in
   (* Each data type's module, given the ones declared before it; a record type that is a
      reference has fields instead. *)
   let* modules =
@@ -866,9 +1032,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
         Ok (d.Datatypes.module_name, member))
   in
   let proof_module path ~at =
-    match
-      List.find all_resources ~f:(fun resource -> Source.resource_has_path resource path)
-    with
+    match Generic_assets.find_resource all_resources path with
     | Some resource -> Ok resource
     | None -> error at "The proof module argument has no translated declaration"
   in
@@ -896,7 +1060,7 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
              resource.resource_scope
         && depends_on_definition [] resource)
   in
-  let* native_resource_members =
+  let* resource_members =
     all
       (List.filter source.proof_resources ~f:(fun resource ->
            (not resource.Source.resource_abstract)
@@ -904,9 +1068,35 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       ~f:(fun resource ->
         let at = resource.Source.resource_at in
         let l = loc at in
+        let worker = Generic_assets.resource_worker resource in
+        let local_resources =
+          List.filter all_resources ~f:(fun candidate ->
+              Option.is_none candidate.Source.resource_application
+              && Option.equal Path.same candidate.resource_scope resource.resource_scope)
+        in
+        let types = Generic_assets.types local_resources types in
+        let types =
+          Option.value_map worker ~default:types ~f:(fun worker ->
+              Generic_parameters.types worker types)
+        in
+        let native_target target =
+          let target =
+            Generic_assets.local_resource ~scope:resource.resource_scope all_resources
+              target
+          in
+          match
+            Generic_assets.native_module types target resource.resource_parameters
+          with
+          | Some target -> Ok target
+          | None -> error at "The resource family arguments are not bound in this context"
+        in
         let* member =
           match (resource.resource_definition, resource.resource_alias_of) with
           | true, _ ->
+              let* () =
+                if Option.is_none worker then Ok ()
+                else unsupported at "A parameterized proof-defined resource algebra"
+              in
               let* backend =
                 match implementation resource with
                 | Some backend -> Ok backend
@@ -921,20 +1111,19 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                    (qualified_name ~loc:l backend))
           | false, Some path ->
               let* target = proof_module path ~at in
+              let* target = native_target target in
               Ok
                 (R.Member.alias ~loc:l
                    (ident ~loc:l (Qualified_name.of_string resource.resource_backend).name)
-                   (qualified_name ~loc:l target.resource_backend))
+                   (qualified_name ~loc:l target))
           | false, None ->
               let* arguments =
                 all resource.resource_arguments ~f:(function
                   | Source.Type_argument typ -> Datatypes.typ types ~at typ
                   | Module_argument path ->
                       let* argument = proof_module path ~at in
-                      Ok
-                        (R.Type.named ~loc:l
-                           (qualified_name ~loc:l argument.resource_backend)
-                           []))
+                      let* argument = native_target argument in
+                      Ok (R.Type.named ~loc:l (qualified_name ~loc:l argument) []))
               in
               let library =
                 qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
@@ -944,7 +1133,47 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                    (ident ~loc:l (Qualified_name.of_string resource.resource_backend).name)
                    library)
         in
-        Ok (resource.resource_backend, member))
+        match worker with
+        | None -> Ok (`Ordinary (resource.resource_backend, member))
+        | Some worker ->
+            let value_dictionary name carrier =
+              Prelude.value_dictionary ~loc:l ~name ~carrier
+                ~unrestricted:(R.Expr.bool ~loc:l true) ~body:(R.Expr.bool ~loc:l true)
+            in
+            let carrier =
+              R.Type.named ~loc:l (qualified_name ~loc:l (worker.member ^ ".T")) []
+            in
+            let dictionary =
+              value_dictionary (Generic_assets.dictionary_name resource "t") carrier
+            in
+            let* aliases =
+              all resource.resource_aliases ~f:(fun alias ->
+                  let alias_name = Generic_assets.alias_name alias in
+                  let member = Generic_assets.alias_member resource alias_name in
+                  let* carrier =
+                    match alias.Datatypes.alias with
+                    | Some typ -> Datatypes.typ types ~at typ
+                    | None -> error at "A resource family type alias has no definition"
+                  in
+                  Ok
+                    [
+                      R.Member.type_ ~loc:l (ident ~loc:l member) (Some carrier);
+                      value_dictionary
+                        (Generic_assets.dictionary_name resource alias_name)
+                        carrier;
+                    ])
+            in
+            Ok (`Generic (worker, member :: dictionary :: List.concat aliases)))
+  in
+  let native_resource_members =
+    List.filter_map resource_members ~f:(function
+      | `Ordinary member -> Some member
+      | `Generic _ -> None)
+  in
+  let generic_resource_workers =
+    List.filter_map resource_members ~f:(function
+      | `Generic worker -> Some worker
+      | `Ordinary _ -> None)
   in
   let imported_resource_members =
     List.filter_map source.proof_resources ~f:(fun resource ->
@@ -1194,7 +1423,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                 String.concat ~sep:"."
                   (context.namespace @ [ Fresh_names.fresh ("PolyPredicate$" ^ key) ])
               in
-              Ok (Some { worker with name })
+              Ok
+                (Some
+                   { worker with name = Generic_family_plan.proof family_plan key name })
           | Direct_invariant _ | Invariant _ ->
               let* () =
                 match definition with
@@ -1219,7 +1450,9 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
                         ("PolyInvariant$" ^ (Qualified_name.of_string key).name);
                     ])
               in
-              Ok (Some { worker with name })
+              Ok
+                (Some
+                   { worker with name = Generic_family_plan.proof family_plan key name })
           | View _ -> Ok None)
   in
   let generic_predicates = List.filter_opt generic_predicates in
@@ -1409,6 +1642,8 @@ let run (scopes : Program_scopes.t) : (t, error) Result.t =
       resource_types;
       types;
       native_resource_members;
+      generic_resource_workers;
+      generic_model_workers;
       imported_resource_members;
       public_resource_members;
       deferred_native_resource_members;

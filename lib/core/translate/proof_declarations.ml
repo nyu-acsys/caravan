@@ -34,7 +34,7 @@ let action_checks ctx (st : structure) =
         in
         let* params =
           State.all st.params ~f:(fun (x, t) ->
-              let* typ = State.of_result (typ ctx ~at t) in
+              let* typ = State.typ ctx ~at t in
               let+ raven = State.fresh x in
               (x, raven, t, typ))
         in
@@ -62,7 +62,7 @@ let action_checks ctx (st : structure) =
         | Some action_params ->
             let* action_vars =
               State.all action_params ~f:(fun (_, raven, t) ->
-                  let+ typ = State.of_result (typ ctx ~at t) in
+                  let+ typ = State.typ ctx ~at t in
                   R.Var.make ~loc:l (ident ~loc:l raven) typ)
             in
             let opened =
@@ -216,7 +216,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
       let ctx =
         let base =
           spec_context types ~shared ~ocaml_env ~preds ~spec_funcs ~primitive_namespace
-            ~generic_predicates ?polymorphic_functions ()
+            ~proof_support ~generic_predicates ?polymorphic_functions ()
         in
         {
           base with
@@ -228,7 +228,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
       let open State.Syntax in
       let l = loc lemma_name.pid_loc in
       let declare ?(implicit = false) (id, _) ty =
-        let* raven_type = State.of_result (typ ctx ~at:id.S.pid_loc ty) in
+        let* raven_type = State.typ ctx ~at:id.S.pid_loc ty in
         let+ raven = State.fresh id.pid_str in
         ( id.pid_str,
           raven,
@@ -264,7 +264,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         {
           ctx;
           logical_definition = false;
-          data = types;
+          data = ctx.given.types;
           funcs = spec_funcs;
           var_types = List.map parameters ~f:(fun (x, _, ty, _) -> (x, ty));
           vars = List.map parameters ~f:(fun (x, raven, _, _) -> (x, Raven raven));
@@ -378,7 +378,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
         let* elt, elt_typ =
           match Datatypes.desc types otyp with
           | Tconstr (_, [ elt ], _) ->
-              let+ elt_typ = State.of_result (typ ctx ~at elt) in
+              let+ elt_typ = State.typ ctx ~at elt in
               (elt, elt_typ)
           | _ -> State.of_result (error at "A sequence owned by index")
         in
@@ -556,7 +556,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let body = List.fold (halves @ history) ~init:body ~f:(bin And) in
       let+ ons =
         State.all st.pendings ~f:(fun p ->
-            let+ key = State.of_result (typ ctx ~at p.key_type) in
+            let+ key = State.typ ctx ~at p.key_type in
             R.Var.make ~loc:l (ident ~loc:l p.pending_on)
               (R.Type.map ~loc:l (R.Type.ref ~loc:l) key))
       in
@@ -848,15 +848,15 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
       @@
       let* params =
         State.all (List.zip_exn function_params inputs) ~f:(fun ((id, _), ty) ->
-            let* raven_type = State.of_result (typ ctx ~at:id.S.pid_loc ty) in
+            let* raven_type = State.typ ctx ~at:id.S.pid_loc ty in
             let+ raven = State.fresh id.pid_str in
             (id.pid_str, raven, ty, R.Var.make ~loc:l (ident ~loc:l raven) raven_type))
       in
-      let* result_type = State.of_result (typ ctx ~at:function_name.pid_loc output) in
+      let* result_type = State.typ ctx ~at:function_name.pid_loc output in
       let env =
         {
           ctx;
-          data = types;
+          data = ctx.given.types;
           funcs = spec_funcs;
           logical_definition = true;
           vars = List.map params ~f:(fun (x, raven, _, _) -> (x, Raven raven));

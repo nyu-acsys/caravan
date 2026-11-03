@@ -215,6 +215,35 @@ let () =
   end;
   begin match
     parse_proof
+      {|module Facts = SetRA (struct type 'a t = 'a fact end)
+        module Authority = Auth (Facts)
+        module Pair = Product
+          (struct type ('a, 'b) t = 'a left end)
+          (struct type ('x, 'y) t = 'y right end)|}
+  with
+  | [
+   Proof_resource
+     { resource_arguments = [ Proof_type_argument { type_params = [ a ]; _ } ]; _ };
+   Proof_resource { resource_arguments = [ Proof_module_argument _ ]; _ };
+   Proof_resource
+     {
+       resource_arguments =
+         [
+           Proof_type_argument { type_params = [ first; second ]; _ };
+           Proof_type_argument { type_params = [ left; right ]; _ };
+         ];
+       _;
+     };
+  ] ->
+      assert (a.pid_str = "a");
+      assert (first.pid_str = "a");
+      assert (second.pid_str = "b");
+      assert (left.pid_str = "x");
+      assert (right.pid_str = "y")
+  | _ -> failwith "parameterized resource arguments were not parsed"
+  end;
+  begin match
+    parse_proof
       {|type fact = Seen of int
         module Facts = SetRA (struct type t = fact end)
         module Authority = Auth (Facts)

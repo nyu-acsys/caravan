@@ -417,6 +417,9 @@ let proof_call ?expected env t =
   match head.S.term_desc with
   | Tvar q when Option.is_some (atomic_proof_signature env t) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
+      let* signature =
+        instantiate_atomic_signature env ~at:t.term_loc ?expected signature method_ args
+      in
       let inputs, outputs = Option.value_exn (atomic_inputs signature method_) in
       let* values = typed_arguments env ~at:t.term_loc inputs args in
       let* () =
@@ -459,6 +462,19 @@ let proof_signature env (t : S.term) =
       | _ -> None
       end
 
+let instantiate_proof_call_signature ?expected env t signature =
+  let open State.Syntax in
+  let head, args = spine t [] in
+  match head.S.term_desc with
+  | Tvar q when Option.is_some (atomic_proof_signature env t) ->
+      let atomic, method_ = Option.value_exn (atomic_method env q) in
+      let+ atomic =
+        instantiate_atomic_signature env ~at:t.term_loc ?expected atomic method_ args
+      in
+      let inputs, outputs = Option.value_exn (atomic_inputs atomic method_) in
+      { signature with lemma_inputs = inputs; lemma_outputs = outputs }
+  | _ -> instantiate_proof_signature env ~at:t.term_loc ?expected signature args
+
 let ghost_fpu env t =
   let open State.Syntax in
   let _, args = spine t [] in
@@ -468,12 +484,17 @@ let ghost_fpu env t =
       | None ->
           State.of_result
             (error location.term_loc "Ghost.fpu needs a declared ghost field location")
-      | Some (field, _) ->
+      | Some (field, owner) ->
+          let* field =
+            instantiate_ghost_field env ~at:location.term_loc
+              ?expected:(Option.first_some (term_type env before) (term_type env after))
+              field owner
+          in
           let* () =
             if resource_field env field then State.return ()
             else State.of_result (error t.term_loc "Ghost.fpu requires a resource field")
           in
-          let* location = location_of env location in
+          let* location = location_of ~expected:field.field_value env location in
           let value t =
             let* () =
               match term_type env t with
@@ -516,6 +537,28 @@ let ghost_initializers env ~owner t =
             | Some _ when shadowed_ghost_descriptor env q ->
                 State.of_result (error at "This name shadows a ghost field descriptor")
             | Some field ->
+                let* instance, field =
+                  State.of_result
+                    (Generic_fields.specialize ~types:env.data
+                       ~environment:env.ctx.given.env ~at ~owner:(Some owner)
+                       ~value:(term_type env value) field)
+                in
+                let* field =
+                  match instance with
+                  | None -> State.return field
+                  | Some (worker, arguments) ->
+                      let+ target =
+                        State.value_instance env.ctx ~at ~target:worker.name ~arguments
+                      in
+                      {
+                        field with
+                        field_backend =
+                          target ^ "."
+                          ^ (Qualified_name.of_string field.field_backend).name;
+                        field_parameters = [];
+                      }
+                in
+                let* () = State.note_domain env.data field.field_value in
                 let* () =
                   State.of_result
                     (if
@@ -545,7 +588,7 @@ let ghost_initializers env ~owner t =
   in
   List.map fields ~f:snd
 
-let ghost_value_location env t =
+let ghost_value_location ?expected env t =
   let open State.Syntax in
   match ghost_projection env t with
   | None ->
@@ -553,8 +596,9 @@ let ghost_value_location env t =
   | Some (field, _) when resource_field env field ->
       State.of_result
         (error t.term_loc "Ghost.read and Ghost.write require an ordinary value field")
-  | Some (field, _) ->
-      let+ location = location_of env t in
+  | Some (field, owner) ->
+      let* field = instantiate_ghost_field env ~at:t.term_loc ?expected field owner in
+      let+ location = location_of ~expected:field.field_value env t in
       (field, location)
 
 (** Type information for lexical bindings; annotations resolve logical operations whose
@@ -563,27 +607,24 @@ let rec proof_value_types ?expected env (t : S.term) =
   let open State.Syntax in
   match proof_signature env t with
   | Some signature ->
-      let+ signature =
-        instantiate_proof_signature env ~at:t.term_loc ?expected signature
-          (snd (spine t []))
-      in
+      let+ signature = instantiate_proof_call_signature ?expected env t signature in
       List.map signature.lemma_outputs ~f:Option.some
   | None ->
       begin match t.term_desc with
       | Ttuple ts -> State.all ts ~f:(proof_value_type env)
       | _ ->
-          let+ ty = proof_value_type env t in
+          let+ ty = proof_value_type ?expected env t in
           [ ty ]
       end
 
-and proof_value_type env (t : S.term) =
+and proof_value_type ?expected env (t : S.term) =
   let open State.Syntax in
   match (ghost_operation t, snd (spine t [])) with
   | Some "alloc", [ _ ] ->
       State.of_result
         (Result.map (Source.ghost_type env.ctx.given.env ~at:t.term_loc) ~f:Option.some)
   | Some "read", [ location ] ->
-      let+ field, _ = ghost_value_location env location in
+      let+ field, _ = ghost_value_location ?expected env location in
       Some field.field_value
   | _ -> (
       match t.term_desc with
@@ -763,7 +804,7 @@ let witness_binding :
   (* Each existential's Raven existentials, one per field of a record, with locals. *)
   let local prefix (existential, ty) =
     let* raven = State.fresh prefix in
-    let+ raven_type = State.of_result (typ env.ctx ~at:t.term_loc ty) in
+    let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
     (existential, raven, raven_type)
   in
   let* existentials =
@@ -923,7 +964,9 @@ let rec proof_expression env targets (body : S.proof_expr) =
   | Proof_value t when Option.equal String.equal (ghost_operation t) (Some "write") ->
       begin match snd (spine t []) with
       | [ location; value ] ->
-          let* field, location = ghost_value_location env location in
+          let* field, location =
+            ghost_value_location ?expected:(term_type env value) env location
+          in
           let* () = check_logical ~expected:field.field_value value in
           let* value = expected_formula env (Some field.field_value) value in
           unit_statement (R.Stmt.assign ~loc:l [ location ] (R.Stmt.expr_rhs value))
@@ -933,7 +976,9 @@ let rec proof_expression env targets (body : S.proof_expr) =
   | Proof_value t when Option.equal String.equal (ghost_operation t) (Some "read") ->
       begin match (snd (spine t []), targets) with
       | [ location ], [ target ] ->
-          let* field, location = ghost_value_location env location in
+          let* field, location =
+            ghost_value_location ~expected:target.target_type env location
+          in
           let+ () =
             if
               Ctype.is_equal env.ctx.given.env false [ field.field_value ]
@@ -968,10 +1013,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
           let expected =
             packed_type (List.map targets ~f:(fun target -> target.target_type))
           in
-          let* signature =
-            instantiate_proof_signature env ~at:t.term_loc ~expected signature
-              (snd (spine t []))
-          in
+          let* signature = instantiate_proof_call_signature ~expected env t signature in
           let* () =
             if
               Ctype.is_equal env.ctx.given.env false
@@ -999,7 +1041,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
                 let+ temporaries =
                   State.all outputs ~f:(fun ty ->
                       let* raven = State.fresh "result" in
-                      let+ raven_type = State.of_result (typ env.ctx ~at:t.term_loc ty) in
+                      let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
                       let target = { target_name = raven; target_type = ty } in
                       ( target,
                         R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
@@ -1022,7 +1064,7 @@ let rec proof_expression env targets (body : S.proof_expr) =
                 begin match outputs with
                 | [ ty ] when not (List.is_empty targets) ->
                     let* raven = State.fresh "result" in
-                    let+ raven_type = State.of_result (typ env.ctx ~at:t.term_loc ty) in
+                    let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
                     let result = R.Expr.var ~loc:l (name ~loc:l raven) in
                     let declaration =
                       R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
@@ -1192,7 +1234,7 @@ and proof_value_binding :
     State.all bindings ~f:(fun (id, ty) ->
         let id = Option.value id ~default:(S.mk_id ~loc:pattern.pat_loc "discard") in
         let* raven = State.fresh id.pid_str in
-        let+ raven_type = State.of_result (typ env.ctx ~at:id.pid_loc ty) in
+        let+ raven_type = State.typ env.ctx ~at:id.pid_loc ty in
         ( id,
           { target_name = raven; target_type = ty },
           R.Stmt.local ~loc:(loc id.pid_loc) ~ghost:true ~typ:raven_type
@@ -1347,7 +1389,7 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
         in
         let* value = expected_formula env (Some ty) state in
         let* raven = State.fresh "proof_state" in
-        let* raven_type = State.of_result (typ ctx ~at:state.term_loc ty) in
+        let* raven_type = State.typ ctx ~at:state.term_loc ty in
         let l = loc state.term_loc in
         let result = R.Expr.var ~loc:l (name ~loc:l raven) in
         let+ () =

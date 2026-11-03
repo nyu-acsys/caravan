@@ -24,7 +24,7 @@ let constructor_value ctx ~at ~result_type data constructor arguments =
   in
   if List.is_empty data.Datatypes.parameters then State.return value
   else
-    let+ typ = State.of_result (typ ctx ~at result_type) in
+    let+ typ = State.typ ctx ~at result_type in
     R.Expr.annotated value typ
 
 let polymorphic_ordering ctx path (args : Typedtree.expression list) =
@@ -114,7 +114,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   | Texp_constant (Const_int n) -> State.return ([], R.Expr.int ~loc:l n)
   | Texp_constant _ -> State.of_result (unsupported at "This constant")
   | Texp_unreachable ->
-      let* typ = State.of_result (typ ctx ~at e.exp_type) in
+      let* typ = State.typ ctx ~at e.exp_type in
       let+ x = State.fresh "unreachable" in
       ( R.Stmt.assert_ ~loc:l (R.Spec.make (R.Expr.bool ~loc:l false))
         :: R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
@@ -153,7 +153,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           (Datatypes.find_label ctx.given.types label)
       with
       | Some { heap = Some _; _ } ->
-          let* typ = State.of_result (typ ctx ~at e.exp_type) in
+          let* typ = State.typ ctx ~at e.exp_type in
           let* fields =
             State.all values ~f:(fun (label, _) ->
                 let+ field = State.field_of_label ctx.given ~at label in
@@ -189,7 +189,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           match Datatypes.admissible ~loc:l ctx.given.types e.exp_type value with
           | None -> State.return (stmts, value)
           | Some _ ->
-              let* typ = State.of_result (typ ctx ~at e.exp_type) in
+              let* typ = State.typ ctx ~at e.exp_type in
               let* () = State.note_domain ctx.given.types e.exp_type in
               let+ x = State.fresh "tmp" in
               ( stmts
@@ -219,9 +219,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
         match scrutinee.exp_desc with
         | Texp_ident (Pident _, _, _) -> State.return ([], v)
         | _ ->
-            let* typ =
-              State.of_result (typ ctx ~at:scrutinee.exp_loc scrutinee.exp_type)
-            in
+            let* typ = State.typ ctx ~at:scrutinee.exp_loc scrutinee.exp_type in
             let+ x = State.fresh "scrutinee" in
             ( R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs v) (ident ~loc:l x),
               R.Expr.var ~loc:l (name ~loc:l x) )
@@ -290,7 +288,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
             | None ->
                 let+ defs =
                   State.all binds ~f:(fun (id, value, t) ->
-                      let* typ = State.of_result (typ ctx ~at t) in
+                      let* typ = State.typ ctx ~at t in
                       let* () = State.note_domain ctx.given.types t in
                       let+ x = State.bind_name ~typ:t id in
                       R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
@@ -397,7 +395,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let statements = stmts @ [ R.Stmt.assert_ ~loc:l (R.Spec.make c) ] in
       if is_unit e.exp_type then State.return (statements, unit_value ~loc:l)
       else
-        let* typ = State.of_result (typ ctx ~at e.exp_type) in
+        let* typ = State.typ ctx ~at e.exp_type in
         let+ result = State.fresh "unreachable" in
         ( statements @ R.Stmt.local ~loc:l ~typ (ident ~loc:l result),
           R.Expr.var ~loc:l (name ~loc:l result) )
@@ -494,7 +492,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   (* The result of [f] applied to the atomic and [args], in a variable, a step that
      linearizes the function by default as [default] says. *)
   let result ?(default = `Commit) ?op f atomic args =
-    let* typ = State.of_result (typ ctx ~at e.exp_type) in
+    let* typ = State.typ ctx ~at e.exp_type in
     let* x = State.fresh "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let init =
@@ -537,7 +535,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       ( stmts @ views @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
         R.Expr.var ~loc:l (name ~loc:l x) )
   | "get", [ a ] ->
-      let* typ = State.of_result (typ ctx ~at e.exp_type) in
+      let* typ = State.typ ctx ~at e.exp_type in
       let* x = State.fresh "tmp" in
       let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (qualified_name ~loc:l field)) in
       let* how = how `Abort in
@@ -677,11 +675,11 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
         let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f ->
-            let* actual_target =
-              State.polymorphic_call ctx ~at ~path ~declaration:declaration.val_type
-                ~occurrence ~target:f
+            let* actual_target, type_instance =
+              State.polymorphic_application ctx ~at ~path
+                ~declaration:declaration.val_type ~occurrence ~target:f
             in
-            call ~actual_target ctx e f args
+            call ~actual_target ?type_instance ctx e f args
         | None -> (
             match path with
             | Pident _ -> State.of_result (unsupported at "A call of a local function")
@@ -690,16 +688,40 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
 
 (** The call of the top-level function [f] with [args], in [e]: a statement, whose result
     is kept in a variable unless it is unit. *)
-and call ?actual_target ctx (e : Typedtree.expression) f
+and call ?actual_target ?type_instance ctx (e : Typedtree.expression) f
     (ocaml_args : Typedtree.expression list) =
   let* arguments, args = operands ctx ocaml_args in
-  let signature = List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal in
+  let* signature =
+    match List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal with
+    | None -> State.return None
+    | Some signature ->
+        begin match type_instance with
+        | None -> State.return (Some signature)
+        | Some _ when List.is_empty signature.procedure_parameters ->
+            State.return (Some signature)
+        | Some (_, arguments) ->
+            if List.length signature.procedure_parameters <> List.length arguments then
+              State.of_result (unsupported e.exp_loc "This generic ghost-call signature")
+            else
+              State.return
+                (Some
+                   (map_procedure_types signature ~f:(fun typ ->
+                        Option.value_exn
+                          (Datatypes.instantiate_alias signature.procedure_parameters
+                             arguments typ))))
+        end
+  in
   let inputs = Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_inputs) in
   let outputs =
     Option.value_map signature ~default:[] ~f:(fun s -> s.procedure_outputs)
   in
+  let returns_value =
+    Option.value_map signature
+      ~default:(not (is_unit e.exp_type))
+      ~f:(fun signature -> signature.procedure_returns_value)
+  in
   let run explicit =
-    call_prepared ?actual_target ctx e f ocaml_args args ~explicit
+    call_prepared ?actual_target ctx e f ocaml_args args ~explicit ~returns_value
       ~signature_outputs:outputs
   in
   let annotation =
@@ -720,7 +742,7 @@ and call ?actual_target ctx (e : Typedtree.expression) f
       (arguments @ statements, value)
 
 and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args args
-    ~explicit ~signature_outputs =
+    ~explicit ~returns_value ~signature_outputs =
   let l = loc e.exp_loc in
   let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
@@ -938,14 +960,14 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   let* public =
     State.all signature_outputs ~f:(fun (_, ty) ->
         let* raven = State.fresh "ghost_result" in
-        let+ raven_type = State.of_result (typ ctx ~at:e.exp_loc ty) in
+        let+ raven_type = State.typ ctx ~at:e.exp_loc ty in
         ( R.Expr.var ~loc:l (name ~loc:l raven),
           R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven) ))
   in
   let public_values = List.map public ~f:fst in
   let ghost_decls = List.concat_map public ~f:snd @ ghost_decls in
   let ghosts = public_values @ ghosts in
-  if is_unit e.exp_type then
+  if is_unit e.exp_type && not returns_value then
     let+ closing = closing (unit_value ~loc:l) in
     let call =
       match ghosts with
@@ -954,7 +976,7 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
     in
     (stmts @ opening @ call @ closing, unit_value ~loc:l, public_values)
   else
-    let* typ = State.of_result (typ ctx ~at:e.exp_loc e.exp_type) in
+    let* typ = State.typ ctx ~at:e.exp_loc e.exp_type in
     let* x = State.fresh "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
     let def =
@@ -1079,7 +1101,7 @@ and match_cases ?commits ~tail ctx ~at v
          let* entry = enter_arm ctx ~commits in
          let* defs =
            State.all binds ~f:(fun (id, value, t) ->
-               let* typ = State.of_result (typ ctx ~at t) in
+               let* typ = State.typ ctx ~at t in
                let* () = State.note_domain ctx.given.types t in
                let+ x = State.bind_name ~typ:t id in
                R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
@@ -1287,7 +1309,7 @@ and branch ctx (e : Typedtree.expression) make =
     let+ stmts = make None in
     (stmts, unit_value ~loc:l)
   else
-    let* typ = State.of_result (typ ctx ~at:e.exp_loc e.exp_type) in
+    let* typ = State.typ ctx ~at:e.exp_loc e.exp_type in
     let* x = State.fresh "tmp" in
     let+ stmts = make (Some (x, l)) in
     ( R.Stmt.local ~loc:l ~const:false ~typ (ident ~loc:l x) @ stmts,

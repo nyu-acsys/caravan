@@ -103,8 +103,26 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
           (Report.error Type name.pid_loc
              (Printf.sprintf "The proof constructor %s is already declared" name.pid_str))
   in
-  let checked_type env at typ =
-    (Typetexp.transl_simple_type env ~closed:true (core_type ~at typ)).ctyp_type
+  let checked_constructor env ~at ~name parameters body =
+    let declaration =
+      Ast_helper.Type.mk ~loc:at
+        ~params:
+          (List.map parameters ~f:(fun parameter ->
+               ( Ast_helper.Typ.var ~loc:parameter.S.pid_loc parameter.pid_str,
+                 (Asttypes.NoVariance, Asttypes.NoInjectivity) )))
+        ~manifest:(core_type ~at body)
+        { txt = Compiler_types.internal_name ~at ("argument_" ^ name); loc = at }
+    in
+    let typed =
+      Typemod.type_interface env [ Ast_helper.Sig.type_ Nonrecursive [ declaration ] ]
+    in
+    match typed.sig_type with
+    | [ Types.Sig_type (_, declaration, _, _) ] ->
+        (declaration.type_params, Option.value_exn declaration.type_manifest)
+    | _ -> failwith "A type argument must elaborate to one type declaration"
+  in
+  let apply_parameters parameters arguments typ =
+    Option.value_exn (Datatypes.instantiate_alias parameters arguments typ)
   in
   let module_exists env name =
     try
@@ -261,14 +279,23 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 Error (Report.error Type at "The AU operation must be a function")
               else Ok ()
             in
+            let* scheme = Polymorphic_functions.discover ~at operation_type in
+            let parameters = scheme.variables in
             let declaration =
+              let params =
+                List.mapi parameters ~f:(fun index _ ->
+                    ( Ast_helper.Typ.var ~loc:at ("a" ^ Int.to_string index),
+                      (Asttypes.NoVariance, Asttypes.NoInjectivity) ))
+              in
               Ast_helper.Sig.module_
                 (Ast_helper.Md.mk ~loc:at
                    { txt = Some name.pid_str; loc = at }
                    (Ast_helper.Mty.signature ~loc:at
                       [
                         Ast_helper.Sig.type_ Nonrecursive
-                          [ Ast_helper.Type.mk ~loc:at { txt = "token"; loc = at } ];
+                          [
+                            Ast_helper.Type.mk ~loc:at ~params { txt = "token"; loc = at };
+                          ];
                       ]))
             in
             let typed = Typemod.type_interface env [ declaration ] in
@@ -287,17 +314,19 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                    ({ txt = Lident name.pid_str; loc = at }, { txt = "token"; loc = at }))
                 env
             in
-            let token = Ctype.newconstr token_path [] in
+            let token =
+              Btype.newgenty (Types.get_desc (Ctype.newconstr token_path parameters))
+            in
             let arrow args result =
               List.fold_right args ~init:result ~f:(fun arg result ->
-                  Ctype.newty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
+                  Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
             in
             let value (name, args, result) =
               let id = Ident.create_local name in
               Types.Sig_value
                 ( id,
                   {
-                    val_type = arrow args result;
+                    val_type = Compiler_types.scheme_structure (arrow args result);
                     val_kind = Val_reg;
                     val_loc = at;
                     val_attributes = [];
@@ -329,6 +358,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 au_operation = operation;
                 au_operation_path = operation_path;
                 au_operation_type = operation_type;
+                au_parameters = parameters;
                 au_token = token;
                 au_token_path = token_path;
                 au_token_paths = [ token_path ];
@@ -390,6 +420,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     (Datatypes.resource_type ~name:name.pid_str ~module_id:resource_id ~at)
                     with
                     alias = Some target.resource_type;
+                    parameters = target.resource_parameters;
                   }
                 in
                 let aliases =
@@ -404,6 +435,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                            ~library_id:resource_id ~at member)
                         with
                         alias = previous.alias;
+                        parameters = previous.parameters;
                       })
                 in
                 let resource =
@@ -489,7 +521,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   Result.all
                     (List.map pairs ~f:(fun (parameter, argument) ->
                          match argument with
-                         | S.Proof_type_argument typ ->
+                         | S.Proof_type_argument { type_params; type_body } ->
                              let* () =
                                if
                                  Proof_library.accepts_type_argument signatures
@@ -501,7 +533,11 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                       (Printf.sprintf "Parameter %s requires a module"
                                          parameter.name))
                              in
-                             Ok (Type_argument (checked_type env at typ))
+                             let parameters, body =
+                               checked_constructor env ~at ~name:parameter.name
+                                 type_params type_body
+                             in
+                             Ok (Type_argument body, parameters)
                          | Proof_module_argument module_name ->
                              let loc = S.qualid_loc module_name in
                              let* path =
@@ -543,7 +579,43 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                          "The proof module argument does not implement %s"
                                          (String.concat ~sep:"." parameter.interface)))
                              in
-                             Ok (Module_argument path)))
+                             Ok (Module_argument path, actual.resource_parameters)))
+                in
+                let arities =
+                  List.filter_map arguments ~f:(fun (_, parameters) ->
+                      Option.some_if
+                        (not (List.is_empty parameters))
+                        (List.length parameters))
+                in
+                let arity = Option.value (List.hd arities) ~default:0 in
+                let* () =
+                  if List.for_all arities ~f:(Int.equal arity) then Ok ()
+                  else
+                    Error
+                      (Report.error Type at
+                         "A proof module family requires equal nonzero argument arities")
+                in
+                let family_names = List.init arity ~f:(fun i -> "a" ^ Int.to_string i) in
+                let resource_parameters =
+                  List.map family_names ~f:(fun name ->
+                      Btype.newgenty (Types.Tvar (Some name)))
+                in
+                let family_arguments =
+                  List.map family_names ~f:(Ast_helper.Typ.var ~loc:at)
+                in
+                let family_type_params =
+                  List.map family_arguments ~f:(fun typ ->
+                      (typ, (Asttypes.NoVariance, Asttypes.NoInjectivity)))
+                in
+                let arguments =
+                  List.map arguments ~f:(fun (argument, parameters) ->
+                      match argument with
+                      | Type_argument typ ->
+                          let arguments =
+                            if List.is_empty parameters then [] else resource_parameters
+                          in
+                          Type_argument (apply_parameters parameters arguments typ)
+                      | Module_argument _ -> argument)
                 in
                 let rec same_resource left right =
                   if Ident.same left.resource_id right.resource_id then true
@@ -571,15 +643,16 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                             && (not right.resource_abstract)
                             && List.equal String.equal left.resource_functor
                                  right.resource_functor
-                            && same_arguments left.resource_arguments
+                            && same_arguments left.resource_parameters
+                                 right.resource_parameters left.resource_arguments
                                  right.resource_arguments
                         end
-                and same_arguments left right =
+                and same_arguments left_parameters right_parameters left right =
                   List.length left = List.length right
+                  && List.length left_parameters = List.length right_parameters
                   && List.for_all2_exn left right ~f:(fun left right ->
                       match (left, right) with
-                      | Type_argument left, Type_argument right ->
-                          Ctype.is_equal env false [ left ] [ right ]
+                      | Type_argument _, Type_argument _ -> true
                       | Module_argument left, Module_argument right ->
                           if Path.same left right then true
                           else
@@ -593,6 +666,15 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                       | Type_argument _, Module_argument _
                       | Module_argument _, Type_argument _ ->
                           false)
+                  && Ctype.is_equal env true
+                       (left_parameters
+                       @ List.filter_map left ~f:(function
+                         | Type_argument typ -> Some typ
+                         | Module_argument _ -> None))
+                       (right_parameters
+                       @ List.filter_map right ~f:(function
+                         | Type_argument typ -> Some typ
+                         | Module_argument _ -> None))
                 in
                 let applicative_source =
                   List.find resources ~f:(fun resource ->
@@ -600,7 +682,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                       && (not resource.resource_definition)
                       && (not resource.resource_abstract)
                       && List.equal String.equal resource.resource_functor library.path
-                      && same_arguments resource.resource_arguments arguments)
+                      && same_arguments resource.resource_parameters resource_parameters
+                           resource.resource_arguments arguments)
                 in
                 let* env, type_members =
                   match applicative_source with
@@ -625,7 +708,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         List.map anchored ~f:(fun member ->
                             Ast_helper.Sig.type_ Nonrecursive
                               [
-                                Ast_helper.Type.mk ~loc:at
+                                Ast_helper.Type.mk ~loc:at ~params:family_type_params
                                   { txt = hidden_name member; loc = at };
                               ])
                       in
@@ -650,19 +733,48 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 let alias_names =
                   List.filter_map pairs ~f:(fun (parameter, argument) ->
                       match argument with
-                      | S.Proof_type_argument typ ->
-                          Some (parameter.name, alias_name parameter, typ)
+                      | S.Proof_type_argument { type_params; type_body } ->
+                          let names =
+                            if List.is_empty type_params then []
+                            else
+                              List.zip_exn
+                                (List.map type_params ~f:(fun parameter ->
+                                     parameter.S.pid_str))
+                                family_names
+                          in
+                          let rec rename = function
+                            | S.PTtyvar id ->
+                                let name =
+                                  List.Assoc.find_exn names id.pid_str ~equal:String.equal
+                                in
+                                S.PTtyvar { id with pid_str = name }
+                            | PTtyapp (name, arguments) ->
+                                S.PTtyapp (name, List.map arguments ~f:rename)
+                            | PTtuple elements -> S.PTtuple (List.map elements ~f:rename)
+                            | PTarrow (argument, result) ->
+                                S.PTarrow (rename argument, rename result)
+                          in
+                          Some (parameter.name, alias_name parameter, rename type_body)
                       | Proof_module_argument _ -> None)
                 in
-                let named name =
-                  Ast_helper.Typ.constr ~loc:at { txt = Lident name; loc = at } []
+                let named ?(arguments = []) name =
+                  Ast_helper.Typ.constr ~loc:at { txt = Lident name; loc = at } arguments
                 in
                 let substitutions =
-                  List.map pairs ~f:(fun (formal, argument) ->
+                  List.map (List.zip_exn pairs arguments)
+                    ~f:(fun ((formal, argument), typed_argument) ->
                       let typ =
                         match argument with
-                        | S.Proof_type_argument _ -> named (alias_name formal)
+                        | S.Proof_type_argument _ ->
+                            named ~arguments:family_arguments (alias_name formal)
                         | Proof_module_argument q ->
+                            let actual =
+                              match typed_argument with
+                              | Module_argument path ->
+                                  Option.value_exn (resource_at_path env resources path)
+                              | Type_argument _ ->
+                                  failwith "A module argument must retain its kind"
+                            in
                             Ast_helper.Typ.constr ~loc:at
                               {
                                 txt =
@@ -671,15 +783,18 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                       { txt = "t"; loc = at } );
                                 loc = at;
                               }
-                              []
+                              (if List.is_empty actual.resource_parameters then []
+                               else family_arguments)
                       in
                       (formal.name, typ))
                 in
                 let metadata_type =
-                  Proof_library.ocaml_type ~at ~signature:library ~substitutions
+                  Proof_library.ocaml_type ~family_arguments ~at ~signature:library
+                    ~substitutions
                 in
                 let operation_type =
-                  Proof_library.operation_type ~at ~signature:library ~substitutions
+                  Proof_library.operation_type ~family_arguments ~at ~signature:library
+                    ~substitutions
                 in
                 let* type_items =
                   Result.all
@@ -689,7 +804,9 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                              List.find type_members ~f:(fun (name, _, _) ->
                                  String.equal name member.name)
                            with
-                           | Some (_, id, _) -> Ok (Some (named (Ident.name id)))
+                           | Some (_, id, _) ->
+                               Ok
+                                 (Some (named ~arguments:family_arguments (Ident.name id)))
                            | None when Option.is_some member.definition && not member.rep
                              ->
                                let definition = Option.value_exn member.definition in
@@ -698,7 +815,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                            | _ -> Ok None
                          in
                          let declaration =
-                           Ast_helper.Type.mk ~loc:at ?manifest
+                           Ast_helper.Type.mk ~loc:at ~params:family_type_params ?manifest
                              { txt = String.uncapitalize member.name; loc = at }
                          in
                          Ok (Ast_helper.Sig.type_ Nonrecursive [ declaration ])))
@@ -707,8 +824,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   List.map alias_names ~f:(fun (_, alias, typ) ->
                       Ast_helper.Sig.type_ Nonrecursive
                         [
-                          Ast_helper.Type.mk ~loc:at ~manifest:(core_type ~at typ)
-                            { txt = alias; loc = at };
+                          Ast_helper.Type.mk ~loc:at ~params:family_type_params
+                            ~manifest:(core_type ~at typ) { txt = alias; loc = at };
                         ])
                 in
                 let operations = Proof_library.member_operations signatures library in
@@ -730,8 +847,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                    String.equal inherited.name operation.name) )
                            with
                            | Some selected, Some inherited ->
-                               Proof_library.operation_type ~at ~signature:selected
-                                 ~substitutions:[] inherited
+                               Proof_library.operation_type ~family_arguments ~at
+                                 ~signature:selected ~substitutions:[] inherited
                            | _ -> operation_type operation
                          in
                          Ok
@@ -754,8 +871,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                  List.Assoc.find ra_constants name ~equal:String.equal )
                              with
                              | Some selected, Some inherited ->
-                                 Proof_library.ocaml_type ~at ~signature:selected
-                                   ~substitutions:[] inherited
+                                 Proof_library.ocaml_type ~family_arguments ~at
+                                   ~signature:selected ~substitutions:[] inherited
                              | _ -> metadata_type typ
                            in
                            Ok
@@ -780,7 +897,13 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   | _ -> Error (Report.error Type at "A proof module must be local")
                 in
                 let resource_type =
-                  checked_type env at (PTtyapp (Qdot (Qid name, S.mk_id ~loc:at "t"), []))
+                  let path, _ =
+                    Env.find_type_by_name
+                      (Ldot
+                         ({ txt = Lident name.pid_str; loc = at }, { txt = "t"; loc = at }))
+                      env
+                  in
+                  Ctype.newconstr path resource_parameters
                 in
                 let resource_descriptor =
                   let descriptor =
@@ -790,19 +913,40 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     List.filter_map type_members ~f:(fun (member, id, _) ->
                         Option.some_if (String.equal member "T") (Path.Pident id))
                   in
-                  let descriptor = Datatypes.with_paths descriptor paths in
+                  let descriptor =
+                    {
+                      (Datatypes.with_paths descriptor paths) with
+                      parameters = resource_parameters;
+                    }
+                  in
                   Option.value_map applicative_source ~default:descriptor
                     ~f:(fun previous ->
-                      { descriptor with alias = Some previous.resource_type })
+                      {
+                        descriptor with
+                        alias =
+                          Some
+                            (apply_parameters previous.resource_parameters
+                               resource_parameters previous.resource_type);
+                      })
                 in
                 let resource_aliases =
-                  List.map alias_names ~f:(fun (_, alias, typ) ->
-                      {
-                        (Datatypes.library_type ~library:name.pid_str
-                           ~library_id:resource_id ~at alias)
-                        with
-                        alias = Some (checked_type env at typ);
-                      })
+                  List.filter_map (List.zip_exn pairs arguments)
+                    ~f:(fun ((formal, argument), typed_argument) ->
+                      match (argument, typed_argument) with
+                      | S.Proof_type_argument _, Type_argument typ ->
+                          let alias = alias_name formal in
+                          Some
+                            {
+                              (Datatypes.library_type ~library:name.pid_str
+                                 ~library_id:resource_id ~at alias)
+                              with
+                              alias = Some typ;
+                              parameters = resource_parameters;
+                            }
+                      | Proof_module_argument _, Module_argument _ -> None
+                      | Proof_type_argument _, Module_argument _
+                      | Proof_module_argument _, Type_argument _ ->
+                          failwith "A resource argument must retain its kind")
                 in
                 let value_type operation =
                   let qualified =
@@ -811,7 +955,22 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         { txt = operation; loc = at } )
                   in
                   let _, value = Env.find_value_by_name qualified env in
-                  let inputs, output = function_arguments value.Types.val_type in
+                  let variables =
+                    List.filter_map
+                      (Polymorphic_functions.all_variables value.Types.val_type)
+                      ~f:(fun variable ->
+                        match Types.get_desc variable with
+                        | Tvar (Some name) ->
+                            Option.map
+                              (List.findi family_names ~f:(fun _ family ->
+                                   String.equal family name))
+                              ~f:(fun (index, _) ->
+                                (variable, List.nth_exn resource_parameters index))
+                        | _ -> None)
+                  in
+                  let parameters, arguments = List.unzip variables in
+                  let typ = apply_parameters parameters arguments value.Types.val_type in
+                  let inputs, output = function_arguments typ in
                   (operation, inputs, output)
                 in
                 let resource_operations =
@@ -832,6 +991,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     resource_environment = env;
                     resource_functor = library.path;
                     resource_arguments = arguments;
+                    resource_parameters;
                     resource_is_ra = Proof_library.is_resource_algebra signatures library;
                     resource_interfaces = Proof_library.interface_paths signatures library;
                     resource_alias_of = None;
@@ -854,16 +1014,31 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             end
         | Proof_field { field_name = name; field_type } ->
             let at = name.pid_loc in
-            let* owner, content =
+            let* () =
               match field_type with
-              | PTtyapp (Qdot (Qid ghost, field), [ owner; content ])
+              | PTtyapp (Qdot (Qid ghost, field), [ _; _ ])
                 when String.equal ghost.pid_str "Ghost"
                      && String.equal field.pid_str "field" ->
-                  Ok (checked_type env at owner, checked_type env at content)
+                  Ok ()
               | _ ->
                   Error
                     (Report.error Type at
                        "A ghost field requires an (owner, value) Ghost.field type")
+            in
+            let* env = value env name (core_type ~at field_type) in
+            let field_path, declaration =
+              Env.find_value_by_name (Lident name.pid_str) env
+            in
+            let* owner, content =
+              match Types.get_desc (monotype declaration.Types.val_type) with
+              | Tconstr (_, [ owner; content ], _) -> Ok (owner, content)
+              | _ ->
+                  Error
+                    (Report.error Type at "A ghost field must have two type parameters")
+            in
+            let field_parameters =
+              Polymorphic_functions.all_variables declaration.val_type
+              |> List.filter ~f:(fun typ -> Types.get_level typ = Btype.generic_level)
             in
             let owner_head = Ctype.expand_head env owner in
             let owner_is_reference =
@@ -871,7 +1046,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
               | Tconstr (p, [ _ ], _) when Datatypes.is_atomic p || Datatypes.is_ref p ->
                   true
               | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
-              | Tconstr (p, [], _) ->
+              | Tconstr (p, _, _) ->
                   let declaration = Env.find_type p env in
                   begin match declaration.type_kind with
                   | Type_record (labels, _) ->
@@ -891,7 +1066,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             in
             let field_resource =
               match Types.get_desc content with
-              | Tconstr (Pdot (module_path, "t"), [], _) ->
+              | Tconstr (Pdot (module_path, "t"), arguments, _) ->
                   let canonical =
                     Env.normalize_module_path None env module_path |> canonical_owner
                   in
@@ -900,12 +1075,13 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                        (resource_at_path env resources module_path)
                        (resource_at_path env resources canonical))
                     ~f:(fun resource ->
-                      Option.some_if resource.resource_is_ra
+                      Option.some_if
+                        (resource.resource_is_ra
+                        && List.length arguments
+                           = List.length resource.resource_parameters)
                         (Path.Pident resource.resource_id))
               | _ -> None
             in
-            let* env = value env name (core_type ~at field_type) in
-            let field_path, _ = Env.find_value_by_name (Lident name.pid_str) env in
             let* field_id =
               match field_path with
               | Pident id -> Ok id
@@ -924,6 +1100,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   field_environment = env;
                   field_owner = owner;
                   field_value = content;
+                  field_parameters;
+                  field_family = None;
                   field_resource;
                   field_at = at;
                 }
@@ -1691,6 +1869,13 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     (Report.error Type at
                        "The exported proof module does not implement its interface")
               in
+              let* () =
+                if List.is_empty private_resource.resource_parameters then Ok ()
+                else
+                  Report.unsupported at
+                    "Exporting a parameterized resource algebra through a nullary \
+                     interface"
+              in
               let temporary =
                 S.mk_id ~loc:at
                   (Compiler_types.internal_name ~at (name.pid_str ^ "_public"))
@@ -2148,9 +2333,15 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                         in
                         Subst.add_type hidden target substitution)
                   in
+                  let original =
+                    Source_type_map.resource original ~f:(Subst.type_expr substitution)
+                  in
                   let descriptor =
                     Datatypes.resource_type ~name:original.resource_name ~module_id:id
                       ~at:original.resource_at
+                  in
+                  let descriptor =
+                    { descriptor with parameters = original.resource_parameters }
                   in
                   let descriptor =
                     if Option.is_some original.resource_public then descriptor
@@ -2177,22 +2368,16 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     resource_environment = qualified_env;
                     resource_arguments =
                       List.map original.resource_arguments ~f:(function
-                        | Type_argument typ ->
-                            Type_argument (Subst.type_expr substitution typ)
+                        | Type_argument _ as argument -> argument
                         | Module_argument path ->
                             Module_argument (Subst.module_path substitution path));
                     resource_alias_of =
                       Option.map original.resource_alias_of
                         ~f:(Subst.module_path substitution);
                     resource_type_members = [];
-                    resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
+                    resource_type =
+                      Ctype.newconstr (Path.Pdot (path, "t")) original.resource_parameters;
                     resource_id = id;
-                    resource_operations =
-                      List.map original.resource_operations
-                        ~f:(fun (name, inputs, output) ->
-                          ( name,
-                            List.map inputs ~f:(Subst.type_expr substitution),
-                            Subst.type_expr substitution output ));
                     resource_descriptor = descriptor;
                     resource_aliases =
                       List.map original.resource_aliases ~f:(fun alias ->
@@ -2205,8 +2390,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                             (Datatypes.library_type ~library:original.resource_name
                                ~library_id:id ~at:original.resource_at member)
                             with
-                            alias =
-                              Option.map alias.alias ~f:(Subst.type_expr substitution);
+                            parameters = alias.parameters;
+                            alias = alias.alias;
                           });
                     resource_public = None;
                     resource_application = Some (carrier_identity, original.resource_id);
@@ -2447,6 +2632,20 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                     ~default:(Subst.module_path substitution au.au_operation_path)
                     ~f:(fun name -> Path.Pdot (view_owner, name))
                 in
+                let related =
+                  Compiler_types.map_group
+                    (au.au_parameters @ [ au.au_operation_type; au.au_token ])
+                    ~f:(Subst.type_expr substitution)
+                in
+                let parameters, operation =
+                  List.split_n related (List.length au.au_parameters)
+                in
+                let operation_type = List.nth_exn operation 0 in
+                let token_arguments =
+                  match Types.get_desc (List.nth_exn operation 1) with
+                  | Tconstr (_, arguments, _) -> arguments
+                  | _ -> failwith "An AU token projection must preserve its constructor"
+                in
                 {
                   au with
                   au_scope = None;
@@ -2454,8 +2653,11 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   au_path = path;
                   au_environment = qualified_env;
                   au_operation_path = operation_path;
-                  au_operation_type = Subst.type_expr substitution au.au_operation_type;
-                  au_token = Ctype.newconstr token_path [];
+                  au_operation_type = operation_type;
+                  au_parameters = parameters;
+                  au_token =
+                    Btype.newgenty
+                      (Types.get_desc (Ctype.newconstr token_path token_arguments));
                   au_token_path = token_path;
                   au_token_paths = token_paths;
                   au_application = Some (carrier_identity, au.au_id);

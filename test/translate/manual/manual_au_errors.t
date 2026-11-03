@@ -39,6 +39,5 @@
   4 |     let value = Other.access token cell in
                                    ^^^^^
   Type Error: The value token has type Read.token but an expression was expected of type
-    Other.token
-  The type constructor Other.token would escape its scope.
+    Other.token.
   [1]

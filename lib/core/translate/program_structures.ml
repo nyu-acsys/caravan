@@ -567,8 +567,6 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
             au_scope = Option.map au.au_scope ~f:project_path;
             au_path = project_path au.au_path;
             au_operation_path = project_path au.au_operation_path;
-            au_operation_type = project au.au_operation_type;
-            au_token = project au.au_token;
             au_token_path = project_path au.au_token_path;
             au_token_paths = List.map au.au_token_paths ~f:project_path;
           }
@@ -602,47 +600,33 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                      (project_path path, names)));
             resources =
               List.map support.resources ~f:(fun resource ->
+                  let resource = Source.map_resource_types resource ~f:project in
                   {
                     resource with
                     resource_backend = rebase resource.Source.resource_backend;
                     resource_path = project_path resource.resource_path;
-                    resource_type = project resource.resource_type;
-                    resource_operations =
-                      List.map resource.resource_operations
-                        ~f:(fun (name, inputs, output) ->
-                          (name, List.map inputs ~f:project, project output));
                   });
             ghost_fields =
               List.map support.ghost_fields ~f:(fun field ->
+                  let field = Source.map_field_types field ~f:project in
                   {
                     field with
                     field_backend = rebase field.Source.field_backend;
                     field_scope = Option.map field.field_scope ~f:project_path;
                     field_path = project_path field.field_path;
-                    field_owner = project field.field_owner;
-                    field_value = project field.field_value;
                     field_resource = Option.map field.field_resource ~f:project_path;
                   });
             atomic_updates =
               List.map support.atomic_updates ~f:(fun signature ->
+                  let signature = map_atomic_types signature ~f:project in
                   {
                     signature with
                     au_owner = Option.map signature.au_owner ~f:project_path;
-                    au_private =
-                      {
-                        inputs = List.map signature.au_private.inputs ~f:project;
-                        result = project signature.au_private.result;
-                        ghost_outputs =
-                          List.map signature.au_private.ghost_outputs ~f:project;
-                        implicit = List.map signature.au_private.implicit ~f:project;
-                      };
-                    au_token = project signature.au_token;
                     au_source = project_atomic_source signature.au_source;
+                    au_generic =
+                      Option.map signature.au_generic ~f:(fun generic ->
+                          { generic with name = rebase generic.name });
                     au_procedure = rebase signature.au_procedure;
-                    au_inputs = List.map signature.au_inputs ~f:project;
-                    au_result = project signature.au_result;
-                    au_ghost_outputs = List.map signature.au_ghost_outputs ~f:project;
-                    au_implicit = List.map signature.au_implicit ~f:project;
                   });
             logical_functions =
               List.map support.logical_functions ~f:(fun (key, signature) ->

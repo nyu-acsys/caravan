@@ -97,15 +97,23 @@ let context_atomic ~(source : Source.t) ~(scoped_proofs : Proof_bindings.t)
         let token =
           if inside au.au_scope then au.au_token else rebase (public au.au_token)
         in
-        Some
-          {
-            signature with
-            au_token = token;
-            au_inputs = List.map signature.au_private.inputs ~f:project;
-            au_result = project signature.au_private.result;
-            au_ghost_outputs = List.map signature.au_private.ghost_outputs ~f:project;
-            au_implicit = List.map signature.au_private.implicit ~f:project;
-          })
+        let signature =
+          map_atomic_types
+            {
+              signature with
+              au_inputs = signature.au_private.inputs;
+              au_result = signature.au_private.result;
+              au_ghost_outputs = signature.au_private.ghost_outputs;
+              au_implicit = signature.au_private.implicit;
+            }
+            ~f:project
+        in
+        let token =
+          match Types.get_desc token with
+          | Tconstr (path, _, _) -> Ctype.newconstr path signature.au_source.au_parameters
+          | _ -> token
+        in
+        Some { signature with au_token = token })
 
 let context_owners ~(source : Source.t) at =
   Option.value_map at ~default:[] ~f:(Proof_scopes.owners_at source.proof_scopes)
@@ -370,33 +378,22 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
       predicate_views;
       resources =
         List.map support.resources ~f:(fun resource ->
+            let resource = Source.map_resource_types resource ~f:project in
             {
               resource with
-              resource_type = project resource.Source.resource_type;
               resource_path = Subst.module_path projection resource.resource_path;
-              resource_operations =
-                List.map resource.resource_operations ~f:(fun (name, inputs, output) ->
-                    (name, List.map inputs ~f:project, project output));
             });
       ghost_fields =
         List.map support.ghost_fields ~f:(fun field ->
+            let field = Source.map_field_types field ~f:project in
             {
               field with
-              field_owner = project field.Source.field_owner;
-              field_value = project field.field_value;
               field_resource =
                 Option.map field.field_resource ~f:(Subst.module_path projection);
             });
       atomic_updates =
         List.map support.atomic_updates ~f:(fun signature ->
-            {
-              signature with
-              au_token = project signature.au_token;
-              au_inputs = List.map signature.au_inputs ~f:project;
-              au_result = project signature.au_result;
-              au_ghost_outputs = List.map signature.au_ghost_outputs ~f:project;
-              au_implicit = List.map signature.au_implicit ~f:project;
-            });
+            map_atomic_types signature ~f:project);
       logical_functions =
         List.map support.logical_functions ~f:(fun (key, signature) ->
             ( key,
@@ -427,8 +424,8 @@ let proof_context_for (proof_env : Proof_env.t)
   module_context context ~projection:Subst.identity
     (proof_context (declaration_scope name) preds spec_funcs proof_support)
 
-let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
-    (t * State.state, error) Result.t =
+let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
+    (decls : Program_declarations.t) state : (t * State.state, error) Result.t =
   let {
     Program_scopes.definition_target;
     funcs;
@@ -484,6 +481,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
       Generic_parameters.discover ~expand:(Datatypes.expand types) ~key ~name ~at
         ~explicit parameters
     in
+    let worker =
+      { worker with name = Generic_family_plan.proof family_plan key worker.name }
+    in
     if List.is_empty worker.variables then Ok None else Ok (Some worker)
   in
   let au_application_view =
@@ -495,8 +495,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
         (Program_scopes.asset_context ~module_contexts:scopes.module_contexts)
   in
   let au_procedure =
-    Program_declarations.au_procedure ~procedures:decls.procedures
-      ~generics:scopes.generics ~generic_procedures:decls.generic_procedures
+    Program_declarations.au_procedure ~polymorphic_functions:decls.polymorphic_functions
+      ~procedures:decls.procedures ~generics:scopes.generics
+      ~generic_procedures:decls.generic_procedures
       ~asset_context:
         (Program_scopes.asset_context ~module_contexts:scopes.module_contexts)
   in
@@ -956,6 +957,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
   let* atomic_updates, state =
     State.run_from state
     @@ State.all atomic_operations ~f:(fun (au_source, f) ->
+        let open State.Syntax in
+        let* scheme =
+          State.of_result
+            (Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
+               f.scheme_type)
+        in
         let preds, spec_funcs, proof_support =
           proof_context ~current_procedure:(proc_name f) ~at:f.loc
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
@@ -966,22 +973,47 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
           module_context context ~projection:context.projection
             (preds, spec_funcs, proof_support)
         in
-        let types =
-          Program_declarations.function_types decls.polymorphic_functions f types
+        let signature =
+          List.Assoc.find_exn procedure_signatures (proc_name f) ~equal:String.equal
+        in
+        let groups =
+          Option.value_map (au_plan au_source) ~default:[] ~f:(fun plan ->
+              [ plan.Generic_proofs.group ])
+        in
+        let worker =
+          Program_declarations.applied_function_worker ~generics
+            ~polymorphic_functions:decls.polymorphic_functions ~groups ~canonical:Fn.id f
+          |> Option.map ~f:(fun worker ->
+              { worker with Polymorphic_functions.id = f.id; paths = f.paths; scheme })
+        in
+        let types = Program_declarations.function_types (Option.to_list worker) f types in
+        let primitive_namespace =
+          match worker with
+          | Some worker -> String.split worker.name ~on:'.'
+          | None ->
+              Module_context.namespace (asset_context au_source.au_scope).destination
         in
         let ctx =
           spec_context types ~shared:no_shared ~ocaml_env:f.environment ~preds ~spec_funcs
-            ~proof_support ()
+            ~proof_support ~generic_predicates:decls.generic_predicates
+            ~primitive_namespace ()
+        in
+        let ctx =
+          {
+            ctx with
+            given =
+              {
+                ctx.given with
+                current_polymorphic = worker;
+                current_procedure = Some (au_procedure au_source f);
+              };
+          }
         in
         State.in_procedure
         @@ State.bind
              (State.bind (formals ctx f) ~f:(fun formals ->
                   contract_env ctx ~spec_funcs f formals ~result:"result"))
              ~f:(fun (_, _, implicit, _) ->
-               let signature =
-                 List.Assoc.find_exn procedure_signatures (proc_name f)
-                   ~equal:String.equal
-               in
                let au_inputs =
                  List.filter_map f.params ~f:(fun p ->
                      match p.fp_kind with
@@ -1008,11 +1040,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                in
                let shape =
                  {
-                   inputs = List.map au_inputs ~f:project;
-                   result = project f.body.exp_type;
-                   ghost_outputs =
-                     List.map signature.procedure_outputs ~f:(fun (_, ty) -> project ty);
-                   implicit = List.map implicit ~f:(fun (_, _, ty, _) -> project ty);
+                   inputs = au_inputs;
+                   result = f.body.exp_type;
+                   ghost_outputs = List.map signature.procedure_outputs ~f:snd;
+                   implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
                  }
                in
                let key =
@@ -1042,18 +1073,68 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t) state :
                            | _ -> None)
                      end
                in
+               let au_generic =
+                 Option.map worker ~f:(fun worker ->
+                     Generic_parameters.
+                       {
+                         key;
+                         member =
+                           (Qualified_name.of_string (au_procedure au_source f)).name;
+                         name = worker.name;
+                         loc = au_source.au_at;
+                         parameters = [ worker.scheme.typ ];
+                         variables = worker.scheme.variables;
+                         explicit = 0;
+                       })
+               in
+               let signature =
+                 map_atomic_types
+                   {
+                     au_key = key;
+                     au_generic;
+                     au_owner = owner;
+                     au_private = shape;
+                     au_token = au_source.au_token;
+                     au_source;
+                     au_procedure = au_procedure au_source f;
+                     au_inputs = shape.inputs;
+                     au_result = shape.result;
+                     au_returns_value = not (is_unit f.body.exp_type);
+                     au_ghost_outputs = shape.ghost_outputs;
+                     au_implicit = shape.implicit;
+                   }
+                   ~f:project
+               in
+               let open State.Syntax in
+               let* signature =
+                 match signature.au_generic with
+                 | None -> State.return signature
+                 | Some generic ->
+                     let declaration = List.hd_exn generic.parameters in
+                     let* arguments =
+                       State.of_result
+                         (Polymorphic_functions.instantiate
+                            ~expand:(Datatypes.expand types) ~at:au_source.au_at
+                            { typ = declaration; variables = generic.variables }
+                            ~declaration ~occurrence:signature.au_source.au_operation_type)
+                     in
+                     State.return
+                       (map_atomic_types signature ~f:(fun typ ->
+                            Option.value_exn
+                              (Datatypes.instantiate_alias generic.variables arguments typ)))
+               in
                State.return
                  {
-                   au_key = key;
-                   au_owner = owner;
-                   au_private = shape;
-                   au_token = au_source.au_token;
-                   au_source;
-                   au_procedure = au_procedure au_source f;
-                   au_inputs = shape.inputs;
-                   au_result = shape.result;
-                   au_ghost_outputs = shape.ghost_outputs;
-                   au_implicit = shape.implicit;
+                   signature with
+                   au_generic =
+                     Option.map signature.au_generic ~f:(fun generic ->
+                         {
+                           generic with
+                           parameters =
+                             signature.au_token
+                             :: (signature.au_inputs @ [ signature.au_result ]
+                               @ signature.au_ghost_outputs @ signature.au_implicit);
+                         });
                  }))
   in
   let proof_support = { proof_support with atomic_updates } in

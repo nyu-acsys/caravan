@@ -11,6 +11,52 @@ let integer_literal ~at text =
         "This integer literal is outside the supported OCaml int range; use a \
          mathematical expression with smaller literals"
 
+let expected_outputs env outputs = function
+  | Some result when List.length outputs = 1 -> [ Some result ]
+  | Some result ->
+      begin match Datatypes.desc env.data result with
+      | Ttuple fields when List.length fields = List.length outputs ->
+          List.map fields ~f:(fun (_, typ) -> Some typ)
+      | _ -> List.map outputs ~f:(fun _ -> None)
+      end
+  | None -> List.map outputs ~f:(fun _ -> None)
+
+let infer_atomic_signature env ~at ?expected signature method_ actuals =
+  match signature.au_generic with
+  | None -> Ok (signature, None)
+  | Some generic ->
+      let inputs, outputs = Option.value_exn (atomic_inputs signature method_) in
+      if List.length actuals <> List.length inputs then
+        error at
+          (Printf.sprintf "AU method %s expects %d arguments" method_ (List.length inputs))
+      else
+        let parameters = inputs @ outputs in
+        let* generic =
+          Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at generic
+            parameters
+        in
+        let inference =
+          Generic_parameters.instantiate ~environment:env.ctx.given.env
+            ~expand:(Datatypes.expand env.data) ~at generic
+            (actuals @ expected_outputs env outputs expected)
+        in
+        let* arguments =
+          match (inference, method_, expected, env.ctx.given.current_polymorphic) with
+          | Ok arguments, _, _, _ -> Ok arguments
+          | Error _, "bind", None, Some current
+            when String.equal current.name generic.name
+                 && List.length current.scheme.variables = List.length generic.variables
+            ->
+              Ok current.scheme.variables
+          | Error error, _, _, _ -> Error error
+        in
+        let instantiated =
+          map_atomic_types signature ~f:(fun typ ->
+              Option.value_exn
+                (Datatypes.instantiate_alias generic.variables arguments typ))
+        in
+        Ok ({ instantiated with au_generic = None }, Some (generic, arguments))
+
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
     concatenation. *)
 let rec term_type env (t : S.term) =
@@ -41,10 +87,16 @@ let rec term_type env (t : S.term) =
       Result.ok
         (source_type env.ctx.given ~at:t.term_loc
            (S.PTtyapp (Qid (S.mk_id ~loc:t.term_loc "set"), [ ty ])))
-  | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (atomic_method env q) ->
+  | _, ({ term_desc = Tvar q; _ }, args) when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
-      Option.bind (atomic_inputs signature method_) ~f:(fun (_, outputs) ->
-          List.hd outputs)
+      Option.bind (atomic_inputs signature method_) ~f:(fun _ ->
+          Option.bind
+            (Result.ok
+               (infer_atomic_signature env ~at:t.term_loc signature method_
+                  (List.map args ~f:(term_type env))))
+            ~f:(fun (signature, _) ->
+              Option.bind (atomic_inputs signature method_) ~f:(fun (_, outputs) ->
+                  List.hd outputs)))
   | _, ({ term_desc = Tvar q; _ }, _) when Option.is_some (logical_signature env q) ->
       let signature = Option.value_exn (logical_signature env q) in
       begin match signature.lemma_generic with
@@ -56,6 +108,13 @@ let rec term_type env (t : S.term) =
                ~variables:(Logical_context.variables env)
                t)
       end
+  | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (collection_builtin env q)
+    ->
+      Result.ok
+        (Source.infer_logical_expression ~is_list:(is_list_term env) env.ctx.given.env
+           ~functions:(List.map env.funcs ~f:fst)
+           ~variables:(Logical_context.variables env)
+           t)
   | _, ({ term_desc = Tvar q; _ }, _ :: _) when Option.is_some (runtime_spec env q) ->
       Result.ok
         (Source.infer_logical_expression env.ctx.given.env
@@ -135,7 +194,11 @@ and is_list_term env t =
 (** The OCaml type of the values that the location [t] holds, where it is known. *)
 and location_type env (t : S.term) =
   match ghost_projection env t with
-  | Some (field, _) -> Some field.field_value
+  | Some (field, owner) ->
+      Result.ok
+        (Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env
+           ~at:t.term_loc ~owner:(term_type env owner) ~value:None field)
+      |> Option.map ~f:(fun (_, field) -> field.Source.field_value)
   | None -> (
       match t.term_desc with
       | Tfield
@@ -335,6 +398,35 @@ let equality_check env (id : S.id) operator a b =
             "Physical equality on boxed values is unsupported in specifications"
   | _ -> Ok ()
 
+let instantiate_atomic_signature env ~at ?expected signature method_ args =
+  let open State.Syntax in
+  let* signature, instance =
+    State.of_result
+      (infer_atomic_signature env ~at ?expected signature method_
+         (List.map args ~f:(term_type env)))
+  in
+  let* signature =
+    match instance with
+    | None -> State.return signature
+    | Some (generic, arguments) ->
+        let+ instance =
+          State.value_instance env.ctx ~at ~target:generic.name ~arguments
+        in
+        {
+          signature with
+          au_procedure =
+            instance ^ "." ^ (Qualified_name.of_string signature.au_procedure).name;
+        }
+  in
+  let* () = State.note_call env.ctx.given signature.au_procedure in
+  let* () =
+    State.note_families env.data
+      (signature.au_token
+      :: (signature.au_inputs @ [ signature.au_result ] @ signature.au_ghost_outputs
+        @ signature.au_implicit))
+  in
+  State.return signature
+
 let instantiate_proof_signature env ~at ?expected ?term signature args =
   let open State.Syntax in
   match signature.lemma_generic with
@@ -349,7 +441,11 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
       in
       let target = Qualified_name.of_string signature.lemma_raven in
       let worker =
-        if List.is_empty target.path then worker
+        if
+          List.is_empty target.path
+          || String.equal signature.lemma_raven
+               (worker.name ^ "." ^ Generic_parameters.member worker)
+        then worker
         else
           {
             worker with
@@ -357,17 +453,6 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
               String.concat ~sep:"."
                 (target.path @ [ (Qualified_name.of_string worker.name).name ]);
           }
-      in
-      let output_types result =
-        match (signature.lemma_outputs, result) with
-        | [ _ ], Some result -> [ Some result ]
-        | outputs, Some result ->
-            begin match Datatypes.desc env.data result with
-            | Ttuple fields when List.length fields = List.length outputs ->
-                List.map fields ~f:(fun (_, typ) -> Some typ)
-            | _ -> List.map outputs ~f:(fun _ -> None)
-            end
-        | outputs, None -> List.map outputs ~f:(fun _ -> None)
       in
       let supplied = List.map args ~f:(term_type env) in
       let omitted =
@@ -378,7 +463,7 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
       let infer result =
         Generic_parameters.instantiate ~environment:env.ctx.given.env
           ~expand:(Datatypes.expand env.data) ~at worker
-          (supplied @ omitted @ output_types result)
+          (supplied @ omitted @ expected_outputs env signature.lemma_outputs result)
       in
       let* arguments =
         State.of_result
@@ -408,8 +493,10 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
             worker.name
         then
           if
-            List.equal Types.eq_type worker.variables
-              (List.map arguments ~f:(Datatypes.expand env.data))
+            List.equal (Option.equal String.equal)
+              (List.mapi arguments ~f:(fun index _ ->
+                   Some (worker.name ^ ".A" ^ Int.to_string index)))
+              (List.map arguments ~f:(Datatypes.dictionary_name env.data))
           then State.return (worker.name ^ "." ^ Generic_parameters.member worker)
           else State.of_result (unsupported at "Polymorphic proof recursion")
         else
@@ -461,8 +548,10 @@ let predicate_target env ~at ~key ~target args =
           worker.name
       then
         if
-          List.equal Types.eq_type worker.variables
-            (List.map arguments ~f:(Datatypes.expand env.data))
+          List.equal (Option.equal String.equal)
+            (List.mapi arguments ~f:(fun index _ ->
+                 Some (worker.name ^ ".A" ^ Int.to_string index)))
+            (List.map arguments ~f:(Datatypes.dictionary_name env.data))
         then State.return (worker.name ^ "." ^ Generic_predicates.member worker)
         else State.of_result (unsupported at "Polymorphic predicate recursion")
       else
@@ -470,6 +559,24 @@ let predicate_target env ~at ~key ~target args =
         instance ^ "." ^ Generic_predicates.member worker
 
 open State.Syntax
+
+(** A generalized field is selected by its owner and stored value together. *)
+let specialize_ghost_field env ~at ?expected field owner =
+  Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env ~at
+    ~owner:(term_type env owner) ~value:expected field
+
+let instantiate_ghost_field env ~at ?expected field owner =
+  let open State.Syntax in
+  let* instance, field =
+    State.of_result (specialize_ghost_field env ~at ?expected field owner)
+  in
+  let* () = State.note_domain env.data field.Source.field_value in
+  match instance with
+  | None -> State.return field
+  | Some (worker, arguments) ->
+      let+ target = State.value_instance env.ctx ~at ~target:worker.name ~arguments in
+      let backend = (Qualified_name.of_string field.field_backend).name in
+      { field with field_backend = target ^ "." ^ backend; field_parameters = [] }
 
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
@@ -553,7 +660,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       R.Expr.ite ~loc:l c a b
   | Tquant (q, binders, body) ->
       let variable ~at x t =
-        let* ty = State.of_result (typ env.ctx ~at t) in
+        let* ty = State.typ env.ctx ~at t in
         let l = loc at in
         let+ raven = if env.logical_definition then State.fresh x else State.return x in
         (raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty)
@@ -651,7 +758,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       end
   | Tcomprehension ((id, ty), body) ->
       let* ty = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in
-      let* raven_type = State.of_result (typ env.ctx ~at:id.pid_loc ty) in
+      let* raven_type = State.typ env.ctx ~at:id.pid_loc ty in
       let* () = State.note_domain env.data ty in
       let* raven = State.fresh id.pid_str in
       let env =
@@ -683,7 +790,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Tattr (_, t) -> formula env t
   | Tcast (t, ty) ->
       let* ty = State.of_result (source_type env.ctx.given ~at ty) in
-      let* raven_type = State.of_result (typ env.ctx ~at ty) in
+      let* raven_type = State.typ env.ctx ~at ty in
       let+ value = expected_formula env (Some ty) t in
       R.Expr.annotated value raven_type
   | Tfield ({ term_desc = Trecord (base, updates); _ }, Qid field) ->
@@ -844,7 +951,7 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
              ~expected t)
       in
       let* value = formula env t in
-      let+ ty = State.of_result (typ env.ctx ~at:t.term_loc expected) in
+      let+ ty = State.typ env.ctx ~at:t.term_loc expected in
       R.Expr.annotated value ty
   | _ -> formula env t
 
@@ -860,7 +967,9 @@ and application env (t : S.term) =
   | Tvar q, args when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
       begin match (method_, atomic_inputs signature method_) with
-      | ("pending" | "committed"), Some (inputs, _) ->
+      | ("pending" | "committed"), Some _ ->
+          let* signature = instantiate_atomic_signature env ~at signature method_ args in
+          let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
           let+ values = typed_arguments env ~at inputs args in
           let values = atomic_arguments ~loc:l signature method_ values in
           let procedure = qualified_name ~loc:l signature.au_procedure in
@@ -925,7 +1034,17 @@ and application env (t : S.term) =
       let+ a = formula env a in
       R.Expr.not_ ~loc:l a
   | Tvar (Qid { pid_str = "own"; _ }), ([ location; v ] | [ location; v; _ ]) ->
-      let expected = location_type env location in
+      let* expected =
+        match ghost_projection env location with
+        | None -> State.return (location_type env location)
+        | Some (field, owner) ->
+            let+ _, field =
+              State.of_result
+                (specialize_ghost_field env ~at:location.term_loc
+                   ?expected:(term_type env v) field owner)
+            in
+            Some field.Source.field_value
+      in
       let* () =
         match (ghost_projection env location, expected) with
         | Some _, Some expected ->
@@ -936,7 +1055,7 @@ and application env (t : S.term) =
                  ~expected v)
         | _ -> State.return ()
       in
-      let* location = location_of env location in
+      let* location = location_of ?expected env location in
       let* v = expected_formula env expected v in
       let+ fraction =
         match args with
@@ -1132,7 +1251,7 @@ and typed_arguments env ~at inputs args =
           | _ -> State.return ()
         in
         let* value = expected_formula env (Some ty) value in
-        let+ raven_type = State.of_result (typ env.ctx ~at ty) in
+        let+ raven_type = State.typ env.ctx ~at ty in
         R.Expr.annotated value raven_type)
 
 and predicate_arguments env ~at ?display key types args =
@@ -1199,7 +1318,7 @@ and quantified env (t : S.term) =
       R.Expr.exists ~loc:l vars body
 
 (** The location [t], as in [own r.count n]: a field of a variable of known type. *)
-and location_of env (t : S.term) =
+and location_of ?expected env (t : S.term) =
   let at = t.term_loc in
   let l = loc at in
   let* () =
@@ -1217,6 +1336,7 @@ and location_of env (t : S.term) =
   in
   match ghost_projection env t with
   | Some (field, owner) ->
+      let* field = instantiate_ghost_field env ~at ?expected field owner in
       let* () =
         match term_type env owner with
         | None -> State.return ()
@@ -1354,7 +1474,7 @@ and constructor ?expected env (t : S.term) args =
       let value = R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data ctor) args in
       begin match expected with
       | Some expected when not (List.is_empty data.parameters) ->
-          let+ typ = State.of_result (typ env.ctx ~at expected) in
+          let+ typ = State.typ env.ctx ~at expected in
           R.Expr.annotated value typ
       | Some _ | None -> State.return value
       end
@@ -1405,7 +1525,7 @@ and record ?expected env (t : S.term) base updates =
       in
       begin match expected with
       | Some expected when not (List.is_empty data.parameters) ->
-          let+ typ = State.of_result (typ env.ctx ~at expected) in
+          let+ typ = State.typ env.ctx ~at expected in
           R.Expr.annotated value typ
       | Some _ | None -> State.return value
       end

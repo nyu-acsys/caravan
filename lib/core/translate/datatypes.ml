@@ -35,6 +35,20 @@ type ctor = {
 type field = { label : string; raven_field : string; typ : Types.type_expr }
 type collection_kind = Sequence | FinSet | Set | Map
 
+type family = {
+  worker : string;
+  member : string;
+  dictionary : string;
+  scope : string list;
+}
+
+type family_instance = {
+  family_namespace : string list;
+  family_worker : string;
+  family_arguments : string list;
+  family_name : string;
+}
+
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
   paths : Path.t list;  (** Other paths naming the same implementation type. *)
@@ -55,6 +69,7 @@ type t = {
       (** An abstract source-value domain, distinct from mathematical carrier validity. *)
   domain_scope : string list option;
       (** The lexical scope containing parameters used by this value representation. *)
+  family : family option;
   atomic_procedure : string option;
   backend_type : Qualified_name.t option;
   library : Path.t option;
@@ -83,6 +98,7 @@ let list =
     empty = false;
     value_constraint = None;
     domain_scope = None;
+    family = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -111,6 +127,7 @@ let option =
     empty = false;
     value_constraint = None;
     domain_scope = None;
+    family = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -157,6 +174,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           empty = List.is_empty cds;
           value_constraint = None;
           domain_scope = None;
+          family = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -217,6 +235,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           empty = false;
           value_constraint = None;
           domain_scope = None;
+          family = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -242,6 +261,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           empty = false;
           value_constraint = None;
           domain_scope = None;
+          family = None;
           atomic_procedure = None;
           backend_type = None;
           module_path = None;
@@ -303,6 +323,7 @@ let library_type ~library ~library_id ~at name =
     empty = false;
     value_constraint = None;
     domain_scope = None;
+    family = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -385,6 +406,7 @@ let collection id kind =
     empty = false;
     value_constraint = None;
     domain_scope = None;
+    family = None;
     atomic_procedure = None;
     backend_type = None;
     module_path = None;
@@ -478,15 +500,9 @@ let instantiate (data : t) arguments =
               ~f:(fun args -> { ctor with args }))))
     ~f:(fun ctors -> { data with ctors })
 
-let instantiated types occurrence =
-  match desc types occurrence with
-  | Tconstr (path, arguments, _) ->
-      Option.bind (find types path) ~f:(fun data -> instantiate data arguments)
-  | _ -> None
-
 let is_value_family (data : t) =
   (not (List.is_empty data.parameters))
-  && Option.is_none data.alias && Option.is_none data.heap
+  && Option.is_none data.family && Option.is_none data.alias && Option.is_none data.heap
 
 let value_family_name (data : t) =
   String.concat ~sep:"." (Option.value data.module_path ~default:[ data.module_name ])
@@ -586,92 +602,81 @@ let find_ctor (types : t list) (ocaml : string) =
 let ctor_name ~loc:l (d : t) (c : ctor) =
   R.Name.make ~loc:l ~path:(Option.value d.module_path ~default:[ d.module_name ]) c.raven
 
-(** The Raven type of the OCaml type [t]; [self] is the data type being defined, if any,
-    which its module calls [T]. *)
-let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
-    (R.Type.t, Report.error) Result.t =
-  let l = loc at in
-  let types = Option.value_map self ~default:types ~f:(fun self -> self :: types) in
-  match desc types t with
-  | Tvar _ ->
-      begin match
-        Option.bind (find_variable types t) ~f:(fun data -> data.backend_type)
-      with
-      | Some backend -> Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l backend) [])
-      | None -> Report.unsupported at "An unbound polymorphic type variable"
+let rec is_int types t =
+  let t = expand_parameterized types t in
+  match Types.get_desc t with
+  | Tconstr (p, [], _) ->
+      begin match find types p with
+      | Some { mathematical_integer = true; _ } | Some { mathematical = true; _ } -> false
+      | Some { alias = Some t; _ } -> is_int types t
+      | _ -> Path.same p Predef.path_int
       end
-  | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
-  | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
-  | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
-  | Tconstr (p, [], _) when is_ghost p -> Ok (R.Type.ref ~loc:l)
-  | Tconstr (p, [], _) when is_permission p -> Ok (R.Type.real ~loc:l)
-  | Tconstr (p, [ elt ], _)
-    when Path.same p Predef.path_list || Path.same p Predef.path_option ->
-      let* elt = typ types ?self ~at elt in
-      let d = Option.value_exn (find types p) in
-      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
-  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Ok (R.Type.ref ~loc:l)
-  | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
-      let* elt = typ types ?self ~at elt in
-      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
-  | Tconstr (p, [ elt ], _) when is_collection types p FinSet ->
-      let* elt = typ types ?self ~at elt in
-      Ok (R.Type.fin_set ~loc:l elt)
-  | Tconstr (p, [ elt ], _) when is_collection types p Set ->
-      let* elt = typ types ?self ~at elt in
-      Ok (R.Type.set ~loc:l elt)
-  | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
-      let* key = typ types ?self ~at key in
-      let* value = typ types ?self ~at value in
-      Ok (R.Type.map ~loc:l key value)
-  | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
-      let data = Option.value_exn (find types p) in
-      let* arguments = Result.all (List.map arguments ~f:(typ types ?self ~at)) in
-      begin match self with
-      | Some self when declares self p ->
-          let source_arguments =
-            match desc types t with Tconstr (_, arguments, _) -> arguments | _ -> []
-          in
-          if List.equal Types.eq_type self.parameters source_arguments then
-            Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
-          else Report.unsupported at "A nonregular recursive datatype"
-      | _ ->
-          let path = Option.value data.module_path ~default:[ data.module_name ] in
-          let name =
-            Qualified_name.{ path = List.drop_last_exn path; name = List.last_exn path }
-          in
-          Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l name) arguments)
+  | Tpoly (t, []) -> is_int types t
+  | _ -> false
+
+let rec abstract_value_constraint types t =
+  let t = expand_parameterized types t in
+  match Types.get_desc t with
+  | Tconstr (path, arguments, _) when not (List.is_empty arguments) ->
+      Option.bind (find types path) ~f:(fun data ->
+          if
+            Option.is_none data.library
+            && List.equal Types.eq_type data.parameters arguments
+          then data.value_constraint
+          else None)
+  | Tvar _ -> Option.bind (find_variable types t) ~f:(fun data -> data.value_constraint)
+  | Tconstr (path, [], _) ->
+      begin match find types path with
+      | Some { mathematical = true; _ } -> None
+      | Some { value_constraint = Some constraint_; _ } -> Some constraint_
+      | Some { alias = Some body; _ } -> abstract_value_constraint types body
+      | Some _ | None -> None
       end
-  | Tconstr (p, [], _)
-    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
-      Ok (R.Type.ref ~loc:l)
-  | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
-      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
-  | Tconstr (p, [], _)
-    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.backend_type) ->
-      let d = Option.value_exn (find types p) in
-      Ok
-        (R.Type.named ~loc:l
-           (Qualified_name.raven ~loc:l (Option.value_exn d.backend_type))
-           [])
-  | Tconstr (p, [], _)
-    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
-      let d = Option.value_exn (find types p) in
-      Ok
-        (R.Type.atomic_token ~loc:l
-           (Qualified_name.raven ~loc:l
-              (Qualified_name.of_string (Option.value_exn d.atomic_procedure))))
-  | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
-      let d = Option.value_exn (find types p) in
-      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
-  | Ttuple components ->
-      let* components =
-        Result.all (List.map components ~f:(fun (_, t) -> typ types ?self ~at t))
-      in
-      Ok (R.Type.tuple ~loc:l components)
-  (* The type of a record label, which is not polymorphic here. *)
-  | Tpoly (t, []) -> typ types ?self ~at t
-  | _ -> Report.unsupported at (Stdlib.Format.asprintf "The type %a" Printtyp.type_expr t)
+  | Tpoly (body, []) -> abstract_value_constraint types body
+  | _ -> None
+
+(** Whether the carrier contains values outside the source value domain. Recursive
+    algebraic cycles without constrained payloads have a trivial domain. *)
+let has_domain types t =
+  let rec visit seen t =
+    let t = expand_parameterized types t in
+    let mathematical =
+      match Types.get_desc t with
+      | Tconstr (path, _, _) ->
+          Option.exists (find types path) ~f:(fun d -> d.mathematical)
+      | _ -> false
+    in
+    if mathematical then false
+    else if
+      Option.is_some (value_family types t)
+      || (match Types.get_desc t with
+        | Tconstr (path, _, _) ->
+            Option.exists (find types path) ~f:(fun data -> Option.is_some data.family)
+        | _ -> false)
+      || Option.is_some (abstract_value_constraint types t)
+      || is_int types t
+    then true
+    else
+      match Types.get_desc t with
+      | Tconstr (path, [], _) ->
+          begin match find types path with
+          | Some { mathematical_integer = true; _ } -> false
+          | Some { alias = Some body; _ } -> visit seen body
+          | Some { heap = Some _; _ } | Some { library = Some _; _ } -> false
+          | Some data when data.empty -> true
+          | Some data when not (List.mem seen path ~equal:Path.same) ->
+              List.exists data.ctors ~f:(fun ctor ->
+                  List.exists ctor.args ~f:(visit (path :: seen)))
+          | Some _ | None -> false
+          end
+      | Tconstr (path, [ element ], _)
+        when Path.same path Predef.path_list || Path.same path Predef.path_option ->
+          visit seen element
+      | Ttuple components -> List.exists components ~f:(fun (_, t) -> visit seen t)
+      | Tpoly (body, []) -> visit seen body
+      | _ -> false
+  in
+  visit [] t
 
 (** Storage identities use the translated type structure, rather than a display tag.
     References have one representation; nominal value types retain their owner. *)
@@ -739,6 +744,16 @@ let rec type_key types t =
               ~f:(fun (key, value) -> Map_key (key, value))
         | _ -> None
         end
+    | Tconstr (path, arguments, _)
+      when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+        let data = Option.value_exn (find types path) in
+        let family = Option.value_exn data.family in
+        Option.map
+          (Option.all (List.map arguments ~f:(dictionary_type_key types)))
+          ~f:(fun arguments ->
+            Applied_key
+              ( String.split family.worker ~on:'.' @ String.split family.member ~on:'.',
+                arguments ))
     | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
         let data = Option.value_exn (find types p) in
         Option.map
@@ -760,6 +775,59 @@ let rec type_key types t =
           ~f:(fun keys -> Tuple_key keys)
     | Tpoly (body, []) -> type_key types body
     | _ -> None
+
+(* A family index retains its value dictionary identity, including its domain. *)
+and dictionary_type_key types t =
+  let ( let* ) value f = Option.bind value ~f in
+  match desc types t with
+  | Tconstr (path, arguments, _)
+    when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+      let family = Option.value_exn (Option.value_exn (find types path)).family in
+      let* arguments = Option.all (List.map arguments ~f:(dictionary_type_key types)) in
+      Some
+        (Applied_key
+           ( ("dictionary" :: String.split family.worker ~on:'.')
+             @ String.split family.dictionary ~on:'.',
+             arguments ))
+  | _ ->
+      begin match abstract_value_constraint types t with
+      | Some { Qualified_name.path; name = "holds" } when not (List.is_empty path) ->
+          Some (Named_key ("dictionary" :: path))
+      | constraint_ ->
+          let* carrier = type_key types t in
+          let* domain =
+            match constraint_ with
+            | Some predicate ->
+                Some (Named_key (("domain" :: predicate.path) @ [ predicate.name ]))
+            | None when is_int types t -> Some (Named_key [ "bounded_int" ])
+            | None when not (has_domain types t) -> Some (Named_key [ "unrestricted" ])
+            | None ->
+                begin match desc types t with
+                | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
+                    Option.map (dictionary_type_key types element) ~f:(fun key ->
+                        List_key key)
+                | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
+                    Option.map (dictionary_type_key types element) ~f:(fun key ->
+                        Option_key key)
+                | Tconstr (path, arguments, _)
+                  when Option.exists (find types path) ~f:is_value_family ->
+                    let data = Option.value_exn (find types path) in
+                    Option.map
+                      (Option.all (List.map arguments ~f:(dictionary_type_key types)))
+                      ~f:(fun arguments ->
+                        Applied_key
+                          (String.split (value_family_name data) ~on:'.', arguments))
+                | Ttuple components ->
+                    Option.map
+                      (Option.all
+                         (List.map components ~f:(fun (_, element) ->
+                              dictionary_type_key types element)))
+                      ~f:(fun keys -> Tuple_key keys)
+                | _ -> Some (Named_key [ "nominal" ])
+                end
+          in
+          Some (Tuple_key [ carrier; domain ])
+      end
 
 let rec key_name = function
   | Int_key -> "Int"
@@ -833,78 +901,6 @@ let cell_key_name key =
 let allocation_tag ~prefix ~suffix data typ =
   Option.map (cell_identity ~prefix ~suffix data typ) ~f:cell_key_name
 
-let rec is_int types t =
-  let t = expand_parameterized types t in
-  match Types.get_desc t with
-  | Tconstr (p, [], _) ->
-      begin match find types p with
-      | Some { mathematical_integer = true; _ } | Some { mathematical = true; _ } -> false
-      | Some { alias = Some t; _ } -> is_int types t
-      | _ -> Path.same p Predef.path_int
-      end
-  | Tpoly (t, []) -> is_int types t
-  | _ -> false
-
-let rec abstract_value_constraint types t =
-  let t = expand_parameterized types t in
-  match Types.get_desc t with
-  | Tconstr (path, arguments, _) when not (List.is_empty arguments) ->
-      Option.bind (find types path) ~f:(fun data ->
-          if
-            Option.is_none data.library
-            && List.equal Types.eq_type data.parameters arguments
-          then data.value_constraint
-          else None)
-  | Tvar _ -> Option.bind (find_variable types t) ~f:(fun data -> data.value_constraint)
-  | Tconstr (path, [], _) ->
-      begin match find types path with
-      | Some { mathematical = true; _ } -> None
-      | Some { value_constraint = Some constraint_; _ } -> Some constraint_
-      | Some { alias = Some body; _ } -> abstract_value_constraint types body
-      | Some _ | None -> None
-      end
-  | Tpoly (body, []) -> abstract_value_constraint types body
-  | _ -> None
-
-(** Whether the carrier contains values outside the source value domain. Recursive
-    algebraic cycles without constrained payloads have a trivial domain. *)
-let has_domain types t =
-  let rec visit seen t =
-    let t = expand_parameterized types t in
-    let mathematical =
-      match Types.get_desc t with
-      | Tconstr (path, _, _) ->
-          Option.exists (find types path) ~f:(fun d -> d.mathematical)
-      | _ -> false
-    in
-    if mathematical then false
-    else if
-      Option.is_some (value_family types t)
-      || Option.is_some (abstract_value_constraint types t)
-      || is_int types t
-    then true
-    else
-      match Types.get_desc t with
-      | Tconstr (path, [], _) ->
-          begin match find types path with
-          | Some { mathematical_integer = true; _ } -> false
-          | Some { alias = Some body; _ } -> visit seen body
-          | Some { heap = Some _; _ } | Some { library = Some _; _ } -> false
-          | Some data when data.empty -> true
-          | Some data when not (List.mem seen path ~equal:Path.same) ->
-              List.exists data.ctors ~f:(fun ctor ->
-                  List.exists ctor.args ~f:(visit (path :: seen)))
-          | Some _ | None -> false
-          end
-      | Tconstr (path, [ element ], _)
-        when Path.same path Predef.path_list || Path.same path Predef.path_option ->
-          visit seen element
-      | Ttuple components -> List.exists components ~f:(fun (_, t) -> visit seen t)
-      | Tpoly (body, []) -> visit seen body
-      | _ -> false
-  in
-  visit [] t
-
 (** A container domain must be declared where all of its carrier parameters are visible.
     Layout-dependent carriers retain the layout's own domain members. *)
 let domain_identity types t =
@@ -915,6 +911,10 @@ let domain_identity types t =
         Option.value_map (find_variable types t) ~default:[] ~f:(fun data ->
             Option.to_list data.domain_scope)
     | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
+    | Tconstr (path, arguments, _)
+      when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+        let family = Option.value_exn (Option.value_exn (find types path)).family in
+        family.scope :: List.concat_map arguments ~f:(scopes seen)
     | Tconstr (path, arguments, _) when Option.exists (find types path) ~f:is_value_family
       ->
         Option.to_list (Option.bind (find types path) ~f:(fun data -> data.domain_scope))
@@ -961,6 +961,10 @@ let domain_identity types t =
 
 let container types t =
   Option.is_some (value_family types t)
+  || (match desc types t with
+    | Tconstr (path, _, _) ->
+        Option.exists (find types path) ~f:(fun data -> Option.is_some data.family)
+    | _ -> false)
   ||
   match desc types t with
   | Tconstr (path, [ _ ], _)
@@ -973,12 +977,6 @@ let structural_constraint_name types t =
   match domain_identity types t with
   | Some key -> Some (cell_key_name key)
   | None -> Option.map (type_key types t) ~f:(fun key -> "ocaml_value$" ^ key_name key)
-
-let supplied_dictionary types t =
-  match abstract_value_constraint types t with
-  | Some { Qualified_name.path; name = "holds" } ->
-      Option.some_if (not (List.is_empty path)) (String.concat ~sep:"." path)
-  | Some _ | None -> None
 
 let rec domain_key ~namespace types t =
   match abstract_value_constraint types t with
@@ -1023,26 +1021,82 @@ let rec domain_key ~namespace types t =
                    else parts)))
 
 and dictionary_name types t =
-  match supplied_dictionary types t with
-  | Some dictionary -> Some dictionary
-  | None when is_int types t -> Some Prelude.value_int
-  | None ->
-      Option.map (domain_identity types t) ~f:(fun key ->
-          let dictionary =
-            String.concat ~sep:"."
-              (key.namespace
-              @ [
-                  "Ocaml$Values$"
-                  ^ framed
-                      [
-                        key_name key.payload; domain_key ~namespace:key.namespace types t;
-                      ];
-                ])
-          in
-          match value_family types t with
-          | Some (data, _) when Option.is_none data.library && not data.mathematical ->
-              dictionary ^ ".Self"
-          | _ -> dictionary)
+  match desc types t with
+  | Tconstr (path, _, _)
+    when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+      supplied_dictionary types t
+  | _ -> (
+      match supplied_dictionary types t with
+      | Some dictionary -> Some dictionary
+      | None when is_int types t -> Some Prelude.value_int
+      | None ->
+          Option.map (domain_identity types t) ~f:(fun key ->
+              let dictionary =
+                String.concat ~sep:"."
+                  (key.namespace
+                  @ [
+                      "Ocaml$Values$"
+                      ^ framed
+                          [
+                            key_name key.payload;
+                            domain_key ~namespace:key.namespace types t;
+                          ];
+                    ])
+              in
+              match value_family types t with
+              | Some (data, _) when Option.is_none data.library && not data.mathematical
+                ->
+                  dictionary ^ ".Self"
+              | _ -> dictionary))
+
+and supplied_dictionary types t =
+  match desc types t with
+  | Tconstr (path, arguments, _)
+    when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+      let data = Option.value_exn (find types path) in
+      let family = Option.value_exn data.family in
+      Option.map (family_instance types data arguments) ~f:(fun instance ->
+          instance.family_name ^ "." ^ family.dictionary)
+  | _ ->
+      begin match abstract_value_constraint types t with
+      | Some { Qualified_name.path; name = "holds" } ->
+          Option.some_if (not (List.is_empty path)) (String.concat ~sep:"." path)
+      | Some _ | None -> None
+      end
+
+and family_instance types (data : t) arguments =
+  let ( let* ) value f = Option.bind value ~f in
+  let* family = data.family in
+  let* _ = Option.some_if (List.length arguments = List.length data.parameters) () in
+  let* family_arguments = Option.all (List.map arguments ~f:(dictionary_name types)) in
+  let scopes =
+    family.scope
+    :: List.map arguments ~f:(fun argument ->
+        Option.value_map (domain_identity types argument) ~default:[] ~f:(fun key ->
+            key.namespace))
+  in
+  let* family_namespace =
+    List.fold scopes ~init:(Some []) ~f:(fun scope next ->
+        let* scope = scope in
+        if List.is_prefix next ~prefix:scope ~equal:String.equal then Some next
+        else if List.is_prefix scope ~prefix:next ~equal:String.equal then Some scope
+        else None)
+  in
+  let self_arguments =
+    List.mapi arguments ~f:(fun index _ -> family.worker ^ ".A" ^ Int.to_string index)
+  in
+  let family_name =
+    if List.equal String.equal family_arguments self_arguments then family.worker
+    else
+      let path_key name = framed (String.split name ~on:'.') in
+      String.concat ~sep:"."
+        (family_namespace
+        @ [
+            "Family$Instance$"
+            ^ framed (List.map (family.worker :: family_arguments) ~f:path_key);
+          ])
+  in
+  Some { family_namespace; family_worker = family.worker; family_arguments; family_name }
 
 let constraint_name types t =
   match abstract_value_constraint types t with
@@ -1055,6 +1109,179 @@ let constraint_name types t =
 
 let domain_namespace types t =
   Option.map (domain_identity types t) ~f:(fun key -> key.namespace)
+
+(** The Raven type of the OCaml type [t]; [self] is the data type being defined, if any,
+    which its module calls [T]. *)
+let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
+    (R.Type.t, Report.error) Result.t =
+  let l = loc at in
+  let types = Option.value_map self ~default:types ~f:(fun self -> self :: types) in
+  match desc types t with
+  | Tvar _ ->
+      begin match
+        Option.bind (find_variable types t) ~f:(fun data -> data.backend_type)
+      with
+      | Some backend -> Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l backend) [])
+      | None -> Report.unsupported at "An unbound polymorphic type variable"
+      end
+  | Tconstr (p, [], _) when Path.same p Predef.path_int -> Ok (R.Type.int ~loc:l)
+  | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
+  | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
+  | Tconstr (p, [], _) when is_ghost p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [], _) when is_permission p -> Ok (R.Type.real ~loc:l)
+  | Tconstr (p, [ elt ], _)
+    when Path.same p Predef.path_list || Path.same p Predef.path_option ->
+      let* elt = typ types ?self ~at elt in
+      let d = Option.value_exn (find types p) in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
+  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
+  | Tconstr (p, [ elt ], _) when is_collection types p FinSet ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.fin_set ~loc:l elt)
+  | Tconstr (p, [ elt ], _) when is_collection types p Set ->
+      let* elt = typ types ?self ~at elt in
+      Ok (R.Type.set ~loc:l elt)
+  | Tconstr (p, [ key; value ], _) when is_collection types p Map ->
+      let* key = typ types ?self ~at key in
+      let* value = typ types ?self ~at value in
+      Ok (R.Type.map ~loc:l key value)
+  | Tconstr (path, arguments, _)
+    when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
+      let data = Option.value_exn (find types path) in
+      let family = Option.value_exn data.family in
+      begin match family_instance types data arguments with
+      | None -> Report.unsupported at "This proof type family instance"
+      | Some instance ->
+          Ok
+            (R.Type.named ~loc:l
+               (Qualified_name.raven ~loc:l
+                  (Qualified_name.of_string (instance.family_name ^ "." ^ family.member)))
+               [])
+      end
+  | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
+      let data = Option.value_exn (find types p) in
+      let* arguments = Result.all (List.map arguments ~f:(typ types ?self ~at)) in
+      begin match self with
+      | Some self when declares self p ->
+          let source_arguments =
+            match desc types t with Tconstr (_, arguments, _) -> arguments | _ -> []
+          in
+          if List.equal Types.eq_type self.parameters source_arguments then
+            Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
+          else Report.unsupported at "A nonregular recursive datatype"
+      | _ ->
+          let path = Option.value data.module_path ~default:[ data.module_name ] in
+          let name =
+            Qualified_name.{ path = List.drop_last_exn path; name = List.last_exn path }
+          in
+          Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l name) arguments)
+      end
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
+      Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.backend_type) ->
+      let d = Option.value_exn (find types p) in
+      Ok
+        (R.Type.named ~loc:l
+           (Qualified_name.raven ~loc:l (Option.value_exn d.backend_type))
+           [])
+  | Tconstr (p, [], _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
+      let d = Option.value_exn (find types p) in
+      Ok
+        (R.Type.atomic_token ~loc:l
+           (Qualified_name.raven ~loc:l
+              (Qualified_name.of_string (Option.value_exn d.atomic_procedure))))
+  | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
+      let d = Option.value_exn (find types p) in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
+  | Ttuple components ->
+      let* components =
+        Result.all (List.map components ~f:(fun (_, t) -> typ types ?self ~at t))
+      in
+      Ok (R.Type.tuple ~loc:l components)
+  (* The type of a record label, which is not polymorphic here. *)
+  | Tpoly (t, []) -> typ types ?self ~at t
+  | _ -> Report.unsupported at (Stdlib.Format.asprintf "The type %a" Printtyp.type_expr t)
+
+(** Instantiates payloads and retains the native owner of dependent constructors. *)
+let instantiated types occurrence =
+  match desc types occurrence with
+  | Tconstr (path, arguments, _) ->
+      Option.bind (find types path) ~f:(fun data ->
+          Option.bind (instantiate data arguments) ~f:(fun instance ->
+              match data.family with
+              | None -> Some instance
+              | Some family ->
+                  Option.map (family_instance types data arguments) ~f:(fun owner ->
+                      let member = Qualified_name.of_string family.member in
+                      {
+                        instance with
+                        module_path =
+                          Some (String.split owner.family_name ~on:'.' @ member.path);
+                      })))
+  | _ -> None
+
+(** Traverses represented carriers and their immutable payloads. *)
+let fold_families types requested ~init ~f =
+  let rec visit seen state typ =
+    match desc types typ with
+    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> state
+    | Tconstr (path, arguments, _) ->
+        let state = List.fold arguments ~init:state ~f:(visit seen) in
+        let data = find types path in
+        let state =
+          match data with
+          | Some data when Option.is_some data.family -> f state data arguments
+          | Some _ | None -> state
+        in
+        if List.mem seen path ~equal:Path.same then state
+        else
+          begin match Option.bind data ~f:(fun data -> instantiate data arguments) with
+          | Some { heap = None; ctors; _ } ->
+              List.fold ctors ~init:state ~f:(fun state ctor ->
+                  List.fold ctor.args ~init:state ~f:(visit (path :: seen)))
+          | Some _ | None -> state
+          end
+    | Ttuple components ->
+        List.fold components ~init:state ~f:(fun state (_, component) ->
+            visit seen state component)
+    | Tpoly (body, []) -> visit seen state body
+    | _ -> state
+  in
+  List.fold requested ~init ~f:(visit [])
+
+(** Native family instances required by carriers and their immutable payloads. *)
+let family_dependencies types requested =
+  let _, instances =
+    fold_families types requested
+      ~init:(Set.empty (module String), [])
+      ~f:(fun (names, instances) data arguments ->
+        match family_instance types data arguments with
+        | None -> (names, instances)
+        | Some instance when Set.mem names instance.family_name -> (names, instances)
+        | Some instance -> (Set.add names instance.family_name, instance :: instances))
+  in
+  List.rev instances
+
+(** Dictionary requests needed to supply the indices of native family instances. *)
+let family_argument_types types requested =
+  let _, arguments =
+    fold_families types requested
+      ~init:(Set.empty (module Int), [])
+      ~f:(fun state _ arguments ->
+        List.fold arguments ~init:state ~f:(fun (seen, arguments) argument ->
+            let id = Types.get_id argument in
+            if Set.mem seen id then (seen, arguments)
+            else (Set.add seen id, argument :: arguments)))
+  in
+  List.rev arguments
 
 let unique_domain_members members =
   let _, members =
@@ -1126,6 +1353,21 @@ let domain_nodes ?(dictionaries = false) types requested =
       ~f:(if dictionaries then dictionary else domain)
   in
   List.rev nodes
+
+let dictionary_declaration_name types typ name =
+  match value_family types typ with
+  | Some (data, _) when Option.is_none data.library && not data.mathematical ->
+      Option.value (String.chop_suffix name ~suffix:".Self") ~default:name
+  | _ -> name
+
+(** Each declaration depends on its own carrier, independently of parent containers. *)
+let family_domain_dependencies ?(dictionaries = false) types requested =
+  List.filter_map (domain_nodes ~dictionaries types requested) ~f:(function
+    | Domain_function (typ, name) -> Some (name, family_dependencies types [ typ ])
+    | Value_dictionary (typ, Some name) ->
+        Some
+          (dictionary_declaration_name types typ name, family_dependencies types [ typ ])
+    | Value_dictionary (_, None) -> None)
 
 (** The monomorphic domain functions needed by the requested carriers. Mathematical
     collections and abstract library carriers retain their own logical contracts. *)
@@ -1241,13 +1483,7 @@ let domain_members ?(dictionaries = false) types requested =
             Ok None
         | Value_dictionary (t, Some name) ->
             let* _ = require_identity t in
-            let name =
-              match value_family types t with
-              | Some (data, _) when Option.is_none data.library && not data.mathematical
-                ->
-                  Option.value (String.chop_suffix name ~suffix:".Self") ~default:name
-              | _ -> name
-            in
+            let name = dictionary_declaration_name types t name in
             let* member = dictionary_definition t name in
             Ok (Some (name, member))
         | Domain_function (t, name) ->
@@ -1502,10 +1738,13 @@ let value_family_members types (data : t) =
           value_templates ~dictionaries:true types payloads )
 
 (** The module declaring [d], given the data types declared before it. *)
-let member (types : t list) (d : t) : (R.Member.t, Report.error) Result.t =
+let member ?(parameters = true) (types : t list) (d : t) :
+    (R.Member.t, Report.error) Result.t =
   let l = loc d.at in
   let variables =
-    List.mapi d.parameters ~f:(fun index variable ->
+    List.mapi
+      (if parameters then d.parameters else [])
+      ~f:(fun index variable ->
         let parameter = "A" ^ Int.to_string index in
         {
           (variable_type ~variable ~owner:[] ~parameter ~at:d.at) with

@@ -1,0 +1,39 @@
+type 'a fact = Seen of 'a
+
+module Facts = SetRA (struct type 'a t = 'a fact end)
+module Authority = Auth (Facts)
+module Alias = Facts
+module Again = SetRA (struct type 'b t = 'b fact end)
+
+lemma valid_items (items : 'a fact set)
+  ensures (Facts.valid (Facts.set items))
+  ensures (Authority.valid (Authority.full (Facts.set items)))
+  ensures (Alias.set items === Facts.set items)
+  ensures (Again.set items === Facts.set items)
+  ensures (Facts.comp (Facts.id : 'a Facts.t) (Facts.set items) === Facts.set items) = ()
+
+lemma integer = valid_items (Set.singleton (Seen 17))
+lemma boolean = valid_items (Set.singleton (Seen true))
+
+let registered : (Ghost.t, 'a Authority.t) Ghost.field = Ghost.field ()
+
+lemma allocate (items : 'a fact set) returns (registration : Ghost.t)
+  ensures (own (Ghost.at registered registration) (Authority.full (Facts.set items))) =
+  Ghost.alloc [Ghost.init registered (Authority.full (Facts.set items))]
+
+lemma grow (registration : Ghost.t) (value : 'a)
+  requires (own (Ghost.at registered registration)
+    (Authority.full (Facts.set Set.empty : 'a Facts.t)))
+  ensures (own (Ghost.at registered registration)
+    (Authority.full (Facts.set (Set.singleton (Seen value))))) =
+  Ghost.fpu (Ghost.at registered registration)
+    (Authority.full (Facts.set Set.empty : 'a Facts.t))
+    (Authority.full (Facts.set (Set.singleton (Seen value))))
+
+lemma integer_registration =
+  let registration = allocate (Set.empty : int fact set) in
+  grow registration 17
+
+lemma boolean_registration =
+  let registration = allocate (Set.empty : bool fact set) in
+  grow registration true
