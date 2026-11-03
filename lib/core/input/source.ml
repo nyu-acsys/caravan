@@ -1237,10 +1237,30 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
       Ok (Ast_helper.Exp.record ~loc fields base)
   | Tattr (_, value) | Told value -> exp value
 
+(** The environments extended with [logical_check_signature], with the environments they
+    extend, most recent first. Logical expressions are checked in few environments, and
+    typing the signature anew for each one dominated the translation. *)
+let signature_environments : (Env.t * Env.t) list ref = ref []
+
+(** [env] with [logical_check_signature], typed once for each environment. *)
+let with_logical_check_signature env =
+  match List.Assoc.find !signature_environments env ~equal:phys_equal with
+  | Some extended -> extended
+  | None ->
+      let extended =
+        (Typemod.type_interface env
+           (Parse.interface (Lexing.from_string logical_check_signature)))
+          .sig_final_env
+      in
+      signature_environments := List.take ((env, extended) :: !signature_environments) 64;
+      extended
+
 (** Types logical expressions before Raven erases reference element types. *)
 let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) env
     ~functions ~variables ?expected (term : S.term) =
   try
+    (* The signature's values are generic, so its environment is shared across levels. *)
+    let env = with_logical_check_signature env in
     Ctype.with_local_level (fun () ->
         let rec free_variables (seen, found) typ =
           let id = Types.get_id typ in
@@ -1393,11 +1413,6 @@ let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) 
           if List.is_empty substitutions && List.is_empty annotation_aliases then
             expression
           else mapper.expr mapper expression
-        in
-        let env =
-          (Typemod.type_interface env
-             (Parse.interface (Lexing.from_string logical_check_signature)))
-            .sig_final_env
         in
         let add env name typ =
           Env.add_value (Ident.create_local name)
