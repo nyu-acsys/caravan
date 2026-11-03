@@ -13,9 +13,12 @@ let unused used base =
   go 0
 
 let given = ref (Set.empty (module String))
+let keyed = ref (Map.empty (module String))
 
 (** Starts a new program, with no names given. *)
-let reset () = given := Set.empty (module String)
+let reset () =
+  given := Set.empty (module String);
+  keyed := Map.empty (module String)
 
 (** Keeps [names] from being given. *)
 let reserve names = given := Set.union !given (Set.of_list (module String) names)
@@ -25,3 +28,14 @@ let fresh base =
   let name = unused !given base in
   given := Set.add !given name;
   name
+
+(** The name of the program for the structural [key], the same for every use of [key]: a
+    fresh name for [base] the first time. Generated declarations identified by long
+    structural keys thus get short, readable names. *)
+let for_key ~key base =
+  match Map.find !keyed key with
+  | Some name -> name
+  | None ->
+      let name = fresh base in
+      keyed := Map.set !keyed ~key ~data:name;
+      name

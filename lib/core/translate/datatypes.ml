@@ -852,6 +852,34 @@ let rec key_name = function
   | Tuple_key arguments -> "Tuple$" ^ framed (List.map arguments ~f:key_name)
   | Atomic_token_key path -> "Token$" ^ framed [ key_name (Named_key path) ]
 
+(** A short, readable rendering of [key] for generated names; not injective. *)
+let rec readable_key = function
+  | Int_key -> "Int"
+  | Integer_key -> "Integer"
+  | Bool_key -> "Bool"
+  | Unit_key -> "Unit"
+  | Ref_key -> "Ref"
+  | Permission_key -> "Permission"
+  | Named_key path -> readable_path path
+  | Applied_key (path, arguments) ->
+      readable_path path ^ String.concat (List.map arguments ~f:readable_key)
+  | List_key child -> readable_key child ^ "List"
+  | Option_key child -> readable_key child ^ "Option"
+  | Seq_key child -> readable_key child ^ "Seq"
+  | Finset_key child -> readable_key child ^ "FinSet"
+  | Set_key child -> readable_key child ^ "Set"
+  | Map_key (key, value) -> "Map" ^ readable_key key ^ readable_key value
+  | Tuple_key arguments -> "Tuple" ^ String.concat (List.map arguments ~f:readable_key)
+  | Atomic_token_key path -> readable_path path ^ "Token"
+
+(** The last informative component of [path]: a module's rather than its [Carrier] or [T].
+*)
+and readable_path path =
+  match List.rev path with
+  | ("Carrier" | "T" | "t") :: owner :: _ -> owner
+  | last :: _ -> last
+  | [] -> "Value"
+
 let relative_path owner path =
   let rec strip owner path =
     match (owner, path) with
@@ -1035,16 +1063,16 @@ and dictionary_name types t =
       | None when is_int types t -> Some Prelude.value_int
       | None ->
           Option.map (domain_identity types t) ~f:(fun key ->
+              let structural =
+                framed
+                  [ key_name key.payload; domain_key ~namespace:key.namespace types t ]
+              in
               let dictionary =
                 String.concat ~sep:"."
                   (key.namespace
                   @ [
-                      "Ocaml$Values$"
-                      ^ framed
-                          [
-                            key_name key.payload;
-                            domain_key ~namespace:key.namespace types t;
-                          ];
+                      Fresh_names.for_key ~key:("Values$" ^ structural)
+                        ("Values$" ^ readable_key key.payload);
                     ])
               in
               match value_family types t with
@@ -1092,12 +1120,30 @@ and family_instance types (data : t) arguments =
   let family_name =
     if List.equal String.equal family_arguments self_arguments then family.worker
     else
-      let path_key name = framed (String.split name ~on:'.') in
+      (* Arguments are named relative to the instance's namespace, so that identical
+         instances in different namespaces share a name. *)
+      let relative name =
+        let path = List.filter (String.split name ~on:'.') ~f:(Fn.non String.is_empty) in
+        relative_path family_namespace path
+      in
+      let path_key name = framed (relative name) in
+      let readable name =
+        match List.rev (relative name) with
+        | "Family" :: owner :: _ -> owner
+        | _ ->
+            let leaf = readable_path (relative name) in
+            Option.value (String.chop_suffix leaf ~suffix:"$Family") ~default:leaf
+      in
       String.concat ~sep:"."
         (family_namespace
         @ [
-            "Family$Instance$"
-            ^ framed (List.map (family.worker :: family_arguments) ~f:path_key);
+            Fresh_names.for_key
+              ~key:
+                ("Family$"
+                ^ framed (List.map (family.worker :: family_arguments) ~f:path_key))
+              ("Family$"
+              ^ String.concat ~sep:"$"
+                  (List.map (family.worker :: family_arguments) ~f:readable));
           ])
   in
   Some { family_namespace; family_worker = family.worker; family_arguments; family_name }

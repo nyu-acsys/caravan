@@ -1261,11 +1261,9 @@ module State = struct
             admissibility = Datatypes.constraint_name given.types elt;
           }
 
-  let primitive_stem field =
-    let qualified = Qualified_name.of_string field in
-    match qualified.path with
-    | [] -> String.uncapitalize qualified.name
-    | path -> "field$" ^ Datatypes.framed (path @ [ qualified.name ])
+  (** The field's name, as the stem of its primitives' names; [add_primitive] makes them
+      distinct. *)
+  let primitive_stem field = String.uncapitalize (Qualified_name.of_string field).name
 
   (** The procedure performing [op] on the atomics with contents of type [elt]. *)
   let primitive (given : inputs) ~at elt op =
