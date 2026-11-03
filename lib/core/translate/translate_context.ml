@@ -1045,7 +1045,9 @@ let source_type_variables (given : inputs) =
       List.Assoc.find given.procedure_signatures procedure ~equal:String.equal)
   |> Option.value_map ~default:[] ~f:(fun signature -> signature.procedure_variables)
 
-(** Resolve local annotation variables through the expected value type. *)
+(** Resolve local annotation variables through the expected value type. A name stands for
+    its first variable: the procedure's, then its worker's, which precede those of the
+    other workers sharing its functor. *)
 let source_type ?expected (given : inputs) ~at annotation =
   let variables =
     source_type_variables given
@@ -1054,6 +1056,7 @@ let source_type ?expected (given : inputs) ~at annotation =
             match Types.get_desc variable with
             | Tvar (Some name) -> Some (name, variable)
             | _ -> None))
+    |> List.stable_dedup ~compare:(fun (left, _) (right, _) -> String.compare left right)
   in
   match (Source.ocaml_type ~variables given.env ~at annotation, expected) with
   | Ok typ, _ -> Ok typ

@@ -57,40 +57,131 @@ let program ?(history = History.default) (source : Source.t) :
   let scoped_binding =
     Program_scopes.scoped_binding ~unapplied_proofs:scopes.unapplied_proofs
   in
-  let* decls, proofs, state =
-    let* decls = Program_declarations.run scopes in
-    let* proofs, state = Program_proofs.run scopes decls State.initial in
-    let* dependencies = Generic_dependencies.create scopes decls proofs in
-    if
-      List.exists dependencies.families.groups ~f:(fun group ->
-          List.length group.Generic_families.members > 1)
-    then
-      let normalize = Generic_families.normalize_name dependencies.families in
-      let assets =
-        List.map (decls.generic_resource_workers @ decls.generic_model_workers) ~f:fst
-        @ List.filter_map decls.source.proof_fields ~f:(fun field ->
-            Option.some_if
-              (not (List.is_empty field.Source.field_parameters))
-              (Generic_fields.worker field))
-      in
-      let family_plan =
-        Generic_family_plan.
+  let snapshot = Fresh_names.save () in
+  let declare family_plan =
+    let* decls = Program_declarations.run ~family_plan scopes in
+    let* proofs, state = Program_proofs.run ~family_plan scopes decls State.initial in
+    Ok (decls, proofs, state)
+  in
+  let complete (decls, proofs, state) =
+    let* shaped = Program_structures.run ~history scopes decls proofs in
+    let* translated, state = Program_members.run scopes decls proofs shaped state in
+    Ok (decls, proofs, shaped, translated, state)
+  in
+  (* Every worker's functor, as [rename] assigns it, and the workers. *)
+  let family_plan ~rename (decls : Program_declarations.t) (proofs : Program_proofs.t) =
+    let assets =
+      List.map (decls.generic_resource_workers @ decls.generic_model_workers) ~f:fst
+      @ List.filter_map decls.source.proof_fields ~f:(fun field ->
+          Option.some_if
+            (not (List.is_empty field.Source.field_parameters))
+            (Generic_fields.worker field))
+    in
+    let proofs = decls.generic_predicates @ proofs.generic_callables in
+    let workers =
+      List.map decls.polymorphic_functions ~f:(fun worker ->
           {
-            runtime =
-              List.map decls.polymorphic_functions ~f:(fun worker ->
-                  (worker.Polymorphic_functions.id, normalize worker.name));
-            proofs =
-              List.map (decls.generic_predicates @ proofs.generic_callables)
-                ~f:(fun worker -> (worker.Generic_parameters.key, normalize worker.name));
-            assets =
-              List.map assets ~f:(fun worker ->
-                  (worker.Generic_parameters.key, normalize worker.name));
-          }
+            Worker_groups.name = worker.Polymorphic_functions.name;
+            arity = List.length worker.scheme.variables;
+          })
+      @ List.map (proofs @ assets) ~f:(fun worker ->
+          {
+            Worker_groups.name = worker.Generic_parameters.name;
+            arity = List.length worker.variables;
+          })
+    in
+    ( Generic_family_plan.
+        {
+          runtime =
+            List.map decls.polymorphic_functions ~f:(fun worker ->
+                (worker.Polymorphic_functions.id, rename worker.name));
+          proofs =
+            List.map proofs ~f:(fun worker ->
+                (worker.Generic_parameters.key, rename worker.name));
+          assets =
+            List.map assets ~f:(fun worker ->
+                (worker.Generic_parameters.key, rename worker.name));
+        },
+      List.dedup_and_sort workers ~compare:(fun left right ->
+          String.compare left.Worker_groups.name right.name) )
+  in
+  let* decls, proofs, shaped, translated, state =
+    let* ((decls, proofs, _) as declared) = declare Generic_family_plan.empty in
+    let* dependencies = Generic_dependencies.create scopes decls proofs in
+    let* declared =
+      if
+        List.exists dependencies.families.groups ~f:(fun group ->
+            List.length group.Generic_families.members > 1)
+      then
+        declare
+          (fst
+             (family_plan
+                ~rename:(Generic_families.normalize_name dependencies.families)
+                decls proofs))
+      else Ok declared
+    in
+    let* ((decls, proofs, _, _, state) as completed) = complete declared in
+    let _, workers = family_plan ~rename:Fn.id decls proofs in
+    let rec generic_modules (group : Generic_modules.t) =
+      group :: List.concat_map group.captures ~f:generic_modules
+    in
+    let generic_modules = List.concat_map scopes.generics ~f:generic_modules in
+    let applications =
+      List.concat_map generic_modules ~f:(fun group ->
+          List.map group.applications ~f:(fun application -> (group, application)))
+    in
+    (* Root functions follow the module applications before them. *)
+    let lexical =
+      List.concat_map decls.polymorphic_functions ~f:(fun worker ->
+          if not (List.is_empty (Qualified_name.of_string worker.name).path) then []
+          else
+            List.filter_map applications ~f:(fun (_, application) ->
+                Option.some_if
+                  (application.source.argument.site.item_loc.loc_start.pos_cnum
+                 < worker.loc.loc_start.pos_cnum)
+                  {
+                    Worker_groups.namespace = [ worker.name ];
+                    target = application.name ^ ".";
+                    arguments = None;
+                  }))
+    in
+    let* groups =
+      Worker_groups.create
+        ~generic_modules:(List.map generic_modules ~f:(fun group -> group.name))
+        ~applications:
+          (List.map applications ~f:(fun (group, application) ->
+               (application.name, group.name)))
+        workers
+        (List.map state.tables.function_instances ~f:(fun instance ->
+             {
+               Worker_groups.namespace = instance.instance_namespace;
+               target = instance.instance_worker;
+               arguments = Some instance.instance_arguments;
+             })
+        @ List.map state.tables.call_targets ~f:(fun (namespace, target) ->
+            { Worker_groups.namespace; target; arguments = None })
+        @ lexical)
+    in
+    if List.is_empty groups then Ok completed
+    else begin
+      (* Translated again, naming everything as before. *)
+      Fresh_names.restore snapshot;
+      Fresh_names.reserve (List.map workers ~f:(fun worker -> worker.Worker_groups.name));
+      let functors =
+        List.concat_map groups ~f:(fun members ->
+            let scope = (Qualified_name.of_string (List.hd_exn members)).path in
+            let name = String.concat ~sep:"." (scope @ [ Fresh_names.fresh "Generic" ]) in
+            List.map members ~f:(fun member -> (member, name)))
+        |> Map.of_alist_exn (module String)
       in
-      let* decls = Program_declarations.run ~family_plan scopes in
-      let* proofs, state = Program_proofs.run ~family_plan scopes decls State.initial in
-      Ok (decls, proofs, state)
-    else Ok (decls, proofs, state)
+      let plan, _ =
+        family_plan
+          ~rename:(fun name -> Option.value (Map.find functors name) ~default:name)
+          decls proofs
+      in
+      let* declared = declare plan in
+      complete declared
+    end
   in
   let {
     Program_declarations.source;
@@ -157,7 +248,6 @@ let program ?(history = History.default) (source : Source.t) :
   } =
     proofs
   in
-  let* shaped = Program_structures.run ~history scopes decls proofs in
   let {
     Program_structures.structures;
     structure_member_lists;
@@ -186,7 +276,6 @@ let program ?(history = History.default) (source : Source.t) :
   let state_members =
     Program_structures.state_members ~destination_of:predicate_destination
   in
-  let* translated, state = Program_members.run scopes decls proofs shaped state in
   let {
     Program_members.library_modules = library_parts;
     library_worker_members;

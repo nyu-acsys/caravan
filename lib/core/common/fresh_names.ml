@@ -20,6 +20,15 @@ let reset () =
   given := Set.empty (module String);
   keyed := Map.empty (module String)
 
+type snapshot = Set.M(String).t * string Map.M(String).t
+
+(** The names given so far, to [restore] for translating the program again. *)
+let save () : snapshot = (!given, !keyed)
+
+let restore ((names, keys) : snapshot) =
+  given := names;
+  keyed := keys
+
 (** Keeps [names] from being given. *)
 let reserve names = given := Set.union !given (Set.of_list (module String) names)
 
