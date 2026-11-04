@@ -4,6 +4,7 @@ import { LanguageClient, LanguageClientOptions, ServerOptions, State, TransportK
 
 import { verificationStateNotification, verifyNotification, toolchainNotification, type VerificationState, type VerificationStateParams } from '../shared/protocol';
 import { VerifierUpdates } from './updates';
+import { registerContractNavigation } from './contracts';
 
 let client: LanguageClient | undefined;
 
@@ -68,6 +69,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   client = new LanguageClient('caravan', 'Caravan', serverOptions, clientOptions);
   const activeClient = client;
   context.subscriptions.push(output, status,
+    registerContractNavigation(),
     activeClient.onNotification(verificationStateNotification, (value: VerificationStateParams) => {
       const document = vscode.workspace.textDocuments.find(item => item.uri.toString() === value.uri);
       if (!document || value.version !== document.version) return;

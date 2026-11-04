@@ -24,9 +24,11 @@ let callable_location = function
 
 (** The Raven program translating [source], with its histories encoded in [history], and
     the origins of its proof obligations. *)
-let program_with_diagnostics ?(history = History.default) (source : Source.t) :
+let program_with_diagnostics ?(history = History.default) ?scopes (source : Source.t) :
     (R.Program.t * origin list * R.Diagnostic.t list, error) Result.t =
-  let* scopes = Program_scopes.run source in
+  let* scopes =
+    match scopes with Some scopes -> Ok scopes | None -> Program_scopes.run source
+  in
   let* scopes = Program_declarations.specialize_continuations scopes in
   let {
     Program_scopes.annotations;

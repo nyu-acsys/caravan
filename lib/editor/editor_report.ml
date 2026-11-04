@@ -44,6 +44,21 @@ let diagnostic ~fallback (d : R.Diagnostic.t) =
   :: List.map d.related ~f:(fun related ->
       entry ~fallback ~kind:"RelatedLoc" related.related_loc related.related_message)
 
+let annotation ~fallback (a : Caravan_core.Editor_annotations.t) =
+  `Assoc
+    (location ~fallback (Caravan_core.Report.loc a.loc)
+    @ [
+        ("kind", `String "InheritedContract");
+        ("source", `String a.source);
+        ("source_loc", `Assoc (location ~fallback (Caravan_core.Report.loc a.source_loc)));
+        ( "clauses",
+          `List
+            (List.map a.clauses ~f:(fun clause ->
+                 `Assoc
+                   ([ ("keyword", `String clause.keyword); ("text", `String clause.text) ]
+                   @ location ~fallback (Caravan_core.Report.loc clause.loc)))) );
+      ])
+
 let report ~annotations (results : Caravan_core.Check.result list) : Yojson.Basic.t =
   let errors =
     `List
@@ -55,7 +70,10 @@ let report ~annotations (results : Caravan_core.Check.result list) : Yojson.Basi
     `Assoc
       [
         ("errors", errors);
-        ("annotations", `List []);
+        ( "annotations",
+          `List
+            (List.concat_map results ~f:(fun result ->
+                 List.map result.annotations ~f:(annotation ~fallback:result.file))) );
         ("members", `List []);
         ("references", `List []);
         ("symbols", `List []);

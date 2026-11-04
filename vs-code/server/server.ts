@@ -1,32 +1,37 @@
 import { createConnection, TextDocuments, TextDocumentSyncKind, DiagnosticSeverity,
-	type Diagnostic, type InitializeParams, type WorkspaceFolder } from 'vscode-languageserver/node';
+	type CodeLens, type Diagnostic, type InitializeParams, type WorkspaceFolder } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { URI } from 'vscode-uri';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { toolchainEnvironment } from '../shared/toolchain';
 import { VerificationProcesses } from './verificationProcesses';
-import { parseReport, normalizeReport } from './report';
+import { parseReport, normalizeReport, normalizeContracts, type RavenReport } from './report';
+import { contractLenses } from './contracts';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
 	executable: string; arguments: string[]; includePaths: string[];
-	smtTimeout: number; verifyOnSave: boolean; cwd: string;
+	smtTimeout: number; verifyOnSave: boolean; showContractLenses: boolean; cwd: string;
 }
 interface Owner {
 	generation: number; dependencies?: Set<string>; abort?: AbortController;
 	diagnostics: Map<string, Diagnostic[]>;
 	state: VerificationState; message?: string;
+	annotationGeneration: number; annotationAbort?: AbortController;
+	annotations?: Promise<CodeLens[]>; annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 }
-const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, cwd: '' };
+const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, cwd: '' };
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const processes = new VerificationProcesses(2);
+const annotationProcesses = new VerificationProcesses(1);
 const owners = new Map<string, Owner>();
 const revisions = new Map<string, number>();
 const dirty = new Set<string>();
 const initialChanges = new Set<string>();
 const diskStamps = new Map<string, string>();
+let codeLensRefresh = false;
 let configuration = false;
 let workspaceFolders = false;
 let globalSettings: unknown = {};
@@ -46,7 +51,7 @@ function siblings(file: string): string[] {
 }
 function ownerOf(root: string): Owner {
 	let owner = owners.get(root);
-	if (!owner) { owner = { generation: 0, diagnostics: new Map(), state: 'unchecked' }; owners.set(root, owner); }
+	if (!owner) { owner = { generation: 0, annotationGeneration: 0, diagnostics: new Map(), state: 'unchecked' }; owners.set(root, owner); }
 	return owner;
 }
 function state(root: string, value: VerificationState, message?: string): void {
@@ -72,11 +77,27 @@ function clear(owner: Owner): void {
 	owner.diagnostics.clear();
 	publish(uris);
 }
+function knownDependencies(root: string, owner: Owner): Set<string> | undefined {
+	if (!owner.dependencies && !owner.annotationDependencies) return undefined;
+	return new Set([...siblings(root), ...(owner.dependencies ?? []), ...(owner.annotationDependencies ?? [])]);
+}
+function clearAnnotations(owner: Owner): void {
+	owner.annotationGeneration++;
+	owner.annotationAbort?.abort();
+	owner.annotationAbort = undefined;
+	owner.annotations = undefined;
+	owner.annotationStamps = undefined;
+}
+function refreshAnnotations(): void {
+	if (codeLensRefresh && !shuttingDown) void connection.sendRequest('workspace/codeLens/refresh').catch(() => undefined);
+}
 function invalidate(file: string): void {
 	if (!relevant(file)) return;
 	revisions.set(file, (revisions.get(file) ?? 0) + 1);
 	for (const [root, owner] of owners) {
-		if (!owner.dependencies || owner.dependencies.has(file) || siblings(root).includes(file)) {
+		const dependencies = knownDependencies(root, owner);
+		if (!dependencies || dependencies.has(file)) {
+			clearAnnotations(owner);
 			owner.generation++;
 			owner.abort?.abort();
 			owner.abort = undefined;
@@ -84,6 +105,7 @@ function invalidate(file: string): void {
 			state(root, 'outdated');
 		}
 	}
+	refreshAnnotations();
 }
 function selectToolchain(value: unknown): void {
 	if (typeof value !== 'object' || value === null) return;
@@ -93,12 +115,14 @@ function selectToolchain(value: unknown): void {
 			|| !path.isAbsolute(candidate.bundleRoot) || candidate.bundleRoot.includes('\0')))) return;
 	toolchain = { executable: candidate.executable, ...(typeof candidate.bundleRoot === 'string' ? { bundleRoot: candidate.bundleRoot } : {}) };
 	for (const [root, owner] of owners) {
+		clearAnnotations(owner);
 		owner.generation++;
 		owner.abort?.abort();
 		owner.abort = undefined;
 		clear(owner);
 		state(root, 'outdated');
 	}
+	refreshAnnotations();
 }
 function workspaceFor(file: string): string {
 	return folders.map(folder => fileOf(folder.uri)).filter((folder): folder is string => !!folder)
@@ -113,6 +137,7 @@ function settingsFrom(value: unknown): Settings {
 		arguments: strings(v.arguments) ? v.arguments : [], includePaths: strings(v.includePaths) ? v.includePaths : [],
 		smtTimeout: typeof v.smtTimeout === 'number' && Number.isInteger(v.smtTimeout) && v.smtTimeout > 0 ? v.smtTimeout : defaults.smtTimeout,
 		verifyOnSave: typeof v.verifyOnSave === 'boolean' ? v.verifyOnSave : defaults.verifyOnSave,
+		showContractLenses: typeof v.showContractLenses === 'boolean' ? v.showContractLenses : defaults.showContractLenses,
 		cwd: typeof v.cwd === 'string' ? v.cwd : ''
 	};
 }
@@ -132,6 +157,67 @@ function hasDirty(dependencies?: Set<string>): boolean {
 function diskStamp(file: string): string {
 	try { const stat = fs.statSync(file); return `${stat.mtimeMs}:${stat.size}`; } catch { return 'missing'; }
 }
+function launch(root: string, config: Settings, annotationsOnly = false): { executable: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv } {
+	const workspace = workspaceFor(root);
+	const cwd = config.cwd ? path.resolve(workspace, config.cwd) : workspace;
+	const selected = config.executable || toolchain?.executable || 'caravan';
+	const executable = selected.includes('/') || selected.includes('\\') ? path.resolve(cwd, selected) : selected;
+	const bundleRoot = !config.executable ? toolchain?.bundleRoot : undefined;
+	const env = bundleRoot ? toolchainEnvironment(bundleRoot) : undefined;
+	const args = [...config.arguments, '--lsp-mode', '--lsp-annotations',
+		...(annotationsOnly ? ['--lsp-annotations-only'] : ['--smt-timeout', String(config.smtTimeout)]),
+		...config.includePaths.flatMap(directory => ['-I', path.resolve(cwd, directory)]), root];
+	return { executable, args, cwd, env };
+}
+function sourceText(source: string): string | undefined {
+	const document = documents.get(URI.file(source).toString());
+	if (document) return document.getText();
+	try { return fs.readFileSync(source, 'utf8'); } catch { return undefined; }
+}
+function reportDependencies(report: RavenReport, root: string, cwd: string): Set<string> {
+	const dependencies = new Set(siblings(root));
+	for (const dependency of report.dependencies) dependencies.add(path.resolve(cwd, dependency));
+	for (const error of report.errors) dependencies.add(path.resolve(cwd, error.file));
+	for (const annotation of report.annotations) {
+		dependencies.add(path.resolve(cwd, annotation.file));
+		dependencies.add(path.resolve(cwd, annotation.source_loc.file));
+		for (const clause of annotation.clauses) dependencies.add(path.resolve(cwd, clause.file));
+	}
+	return dependencies;
+}
+function checkedReport(stdout: string, code: number | null, root: string, cwd: string): RavenReport {
+	const parsed = parseReport(stdout, code);
+	if (!parsed.dependencies.some(dependency => path.resolve(cwd, dependency) === root)) {
+		throw new Error('Caravan report omitted the requested implementation dependency');
+	}
+	return parsed;
+}
+async function annotations(root: string, uri: string, owner: Owner): Promise<CodeLens[]> {
+	const generation = owner.annotationGeneration;
+	try {
+		const config = await settings(uri);
+		if (shuttingDown || generation !== owner.annotationGeneration) return [];
+		const known = knownDependencies(root, owner);
+		if (!config.showContractLenses || hasDirty(known) || !fs.existsSync(root)) return [];
+		const snapshot = new Map(revisions);
+		const { executable, args, cwd, env } = launch(root, config, true);
+		const abort = new AbortController();
+		owner.annotationAbort = abort;
+		const output = await annotationProcesses.run(executable, args, cwd, abort.signal, env);
+		if (shuttingDown || abort.signal.aborted || generation !== owner.annotationGeneration) return [];
+		const report = checkedReport(output.stdout, output.code, root, cwd);
+		const dependencies = reportDependencies(report, root, cwd);
+		owner.annotationDependencies = dependencies;
+		if (hasDirty(dependencies) || [...dependencies].some(file => (revisions.get(file) ?? 0) !== (snapshot.get(file) ?? 0))) return [];
+		owner.annotationStamps = new Map([...dependencies].map(file => [file, diskStamp(file)]));
+		return contractLenses(normalizeContracts(report, cwd, sourceText), root);
+	} catch {
+		// Older toolchains may not support frontend-only annotation reports.
+		return [];
+	} finally {
+		if (generation === owner.annotationGeneration) owner.annotationAbort = undefined;
+	}
+}
 async function verify(uri: string, onSave = false): Promise<void> {
 	const file = fileOf(uri);
 	if (!file || !relevant(file) || shuttingDown) return;
@@ -146,45 +232,20 @@ async function verify(uri: string, onSave = false): Promise<void> {
 		if (onSave && !config.verifyOnSave) return;
 		clear(owner);
 		if (!fs.existsSync(root)) { state(root, 'unavailable', `No implementation found: ${root}`); return; }
-		const known = owner.dependencies ? new Set([...owner.dependencies, ...siblings(root)]) : undefined;
+		const known = knownDependencies(root, owner);
 		if (hasDirty(known)) { state(root, 'outdated', 'Save changed OCaml and proof files before verifying.'); return; }
 		const snapshot = new Map(revisions);
-		const workspace = workspaceFor(root);
-		const cwd = config.cwd ? path.resolve(workspace, config.cwd) : workspace;
-		const selected = config.executable || toolchain?.executable || 'caravan';
-		const executable = selected.includes('/') || selected.includes('\\')
-			? path.resolve(cwd, selected) : selected;
-		const bundleRoot = !config.executable ? toolchain?.bundleRoot : undefined;
-		const env = bundleRoot ? toolchainEnvironment(bundleRoot) : undefined;
-		const args = [...config.arguments, '--lsp-mode', '--lsp-annotations', '--smt-timeout', String(config.smtTimeout),
-			...config.includePaths.flatMap(directory => ['-I', path.resolve(cwd, directory)]), root];
+		const { executable, args, cwd, env } = launch(root, config);
 		const abort = new AbortController();
 		owner.abort = abort;
 		state(root, 'verifying');
 		const output = await processes.run(executable, args, cwd, abort.signal, env);
 		if (shuttingDown || abort.signal.aborted || generation !== owner.generation) return;
-		let report;
-		try {
-			const parsed = parseReport(output.stdout, output.code);
-			if (!parsed.dependencies.some(dependency => path.resolve(cwd, dependency) === root)) {
-				throw new Error('Caravan report omitted the requested implementation dependency');
-			}
-			report = { results: [normalizeReport(parsed, root, cwd, source => {
-				const document = documents.get(URI.file(source).toString());
-				if (document) return document.getText();
-				try { return fs.readFileSync(source, 'utf8'); } catch { return undefined; }
-			})] };
-		}
+		let parsed;
+		try { parsed = checkedReport(output.stdout, output.code, root, cwd); }
 		catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}${output.stderr.trim() ? `: ${output.stderr.trim().slice(0, 2000)}` : ''}`); }
-		const dependencies = new Set(siblings(root));
-		for (const result of report.results) {
-			dependencies.add(path.resolve(cwd, result.file));
-			for (const dependency of result.dependencies) dependencies.add(path.resolve(cwd, dependency));
-			for (const diagnostic of result.diagnostics) {
-				dependencies.add(path.resolve(cwd, diagnostic.location.file));
-				for (const related of diagnostic.related) dependencies.add(path.resolve(cwd, related.location.file));
-			}
-		}
+		const report = { results: [normalizeReport(parsed, root, cwd, sourceText)] };
+		const dependencies = reportDependencies(parsed, root, cwd);
 		owner.dependencies = dependencies;
 		if (hasDirty(dependencies) || [...dependencies].some(dependency => (revisions.get(dependency) ?? 0) !== (snapshot.get(dependency) ?? 0))) {
 			state(root, 'outdated', 'A dependency changed during verification.'); return;
@@ -224,22 +285,25 @@ async function verify(uri: string, onSave = false): Promise<void> {
 
 connection.onInitialize((params: InitializeParams) => {
 	selectToolchain(params.initializationOptions?.toolchain);
+	codeLensRefresh = params.capabilities.workspace?.codeLens?.refreshSupport === true;
 	configuration = params.capabilities.workspace?.configuration === true;
 	workspaceFolders = params.capabilities.workspace?.workspaceFolders === true;
 	folders = params.workspaceFolders ?? (params.rootUri ? [{ uri: params.rootUri, name: 'workspace' }] : []);
-	return { capabilities: { textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
+	return { capabilities: { codeLensProvider: { resolveProvider: false }, textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
 		workspace: { workspaceFolders: { supported: true, changeNotifications: true } } } };
 });
 connection.onInitialized(() => {
 	if (!workspaceFolders) return;
 	connection.workspace.onDidChangeWorkspaceFolders(event => {
 		folders = folders.filter(folder => !event.removed.some(removed => removed.uri === folder.uri)).concat(event.added);
-		for (const [root, owner] of owners) { owner.generation++; owner.abort?.abort(); clear(owner); state(root, 'outdated'); }
+		for (const [root, owner] of owners) { clearAnnotations(owner); owner.generation++; owner.abort?.abort(); clear(owner); state(root, 'outdated'); }
+		refreshAnnotations();
 	});
 });
 connection.onDidChangeConfiguration(event => {
 	globalSettings = event.settings?.caravan ?? {};
-	for (const [root, owner] of owners) { owner.generation++; owner.abort?.abort(); clear(owner); state(root, 'outdated'); }
+	for (const [root, owner] of owners) { clearAnnotations(owner); owner.generation++; owner.abort?.abort(); clear(owner); state(root, 'outdated'); }
+	refreshAnnotations();
 });
 connection.onDidChangeWatchedFiles(event => {
 	for (const change of event.changes) {
@@ -250,6 +314,20 @@ connection.onDidChangeWatchedFiles(event => {
 		diskStamps.set(file, stamp);
 		invalidate(file);
 	}
+});
+connection.onCodeLens(async (params, token) => {
+	const root = fileOf(params.textDocument.uri);
+	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return [];
+	const owner = ownerOf(root);
+	if (owner.annotationStamps) {
+		for (const [file, stamp] of owner.annotationStamps) {
+			if (diskStamp(file) !== stamp) { invalidate(file); break; }
+		}
+	}
+	if (hasDirty(knownDependencies(root, owner))) return [];
+	owner.annotations ??= annotations(root, params.textDocument.uri, owner);
+	const result = await owner.annotations;
+	return token.isCancellationRequested ? [] : result;
 });
 connection.onNotification(toolchainNotification, selectToolchain);
 connection.onNotification(verifyNotification, (params: VerifyParams) => {
@@ -289,12 +367,12 @@ documents.onDidClose(event => {
 	const root = rootOf(file);
 	if (!documents.all().some(document => { const open = fileOf(document.uri); return open && rootOf(open) === root; })) {
 		const owner = owners.get(root);
-		if (owner) { owner.generation++; owner.abort?.abort(); clear(owner); owners.delete(root); }
+		if (owner) { clearAnnotations(owner); owner.generation++; owner.abort?.abort(); clear(owner); owners.delete(root); }
 	}
 });
 function stop(): void {
 	shuttingDown = true;
-	for (const owner of owners.values()) { owner.generation++; owner.abort?.abort(); }
+	for (const owner of owners.values()) { clearAnnotations(owner); owner.generation++; owner.abort?.abort(); }
 }
 connection.onShutdown(stop);
 connection.onExit(stop);

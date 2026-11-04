@@ -8,6 +8,9 @@ const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const core = require('../out/client/verifier');
 const { systemPath } = require('../out/shared/toolchain');
+const { parseReport, normalizeContracts } = require('../out/server/report');
+const { contractLenses } = require('../out/server/contracts');
+const { readFileSync } = require('node:fs');
 const run = promisify(execFile);
 
 test('native release installs and verifies Saturn with its relocated compiler and solver',
@@ -48,8 +51,19 @@ test('native release installs and verifies Saturn with its relocated compiler an
         assert.deepEqual(Object.keys(environment).filter(key => key.toUpperCase() === 'PATH'), ['PATH']);
         await fs.access(path.join(root, 'bin', 'z3.exe'));
       }
-      const result = await run(selected.executable, ['--shh', '-I', path.join(repository, 'test/saturn/backoff'),
-        path.join(repository, 'test/saturn/treiber_stack/treiber_stack.ml')], { env: environment, timeout: 120000 });
+      const source = path.join(repository, 'test/saturn/treiber_stack/treiber_stack.ml');
+      const includes = ['-I', path.join(repository, 'test/saturn/backoff')];
+      const metadata = await run(selected.executable,
+        ['--lsp-mode', '--lsp-annotations', '--lsp-annotations-only', ...includes, source],
+        { env: environment, timeout: 30000 });
+      const report = parseReport(metadata.stdout, 0);
+      const contracts = normalizeContracts(report, repository, file => readFileSync(file, 'utf8'));
+      const lenses = contractLenses(contracts, source);
+      assert.ok(lenses.length >= 6);
+      assert.ok(lenses.every(lens => lens.command.command === 'caravan.openContract'));
+      assert.ok(lenses.every(lens => lens.command.title.startsWith('contract (treiber_stack.mli)')));
+      const result = await run(selected.executable, ['--shh', ...includes, source],
+        { env: environment, timeout: 120000 });
       assert.match(result.stdout, /Verification successful/);
     } finally {
       await new Promise(resolve => server.close(resolve));

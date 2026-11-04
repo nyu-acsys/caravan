@@ -59,7 +59,8 @@
         "caravan.cwd": {"type": "string", "default": "", "scope": "resource", "description": "Working directory, relative to the containing workspace folder or absolute. Empty uses the workspace folder, or the file directory outside a workspace."},
         "caravan.includePaths": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Include directories passed with -I, resolved from the working directory."},
         "caravan.smtTimeout": {"type": "integer", "minimum": 1, "default": 10000, "scope": "resource", "description": "SMT solver timeout in milliseconds."},
-        "caravan.verifyOnSave": {"type": "boolean", "default": true, "scope": "resource", "description": "Verify supported files after saving."}
+        "caravan.verifyOnSave": {"type": "boolean", "default": true, "scope": "resource", "description": "Verify supported files after saving."},
+        "caravan.showContractLenses": {"type": "boolean", "default": true, "scope": "resource", "description": "Show external interface and proof-file contracts above implementation functions. Click a summary to open its original annotation."}
       }
     }
   }

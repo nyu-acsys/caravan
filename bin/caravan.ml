@@ -45,10 +45,17 @@ let lsp_mode =
 
 let lsp_annotations =
   let doc =
-    "With --lsp-mode, print an object with errors and source dependencies. Editor \
-     annotation tables are currently empty."
+    "With --lsp-mode, print an object with errors, source dependencies, and editor \
+     annotations."
   in
   Arg.(value & flag & info [ "lsp-annotations" ] ~doc)
+
+let lsp_annotations_only =
+  let doc =
+    "With --lsp-mode --lsp-annotations, collect source annotations without translating \
+     the program to Raven or verifying its proofs."
+  in
+  Arg.(value & flag & info [ "lsp-annotations-only" ] ~doc)
 
 let smt_timeout =
   let doc = "The time the solver may take on a query, in milliseconds." in
@@ -80,7 +87,7 @@ let files =
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
 
 let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_annotations
-    smt_timeout files =
+    lsp_annotations_only smt_timeout files =
   if manifest then begin
     Logs.app (fun m ->
         m "%s"
@@ -93,15 +100,29 @@ let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_anno
     Logs.err (fun m -> m "--lsp-mode and --emit-rav cannot be used together");
     1
   end
+  else if lsp_annotations_only && not (lsp_mode && lsp_annotations) then begin
+    Logs.err (fun m -> m "--lsp-annotations-only requires --lsp-mode --lsp-annotations");
+    1
+  end
   else if lsp_mode then (
     let results =
-      List.map (Caravan_core.Check.run ~include_dirs ~history ~smt_timeout) files
+      if lsp_annotations_only then
+        List.map (Caravan_core.Check.annotations_only ~include_dirs) files
+      else List.map (Caravan_core.Check.run ~include_dirs ~history ~smt_timeout) files
     in
     Logs.app (fun m ->
         m "%s"
           (Caravan_editor.Editor_report.to_string ~annotations:lsp_annotations results));
-    if List.for_all (fun result -> result.Caravan_core.Check.verified) results then 0
-    else 1)
+    let succeeded result =
+      if lsp_annotations_only then
+        not
+          (List.exists
+             (fun (diagnostic : Raven_api.Diagnostic.t) ->
+               diagnostic.severity = Raven_api.Diagnostic.Error)
+             result.Caravan_core.Check.diagnostics)
+      else result.Caravan_core.Check.verified
+    in
+    if List.for_all succeeded results then 0 else 1)
   else begin
     if not no_greeting then Logs.app (fun m -> m "%s" greeting);
     (* Every file is checked, also after one that fails. *)
@@ -119,6 +140,6 @@ let cmd =
   Cmd.v info
     Term.(
       const main $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest
-      $ lsp_mode $ lsp_annotations $ smt_timeout $ files)
+      $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ files)
 
 let () = Stdlib.exit (Cmd.eval' cmd)

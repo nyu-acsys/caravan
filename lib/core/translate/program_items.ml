@@ -8,6 +8,11 @@ open Proof_terms
 open Atomic_proofs
 open Procedures
 
+let binding_name_location (binding : Typedtree.value_binding) =
+  match binding.vb_pat.pat_desc with
+  | Tpat_var (_, name, _) -> name.loc
+  | _ -> binding.vb_pat.pat_loc
+
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
 let items source (inventory : Module_inventory.t) =
@@ -66,20 +71,20 @@ let items source (inventory : Module_inventory.t) =
         | Tpat_var (id, _, _), Some (params, body) ->
             let site = entry.site in
             let* own =
-              contract_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
-                ~next:site.next
+              contract_with_origin_after ~scope:site.scope site.annotations
+                ~item_loc:site.item_loc ~next:site.next
             in
             let* supplied =
               all entry.signatures ~f:(fun (view : Module_inventory.signature_value) ->
                   let site = view.site in
                   let* contract =
-                    contract_after ~scope:site.scope site.annotations
+                    contract_with_origin_after ~scope:site.scope site.annotations
                       ~item_loc:site.item_loc ~next:site.next
                   in
                   let* () =
                     match contract with
                     | None -> Ok ()
-                    | Some contract ->
+                    | Some (contract, _) ->
                         let* () =
                           Signature_contract.lowerable source view
                             ~environment:
@@ -131,6 +136,8 @@ let items source (inventory : Module_inventory.t) =
               | None, _ :: (_, at) :: _ ->
                   error at "Multiple contracts for a module member are unsupported"
             in
+            let contract_origin = Option.map contract ~f:snd in
+            let contract = Option.map contract ~f:fst in
             let earlier =
               List.take_while inventory.values ~f:(fun other ->
                   not (phys_equal other entry))
@@ -167,7 +174,9 @@ let items source (inventory : Module_inventory.t) =
                  params;
                  body;
                  loc = vb.vb_loc;
+                 name_loc = binding_name_location vb;
                  contract;
+                 contract_origin;
                  next =
                    Some
                      (Option.value site.next
@@ -314,8 +323,11 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
         ((vb : Typedtree.value_binding), id, params, body, (rest : Typedtree.expression))
       ->
       let* contract =
-        contract_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc)
+        contract_with_origin_after annotations ~item_loc:vb.vb_loc
+          ~next:(Some rest.exp_loc)
       in
+      let contract_origin = Option.map contract ~f:snd in
+      let contract = Option.map contract ~f:fst in
       let continues = Option.bind contract ~f:(fun c -> c.continues) in
       let* () =
         match continues with
@@ -434,7 +446,9 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           params = prefix_params @ captured_params @ params;
           body;
           loc = vb.vb_loc;
+          name_loc = binding_name_location vb;
           contract;
+          contract_origin;
           next = Some rest.exp_loc;
           prefix;
           prefix_count = List.length prefix_params;

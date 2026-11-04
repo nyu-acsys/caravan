@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- The VS Code extension highlights proofs and annotations, verifies saved files, and manages bundled toolchains and compatible verifier updates.
+- The VS Code extension highlights proofs and annotations, shows external contract summaries, verifies saved files, and manages bundled toolchains and compatible verifier updates.
 - Source value domains preserve machine bounds through compound values and abstract module contracts, and support empty variants without assuming an inhabitant.
 - Static modules, nested signatures, checked module aliases, and monomorphic curried named and unit functors preserve type identities and support qualified calls, ordinary and atomic contracts, and scoped logical types and functions, predicates, invariants and lemma proofs.
 - Proof files support resource algebra instances, ghost fields, AU facades, state records, views, and actions in module scopes, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.

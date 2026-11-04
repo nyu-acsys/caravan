@@ -8,6 +8,8 @@
 VS Code integration for [Caravan](https://github.com/nyu-acsys/caravan), a verifier
 for multicore OCaml programs. The extension highlights specifications and proof
 files, reports verification errors in the editor, and tracks verification status.
+Contracts from companion interfaces and proof headers appear above their
+implementation functions.
 
 New to Caravan? Start with the **[project introduction and examples](https://github.com/nyu-acsys/caravan#readme)**.
 The instructions below cover setup, day-to-day use, and building the extension.
@@ -81,6 +83,18 @@ such as `/path/to/caravan/_build/default/bin/caravan.exe`.
 
 ### Verifying a file
 
+Opening a saved `.ml` file shows contract summaries above functions whose contracts
+come from a `.mli` or `.proof` file. A lens such as
+`contract (stack.mli): requires ... · ensures ...` shows the original clauses;
+click it to open and select the annotation in its source file. Inline contracts
+already visible in the `.ml` are not repeated.
+
+Contract discovery runs independently of the solver and does not verify the file.
+Edits to the implementation or its dependencies hide outdated summaries until the
+saved inputs can be analyzed again. If discovery fails, run verification to see
+the diagnostics. Older Caravan builds without annotation discovery still support
+verification, but do not provide these lenses.
+
 Open an annotated `.ml`, its `.mli`, or a `.proof` file. Save the file to verify it,
 or run **Caravan: Verify Saved File** from the Command Palette. Clicking the
 **Caravan:** status item also verifies the active file. For `.mli` and `.proof`
@@ -126,6 +140,8 @@ to the VS Code window:
 * `caravan.smtTimeout`: The time limit in milliseconds for each SMT query.
   Defaults to `10000`.
 * `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
+* `caravan.showContractLenses`: Show external contracts above implementation
+  functions. Defaults to `true`.
 
 The executable is launched directly without a shell. Give the program and each
 argument separately; do not put shell quoting or a complete command line into a
@@ -176,8 +192,14 @@ The client launches `out/server/server.js` over IPC. The server invokes Caravan
 with Raven's `--lsp-mode --lsp-annotations` options. Reports use the same JSON
 shape: `errors`, `dependencies`, `annotations`, `members`, `references`, and
 `symbols`. Source lines are one-based and columns are UTF-8 byte offsets; the
-server converts them to LSP UTF-16 positions. The annotation, member, reference,
-and symbol tables are currently empty.
+server converts them to LSP UTF-16 positions. The annotation table includes
+external contracts in Raven's `InheritedContract` format; member, reference, and
+symbol tables are currently empty.
+
+Adding `--lsp-annotations-only` collects these attachments using the same front-end
+resolution as verification, without generating Raven code or running SMT checks.
+The server uses this mode for CodeLens requests, with a separate worker queue and
+cache so ongoing verification does not delay contract display.
 
 `caravan --manifest` reports its version, editor protocol, minimum Z3 version,
 OCaml compiler version, and linked Raven API version. A native archive carries

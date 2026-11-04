@@ -26,6 +26,19 @@ const report = {errors:fail?[
 ]:warning?[{...location,kind:'Warning',message:['Trusted specification']}]:[],
  dependencies:[file,path.join(path.dirname(file),'dependency.ml')],annotations:[],members:[],references:[],symbols:[]};
 if(text.includes('nodeps')) report.dependencies=[];
+if(process.argv.includes('--lsp-annotations-only')) {
+ const origin = file.replace(/\\.ml$/, text.includes('proof-contract') ? '.proof' : '.mli');
+ const originLocation = {...location,file:origin};
+ report.errors=[];
+ report.dependencies.push(origin,path.join(path.dirname(file),'metadata-only.ml'));
+ if(text.includes('contract')) report.annotations=[{...location,kind:'InheritedContract',source:'Main.f',source_loc:originLocation,
+  clauses:[{...originLocation,keyword:'requires',text:'  x > 0\\n  && true  '},{...originLocation,keyword:'ensures',text:'result > x'}]}];
+ if(text.includes('metadata-invalid')) report.annotations[0].source_loc.start_line=0;
+ if(text.includes('metadata-unsupported')) {console.error('unknown option --lsp-annotations-only');process.exit(2);}
+ const answerMetadata=()=>{process.stdout.write(JSON.stringify(report));process.exit(0);};
+ if(text.includes('metadata-slow')) setTimeout(answerMetadata,1200);else answerMetadata();
+ return;
+}
 function answer() {
  if(text.includes('stderr')) {console.error('solver could not start');process.exit(2);}
  if(text.includes('malformed')) process.stdout.write('bad JSON');
@@ -36,7 +49,7 @@ function answer() {
 if(text.includes('slow')) setTimeout(answer,1200); else answer();
 `;
 
-async function fixture(t, initial = 'let x = 1', toolchain) {
+async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = false) {
 	const dir = URI.file(await fs.mkdtemp(path.join(os.tmpdir(), 'caravan lsp '))).fsPath;
 	const file = path.join(dir, 'main.ml');
 	const script = path.join(dir, 'fake verifier.cjs');
@@ -45,6 +58,7 @@ async function fixture(t, initial = 'let x = 1', toolchain) {
 	const settings = { executable: process.execPath, arguments: [script], includePaths: ['include with spaces'], smtTimeout: 77, verifyOnSave: true };
 	const child = spawn(process.execPath, [path.resolve(__dirname, '../out/server/server.js'), '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
 	const messages = [];
+	const requests = [];
 	const pending = new Map();
 	let buffer = Buffer.alloc(0);
 	let nextId = 0;
@@ -65,6 +79,7 @@ async function fixture(t, initial = 'let x = 1', toolchain) {
 			const message = JSON.parse(buffer.subarray(headerEnd + 4, headerEnd + 4 + length).toString());
 			buffer = buffer.subarray(headerEnd + 4 + length);
 			if (message.method && message.id !== undefined) {
+				requests.push(message);
 				send({ id: message.id, result: message.method === 'workspace/configuration' ? message.params.items.map(() => settings) : null });
 			} else if (message.id !== undefined) {
 				const callback = pending.get(message.id);
@@ -100,9 +115,9 @@ async function fixture(t, initial = 'let x = 1', toolchain) {
 		}
 		await fs.rm(dir, { recursive: true, force: true });
 	});
-	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true } }, initializationOptions: { toolchain } });
+	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport } } }, initializationOptions: { toolchain } });
 	notify('initialized', {});
-	return { dir, file, settings, messages, notify, wait, state, open };
+	return { dir, file, settings, messages, requests, request, notify, wait, state, open };
 }
 
 test('save and manual verification resolve companions, flags and related diagnostics', { timeout: 15000 }, async t => {
@@ -324,4 +339,127 @@ test('toolchain changes cancel in-flight verification and invalidate unchanged d
 	assert.equal(f.messages.slice(invalid).some(message => message.params?.state === 'outdated'), false);
 	f.notify('caravan/verify', { uri: uri(f.file) });
 	await f.state('failed', invalid);
+});
+
+const lenses = (f, target = f.file) => f.request('textDocument/codeLens', { textDocument: { uri: uri(target) } });
+const runs = async f => (await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim().split('\n').map(JSON.parse);
+
+test('contract lenses discover frontend metadata, cache it, and preserve unchecked state', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'é😀contract fail unicode');
+	const origin = f.file.replace(/\.ml$/, '.mli');
+	await fs.writeFile(origin, 'é😀contract');
+	await f.open();
+	await f.state('unchecked');
+	const result = await lenses(f);
+	assert.equal(result.length, 1);
+	assert.equal(result[0].command.title, 'contract (main.mli): requires x > 0 && true · ensures result > x');
+	assert.deepEqual(result[0].range, { start: { line: 0, character: 3 }, end: { line: 0, character: 3 } });
+	assert.equal(result[0].command.command, 'caravan.openContract');
+	assert.deepEqual(result[0].command.arguments, [{ uri: uri(origin), range: { start: { line: 0, character: 3 }, end: { line: 0, character: 7 } } }]);
+	assert.deepEqual(await lenses(f), result);
+	assert.deepEqual(await lenses(f, origin), []);
+	assert.equal((await runs(f)).length, 1);
+	assert.ok((await runs(f))[0].includes('--lsp-annotations-only'));
+	assert.equal(f.messages.some(message => message.method === 'textDocument/publishDiagnostics' || (message.params?.state && message.params.state !== 'unchecked')), false);
+	assert.equal(f.requests.some(message => message.method === 'workspace/codeLens/refresh'), false);
+});
+
+test('contract metadata has a separate worker from slow verification', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'contract slow');
+	const other = path.join(f.dir, 'other.ml');
+	await fs.writeFile(other, 'slow');
+	await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'contract');
+	await f.open();
+	await f.open(other);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	f.notify('caravan/verify', { uri: uri(other) });
+	await f.state('verifying');
+	await f.state('verifying', 0, other);
+	assert.equal((await lenses(f)).length, 1);
+	assert.equal(f.messages.some(message => message.params?.state === 'verified'), false);
+	await f.state('verified');
+	assert.equal((await lenses(f)).length, 1);
+	assert.equal((await runs(f)).filter(args => args.includes('--lsp-annotations-only')).length, 1);
+	const metadataDependency = path.join(f.dir, 'metadata-only.ml');
+	await fs.writeFile(metadataDependency, 'let dependency = 1');
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(metadataDependency), type: 1 }] });
+	assert.equal((await lenses(f)).length, 1);
+	assert.equal((await runs(f)).filter(args => args.includes('--lsp-annotations-only')).length, 2);
+});
+
+test('companion edits, dependencies, configuration and toolchains invalidate contract lenses', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'proof-contract', undefined, true);
+	f.settings.verifyOnSave = false;
+	const proof = f.file.replace(/\.ml$/, '.proof');
+	await fs.writeFile(proof, 'contract');
+	await f.open();
+	await f.open(proof);
+	assert.equal((await lenses(f)).length, 1);
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'changed' }] });
+	assert.deepEqual(await lenses(f), []);
+	assert.equal((await runs(f)).length, 1);
+	await fs.writeFile(proof, 'changed');
+	f.notify('textDocument/didSave', { textDocument: { uri: uri(proof) } });
+	assert.equal((await lenses(f)).length, 1);
+	const missingInterface = f.file.replace(/\.ml$/, '.mli');
+	await fs.writeFile(missingInterface, 'new interface');
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(missingInterface), type: 1 }] });
+	assert.equal((await lenses(f)).length, 1);
+	const dependency = path.join(f.dir, 'dependency.ml');
+	await fs.writeFile(dependency, 'let dependency = 1');
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(dependency), type: 1 }] });
+	assert.equal((await lenses(f)).length, 1);
+	f.notify('workspace/didChangeConfiguration', { settings: {} });
+	assert.equal((await lenses(f)).length, 1);
+	f.notify('caravan/toolchain', { executable: process.execPath });
+	assert.equal((await lenses(f)).length, 1);
+	assert.equal((await runs(f)).length, 6);
+	assert.ok(f.requests.some(message => message.method === 'workspace/codeLens/refresh'));
+	f.settings.showContractLenses = false;
+	f.notify('workspace/didChangeConfiguration', { settings: {} });
+	assert.deepEqual(await lenses(f), []);
+	assert.equal((await runs(f)).length, 6);
+});
+
+test('stale frontend metadata cannot reinstall lenses after a companion edit', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'contract metadata-slow');
+	const origin = f.file.replace(/\.ml$/, '.mli');
+	await fs.writeFile(origin, 'contract');
+	await f.open();
+	await f.open(origin);
+	const first = lenses(f);
+	while (true) {
+		try { if ((await runs(f)).length) break; } catch { }
+		await delay(10);
+	}
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(origin), version: 2 }, contentChanges: [{ text: 'dirty' }] });
+	assert.deepEqual(await first, []);
+	assert.deepEqual(await lenses(f), []);
+	await delay(1300);
+	assert.deepEqual(await lenses(f), []);
+	assert.equal((await runs(f)).length, 1);
+});
+
+test('older tools and malformed metadata quietly cache empty lenses and verification still works', { timeout: 15000 }, async t => {
+	for (const marker of ['metadata-unsupported', 'metadata-invalid']) {
+		const f = await fixture(t, `contract ${marker}`);
+		await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'contract');
+		await f.open();
+		assert.deepEqual(await lenses(f), []);
+		assert.deepEqual(await lenses(f), []);
+		assert.equal((await runs(f)).length, 1);
+		assert.equal(f.messages.some(message => message.params?.state === 'unavailable'), false);
+		f.notify('caravan/verify', { uri: uri(f.file) });
+		await f.state('verified');
+	}
+});
+
+test('known contract annotations validate strictly while unknown annotations are ignored', () => {
+	const location = { file: 'main.ml', start_line: 1, start_col: 0, end_line: 1, end_col: 1 };
+	const report = { errors: [], dependencies: ['main.ml'], annotations: [{ kind: 'FutureAnnotation' }], members: [], references: [], symbols: [] };
+	assert.deepEqual(parseReport(JSON.stringify(report), 0).annotations, []);
+	report.annotations = [{ ...location, kind: 'InheritedContract', source: 'Main.f', source_loc: { ...location, file: 'main.mli' }, clauses: [{ ...location, keyword: 'requires', text: 'true' }] }];
+	assert.equal(parseReport(JSON.stringify(report), 0).annotations.length, 1);
+	report.annotations[0].clauses[0].end_col = -1;
+	assert.throws(() => parseReport(JSON.stringify(report), 0), /invalid inherited contract/);
 });

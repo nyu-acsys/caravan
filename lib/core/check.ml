@@ -65,6 +65,7 @@ type result = {
   verified : bool;
   diagnostics : R.Diagnostic.t list;
   dependencies : string list;
+  annotations : Editor_annotations.t list;
 }
 
 type prepared = {
@@ -73,6 +74,7 @@ type prepared = {
   warnings : R.Diagnostic.t list;
   explicit_proof_files : string list;
   dependencies : string list;
+  annotations : Editor_annotations.t list;
 }
 
 let sibling_dependencies file =
@@ -88,10 +90,17 @@ let source_dependencies (source : Source.t) =
   |> List.filter ~f:(fun file -> not (String.is_empty file))
   |> List.dedup_and_sort ~compare:String.compare
 
-let prepare ~include_dirs ~history file =
+let analyze ~include_dirs file =
   let ( let* ) result f = Result.bind result ~f in
   let* source = Source.load ~include_dirs file in
-  let* program, origins, warnings = Translate.program_with_diagnostics ~history source in
+  let* scopes = Program_scopes.run source in
+  Ok (source, scopes, Editor_annotations.collect scopes)
+
+let prepare_scopes ~history (source, scopes, annotations) =
+  let ( let* ) result f = Result.bind result ~f in
+  let* program, origins, warnings =
+    Translate.program_with_diagnostics ~history ~scopes source
+  in
   let explicit_proof_files =
     List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
         match entry.Proof_scopes.declaration with
@@ -108,7 +117,11 @@ let prepare ~include_dirs ~history file =
       warnings;
       explicit_proof_files;
       dependencies = source_dependencies source;
+      annotations;
     }
+
+let prepare ~include_dirs ~history file =
+  Result.bind (analyze ~include_dirs file) ~f:(prepare_scopes ~history)
 
 let verify ~smt_timeout prepared =
   let result =
@@ -121,18 +134,50 @@ let verify ~smt_timeout prepared =
           (explain prepared.origins diagnostic)) )
 
 (** Structured verification results shared by the command line and editors. *)
-let run ~include_dirs ~history ~smt_timeout file =
-  match prepare ~include_dirs ~history file with
-  | Error error ->
+let analysis_error file error =
+  {
+    file;
+    verified = false;
+    diagnostics = [ Report.to_diagnostic error ];
+    dependencies = sibling_dependencies file;
+    annotations = [];
+  }
+
+let annotations_only ~include_dirs file =
+  match analyze ~include_dirs file with
+  | Error error -> analysis_error file error
+  | Ok (source, _, annotations) ->
       {
         file;
         verified = false;
-        diagnostics = [ Report.to_diagnostic error ];
-        dependencies = sibling_dependencies file;
+        diagnostics = [];
+        dependencies = source_dependencies source;
+        annotations;
       }
-  | Ok prepared ->
-      let verified, diagnostics = verify ~smt_timeout prepared in
-      { file; verified; diagnostics; dependencies = prepared.dependencies }
+
+let run ~include_dirs ~history ~smt_timeout file =
+  match analyze ~include_dirs file with
+  | Error error -> analysis_error file error
+  | Ok ((source, _, annotations) as analysis) ->
+      begin match prepare_scopes ~history analysis with
+      | Error error ->
+          {
+            file;
+            verified = false;
+            diagnostics = [ Report.to_diagnostic error ];
+            dependencies = source_dependencies source;
+            annotations;
+          }
+      | Ok prepared ->
+          let verified, diagnostics = verify ~smt_timeout prepared in
+          {
+            file;
+            verified;
+            diagnostics;
+            dependencies = prepared.dependencies;
+            annotations = prepared.annotations;
+          }
+      end
 
 (** The human-readable command line, including the generated-program escape hatch. *)
 let file ~include_dirs ~history ~emit_rav ~smt_timeout file =

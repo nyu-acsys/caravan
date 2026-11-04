@@ -21,7 +21,10 @@ type func = {
   params : Typedtree.function_param list;
   body : Typedtree.expression;
   loc : Location.t;
+  name_loc : Location.t;
   contract : S.contract option;
+  contract_origin : Annotation.t option;
+      (** The selected source contract, absent for inferred contracts. *)
   next : Location.t option;  (** The next item or the end of the enclosing scope. *)
   prefix : Ident.t list;
       (** The variables of the parameters of the function that a lifted local function
@@ -2042,8 +2045,8 @@ let without_application_operators (structure : Typedtree.structure) =
 
 (** The contract annotating the item at [item_loc], ending before [next]: an annotation in
     between. *)
-let contract_after ?scope (annotations : Annotation.t list) ~(item_loc : Location.t)
-    ~(next : Location.t option) : (S.contract option, error) Result.t =
+let contract_with_origin_after ?scope (annotations : Annotation.t list)
+    ~(item_loc : Location.t) ~(next : Location.t option) =
   let after (a : Annotation.t) =
     Declaration_scope.following ?scope ~item_loc ~next a.loc
   in
@@ -2052,8 +2055,13 @@ let contract_after ?scope (annotations : Annotation.t list) ~(item_loc : Locatio
         after a && Poly.equal (Annotation.kind a) Annotation.Contract)
   with
   | [] -> Ok None
-  | [ a ] -> Result.map (Annotation.contract a) ~f:Option.some
+  | [ a ] -> Result.map (Annotation.contract a) ~f:(fun contract -> Some (contract, a))
   | _ :: a :: _ -> error a.loc "A function has at most one contract"
+
+let contract_after ?scope annotations ~item_loc ~next =
+  Result.map
+    (contract_with_origin_after ?scope annotations ~item_loc ~next)
+    ~f:(Option.map ~f:fst)
 
 (** Function proof markers follow their declaration, before the next item. *)
 let marked_after ?scope (annotations : Annotation.t list) kind ~(item_loc : Location.t)
