@@ -328,12 +328,22 @@ let rec spec_pattern env (p : S.pat) (v : R.Expr.t) =
             match p.pat_desc with Ptuple ps -> Some ps | _ -> None
           in
           let* args = ctor_args ~at (List.length c.fields) (Option.to_list arg) ~tuple in
-          let fields =
-            List.map c.fields ~f:(fun f ->
-                R.Expr.field ~loc:l v (qualified_name ~loc:l f))
+          let is_c, fields =
+            match shared_exception env.ctx c with
+            (* The application's own exception, in a functor body it shares. *)
+            | Some app ->
+                ( shared_exception_call ~loc:l app "is" c [ v ],
+                  List.mapi c.fields ~f:(fun i _ ->
+                      shared_exception_call ~loc:l app
+                        ("field$" ^ Int.to_string i)
+                        c [ v ]) )
+            | None ->
+                ( R.Expr.is_ ~loc:l v (ident ~loc:l c.raven),
+                  List.map c.fields ~f:(fun f ->
+                      R.Expr.field ~loc:l v (qualified_name ~loc:l f)) )
           in
           let* conds, binds = components args fields in
-          Ok (conjoin (Some (R.Expr.is_ ~loc:l v (ident ~loc:l c.raven)) :: conds), binds)
+          Ok (conjoin (Some is_c :: conds), binds)
       end
 
 let generic_operands env operands =

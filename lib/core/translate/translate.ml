@@ -1193,6 +1193,19 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     Report.zip ~at:Location.none "The generic module groups and their interfaces" generics
       generic_interfaces
   in
+  (* The exceptions of functor bodies their applications share: each application's own
+     are given by a module. *)
+  let* shared_exception_members =
+    all generics ~f:(fun group ->
+        Result.map
+          (Exceptions.shared_members
+             ~loc:(loc group.representative.template.mod_loc)
+             types group)
+          ~f:(fun members -> (group, members)))
+  in
+  let shared_exception_modules group =
+    Option.join (List.Assoc.find shared_exception_members group ~equal:phys_equal)
+  in
   let* generic_implementation_templates =
     all paired_generics ~f:(fun (group, interface) ->
         let l = loc group.representative.template.mod_loc in
@@ -1224,9 +1237,14 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             ~params:
               (List.map (Generic_modules.parameter_groups group) ~f:(fun stage ->
                    (ident ~loc:l stage.parameter, q stage.interface))
+              @ (if Option.is_some group.world then
+                   [
+                     (ident ~loc:l "Layout", q (Option.value_exn group.world ^ ".Shape"));
+                   ]
+                 else [])
               @
-              if Option.is_some group.world then
-                [ (ident ~loc:l "Layout", q (Option.value_exn group.world ^ ".Shape")) ]
+              if Option.is_some (shared_exception_modules group) then
+                [ (ident ~loc:l "App", q (Exceptions.shared_interface group)) ]
               else [])
             (ident ~loc:l (Qualified_name.of_string group.name).name)
             members
@@ -1527,9 +1545,16 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       application.world ^ "." ^ (Qualified_name.of_string group.name).name,
                       view_names @ [ canonical.layout ] )
             in
+            let exception_module, arguments =
+              match shared_exception_modules group with
+              | Some (_, modules) ->
+                  ( [ List.Assoc.find_exn modules application ~equal:phys_equal ],
+                    arguments @ [ Exceptions.shared_module application ] )
+              | None -> ([], arguments)
+            in
             Ok
               ( application.source.argument,
-                setup,
+                setup @ exception_module,
                 R.Member.instance ~loc:l
                   ~def:
                     ( q worker,
@@ -1689,8 +1714,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         @ (if List.exists structure_member_lists ~f:(fun (st, _) -> has_history st) then
              History.program_members history
            else [])
-        @ imported_resource_members @ modules @ value_factories @ ready_domains
-        @ ready_cells @ fields @ library_modules @ root_members),
+        @ imported_resource_members @ modules @ value_factories
+        @ List.filter_map shared_exception_members ~f:(fun (_, members) ->
+            Option.map members ~f:fst)
+        @ ready_domains @ ready_cells @ fields @ library_modules @ root_members),
       state.origins,
       List.rev state.warnings )
 

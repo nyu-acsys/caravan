@@ -18,6 +18,9 @@ let plan types groups =
         List.concat_map group.applications ~f:(fun application ->
             List.filter_map application.source.declarations ~f:(fun declaration ->
                 match declaration.Typedtree.typ_kind with
+                (* A witness's tags carry no data: the representative's serve all. *)
+                | Ttype_variant _ when Datatypes.is_witness_declaration declaration ->
+                    None
                 | Ttype_variant _ | Ttype_record _ ->
                     Option.map
                       (Datatypes.find types

@@ -82,33 +82,43 @@ let eligible (source : Module_inventory.specialization) =
         let parameters =
           List.map source.parameters ~f:(fun stage -> stage.Module_inventory.parameter)
         in
-        let closed_heap_value_type =
-          Closed_layout.is_closed ~environment:body.str_final_env ~parameters
-            ~at:source.template.mod_loc
+        let closed_heap_value_type ?(env = body.str_final_env) =
+          Closed_layout.is_closed ~environment:env ~parameters ~at:source.template.mod_loc
         in
-        let expanded_type t =
+        let expanded_type ?(env = body.str_final_env) t =
           let expanded =
             Signature_contract.compiler ~at:source.template.mod_loc (fun () ->
-                Ctype.expand_head body.str_final_env t)
+                Ctype.expand_head env t)
           in
           Result.map expanded ~f:Types.get_desc
         in
-        let function_roots = ref roots in
+        (* A function and those that are directly its body, as a function with locally
+           abstract types elaborates to. *)
+        let rec with_bodies (e : Typedtree.expression) =
+          match e.exp_desc with
+          | Texp_function (_, Tfunction_body ({ exp_desc = Texp_function _; _ } as body))
+            ->
+              e :: with_bodies body
+          | _ -> [ e ]
+        in
+        let function_roots = ref (List.concat_map roots ~f:with_bodies) in
         let value_binding iterator (binding : Typedtree.value_binding) =
           (match (binding.vb_pat.pat_desc, binding.vb_expr.exp_desc) with
           | Tpat_var _, Texp_function _ ->
-              function_roots := binding.vb_expr :: !function_roots
+              function_roots := with_bodies binding.vb_expr @ !function_roots
           | _ -> ());
           Tast_iterator.default_iterator.value_binding iterator binding
         in
         let functions = { Tast_iterator.default_iterator with value_binding } in
         functions.structure functions body;
-        let rec heap_type t =
-          match expanded_type t with
+        (* In [env], where a function's locally abstract types are known. *)
+        let rec heap_type ?env t =
+          let heap_type = heap_type ?env in
+          match expanded_type ?env t with
           | Error _ -> true
           | Ok (Tconstr (path, [ element ], _))
             when Datatypes.is_ref path || Datatypes.is_atomic path ->
-              not (closed_heap_value_type element)
+              not (closed_heap_value_type ?env element)
           | Ok (Tconstr (path, args, _)) ->
               Datatypes.is_ref path || Datatypes.is_atomic path
               || List.exists args ~f:heap_type
@@ -118,7 +128,8 @@ let eligible (source : Module_inventory.specialization) =
           | _ -> false
         in
         let expr (iterator : Tast_iterator.iterator) (expression : Typedtree.expression) =
-          if heap_type expression.exp_type then heap_access := true;
+          if heap_type ~env:expression.exp_env expression.exp_type then
+            heap_access := true;
           begin match expression.exp_desc with
           | Texp_function _
             when not (List.exists !function_roots ~f:(phys_equal expression)) ->
@@ -143,11 +154,13 @@ let eligible (source : Module_inventory.specialization) =
         (not !heap_access)
         && List.for_all body.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
-            | Tstr_value _ | Tstr_attribute _ -> true
+            | Tstr_value _ | Tstr_attribute _ | Tstr_exception _ -> true
             | Tstr_type (_, declarations) ->
                 List.for_all declarations ~f:(fun declaration ->
                     match declaration.Typedtree.typ_kind with
                     | Ttype_abstract -> Option.is_some declaration.typ_manifest
+                    | Ttype_variant _ when Datatypes.is_witness_declaration declaration ->
+                        true
                     | Ttype_variant constructors ->
                         List.is_empty declaration.typ_params
                         || List.for_all constructors ~f:(fun constructor ->

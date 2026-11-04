@@ -24,6 +24,13 @@ functor's applications, which each declare their own.
   $ caravan --shh functor_applications.ml
   Verification successful.
 
+A functor body its applications share takes each application's exceptions from a module.
+
+  $ caravan --shh shared_functor.ml
+  Verification successful.
+  $ caravan --shh --emit-rav shared_functor.ml | grep -c 'App: '
+  1
+
 Exceptions of modules, of generic functions at several types, and of an interface.
 
   $ caravan --shh modules.ml

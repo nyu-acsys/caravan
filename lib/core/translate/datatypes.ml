@@ -214,6 +214,14 @@ let witness_of_declaration (decl : Typedtree.type_declaration) cds =
             (String.uncapitalize cd.cd_name.txt, arguments));
     }
 
+(** Whether [decl] declares a GADT witness. *)
+let is_witness_declaration (decl : Typedtree.type_declaration) =
+  match decl.typ_kind with
+  | Ttype_variant cds ->
+      List.exists cds ~f:(fun cd -> Option.is_some cd.Typedtree.cd_res)
+      && Result.is_ok (witness_of_declaration decl cds)
+  | _ -> false
+
 (** The data type that [decl] declares, if it is a variant type. A GADT witness declares
     its constructors as a data type without parameters, the witness's tags. *)
 let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Result.t =

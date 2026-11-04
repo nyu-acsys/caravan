@@ -1058,6 +1058,10 @@ type inputs = {
   atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
   raising_library_calls : string list;
       (** The library functions that may raise, whose calls are not supported yet. *)
+  shared_exceptions : (string * string list) option;
+      (** In a functor body that its applications share: the module that gives each
+          application's exceptions, and the keys of the representative's, whose
+          constructors it stands for. *)
   libraries : string list Path_bindings.t;
       (** The modules of the libraries, with their names: trusted Raven modules. *)
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
@@ -1121,6 +1125,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     witness_raising = [];
     atomic_procedures = [];
     raising_library_calls = [];
+    shared_exceptions = None;
     initializations = [];
     linearizations = [];
     shared;
@@ -1146,6 +1151,25 @@ let witness_condition ctx ~loc id position variable =
               (Qualified_name.raven ~loc
                  (Qualified_name.of_string (worker_name ^ ".W.tag")))))
   | _ -> None
+
+(** The member of the module of a shared functor body's exceptions for the exception with
+    the representative's key [key], of [kind] ([make], [is] or a payload [field$i]). *)
+let shared_exception_member kind key =
+  kind ^ "$" ^ String.tr ~target:'.' ~replacement:'$' key
+
+(** For the constructor [c] of an exception declared in a functor body shared by its
+    applications: the module giving the application's own. *)
+let shared_exception ctx (c : Datatypes.ctor) =
+  Option.bind ctx.given.shared_exceptions ~f:(fun (app, keys) ->
+      Option.some_if (List.mem keys c.ocaml ~equal:String.equal) app)
+
+(** The call of the member [kind] for the exception [c] of the shared functor body,
+    through the module [app]. *)
+let shared_exception_call ~loc app kind (c : Datatypes.ctor) arguments =
+  R.Expr.call ~loc
+    (Qualified_name.raven ~loc
+       (Qualified_name.of_string (app ^ "." ^ shared_exception_member kind c.ocaml)))
+    arguments
 
 let assert_admissible ctx ~loc typ variable =
   Option.value_map (value_spec ctx ~loc typ variable) ~default:[] ~f:(fun spec ->

@@ -932,11 +932,21 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
                          p)
                       (Some raised))
               in
-              let fields =
-                Option.value_map (Datatypes.find_ctor ctx.given.types raised) ~default:[]
-                  ~f:(fun (_, c) -> c.fields)
+              let ctor = Option.map (Datatypes.find_ctor ctx.given.types raised) ~f:snd in
+              let fields = Option.value_map ctor ~default:[] ~f:(fun c -> c.fields) in
+              (* A shared functor body's exception's payload is read through its module. *)
+              let field f =
+                match
+                  Option.bind ctor ~f:(fun c ->
+                      Option.map (shared_exception ctx c) ~f:(fun app -> (app, c)))
+                with
+                | Some (app, c) ->
+                    let i, _ =
+                      List.findi_exn c.fields ~f:(fun _ name -> String.equal name f)
+                    in
+                    shared_exception_call ~loc:l app ("field$" ^ Int.to_string i) c [ e ]
+                | None -> R.Expr.field ~loc:l e (qualified_name ~loc:l f)
               in
-              let field f = R.Expr.field ~loc:l e (qualified_name ~loc:l f) in
               (* The payload's pattern variables are its fields. *)
               let bindings (p : S.pat) =
                 match p.pat_desc with

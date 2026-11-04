@@ -35,6 +35,9 @@ let is_closed ~environment ~parameters ~at typ =
         if depends_on_parameter path then false
         else
           begin match declaration path with
+          (* A locally abstract type, as a generalized variable, uses the function
+             worker's dictionary. *)
+          | Ok { type_is_newtype = true; _ } -> true
           | Ok definition when List.length definition.type_params = List.length arguments
             ->
               let substitutions = List.zip_exn definition.type_params arguments in

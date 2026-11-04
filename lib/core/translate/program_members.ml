@@ -1739,17 +1739,71 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             (body_proc_name f, set)))
   in
   let raising = by_own_names raising in
+  (* A functor body its applications share raises, called through each application, what
+     it raises through the representative's, with the exceptions it declares the
+     application's own. *)
+  let for_applications sets ~rename =
+    sets
+    @ List.concat_map scopes.generics ~f:(fun (group : Generic_modules.t) ->
+        let representative =
+          List.find_exn group.applications ~f:(fun application ->
+              phys_equal application.source group.representative)
+        in
+        let shared = Exceptions.shared decls.types group in
+        List.concat_map group.applications ~f:(fun application ->
+            if phys_equal application representative then []
+            else
+              let key name =
+                Option.value
+                  (Option.bind (List.Assoc.find shared name ~equal:String.equal)
+                     ~f:(fun constructors ->
+                       Option.map
+                         (Option.join
+                            (List.Assoc.find constructors application ~equal:phys_equal))
+                         ~f:(fun c -> c.Datatypes.ocaml)))
+                  ~default:name
+              in
+              List.filter_map sets ~f:(fun (name, set) ->
+                  Option.map
+                    (String.chop_prefix name ~prefix:(representative.name ^ "."))
+                    ~f:(fun member -> (application.name ^ "." ^ member, rename ~key set)))))
+  in
+  let rename_set ~key = function
+    | State.Raises names -> State.Raises (List.map names ~f:key)
+    | Raises_any -> Raises_any
+  in
+  let raising = for_applications raising ~rename:rename_set in
+  (* A function of a functor body its applications share, whose exceptions are given by
+     the worker's module [App]. *)
+  let shared_exceptions_of f =
+    let rec worker = function
+      | Module_context.Worker group -> Some group
+      | Function_worker (_, parent) | Proof_worker (_, parent) -> worker parent
+      | Flat -> None
+    in
+    Option.bind
+      (worker (body_destination f))
+      ~f:(fun (group : Generic_modules.t) ->
+        match Exceptions.shared decls.types group with
+        | [] -> None
+        | shared -> Some (group.name ^ ".App", List.map shared ~f:fst))
+  in
   let atomic_procedures =
     List.concat_map translated ~f:(fun (name, f, _) ->
         if Option.exists f.contract ~f:(fun c -> c.atomic) then [ name; body_proc_name f ]
         else [])
+    |> List.map ~f:(fun name -> (name, ()))
+    |> for_applications ~rename:(fun ~key:_ () -> ())
+    |> List.map ~f:fst
   in
   let witness_raising =
-    by_own_names
-      (List.filter_map translated ~f:(fun (name, f, _) ->
-           Option.bind (witness_parameter f) ~f:(fun (position, _, _) ->
-               Option.map (List.Assoc.find by_constructor name ~equal:String.equal)
-                 ~f:(fun sets -> (name, (position, sets))))))
+    for_applications ~rename:(fun ~key (position, sets) ->
+        (position, List.map sets ~f:(fun (c, set) -> (c, rename_set ~key set))))
+    @@ by_own_names
+         (List.filter_map translated ~f:(fun (name, f, _) ->
+              Option.bind (witness_parameter f) ~f:(fun (position, _, _) ->
+                  Option.map (List.Assoc.find by_constructor name ~equal:String.equal)
+                    ~f:(fun sets -> (name, (position, sets))))))
   in
   let* procs, state =
     State.run_from state
@@ -1789,6 +1843,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   atomic_procedures;
                   libraries = library_paths libraries;
                   raising_library_calls = raising_library_calls libraries;
+                  shared_exceptions = shared_exceptions_of f;
                   annotations;
                   proof_lemmas =
                     (let context = body_module_context f in

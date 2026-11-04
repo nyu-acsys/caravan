@@ -4,6 +4,7 @@
 
 open Base
 module S = Caravan_spec.Spec_ast
+module R = Raven_api
 
 let ( let* ) = Result.( >>= )
 
@@ -519,3 +520,125 @@ let raises_postconditions ?(only = true) types ~at clauses set =
           at)
   in
   holds @ if only then Option.to_list only_raised else []
+
+(** The data type of [exn] among [types], if the program has one. *)
+let exception_type types =
+  List.find types ~f:(fun d ->
+      List.mem d.Datatypes.paths Predef.path_exn ~equal:Path.same)
+
+(** The exceptions that the functor body shared by [group]'s applications declares, by the
+    representative's keys, each with every application's own constructor. *)
+let shared types (group : Generic_modules.t) =
+  match exception_type types with
+  | None -> []
+  | Some exn ->
+      (* An application's copies are declared under its module's path: its argument's
+         namespace without the parameter. *)
+      let prefix (source : Module_inventory.specialization) =
+        String.concat ~sep:"." (List.drop_last_exn source.argument.namespace) ^ "."
+      in
+      let representative = prefix group.representative in
+      List.filter_map exn.extension_keys ~f:(fun (_, key) ->
+          Option.map (String.chop_prefix key ~prefix:representative) ~f:(fun suffix ->
+              ( key,
+                List.map group.applications ~f:(fun application ->
+                    ( application,
+                      Option.map
+                        (Datatypes.find_ctor types (prefix application.source ^ suffix))
+                        ~f:snd )) )))
+
+(** The name of the interface of the modules that give a shared functor body, [group]'s,
+    its application's exceptions. *)
+let shared_interface (group : Generic_modules.t) =
+  (Qualified_name.of_string group.name).name ^ "$Exceptions"
+
+(** The module that gives [application] its exceptions in [group]'s shared body. *)
+let shared_module (application : Generic_modules.application) =
+  application.name ^ "$Exceptions"
+
+(** For a functor body shared by [group]'s applications that declares exceptions: the
+    interface of the modules giving each application its own, and each application's
+    module. Each exception [E] has [make$E], [is$E] and its payload's [field$i$E]. *)
+let shared_members ~loc types (group : Generic_modules.t) =
+  let shared = shared types group in
+  if List.is_empty shared then Ok None
+  else
+    let exn = Option.value_exn (exception_type types) in
+    let ident text = R.Ident.make ~loc text in
+    let exn_type =
+      R.Type.named ~loc (R.Name.make ~loc ~path:[ exn.module_name ] "T") []
+    in
+    let e = R.Expr.var ~loc (R.Name.make ~loc "e") in
+    let member kind key = Translate_context.shared_exception_member kind key in
+    let call text args = R.Expr.call ~loc (R.Name.make ~loc text) args in
+    let* entries =
+      Result.all
+        (List.map shared ~f:(fun (key, constructors) ->
+             let* constructors =
+               Result.all
+                 (List.map constructors ~f:(fun (application, c) ->
+                      match c with
+                      | Some ({ Datatypes.fields = []; _ } as c) -> Ok (application, c)
+                      | Some _ ->
+                          Report.unsupported group.representative.template.mod_loc
+                            "A payload of an exception of a functor body its \
+                             applications share"
+                      | None ->
+                          Report.internal group.representative.template.mod_loc
+                            "An application's copy of a shared functor body's exception"))
+             in
+             Ok (key, constructors)))
+    in
+    let is_ctor (c : Datatypes.ctor) = R.Expr.is_ ~loc e (ident c.raven) in
+    let interface =
+      R.Member.module_ ~loc ~interface:true
+        (ident (shared_interface group))
+        (List.concat_map entries ~f:(fun (key, constructors) ->
+             [
+               R.Member.callable
+                 (R.Callable.func ~loc
+                    ~formals:[ R.Var.make ~loc (ident "e") exn_type ]
+                    ~returns:[ R.Var.make ~loc (ident "r") (R.Type.bool ~loc) ]
+                    ~ensures:
+                      [
+                        R.Spec.make
+                          (R.Expr.binary ~loc Impl
+                             (R.Expr.var ~loc (R.Name.make ~loc "r"))
+                             (List.reduce_exn ~f:(R.Expr.binary ~loc Or)
+                                (List.map constructors ~f:(fun (_, c) -> is_ctor c))));
+                      ]
+                    (ident (member "is" key))
+                    None);
+               R.Member.callable
+                 (R.Callable.func ~loc
+                    ~returns:[ R.Var.make ~loc (ident "e") exn_type ]
+                    ~ensures:[ R.Spec.make (call (member "is" key) [ e ]) ]
+                    (ident (member "make" key))
+                    None);
+             ]))
+    in
+    let modules =
+      List.map group.applications ~f:(fun application ->
+          ( application,
+            R.Member.module_ ~loc
+              ~implements:[ (R.Name.make ~loc (shared_interface group), []) ]
+              (ident (shared_module application))
+              (List.concat_map entries ~f:(fun (key, constructors) ->
+                   let c =
+                     List.Assoc.find_exn constructors application ~equal:phys_equal
+                   in
+                   [
+                     R.Member.callable
+                       (R.Callable.func ~loc
+                          ~formals:[ R.Var.make ~loc (ident "e") exn_type ]
+                          ~returns:[ R.Var.make ~loc (ident "r") (R.Type.bool ~loc) ]
+                          (ident (member "is" key))
+                          (Some (is_ctor c)));
+                     R.Member.callable
+                       (R.Callable.func ~loc
+                          ~returns:[ R.Var.make ~loc (ident "e") exn_type ]
+                          (ident (member "make" key))
+                          (Some (R.Expr.call ~loc (Datatypes.ctor_name ~loc exn c) [])));
+                   ])) ))
+    in
+    Ok (Some (interface, modules))

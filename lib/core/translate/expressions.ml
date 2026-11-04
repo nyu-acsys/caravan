@@ -135,7 +135,14 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                 established ctx arg value)
           in
           let+ value =
-            constructor_value ctx ~at ~result_type:e.exp_type d c (List.map named ~f:snd)
+            match shared_exception ctx c with
+            (* The application's own exception, in a functor body it shares. *)
+            | Some app ->
+                State.return
+                  (shared_exception_call ~loc:l app "make" c (List.map named ~f:snd))
+            | None ->
+                constructor_value ctx ~at ~result_type:e.exp_type d c
+                  (List.map named ~f:snd)
           in
           (stmts @ List.concat_map named ~f:fst, value)
       end
@@ -1327,10 +1334,20 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
       begin match occurrence_constructor ctx.given.types p.pat_type cstr with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (_, c) ->
-          let is_c = R.Expr.is_ ~loc:l v (ident ~loc:l c.raven) in
-          let fields =
-            List.map c.fields ~f:(fun f ->
-                ([], R.Expr.field ~loc:l v (qualified_name ~loc:l f)))
+          let is_c, fields =
+            match shared_exception ctx c with
+            (* The application's own exception, in a functor body it shares. *)
+            | Some app ->
+                ( shared_exception_call ~loc:l app "is" c [ v ],
+                  List.mapi c.fields ~f:(fun i _ ->
+                      ( [],
+                        shared_exception_call ~loc:l app
+                          ("field$" ^ Int.to_string i)
+                          c [ v ] )) )
+            | None ->
+                ( R.Expr.is_ ~loc:l v (ident ~loc:l c.raven),
+                  List.map c.fields ~f:(fun f ->
+                      ([], R.Expr.field ~loc:l v (qualified_name ~loc:l f))) )
           in
           let+ access, cond, binds =
             components (conjoin [ guard; Some is_c ]) ps fields
@@ -1516,8 +1533,10 @@ and flat_cases ctx v cases =
               ( occurrence_constructor ctx.given.types p.pat_type cstr,
                 Option.all (List.map ps ~f:flat_arg) )
             with
-            | Some (_, c), Some args when not (List.mem seen c.raven ~equal:String.equal)
-              ->
+            (* A shared functor body's exception is matched through its module. *)
+            | Some (_, c), Some args
+              when (not (List.mem seen c.raven ~equal:String.equal))
+                   && Option.is_none (shared_exception ctx c) ->
                 Option.map
                   (flat (c.raven :: seen) rest)
                   ~f:(fun rest -> (`Ctor (c, args, p), rhs) :: rest)
