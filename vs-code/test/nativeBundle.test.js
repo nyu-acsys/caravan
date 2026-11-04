@@ -8,7 +8,9 @@ const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const core = require('../out/client/verifier');
 const { systemPath } = require('../out/shared/toolchain');
-const { parseReport, normalizeContracts, normalizeProofSteps } = require('../out/server/report');
+const { parseReport, normalizeContracts, normalizeProofSteps, normalizeMembers } = require('../out/server/report');
+const { VerificationProcesses } = require('../out/server/verificationProcesses');
+const { memberLenses } = require('../out/server/memberLenses');
 const { contractLenses, contractHover } = require('../out/server/contracts');
 const { renderProofView } = require('../out/server/proofView');
 const { proofHints } = require('../out/server/proofHints');
@@ -82,9 +84,24 @@ test('native release installs and verifies Saturn with its relocated compiler an
       assert.ok(view.text.includes('(*@ proof fold stack t [] *)'));
       assert.ok(view.text.includes('predicate stack'));
       assert.ok(view.links.some(link => link.target.includes('/treiber_stack.proof#')));
-      const result = await run(selected.executable, ['--shh', ...includes, source],
-        { env: environment, timeout: 120000 });
-      assert.match(result.stdout, /Verification successful/);
+      const phases = [];
+      const snapshots = [];
+      const result = await new VerificationProcesses(1).serve(selected.executable, [],
+        ['--lsp-mode', '--lsp-annotations', ...includes, source], repository,
+        new AbortController().signal, environment, (stdout, phase) => {
+          phases.push(phase);
+          snapshots.push(normalizeMembers(parseReport(stdout), repository,
+            file => readFileSync(file, 'utf8')));
+        });
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(phases[0], 'typed');
+      assert.ok(phases.includes('scheduled'));
+      assert.ok(phases.includes('progress'));
+      assert.ok(snapshots.some(members => members.some(member => member.status === 'pending')));
+      const verified = normalizeMembers(parseReport(result.stdout, result.code), repository,
+        file => readFileSync(file, 'utf8'));
+      assert.ok(verified.some(member => member.name === 'create' && member.status === 'verified'));
+      assert.ok(memberLenses(verified, source, 'verified').length >= 6);
     } finally {
       await new Promise(resolve => server.close(resolve));
       await fs.rm(storage, { recursive: true, force: true });

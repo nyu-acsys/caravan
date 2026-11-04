@@ -13,6 +13,7 @@ const uri = file => URI.file(file).toString();
 const fakeVerifier = `
 const fs = require('node:fs');
 const path = require('node:path');
+if(process.argv.at(-1)==='--server') {console.error('unknown option --server');process.exit(2);}
 const file = process.argv.at(-1);
 const text = fs.readFileSync(file, 'utf8');
 fs.appendFileSync(path.join(path.dirname(file), 'runs'), JSON.stringify(process.argv.slice(2)) + '\\n');
@@ -354,6 +355,117 @@ const runs = async f => (await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).tr
 const proofHints = (f, range = { start: { line: 0, character: 0 }, end: { line: 100, character: 0 } }, target = f.file) =>
 	f.request('textDocument/inlayHint', { textDocument: { uri: uri(target) }, range });
 
+const streamingVerifier = `
+const fs = require('node:fs');
+const path = require('node:path');
+function report(file, first, second, failure = false) {
+ const loc=(line,start,end)=>({file,start_line:line,start_col:start,end_line:line,end_col:end});
+ const leaf=(id,line,status)=>({...loc(line,6,6+id.length),id,name:'Work.'+id,kind:'function',
+  extent:loc(line,2,25),parent:'Work',group:false,status,own_status:status,own_checks:['unchecked','checked'].includes(status)?0:1,counts:{[status]:1}});
+ const counts={}; for(const status of [first,second]) counts[status]=(counts[status]||0)+1;
+ const order=['unchecked','checked','verified','pending','skipped','timeout','failed'];
+ const status=order.indexOf(first)>order.indexOf(second)?first:second;
+ return {errors:failure?[{...loc(first==='failed'?2:3,6,12),kind:'Verification',message:['streamed failure']}]:[],
+ dependencies:[file,file.replace(/\\.ml$/,'.proof')],annotations:[],references:[],symbols:[],
+ members:[{...loc(1,7,11),id:'Work',name:'Work',kind:'module',extent:{...loc(1,0,3),end_line:4},
+ group:true,status,own_status:'checked',own_checks:0,counts},leaf('first',2,first),leaf('second',3,second)]};
+}
+if(process.argv.at(-1)!=='--server') {
+ const file=process.argv.at(-1);process.stdout.write(JSON.stringify(report(file,'unchecked','unchecked')));
+} else {
+ let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',data=>input+=data);
+ process.stdin.on('end',()=>{
+  const request=JSON.parse(input),file=request.args.at(-1),dir=path.dirname(file);
+  const send=(phase,value)=>process.stdout.write(JSON.stringify({id:request.id,phase,partial:JSON.stringify(value)})+'\\n');
+  send('typed',report(file,'checked','checked'));
+  send('scheduled',report(file,'pending','pending'));
+  const early=fs.readFileSync(file,'utf8').includes('early-fail');
+  send('progress',report(file,early?'failed':'verified','pending',early));
+  const timer=setInterval(()=>{
+   if(!fs.existsSync(path.join(dir,'finish'))) return;
+   clearInterval(timer);
+   const fails=fs.readFileSync(file,'utf8').includes('fail-run');
+   const final=report(file,early?'failed':'verified',early?'verified':fails?'failed':'verified',fails||early);
+   send('progress',final);
+   process.stdout.write(JSON.stringify({id:request.id,exit:fails||early?1:0,stdout:JSON.stringify(final),stderr:''})+'\\n');
+  },10);
+ });
+}
+`;
+
+async function streamingFixture(t, fails = false, early = false) {
+	const f = await fixture(t, 'module Work = struct\n  let first () = ()\n  let second () = ()\nend\n' + (fails ? '(* fail-run *)' : '') + (early ? '(* early-fail *)' : ''), undefined, true);
+	f.settings.showContractLenses = false;
+	f.settings.verifyOnSave = false;
+	await fs.writeFile(path.join(f.dir, 'fake verifier.cjs'), streamingVerifier);
+	await f.open();
+	return f;
+}
+async function mixedMemberLenses(f, completed = '✓ verified') {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		const result = await lenses(f);
+		if (result.some(lens => lens.command.title === completed) && result.some(lens => lens.command.title === '⋯ checking')) return result;
+		await delay(10);
+	}
+	throw new Error('No live mixed member statuses before verification completed');
+}
+
+test('verification streams member lenses and module summaries before the final result', { timeout: 15000 }, async t => {
+	const f = await streamingFixture(t, true);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verifying');
+	const progress = await mixedMemberLenses(f);
+	assert.ok(progress.some(lens => /1 checking, 1 verified/.test(lens.command.title)));
+	assert.equal(f.messages.some(message => message.params?.state === 'failed'), false);
+	await fs.writeFile(path.join(f.dir, 'finish'), 'yes');
+	await f.state('failed');
+	const final = await lenses(f);
+	assert.ok(final.some(lens => lens.command.title === '✓ verified'));
+	assert.ok(final.some(lens => lens.command.title === '✗ failed'));
+	assert.ok(final.some(lens => /1 failed, 1 verified/.test(lens.command.title)));
+	await f.wait(message => message.method === 'textDocument/publishDiagnostics'
+		&& message.params.diagnostics.some(diagnostic => diagnostic.message === 'streamed failure'));
+});
+
+test('companion edits discard streaming results even when the implementation version is unchanged', { timeout: 15000 }, async t => {
+	const f = await streamingFixture(t);
+	const proof = f.file.replace(/\.ml$/, '.proof');
+	await fs.writeFile(proof, 'original');
+	await f.open(proof);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verifying');
+	await mixedMemberLenses(f);
+	const changed = f.messages.length;
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'dirty' }] });
+	await f.state('outdated', changed);
+	assert.equal((await lenses(f)).some(lens => lens.command.title.includes('verified')), false);
+	await fs.writeFile(proof, 'dirty');
+	f.notify('textDocument/didSave', { textDocument: { uri: uri(proof) } });
+	const fresh = f.messages.length;
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verifying', fresh);
+	await mixedMemberLenses(f);
+	await fs.writeFile(path.join(f.dir, 'finish'), 'yes');
+	await f.state('verified', fresh);
+	assert.equal((await lenses(f)).filter(lens => lens.command.title === '✓ verified').length, 2);
+});
+
+test('streamed failures and diagnostics remain visible while other members are pending', { timeout: 15000 }, async t => {
+	const f = await streamingFixture(t, true, true);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verifying');
+	await mixedMemberLenses(f, '✗ failed');
+	await f.wait(message => message.method === 'textDocument/publishDiagnostics'
+		&& message.params.diagnostics.some(diagnostic => diagnostic.message === 'streamed failure'));
+	assert.equal(f.messages.some(message => message.params?.state === 'failed'), false);
+	await fs.writeFile(path.join(f.dir, 'finish'), 'yes');
+	await f.state('failed');
+	const final = await lenses(f);
+	assert.ok(final.some(lens => lens.command.title === '✗ failed'));
+	assert.ok(final.some(lens => /1 failed, 1 verified/.test(lens.command.title)));
+});
+
 test('proof hints share discovery with hovers and views and invalidate without a source version change', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
 	f.settings.verifyOnSave = false;
@@ -501,7 +613,7 @@ test('companion edits, dependencies, configuration and toolchains invalidate con
 	f.settings.showContractLenses = false;
 	f.notify('workspace/didChangeConfiguration', { settings: {} });
 	assert.deepEqual(await lenses(f), []);
-	assert.equal((await runs(f)).length, 6);
+	assert.equal((await runs(f)).length, 7);
 	const contract = await hover(f);
 	assert.match(contract.contents.value, /main\.proof:1/);
 	assert.equal((await runs(f)).length, 7);

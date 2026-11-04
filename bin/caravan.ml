@@ -86,14 +86,21 @@ let files =
   let doc = "The OCaml files to verify." in
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
 
-let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_annotations
-    lsp_annotations_only smt_timeout files =
+let protocol_source = Logs.Src.create "caravan.editor"
+
+module Protocol = (val Logs.src_log protocol_source)
+
+let print text =
+  Logs.Src.set_level protocol_source (Some Logs.App);
+  Protocol.app (fun m -> m "%s" text)
+
+let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_rav
+    manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout files =
   if manifest then begin
-    Logs.app (fun m ->
-        m "%s"
-          (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
-             ~lsp_protocol:Caravan_config.lsp_protocol_version
-             ~min_z3:Caravan_config.min_z3_version));
+    emit
+      (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
+         ~lsp_protocol:Caravan_config.lsp_protocol_version
+         ~min_z3:Caravan_config.min_z3_version);
     0
   end
   else if lsp_mode && emit_rav then begin
@@ -108,11 +115,12 @@ let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_anno
     let results =
       if lsp_annotations_only then
         List.map (Caravan_core.Check.annotations_only ~include_dirs) files
-      else List.map (Caravan_core.Check.run ~include_dirs ~history ~smt_timeout) files
+      else
+        List.map
+          (Caravan_core.Check.run ?on_progress ~include_dirs ~history ~smt_timeout)
+          files
     in
-    Logs.app (fun m ->
-        m "%s"
-          (Caravan_editor.Editor_report.to_string ~annotations:lsp_annotations results));
+    emit (Caravan_editor.Editor_report.to_string ~annotations:lsp_annotations results);
     let succeeded result =
       if lsp_annotations_only then
         not
@@ -135,11 +143,104 @@ let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_anno
     if verified then 0 else 1
   end
 
-let cmd =
+let cmd ?emit ?on_progress () =
   let info = Cmd.info "caravan" ~version:Caravan_config.version in
   Cmd.v info
     Term.(
-      const main $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest
-      $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ files)
+      const (main ?emit ?on_progress)
+      $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest $ lsp_mode
+      $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ files)
 
-let () = Stdlib.exit (Cmd.eval' cmd)
+let serve defaults =
+  Logs.set_reporter (Logs_fmt.reporter ());
+  Logs.Src.set_level protocol_source (Some Logs.App);
+  let answer fields = print (Yojson.Basic.to_string (`Assoc fields)) in
+  let decode line =
+    match Yojson.Basic.from_string line with
+    | `Assoc fields ->
+        let get key = List.assoc_opt key fields in
+        begin match (get "id", get "cwd", get "args", get "partial") with
+        | Some id, Some (`String cwd), Some (`List args), partial ->
+            let strings =
+              List.filter_map (function `String s -> Some s | _ -> None) args
+            in
+            if List.length strings <> List.length args then Error "args must be strings"
+            else Ok (id, cwd, strings, partial = Some (`Bool true))
+        | _ -> Error "Expected id, cwd, args and optional partial"
+        end
+    | _ -> Error "Expected a request object"
+    | exception Yojson.Json_error message -> Error message
+  in
+  let rec loop () =
+    match Stdio.In_channel.input_line Stdio.stdin with
+    | None -> ()
+    | Some line ->
+        begin match decode line with
+        | Error message -> answer [ ("id", `Null); ("error", `String message) ]
+        | Ok (id, cwd, args, partial) ->
+            if not (Sys.file_exists cwd && Sys.is_directory cwd) then
+              answer [ ("id", id); ("error", `String ("No such directory: " ^ cwd)) ]
+            else if not (List.mem "--lsp-mode" args && List.mem "--lsp-annotations" args)
+            then
+              answer
+                [
+                  ("id", id);
+                  ("error", `String "Server requests require --lsp-mode --lsp-annotations");
+                ]
+            else begin
+              Unix.chdir cwd;
+              let output = Buffer.create 1024 and errors = Buffer.create 256 in
+              let formatter = Format.formatter_of_buffer errors in
+              let on_progress =
+                if not partial then None
+                else
+                  Some
+                    (fun (progress : Caravan_core.Check.progress) ->
+                      let phase =
+                        match progress.phase with
+                        | Raven_api.Progress.Typed -> Some "typed"
+                        | Scheduled -> Some "scheduled"
+                        | Progress -> Some "progress"
+                        | Final -> None
+                      in
+                      Option.iter
+                        (fun phase ->
+                          answer
+                            [
+                              ("id", id);
+                              ("phase", `String phase);
+                              ( "partial",
+                                `String
+                                  (Caravan_editor.Editor_report.to_string
+                                     ~annotations:true [ progress.result ]) );
+                            ])
+                        phase)
+              in
+              let emit text =
+                Buffer.add_string output text;
+                Buffer.add_char output '\n'
+              in
+              let exit =
+                Cmd.eval' ~help:formatter ~err:formatter
+                  ~argv:(Array.of_list ("caravan" :: (defaults @ args)))
+                  (cmd ~emit ?on_progress ())
+              in
+              Format.pp_print_flush formatter ();
+              answer
+                [
+                  ("id", id);
+                  ("exit", `Int exit);
+                  ("stdout", `String (Buffer.contents output));
+                  ("stderr", `String (Buffer.contents errors));
+                ]
+            end
+        end;
+        loop ()
+  in
+  loop ()
+
+let () =
+  let args = Array.to_list Sys.argv in
+  match List.rev args with
+  | "--server" :: defaults -> serve (List.tl (List.rev defaults))
+  | _ -> Stdlib.exit (Cmd.eval' (cmd ()))

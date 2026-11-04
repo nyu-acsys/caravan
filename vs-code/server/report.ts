@@ -27,13 +27,24 @@ export interface ProofStep extends RavenLocation {
 export interface NormalizedProofStep {
 	location: SourceLocation; sourceLocation: SourceLocation; text: string;
 }
+export type MemberStatus = 'unchecked' | 'checked' | 'trusted' | 'verified' | 'pending' | 'skipped' | 'timeout' | 'failed';
+export interface RavenMember extends RavenLocation {
+	id: string; name: string; kind: string; extent: RavenLocation; parent?: string;
+	group: boolean; status: MemberStatus; own_status: MemberStatus; own_checks: number;
+	counts: Partial<Record<MemberStatus, number>>;
+}
+export interface NormalizedMember {
+	id: string; name: string; kind: string; location: SourceLocation; extent: SourceLocation; parent?: string;
+	group: boolean; status: MemberStatus; ownStatus: MemberStatus; ownChecks: number;
+	counts: Partial<Record<MemberStatus, number>>;
+}
 interface RavenError extends RavenLocation {
 	file: string; start_line: number; start_col: number; end_line: number; end_col: number;
 	kind: string; message: string[];
 }
 export interface RavenReport {
 	errors: RavenError[]; dependencies: string[];
-	annotations: InheritedContract[]; proofSteps: ProofStep[]; members: unknown[]; references: unknown[]; symbols: unknown[];
+	annotations: InheritedContract[]; proofSteps: ProofStep[]; members: RavenMember[]; references: unknown[]; symbols: unknown[];
 }
 const auxiliaryKinds = new Set(['RelatedLoc', 'Warning', 'Limit', 'Counterexample', 'Branch']);
 function object(value: unknown): value is Record<string, unknown> {
@@ -62,7 +73,17 @@ function proofStep(value: unknown): value is ProofStep {
 	return ravenLocation(value) && object(value) && value.kind === 'ProofStep'
 		&& ravenLocation(value.source_loc) && typeof value.text === 'string';
 }
-export function parseReport(text: string, exitCode: number | null): RavenReport {
+const memberStatuses = new Set(['unchecked', 'checked', 'trusted', 'verified', 'pending', 'skipped', 'timeout', 'failed']);
+function ravenMember(value: unknown): value is RavenMember {
+	return ravenLocation(value) && object(value) && typeof value.id === 'string' && !!value.id
+		&& typeof value.name === 'string' && typeof value.kind === 'string' && !!value.kind && ravenLocation(value.extent)
+		&& (value.parent === undefined || typeof value.parent === 'string')
+		&& typeof value.group === 'boolean' && typeof value.status === 'string' && memberStatuses.has(value.status)
+		&& typeof value.own_status === 'string' && memberStatuses.has(value.own_status)
+		&& Number.isSafeInteger(value.own_checks) && (value.own_checks as number) >= 0 && object(value.counts)
+		&& Object.entries(value.counts).every(([key, count]) => memberStatuses.has(key) && Number.isSafeInteger(count) && (count as number) >= 0);
+}
+export function parseReport(text: string, exitCode: number | null | undefined): RavenReport {
 	let value: unknown;
 	try { value = JSON.parse(text); } catch { throw new Error('Caravan returned invalid JSON'); }
 	if (!object(value) || !Array.isArray(value.errors) || !value.errors.every(ravenError)
@@ -73,8 +94,9 @@ export function parseReport(text: string, exitCode: number | null): RavenReport 
 	if (!annotations.every(inheritedContract)) throw new Error('Caravan returned an invalid inherited contract annotation');
 	const proofSteps = value.annotations.filter(item => object(item) && item.kind === 'ProofStep');
 	if (!proofSteps.every(proofStep)) throw new Error('Caravan returned an invalid proof step annotation');
+	if (!value.members.every(ravenMember)) throw new Error('Caravan returned an invalid member status');
 	const failed = value.errors.some(error => !auxiliaryKinds.has(error.kind));
-	if (exitCode !== (failed ? 1 : 0)) throw new Error(`Caravan report disagrees with exit code ${exitCode}`);
+	if (exitCode !== undefined && exitCode !== (failed ? 1 : 0)) throw new Error(`Caravan report disagrees with exit code ${exitCode}`);
 	return { errors: value.errors, dependencies: value.dependencies, annotations, proofSteps,
 		members: value.members, references: value.references, symbols: value.symbols };
 }
@@ -117,6 +139,12 @@ export function normalizeContracts(report: RavenReport, cwd: string, readText: (
 export function normalizeProofSteps(report: RavenReport, cwd: string, readText: (file: string) => string | undefined): NormalizedProofStep[] {
 	const location = locationNormalizer(cwd, readText);
 	return report.proofSteps.map(step => ({ location: location(step), sourceLocation: location(step.source_loc), text: step.text }));
+}
+export function normalizeMembers(report: RavenReport, cwd: string, readText: (file: string) => string | undefined): NormalizedMember[] {
+	const location = locationNormalizer(cwd, readText);
+	return report.members.map(member => ({ id: member.id, name: member.name, kind: member.kind,
+		location: location(member), extent: location(member.extent), parent: member.parent, group: member.group,
+		status: member.status, ownStatus: member.own_status, ownChecks: member.own_checks, counts: member.counts }));
 }
 
 export function normalizeReport(report: RavenReport, root: string, cwd: string, readText: (file: string) => string | undefined): FileResult {

@@ -9,7 +9,7 @@ VS Code integration for [Caravan](https://github.com/nyu-acsys/caravan), a verif
 for multicore OCaml programs. The extension highlights specifications and proof
 files, reports verification errors in the editor, and tracks verification status.
 Contracts from companion interfaces and proof headers appear above their
-implementation functions.
+implementation functions, with streamed member statuses and module summaries.
 
 New to Caravan? Start with the **[project introduction and examples](https://github.com/nyu-acsys/caravan#readme)**.
 The instructions below cover setup, day-to-day use, and building the extension.
@@ -96,7 +96,8 @@ comment markers, with a link to its
 These hovers complement OCaml Platform's type
 information and remain available when contract lenses are disabled.
 
-Contract discovery runs independently of the solver and does not verify the file.
+Discovery runs independently of the solver and does not verify the file. It also
+finds source members for status lenses, initially marked `○ not checked`.
 Edits to the implementation or its dependencies hide outdated summaries until the
 saved inputs can be analyzed again. If discovery fails, run verification to see
 the diagnostics. Older Caravan builds without annotation discovery still support
@@ -114,6 +115,22 @@ or run **Caravan: Verify Saved File** from the Command Palette. Clicking the
 **Caravan:** status item also verifies the active file. For `.mli` and `.proof`
 files, Caravan checks the sibling `.ml` implementation with its interface and
 proof; a missing implementation is reported as unavailable.
+
+Status lenses appear above reported source members in `.ml`, `.mli`, and `.proof`
+files. `○ type-checked` records successful front-end checking; `✓ verified` records
+completed proof checks, while `– trusted` identifies assumed contracts. During
+verification, `⋯ checking` remains until all checks generated for a member finish.
+Failures, solver timeouts, and skipped checks remain visible as `✗ failed`,
+`⏱ timed out`, and `– skipped`. A failure elsewhere leaves independently verified
+members verified. These lenses display information; verification still runs for
+the implementation and its companions.
+
+Module, functor, and proof-module summaries count each source member once, rather
+than counting generated procedures or adding nested module totals again. Module
+boundary checks and file prerequisites appear separately when they prevent a
+successful summary, even if every counted member is verified. Editing these inputs
+marks stale lenses outdated; an unavailable verifier cannot leave a current
+verified display.
 
 Errors and warnings appear in the Problems panel and editor, with related source
 locations. The status bar tracks the active file and its current version: unchecked,
@@ -169,7 +186,7 @@ to the VS Code window:
   Defaults to `10000`.
 * `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
 * `caravan.showContractLenses`: Show external contracts above implementation
-  functions. Defaults to `true`.
+  functions. Defaults to `true`; member status lenses remain available independently.
 * `caravan.showProofHints`: Show inline proof-step labels with full annotation
   hovers and source navigation. Defaults to `true`.
 
@@ -193,7 +210,8 @@ This creates an unbundled development package. It includes the language server
 and its runtime dependencies; configure your installed Caravan and Z3 as above.
 
 `npm test` compiles the client and server and tests verification diagnostics,
-related locations, warnings, cancellation, and stale-result handling over LSP.
+related locations, warnings, streamed member statuses, cancellation, and stale-result
+handling over LSP.
 It also checks TextMate token scopes with Oniguruma and compares keyword coverage
 with Caravan's specification lexer. Installer tests use local release fixtures,
 checking version selection, compatibility, checksums, extraction, cancellation,
@@ -224,11 +242,33 @@ shape: `errors`, `dependencies`, `annotations`, `members`, `references`, and
 `symbols`. Source lines are one-based and columns are UTF-8 byte offsets; the
 server converts them to LSP UTF-16 positions. The annotation table includes
 external contracts in Raven's `InheritedContract` format and Caravan `ProofStep`
-entries with source locations and annotation text. Member, reference, and symbol
-tables are currently empty.
+entries with source locations and annotation text. The `members` table describes
+source declarations: `id`, `name`, `kind`, the declaration's location fields,
+`extent`, optional `parent`, `group`, `status`, `own_status`, `own_checks`, and
+`counts`. Locations use `file`, `start_line`, `start_col`, `end_line`, and `end_col`;
+`extent` spans the declaration's text. `status` includes nested members and
+prerequisites, while `own_status` and `own_checks` describe its own backend checks.
+Group `counts` count source leaves by status. Status values are `unchecked`,
+`checked`, `trusted`, `verified`, `pending`, `skipped`, `timeout`, and `failed`.
+The reference and symbol tables remain empty.
 
-Adding `--lsp-annotations-only` collects these attachments using the same front-end
-resolution as verification, without generating Raven code or running SMT checks.
+Verification uses `caravan --server`, with Raven's JSON-line framing. Each request
+contains `id`, `cwd`, `args`, and `partial: true`; `args` includes the editor options
+and implementation path. Partial responses contain the same `id`, a `phase`
+(`typed`, `scheduled`, or `progress`), and `partial`, a JSON report encoded as a
+string. The final response contains `id`, `exit`, `stdout`, and `stderr`, with the
+final report in `stdout`. The extension starts one process per verification run;
+it does not keep a persistent verifier session or reuse proof fingerprints.
+An older executable that explicitly rejects `--server` falls back to a batch run.
+A malformed stream is reported as an error without a batch retry.
+
+Streamed reports use the same worker queue, cancellation, dirty-input checks, and
+dependency/run generations as final results. A companion-file change invalidates
+the run even when the implementation document's version has not changed.
+
+Adding `--lsp-annotations-only` collects these attachments and an unchecked member
+inventory using the same front-end resolution as verification, without generating
+Raven code or running SMT checks. Discovery never marks a member verified.
 The server shares this mode, worker queue, and dependency cache between contract
 lenses, hovers, and proof views, so ongoing verification does not delay discovery.
 The client requests a combined view with `caravan/proofView` and refreshes its

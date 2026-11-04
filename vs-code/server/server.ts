@@ -5,11 +5,12 @@ import { URI } from 'vscode-uri';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { toolchainEnvironment } from '../shared/toolchain';
-import { VerificationProcesses } from './verificationProcesses';
-import { parseReport, normalizeReport, normalizeContracts, normalizeProofSteps, type RavenReport } from './report';
+import { VerificationProcesses, UnsupportedServerError } from './verificationProcesses';
+import { parseReport, normalizeReport, normalizeContracts, normalizeProofSteps, normalizeMembers, type RavenReport, type NormalizedMember, type FileResult } from './report';
 import { contractLenses, contractHover } from './contracts';
 import { renderProofView, type ProofMetadata } from './proofView';
 import { proofHints } from './proofHints';
+import { memberLenses } from './memberLenses';
 import { proofViewRequest, proofViewChangedNotification } from '../shared/protocol';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
@@ -24,6 +25,7 @@ interface Owner {
 	annotationGeneration: number; annotationAbort?: AbortController;
 	annotations?: Promise<ProofMetadata | undefined>; annotationError?: string;
 	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
+	members?: NormalizedMember[];
 }
 const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, showProofHints: true, cwd: '' };
 const connection = createConnection();
@@ -43,6 +45,7 @@ let globalSettings: unknown = {};
 let folders: WorkspaceFolder[] = [];
 let shuttingDown = false;
 let initialized = false;
+let memberRefreshScheduled = false;
 let toolchain: ToolchainSelection | undefined;
 
 function fileOf(uri: string): string | undefined {
@@ -83,6 +86,26 @@ function clear(owner: Owner): void {
 	owner.diagnostics.clear();
 	publish(uris);
 }
+function publishResult(owner: Owner, result: FileResult): void {
+	const diagnostics = new Map<string, Diagnostic[]>();
+	const resultUri = URI.file(result.file).toString();
+	diagnostics.set(resultUri, []);
+	for (const item of result.diagnostics) {
+		const uri = URI.file(item.location.file).toString();
+		const entries = diagnostics.get(uri) ?? [];
+		entries.push({ range: { start: item.location.start, end: item.location.end },
+			severity: item.severity === 'error' ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
+			source: 'Caravan', code: item.kind, message: item.message,
+			relatedInformation: item.related.map(related => ({
+				location: { uri: URI.file(related.location.file).toString(),
+					range: { start: related.location.start, end: related.location.end } }, message: related.message
+			})) });
+		diagnostics.set(uri, entries);
+	}
+	const uris = new Set([...owner.diagnostics.keys(), ...diagnostics.keys()]);
+	owner.diagnostics = diagnostics;
+	publish(uris);
+}
 function knownDependencies(root: string, owner: Owner): Set<string> | undefined {
 	if (!owner.dependencies && !owner.annotationDependencies) return undefined;
 	return new Set([...siblings(root), ...(owner.dependencies ?? []), ...(owner.annotationDependencies ?? [])]);
@@ -94,6 +117,15 @@ function clearAnnotations(owner: Owner): void {
 	owner.annotations = undefined;
 	owner.annotationError = undefined;
 	owner.annotationStamps = undefined;
+	owner.members = undefined;
+}
+function refreshMemberLenses(): void {
+	if (!codeLensRefresh || shuttingDown || memberRefreshScheduled) return;
+	memberRefreshScheduled = true;
+	setImmediate(() => {
+		memberRefreshScheduled = false;
+		if (!shuttingDown) void connection.sendRequest('workspace/codeLens/refresh').catch(() => undefined);
+	});
 }
 function refreshAnnotations(): void {
 	if (codeLensRefresh && !shuttingDown) void connection.sendRequest('workspace/codeLens/refresh').catch(() => undefined);
@@ -197,9 +229,13 @@ function reportDependencies(report: RavenReport, root: string, cwd: string): Set
 		dependencies.add(path.resolve(cwd, step.file));
 		dependencies.add(path.resolve(cwd, step.source_loc.file));
 	}
+	for (const member of report.members) {
+		dependencies.add(path.resolve(cwd, member.file));
+		dependencies.add(path.resolve(cwd, member.extent.file));
+	}
 	return dependencies;
 }
-function checkedReport(stdout: string, code: number | null, root: string, cwd: string): RavenReport {
+function checkedReport(stdout: string, code: number | null | undefined, root: string, cwd: string): RavenReport {
 	const parsed = parseReport(stdout, code);
 	if (!parsed.dependencies.some(dependency => path.resolve(cwd, dependency) === root)) {
 		throw new Error('Caravan report omitted the requested implementation dependency');
@@ -226,7 +262,8 @@ async function annotations(root: string, uri: string, owner: Owner): Promise<Pro
 		owner.annotationStamps = new Map([...dependencies].map(file => [file, diskStamp(file)]));
 		const error = normalizeReport(report, root, cwd, sourceText).diagnostics.find(diagnostic => diagnostic.severity === 'error');
 		if (error) throw new Error(error.message);
-		return { contracts: normalizeContracts(report, cwd, sourceText), steps: normalizeProofSteps(report, cwd, sourceText) };
+		return { contracts: normalizeContracts(report, cwd, sourceText), steps: normalizeProofSteps(report, cwd, sourceText),
+			members: normalizeMembers(report, cwd, sourceText) };
 	} catch (error) {
 		// Older toolchains may not support frontend-only annotation reports.
 		if (generation === owner.annotationGeneration) owner.annotationError = error instanceof Error ? error.message : String(error);
@@ -270,8 +307,29 @@ async function verify(uri: string, onSave = false): Promise<void> {
 		const { executable, args, cwd, env } = launch(root, config);
 		const abort = new AbortController();
 		owner.abort = abort;
+		owner.members = undefined;
 		state(root, 'verifying');
-		const output = await processes.run(executable, args, cwd, abort.signal, env);
+		refreshMemberLenses();
+		const current = () => !shuttingDown && !abort.signal.aborted && generation === owner.generation;
+		const unchanged = (dependencies: Set<string>) => !hasDirty(dependencies)
+			&& [...dependencies].every(file => (revisions.get(file) ?? 0) === (snapshot.get(file) ?? 0));
+		const partial = (text: string) => {
+			if (!current()) return;
+			const report = checkedReport(text, undefined, root, cwd);
+			const dependencies = reportDependencies(report, root, cwd);
+			owner.dependencies = dependencies;
+			if (!unchanged(dependencies)) { invalidate(root); return; }
+			owner.members = normalizeMembers(report, cwd, sourceText);
+			publishResult(owner, normalizeReport(report, root, cwd, sourceText));
+			refreshMemberLenses();
+		};
+		let output;
+		try {
+			output = await processes.serve(executable, config.arguments, args.slice(config.arguments.length), cwd, abort.signal, env, partial);
+		} catch (error) {
+			if (!(error instanceof UnsupportedServerError) || !current()) throw error;
+			output = await processes.run(executable, args, cwd, abort.signal, env);
+		}
 		if (shuttingDown || abort.signal.aborted || generation !== owner.generation) return;
 		let parsed;
 		try { parsed = checkedReport(output.stdout, output.code, root, cwd); }
@@ -282,33 +340,18 @@ async function verify(uri: string, onSave = false): Promise<void> {
 		if (hasDirty(dependencies) || [...dependencies].some(dependency => (revisions.get(dependency) ?? 0) !== (snapshot.get(dependency) ?? 0))) {
 			state(root, 'outdated', 'A dependency changed during verification.'); return;
 		}
-		const diagnostics = new Map<string, Diagnostic[]>();
-		for (const result of report.results) {
-			const resultUri = URI.file(path.resolve(cwd, result.file)).toString();
-			if (!diagnostics.has(resultUri)) diagnostics.set(resultUri, []);
-			for (const item of result.diagnostics) {
-				const targetUri = URI.file(path.resolve(cwd, item.location.file)).toString();
-				const items = diagnostics.get(targetUri) ?? [];
-				items.push({ range: { start: item.location.start, end: item.location.end },
-					severity: item.severity === 'error' ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
-					source: 'Caravan', code: item.kind, message: item.message,
-					relatedInformation: item.related.map(related => ({
-						location: { uri: URI.file(path.resolve(cwd, related.location.file)).toString(), range: { start: related.location.start, end: related.location.end } },
-						message: related.message
-					})) });
-				diagnostics.set(targetUri, items);
-			}
-		}
-		owner.diagnostics = diagnostics;
-		publish(diagnostics.keys());
+		owner.members = normalizeMembers(parsed, cwd, sourceText);
+		publishResult(owner, report.results[0]);
 		const verified = report.results.every(result => result.verified);
 		const warnings = report.results.some(result => result.diagnostics.some(diagnostic => diagnostic.severity === 'warning'));
 		state(root, verified ? warnings ? 'verifiedWithWarnings' : 'verified' : 'failed');
+		refreshMemberLenses();
 	} catch (error) {
 		if (!shuttingDown && generation === owner.generation) {
 			const message = error instanceof Error ? error.message : String(error);
 			connection.console.error(message);
 			state(root, 'unavailable', message);
+			refreshMemberLenses();
 		}
 	} finally {
 		if (generation === owner.generation) owner.abort = undefined;
@@ -350,11 +393,17 @@ connection.onDidChangeWatchedFiles(event => {
 	}
 });
 connection.onCodeLens(async (params, token) => {
-	const root = fileOf(params.textDocument.uri);
-	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return [];
-	if (!(await settings(params.textDocument.uri)).showContractLenses) return [];
-	const result = await metadataFor(params.textDocument.uri);
-	return token.isCancellationRequested ? [] : contractLenses(result?.contracts ?? [], root);
+	const file = fileOf(params.textDocument.uri);
+	if (!file || !relevant(file) || shuttingDown || token.isCancellationRequested) return [];
+	const root = rootOf(file);
+	const config = await settings(params.textDocument.uri);
+	const needsContracts = config.showContractLenses && file === root;
+	const metadata = needsContracts || !owners.get(root)?.members
+		? await metadataFor(URI.file(root).toString()) : undefined;
+	if (token.isCancellationRequested) return [];
+	const owner = owners.get(root);
+	return [...(config.showContractLenses && file === root ? contractLenses(metadata?.contracts ?? [], root) : []),
+		...memberLenses(owner?.members ?? metadata?.members ?? [], file, owner?.state ?? 'unchecked')];
 });
 connection.onHover(async (params, token) => {
 	const root = fileOf(params.textDocument.uri);

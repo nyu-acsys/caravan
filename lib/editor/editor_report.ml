@@ -71,6 +71,26 @@ let annotation ~fallback = function
             ("text", `String a.text);
           ])
 
+let member ~fallback (m : Caravan_core.Editor_members.member) =
+  let status s = `String (Caravan_core.Editor_members.status_to_string s) in
+  `Assoc
+    (location ~fallback (Caravan_core.Report.loc m.name_loc)
+    @ [
+        ("id", `String m.id);
+        ("name", `String m.name);
+        ("kind", `String m.kind);
+        ("extent", `Assoc (location ~fallback (Caravan_core.Report.loc m.extent)));
+        ("group", `Bool m.group);
+        ("status", status m.status);
+        ("own_status", status m.own_status);
+        ("own_checks", `Int (List.length m.checks));
+        ( "counts",
+          `Assoc
+            (List.map m.counts ~f:(fun (s, n) ->
+                 (Caravan_core.Editor_members.status_to_string s, `Int n))) );
+      ]
+    @ Option.value_map m.parent ~default:[] ~f:(fun id -> [ ("parent", `String id) ]))
+
 let report ~annotations (results : Caravan_core.Check.result list) : Yojson.Basic.t =
   let errors =
     `List
@@ -86,7 +106,10 @@ let report ~annotations (results : Caravan_core.Check.result list) : Yojson.Basi
           `List
             (List.concat_map results ~f:(fun result ->
                  List.map result.annotations ~f:(annotation ~fallback:result.file))) );
-        ("members", `List []);
+        ( "members",
+          `List
+            (List.concat_map results ~f:(fun result ->
+                 List.map result.members ~f:(member ~fallback:result.file))) );
         ("references", `List []);
         ("symbols", `List []);
         ( "dependencies",

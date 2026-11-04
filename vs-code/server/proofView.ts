@@ -1,12 +1,13 @@
 import * as path from 'node:path';
 import { URI } from 'vscode-uri';
 import type { ProofViewResult } from '../shared/protocol';
-import type { NormalizedContract, NormalizedProofStep, Position, SourceLocation } from './report';
+import type { NormalizedContract, NormalizedProofStep, NormalizedMember, Position, SourceLocation } from './report';
 import { contractBody } from './contracts';
 
 export interface ProofMetadata {
 	contracts: NormalizedContract[];
 	steps: NormalizedProofStep[];
+	members?: NormalizedMember[];
 }
 interface Insertion {
 	offset: number;

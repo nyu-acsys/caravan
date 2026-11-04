@@ -3,6 +3,9 @@
  (public_name caravan)
  (libraries
   base
+  stdio
+  unix
+  yojson
   cmdliner
   fmt
   fmt.cli

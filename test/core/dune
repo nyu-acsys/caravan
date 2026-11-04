@@ -43,3 +43,13 @@
  (name storage_identities)
  (modules storage_identities)
  (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name editor_members)
+ (modules editor_members)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))

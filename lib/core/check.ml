@@ -66,15 +66,20 @@ type result = {
   diagnostics : R.Diagnostic.t list;
   dependencies : string list;
   annotations : Editor_annotations.t list;
+  members : Editor_members.member list;
 }
 
+type progress = { phase : R.Progress.phase; result : result }
+
 type prepared = {
+  file : string;
   program : R.Program.t;
   origins : Translate_context.origin list;
   warnings : R.Diagnostic.t list;
   explicit_proof_files : string list;
   dependencies : string list;
   annotations : Editor_annotations.t list;
+  members : Editor_members.member list;
 }
 
 let sibling_dependencies file =
@@ -94,9 +99,9 @@ let analyze ~include_dirs file =
   let ( let* ) result f = Result.bind result ~f in
   let* source = Source.load ~include_dirs file in
   let* scopes = Program_scopes.run source in
-  Ok (source, scopes, Editor_annotations.collect scopes)
+  Ok (source, scopes, Editor_annotations.collect scopes, Editor_members.collect scopes)
 
-let prepare_scopes ~history (source, scopes, annotations) =
+let prepare_scopes ~history (source, scopes, annotations, members) =
   let ( let* ) result f = Result.bind result ~f in
   let* program, origins, warnings =
     Translate.program_with_diagnostics ~history ~scopes source
@@ -112,26 +117,76 @@ let prepare_scopes ~history (source, scopes, annotations) =
   in
   Ok
     {
+      file = source.file;
       program;
       origins;
       warnings;
       explicit_proof_files;
       dependencies = source_dependencies source;
       annotations;
+      members;
     }
 
 let prepare ~include_dirs ~history file =
   Result.bind (analyze ~include_dirs file) ~f:(prepare_scopes ~history)
 
-let verify ~smt_timeout prepared =
+let verify ?on_progress ~collect_members ~smt_timeout prepared =
+  let explain diagnostic =
+    blame ~explicit_proof_files:prepared.explicit_proof_files
+      (explain prepared.origins diagnostic)
+  in
+  (* Cache the last snapshot so an aborted run retains its unfinished checks. *)
+  let latest = ref prepared.members in
+  let update (snapshot : R.Progress.t) =
+    let snapshot =
+      match snapshot.phase with
+      | Final ->
+          let recorded check =
+            List.exists snapshot.checks ~f:(Editor_members.same_check check)
+          in
+          {
+            snapshot with
+            checks =
+              snapshot.checks
+              @ List.filter
+                  (List.concat_map !latest ~f:(fun member -> member.Editor_members.checks))
+                  ~f:(fun check -> not (recorded check));
+          }
+      | Typed | Scheduled | Progress -> snapshot
+    in
+    let members = Editor_members.project prepared.members snapshot in
+    latest := members;
+    match snapshot.phase with
+    | Final -> ()
+    | Typed | Scheduled | Progress ->
+        Option.iter on_progress ~f:(fun send ->
+            send
+              {
+                phase = snapshot.phase;
+                result =
+                  {
+                    file = prepared.file;
+                    verified = false;
+                    diagnostics =
+                      prepared.warnings @ List.map snapshot.diagnostics ~f:explain;
+                    dependencies = prepared.dependencies;
+                    annotations =
+                      (match snapshot.phase with
+                      | Typed -> prepared.annotations
+                      | _ -> []);
+                    members;
+                  };
+              })
+  in
   let result =
-    R.verify ~options:{ R.default_options with smt_timeout } prepared.program
+    let on_progress =
+      if collect_members || Option.is_some on_progress then Some update else None
+    in
+    R.verify ~options:{ R.default_options with smt_timeout } ?on_progress prepared.program
   in
   ( result.verified,
-    prepared.warnings
-    @ List.map result.diagnostics ~f:(fun diagnostic ->
-        blame ~explicit_proof_files:prepared.explicit_proof_files
-          (explain prepared.origins diagnostic)) )
+    prepared.warnings @ List.map result.diagnostics ~f:explain,
+    Editor_members.finish ~verified:result.verified !latest )
 
 (** Structured verification results shared by the command line and editors. *)
 let analysis_error file error =
@@ -141,24 +196,26 @@ let analysis_error file error =
     diagnostics = [ Report.to_diagnostic error ];
     dependencies = sibling_dependencies file;
     annotations = [];
+    members = [];
   }
 
 let annotations_only ~include_dirs file =
   match analyze ~include_dirs file with
   | Error error -> analysis_error file error
-  | Ok (source, _, annotations) ->
+  | Ok (source, _, annotations, members) ->
       {
         file;
         verified = false;
         diagnostics = [];
         dependencies = source_dependencies source;
         annotations;
+        members;
       }
 
-let run ~include_dirs ~history ~smt_timeout file =
+let run ?on_progress ?(collect_members = true) ~include_dirs ~history ~smt_timeout file =
   match analyze ~include_dirs file with
   | Error error -> analysis_error file error
-  | Ok ((source, _, annotations) as analysis) ->
+  | Ok ((source, _, annotations, members) as analysis) ->
       begin match prepare_scopes ~history analysis with
       | Error error ->
           {
@@ -167,15 +224,19 @@ let run ~include_dirs ~history ~smt_timeout file =
             diagnostics = [ Report.to_diagnostic error ];
             dependencies = source_dependencies source;
             annotations;
+            members;
           }
       | Ok prepared ->
-          let verified, diagnostics = verify ~smt_timeout prepared in
+          let verified, diagnostics, members =
+            verify ?on_progress ~collect_members ~smt_timeout prepared
+          in
           {
             file;
             verified;
             diagnostics;
             dependencies = prepared.dependencies;
             annotations = prepared.annotations;
+            members;
           }
       end
 
@@ -191,7 +252,7 @@ let file ~include_dirs ~history ~emit_rav ~smt_timeout file =
         Logs.app (fun m -> m "%a" R.Program.pr prepared.program);
         true)
   else
-    let result = run ~include_dirs ~history ~smt_timeout file in
+    let result = run ~collect_members:false ~include_dirs ~history ~smt_timeout file in
     List.iter result.diagnostics ~f:Report.print_diagnostic;
     if result.verified then Logs.app (fun m -> m "Verification successful.");
     result.verified

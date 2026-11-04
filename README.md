@@ -631,6 +631,11 @@ The [VS Code extension](vs-code/) adds highlighting for `.proof` files and inlin
 specifications alongside OCaml Platform. It verifies saved files on demand or on
 save, with diagnostics in Problems and verification status in the status bar.
 Contract lenses and hovers link implementation functions to their annotations.
+Member status lenses stream proof progress, with summaries for modules, functors,
+and proof modules. They distinguish unchecked, type-checked, trusted, and verified
+declarations, retain failures and timeouts, and keep members pending until all their
+generated checks finish. Summaries count source members once and show module or file
+prerequisites separately when they prevent verification.
 A read-only proof view combines the implementation with external annotations
 and companion files, with links back to the original sources.
 Platform packages include Caravan, its linked Raven verifier, Z3, and matching
