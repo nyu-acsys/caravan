@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Exceptions can be declared, raised, handled, and specified with `raises` clauses, including in atomic contracts and loops.
+- Functions over constant GADT witnesses, as Saturn's `pop_as`, are verified once for all witnesses, with contracts matching on them.
 - The VS Code extension highlights proofs and annotations, shows external contract summaries, verifies saved files, and manages bundled toolchains and compatible verifier updates.
 - Source value domains preserve machine bounds through compound values and abstract module contracts, and support empty variants without assuming an inhabitant.
 - Static modules, nested signatures, checked module aliases, and monomorphic curried named and unit functors preserve type identities and support qualified calls, ordinary and atomic contracts, and scoped logical types and functions, predicates, invariants and lemma proofs.
