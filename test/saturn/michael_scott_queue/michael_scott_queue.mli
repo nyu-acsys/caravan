@@ -21,6 +21,22 @@ val is_empty : 'a t -> bool
     atomic requires queue q xs
     atomic ensures queue q xs && b = (length xs = 0) *)
 
+exception Empty
+
+val pop_exn : 'a t -> 'a
+(*@ r = atomic pop_exn q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
+    atomic raises Empty -> length xs = 0 && queue q xs *)
+
+val drop_exn : 'a t -> unit
+(*@ atomic drop_exn q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures length xs > 0 && queue q (drop 1 xs)
+    atomic raises Empty -> length xs = 0 && queue q xs *)
+
 val pop_opt : 'a t -> 'a option
 (*@ r = atomic pop_opt q
     requires is_queue q

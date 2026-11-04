@@ -83,6 +83,8 @@ type t = {
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
   witness : witness option;
+  extension_keys : (Shape.Uid.t * string) list;
+      (** For [exn]: the key of each declared exception, its constructor's [ocaml]. *)
   at : Location.t;
 }
 
@@ -109,6 +111,7 @@ let list =
     family = None;
     atomic_procedure = None;
     witness = None;
+    extension_keys = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -139,6 +142,7 @@ let option =
     family = None;
     atomic_procedure = None;
     witness = None;
+    extension_keys = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -265,6 +269,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           family = None;
           atomic_procedure = None;
           witness;
+          extension_keys = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -327,6 +332,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           family = None;
           atomic_procedure = None;
           witness = None;
+          extension_keys = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -354,6 +360,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           family = None;
           atomic_procedure = None;
           witness = None;
+          extension_keys = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -417,6 +424,7 @@ let library_type ~library ~library_id ~at name =
     family = None;
     atomic_procedure = None;
     witness = None;
+    extension_keys = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -501,6 +509,7 @@ let collection id kind =
     family = None;
     atomic_procedure = None;
     witness = None;
+    extension_keys = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -636,13 +645,33 @@ let find_variable (types : t list) variable =
               Int.equal (Types.get_id (expand types bound)) (Types.get_id variable)))
   | _ -> None
 
+(** The [ocaml] of the constructor [cstr] of [d]: its name, or for an exception, the key
+    of its declaration. *)
+let constructor_key (d : t) (cstr : Data_types.constructor_description) =
+  match cstr.cstr_tag with
+  | Cstr_extension (path, _) ->
+      begin match
+        List.Assoc.find d.extension_keys cstr.cstr_uid ~equal:Shape.Uid.equal
+      with
+      | Some key -> key
+      | None ->
+          (* A functor application's exception, named through it, as [First.Empty]: the
+             application's copy is declared under that path. *)
+          let name = Path.name path in
+          if List.exists d.extension_keys ~f:(fun (_, key) -> String.equal key name) then
+            name
+          else cstr.cstr_name
+      end
+  | _ -> cstr.cstr_name
+
 (** The backend constructor of [cstr], retaining its source payload types. *)
 let find_cstr (types : t list) (cstr : Data_types.constructor_description) =
   match Types.get_desc cstr.cstr_res with
   | Tconstr (p, _, _) ->
       Option.bind (find types p) ~f:(fun d ->
+          let key = constructor_key d cstr in
           Option.map
-            (List.find d.ctors ~f:(fun c -> String.equal c.ocaml cstr.cstr_name))
+            (List.find d.ctors ~f:(fun c -> String.equal c.ocaml key))
             ~f:(fun c ->
               let args = if Option.is_some d.id then cstr.cstr_args else c.args in
               (d, { c with args })))

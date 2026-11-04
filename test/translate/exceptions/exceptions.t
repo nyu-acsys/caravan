@@ -16,6 +16,14 @@ exceptions raise as declared ones.
   $ caravan --shh inferred.ml
   Verification successful.
 
+Exceptions of different modules with the same name are different, as are those of a
+functor's applications, which each declare their own.
+
+  $ caravan --shh same_names.ml
+  Verification successful.
+  $ caravan --shh functor_applications.ml
+  Verification successful.
+
 Exceptions of modules, of generic functions at several types, and of an interface.
 
   $ caravan --shh modules.ml

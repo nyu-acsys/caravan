@@ -308,7 +308,10 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* stmts, v = expr ctx argument in
       let* caught = State.gets (fun (s : State.state) -> s.carried.caught) in
       let set =
-        match (Exceptions.named argument, argument.exp_desc) with
+        match
+          ( Exceptions.named ~key:(Exceptions.key ctx.given.types) argument,
+            argument.exp_desc )
+        with
         | Some name, _ -> State.Raises [ name ]
         | None, Texp_ident (Pident id, _, _) ->
             (* Re-raising what a handler caught. *)
@@ -334,7 +337,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                   | _ -> R.Expr.tuple ~loc:l []
                 in
                 au.close Commit ~value:result
-                  ~outcome:(Raised (v, Exceptions.named argument))
+                  ~outcome:
+                    (Raised
+                       (v, Exceptions.named ~key:(Exceptions.key ctx.given.types) argument))
             | _ ->
                 State.of_result
                   (error at
@@ -946,6 +951,17 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
                                  Option.some_if
                                    (String.equal x y && String.equal g field)
                                    value))
+                     (* The field itself of a variable, as [t.head]. *)
+                     | Some
+                         {
+                           exp_desc =
+                             Texp_field
+                               ({ exp_desc = Texp_ident (Pident y, _, _); _ }, _, label);
+                           _;
+                         }
+                       when String.equal label.lbl_name field ->
+                         Option.map (State.name_in s.names y) ~f:(fun y ->
+                             R.Expr.var ~loc:l (name ~loc:l y))
                      | _ -> None)
                in
                match (known, equation) with
@@ -1611,7 +1627,7 @@ and loop_raising ctx ~at ~(spec : S.loop_spec) (cond : Typedtree.expression opti
             Option.value
               (List.Assoc.find ctx.given.raising f ~equal:String.equal)
               ~default:(State.Raises [])))
-      (Exceptions.uses e)
+      (Exceptions.uses ~key:(Exceptions.key ctx.given.types) e)
   in
   let raising e = match raises e with State.Raises [] -> false | _ -> true in
   match cond with
@@ -1735,7 +1751,9 @@ and handled ctx ~at ~tail (e : Typedtree.expression) ~cases ~protected ~normal =
               })
         in
         (* The cases, on the exception raised; one no case catches propagates. *)
-        let handled, catch_all = Exceptions.handled (List.map cases ~f:fst) in
+        let handled, catch_all =
+          Exceptions.handled ~key:(Exceptions.key ctx.given.types) (List.map cases ~f:fst)
+        in
         let* otherwise =
           match unhandled reaching ~handled ~catch_all with
           | Raises [] -> State.return []

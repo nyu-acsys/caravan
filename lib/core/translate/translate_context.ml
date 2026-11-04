@@ -1866,11 +1866,21 @@ let occurrence_constructor types occurrence
             ~f:(fun args -> (data, { constructor with args }))
       | _ -> None)
 
+(** The prefix of the name that Caravan gives an exception by its key, in contracts it
+    makes. *)
+let exception_constructor_prefix = "caravan$exception$"
+
 let find_constructor ?occurrence env q =
-  Option.bind (Source.constructor env.ctx.given.env q) ~f:(fun description ->
-      match occurrence with
-      | Some occurrence -> occurrence_constructor env.data occurrence description
-      | None -> Datatypes.find_cstr env.data description)
+  match q with
+  | S.Qid { pid_str; _ }
+    when String.is_prefix pid_str ~prefix:exception_constructor_prefix ->
+      let key = String.chop_prefix_exn pid_str ~prefix:exception_constructor_prefix in
+      Datatypes.find_ctor env.data key
+  | _ ->
+      Option.bind (Source.constructor env.ctx.given.env q) ~f:(fun description ->
+          match occurrence with
+          | Some occurrence -> occurrence_constructor env.data occurrence description
+          | None -> Datatypes.find_cstr env.data description)
 
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)

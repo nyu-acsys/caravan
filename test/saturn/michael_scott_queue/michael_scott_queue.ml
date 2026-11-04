@@ -42,17 +42,44 @@ let push { tail; _ } value =
     end;
   if not (Atomic.compare_and_set tail old_tail new_tail) then fix_tail tail new_tail
 
-let rec pop_opt q backoff =
-  let old_head = Atomic.get q.head in
+exception Empty
+
+type ('a, _) poly =
+  | Option : ('a, 'a option) poly
+  | Value : ('a, 'a) poly
+  | Unit : ('a, unit) poly
+
+let rec pop_as : type a r. a node Atomic.t Atomic.t -> Backoff.t -> (a, r) poly -> r =
+ fun head backoff poly ->
+  let old_head = Atomic.get head in
   match Atomic.get old_head (*@ returning Nil -> commit *) with
-  | Nil -> None
+  | Nil ->
+      begin match poly with Value | Unit -> raise Empty | Option -> None
+      end
   | Next (value, next) ->
-      if Atomic.compare_and_set q.head old_head next then Some value
+      if Atomic.compare_and_set head old_head next then
+        begin match poly with Value -> value | Option -> Some value | Unit -> ()
+        end
       else
         let backoff = Backoff.once backoff in
-        pop_opt q backoff
+        pop_as head backoff poly
+(*@ r = atomic pop_as [q : 'a t] head backoff poly
+    requires is_queue q
+    requires head == q.head
+    atomic requires queue q xs
+    atomic ensures match poly with
+      | Option ->
+          if length xs = 0 then r = None && queue q xs
+          else r === Some xs.(0) && queue q (drop 1 xs)
+      | Value -> length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
+      | Unit -> length xs > 0 && queue q (drop 1 xs)
+    atomic raises Empty ->
+      (match poly with Option -> false | Value -> true | Unit -> true)
+      && length xs = 0 && queue q xs *)
 
-let pop_opt q = pop_opt q Backoff.default
+let pop_exn t = pop_as t.head Backoff.default Value
+let pop_opt t = pop_as t.head Backoff.default Option
+let drop_exn t = pop_as t.head Backoff.default Unit
 
 (* If the head's cell is the last at the first read, the call waits for it to be linked,
    which commits the call with false; it commits with true if the cell is still the last

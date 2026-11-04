@@ -7,7 +7,12 @@ module S = Caravan_spec.Spec_ast
 
 let ( let* ) = Result.( >>= )
 
-type declared = { name : string; args : Types.type_expr list; at : Location.t }
+type declared = {
+  name : string;  (** Its key: its name, qualified by the modules declaring it. *)
+  uid : Shape.Uid.t;
+  args : Types.type_expr list;
+  at : Location.t;
+}
 
 (** The predefined exceptions, without a payload, that programs may raise. *)
 let predefined = [ "Not_found"; "Exit" ]
@@ -43,44 +48,45 @@ let mentioned (structure : Typedtree.structure) =
   iterator.structure iterator structure;
   !found
 
-(** The exceptions that [structure] declares outside functors, in order. *)
+(** The exceptions that [structure] declares outside functors, in order, each named by the
+    modules declaring it. A functor's applications are expanded in [structure], each
+    declaring its own. *)
 let declared (structure : Typedtree.structure) =
-  let rec items in_functor (items : Typedtree.structure_item list) =
+  let rec items path (items : Typedtree.structure_item list) =
     Result.all
       (List.map items ~f:(fun (item : Typedtree.structure_item) ->
            match item.str_desc with
            | Tstr_exception { tyexn_constructor = ext; _ } ->
-               if in_functor then
-                 Report.unsupported item.str_loc "An exception declared in a functor"
-               else
-                 begin match ext.ext_kind with
-                 | Text_decl (_, Cstr_tuple args, None) ->
-                     Ok
-                       [
-                         {
-                           name = ext.ext_name.txt;
-                           args =
-                             List.map args ~f:(fun (ct : Typedtree.core_type) ->
-                                 ct.ctyp_type);
-                           at = ext.ext_loc;
-                         };
-                       ]
-                 | Text_decl _ ->
-                     Report.unsupported ext.ext_loc
-                       "An exception with a record or a GADT payload"
-                 | Text_rebind _ -> Report.unsupported ext.ext_loc "An exception alias"
-                 end
-           | Tstr_module { mb_expr; _ } -> module_expr in_functor mb_expr
+               begin match ext.ext_kind with
+               | Text_decl (_, Cstr_tuple args, None) ->
+                   Ok
+                     [
+                       {
+                         name = String.concat ~sep:"." (path @ [ ext.ext_name.txt ]);
+                         uid = ext.ext_type.ext_uid;
+                         args =
+                           List.map args ~f:(fun (ct : Typedtree.core_type) ->
+                               ct.ctyp_type);
+                         at = ext.ext_loc;
+                       };
+                     ]
+               | Text_decl _ ->
+                   Report.unsupported ext.ext_loc
+                     "An exception with a record or a GADT payload"
+               | Text_rebind _ -> Report.unsupported ext.ext_loc "An exception alias"
+               end
+           | Tstr_module { mb_expr; mb_name; _ } ->
+               module_expr (path @ Option.to_list mb_name.txt) mb_expr
            | _ -> Ok []))
     |> Result.map ~f:List.concat
-  and module_expr in_functor (m : Typedtree.module_expr) =
+  and module_expr path (m : Typedtree.module_expr) =
     match m.mod_desc with
-    | Tmod_structure s -> items in_functor s.str_items
-    | Tmod_functor (_, body) -> module_expr true body
-    | Tmod_constraint (body, _, _, _) -> module_expr in_functor body
-    | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ -> Ok []
+    | Tmod_structure s -> items path s.str_items
+    | Tmod_constraint (body, _, _, _) -> module_expr path body
+    | Tmod_functor _ | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ ->
+        Ok []
   in
-  let* declared = items false structure.str_items in
+  let* declared = items [] structure.str_items in
   match
     List.find_a_dup
       (List.map declared ~f:(fun d -> d.name) @ predefined)
@@ -103,7 +109,7 @@ let datatype (structure : Typedtree.structure) =
   else
     let* declared = declared structure in
     let ctor name args =
-      let raven = String.uncapitalize name in
+      let raven = String.uncapitalize (String.tr ~target:'.' ~replacement:'$' name) in
       {
         Datatypes.ocaml = name;
         raven;
@@ -120,14 +126,26 @@ let datatype (structure : Typedtree.structure) =
            ctors =
              List.map predefined ~f:(fun name -> ctor name [])
              @ List.map declared ~f:(fun d -> ctor d.name d.args);
+           extension_keys = List.map declared ~f:(fun d -> (d.uid, d.name));
            at = Location.none;
          })
 
-(** The exception that raising [e] raises, if [e] names it by its constructor. *)
-let named (e : Typedtree.expression) =
+(** The key of the exception constructor [cstr], with the data types [types]: of its
+    declaration, or its name for a predefined one. *)
+let key types (cstr : Data_types.constructor_description) =
+  match
+    List.find types ~f:(fun d ->
+        List.mem d.Datatypes.paths Predef.path_exn ~equal:Path.same)
+  with
+  | Some exn -> Datatypes.constructor_key exn cstr
+  | None -> cstr.cstr_name
+
+(** The exception that raising [e] raises, by its [key], if [e] names it by its
+    constructor. *)
+let named ~key (e : Typedtree.expression) =
   match e.exp_desc with
   | Texp_construct (_, cstr, _) -> (
-      match cstr.cstr_tag with Cstr_extension _ -> Some cstr.cstr_name | _ -> None)
+      match cstr.cstr_tag with Cstr_extension _ -> Some (key cstr) | _ -> None)
   | _ -> None
 
 (** The argument of [e] if [e] raises it, as [raise e] or [raise_notrace e]. *)
@@ -141,7 +159,7 @@ let raised_argument (e : Typedtree.expression) =
 
 (** The exceptions that handler patterns [patterns] catch whatever their payloads, and
     whether one catches every exception. *)
-let handled (patterns : Typedtree.pattern list) =
+let handled ~key (patterns : Typedtree.pattern list) =
   let rec irrefutable (p : Typedtree.pattern) =
     match p.pat_desc with
     | Tpat_any | Tpat_var _ -> true
@@ -155,7 +173,7 @@ let handled (patterns : Typedtree.pattern list) =
     | Tpat_alias (q, _, _, _, _) -> catches q
     | Tpat_construct (_, cstr, args, _) when List.for_all args ~f:irrefutable -> (
         match cstr.cstr_tag with
-        | Cstr_extension _ -> ([ cstr.cstr_name ], false)
+        | Cstr_extension _ -> ([ key cstr ], false)
         | _ -> ([], false))
     | Tpat_or (a, b, _) ->
         let a, all_a = catches a and b, all_b = catches b in
@@ -195,7 +213,7 @@ let rec matched_constructors (p : Typedtree.pattern) =
 
 (** The raises and calls of [body], outside the local functions it defines; [witness] is
     the function's witness parameter, whose matches record their cases. *)
-let uses ?witness (body : Typedtree.expression) =
+let uses ~key ?witness (body : Typedtree.expression) =
   let rec scan caught loops (e : Typedtree.expression) : uses =
     let sub = scan caught loops in
     match (e.exp_desc, raised_argument e) with
@@ -215,7 +233,7 @@ let uses ?witness (body : Typedtree.expression) =
         ]
     | _, Some argument ->
         let raised =
-          match (named argument, argument.exp_desc) with
+          match (named ~key argument, argument.exp_desc) with
           | Some name, _ -> Raise (Some name, e.exp_loc)
           | None, Texp_ident (Pident id, _, _) -> (
               match List.Assoc.find caught id ~equal:Ident.same with
@@ -228,7 +246,7 @@ let uses ?witness (body : Typedtree.expression) =
     | Texp_try (protected, cases, _), None ->
         let protected = sub protected in
         let handled, catch_all =
-          handled
+          handled ~key
             (List.map cases ~f:(fun (c : Typedtree.value Typedtree.case) -> c.c_lhs))
         in
         let cases =
@@ -253,7 +271,7 @@ let uses ?witness (body : Typedtree.expression) =
           List.filter_map split ~f:(fun ((_, p), rhs) ->
               Option.map p ~f:(fun p -> (p, rhs)))
         in
-        let handled, catch_all = handled (List.map exception_cases ~f:fst) in
+        let handled, catch_all = handled ~key (List.map exception_cases ~f:fst) in
         let cases =
           List.concat_map exception_cases ~f:(fun (p, rhs) ->
               let caught =
@@ -295,16 +313,26 @@ let uses ?witness (body : Typedtree.expression) =
 
 let union = Translate_context.union_raises
 
+(** The key of the exception constructor that [q] names in the OCaml environment [env]. *)
+let resolver types env q = Option.map (Source.constructor env q) ~f:(key types)
+
+(** The key of the exception that the [raises] pattern [p] names, with [resolve] the key
+    of a constructor in the function's scope. *)
+let pattern_key ~resolve (p : Caravan_spec.Spec_ast.pat) =
+  match p.pat_desc with
+  | Pconstr (q, _) ->
+      Some
+        (match resolve q with
+        | Some key -> key
+        | None -> ( match q with Qid id | Qdot (_, id) -> id.pid_str))
+  | _ -> None
+
 (** The exceptions of [contract]'s [raises] and [atomic raises] clauses. *)
-let declared_raises (contract : Caravan_spec.Spec_ast.contract) =
+let declared_raises ~resolve (contract : Caravan_spec.Spec_ast.contract) =
   Translate_context.State_monad.Raises
     (List.filter_map
        (List.map contract.raises ~f:fst @ List.map contract.atomic_raises ~f:fst)
-       ~f:(fun (p : Caravan_spec.Spec_ast.pat) ->
-         match p.pat_desc with
-         | Pconstr (Qid id, _) -> Some id.pid_str
-         | Pconstr (Qdot (_, id), _) -> Some id.pid_str
-         | _ -> None)
+       ~f:(pattern_key ~resolve)
     |> List.dedup_and_sort ~compare:String.compare)
 
 (** The exceptions that [uses] may raise, with [callee] the exceptions of a call; only in
@@ -355,13 +383,15 @@ let intersection left right =
     contract raises what its [raises] clauses say; one without raises what its body raises
     and its calls may raise. Also, per witness constructor, what each function with a
     witness parameter raises when called with it. *)
-let raise_sets procedures ~resolve =
+let raise_sets ~key procedures ~resolve =
   let module S = Translate_context.State_monad in
   let bodies =
-    List.map procedures ~f:(fun (name, contract, body, witness) ->
+    List.map procedures ~f:(fun (name, contract, body, witness, resolve) ->
         ( name,
-          (contract : Caravan_spec.Spec_ast.contract option),
-          uses ?witness:(Option.map witness ~f:fst) body,
+          Option.map
+            (contract : Caravan_spec.Spec_ast.contract option)
+            ~f:(declared_raises ~resolve),
+          uses ~key ?witness:(Option.map witness ~f:fst) body,
           Option.map witness ~f:snd ))
   in
   let same left right =
@@ -391,13 +421,13 @@ let raise_sets procedures ~resolve =
     in
     let declared_or contract inferred =
       match contract with
-      | Some contract -> intersection (declared_raises contract) (Lazy.force inferred)
+      | Some declared -> intersection declared (Lazy.force inferred)
       | None -> Lazy.force inferred
     in
     let next_sets =
       List.map bodies ~f:(fun (name, contract, uses, _) ->
           match contract with
-          | Some contract -> (name, declared_raises contract)
+          | Some declared -> (name, declared)
           | None -> (name, raised ~callee:(callee name) uses))
     in
     let next_by_constructor =
@@ -418,10 +448,7 @@ let raise_sets procedures ~resolve =
   in
   let initial =
     ( List.map bodies ~f:(fun (name, contract, _, _) ->
-          ( name,
-            match contract with
-            | Some contract -> declared_raises contract
-            | None -> S.Raises [] )),
+          (name, match contract with Some declared -> declared | None -> S.Raises [])),
       List.filter_map bodies ~f:(fun (name, _, _, constructors) ->
           Option.map constructors ~f:(fun constructors ->
               (name, List.map constructors ~f:(fun c -> (c, S.Raises []))))) )
@@ -437,6 +464,10 @@ let pattern ~at desc = { S.pat_desc = desc; pat_loc = at }
 
 let constructor_pattern ~at name argument =
   pattern ~at (Pconstr (Qid (S.mk_id ~loc:at name), argument))
+
+(** A pattern of the exception with the key [key], whatever the scope. *)
+let exception_pattern ~at key argument =
+  constructor_pattern ~at (Translate_context.exception_constructor_prefix ^ key) argument
 
 (** The postcondition [t] of a function that may raise, holding when it returns. *)
 let on_return (t : S.term) =
@@ -474,7 +505,7 @@ let raises_postconditions ?(only = true) types ~at clauses set =
                  | Some (_, { fields = _ :: _; _ }) -> Some (pattern ~at Pwild)
                  | _ -> None
                in
-               constructor_pattern ~at name argument))
+               exception_pattern ~at name argument))
     | [], Translate_context.State_monad.Raises_any -> None
   in
   let only_raised =

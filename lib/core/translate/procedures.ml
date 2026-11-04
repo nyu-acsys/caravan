@@ -926,10 +926,11 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
           | Raised (e, Some raised) ->
               let clauses =
                 List.filter raised_posts ~f:(fun ((p : S.pat), _) ->
-                    match p.pat_desc with
-                    | Pconstr ((Qid id | Qdot (_, id)), _) ->
-                        String.equal id.pid_str raised
-                    | _ -> false)
+                    Option.equal String.equal
+                      (Exceptions.pattern_key
+                         ~resolve:(Exceptions.resolver ctx.given.types ctx.given.env)
+                         p)
+                      (Some raised))
               in
               let fields =
                 Option.value_map (Datatypes.find_ctor ctx.given.types raised) ~default:[]
@@ -1567,7 +1568,12 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
         let witness_name =
           let header =
             Option.bind f.contract ~f:(fun c ->
-                Option.bind c.header ~f:(fun h -> List.nth h.hd_args position))
+                Option.bind c.header ~f:(fun h ->
+                    List.nth
+                      (List.filter h.hd_args ~f:(function
+                        | S.Lghost _ -> false
+                        | _ -> true))
+                      position))
           in
           match
             (header, Option.map (List.nth f.params position) ~f:(fun p -> p.fp_kind))

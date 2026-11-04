@@ -1721,13 +1721,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     | _ -> None
   in
   let raising, by_constructor =
-    Exceptions.raise_sets
+    Exceptions.raise_sets ~key:(Exceptions.key decls.types)
       (List.map translated ~f:(fun (name, f, _) ->
            ( name,
              f.contract,
              f.body,
              Option.map (witness_parameter f) ~f:(fun (_, id, constructors) ->
-                 (id, constructors)) )))
+                 (id, constructors)),
+             Exceptions.resolver decls.types f.environment )))
       ~resolve
   in
   (* By the names calls use, and by the procedures' own, as a worker's. *)
