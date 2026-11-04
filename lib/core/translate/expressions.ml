@@ -256,6 +256,23 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
               target)
       in
       (R.Stmt.local ~loc:l ~const:false ~typ (ident ~loc:l x) @ stmts, value)
+  | Texp_match ({ exp_desc = Texp_ident (Pident id, _, _); _ }, cases, [], _)
+    when Option.is_some
+           (specialized_case ctx ~scrutinee:(Ident.name id) cases
+              ~constructors:(fun (c : Typedtree.computation Typedtree.case) ->
+                match Typedtree.split_pattern c.c_lhs with
+                | Some p, None -> Exceptions.matched_constructors p
+                | _ -> Some [])) ->
+      (* In a copy for a witness's constructor, a match on the witness is its case. *)
+      let case =
+        Option.value_exn
+          (specialized_case ctx ~scrutinee:(Ident.name id) cases
+             ~constructors:(fun (c : Typedtree.computation Typedtree.case) ->
+               match Typedtree.split_pattern c.c_lhs with
+               | Some p, None -> Exceptions.matched_constructors p
+               | _ -> Some []))
+      in
+      expr ~tail ctx case.c_rhs
   | Texp_match (scrutinee, cases, [], partial) ->
       let* read = is_read_value scrutinee in
       let* scrutinee_stmts, v = expr ctx scrutinee in
@@ -287,7 +304,8 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* state = au_state in
       let commits =
         match state with
-        | Some (On_read c) when read -> Some (case_commits c (List.map cases ~f:fst))
+        | Some (On_read c | Collecting c) when read ->
+            Some (case_commits c (List.map cases ~f:fst))
         | _ -> None
       in
       let+ stmts =
@@ -846,6 +864,30 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
             (stmts @ [ overflow ], v))
     | None, None, _ -> (
         let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
+        (* A function copied per witness constructor is called as the copy for the
+           constructor passed. *)
+        let* path, declaration =
+          match
+            List.find ctx.given.specialized_calls ~f:(fun (paths, _, _) ->
+                List.mem paths path ~equal:Path.same)
+          with
+          | None -> State.return (path, declaration)
+          | Some (_, position, copies) -> (
+              let copy =
+                match Option.map (List.nth args position) ~f:(fun a -> a.exp_desc) with
+                | Some (Texp_construct (_, cstr, [])) ->
+                    List.find copies ~f:(fun (c, _, _) -> String.equal c cstr.cstr_name)
+                | _ -> None
+              in
+              match copy with
+              | Some (_, id, scheme) ->
+                  State.return (Path.Pident id, { declaration with val_type = scheme })
+              | None ->
+                  State.of_result
+                    (unsupported at
+                       "A call of a function whose calls wait to be helped, with a \
+                        witness other than a constructor"))
+        in
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f when List.mem ctx.given.raising_library_calls f ~equal:String.equal ->
             State.of_result (unsupported at "A call of a library function that may raise")

@@ -365,7 +365,10 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let var x = R.Expr.var ~loc:l (R.Name.make ~loc:l x) in
       let state_env =
         bind env state
-          (State (List.map st.fields ~f:(fun (f, raven, _, t, _) -> (f, (var raven, t)))))
+          (State
+             (List.map st.fields ~f:(fun (f, raven, _, t, _) -> (f, (var raven, t)))
+             @ List.map st.pendings ~f:(fun p ->
+                 (p.pending_field ^ "#on", (var p.pending_on, p.key_type)))))
       in
       let length s =
         R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Seq" ] "length") [ s ]
@@ -488,6 +491,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                    (generated_ident ~loc:l part.part_pred)
                    (Some e)) )
       in
+      let source_body = body in
       let* body =
         State.all
           (List.mapi (conjuncts body) ~f:(fun n t -> (n, t)))
@@ -527,17 +531,79 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                                    Ctype.is_equal state_env.ctx.given.env false
                                      [ element ] [ p.key_type ]))
                           in
-                          Option.some_if equal (chain, entries)
+                          Option.some_if equal (field, chain, entries)
                       | _ -> State.return None
                       end
                   | None -> State.return None)
             in
-            let+ helped_key =
+            let* helped_key =
               formula
                 (bind state_env helping_state
                    (Option.value_exn
                       (List.Assoc.find state_env.vars state ~equal:String.equal)))
                 helping_key
+            in
+            let linked = bin Neq key helped_key in
+            (* A carried result is, once linked, the one for the contents the invariant
+               states for the key, at its position. *)
+            let _, _, helped_result = p.helping in
+            let+ carried =
+              match helped_result.contents with
+              | None -> State.return []
+              | Some _ ->
+                  let stated =
+                    List.find_map (List.filter_opt membership_chains)
+                      ~f:(fun (field, chain, _) ->
+                        List.find_map (conjuncts source_body) ~f:(fun t ->
+                            match chain_of ~state t with
+                            | Some (i, _, f, value) when String.equal f field ->
+                                Some (i, R.Expr.index ~loc:l (var chain) key, value)
+                            | _ -> None))
+                  in
+                  begin match stated with
+                  | None ->
+                      State.of_result
+                        (unsupported at
+                           "Helping with the contents of a key whose contents the \
+                            invariant does not state")
+                  | Some (i, position, value) ->
+                      let stated_env =
+                        {
+                          (bind state_env i.S.pid_str (Value position)) with
+                          var_types = (i.pid_str, Predef.type_int) :: state_env.var_types;
+                        }
+                      in
+                      let* contents = formula stated_env value in
+                      let env =
+                        {
+                          state_env with
+                          ctx =
+                            {
+                              state_env.ctx with
+                              given =
+                                {
+                                  state_env.ctx.given with
+                                  specialized_witness = p.specialized;
+                                };
+                            };
+                        }
+                      in
+                      let+ result, _ =
+                        helped_value ~stated:(stated_env, value) env ~at
+                          ~key_type:p.key_type helped_result contents
+                      in
+                      [
+                        R.Expr.ite ~loc:l linked
+                          (R.Expr.own ~loc:l
+                             [
+                               R.Expr.field ~loc:l hc
+                                 (qualified_name ~loc:l (pending_name st p "result"));
+                               result;
+                               R.Expr.real ~loc:l 0.5;
+                             ])
+                          (R.Expr.bool ~loc:l true);
+                      ]
+                  end
             in
             let pending_field f =
               R.Expr.field ~loc:l hc (qualified_name ~loc:l (pending_name st p f))
@@ -547,7 +613,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             in
             (* A key that is an entry of a field owned by index is at its position. *)
             let membership =
-              List.map (List.filter_opt membership_chains) ~f:(fun (chain, entries) ->
+              List.map (List.filter_opt membership_chains) ~f:(fun (_, chain, entries) ->
                   let index = R.Expr.index ~loc:l (var chain) key in
                   List.reduce_exn ~f:(bin And)
                     [
@@ -567,7 +633,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                  (bin Impl (bin In hc registrations)
                     (List.reduce_exn ~f:(bin And)
                        ((half "watched" key :: membership)
-                       @ [ half "linked" (bin Neq key helped_key); registered ])))))
+                       @ [ half "linked" linked ]
+                       @ carried @ [ registered ])))))
       in
       let body, parts = List.unzip (body @ waiting) in
       let body = List.reduce_exn body ~f:(bin And) in
@@ -961,7 +1028,7 @@ let logical_contract = function
   | Some (c : S.contract) ->
       c.atomic || not (List.is_empty (c.atomic_requires @ c.atomic_ensures))
 
-let generic_modules (source : Source.t) ~types ~functions inventory =
+let generic_modules ?(copies = []) (source : Source.t) ~types ~functions inventory =
   let types =
     List.concat_map source.proof_resources ~f:(fun resource ->
         List.concat_map (resource :: Option.to_list resource.Source.resource_public)
@@ -980,13 +1047,22 @@ let generic_modules (source : Source.t) ~types ~functions inventory =
               in
               (name, Option.value_map body ~default:id ~f:(fun function_ -> function_.id)))
         in
-        if
-          List.equal
-            (fun (left, left_id) (right, right_id) ->
+        (* A function copied per witness constructor is its copies. *)
+        let body_members =
+          List.concat_map specialization.body_members ~f:(fun (name, id) ->
+              match List.Assoc.find copies id ~equal:Ident.same with
+              | Some copied -> List.map copied ~f:(fun copy -> (Ident.name copy, copy))
+              | None -> [ (name, id) ])
+        in
+        let same =
+          List.equal (fun (left, left_id) (right, right_id) ->
               String.equal left right && Ident.same left_id right_id)
-            members specialization.members
+        in
+        if
+          same members specialization.members
+          && same body_members specialization.body_members
         then specialization
-        else { specialization with members })
+        else { specialization with members; body_members })
   in
   let groups =
     Generic_modules.plan ~proof_layout:(Generic_proofs.has_models source) specializations

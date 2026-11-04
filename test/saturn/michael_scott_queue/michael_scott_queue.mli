@@ -30,6 +30,19 @@ val pop_exn : 'a t -> 'a
     atomic ensures length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
     atomic raises Empty -> length xs = 0 && queue q xs *)
 
+val peek_opt : 'a t -> 'a option
+(*@ r = atomic peek_opt q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures queue q xs && if length xs = 0 then r = None else r === Some xs.(0) *)
+
+val peek_exn : 'a t -> 'a
+(*@ r = atomic peek_exn q
+    requires is_queue q
+    atomic requires queue q xs
+    atomic ensures queue q xs && length xs > 0 && r === xs.(0)
+    atomic raises Empty -> length xs = 0 && queue q xs *)
+
 val drop_exn : 'a t -> unit
 (*@ atomic drop_exn q
     requires is_queue q

@@ -61,11 +61,31 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
         let instantiated = map_atomic_types signature ~f:substitute in
         Ok ({ instantiated with au_generic = None }, Some (generic, arguments))
 
+(** The constructors that the contract pattern [p] matches, [None] if any. *)
+let spec_constructors (p : S.pat) =
+  match p.pat_desc with
+  | Pconstr ((Qid id | Qdot (_, id)), _) -> Some [ id.pid_str ]
+  | Pwild | Pid _ -> None
+  | _ -> Some []
+
+(** The case of the match [t] on the witness of a copy for a witness's constructor, for
+    that constructor, if [t] is one. *)
+let specialized_body ctx (t : S.term) =
+  match t.term_desc with
+  | Tmatch ({ term_desc = Tvar (Qid { pid_str = scrutinee; _ }); _ }, cases) ->
+      Option.map
+        (specialized_case ctx ~scrutinee cases ~constructors:(fun (p, _) ->
+             spec_constructors p))
+        ~f:snd
+  | _ -> None
+
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
     concatenation. *)
 let rec term_type env (t : S.term) =
   match (t.term_desc, spine (S.chain t) []) with
   | Tcast (_, ty), _ -> Result.ok (source_type env.ctx.given ~at:t.term_loc ty)
+  | Tmatch _, _ when Option.is_some (specialized_body env.ctx t) ->
+      term_type env (Option.value_exn (specialized_body env.ctx t))
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
   | ( _,
@@ -633,6 +653,31 @@ let instantiate_ghost_field env ~at ?expected field owner =
       let backend = (Qualified_name.of_string field.field_backend).name in
       { field with field_backend = target ^ "." ^ backend; field_parameters = [] }
 
+(** The state [s] and its field [f], with the key, if [t] is [waiting s.f key]. *)
+let waiting_application (t : S.term) =
+  match spine (S.chain t) [] with
+  | ( { term_desc = Tvar (Qid { pid_str = "waiting"; _ }); _ },
+      [ { term_desc = Tfield ({ term_desc = Tvar (Qid s); _ }, Qid field); _ }; key ] ) ->
+      Some (s.pid_str, field.pid_str, key)
+  | _ -> None
+
+(** The registrations of the pending field [field] of the state bound to [s] in [env], or
+    of its copies, with the maps of their keys, its entries [f#on]. *)
+let pending_registrations env ~at s field =
+  match state_fields env s with
+  | None -> error at "waiting takes a field of the state, as s.waiting"
+  | Some fields -> (
+      match
+        List.filter_map fields ~f:(fun (name, (registrations, _)) ->
+            if String.equal name field || String.is_prefix name ~prefix:(field ^ "$") then
+              Option.map
+                (List.Assoc.find fields (name ^ "#on") ~equal:String.equal)
+                ~f:(fun (on, _) -> (registrations, on))
+            else None)
+      with
+      | [] -> error at "waiting takes a field of pending calls of the state, as s.waiting"
+      | pendings -> Ok pendings)
+
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   let* () =
@@ -713,6 +758,40 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let* a = formula env a in
       let+ b = formula env b in
       R.Expr.ite ~loc:l c a b
+  | Tquant (Tforall, [ (c, Some key_type) ], body)
+    when match spine (S.chain body) [] with
+         | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ w; _ ] -> (
+             match waiting_application w with
+             | Some (_, _, { term_desc = Tvar (Qid k); _ }) ->
+                 String.equal k.pid_str c.pid_str
+             | _ -> false)
+         | _ -> false ->
+      (* Over the keys calls wait on: over the registrations, each at its key. *)
+      let w, rest =
+        match spine (S.chain body) [] with
+        | _, [ w; rest ] -> (w, rest)
+        | _ -> assert false
+      in
+      let s, field, _ = Option.value_exn (waiting_application w) in
+      let* pendings = State.of_result (pending_registrations env ~at s field) in
+      let* key_type =
+        State.of_result (source_type env.ctx.given ~at:c.pid_loc key_type)
+      in
+      let hc = R.Expr.var ~loc:l (name ~loc:l "hc") in
+      let+ each =
+        State.all pendings ~f:(fun (registrations, on) ->
+            let env =
+              {
+                (bind env c.pid_str (Value (R.Expr.index ~loc:l on hc))) with
+                var_types = (c.pid_str, key_type) :: env.var_types;
+              }
+            in
+            let+ rest = formula env rest in
+            R.Expr.forall ~loc:l
+              [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+              (R.Expr.binary ~loc:l Impl (R.Expr.binary ~loc:l In hc registrations) rest))
+      in
+      List.reduce_exn each ~f:(R.Expr.binary ~loc:l And)
   | Tquant (q, binders, body) ->
       let variable ~at x t =
         let* ty = State.typ env.ctx ~at t in
@@ -836,6 +915,39 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let+ ts = State.all ts ~f:(formula env) in
       R.Expr.tuple ~loc:l ts
   | Trecord (base, updates) -> record env t base updates
+  | Tmatch ({ term_desc = Tvar (Qid { pid_str = scrutinee; _ }); _ }, cases)
+    when Option.is_some
+           (specialized_case env.ctx ~scrutinee cases ~constructors:(fun (p, _) ->
+                spec_constructors p)) ->
+      (* In a copy for a witness's constructor, a match on the witness is its case, in
+         which the types it selects are the constructor's. *)
+      let _, body =
+        Option.value_exn
+          (specialized_case env.ctx ~scrutinee cases ~constructors:(fun (p, _) ->
+               spec_constructors p))
+      in
+      let aliases =
+        match
+          ( env.ctx.given.specialized_witness,
+            Option.bind
+              (List.Assoc.find env.var_types scrutinee ~equal:String.equal)
+              ~f:(Witnesses.witness_type env.data) )
+        with
+        | Some (_, ctor), Some (_, witness, arguments) ->
+            fst (Witnesses.refinement witness arguments (String.uncapitalize ctor))
+        | _ -> []
+      in
+      formula
+        {
+          env with
+          data = aliases @ env.data;
+          ctx =
+            {
+              env.ctx with
+              given = { env.ctx.given with types = aliases @ env.ctx.given.types };
+            };
+        }
+        body
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
       let* scrutinee_type =
@@ -1184,6 +1296,21 @@ and application env (t : S.term) =
   | Tvar (Qid { pid_str = "not"; _ }), [ a ] ->
       let+ a = formula env a in
       R.Expr.not_ ~loc:l a
+  | Tvar (Qid { pid_str = "waiting"; _ }), _ when Option.is_some (waiting_application t)
+    ->
+      (* Some call of the pending field, or of its copies, waits on the key. *)
+      let s, field, key = Option.value_exn (waiting_application t) in
+      let* pendings = State.of_result (pending_registrations env ~at s field) in
+      let* key = formula env key in
+      let hc = R.Expr.var ~loc:l (name ~loc:l "hc") in
+      State.return
+        (List.reduce_exn ~f:(R.Expr.binary ~loc:l Or)
+           (List.map pendings ~f:(fun (registrations, on) ->
+                R.Expr.exists ~loc:l
+                  [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+                  (R.Expr.binary ~loc:l And
+                     (R.Expr.binary ~loc:l In hc registrations)
+                     (R.Expr.binary ~loc:l Eq (R.Expr.index ~loc:l on hc) key)))))
   | Tvar (Qid { pid_str = "own"; _ }), ([ location; v ] | [ location; v; _ ]) ->
       let* expected =
         match ghost_projection env location with

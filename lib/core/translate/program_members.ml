@@ -1173,18 +1173,27 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           (Generic_proofs.source_projection plan)
                           helped.scheme_type
                   in
+                  (* For a copy for a witness's constructor, results matching on the
+                     witness select its case. *)
+                  let specialize (ctx : context) =
+                    {
+                      ctx with
+                      given = { ctx.given with specialized_witness = p.specialized };
+                    }
+                  in
                   State.in_procedure
                     (pending_members
-                       (spec_context types
-                          ~shared:(shared_for_proof st.invariant)
-                          ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
-                          ~primitive_namespace:
-                            (Option.value_map st.generic
-                               ~default:(declaration_context st.invariant).namespace
-                               ~f:(fun worker -> String.split worker.name ~on:'.'))
-                          ~polymorphic_functions:
-                            (polymorphic_registry (owner_destination st.invariant))
-                          ~generic_predicates ())
+                       (specialize
+                       @@ spec_context types
+                            ~shared:(shared_for_proof st.invariant)
+                            ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
+                            ~primitive_namespace:
+                              (Option.value_map st.generic
+                                 ~default:(declaration_context st.invariant).namespace
+                                 ~f:(fun worker -> String.split worker.name ~on:'.'))
+                            ~polymorphic_functions:
+                              (polymorphic_registry (owner_destination st.invariant))
+                            ~generic_predicates ())
                        st p helped ~helped_declaration
                        ~helped_proc:
                          (match owner_destination st.invariant with
@@ -1704,21 +1713,27 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   (* The witness parameter of a function over a witness, with its position and the
      witness's constructors. *)
-  let witness_parameter f =
+  let witness_parameter (f : Procedures.func) =
     let ( let* ) value f = Option.bind value ~f in
-    let* worker = Program_declarations.enclosing_worker polymorphic_functions f in
-    let* witness = worker.witness in
-    let* () = Option.some_if (Ident.same worker.id f.id) () in
-    let* param = List.nth f.params witness.parameter in
-    match param.fp_kind with
-    | Tparam_pat ({ pat_desc = Tpat_var (id, _, _); _ } as pattern) ->
-        let data, _, _, _, _, _ = body_context f in
-        Option.map (Witnesses.witness_type data pattern.pat_type)
-          ~f:(fun (witness_data, _, _) ->
-            ( witness.parameter,
-              id,
-              List.map witness_data.Datatypes.ctors ~f:(fun c -> c.Datatypes.ocaml) ))
-    | _ -> None
+    match f.copy_for with
+    | Some copy ->
+        (* A copy is over its constructor only. *)
+        let* position, _, _, _ = Specializations.witness_parameter decls.types f in
+        Some (position, copy.witness, [ copy.constructor ])
+    | None -> (
+        let* worker = Program_declarations.enclosing_worker polymorphic_functions f in
+        let* witness = worker.witness in
+        let* () = Option.some_if (Ident.same worker.id f.id) () in
+        let* param = List.nth f.params witness.parameter in
+        match param.fp_kind with
+        | Tparam_pat ({ pat_desc = Tpat_var (id, _, _); _ } as pattern) ->
+            let data, _, _, _, _, _ = body_context f in
+            Option.map (Witnesses.witness_type data pattern.pat_type)
+              ~f:(fun (witness_data, _, _) ->
+                ( witness.parameter,
+                  id,
+                  List.map witness_data.Datatypes.ctors ~f:(fun c -> c.Datatypes.ocaml) ))
+        | _ -> None)
   in
   let raising, by_constructor =
     Exceptions.raise_sets ~key:(Exceptions.key decls.types)
@@ -1738,7 +1753,30 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         Option.map (List.Assoc.find sets name ~equal:String.equal) ~f:(fun set ->
             (body_proc_name f, set)))
   in
+  (* A copy raises what it does for its constructor. *)
+  let raising =
+    List.map raising ~f:(fun (name, set) ->
+        match
+          List.find_map translated ~f:(fun (n, (f : Procedures.func), _) ->
+              Option.some_if (String.equal n name) f.copy_for)
+        with
+        | Some (Some copy) ->
+            ( name,
+              Option.value ~default:set
+                (Option.bind (List.Assoc.find by_constructor name ~equal:String.equal)
+                   ~f:(fun sets ->
+                     List.Assoc.find sets copy.constructor ~equal:String.equal)) )
+        | _ -> (name, set))
+  in
   let raising = by_own_names raising in
+  (* The calls of functions copied per witness constructor, which call the copies. *)
+  let specialized_calls =
+    List.map scopes.specialized ~f:(fun (s : Specializations.t) ->
+        ( Path.Pident s.original.id :: s.original.paths,
+          s.position,
+          List.map s.copies ~f:(fun copy -> (copy.constructor, copy.copy_id, copy.scheme))
+        ))
+  in
   (* A functor body its applications share raises, called through each application, what
      it raises through the representative's, with the exceptions it declares the
      application's own. *)
@@ -1844,6 +1882,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   libraries = library_paths libraries;
                   raising_library_calls = raising_library_calls libraries;
                   shared_exceptions = shared_exceptions_of f;
+                  specialized_witness =
+                    Option.bind f.copy_for ~f:(fun copy ->
+                        Option.map (Specializations.witness_parameter decls.types f)
+                          ~f:(fun (_, id, _, _) -> (id, copy.constructor)));
+                  specialized_calls;
                   annotations;
                   proof_lemmas =
                     (let context = body_module_context f in

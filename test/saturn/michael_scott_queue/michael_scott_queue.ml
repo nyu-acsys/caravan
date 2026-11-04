@@ -81,6 +81,42 @@ let pop_exn t = pop_as t.head Backoff.default Value
 let pop_opt t = pop_as t.head Backoff.default Option
 let drop_exn t = pop_as t.head Backoff.default Unit
 
+(* As is_empty: if the head's cell is the last at the first read, the call waits for it to
+   be linked, which commits the call with the linked value. *)
+let peek_as : type a r. a node Atomic.t Atomic.t -> (a, r) poly -> r =
+ fun head poly ->
+  let old_head =
+    Atomic.get head
+    (*@ returning c ->
+        if c != s.cells.(length s.values) then
+          commit
+            (match poly with
+            | Option -> Some s.values.(s.head)
+            | Value -> s.values.(s.head)
+            | Unit -> ())
+        else wait in s.peeking on c *)
+  in
+  match Atomic.get old_head (*@ returning Nil -> commit *) with
+  | Nil ->
+      begin match poly with Value | Unit -> raise Empty | Option -> None
+      end
+  | Next (value, _) -> (
+      match poly with Value -> value | Option -> Some value | Unit -> ())
+(*@ r = atomic peek_as [q : 'a t] head poly
+    requires is_queue q
+    requires head == q.head
+    atomic requires queue q xs
+    atomic ensures queue q xs && match poly with
+      | Option -> if length xs = 0 then r === None else r === Some xs.(0)
+      | Value -> length xs > 0 && r === xs.(0)
+      | Unit -> length xs > 0
+    atomic raises Empty ->
+      (match poly with Option -> false | Value -> true | Unit -> true)
+      && length xs = 0 && queue q xs *)
+
+let peek_opt t = peek_as t.head Option
+let peek_exn t = peek_as t.head Value
+
 (* If the head's cell is the last at the first read, the call waits for it to be linked,
    which commits the call with false; it commits with true if the cell is still the last
    at the second read. *)

@@ -62,11 +62,12 @@ let declaration_references = function
         view_value
   | Proof_action { action_update; action_consumes; action_helps; _ } ->
       let terms = List.map action_update ~f:snd @ Option.to_list action_consumes in
-      let terms =
-        terms
-        @ Option.value_map action_helps ~default:[] ~f:(fun (a, b, c) -> [ a; b; c ])
-      in
+      let terms = terms @ List.concat_map action_helps ~f:(fun (a, b, _) -> [ a; b ]) in
       List.concat_map terms ~f:(Translate_context.term_references [])
+      @ List.concat_map action_helps ~f:(fun (_, _, { contents; result }) ->
+          Translate_context.term_references
+            (Option.value_map contents ~default:[] ~f:Translate_context.pat_names)
+            result)
   | Proof_module _ | Proof_definition _ | Proof_type _ | Proof_resource _ | Proof_au _
   | Proof_field _ | Proof_state _ ->
       []

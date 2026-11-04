@@ -246,6 +246,14 @@ let enclosing_worker polymorphic_functions (f : func) =
               Ident.same worker.Polymorphic_functions.id id))
 
 let function_types polymorphic_functions f types =
+  (* A copy for a witness's constructor has the types it selects as its index types. *)
+  let types =
+    match f.copy_for with
+    | None -> types
+    | Some copy ->
+        List.map copy.newtypes ~f:(fun (id, body) -> Datatypes.local_alias id body)
+        @ types
+  in
   match enclosing_worker polymorphic_functions f with
   | None -> types
   | Some worker ->
@@ -866,6 +874,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             in
             let source_binding =
               Option.is_some f.lexical_owner
+              || Option.is_some f.copy_for
               || List.exists inventory.values ~f:(fun entry ->
                   match entry.Module_inventory.binding.vb_pat.pat_desc with
                   | Tpat_var (id, _, _) -> Ident.same id f.id
@@ -910,7 +919,10 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                   "An explicitly polymorphic annotation without locally abstract types"
             in
             let* witness =
-              Witnesses.parameter types ~at:f.loc ~variables:scheme.variables f.params
+              match f.copy_for with
+              | Some _ -> Ok None
+              | None ->
+                  Witnesses.parameter types ~at:f.loc ~variables:scheme.variables f.params
             in
             Ok
               (Some

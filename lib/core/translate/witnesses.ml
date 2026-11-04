@@ -379,3 +379,13 @@ let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~resul
                  ( aliases @ types,
                    Option.map2 result_index own ~f:(fun position own ->
                        own ^ "." ^ conversion ctor position) )))
+
+(** [t] with the locally abstract types [newtypes] binds replaced by their types. *)
+let rec substitute_newtypes newtypes t =
+  match Types.get_desc t with
+  | Tconstr (Pident id, [], _) when List.Assoc.mem newtypes id ~equal:Ident.same ->
+      List.Assoc.find_exn newtypes id ~equal:Ident.same
+  | Tconstr _ | Ttuple _ | Tarrow _ | Tpoly _ ->
+      Btype.newgenty
+        (Btype.copy_type_desc (substitute_newtypes newtypes) (Types.get_desc t))
+  | _ -> t

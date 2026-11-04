@@ -189,6 +189,7 @@ let items source (inventory : Module_inventory.t) =
                  prefix_count = 0;
                  captured = [];
                  role = None;
+                 copy_for = None;
                  manual =
                    manual_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
                      ~next:site.next;
@@ -457,6 +458,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           trusted =
             trusted_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
           role = Option.map continues ~f:(fun _ -> outer.id);
+          copy_for = None;
         })
 
 (** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
@@ -1102,14 +1104,6 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
         (x, t, decl x typ))
   in
   let args = List.map params ~f:(fun (x, _, _) -> var x) in
-  let* () =
-    if List.length helped.params = List.length params then State.return ()
-    else
-      State.of_result
-        (unsupported helped.loc
-           "Helping a function whose parameters are not those of the structure's \
-            invariant")
-  in
   let* result_name, arg_names =
     State.of_result
       (contract_names helped
@@ -1126,23 +1120,138 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       vars = List.map params ~f:(fun (x, _, _) -> (x, Raven x));
     }
   in
-  let _, _, result_term = p.helping in
-  let* result_type =
-    match term_type env result_term with
-    | Some typ -> State.return typ
-    | None -> State.of_result (error at "Cannot infer the helped result's type")
+  (* The arguments of the helped calls' updates, by the helped function's parameters, as
+     the structure's: those parameters themselves, or for a function taking the
+     structure as a ghost parameter, its field that a precondition makes a parameter,
+     and a copy's witness, its constructor. *)
+  let same_parameters = List.length helped.params = List.length params in
+  let* helped_args =
+    if same_parameters then
+      State.return
+        (List.map2_exn arg_names params ~f:(fun name (x, t, _) -> (name, var x, t)))
+    else
+      let structure = match params with [ (x, _, _) ] -> Some x | _ -> None in
+      let ghosts = List.map (ghost_params helped) ~f:(fun (id, _) -> id.S.pid_str) in
+      let requires =
+        Option.value_map helped.contract ~default:[] ~f:(fun c -> c.requires)
+      in
+      let field_of name =
+        List.find_map requires ~f:(fun t ->
+            match spine (S.chain t) [] with
+            | ( { term_desc = Tvar (Qid { pid_str = "=="; _ }); _ },
+                [
+                  { term_desc = Tvar (Qid { pid_str = x; _ }); _ };
+                  ({ term_desc = Tfield ({ term_desc = Tvar (Qid g); _ }, _); _ } as field);
+                ] )
+              when String.equal x name && List.mem ghosts g.pid_str ~equal:String.equal ->
+                Some (g.pid_str, field)
+            | _ -> None)
+      in
+      let* regular =
+        State.all (List.zip_exn arg_names helped.params) ~f:(fun (name, param) ->
+            let pattern_type =
+              match param.Typedtree.fp_kind with
+              | Tparam_pat p | Tparam_optional_default (p, _) -> Some p.pat_type
+            in
+            match (name, pattern_type, helped.copy_for, structure) with
+            | Some name, Some t, Some copy, _
+              when String.equal name (Ident.name copy.witness) ->
+                begin match Witnesses.witness_type ctx.given.types t with
+                | Some (data, _, _) ->
+                    let c =
+                      List.find_exn data.ctors ~f:(fun c ->
+                          String.equal c.Datatypes.ocaml copy.constructor)
+                    in
+                    State.return
+                      ( Some name,
+                        R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data c) [],
+                        Witnesses.substitute_newtypes copy.newtypes t )
+                | None -> State.of_result (error at "A copy's witness of no witness type")
+                end
+            | Some name, Some _, _, Some structure ->
+                begin match field_of name with
+                | Some (ghost, field) ->
+                    let env = bind env ghost (Raven structure) in
+                    let env =
+                      {
+                        env with
+                        var_types = (ghost, List.hd_exn st.params |> snd) :: env.var_types;
+                      }
+                    in
+                    let* value = formula env field in
+                    let+ t =
+                      State.of_result
+                        (Report.expect ~at "The type of a helped call's argument"
+                           (term_type env field))
+                    in
+                    (Some name, value, t)
+                | None ->
+                    State.of_result
+                      (unsupported helped.loc
+                         "Helping a function with a parameter that is neither the \
+                          structure nor its field")
+                end
+            | _ ->
+                State.of_result
+                  (unsupported helped.loc
+                     "Helping a function whose parameters are not those of the \
+                      structure's invariant"))
+      in
+      let ghost =
+        List.map ghosts ~f:(fun name ->
+            (Some name, var (Option.value_exn structure), List.hd_exn st.params |> snd))
+      in
+      State.return (regular @ ghost)
   in
-  let occurrence =
-    List.fold_right st.params ~init:result_type ~f:(fun (_, argument) result ->
-        Btype.newgenty
-          (Tarrow (Nolabel, Btype.newgenty (Tpoly (argument, [])), result, Types.commu_ok)))
+  (* The update's arguments, and the results it commits with: the result, and for a
+     function that may raise, no exception. *)
+  let tuple = function [ e ] -> e | es -> R.Expr.tuple ~loc:l es in
+  let au_args = [ tuple (List.map helped_args ~f:(fun (_, value, _) -> value)) ] in
+  let* outcome_typ = State.typ ctx ~at outcome_type in
+  let returned v =
+    if Option.exists helped.contract ~f:raising_contract then
+      tuple [ v; no_exception ~loc:l outcome_typ ]
+    else v
   in
+  let _, _, helped_result = p.helping in
+  (* A result that depends on the key's contents after the helping action is stored in
+     the registration, as the invariant relates it to them. *)
+  let carried = Option.is_some helped_result.contents in
+  let* contents_typ =
+    let* contents = State.of_result (key_contents ctx.given.types ~at p.key_type) in
+    State.typ ctx ~at contents
+  in
+  let* result, result_type =
+    helped_value env ~at ~key_type:p.key_type helped_result (var "contents")
+  in
+  let* result_typ = State.typ ctx ~at result_type in
   let* helped_proc =
-    State.polymorphic_call ctx ~at ~path:(List.hd_exn helped.paths)
-      ~declaration:helped_declaration ~occurrence ~target:helped_proc
+    if same_parameters then
+      let occurrence =
+        List.fold_right st.params ~init:result_type ~f:(fun (_, argument) result ->
+            Btype.newgenty
+              (Tarrow
+                 (Nolabel, Btype.newgenty (Tpoly (argument, [])), result, Types.commu_ok)))
+      in
+      State.polymorphic_call ctx ~at ~path:(List.hd_exn helped.paths)
+        ~declaration:helped_declaration ~occurrence ~target:helped_proc
+    else
+      (* Its instance at the structure's type arguments, which its variables are. *)
+      match
+        ( Path_bindings.find ctx.given.polymorphic_functions (List.hd_exn helped.paths),
+          Datatypes.desc ctx.given.types (List.hd_exn st.params |> snd) )
+      with
+      | None, _ -> State.return helped_proc
+      | Some worker, Tconstr (_, arguments, _)
+        when List.length arguments = List.length worker.scheme.variables ->
+          let+ instance = State.value_instance ctx ~at ~target:worker.name ~arguments in
+          instance ^ "." ^ (Qualified_name.of_string helped_proc).name
+      | Some _, _ ->
+          State.of_result
+            (unsupported helped.loc
+               "Helping a generic function whose type parameters are not the structure's")
   in
   let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
-  let* result = formula env result_term in
   let registration = pending_name st p "registration" in
   let registered hc =
     R.Expr.call ~loc:l (qualified_name ~loc:l registration) (hc :: args)
@@ -1154,6 +1263,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       ("token", token_typ);
       ("retired", bool_typ);
     ]
+    @ if carried then [ ("result", result_typ) ] else []
   in
   let ghost_fields =
     List.map fields ~f:(fun (f, t) ->
@@ -1161,27 +1271,43 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   in
   (* The registration of a call: its update until it retires, committed once helped. *)
   let hc = var "hc" in
+  (* A carried result: all of it until linked, half of it after, with the invariant's
+     half relating it to the key's contents. *)
+  let committed, stored =
+    if carried then
+      ( var "res",
+        [
+          R.Expr.ite ~loc:l (var "l")
+            (half hc "result" (var "res"))
+            (R.Expr.own ~loc:l [ field hc "result"; var "res"; R.Expr.real ~loc:l 1.0 ]);
+        ] )
+    else (result, [])
+  in
   let registration_pred =
     R.Callable.func ~loc:l ~kind:Pred
       ~formals:(decl "hc" ref_typ :: List.map params ~f:(fun (_, _, d) -> d))
       (generated_ident ~loc:l registration)
       (Some
          (R.Expr.exists ~loc:l
-            [ decl "tok" token_typ; decl "l" bool_typ; decl "r" bool_typ ]
+            ([ decl "tok" token_typ; decl "l" bool_typ; decl "r" bool_typ ]
+            @ if carried then [ decl "res" result_typ ] else [])
             (List.reduce_exn ~f:(bin And)
-               [
-                 half hc "token" (var "tok");
-                 half hc "linked" (var "l");
-                 half hc "retired" (var "r");
-                 R.Expr.ite ~loc:l (var "r") (R.Expr.bool ~loc:l true)
-                   (R.Expr.ite ~loc:l (var "l")
-                      (R.Expr.au_commit ~loc:l
-                         (qualified_name ~loc:l helped_proc)
-                         ((var "tok" :: args) @ [ result ]))
-                      (R.Expr.au ~loc:l
-                         (qualified_name ~loc:l helped_proc)
-                         (var "tok" :: args)));
-               ])))
+               ([
+                  half hc "token" (var "tok");
+                  half hc "linked" (var "l");
+                  half hc "retired" (var "r");
+                ]
+               @ stored
+               @ [
+                   R.Expr.ite ~loc:l (var "r") (R.Expr.bool ~loc:l true)
+                     (R.Expr.ite ~loc:l (var "l")
+                        (R.Expr.au_commit ~loc:l
+                           (qualified_name ~loc:l helped_proc)
+                           ((var "tok" :: au_args) @ [ returned committed ]))
+                        (R.Expr.au ~loc:l
+                           (qualified_name ~loc:l helped_proc)
+                           (var "tok" :: au_args)));
+                 ]))))
   in
   (* The values of the structure's views, which the helped function's implicit
      parameters are bound to by its atomic precondition. *)
@@ -1220,10 +1346,13 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   let post_env =
     List.fold view_values
       ~init:
-        (List.fold2_exn arg_names params ~init:env ~f:(fun env name (x, t, _) ->
+        (List.fold helped_args ~init:env ~f:(fun env (name, value, t) ->
              match name with
              | Some name ->
-                 { (bind env name (Raven x)) with var_types = (name, t) :: env.var_types }
+                 {
+                   (bind env name (Value value)) with
+                   var_types = (name, t) :: env.var_types;
+                 }
              | None -> env))
       ~f:(fun env (x, v, _, t, _) ->
         match List.find bindings ~f:(fun (_, w, _) -> String.equal v w) with
@@ -1269,14 +1398,14 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
     List.concat_map bound ~f:(fun (x, _, _, _, typ) -> local (x ^ "_1") typ)
     @ [
         (match opened_values with
-        | [] -> call "openAU" (var "tok" :: args)
+        | [] -> call "openAU" (var "tok" :: au_args)
         | _ ->
             R.Stmt.assign ~loc:l opened_values
-              (R.Stmt.expr_rhs (R.Expr.call ~loc:l (n "openAU") (var "tok" :: args))));
+              (R.Stmt.expr_rhs (R.Expr.call ~loc:l (n "openAU") (var "tok" :: au_args))));
       ]
     @ view_uses (fun ~loc p args -> R.Stmt.unfold ~loc p args)
     @ view_uses (fun ~loc p args -> R.Stmt.fold ~loc p args)
-    @ [ call "commitAU" ((var "tok" :: args) @ [ result ]) ]
+    @ [ call "commitAU" ((var "tok" :: au_args) @ [ returned result ]) ]
   in
   let body =
     [
@@ -1287,6 +1416,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
         @ [
             call help
               (args @ [ c ]
+              @ (if carried then [ var "contents" ] else [])
               @ List.map view_values ~f:(fun (x, _, _, _, _) -> var x)
               @ [ R.Expr.call ~loc:l (n "--") [ regs; R.Expr.set ~loc:l [ hc ] ]; on; ls ]
               );
@@ -1299,16 +1429,22 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
                     (qualified_name ~loc:l registration)
                     (hc :: args);
                   R.Stmt.if_ ~loc:l (R.Expr.not_ ~loc:l (var "r")) commit [];
+                ]
+              @ (if carried then
+                   [ R.Stmt.assign ~loc:l [ field hc "result" ] (R.Stmt.expr_rhs result) ]
+                 else [])
+              @ [
                   R.Stmt.assign ~loc:l
                     [ field hc "linked" ]
                     (R.Stmt.expr_rhs (R.Expr.bool ~loc:l true));
                   R.Stmt.fold ~loc:l
                     ~witnesses:
-                      [
-                        (ident ~loc:l "tok", var "tok");
-                        (ident ~loc:l "l", R.Expr.bool ~loc:l true);
-                        (ident ~loc:l "r", var "r");
-                      ]
+                      ([
+                         (ident ~loc:l "tok", var "tok");
+                         (ident ~loc:l "l", R.Expr.bool ~loc:l true);
+                         (ident ~loc:l "r", var "r");
+                       ]
+                      @ if carried then [ (ident ~loc:l "res", result) ] else [])
                     (qualified_name ~loc:l registration)
                     (hc :: args);
                 ])
@@ -1322,6 +1458,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       ~formals:
         (List.map params ~f:(fun (_, _, d) -> d)
         @ [ decl "c" key_typ ]
+        @ (if carried then [ decl "contents" contents_typ ] else [])
         @ List.map view_values ~f:(fun (x, _, _, _, typ) -> decl x typ)
         @ [
             decl "regs" (R.Type.fin_set ~loc:l ref_typ);
@@ -1329,25 +1466,37 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
             decl "ls" (R.Type.map ~loc:l ref_typ bool_typ);
           ])
       ~requires:
-        (List.map (posts @ view_owned) ~f:R.Spec.make
+        (List.map view_owned ~f:R.Spec.make
         @ [
+            (* The helped calls' atomic postconditions hold if some call waits on [c]. *)
             R.Spec.make
               (each
                  (List.reduce_exn ~f:(bin And)
-                    [
-                      half hc "linked" (R.Expr.index ~loc:l ls hc);
-                      registered hc;
-                      bin Impl waits_on_c (R.Expr.not_ ~loc:l (R.Expr.index ~loc:l ls hc));
-                    ]));
+                    ([
+                       half hc "linked" (R.Expr.index ~loc:l ls hc);
+                       registered hc;
+                       bin Impl waits_on_c
+                         (R.Expr.not_ ~loc:l (R.Expr.index ~loc:l ls hc));
+                     ]
+                    @ List.map posts ~f:(bin Impl waits_on_c))));
           ])
       ~ensures:
         (List.map view_owned ~f:R.Spec.make
         @ [
             R.Spec.make
               (each
-                 (bin And
-                    (half hc "linked" (bin Or (R.Expr.index ~loc:l ls hc) waits_on_c))
-                    (registered hc)));
+                 (List.reduce_exn ~f:(bin And)
+                    ([
+                       half hc "linked" (bin Or (R.Expr.index ~loc:l ls hc) waits_on_c);
+                       registered hc;
+                     ]
+                    @
+                    if carried then
+                      [
+                        R.Expr.ite ~loc:l waits_on_c (half hc "result" result)
+                          (R.Expr.bool ~loc:l true);
+                      ]
+                    else [])));
           ])
       ~decreases:[ regs ] (generated_ident ~loc:l help) (Some body)
   in

@@ -20,6 +20,8 @@ type t = {
   definition_member_name : string -> string option;
   libraries : Library_modules.t list;
   funcs : Procedures.func list;
+  specialized : Specializations.t list;
+      (** The functions over a witness copied per constructor, which calls select. *)
   access_proofs : ((int * int) * Annotation.t) list;
   return_proofs : ((int * int) * Annotation.t) list;
   types : Datatypes.t list;
@@ -291,7 +293,17 @@ let run (source : Source.t) : (t, error) Result.t =
     List.map (List.concat lifted) ~f:(fun f ->
         { f with raven_name = Fresh_names.fresh f.raven_name })
   in
-  let funcs = inherit_contracts (funcs @ lifted) in
+  (* The functions whose calls wait to be helped, which pending fields name. *)
+  let rec helped declarations =
+    List.concat_map declarations ~f:(function
+      | S.Proof_state { state_fields; _ } ->
+          List.filter_map state_fields ~f:(fun field -> field.sf_helps)
+      | Proof_module { module_declarations; _ } -> helped module_declarations
+      | _ -> [])
+  in
+  let helped = helped source.proof in
+  let* funcs, specialized = Specializations.run types ~helped (funcs @ lifted) in
+  let funcs = inherit_contracts funcs in
   let* access_proofs =
     access_annotations ~libraries
       ~checked:
@@ -470,7 +482,11 @@ let run (source : Source.t) : (t, error) Result.t =
           ~f:(fun (member, _) ->
             List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))))
   in
-  let* generics = generic_modules source ~types ~functions:funcs inventory in
+  let copies =
+    List.map specialized ~f:(fun (s : Specializations.t) ->
+        (s.original.id, List.map s.copies ~f:(fun copy -> copy.copy_id)))
+  in
+  let* generics = generic_modules ~copies source ~types ~functions:funcs inventory in
   let* module_scopes = Module_context.collect_scopes source.proof_scopes in
   let* generic_proofs = Generic_proofs.plan generics module_scopes in
   let module_contexts = Module_context.plan ~scopes:module_scopes generic_proofs in
@@ -516,6 +532,7 @@ let run (source : Source.t) : (t, error) Result.t =
       definition_member_name;
       libraries;
       funcs;
+      specialized;
       access_proofs;
       return_proofs;
       types;

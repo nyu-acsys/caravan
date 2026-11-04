@@ -8,6 +8,14 @@ open Proof_terms
 open Atomic_proofs
 open Expressions
 
+type copy_for = {
+  constructor : string;  (** By its OCaml name. *)
+  witness : Ident.t;  (** The witness parameter. *)
+  newtypes : (Ident.t * Types.type_expr) list;
+      (** The locally abstract types it selects, with its types for them. *)
+}
+(** A copy of a function over a GADT witness for one of its constructors. *)
+
 type func = {
   id : Ident.t;
   namespace : string list;
@@ -38,6 +46,9 @@ type func = {
       (** Whether the function is trusted, as [(*@ trusted *)] after it says: its contract
           assumed, its body not translated. *)
   role : Ident.t option;  (** The function whose atomic update it continues. *)
+  copy_for : copy_for option;
+      (** For a copy of a function over a GADT witness for one of its constructors: the
+          constructor, whose case matches on the witness select. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
     a local function lifted to the top level. *)
@@ -130,10 +141,18 @@ let contract_names (f : func) (header : S.header option) n =
           hd_args = List.filter h.hd_args ~f:(function S.Lghost _ -> false | _ -> true);
         }
       in
-      if not (String.equal h.hd_name.pid_str (Ident.name f.id)) then
+      (* A copy for a witness's constructor has its function's contract. *)
+      let name =
+        match f.copy_for with
+        | Some { constructor; _ } ->
+            Option.value
+              (String.chop_suffix (Ident.name f.id) ~suffix:("$" ^ constructor))
+              ~default:(Ident.name f.id)
+        | None -> Ident.name f.id
+      in
+      if not (String.equal h.hd_name.pid_str name) then
         error h.hd_name.pid_loc
-          (Printf.sprintf "This contract is for %s, not %s" h.hd_name.pid_str
-             (Ident.name f.id))
+          (Printf.sprintf "This contract is for %s, not %s" h.hd_name.pid_str name)
       else if List.length h.hd_args <> n then
         error h.hd_name.pid_loc
           (Printf.sprintf "This contract names %d arguments, but %s has %d"
@@ -158,7 +177,15 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
             @ List.map (Typedtree.pat_bound_idents_full pattern)
                 ~f:(fun (_, name, typ, _) -> (name.txt, typ)))
   in
-  let variables = (result_name, f.body.exp_type) :: parameters_named in
+  (* A copy for a witness's constructor has its types for the ones it selects. *)
+  let copy_type t =
+    Option.value_map f.copy_for ~default:t ~f:(fun copy ->
+        Witnesses.substitute_newtypes copy.newtypes t)
+  in
+  let variables =
+    List.map ((result_name, f.body.exp_type) :: parameters_named) ~f:(fun (name, t) ->
+        (name, copy_type t))
+  in
   let known_names = List.map declarations ~f:(fun (id, _) -> id.S.pid_str) in
   let known q =
     match q with
@@ -228,6 +255,18 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
         @ contract.atomic_ensures)
   in
   let constraints = List.concat_map terms ~f:constraints in
+  (* In a copy for a witness's constructor, the terms on the witness select results of
+     its other constructors' types, which say nothing of the ghost variables. *)
+  let constraints =
+    match f.copy_for with
+    | None -> constraints
+    | Some copy ->
+        List.filter constraints ~f:(fun term ->
+            not
+              (List.exists (term_references [] term) ~f:(function
+                | S.Qid id -> String.equal id.pid_str (Ident.name copy.witness)
+                | Qdot _ -> false)))
+  in
   let witnesses =
     List.concat_map constraints ~f:(term_references [])
     |> List.filter_map ~f:(function
@@ -260,7 +299,11 @@ let formals ?(names = []) ctx (f : func) =
           let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.bind_name ~typ:pat_type id in
           let spec =
-            match witness_condition ctx ~loc:(loc pat_loc) f.id i x with
+            match
+              Option.first_some
+                (witness_condition ctx ~loc:(loc pat_loc) f.id i x)
+                (specialized_condition ctx ~loc:(loc pat_loc) id pat_type x)
+            with
             | Some condition -> Some (R.Spec.make condition)
             | None -> value_spec ctx ~loc:(loc pat_loc) pat_type x
           in
@@ -613,10 +656,19 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
       ~f:(fun position ((parameter : Typedtree.function_param), (formal_name, _, _)) ->
         match (parameter.fp_kind, formal_name) with
         | Tparam_pat pattern, Some (_, name) ->
-            Option.first_some
-              (witness_condition ctx ~loc:l f.id position name)
-              (Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
-                 (R.Expr.var ~loc:l (R.Name.make ~loc:l name)))
+            let specialized =
+              match pattern.pat_desc with
+              | Tpat_var (id, _, _) ->
+                  specialized_condition ctx ~loc:l id pattern.pat_type name
+              | _ -> None
+            in
+            List.find_map ~f:Fn.id
+              [
+                witness_condition ctx ~loc:l f.id position name;
+                specialized;
+                Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
+                  (R.Expr.var ~loc:l (R.Name.make ~loc:l name));
+              ]
         | _ -> None)
   in
   let requires = domains @ requires in
@@ -788,7 +840,7 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
     | [] -> R.Stmt.call ~loc:l (au_call ~l "openAU" [])
     | _ -> R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs (au_call ~l "openAU" []))
   in
-  let open_ ~contents ~at ~unfold:with_unfold =
+  let open_ ~invariants_open ~contents ~at ~unfold:with_unfold =
     let open State.Syntax in
     let l = loc at in
     let* decls = implicit_values ~at ~const:(Some false) in
@@ -797,7 +849,8 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
       if with_unfold then each pres ~at unfold (opened values) else State.return []
     in
     let+ invariants =
-      if with_unfold then use_invariants ?contents ctx ~at ~fold:false
+      if with_unfold && not invariants_open then
+        use_invariants ?contents ctx ~at ~fold:false
       else State.return []
     in
     (invariants @ List.concat_map decls ~f:fst @ [ opening ~l values ] @ unfolds, values)
@@ -1625,6 +1678,15 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let atomic_posts =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
   in
+  (* A copy for a witness's constructor raises only what it does for it, which atomic
+     calls rely on before they commit. *)
+  let copy_raises_terms =
+    match (raising, f.copy_for) with
+    | Some (set, _), Some _ when atomic ->
+        Option.to_list
+          (List.last (Exceptions.raises_postconditions ctx.given.types ~at:f.loc [] set))
+    | _ -> []
+  in
   let* atomic_ensures =
     match raising with
     | None -> postconditions ~atomic:true atomic_posts
@@ -1641,7 +1703,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                   (Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_raises))
                   ~f:(fun (p, t) -> (p, Some t)))
                (State.Raises [])
-            @ if atomic then witness_raises_terms else [])
+            @ (if atomic then witness_raises_terms else [])
+            @ copy_raises_terms)
         in
         normal @ exceptional
   in
@@ -1785,7 +1848,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
             error f.loc
               "This function may return waiting to be helped: a step after it waits \
                collects its result, as (*@ returning Nil -> commit true *)"
-        | Some (Committing | On_cas | On_read _ | Unknown) ->
+        | Some (Committing | On_cas | On_read _ | Collecting _ | Unknown) ->
             error f.loc
               "Caravan cannot tell whether this function linearizes on every path"
         end

@@ -142,7 +142,7 @@
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES ATOMIC_RAISES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
-%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS PROOF AT
+%token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS AS PROOF AT
 %token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
 
 (* Keywords *)
@@ -477,7 +477,7 @@ proof_decl:
 | ACTION n = lident ps = lident* EQUAL step = action_step?
     LEFTBRC s = lident WITH fs = semicolon_list1(field_value) RIGHTBRC
     ls = loption(preceded(LINEARIZES, separated_nonempty_list(COMMA, lident)))
-    h = preceded(HELPS, helps)?
+    h = list(preceded(HELPS, helps))
     { let step, consumes =
         match step with Some (st, c) -> (Some st, c) | None -> (None, None) in
       Proof_action { action_name = n; action_params = ps; action_step = step;
@@ -516,7 +516,8 @@ lemma_clause:
 ;
 
 helps:
-| f = term ON k = term WITH v = term { (f, k, v) }
+| f = term ON k = term p = preceded(AS, mpat)? WITH v = term
+    { (f, k, { contents = p; result = v }) }
 ;
 
 action_step:

@@ -751,25 +751,110 @@ let push_snapshot snapshots inv (state : opened) =
   )
   :: List.Assoc.remove snapshots inv ~equal:String.equal
 
+(** The contents of the atomics of the type [key_type], keys of pending calls. *)
+let key_contents types ~at key_type =
+  match Datatypes.desc types key_type with
+  | Tconstr (path, [ contents ], _) when Datatypes.is_atomic path -> Ok contents
+  | _ -> unsupported at "Helping calls waiting on a key that is not an atomic"
+
+(** The subterms of [t] that the variables of [p] match, if [t] has its shape. *)
+let rec matched_subterms (p : S.pat) (t : S.term) =
+  let ( let* ) value f = Option.bind value ~f in
+  match (p.pat_desc, (S.chain t).term_desc) with
+  | Pwild, _ -> Some []
+  | Pid id, _ -> Some [ (id.pid_str, t) ]
+  | Pcast (p, _), _ -> matched_subterms p t
+  | Ptuple ps, Ttuple ts when List.length ps = List.length ts ->
+      let* matched =
+        Option.all (List.map2_exn ps ts ~f:(fun p t -> matched_subterms p t))
+      in
+      Some (List.concat matched)
+  | Pconstr (c, Some p), Tapply ({ term_desc = Tvar d; _ }, argument)
+    when String.equal (qualid_key c) (qualid_key d) ->
+      matched_subterms p argument
+  | _ -> None
+
+(** The result [h] with which an action commits the calls it helps, for the contents
+    [contents] of their key after it, with its OCaml type. With [stated], the contents are
+    that term in that environment, whose parts the result's pattern names. *)
+let helped_value ?stated env ~at ~key_type (h : S.helped_result) contents =
+  let open State.Syntax in
+  let* env =
+    match h.contents with
+    | None -> State.return env
+    | Some p ->
+        let* contents_type = State.of_result (key_contents env.data ~at key_type) in
+        let+ bindings =
+          match
+            Option.bind stated ~f:(fun (stated_env, term) ->
+                Option.map (matched_subterms p term) ~f:(fun parts -> (stated_env, parts)))
+          with
+          | Some (stated_env, parts) ->
+              State.all parts ~f:(fun (x, part) ->
+                  let+ e = formula stated_env part in
+                  (x, e))
+          | None -> State.map ~f:snd (State.of_result (spec_pattern env p contents))
+        in
+        let env =
+          List.fold bindings ~init:env ~f:(fun env (x, e) -> bind env x (Value e))
+        in
+        { env with var_types = pattern_types env p contents_type @ env.var_types }
+  in
+  let* typ =
+    let result = Option.value (specialized_body env.ctx h.result) ~default:h.result in
+    match term_type env result with
+    | Some typ -> State.return typ
+    | None ->
+        State.of_result
+          (Source.infer_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
+             result)
+  in
+  let+ value = formula env h.result in
+  (value, typ)
+
 (** The lemma calls by which the action [p] that a step performs on [st], whose invariant
     has the arguments [args] and is open in [opened], helps the calls waiting in a pending
     field, committed in the state [values] after it. *)
 let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
   let open State.Syntax in
-  match p.performed.helps with
-  | Some (field, key, _) -> begin
+  State.map ~f:List.concat
+  @@ State.all p.performed.helps ~f:(fun (field, key, (helped : S.helped_result)) ->
       let* env =
         action_env ~action:p.performed ctx st st.params args opened.values p.bindings
       in
       let* views = State.attempt (views_after ctx st args values) in
-      let+ c = State.attempt (formula env key) in
+      let* c = State.attempt (formula env key) in
+      (* A result carried from the key's contents: those its step writes. *)
+      let+ contents =
+        match (helped.contents, p.performed.step) with
+        | None, _ -> State.return (Ok [])
+        | Some _, Some (("compare_and_set" | "set" | "exchange"), step_args) ->
+            begin match List.last step_args with
+            | Some (Some written) ->
+                State.map ~f:(Result.map ~f:List.return)
+                  (State.attempt (formula env written))
+            | _ ->
+                State.of_result
+                  (unsupported p.performed.action_at
+                     "Helping with the contents of a key that the step writes to no \
+                      given value")
+            end
+        | Some _, _ ->
+            State.of_result
+              (unsupported p.performed.action_at
+                 "Helping with the contents of a key that the action's step does not \
+                  write")
+      in
       match
         ( List.find st.pendings ~f:(fun q -> String.equal q.pending_field field),
-          c,
+          Result.combine c contents ~ok:(fun c contents -> (c, contents)) ~err:Fn.const,
           views,
           List.findi st.fields ~f:(fun _ (f, _, _, _, _) -> String.equal f field) )
       with
-      | Some pending, Ok c, Ok views, Some (i, _) ->
+      | Some pending, Ok (c, contents), Ok views, Some (i, _) ->
           let on = List.Assoc.find_exn opened.indices field ~equal:String.equal in
           let hc = R.Expr.var ~loc:la (name ~loc:la "hc") in
           let helped =
@@ -780,13 +865,11 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
           [
             lemma
               (pending_name st pending "help")
-              (args @ [ c ]
+              (args @ [ c ] @ contents
               @ List.map views ~f:(fun (_, _, value) -> value)
               @ [ List.nth_exn opened.values i; on; helped ]);
           ]
-      | _ -> []
-    end
-  | None -> State.return []
+      | _ -> [])
 
 (** Whether a step on atomics with contents of type [contents] may need the part [part] of
     an invariant, comparing the types' heads by name, as copies of a module have types of
@@ -1585,8 +1668,17 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         Option.map (waits outcome) ~f:(fun (field : S.term) -> field.term_desc)
       with
       | Some (Tfield (_, Qid f)) ->
+          (* A copy for a witness's constructor waits in the field of its calls. *)
+          let field =
+            match ctx.given.specialized_witness with
+            | Some (_, ctor)
+              when List.exists st.pendings ~f:(fun q ->
+                       String.equal q.pending_field (f.pid_str ^ "$" ^ ctor)) ->
+                f.pid_str ^ "$" ^ ctor
+            | _ -> f.pid_str
+          in
           begin match
-            List.find st.pendings ~f:(fun q -> String.equal q.pending_field f.pid_str)
+            List.find st.pendings ~f:(fun q -> String.equal q.pending_field field)
           with
           | Some q -> Ok q
           | None ->
@@ -1624,6 +1716,19 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
           (unsupported at "Linearizing with the function's result, before a choice,")
     | Waits (_, key) ->
         let* key = formula env key in
+        (* A carried result, unknown until helped. *)
+        let _, _, helped_result = pending.helping in
+        let* stored =
+          match helped_result.contents with
+          | None -> State.return None
+          | Some _ ->
+              let* _, result_type =
+                helped_value env ~at ~key_type:pending.key_type helped_result key
+              in
+              let* typ = State.typ ctx ~at result_type in
+              let+ x = State.fresh "result" in
+              Some (x, typ)
+        in
         let on =
           List.Assoc.find_exn opened.indices pending.pending_field ~equal:String.equal
         in
@@ -1663,23 +1768,29 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         in
         let _, raven_field, _, _, _ = List.nth_exn st.fields i in
         unfolds
+        @ Option.value_map stored ~default:[] ~f:(fun (x, typ) ->
+            R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x))
         @ [
             R.Stmt.assign ~loc:l
               [ var hc ]
               (R.Stmt.new_rhs
-                 [
-                   (field "watched", Some key);
-                   (field "linked", Some (R.Expr.bool ~loc:l false));
-                   (field "token", Some au.token);
-                   (field "retired", Some (R.Expr.bool ~loc:l false));
-                 ]);
+                 ([
+                    (field "watched", Some key);
+                    (field "linked", Some (R.Expr.bool ~loc:l false));
+                    (field "token", Some au.token);
+                    (field "retired", Some (R.Expr.bool ~loc:l false));
+                  ]
+                 @ Option.value_map stored ~default:[] ~f:(fun (x, _) ->
+                     [ (field "result", Some (var x)) ])));
             R.Stmt.fold ~loc:l
               ~witnesses:
-                [
-                  (ident ~loc:l "tok", au.token);
-                  (ident ~loc:l "l", R.Expr.bool ~loc:l false);
-                  (ident ~loc:l "r", R.Expr.bool ~loc:l false);
-                ]
+                ([
+                   (ident ~loc:l "tok", au.token);
+                   (ident ~loc:l "l", R.Expr.bool ~loc:l false);
+                   (ident ~loc:l "r", R.Expr.bool ~loc:l false);
+                 ]
+                @ Option.value_map stored ~default:[] ~f:(fun (x, _) ->
+                    [ (ident ~loc:l "res", var x) ]))
               (qualified_name ~loc:l (pending_name st pending "registration"))
               (var hc :: args);
             lemma (member_name st "learn")
@@ -1747,10 +1858,10 @@ let collected_terms ctx (p : S.pat) value result =
   let+ result = formula env result in
   (matches, result)
 
-(** The statements of the step at [at] that collects the result of the function with the
-    update [au], left to be helped as [r] says, if its result [value] matches [p]:
-    committing with [result] if nobody helped it, and retiring the registration. *)
-let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat) result =
+(** The ghost statements retiring the registration of the function with the update [au],
+    left to be helped as [r] says, at the step at [at] whose result is [value], after
+    [commit], with the registration unfolded. *)
+let retire ctx (au : au) (r : registered) ~(at : Location.t) ~value commit =
   let open State.Syntax in
   let l = loc at in
   let var x = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -1758,41 +1869,79 @@ let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat)
     open_pending_structure ctx ~at
       "A step that collects a result without a structure with pending calls"
   in
-  let* matches, result = collected_terms ctx p value result in
-  let* commit = au.commit_only ~at ~value:result in
   let* linked = State.fresh "linked" in
+  (* A carried result, kept as the registration holds it. *)
+  let _, _, helped_result = r.pending.helping in
+  let+ stored =
+    match helped_result.contents with
+    | None -> State.return None
+    | Some _ ->
+        let* env = scope_env ctx in
+        let* _, result_type =
+          helped_value env ~at ~key_type:r.pending.key_type helped_result value
+        in
+        let* typ = State.typ ctx ~at result_type in
+        let+ x = State.fresh "result" in
+        Some (x, typ)
+  in
+  let carried f = Option.value_map stored ~default:[] ~f in
   let registration = qualified_name ~loc:l (pending_name st r.pending "registration") in
   let retired = qualified_name ~loc:l (pending_name st r.pending "retired") in
-  let+ () = modify_au (fun au -> { au with au_state = Committed; au_step = at }) in
   [
-    R.Stmt.ghost_block ~loc:l
-      [
-        R.Stmt.if_ ~loc:l r.registered
-          (R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.bool ~loc:l) (ident ~loc:l linked)
-          @ [
-              R.Stmt.unfold ~loc:l
-                ~witnesses:[ (ident ~loc:l linked, var "l") ]
-                registration (r.registration :: args);
-            ]
-          @ (match matches with
-            | Some c -> [ R.Stmt.if_ ~loc:l c commit [] ]
-            | None -> commit)
-          @ [
-              R.Stmt.assign ~loc:l
-                [ R.Expr.field ~loc:l r.registration retired ]
-                (R.Stmt.expr_rhs (R.Expr.bool ~loc:l true));
-              R.Stmt.fold ~loc:l
-                ~witnesses:
-                  [
-                    (ident ~loc:l "tok", au.token);
-                    (ident ~loc:l "l", var linked);
-                    (ident ~loc:l "r", R.Expr.bool ~loc:l true);
-                  ]
-                registration (r.registration :: args);
-            ])
-          [];
-      ];
+    R.Stmt.if_ ~loc:l r.registered
+      (R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.bool ~loc:l) (ident ~loc:l linked)
+      @ carried (fun (x, typ) -> R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x))
+      @ [
+          R.Stmt.unfold ~loc:l
+            ~witnesses:
+              ((ident ~loc:l linked, var "l")
+              :: carried (fun (x, _) -> [ (ident ~loc:l x, var "res") ]))
+            registration (r.registration :: args);
+        ]
+      @ commit
+      @ [
+          R.Stmt.assign ~loc:l
+            [ R.Expr.field ~loc:l r.registration retired ]
+            (R.Stmt.expr_rhs (R.Expr.bool ~loc:l true));
+          R.Stmt.fold ~loc:l
+            ~witnesses:
+              ([
+                 (ident ~loc:l "tok", au.token);
+                 (ident ~loc:l "l", var linked);
+                 (ident ~loc:l "r", R.Expr.bool ~loc:l true);
+               ]
+              @ carried (fun (x, _) -> [ (ident ~loc:l "res", var x) ]))
+            registration (r.registration :: args);
+        ])
+      [];
   ]
+
+(** The statements of the step at [at] that collects the result of the function with the
+    update [au], left to be helped as [r] says, if its result [value] matches [p]:
+    committing with [result] if nobody helped it, and retiring the registration. *)
+let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat) result =
+  let open State.Syntax in
+  let l = loc at in
+  let* matches, result = collected_terms ctx p value result in
+  let* commit = au.commit_only ~at ~value:result in
+  let commit =
+    match matches with Some c -> [ R.Stmt.if_ ~loc:l c commit [] ] | None -> commit
+  in
+  let* retiring = retire ctx au r ~at ~value commit in
+  let+ () = modify_au (fun au -> { au with au_state = Committed; au_step = at }) in
+  [ R.Stmt.ghost_block ~loc:l retiring ]
+
+(** The statements of the read at [at] that collects the result of the function with the
+    update [au], left to be helped as [r] says, whose result [value] has the constructor
+    [c] if nobody helped it: retiring the registration, the invariants left open for the
+    arm of that constructor, which opens the update and commits with the function's
+    result. *)
+let collect_returning ctx (au : au) (r : registered) ~(at : Location.t) ~value c =
+  let open State.Syntax in
+  let l = loc at in
+  let* retiring = retire ctx au r ~at ~value [] in
+  let+ () = modify_au (fun au -> { au with au_state = Collecting c; au_step = at }) in
+  [ R.Stmt.ghost_block ~loc:l retiring ]
 
 (** The statements of [access], an atomic step, inside the atomic update of a function
     with an atomic contract that has not linearized yet. The step linearizes the function
@@ -1891,18 +2040,27 @@ let linearize ?step ?value ?access_type ?contents ctx ~at
     | Some (au, au_path), ((`Commit | `Abort | `Cas | `Returning _) as how), _ ->
         begin match au_path.au_state with
         | Committed -> around access
-        | Registered _ ->
-            State.of_result
-              (error at
-                 "This function waits to be helped: the next step collects its result, \
-                  as (*@ returning Nil -> commit true *)")
-        | Committing | On_cas | On_read _ | Partly | Unknown ->
+        | Registered r ->
+            begin match (how, value) with
+            | `Returning c, Some value ->
+                let* opening = use_invariants ctx ~at ~fold:false in
+                let+ collected = collect_returning ctx au r ~at ~value c in
+                opening @ access @ collected
+            | _ ->
+                State.of_result
+                  (error at
+                     "This function waits to be helped: the next step collects its \
+                      result, as (*@ returning Nil -> commit true *)")
+            end
+        | Committing | On_cas | On_read _ | Collecting _ | Partly | Unknown ->
             State.of_result
               (error at
                  "Caravan cannot tell whether the function has linearized before this \
                   step")
         | Pending ->
-            let* opening, values = au.open_ ~contents ~at ~unfold:true in
+            let* opening, values =
+              au.open_ ~invariants_open:false ~contents ~at ~unfold:true
+            in
             let* () =
               modify_au (fun au -> { au with au_values = values; au_step = at })
             in
@@ -1969,14 +2127,17 @@ let open_for_call (au : au) ~(at : Location.t) =
   let* path = get_path in
   match Option.map path.au ~f:(fun au -> au.au_state) with
   | Some Pending ->
-      let* opening, values = au.open_ ~contents:None ~at ~unfold:false in
+      let* opening, values =
+        au.open_ ~invariants_open:false ~contents:None ~at ~unfold:false
+      in
       let+ () =
         modify_au (fun au ->
             { au with au_values = values; au_step = at; au_state = Committed })
       in
       Some (opening, values)
   | None | Some Committed -> State.return None
-  | Some (Committing | On_cas | On_read _ | Partly | Registered _ | Unknown) ->
+  | Some (Committing | On_cas | On_read _ | Collecting _ | Partly | Registered _ | Unknown)
+    ->
       State.of_result
         (error at
            "Caravan cannot tell whether the function has linearized before this call")
@@ -2019,6 +2180,24 @@ let enter_arm ctx ~(commits : bool option) =
           au.close Abort
             ~value:(R.Expr.tuple ~loc:(loc au_path.au_step) [])
             ~outcome:Returned
+      | None ->
+          let+ () = put_au_state Unknown in
+          []
+      end
+  | Some (au, ({ au_state = Collecting _; _ } as au_path)) ->
+      begin match commits with
+      | Some true ->
+          let at = au_path.au_step in
+          let* opening, values =
+            au.open_ ~invariants_open:true ~contents:None ~at ~unfold:true
+          in
+          let* () = modify_au (fun au -> { au with au_values = values }) in
+          let+ commit = commit_now au ~step:at in
+          opening @ commit
+      | Some false ->
+          (* Helped: committed by the helping call, the invariants open since the read. *)
+          let* () = put_au_state Committed in
+          use_invariants ctx ~at:au_path.au_step ~fold:true
       | None ->
           let+ () = put_au_state Unknown in
           []

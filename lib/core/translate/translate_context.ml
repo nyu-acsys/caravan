@@ -95,8 +95,8 @@ type action = {
   state : string;
   update : (string * S.term) list;  (** The fields it changes. *)
   linearizes : Ident.t list;
-  helps : (string * S.term * S.term) option;
-      (** The pending field whose calls it helps, the key and the result. *)
+  helps : (string * S.term * S.helped_result) list;
+      (** The pending fields whose calls it helps, each with the key and the result. *)
   action_at : Location.t;
 }
 (** An action of a structure (see {!S.Proof_action}). *)
@@ -114,9 +114,12 @@ type pending = {
   pending_on : string;  (** The existential of the keys of the registrations. *)
   key_type : Types.type_expr;
   helped : Ident.t;  (** The function whose calls wait. *)
-  helping : string * S.term * S.term;
-      (** The key whose calls the action that helps commits, and the result, in terms of
-          the state before the action, named as the action names it. *)
+  specialized : (Ident.t * string) option;
+      (** For a copy of a function over a witness, the witness parameter and the
+          constructor it is copied for. *)
+  helping : string * S.term * S.helped_result;
+      (** The key whose calls the action that helps commits, in terms of the state before
+          the action, named as the action names it, and the result. *)
 }
 (** A field of calls of [helped] waiting to be helped, each registered on a key: a finite
     set of registrations, ghost cells holding the calls' updates. *)
@@ -164,6 +167,10 @@ type au_state =
   | On_read of string
       (** The update open, linearized if the value of the last read has this constructor.
       *)
+  | Collecting of string
+      (** Left to be helped before the last read, the invariants open since: linearized by
+          the read if its value has this constructor, and committed by the helping call
+          otherwise. *)
   | Partly  (** Linearized on some paths, the update closed. *)
   | Registered of registered
       (** Linearized, or left to be helped if [registered] says so: given away in a
@@ -585,6 +592,7 @@ type au = {
           commits with. *)
   has_result : bool;
   open_ :
+    invariants_open:bool ->
     contents:Types.type_expr option ->
     at:Location.t ->
     unfold:bool ->
@@ -592,7 +600,7 @@ type au = {
       (** Opens the atomic update for the step at [at], on atomics with contents of type
           [contents] if known: the statements, unfolding the atomic precondition's
           predicates and the invariants if [unfold], and the values of the implicit
-          parameters. *)
+          parameters. The invariants are not opened again if [invariants_open]. *)
   close : au_close -> value:R.Expr.t -> outcome:au_outcome -> R.Stmt.t list State_monad.t;
       (** Closes the open update, committing with the function's result [value] and its
           [outcome]. *)
@@ -1058,6 +1066,13 @@ type inputs = {
   atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
   raising_library_calls : string list;
       (** The library functions that may raise, whose calls are not supported yet. *)
+  specialized_witness : (Ident.t * string) option;
+      (** In a copy of a function over a witness for one of its constructors: its witness
+          parameter and the constructor, whose cases its matches select. *)
+  specialized_calls :
+    (Path.t list * int * (string * Ident.t * Types.type_expr) list) list;
+      (** The functions over a witness copied per constructor: their paths, the witness's
+          position, and per constructor the copy and its type. *)
   shared_exceptions : (string * string list) option;
       (** In a functor body that its applications share: the module that gives each
           application's exceptions, and the keys of the representative's, whose
@@ -1125,6 +1140,8 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     witness_raising = [];
     atomic_procedures = [];
     raising_library_calls = [];
+    specialized_witness = None;
+    specialized_calls = [];
     shared_exceptions = None;
     initializations = [];
     linearizations = [];
@@ -1170,6 +1187,30 @@ let shared_exception_call ~loc app kind (c : Datatypes.ctor) arguments =
     (Qualified_name.raven ~loc
        (Qualified_name.of_string (app ^ "." ^ shared_exception_member kind c.ocaml)))
     arguments
+
+(** That [variable], the parameter [parameter] of type [typ], is the constructor of the
+    copy of a function over a witness, if it is the copy's witness parameter. *)
+let specialized_condition ctx ~loc parameter typ variable =
+  match (ctx.given.specialized_witness, Witnesses.witness_type ctx.given.types typ) with
+  | Some (witness, ctor), Some (data, _, _) when Ident.same witness parameter ->
+      Option.map
+        (List.find data.ctors ~f:(fun c -> String.equal c.ocaml ctor))
+        ~f:(fun c ->
+          R.Expr.binary ~loc Eq
+            (R.Expr.var ~loc (name ~loc variable))
+            (R.Expr.call ~loc (Datatypes.ctor_name ~loc data c) []))
+  | _ -> None
+
+(** Of [cases], matching the witness [scrutinee] of a copy for one of its constructors,
+    the one for that constructor. *)
+let specialized_case ctx ~scrutinee cases ~constructors =
+  Option.bind ctx.given.specialized_witness ~f:(fun (parameter, ctor) ->
+      if not (String.equal scrutinee (Ident.name parameter)) then None
+      else
+        List.find cases ~f:(fun case ->
+            match constructors case with
+            | Some names -> List.mem names ctor ~equal:String.equal
+            | None -> true))
 
 let assert_admissible ctx ~loc typ variable =
   Option.value_map (value_spec ctx ~loc typ variable) ~default:[] ~f:(fun spec ->
@@ -2195,6 +2236,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     || List.mem
          [
            "own";
+           "waiting";
            "not";
            "max_int";
            "min_int";

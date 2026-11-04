@@ -119,7 +119,8 @@ let declaration_shape declaration =
         List.map
           (Option.to_list action_consumes
           @ List.map action_update ~f:snd
-          @ Option.value_map action_helps ~default:[] ~f:(fun (a, b, c) -> [ a; b; c ]))
+          @ List.concat_map action_helps ~f:(fun (field, key, helped) ->
+              [ field; key; helped.S.result ]))
           ~f:term )
   | Proof_type _ -> ("type", false, [])
   | Proof_resource _ -> ("resource", false, [])

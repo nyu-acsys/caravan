@@ -91,28 +91,34 @@ let create ~generic_modules ~applications workers uses =
     @ List.map generic_modules ~f:(fun name -> Generic_module name)
   in
   let edges = weighted_uses ~applications nodes uses in
-  let rec level visiting levels name =
-    match Map.find levels name with
-    | Some found -> Ok (levels, found)
-    | None when Set.mem visiting name ->
-        Report.internal Location.none "Cyclic uses of generic declaration workers"
-    | None ->
-        let* levels, found =
-          List.fold_result
+  (* Each node's level, the heaviest path of uses from it: uses of weight 0 may be
+     cyclic, as their nodes share a functor, but no cycle may have a heavier one. *)
+  let names = List.map nodes ~f:node_name in
+  let step levels =
+    List.fold names ~init:levels ~f:(fun levels name ->
+        let found =
+          List.fold
             (Option.value (Map.find edges name) ~default:[])
-            ~init:(levels, 0)
-            ~f:(fun (levels, found) (target, weight) ->
-              let* levels, below = level (Set.add visiting name) levels target in
-              Ok (levels, Int.max found (below + weight)))
+            ~init:0
+            ~f:(fun found (target, weight) ->
+              Int.max found (Option.value (Map.find levels target) ~default:0 + weight))
         in
-        Ok (Map.set levels ~key:name ~data:found, found)
+        Map.set levels ~key:name ~data:found)
+  in
+  let rec settle levels rounds =
+    let next = step levels in
+    if Map.equal Int.equal next levels then Ok levels
+    else if rounds > List.length names then
+      Report.internal Location.none "Cyclic uses of generic declaration workers"
+    else settle next (rounds + 1)
   in
   let* levels =
-    List.fold_result workers
-      ~init:(Map.empty (module String))
-      ~f:(fun levels worker ->
-        let* levels, _ = level (Set.empty (module String)) levels worker.name in
-        Ok levels)
+    settle
+      (Map.of_alist_reduce
+         (module String)
+         (List.map names ~f:(fun n -> (n, 0)))
+         ~f:Int.max)
+      0
   in
   let key worker =
     (List.drop_last_exn (path worker.name), worker.arity, Map.find_exn levels worker.name)

@@ -41,6 +41,7 @@
         "continues", CONTINUES;
         "end", END;
         "helps", HELPS;
+        "as", AS;
         "on", ON;
         "wait", WAIT;
         "linearizes", LINEARIZES;

@@ -42,6 +42,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     definition_member_name;
     libraries;
     funcs;
+    specialized = _;
     access_proofs;
     return_proofs;
     types;

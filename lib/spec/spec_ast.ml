@@ -244,6 +244,14 @@ and outline = {
 *)
 
 (** A declaration of a proof. *)
+type helped_result = {
+  contents : pat option;
+      (** The pattern that the key's contents after the action match, binding what the
+          result uses, [as Next (v, _)]. *)
+  result : term;
+}
+(** The result with which an action commits the calls it helps. *)
+
 type proof_decl =
   | Proof_module of {
       module_name : id;
@@ -309,9 +317,9 @@ type proof_decl =
       action_state : id;
       action_update : (id * term) list;
       action_linearizes : id list;
-      action_helps : (term * term * term) option;
-          (** The calls it helps: those waiting in a pending field on a key, with the
-              result, [helps s.waiting on last s.cells with false]. *)
+      action_helps : (term * term * helped_result) list;
+          (** The calls it helps: those waiting in pending fields on keys, with the
+              results, [helps s.waiting on last s.cells with false]. *)
     }
       (** A transition of the state, as
           [action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1) ~> {

@@ -7,6 +7,7 @@ type 'a state = {
   head : integer [@grows];
   tail : integer;
   waiting : 'a node Atomic.t pending [@helps is_empty];
+  peeking : 'a node Atomic.t pending [@helps peek_as];
 }
 
 invariant is_queue (q : 'a t) (s : 'a state) =
@@ -18,6 +19,8 @@ invariant is_queue (q : 'a t) (s : 'a state) =
   && (forall i : integer. 0 <= i && i < length s.values ->
         own s.cells.(i) (Next (s.values.(i), s.cells.(i + 1))))
   && own s.cells.(length s.values) Nil
+  && (forall c : 'a node Atomic.t. waiting s.peeking c ->
+        c == s.cells.(length s.values) -> s.head = length s.values)
 
 view queue (q : 'a t) = drop s.head s.values
 
@@ -30,6 +33,8 @@ action link v c = compare_and_set s.cells.(length s.values) Nil (Next (v, c))
   consumes own c Nil
   ~> { s with cells = s.cells ++ [ c ]; values = s.values ++ [ v ] } linearizes push
   helps s.waiting on s.cells.(length s.values) with false
+  helps s.peeking on s.cells.(length s.values) as Next (v, _)
+    with (match poly with Option -> Some v | Value -> v | Unit -> ())
 
 (* Moving the tail on, to a cell linked before. *)
 action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }
