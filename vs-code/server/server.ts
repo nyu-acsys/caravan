@@ -4,9 +4,10 @@ import { TextDocument } from 'vscode-languageserver-textdocument';
 import { URI } from 'vscode-uri';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { toolchainEnvironment } from '../shared/toolchain';
 import { VerificationProcesses } from './verificationProcesses';
 import { parseReport, normalizeReport } from './report';
-import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams } from '../shared/protocol';
+import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
 	executable: string; arguments: string[]; includePaths: string[];
@@ -17,7 +18,7 @@ interface Owner {
 	diagnostics: Map<string, Diagnostic[]>;
 	state: VerificationState; message?: string;
 }
-const defaults: Settings = { executable: 'caravan', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, cwd: '' };
+const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, cwd: '' };
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const processes = new VerificationProcesses(2);
@@ -31,6 +32,7 @@ let workspaceFolders = false;
 let globalSettings: unknown = {};
 let folders: WorkspaceFolder[] = [];
 let shuttingDown = false;
+let toolchain: ToolchainSelection | undefined;
 
 function fileOf(uri: string): string | undefined {
 	const parsed = URI.parse(uri);
@@ -83,6 +85,21 @@ function invalidate(file: string): void {
 		}
 	}
 }
+function selectToolchain(value: unknown): void {
+	if (typeof value !== 'object' || value === null) return;
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.executable !== 'string' || !candidate.executable.trim() || candidate.executable.includes('\0')
+		|| (candidate.bundleRoot !== undefined && (typeof candidate.bundleRoot !== 'string'
+			|| !path.isAbsolute(candidate.bundleRoot) || candidate.bundleRoot.includes('\0')))) return;
+	toolchain = { executable: candidate.executable, ...(typeof candidate.bundleRoot === 'string' ? { bundleRoot: candidate.bundleRoot } : {}) };
+	for (const [root, owner] of owners) {
+		owner.generation++;
+		owner.abort?.abort();
+		owner.abort = undefined;
+		clear(owner);
+		state(root, 'outdated');
+	}
+}
 function workspaceFor(file: string): string {
 	return folders.map(folder => fileOf(folder.uri)).filter((folder): folder is string => !!folder)
 		.filter(folder => file === folder || file.startsWith(folder + path.sep))
@@ -92,7 +109,7 @@ function settingsFrom(value: unknown): Settings {
 	const v = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
 	const strings = (x: unknown): x is string[] => Array.isArray(x) && x.every(item => typeof item === 'string');
 	return {
-		executable: typeof v.executable === 'string' && v.executable ? v.executable : defaults.executable,
+		executable: typeof v.executable === 'string' && v.executable.trim() ? v.executable : defaults.executable,
 		arguments: strings(v.arguments) ? v.arguments : [], includePaths: strings(v.includePaths) ? v.includePaths : [],
 		smtTimeout: typeof v.smtTimeout === 'number' && Number.isInteger(v.smtTimeout) && v.smtTimeout > 0 ? v.smtTimeout : defaults.smtTimeout,
 		verifyOnSave: typeof v.verifyOnSave === 'boolean' ? v.verifyOnSave : defaults.verifyOnSave,
@@ -134,14 +151,17 @@ async function verify(uri: string, onSave = false): Promise<void> {
 		const snapshot = new Map(revisions);
 		const workspace = workspaceFor(root);
 		const cwd = config.cwd ? path.resolve(workspace, config.cwd) : workspace;
-		const executable = config.executable.includes('/') || config.executable.includes('\\')
-			? path.resolve(cwd, config.executable) : config.executable;
+		const selected = config.executable || toolchain?.executable || 'caravan';
+		const executable = selected.includes('/') || selected.includes('\\')
+			? path.resolve(cwd, selected) : selected;
+		const bundleRoot = !config.executable ? toolchain?.bundleRoot : undefined;
+		const env = bundleRoot ? toolchainEnvironment(bundleRoot) : undefined;
 		const args = [...config.arguments, '--lsp-mode', '--lsp-annotations', '--smt-timeout', String(config.smtTimeout),
 			...config.includePaths.flatMap(directory => ['-I', path.resolve(cwd, directory)]), root];
 		const abort = new AbortController();
 		owner.abort = abort;
 		state(root, 'verifying');
-		const output = await processes.run(executable, args, cwd, abort.signal);
+		const output = await processes.run(executable, args, cwd, abort.signal, env);
 		if (shuttingDown || abort.signal.aborted || generation !== owner.generation) return;
 		let report;
 		try {
@@ -203,6 +223,7 @@ async function verify(uri: string, onSave = false): Promise<void> {
 }
 
 connection.onInitialize((params: InitializeParams) => {
+	selectToolchain(params.initializationOptions?.toolchain);
 	configuration = params.capabilities.workspace?.configuration === true;
 	workspaceFolders = params.capabilities.workspace?.workspaceFolders === true;
 	folders = params.workspaceFolders ?? (params.rootUri ? [{ uri: params.rootUri, name: 'workspace' }] : []);
@@ -230,6 +251,7 @@ connection.onDidChangeWatchedFiles(event => {
 		invalidate(file);
 	}
 });
+connection.onNotification(toolchainNotification, selectToolchain);
 connection.onNotification(verifyNotification, (params: VerifyParams) => {
 	if (params && typeof params.uri === 'string') void verify(params.uri);
 });

@@ -3,19 +3,20 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { pathToFileURL } = require('node:url');
+const { URI } = require('vscode-uri');
 const { spawn } = require('node:child_process');
 const { parseReport, normalizeReport, utf16Column } = require('../out/server/report');
 const { VerificationProcesses } = require('../out/server/verificationProcesses');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-const uri = file => pathToFileURL(file).href;
+const uri = file => URI.file(file).toString();
 const fakeVerifier = `
 const fs = require('node:fs');
 const path = require('node:path');
 const file = process.argv.at(-1);
 const text = fs.readFileSync(file, 'utf8');
 fs.appendFileSync(path.join(path.dirname(file), 'runs'), JSON.stringify(process.argv.slice(2)) + '\\n');
+fs.writeFileSync(path.join(path.dirname(file), 'environment'), JSON.stringify({OCAMLLIB:process.env.OCAMLLIB,PATH:process.env.PATH}));
 const location = {file,start_line:1,start_col:text.includes('unicode')?6:2,end_line:1,end_col:text.includes('unicode')?10:4};
 const fail = text.includes('fail');
 const warning = text.includes('warning');
@@ -35,8 +36,8 @@ function answer() {
 if(text.includes('slow')) setTimeout(answer,1200); else answer();
 `;
 
-async function fixture(t, initial = 'let x = 1') {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'caravan lsp '));
+async function fixture(t, initial = 'let x = 1', toolchain) {
+	const dir = URI.file(await fs.mkdtemp(path.join(os.tmpdir(), 'caravan lsp '))).fsPath;
 	const file = path.join(dir, 'main.ml');
 	const script = path.join(dir, 'fake verifier.cjs');
 	await fs.writeFile(file, initial);
@@ -99,7 +100,7 @@ async function fixture(t, initial = 'let x = 1') {
 		}
 		await fs.rm(dir, { recursive: true, force: true });
 	});
-	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true } } });
+	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true } }, initializationOptions: { toolchain } });
 	notify('initialized', {});
 	return { dir, file, settings, messages, notify, wait, state, open };
 }
@@ -211,7 +212,7 @@ test('leading related locations attach to the next error and missing library tex
 			{ ...location, file: 'main.ml', start_line: 1, end_line: 1, start_col: 6, end_col: 7, kind: 'Verification', message: ['Cannot prove'] }],
 		dependencies: [], annotations: [], members: [], references: [], symbols: []
 	}), 1);
-	const normalized = normalizeReport(report, '/tmp/main.ml', '/tmp', file => file.endsWith('main.ml') ? 'é😀x' : undefined);
+	const normalized = normalizeReport(report, path.join(os.tmpdir(), 'main.ml'), os.tmpdir(), file => file.endsWith('main.ml') ? 'é😀x' : undefined);
 	assert.equal(normalized.diagnostics[0].location.start.character, 3);
 	assert.equal(normalized.diagnostics[0].related[0].message, 'Inherited\ncontract');
 	assert.deepEqual(normalized.diagnostics[0].related[0].location.start, { line: 2, character: 7 });
@@ -274,4 +275,53 @@ test('process cancellation removes queued work and terminates child process grou
 	await delay(900);
 	await assert.rejects(fs.access(marker), { code: 'ENOENT' });
 	assert.equal((await processes.run(process.execPath, ['-e', "process.stdout.write('ok')"], dir, new AbortController().signal)).stdout, 'ok');
+});
+
+
+test('automatic toolchain uses matching compiler environment and explicit launcher overrides it', { timeout: 15000 }, async t => {
+	const bundleRoot = path.join(os.tmpdir(), 'managed toolchain');
+	const f = await fixture(t, 'let x = 1', { executable: process.execPath, bundleRoot });
+	f.settings.executable = '';
+	await f.open();
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified');
+	let environment = JSON.parse(await fs.readFile(path.join(f.dir, 'environment'), 'utf8'));
+	assert.equal(environment.OCAMLLIB, path.join(bundleRoot, 'lib', 'ocaml'));
+	assert.equal(environment.PATH.split(path.delimiter)[0], path.join(bundleRoot, 'bin'));
+	const from = f.messages.length;
+	f.notify('caravan/toolchain', { executable: path.join(f.dir, 'missing'), bundleRoot });
+	await f.state('outdated', from);
+	f.settings.executable = process.execPath;
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	environment = JSON.parse(await fs.readFile(path.join(f.dir, 'environment'), 'utf8'));
+	assert.equal(environment.OCAMLLIB, process.env.OCAMLLIB);
+	assert.equal(environment.PATH, process.env.PATH);
+});
+
+test('toolchain changes cancel in-flight verification and invalidate unchanged document versions', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'slow fail');
+	await f.open();
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verifying');
+	for (let attempt = 0; attempt < 100; attempt++) {
+		try { await fs.access(path.join(f.dir, 'runs')); break; } catch { await delay(10); }
+	}
+	const from = f.messages.length;
+	f.notify('caravan/toolchain', { executable: process.execPath });
+	assert.equal((await f.state('outdated', from)).params.version, 1);
+	await delay(1300);
+	assert.equal(f.messages.slice(from).some(message => ['failed', 'verified', 'unavailable'].includes(message.params?.state)), false);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('failed', from);
+	const changed = f.messages.length;
+	f.notify('caravan/toolchain', { executable: process.execPath });
+	await f.state('outdated', changed);
+	await f.wait(message => message.method === 'textDocument/publishDiagnostics' && message.params.diagnostics.length === 0, changed);
+	const invalid = f.messages.length;
+	for (const value of [null, {}, { executable: 42 }, { executable: '' }, { executable: process.execPath, bundleRoot: 42 }]) f.notify('caravan/toolchain', value);
+	await delay(100);
+	assert.equal(f.messages.slice(invalid).some(message => message.params?.state === 'outdated'), false);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('failed', invalid);
 });

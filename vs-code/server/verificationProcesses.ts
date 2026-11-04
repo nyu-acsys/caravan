@@ -46,13 +46,13 @@ export class VerificationProcesses {
 			}
 		});
 	}
-	async run(executable: string, args: string[], cwd: string, signal: AbortSignal): Promise<ProcessResult> {
+	async run(executable: string, args: string[], cwd: string, signal: AbortSignal, env?: NodeJS.ProcessEnv): Promise<ProcessResult> {
 		await this.acquire(signal);
 		try {
 			if (signal.aborted) throw new Error('Verification cancelled');
 			return await new Promise<ProcessResult>((resolve, reject) => {
 				const child = spawn(executable, args, {
-					cwd, shell: false, detached: process.platform !== 'win32', windowsHide: true,
+					cwd, env, shell: false, detached: process.platform !== 'win32', windowsHide: true,
 					stdio: ['ignore', 'pipe', 'pipe']
 				});
 				const stdout: Buffer[] = [];

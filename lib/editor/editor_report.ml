@@ -67,3 +67,14 @@ let report ~annotations (results : Caravan_core.Check.result list) : Yojson.Basi
       ]
 
 let to_string ~annotations results = Yojson.Basic.to_string (report ~annotations results)
+
+let manifest ~version ~lsp_protocol ~min_z3 =
+  Yojson.Basic.to_string
+    (`Assoc
+       [
+         ("version", `String version);
+         ("lsp_protocol", `Int lsp_protocol);
+         ("min_z3", `String min_z3);
+         ("ocaml_version", `String Stdlib.Sys.ocaml_version);
+         ("raven_api_version", `Int R.version);
+       ])

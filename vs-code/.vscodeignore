@@ -9,5 +9,9 @@ node_modules/@types/**
 node_modules/vscode-textmate/**
 node_modules/vscode-oniguruma/**
 **/*.map
+**/*~
 .gitignore
 dune
+downloads/**
+dist/**
+CARAVAN_VERSION

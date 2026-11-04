@@ -1,5 +1,8 @@
 Editor output uses Raven's flags and JSON shapes, with no human-readable prefix.
 
+  $ caravan --manifest > manifest.json
+  $ python3 check_editor_report.py manifest manifest.json
+
   $ caravan --lsp-mode editor_ok.ml > plain.json
   $ python3 check_editor_report.py plain plain.json
   $ caravan --lsp-mode --lsp-annotations editor_ok.ml > enriched.json

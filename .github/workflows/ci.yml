@@ -16,7 +16,11 @@ env:
 
 jobs:
   editor:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: vs-code
@@ -29,6 +33,9 @@ jobs:
           cache-dependency-path: vs-code/package-lock.json
       - run: npm ci
       - run: npm test
+      - name: Test native bundle packaging helpers
+        working-directory: .
+        run: python -m unittest discover -s scripts/release -v
 
   # The ocamlformat version must match the one in .ocamlformat.
   format:
@@ -57,8 +64,13 @@ jobs:
           - os: ubuntu-latest
             z3_glob: "*x64-glibc*.zip"
             ocaml-compiler: "5.5"
+          - os: windows-latest
+            z3_glob: "*x64-win*.zip"
+            ocaml-compiler: "5.5"
 
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout tree

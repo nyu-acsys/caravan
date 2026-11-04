@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { LanguageClient, LanguageClientOptions, ServerOptions, State, TransportKind } from 'vscode-languageclient/node';
 
-import { verificationStateNotification, verifyNotification, type VerificationState, type VerificationStateParams } from '../shared/protocol';
+import { verificationStateNotification, verifyNotification, toolchainNotification, type VerificationState, type VerificationStateParams } from '../shared/protocol';
+import { VerifierUpdates } from './updates';
 
 let client: LanguageClient | undefined;
 
@@ -19,6 +20,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   status.command = 'caravan.verify';
   const states = new Map<string, VerificationStateParams>();
   let unavailable = false;
+  const updates = new VerifierUpdates(context, output, async selection => {
+    if (client?.isRunning()) await client.sendNotification(toolchainNotification, {
+      executable: selection.executable, bundleRoot: selection.bundleRoot });
+  });
+  const toolchain = await updates.refresh();
+  updates.register();
   const refresh = (): void => {
     const document = vscode.window.activeTextEditor?.document;
     if (!document || !supported(document)) {
@@ -46,6 +53,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ml,mli,proof}');
   context.subscriptions.push(fileWatcher);
   const clientOptions: LanguageClientOptions = {
+    initializationOptions: () => {
+      const selected = updates.current ?? toolchain;
+      return { toolchain: { executable: selected.executable, bundleRoot: selected.bundleRoot } };
+    },
     documentSelector: [
       { scheme: 'file', language: 'ocaml', pattern: '**/*.ml' },
       { scheme: 'file', language: 'ocaml.interface', pattern: '**/*.mli' },
@@ -97,6 +108,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   refresh();
   try {
     await activeClient.start();
+    const latest = updates.current;
+    if (latest && (latest.executable !== toolchain.executable || latest.bundleRoot !== toolchain.bundleRoot)) {
+      await activeClient.sendNotification(toolchainNotification, { executable: latest.executable, bundleRoot: latest.bundleRoot });
+    }
+    void updates.check(false);
   } catch (error) {
     unavailable = true;
     refresh();

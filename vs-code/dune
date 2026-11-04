@@ -1,1 +1,1 @@
-(dirs :standard \ node_modules out)
+(dirs :standard \ node_modules out bundled downloads dist)

@@ -630,6 +630,8 @@ proofs. A program with outlines has no proof annotations in its `.ml`.
 The [VS Code extension](vs-code/) adds highlighting for `.proof` files and inline
 specifications alongside OCaml Platform. It verifies saved files on demand or on
 save, with diagnostics in Problems and verification status in the status bar.
+Platform packages include Caravan, its linked Raven verifier, Z3, and matching
+OCaml interfaces, with compatible toolchain updates managed by the extension.
 See its README for installation and tool configuration.
 
 ## Building

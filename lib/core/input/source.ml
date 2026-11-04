@@ -429,7 +429,15 @@ let library_files ~include_dirs file =
     raising; they are returned here. *)
 let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
   try
-    Compmisc.init_path ();
+    let standard_library =
+      let root = Stdlib.Filename.(dirname (dirname Stdlib.Sys.executable_name)) in
+      let directory = Stdlib.Filename.concat root "lib/ocaml" in
+      Option.some_if
+        (Stdlib.Sys.file_exists (Stdlib.Filename.concat root "manifest.json")
+        && Stdlib.Sys.file_exists (Stdlib.Filename.concat directory "stdlib.cmi"))
+        directory
+    in
+    Compmisc.init_path ?standard_library ();
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in

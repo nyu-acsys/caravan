@@ -9,3 +9,6 @@ export interface VerificationStateParams {
 	message?: string;
 }
 export interface VerifyParams { uri: string }
+
+export const toolchainNotification = 'caravan/toolchain';
+export interface ToolchainSelection { executable: string; bundleRoot?: string }

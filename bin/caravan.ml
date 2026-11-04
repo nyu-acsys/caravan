@@ -35,6 +35,10 @@ let emit_rav =
   let doc = "Print the Raven program generated for the files instead of verifying it." in
   Arg.(value & flag & info [ "emit-rav" ] ~doc)
 
+let manifest =
+  let doc = "Print the tool version and compatibility information as JSON, then exit." in
+  Arg.(value & flag & info [ "manifest" ] ~doc)
+
 let lsp_mode =
   let doc = "Format error messages for LSP integration, as Raven does." in
   Arg.(value & flag & info [ "lsp-mode" ] ~doc)
@@ -75,9 +79,17 @@ let files =
   let doc = "The OCaml files to verify." in
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
 
-let main () no_greeting include_dirs history emit_rav lsp_mode lsp_annotations smt_timeout
-    files =
-  if lsp_mode && emit_rav then begin
+let main () no_greeting include_dirs history emit_rav manifest lsp_mode lsp_annotations
+    smt_timeout files =
+  if manifest then begin
+    Logs.app (fun m ->
+        m "%s"
+          (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
+             ~lsp_protocol:Caravan_config.lsp_protocol_version
+             ~min_z3:Caravan_config.min_z3_version));
+    0
+  end
+  else if lsp_mode && emit_rav then begin
     Logs.err (fun m -> m "--lsp-mode and --emit-rav cannot be used together");
     1
   end
@@ -106,7 +118,7 @@ let cmd =
   let info = Cmd.info "caravan" ~version:Caravan_config.version in
   Cmd.v info
     Term.(
-      const main $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ lsp_mode
-      $ lsp_annotations $ smt_timeout $ files)
+      const main $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest
+      $ lsp_mode $ lsp_annotations $ smt_timeout $ files)
 
 let () = Stdlib.exit (Cmd.eval' cmd)

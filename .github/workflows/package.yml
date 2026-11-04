@@ -1,0 +1,86 @@
+name: Package bundled VS Code extension
+on:
+  push:
+    tags: ['vscode-v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, darwin-arm64, win32-x64]
+    defaults:
+      run:
+        working-directory: vs-code
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: vs-code/package-lock.json
+      - run: npm ci
+      - name: Fetch pinned Caravan release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat CARAVAN_VERSION)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Set CARAVAN_VERSION to a published verifier tag before packaging.' >&2; exit 1; }
+          mkdir -p downloads bundled
+          gh release download "$version" --repo "$GITHUB_REPOSITORY" \
+            --pattern "caravan-$PLATFORM.tar.gz" --pattern SHA256SUMS --pattern manifest.json --dir downloads
+          cd downloads
+          python3 - <<'PYTHON'
+          import hashlib, pathlib, re
+          expected = {'manifest.json', 'caravan-' + __import__('os').environ['PLATFORM'] + '.tar.gz'}
+          entries = {}
+          for line in pathlib.Path('SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9_.-]+)', line)
+              if not match or match[2] in entries:
+                  raise ValueError('Malformed or duplicate checksum entry')
+              entries[match[2]] = match[1]
+          if not expected <= entries.keys():
+              raise ValueError('Checksum list must cover manifest and selected archive')
+          for name in expected:
+              with open(name, 'rb') as source:
+                  if hashlib.file_digest(source, 'sha256').hexdigest() != entries[name]:
+                      raise ValueError('Checksum mismatch for ' + name)
+          PYTHON
+          tar -xzf "caravan-$PLATFORM.tar.gz" -C ../bundled
+          cmp manifest.json ../bundled/manifest.json
+      - name: Check extension tag and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/vscode-v* ]]; then
+            version=$(node -p 'require("./package.json").version')
+            test "$GITHUB_REF_NAME" = "vscode-v$version"
+          fi
+          mkdir -p dist
+          npx --yes @vscode/vsce@3.7.1 package --target '${{ matrix.platform }}' --out dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caravan-vscode-${{ matrix.platform }}
+          path: vs-code/dist/*.vsix
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/vscode-v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: artifacts/*/*.vsix
+          fail_on_unmatched_files: true

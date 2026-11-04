@@ -6,6 +6,10 @@
   "version": "0.1.0",
   "publisher": "nyu-acsys",
   "repository": { "type": "git", "url": "https://github.com/nyu-acsys/caravan.git", "directory": "vs-code" },
+  "vsce": {
+    "baseContentUrl": "https://github.com/nyu-acsys/caravan/blob/HEAD/vs-code",
+    "baseImagesUrl": "https://github.com/nyu-acsys/caravan/raw/HEAD/vs-code"
+  },
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages", "Linters"],
@@ -32,7 +36,12 @@
     "vscode-oniguruma": "^2.0.1"
   },
   "contributes": {
-    "commands": [{"command": "caravan.verify", "title": "Caravan: Verify Saved File"}],
+    "commands": [
+      {"command": "caravan.verify", "title": "Caravan: Verify Saved File"},
+      {"command": "caravan.updateVerifier", "title": "Caravan: Update Verifier"},
+      {"command": "caravan.showVerifierVersion", "title": "Caravan: Show Verifier Version"},
+      {"command": "caravan.useBundledVerifier", "title": "Caravan: Use Bundled Verifier"}
+    ],
     "languages": [{"id": "caravan-proof", "aliases": ["Caravan Proof"], "extensions": [".proof"], "configuration": "./language-configuration.json"}],
     "grammars": [
       {"language": "caravan-proof", "scopeName": "source.caravan.proof", "path": "./syntaxes/proof.tmLanguage.json"},
@@ -42,7 +51,10 @@
     "configuration": {
       "title": "Caravan",
       "properties": {
-        "caravan.executable": {"type": "string", "default": "caravan", "scope": "resource", "description": "Caravan executable or launcher program. Runs without a shell."},
+        "caravan.executable": {"type": "string", "default": "", "scope": "resource", "description": "Override the managed or bundled Caravan with an executable or launcher program. Empty selects automatically. Runs without a shell."},
+        "caravan.updateChannel": {"type": "string", "enum": ["stable", "tag", "bundled"], "default": "stable", "scope": "window", "description": "Follow stable Caravan releases, select a release tag, or use only the bundled toolchain. Updates are offered before downloading."},
+        "caravan.caravanVersion": {"type": "string", "default": "", "scope": "window", "description": "Caravan release tag for the tag channel, for example v0.1.0."},
+        "caravan.checkForUpdates": {"type": "boolean", "default": true, "scope": "window", "description": "Check for a newer compatible toolchain on startup, at most once a day. Downloads require acceptance."},
         "caravan.arguments": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Arguments before Caravan's verification flags and file path. For opam use executable opam and arguments [exec, --, caravan]."},
         "caravan.cwd": {"type": "string", "default": "", "scope": "resource", "description": "Working directory, relative to the containing workspace folder or absolute. Empty uses the workspace folder, or the file directory outside a workspace."},
         "caravan.includePaths": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Include directories passed with -I, resolved from the working directory."},
