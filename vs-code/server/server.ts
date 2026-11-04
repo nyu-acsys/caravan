@@ -1,13 +1,13 @@
 import { createConnection, TextDocuments, TextDocumentSyncKind, DiagnosticSeverity,
-	type CodeLens, type Diagnostic, type InitializeParams, type WorkspaceFolder } from 'vscode-languageserver/node';
+	type Diagnostic, type InitializeParams, type WorkspaceFolder } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { URI } from 'vscode-uri';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { toolchainEnvironment } from '../shared/toolchain';
 import { VerificationProcesses } from './verificationProcesses';
-import { parseReport, normalizeReport, normalizeContracts, type RavenReport } from './report';
-import { contractLenses } from './contracts';
+import { parseReport, normalizeReport, normalizeContracts, type RavenReport, type NormalizedContract } from './report';
+import { contractLenses, contractHover } from './contracts';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
@@ -19,7 +19,7 @@ interface Owner {
 	diagnostics: Map<string, Diagnostic[]>;
 	state: VerificationState; message?: string;
 	annotationGeneration: number; annotationAbort?: AbortController;
-	annotations?: Promise<CodeLens[]>; annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
+	annotations?: Promise<NormalizedContract[]>; annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 }
 const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, cwd: '' };
 const connection = createConnection();
@@ -192,13 +192,13 @@ function checkedReport(stdout: string, code: number | null, root: string, cwd: s
 	}
 	return parsed;
 }
-async function annotations(root: string, uri: string, owner: Owner): Promise<CodeLens[]> {
+async function annotations(root: string, uri: string, owner: Owner): Promise<NormalizedContract[]> {
 	const generation = owner.annotationGeneration;
 	try {
 		const config = await settings(uri);
 		if (shuttingDown || generation !== owner.annotationGeneration) return [];
 		const known = knownDependencies(root, owner);
-		if (!config.showContractLenses || hasDirty(known) || !fs.existsSync(root)) return [];
+		if (hasDirty(known) || !fs.existsSync(root)) return [];
 		const snapshot = new Map(revisions);
 		const { executable, args, cwd, env } = launch(root, config, true);
 		const abort = new AbortController();
@@ -210,13 +210,28 @@ async function annotations(root: string, uri: string, owner: Owner): Promise<Cod
 		owner.annotationDependencies = dependencies;
 		if (hasDirty(dependencies) || [...dependencies].some(file => (revisions.get(file) ?? 0) !== (snapshot.get(file) ?? 0))) return [];
 		owner.annotationStamps = new Map([...dependencies].map(file => [file, diskStamp(file)]));
-		return contractLenses(normalizeContracts(report, cwd, sourceText), root);
+		return normalizeContracts(report, cwd, sourceText);
 	} catch {
 		// Older toolchains may not support frontend-only annotation reports.
 		return [];
 	} finally {
 		if (generation === owner.annotationGeneration) owner.annotationAbort = undefined;
 	}
+}
+async function contractsFor(uri: string): Promise<NormalizedContract[]> {
+	const root = fileOf(uri);
+	if (!root || !root.endsWith('.ml') || shuttingDown) return [];
+	const owner = ownerOf(root);
+	if (owner.annotationStamps) {
+		for (const [file, stamp] of owner.annotationStamps) {
+			if (diskStamp(file) !== stamp) { invalidate(file); break; }
+		}
+	}
+	if (hasDirty(knownDependencies(root, owner))) return [];
+	const generation = owner.annotationGeneration;
+	owner.annotations ??= annotations(root, uri, owner);
+	const result = await owner.annotations;
+	return generation !== owner.annotationGeneration || hasDirty(knownDependencies(root, owner)) ? [] : result;
 }
 async function verify(uri: string, onSave = false): Promise<void> {
 	const file = fileOf(uri);
@@ -289,7 +304,7 @@ connection.onInitialize((params: InitializeParams) => {
 	configuration = params.capabilities.workspace?.configuration === true;
 	workspaceFolders = params.capabilities.workspace?.workspaceFolders === true;
 	folders = params.workspaceFolders ?? (params.rootUri ? [{ uri: params.rootUri, name: 'workspace' }] : []);
-	return { capabilities: { codeLensProvider: { resolveProvider: false }, textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
+	return { capabilities: { hoverProvider: true, codeLensProvider: { resolveProvider: false }, textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
 		workspace: { workspaceFolders: { supported: true, changeNotifications: true } } } };
 });
 connection.onInitialized(() => {
@@ -318,16 +333,15 @@ connection.onDidChangeWatchedFiles(event => {
 connection.onCodeLens(async (params, token) => {
 	const root = fileOf(params.textDocument.uri);
 	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return [];
-	const owner = ownerOf(root);
-	if (owner.annotationStamps) {
-		for (const [file, stamp] of owner.annotationStamps) {
-			if (diskStamp(file) !== stamp) { invalidate(file); break; }
-		}
-	}
-	if (hasDirty(knownDependencies(root, owner))) return [];
-	owner.annotations ??= annotations(root, params.textDocument.uri, owner);
-	const result = await owner.annotations;
-	return token.isCancellationRequested ? [] : result;
+	if (!(await settings(params.textDocument.uri)).showContractLenses) return [];
+	const result = await contractsFor(params.textDocument.uri);
+	return token.isCancellationRequested ? [] : contractLenses(result, root);
+});
+connection.onHover(async (params, token) => {
+	const root = fileOf(params.textDocument.uri);
+	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return null;
+	const result = await contractsFor(params.textDocument.uri);
+	return token.isCancellationRequested ? null : contractHover(result, root, params.position, sourceText, workspaceFor(root));
 });
 connection.onNotification(toolchainNotification, selectToolchain);
 connection.onNotification(verifyNotification, (params: VerifyParams) => {

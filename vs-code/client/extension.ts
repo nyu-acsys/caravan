@@ -36,13 +36,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const saved = states.get(document.uri.toString());
     const state = document.isDirty ? 'outdated' : unavailable ? 'unavailable' :
       saved && saved.version === document.version ? saved.state : 'unchecked';
-    const icons: Record<VerificationState, string> = {
-      unchecked: 'circle-outline', outdated: 'circle-slash', verifying: 'sync~spin',
-      verified: 'pass', verifiedWithWarnings: 'warning', failed: 'error', unavailable: 'warning'
+    const presentations: Record<VerificationState, { icon: string; color: string }> = {
+      unchecked: { icon: 'circle-outline', color: 'descriptionForeground' },
+      outdated: { icon: 'circle-slash', color: 'descriptionForeground' },
+      verifying: { icon: 'sync~spin', color: 'charts.blue' },
+      verified: { icon: 'pass', color: 'charts.green' },
+      verifiedWithWarnings: { icon: 'warning', color: 'charts.yellow' },
+      failed: { icon: 'error', color: 'charts.red' },
+      unavailable: { icon: 'warning', color: 'charts.orange' }
     };
+    const presentation = presentations[state];
     const label = state === 'verifiedWithWarnings' ? 'verified with warnings' : state;
-    status.text = `$(${icons[state]}) Caravan: ${label}`;
-    status.color = state === 'verifiedWithWarnings' ? new vscode.ThemeColor('editorWarning.foreground') : undefined;
+    status.text = `$(${presentation.icon}) Caravan: ${label}`;
+    status.color = new vscode.ThemeColor(presentation.color);
     status.tooltip = saved?.version === document.version && saved.state === state && saved.message ?
       saved.message : state === 'outdated' ? 'Save the file before verifying.' : 'Verify the saved file with Caravan.';
     status.show();

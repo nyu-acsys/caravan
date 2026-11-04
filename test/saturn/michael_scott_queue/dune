@@ -1,3 +1,8 @@
+(library
+ (name caravan_saturn_michael_scott_queue)
+ (wrapped false)
+ (libraries caravan_saturn_backoff))
+
 (cram
  (deps
   %{bin:caravan}

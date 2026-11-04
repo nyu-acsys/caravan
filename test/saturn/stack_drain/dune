@@ -1,5 +1,11 @@
 (copy_files ../treiber_stack/treiber_stack.mli)
 
+(library
+ (name caravan_saturn_stack_drain)
+ (wrapped false)
+ (modules stack_drain wrong_contents wrong_result raising_call)
+ (libraries caravan_saturn_treiber_stack))
+
 (cram
  (deps
   %{bin:caravan}

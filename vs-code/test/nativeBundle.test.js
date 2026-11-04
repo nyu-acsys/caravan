@@ -9,7 +9,7 @@ const { execFile } = require('node:child_process');
 const core = require('../out/client/verifier');
 const { systemPath } = require('../out/shared/toolchain');
 const { parseReport, normalizeContracts } = require('../out/server/report');
-const { contractLenses } = require('../out/server/contracts');
+const { contractLenses, contractHover } = require('../out/server/contracts');
 const { readFileSync } = require('node:fs');
 const run = promisify(execFile);
 
@@ -61,7 +61,13 @@ test('native release installs and verifies Saturn with its relocated compiler an
       const lenses = contractLenses(contracts, source);
       assert.ok(lenses.length >= 6);
       assert.ok(lenses.every(lens => lens.command.command === 'caravan.openContract'));
-      assert.ok(lenses.every(lens => lens.command.title.startsWith('contract (treiber_stack.mli)')));
+      assert.ok(lenses.some(lens => lens.command.arguments[0].uri.endsWith('/treiber_stack.mli')));
+      assert.ok(lenses.every(lens => /\/treiber_stack\.(mli|proof)$/.test(lens.command.arguments[0].uri)));
+      const hover = contractHover(contracts, source, contracts[0].location.start,
+        file => readFileSync(file, 'utf8'), repository);
+      assert.ok(hover.contents.value.includes('Contract from [test/saturn/treiber\\_stack/treiber\\_stack.mli:'));
+      assert.match(hover.contents.value, /```caravan-proof\nt = create \(\)/);
+      assert.equal(hover.contents.value.includes('(*@'), false);
       const result = await run(selected.executable, ['--shh', ...includes, source],
         { env: environment, timeout: 120000 });
       assert.match(result.stdout, /Verification successful/);

@@ -13,3 +13,9 @@
 Keep positive and negative checks alongside the sources they exercise. Examples
 and case studies should have a directory of their own; focused regressions can
 share a directory by feature.
+
+The Saturn sources and clients also have ordinary Dune library stanzas, so
+`dune build` checks their OCaml types and supplies editor configurations to OCaml
+Platform. Select the project's OCaml 5.5 switch in the editor and build from the
+repository root. Backoff is an interface-only dependency; these stanzas compile
+the examples but do not provide an executable Backoff implementation.

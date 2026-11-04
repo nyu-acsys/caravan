@@ -342,6 +342,8 @@ test('toolchain changes cancel in-flight verification and invalidate unchanged d
 });
 
 const lenses = (f, target = f.file) => f.request('textDocument/codeLens', { textDocument: { uri: uri(target) } });
+const hover = (f, position = { line: 0, character: 2 }, target = f.file) =>
+	f.request('textDocument/hover', { textDocument: { uri: uri(target) }, position });
 const runs = async f => (await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim().split('\n').map(JSON.parse);
 
 test('contract lenses discover frontend metadata, cache it, and preserve unchecked state', { timeout: 15000 }, async t => {
@@ -350,14 +352,22 @@ test('contract lenses discover frontend metadata, cache it, and preserve uncheck
 	await fs.writeFile(origin, 'é😀contract');
 	await f.open();
 	await f.state('unchecked');
+	const contract = await hover(f, { line: 0, character: 3 });
+	assert.deepEqual(contract.range, { start: { line: 0, character: 3 }, end: { line: 0, character: 7 } });
+	assert.equal(contract.contents.kind, 'markdown');
+	assert.ok(contract.contents.value.includes(`(<${uri(origin)}#L1%2C4>)`));
+	assert.match(contract.contents.value, /main\.mli:1/);
+	assert.match(contract.contents.value, /```caravan-proof\ncont\n```/);
+	assert.equal(await hover(f, { line: 0, character: 7 }), null);
 	const result = await lenses(f);
 	assert.equal(result.length, 1);
-	assert.equal(result[0].command.title, 'contract (main.mli): requires x > 0 && true · ensures result > x');
+	assert.equal(result[0].command.title, 'requires x > 0 && true · ensures result > x');
 	assert.deepEqual(result[0].range, { start: { line: 0, character: 3 }, end: { line: 0, character: 3 } });
 	assert.equal(result[0].command.command, 'caravan.openContract');
 	assert.deepEqual(result[0].command.arguments, [{ uri: uri(origin), range: { start: { line: 0, character: 3 }, end: { line: 0, character: 7 } } }]);
 	assert.deepEqual(await lenses(f), result);
 	assert.deepEqual(await lenses(f, origin), []);
+	assert.equal(await hover(f, { line: 0, character: 3 }, origin), null);
 	assert.equal((await runs(f)).length, 1);
 	assert.ok((await runs(f))[0].includes('--lsp-annotations-only'));
 	assert.equal(f.messages.some(message => message.method === 'textDocument/publishDiagnostics' || (message.params?.state && message.params.state !== 'unchecked')), false);
@@ -397,6 +407,7 @@ test('companion edits, dependencies, configuration and toolchains invalidate con
 	assert.equal((await lenses(f)).length, 1);
 	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'changed' }] });
 	assert.deepEqual(await lenses(f), []);
+	assert.equal(await hover(f), null);
 	assert.equal((await runs(f)).length, 1);
 	await fs.writeFile(proof, 'changed');
 	f.notify('textDocument/didSave', { textDocument: { uri: uri(proof) } });
@@ -419,6 +430,9 @@ test('companion edits, dependencies, configuration and toolchains invalidate con
 	f.notify('workspace/didChangeConfiguration', { settings: {} });
 	assert.deepEqual(await lenses(f), []);
 	assert.equal((await runs(f)).length, 6);
+	const contract = await hover(f);
+	assert.match(contract.contents.value, /main\.proof:1/);
+	assert.equal((await runs(f)).length, 7);
 });
 
 test('stale frontend metadata cannot reinstall lenses after a companion edit', { timeout: 15000 }, async t => {
@@ -428,13 +442,16 @@ test('stale frontend metadata cannot reinstall lenses after a companion edit', {
 	await f.open();
 	await f.open(origin);
 	const first = lenses(f);
+	const firstHover = hover(f);
 	while (true) {
 		try { if ((await runs(f)).length) break; } catch { }
 		await delay(10);
 	}
 	f.notify('textDocument/didChange', { textDocument: { uri: uri(origin), version: 2 }, contentChanges: [{ text: 'dirty' }] });
 	assert.deepEqual(await first, []);
+	assert.equal(await firstHover, null);
 	assert.deepEqual(await lenses(f), []);
+	assert.equal(await hover(f), null);
 	await delay(1300);
 	assert.deepEqual(await lenses(f), []);
 	assert.equal((await runs(f)).length, 1);

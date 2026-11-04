@@ -85,9 +85,16 @@ such as `/path/to/caravan/_build/default/bin/caravan.exe`.
 
 Opening a saved `.ml` file shows contract summaries above functions whose contracts
 come from a `.mli` or `.proof` file. A lens such as
-`contract (stack.mli): requires ... · ensures ...` shows the original clauses;
+`requires ... · ensures ...` shows the original clauses;
 click it to open and select the annotation in its source file. Inline contracts
 already visible in the `.ml` are not repeated.
+
+Hover over an implementation function's name to see its complete external
+contract, including the original header and line breaks but omitting the outer
+comment markers, with a link to its
+`.mli` or `.proof` source. Contracts use Caravan's proof syntax highlighting.
+These hovers complement OCaml Platform's type
+information and remain available when contract lenses are disabled.
 
 Contract discovery runs independently of the solver and does not verify the file.
 Edits to the implementation or its dependencies hide outdated summaries until the
