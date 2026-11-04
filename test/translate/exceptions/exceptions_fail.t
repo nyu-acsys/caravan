@@ -81,3 +81,47 @@ if the exception leaves the function, or the loop's own. Its condition may not r
               ^^^^^^^^^^^
   Unsupported Error: A loop condition that may raise is not supported yet.
   [1]
+
+A raise leaving a function with an atomic contract must follow the step that linearizes
+it; what its atomic raises clauses say is checked; and a raising call in such a function
+must be a retry.
+
+  $ mkdir early wrong twice
+  $ cp atomic_stack.ml atomic_stack.mli early/
+  $ grep -v pop_exn atomic_stack.proof > early/atomic_stack.proof
+  $ caravan --shh early/atomic_stack.ml
+  [Error] File "early/atomic_stack.ml", line 14, columns 10-21:
+  14 |   | [] -> raise Empty
+                 ^^^^^^^^^^^
+  Type Error: This raise may leave the function before a step linearizes it, or after it linearized returning: annotate the step that linearizes it by raising, as (*@ returning [] -> commit *).
+  [1]
+  $ cp atomic_stack.ml atomic_stack.proof wrong/
+  $ sed 's/xs = \[\] && stack t \[\]/xs <> [] \&\& stack t []/' atomic_stack.mli > wrong/atomic_stack.mli
+  $ caravan --shh wrong/atomic_stack.ml
+  [Error] File "wrong/atomic_stack.ml", line 13, columns 8-20:
+  13 |   match Atomic.get t with
+               ^^^^^^^^^^^^
+  Verification Error: The atomic postcondition may not hold after this step, which linearizes the function.
+  File "wrong/atomic_stack.mli", line 22, columns 27-49:
+  22 |     atomic raises Empty -> xs <> [] && stack t [] *)
+                                  ^^^^^^^^^^^^^^^^^^^^^^
+  Related Location: The atomic postcondition.
+  [Error] File "wrong/atomic_stack.ml", line 13, columns 8-20:
+  13 |   match Atomic.get t with
+               ^^^^^^^^^^^^
+  Verification Error: A postcondition may not hold at this return point.
+  File "wrong/atomic_stack.mli", line 22, columns 27-35:
+  22 |     atomic raises Empty -> xs <> [] && stack t [] *)
+                                  ^^^^^^^^
+  Related Location: This assertion may not hold.
+  [1]
+  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.proof twice/
+  $ chmod u+w twice/atomic_stack.ml twice/atomic_stack.mli
+  $ cat atomic_stack_twice.ml >> twice/atomic_stack.ml
+  $ cat atomic_stack_twice.mli >> twice/atomic_stack.mli
+  $ caravan --shh twice/atomic_stack.ml
+  [Error] File "twice/atomic_stack.ml", line 18, columns 10-19:
+  18 |   let _ = pop_exn t in
+                 ^^^^^^^^^
+  Unsupported Error: A call that may raise, other than a retry, in a function with an atomic contract is not supported yet.
+  [1]

@@ -1505,12 +1505,13 @@ let linearization ctx (e : Typedtree.expression) =
     arm whose value is its result. *)
 let commit_now (au : au) ~(step : Location.t) =
   let open State.Syntax in
-  if au.has_result then
+  (* The commit waits for the result, or for the outcome, which a raise may decide. *)
+  if au.has_result || Option.is_some au.raising then
     let+ () = put_au_state Committing in
     []
   else
     let* () = put_au_state Committed in
-    au.close Commit ~value:(R.Expr.tuple ~loc:(loc step) [])
+    au.close Commit ~value:(R.Expr.tuple ~loc:(loc step) []) ~outcome:Returned
 
 (** The open structure with a pending field among the invariants of the function, with its
     invariant's arguments and open state; [message] at [at] if there is none. *)
@@ -1912,7 +1913,7 @@ let linearize ?step ?value ?access_type ?contents ctx ~at
               match how with
               | `Abort ->
                   let* () = put_au_state Pending in
-                  au.close Abort ~value:(R.Expr.tuple ~loc:(loc at) [])
+                  au.close Abort ~value:(R.Expr.tuple ~loc:(loc at) []) ~outcome:Returned
               | `Commit -> commit_now au ~step:at
               | `Cas ->
                   let* () = put_au_state On_cas in
@@ -2015,7 +2016,9 @@ let enter_arm ctx ~(commits : bool option) =
       | Some true -> commit_now au ~step:au_path.au_step
       | Some false ->
           let* () = put_au_state Pending in
-          au.close Abort ~value:(R.Expr.tuple ~loc:(loc au_path.au_step) [])
+          au.close Abort
+            ~value:(R.Expr.tuple ~loc:(loc au_path.au_step) [])
+            ~outcome:Returned
       | None ->
           let+ () = put_au_state Unknown in
           []
@@ -2030,7 +2033,7 @@ let finish_arm ctx ~tail v =
   match update with
   | Some (au, { au_state = Committing; _ }) when tail ->
       let* () = put_au_state Committed in
-      au.close Commit ~value:v
+      au.close Commit ~value:v ~outcome:Returned
   | _ -> State.return []
 
 (** The state of the atomic update after two branches. *)

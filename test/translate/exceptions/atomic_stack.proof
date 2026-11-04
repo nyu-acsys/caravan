@@ -1,0 +1,5 @@
+predicate stack (t : 'a t) (xs [@implicit] : 'a list) = own t xs
+
+proof create = on return fold stack t []
+
+proof pop_exn t = at (Atomic.get t) returning [] -> commit

@@ -57,3 +57,16 @@ if the exception leaves the function, or the loop's own raises clauses.
   $ caravan --shh --emit-rav loops.ml > loops.rav
   $ raven --shh loops.rav
   Verification successful.
+
+A function with an atomic contract linearizes by raising: the step that linearizes it
+commits its update with the exception the function then raises, which its atomic raises
+clauses describe. Clients catch it, or propagate it with its state.
+
+  $ caravan --shh atomic_stack.ml
+  Verification successful.
+  $ mkdir clients
+  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.proof clients/
+  $ chmod u+w clients/atomic_stack.ml
+  $ cat atomic_stack_clients.ml >> clients/atomic_stack.ml
+  $ caravan --shh clients/atomic_stack.ml
+  Verification successful.

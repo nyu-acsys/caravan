@@ -204,6 +204,8 @@ rule token = parse
       { newlines lexbuf; ATOMIC_REQUIRES }
   | "atomic" (space | newline)+ "ensures"
       { newlines lexbuf; ATOMIC_ENSURES }
+  | "atomic" (space | newline)+ "raises"
+      { newlines lexbuf; ATOMIC_RAISES }
   | int_literal as lit
       { INTEGER (lit, None) }
   | (int_literal as lit) (int_literal_modifier as modif)

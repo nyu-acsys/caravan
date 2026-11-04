@@ -96,6 +96,9 @@ type contract = {
   raises : (pat * term option) list;
       (** The exceptions the function may raise, as patterns, each with what holds when it
           raises it: [raises E x -> t]. *)
+  atomic_raises : (pat * term) list;
+      (** What holds atomically when the function linearizes by raising an exception:
+          [atomic raises E -> t]. *)
   variant : term list;
   pure : bool;
   continues : id option;
@@ -112,6 +115,7 @@ let empty_contract =
     atomic_requires = [];
     atomic_ensures = [];
     raises = [];
+    atomic_raises = [];
     variant = [];
     pure = false;
     continues = None;

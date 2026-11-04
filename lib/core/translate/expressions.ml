@@ -313,9 +313,35 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
         | None, _ -> State.Raises_any
       in
       let* outcome = State.typ ctx ~at outcome_type in
+      (* Leaving a function with an atomic contract commits its update with the exception:
+         the step before linearized it. *)
+      let* (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+      let* commit =
+        match (ctx.au, carried.handlers) with
+        | Some au, [] -> (
+            let* state = au_state in
+            match state with
+            | Some Committing ->
+                let* () = put_au_state Committed in
+                let result =
+                  match (au.has_result, carried.exit) with
+                  | true, Some { results = r :: _; _ } -> r
+                  | _ -> R.Expr.tuple ~loc:l []
+                in
+                au.close Commit ~value:result
+                  ~outcome:(Raised (v, Exceptions.named argument))
+            | _ ->
+                State.of_result
+                  (error at
+                     "This raise may leave the function before a step linearizes it, or \
+                      after it linearized returning: annotate the step that linearizes \
+                      it by raising, as (*@ returning [] -> commit *)"))
+        | _ -> State.return []
+      in
       let* leave =
         propagate ~at ~certain:true ~typ:outcome (raised_exception ~loc:l outcome v) set
       in
+      let leave = commit @ leave in
       (* The raise's value, which no code after it reads. *)
       if is_unit e.exp_type then State.return (stmts @ leave, unit_value ~loc:l)
       else
@@ -947,9 +973,10 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
     Option.value_map retry ~default:([], []) ~f:(fun (_, o, values) -> (o, values))
   in
   (* The retry commits with its result. *)
-  let closing value =
+  let closing value outcome =
     Option.value_map retry ~default:(State.return []) ~f:(fun (au, _, _) ->
-        au.close Commit_call ~value)
+        au.close Commit_call ~value
+          ~outcome:(Option.value_map outcome ~default:Returned ~f:(fun o -> Outcome o)))
   in
   (* The latest snapshot witnesses the facts about earlier states that the callee
      requires, with the arguments' positions in it. *)
@@ -1109,6 +1136,17 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
     match List.Assoc.find ctx.given.raising f ~equal:String.equal with
     | None -> State.return None
     | Some set ->
+        let* handlers = State.gets (fun (s : State.state) -> s.carried.handlers) in
+        (* Leaving the function must commit its atomic update: only a retry does. *)
+        let* () =
+          match (ctx.au, retry, handlers) with
+          | Some _, None, [] ->
+              State.of_result
+                (unsupported e.exp_loc
+                   "A call that may raise, other than a retry, in a function with an \
+                    atomic contract")
+          | _ -> State.return ()
+        in
         let* typ = State.typ ctx ~at:e.exp_loc outcome_type in
         let* x = State.fresh "raised" in
         let v = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -1125,14 +1163,15 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   let propagation =
     Option.value_map outcome ~default:[] ~f:(fun (_, _, leave) -> leave)
   in
+  let outcome_value = Option.map outcome ~f:(fun (_, v, _) -> v) in
   if is_unit e.exp_type && not returns_value then
-    let+ closing = closing (unit_value ~loc:l) in
+    let+ closing = closing (unit_value ~loc:l) outcome_value in
     let call =
       match ghosts with
       | [] -> [ R.Stmt.call ~loc:l callee ]
       | _ -> ghost_decls @ [ R.Stmt.assign ~loc:l ghosts (R.Stmt.expr_rhs callee) ]
     in
-    (stmts @ opening @ call @ propagation @ closing, unit_value ~loc:l, public_values)
+    (stmts @ opening @ call @ closing @ propagation, unit_value ~loc:l, public_values)
   else
     let* typ = State.typ ctx ~at:e.exp_loc e.exp_type in
     let* x = State.fresh "tmp" in
@@ -1145,8 +1184,17 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
           @ ghost_decls
           @ [ R.Stmt.assign ~loc:l (v :: ghosts) (R.Stmt.expr_rhs callee) ]
     in
-    let+ closing = closing v in
-    (stmts @ opening @ def @ propagation @ closing, v, public_values)
+    let* closing = closing v outcome_value in
+    (* A retry that raised committed the update with its result, which the function
+       returns. *)
+    let+ (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+    let returned =
+      match (retry, outcome_value, carried.exit) with
+      | Some (au, _, _), Some _, Some { results = result :: _; _ } when au.has_result ->
+          [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs v) ]
+      | _ -> []
+    in
+    (stmts @ opening @ def @ closing @ returned @ propagation, v, public_values)
 
 (** The constructor argument [arg], with value [value], named and checked admissible if it
     is a nested constructor application. A literal's admissibility is then established one

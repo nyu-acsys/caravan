@@ -107,6 +107,7 @@
     | `Atomic_requires -> { c with atomic_requires = t :: c.atomic_requires }
     | `Atomic_ensures -> { c with atomic_ensures = t :: c.atomic_ensures }
     | `Raises (p, post) -> { c with raises = (p, post) :: c.raises }
+    | `Atomic_raises (p, post) -> { c with atomic_raises = (p, post) :: c.atomic_raises }
     | `Variant -> { c with variant = t :: c.variant }
     | `Pure -> { c with pure = true }
     | `Continues f -> { c with continues = Some f }
@@ -120,6 +121,7 @@
              atomic_requires = List.rev c.atomic_requires;
              atomic_ensures = List.rev c.atomic_ensures;
              raises = List.rev c.raises;
+             atomic_raises = List.rev c.atomic_raises;
              variant = List.rev c.variant }
 %}
 
@@ -139,7 +141,7 @@
 (* Contract tokens *)
 
 %token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
-%token ATOMIC_REQUIRES ATOMIC_ENSURES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
+%token ATOMIC_REQUIRES ATOMIC_ENSURES ATOMIC_RAISES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS PROOF AT
 %token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
 
@@ -717,6 +719,7 @@ clause:
 | ATOMIC_ENSURES t = term { `Atomic_ensures, t }
 | RAISES p = mpat_app ARROW t = term { `Raises (p, Some t), t }
 | RAISES p = mpat_app { `Raises (p, None), mk_term Ttrue $loc }
+| ATOMIC_RAISES p = mpat_app ARROW t = term { `Atomic_raises (p, t), t }
 | VARIANT t = term { `Variant, t }
 | PURE { `Pure, mk_term Ttrue $loc }
 | CONTINUES f = lident { `Continues f, mk_term Ttrue $loc }

@@ -741,7 +741,8 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
     are [implicit]; [result] is the contract's name for the result, if there is one; and
     the update. A step inside the update unfolds the predicates of [pres], and folds those
     of [posts] if it commits, and those of [pres] if it aborts. *)
-let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_results =
+let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implicit ~pres
+    ~posts ~past_results =
   let open State.Syntax in
   let* phi = State.fresh "phi" in
   let au_call ~l f args =
@@ -804,6 +805,7 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
       has_result = Option.is_some result;
       open_;
       close;
+      raising;
       token = R.Expr.var ~loc:(loc at) (name ~loc:(loc at) phi);
       commit_only;
     }
@@ -827,20 +829,43 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                 (t.term_loc, "The atomic postcondition"));
         }
     in
+    let value =
+      match raising with
+      | None -> value
+      | Some typ ->
+          R.Expr.tuple ~loc:l
+            ((if Option.is_some result then [ value ] else [])
+            @ [ no_exception ~loc:l typ ])
+    in
     List.concat_map decls ~f:fst
     @ [ opening ~l values ]
     @ unfolds @ folds
     @ [ R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) ]
-  and close c ~value =
+  and close c ~value ~outcome =
     State.bind State.get ~f:(fun (s : State.state) ->
         let au_path = Option.value s.path.au ~default:initial in
         let at = au_path.au_step in
         let l = loc at in
+        (* The values it commits with: the function's results, and its outcome. *)
+        let outcome_value =
+          Option.map raising ~f:(fun typ ->
+              match outcome with
+              | Returned -> no_exception ~loc:l typ
+              | Raised (e, _) -> raised_exception ~loc:l typ e
+              | Outcome o -> o)
+        in
         let value =
-          match au.ghost_results with
-          | [] -> value
-          | ghosts ->
-              R.Expr.tuple ~loc:l ((if au.has_result then [ value ] else []) @ ghosts)
+          match (au.ghost_results, outcome_value) with
+          | [], None -> value
+          | ghosts, _ ->
+              let components =
+                (if au.has_result then [ value ] else [])
+                @ ghosts @ Option.to_list outcome_value
+              in
+              begin match components with
+              | [ v ] -> v
+              | components -> R.Expr.tuple ~loc:l components
+              end
         in
         let commit = R.Stmt.call ~loc:l (au_call ~l "commitAU" [ value ]) in
         let open State.Syntax in
@@ -880,6 +905,49 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                        "This step linearizes the function, which ensures a fact about \
                         the state after it, but performs no action"))
         in
+        (* The atomic postconditions of the outcome, with the environment they are in. *)
+        let* posts, posts_env =
+          match outcome with
+          | Returned | Outcome _ -> State.return (posts, Fn.id)
+          | Raised (_, None) ->
+              State.of_result
+                (unsupported at
+                   "Raising an exception value in a function with an atomic contract")
+          | Raised (e, Some raised) ->
+              let clauses =
+                List.filter raised_posts ~f:(fun ((p : S.pat), _) ->
+                    match p.pat_desc with
+                    | Pconstr ((Qid id | Qdot (_, id)), _) ->
+                        String.equal id.pid_str raised
+                    | _ -> false)
+              in
+              let fields =
+                Option.value_map (Datatypes.find_ctor ctx.given.types raised) ~default:[]
+                  ~f:(fun (_, c) -> c.fields)
+              in
+              let field f = R.Expr.field ~loc:l e (qualified_name ~loc:l f) in
+              (* The payload's pattern variables are its fields. *)
+              let bindings (p : S.pat) =
+                match p.pat_desc with
+                | Pconstr (_, Some { pat_desc = Pid x; _ }) ->
+                    List.map (List.take fields 1) ~f:(fun f -> (x.pid_str, field f))
+                | Pconstr (_, Some { pat_desc = Ptuple ps; _ }) ->
+                    List.filter_map
+                      (List.zip_exn ps (List.take fields (List.length ps)))
+                      ~f:(fun ((q : S.pat), f) ->
+                        match q.pat_desc with
+                        | Pid x -> Some (x.pid_str, field f)
+                        | _ -> None)
+                | _ -> []
+              in
+              State.return
+                ( List.map clauses ~f:snd,
+                  fun env ->
+                    List.fold
+                      (List.concat_map clauses ~f:(fun (p, _) -> bindings p))
+                      ~init:env
+                      ~f:(fun env (x, v) -> bind env x (Value v)) )
+        in
         match c with
         | Commit ->
             let message =
@@ -918,10 +986,13 @@ let atomic_update ctx env ~at ~self ~role ~result implicit ~pres ~posts ~past_re
                     else fold ~loc ~pred p args
                   in
                   let* views = perform_views ctx ~at a in
-                  let+ others = each posts ~at others (opened ~value au_path.au_values) in
+                  let+ others =
+                    each posts ~at others (posts_env (opened ~value au_path.au_values))
+                  in
                   views @ others
               | None ->
-                  each posts ~at (with_views ctx fold) (opened ~value au_path.au_values)
+                  each posts ~at (with_views ctx fold)
+                    (posts_env (opened ~value au_path.au_values))
             in
             (* The step is the action's, if its step says when. *)
             let performs = Option.map au_path.au_performing ~f:fst in
@@ -1262,8 +1333,6 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       begin match raising with
       | None -> Ok ()
       | Some _ when pure -> unsupported f.loc "A pure function that may raise"
-      | Some _ when Option.exists f.contract ~f:(fun c -> c.atomic) ->
-          unsupported f.loc "A function with an atomic contract that may raise"
       | Some _ -> Ok ()
       end
   in
@@ -1489,13 +1558,34 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let atomic_posts =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
   in
-  let* atomic_ensures = postconditions ~atomic:true atomic_posts in
+  let* atomic_ensures =
+    match raising with
+    | None -> postconditions ~atomic:true atomic_posts
+    | Some _ ->
+        (* As the postconditions: when it returns, and when it raises, what its atomic
+           raises clauses say. *)
+        let* normal =
+          postconditions ~atomic:true (List.map atomic_posts ~f:Exceptions.on_return)
+        in
+        let+ exceptional =
+          postconditions ~atomic:true
+            (Exceptions.raises_postconditions ~only:false ctx.given.types ~at:f.loc
+               (List.map
+                  (Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_raises))
+                  ~f:(fun (p, t) -> (p, Some t)))
+               (State.Raises []))
+        in
+        normal @ exceptional
+  in
   let* bind_au, au =
     if atomic && not f.manual then
       let+ binding, au =
         atomic_update ctx env ~at:f.loc ~self:proc_name
           ~role:(Option.value f.role ~default:f.id)
           ~result:(Option.some_if (not (List.is_empty returns)) result_name)
+          ~raising:(Option.map raising ~f:snd)
+          ~raised_posts:
+            (Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_raises))
           implicit_decls ~pres:atomic_pres ~posts:atomic_posts
           ~past_results:
             (List.map past_results ~f:(fun ((p, st, _, d, w), _) -> (p, st, d, w)))

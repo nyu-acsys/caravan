@@ -253,14 +253,17 @@ let uses (body : Typedtree.expression) =
 
 let union = Translate_context.union_raises
 
-(** The exceptions of [contract]'s [raises] clauses. *)
+(** The exceptions of [contract]'s [raises] and [atomic raises] clauses. *)
 let declared_raises (contract : Caravan_spec.Spec_ast.contract) =
   Translate_context.State_monad.Raises
-    (List.filter_map contract.raises ~f:(fun ((p : Caravan_spec.Spec_ast.pat), _) ->
+    (List.filter_map
+       (List.map contract.raises ~f:fst @ List.map contract.atomic_raises ~f:fst)
+       ~f:(fun (p : Caravan_spec.Spec_ast.pat) ->
          match p.pat_desc with
          | Pconstr (Qid id, _) -> Some id.pid_str
          | Pconstr (Qdot (_, id), _) -> Some id.pid_str
-         | _ -> None))
+         | _ -> None)
+    |> List.dedup_and_sort ~compare:String.compare)
 
 (** The exceptions that [uses] may raise, with [callee] the exceptions of a call. *)
 let rec raised ~callee (uses : uses) =
@@ -342,7 +345,7 @@ let on_return (t : S.term) =
 (** The postconditions of a function, or a loop, that may raise the exceptions [set], with
     its [raises] clauses [clauses]: what holds when it raises each, and that it raises no
     other. *)
-let raises_postconditions types ~at clauses set =
+let raises_postconditions ?(only = true) types ~at clauses set =
   let some p = constructor_pattern ~at "Some" (Some p) in
   let true_ = S.mk_term Ttrue at in
   let holds =
@@ -366,7 +369,7 @@ let raises_postconditions types ~at clauses set =
                constructor_pattern ~at name argument))
     | [], Translate_context.State_monad.Raises_any -> None
   in
-  let only =
+  let only_raised =
     Option.map raised ~f:(fun patterns ->
         S.mk_term
           (Tmatch
@@ -376,4 +379,4 @@ let raises_postconditions types ~at clauses set =
                @ [ (pattern ~at Pwild, S.mk_term Tfalse at) ] ))
           at)
   in
-  holds @ Option.to_list only
+  holds @ if only then Option.to_list only_raised else []

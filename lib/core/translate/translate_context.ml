@@ -183,6 +183,11 @@ type au_close =
   | Abort  (** The step did not change the abstract state. *)
   | Commit_call  (** The step is a call, which linearized the function in its place. *)
 
+(** How a function that commits its atomic update ends: returning, raising an exception
+    with its value and constructor's name if known, or with the outcome of a call that
+    committed in its place. *)
+and au_outcome = Returned | Raised of R.Expr.t * string option | Outcome of R.Expr.t
+
 (** The state of a translation, threaded explicitly: what each arm of a branch starts
     from, what carries on from arm to arm within a procedure, the supply of fresh names,
     the fields and primitives used, and the checks generated: the monad, without the
@@ -584,8 +589,12 @@ type au = {
           [contents] if known: the statements, unfolding the atomic precondition's
           predicates and the invariants if [unfold], and the values of the implicit
           parameters. *)
-  close : au_close -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
-      (** Closes the open update, committing with the function's result [value]. *)
+  close : au_close -> value:R.Expr.t -> outcome:au_outcome -> R.Stmt.t list State_monad.t;
+      (** Closes the open update, committing with the function's result [value] and its
+          [outcome]. *)
+  raising : R.Type.t option;
+      (** The type of the function's outcome, if it may raise: then its commits pass the
+          outcome after its other results. *)
   token : R.Expr.t;  (** The update's token. *)
   commit_only : at:Location.t -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
       (** Opens the update and commits it with [value] at once, at the step at [at], the
