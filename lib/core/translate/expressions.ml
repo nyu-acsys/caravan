@@ -405,21 +405,45 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           | Ok c -> Some (R.Expr.binary ~loc:l Eq (R.Expr.var ~loc:l (name ~loc:l x)) c)
           | Error _ -> None
       in
-      let* invariants = loop_invariants ctx ~at spec ~relation in
-      let* body_stmts, _ = expr ctx body in
+      (* A loop that may raise stops once it has, and then propagates the exception. *)
+      let* raising = loop_raising ctx ~at ~spec (Some cond) body in
+      let guard = Option.map raising ~f:(fun (_, _, _, g, _) -> g) in
+      let decl, exceptional =
+        Option.value_map raising ~default:([], []) ~f:(fun (d, _, _, _, x) -> (d, x))
+      in
+      let unraised c =
+        Option.value_map guard ~default:c ~f:(fun g -> R.Expr.binary ~loc:l And c g)
+      in
+      let* invariants = loop_invariants ?guard ctx ~at spec ~relation in
+      let invariants = invariants @ exceptional in
+      let target = (x, l) in
+      let* body_stmts, reaching =
+        in_loop raising (fun () ->
+            let* body_stmts, _ = expr ctx body in
+            if List.is_empty c_stmts then State.return body_stmts
+            else
+              let+ c_stmts', c' = expr ctx cond in
+              body_stmts @ c_stmts' @ [ assign target c' ])
+      in
+      let+ propagation =
+        match raising with
+        | None -> State.return []
+        | Some (_, outcome, typ, _, _) ->
+            propagate ~at ~certain:false ~typ outcome reaching
+      in
       if List.is_empty c_stmts then
-        State.return ([ R.Stmt.while_ ~loc:l ~invariants c body_stmts ], unit_value ~loc:l)
+        ( decl @ [ R.Stmt.while_ ~loc:l ~invariants (unraised c) body_stmts ] @ propagation,
+          unit_value ~loc:l )
       else
-        let target = (x, l) in
-        let+ c_stmts', c' = expr ctx cond in
-        ( c_stmts
+        ( c_stmts @ decl
           @ R.Stmt.local ~loc:l ~const:false ~typ:(R.Type.bool ~loc:l) (ident ~loc:l x)
           @ [
               assign target c;
               R.Stmt.while_ ~loc:l ~invariants
-                (R.Expr.var ~loc:l (name ~loc:l x))
-                (body_stmts @ c_stmts' @ [ assign target c' ]);
-            ],
+                (unraised (R.Expr.var ~loc:l (name ~loc:l x)))
+                body_stmts;
+            ]
+          @ propagation,
           unit_value ~loc:l )
   | Texp_for (id, _, lo, hi, direction, body) ->
       let* () = no_loop_before_linearizing ~at in
@@ -440,9 +464,16 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* hi_def, hi, hi_value = bound "last" hi in
       let* i = State.bind_name ~typ:Predef.type_int id in
       let iv = R.Expr.var ~loc:l (name ~loc:l i) in
-      let* invariants =
-        loop_invariants ~counter:i ctx ~at spec ~relation:(fun _ -> State.return None)
+      let* raising = loop_raising ctx ~at ~spec None body in
+      let guard = Option.map raising ~f:(fun (_, _, _, g, _) -> g) in
+      let decl, exceptional =
+        Option.value_map raising ~default:([], []) ~f:(fun (d, _, _, _, x) -> (d, x))
       in
+      let* invariants =
+        loop_invariants ~counter:i ?guard ctx ~at spec ~relation:(fun _ ->
+            State.return None)
+      in
+      let invariants = invariants @ exceptional in
       let bin op a b = R.Expr.binary ~loc:l op a b in
       let one = R.Expr.int ~loc:l 1 in
       let test, step, beyond =
@@ -456,16 +487,27 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
         | Upto -> bin And (bin Leq lo iv) (bin Or (bin Leq iv beyond) (bin Eq iv lo))
         | Downto -> bin And (bin Geq lo iv) (bin Or (bin Geq iv beyond) (bin Eq iv lo))
       in
-      let+ body_stmts, _ = expr ctx body in
-      ( lo_stmts @ hi_stmts @ lo_def @ hi_def
+      let* body_stmts, reaching =
+        in_loop raising (fun () ->
+            let+ body_stmts, _ = expr ctx body in
+            body_stmts @ [ assign (i, l) step ])
+      in
+      let+ propagation =
+        match raising with
+        | None -> State.return []
+        | Some (_, outcome, typ, _, _) ->
+            propagate ~at ~certain:false ~typ outcome reaching
+      in
+      let test = Option.value_map guard ~default:test ~f:(bin And test) in
+      ( lo_stmts @ hi_stmts @ lo_def @ hi_def @ decl
         @ R.Stmt.local ~loc:l ~const:false ~typ:int ~init:(R.Stmt.expr_rhs lo)
             (ident ~loc:l i)
         @ [
             R.Stmt.while_ ~loc:l
               ~invariants:(R.Spec.make range :: lo_value :: hi_value :: invariants)
-              test
-              (body_stmts @ [ assign (i, l) step ]);
-          ],
+              test body_stmts;
+          ]
+        @ propagation,
         unit_value ~loc:l )
   | Texp_assert (c, _) ->
       let* stmts, c = expr ctx c in
@@ -1451,6 +1493,101 @@ and conditional ctx ~at ?polarity ~tail c e1 e2 target =
   let* stmts = conditional_arms ctx ~at ?polarity ~tail c e1 e2 target in
   let+ pending = after_branch ~loc:(loc at) before in
   stmts @ pending
+
+(** For a loop at [at] whose [body] may raise: its outcome variable's declaration, the
+    variable and its type, the condition that nothing was raised, which continues the loop
+    and guards the invariants of [spec], and what holds when it has: the loop's [raises]
+    clauses, or if it has none and no handler of the function covers it, the function's,
+    proven where it raises. *)
+and loop_raising ctx ~at ~(spec : S.loop_spec) (cond : Typedtree.expression option) body =
+  let l = loc at in
+  let raises (e : Typedtree.expression) =
+    Exceptions.raised
+      ~callee:(fun path ->
+        Option.value_map (resolved_call ctx.given.functions ctx.given.libraries path)
+          ~default:(State.Raises []) ~f:(fun f ->
+            Option.value
+              (List.Assoc.find ctx.given.raising f ~equal:String.equal)
+              ~default:(State.Raises [])))
+      (Exceptions.uses e)
+  in
+  let raising e = match raises e with State.Raises [] -> false | _ -> true in
+  match cond with
+  | Some cond when raising cond ->
+      State.of_result (unsupported cond.exp_loc "A loop condition that may raise")
+  | _ when not (raising body) -> State.return None
+  | _ ->
+      let* typ = State.typ ctx ~at outcome_type in
+      let* k = State.fresh "raised" in
+      let outcome = R.Expr.var ~loc:l (name ~loc:l k) in
+      let none = no_exception ~loc:l typ in
+      let* (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+      let unraised = R.Expr.binary ~loc:l Eq outcome none in
+      let terms =
+        match (spec.loop_raises, carried.handlers, carried.exit) with
+        | _ :: _, _, _ ->
+            Exceptions.raises_postconditions ctx.given.types ~at spec.loop_raises
+              (raises body)
+        | [], [], Some exit -> exit.raises_terms
+        | [], _, _ -> []
+      in
+      let+ exceptional =
+        match terms with
+        | _ :: _ ->
+            let* env = scope_env ctx in
+            let env =
+              {
+                (bind env outcome_name (Raven k)) with
+                var_types = (outcome_name, outcome_type) :: env.var_types;
+              }
+            in
+            let+ terms = State.all terms ~f:(Spec_terms.formula env) in
+            [
+              R.Spec.make
+                (R.Expr.binary ~loc:l Impl
+                   (R.Expr.binary ~loc:l Neq outcome none)
+                   (List.reduce_exn terms ~f:(R.Expr.binary ~loc:l And)));
+            ]
+        | [] -> State.return []
+      in
+      Some
+        ( R.Stmt.local ~loc:l ~const:false ~typ ~init:(R.Stmt.expr_rhs none)
+            (ident ~loc:l k),
+          outcome,
+          typ,
+          unraised,
+          exceptional )
+
+(** The statements [translate ()] of a loop's body, as the protected part of a handler
+    catching nothing if the loop may raise, as [raising] says, with what may reach it. *)
+and in_loop raising translate =
+  match raising with
+  | None ->
+      let+ stmts = translate () in
+      (stmts, State.Raises [])
+  | Some (_, outcome, outcome_type, _, _) ->
+      let* (enclosing : State.carried) =
+        State.gets (fun (s : State.state) -> s.carried)
+      in
+      let* () =
+        State.modify_carried (fun c ->
+            {
+              c with
+              handlers = { outcome; outcome_type; reaching = Raises [] } :: c.handlers;
+            })
+      in
+      let* stmts = translate () in
+      let* stmts = nest stmts in
+      let* reaching =
+        State.gets (fun (s : State.state) ->
+            match s.carried.handlers with
+            | handler :: _ -> handler.reaching
+            | [] -> State.Raises [])
+      in
+      let+ () =
+        State.modify_carried (fun c -> { c with handlers = enclosing.handlers })
+      in
+      (stmts, reaching)
 
 (** The statements and value of [e], whose [protected] statements, computing its value
     into a target, may raise: if they do, the handler [cases] match the exception, and one

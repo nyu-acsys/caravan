@@ -1175,67 +1175,6 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
               ])
       end
 
-(** The name of a function's outcome in the terms of its contract. *)
-let outcome_name = "caravan$raised"
-
-let outcome_term ~at = S.mk_term (Tvar (Qid (S.mk_id ~loc:at outcome_name))) at
-let pattern ~at desc = { S.pat_desc = desc; pat_loc = at }
-
-let constructor_pattern ~at name argument =
-  pattern ~at (Pconstr (Qid (S.mk_id ~loc:at name), argument))
-
-(** The postcondition [t] of a function that may raise, holding when it returns. *)
-let on_return (t : S.term) =
-  let at = t.term_loc in
-  S.mk_term
-    (Tmatch
-       ( outcome_term ~at,
-         [
-           (constructor_pattern ~at "None" None, t);
-           (pattern ~at Pwild, S.mk_term Ttrue at);
-         ] ))
-    at
-
-(** The postconditions of a function that may raise the exceptions [set], with the
-    [raises] clauses of [contract]: what holds when it raises each, and that it raises no
-    other. *)
-let raises_postconditions types ~at contract set =
-  let some p = constructor_pattern ~at "Some" (Some p) in
-  let true_ = S.mk_term Ttrue at in
-  let clauses = Option.value_map contract ~default:[] ~f:(fun c -> c.S.raises) in
-  let holds =
-    List.filter_map clauses ~f:(fun (p, post) ->
-        Option.map post ~f:(fun post ->
-            S.mk_term
-              (Tmatch (outcome_term ~at, [ (some p, post); (pattern ~at Pwild, true_) ]))
-              at))
-  in
-  let raised =
-    match (clauses, set) with
-    | _ :: _, _ -> Some (List.map clauses ~f:fst)
-    | [], State.Raises names ->
-        Some
-          (List.map names ~f:(fun name ->
-               let argument =
-                 match Datatypes.find_ctor types name with
-                 | Some (_, { fields = _ :: _; _ }) -> Some (pattern ~at Pwild)
-                 | _ -> None
-               in
-               constructor_pattern ~at name argument))
-    | [], Raises_any -> None
-  in
-  let only =
-    Option.map raised ~f:(fun patterns ->
-        S.mk_term
-          (Tmatch
-             ( outcome_term ~at,
-               (constructor_pattern ~at "None" None, true_)
-               :: List.map patterns ~f:(fun p -> (some p, true_))
-               @ [ (pattern ~at Pwild, S.mk_term Tfalse at) ] ))
-          at)
-  in
-  holds @ Option.to_list only
-
 (** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
     its function. [funcs] are the functions contracts can call, by their OCaml names. *)
 let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
@@ -1533,15 +1472,18 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   (* Names free in the postconditions are existentially quantified, as [j] in
      [ensures own c.count j]. *)
   let postconditions = contract_postconditions env ~at:f.loc in
+  let raises_terms set =
+    Exceptions.raises_postconditions ctx.given.types ~at:f.loc
+      (Option.value_map f.contract ~default:[] ~f:(fun c -> c.raises))
+      set
+  in
   let* ensures =
     let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
     match raising with
     | None -> postconditions posts
     | Some (set, _) ->
-        let* normal = postconditions (List.map posts ~f:on_return) in
-        let+ exceptional =
-          postconditions (raises_postconditions ctx.given.types ~at:f.loc f.contract set)
-        in
+        let* normal = postconditions (List.map posts ~f:Exceptions.on_return) in
+        let+ exceptional = postconditions (raises_terms set) in
         normal @ exceptional
   in
   let atomic_posts =
@@ -1616,6 +1558,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
             c with
             exit =
               Option.map raising ~f:(fun (allowed, _) ->
+                  let raises_terms = raises_terms allowed in
                   {
                     State.results =
                       (if List.is_empty returns then []
@@ -1623,6 +1566,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                       @ List.map ghost_returns ~f:(fun (_, raven, _) ->
                           R.Expr.var ~loc:l (name ~loc:l raven));
                     allowed;
+                    raises_terms;
                   });
           })
     in

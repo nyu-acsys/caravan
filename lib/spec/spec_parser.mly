@@ -239,12 +239,18 @@ return_adapter:
 loop_spec:
 | cs = loop_clause* EOF
     { let invariants = List.filter_map (function
-        | `Invariant t -> Some t | `State_invariant _ | `Variant _ -> None) cs in
+        | `Invariant t -> Some t
+        | `State_invariant _ | `Variant _ | `Raises _ -> None) cs in
       let state_invariants = List.filter_map (function
-        | `State_invariant invariant -> Some invariant | `Invariant _ | `Variant _ -> None) cs in
+        | `State_invariant invariant -> Some invariant
+        | `Invariant _ | `Variant _ | `Raises _ -> None) cs in
       let loop_variant = List.filter_map (function
-        | `Variant t -> Some t | `Invariant _ | `State_invariant _ -> None) cs in
-      { invariants; state_invariants; loop_variant } }
+        | `Variant t -> Some t
+        | `Invariant _ | `State_invariant _ | `Raises _ -> None) cs in
+      let loop_raises = List.filter_map (function
+        | `Raises clause -> Some clause
+        | `Invariant _ | `State_invariant _ | `Variant _ -> None) cs in
+      { invariants; state_invariants; loop_variant; loop_raises } }
 ;
 
 predicate:
@@ -700,6 +706,8 @@ loop_clause:
 | INVARIANT LEFTPAR FUN state = pat_arg ARROW t = term RIGHTPAR
     { `State_invariant (state, t) }
 | VARIANT t = term { `Variant t }
+| RAISES p = mpat_app ARROW t = term { `Raises (p, Some t) }
+| RAISES p = mpat_app { `Raises (p, None) }
 ;
 
 clause:

@@ -121,6 +121,8 @@ type loop_spec = {
   invariants : term list;
   state_invariants : (pat * term) list;
   loop_variant : term list;
+  loop_raises : (pat * term option) list;
+      (** What holds when the loop stops by raising an exception: [raises E x -> t]. *)
 }
 (** The specification of a loop, written at the start of its body. *)
 

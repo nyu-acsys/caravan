@@ -1708,22 +1708,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         Option.map (List.Assoc.find raising name ~equal:String.equal) ~f:(fun set ->
             (body_proc_name f, set)))
   in
-  let* _ =
-    all translated ~f:(fun (name, f, _) ->
-        match
-          List.find
-            (Exceptions.in_loops (Exceptions.uses f.body))
-            ~f:(fun (use, _) ->
-              match use with
-              | Raise _ | Reraise _ -> true
-              | Call (path, _) ->
-                  Option.exists (resolve name path) ~f:(fun callee ->
-                      List.Assoc.mem raising callee ~equal:String.equal)
-              | Handled _ -> false)
-        with
-        | Some (_, at) -> unsupported at "Raising an exception in a loop"
-        | None -> Ok ())
-  in
   let* procs, state =
     State.run_from state
     @@ State.all funcs ~f:(fun f ->

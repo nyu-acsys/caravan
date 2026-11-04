@@ -17,7 +17,8 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     List.filter ctx.given.annotations ~f:(fun a ->
         between a && Poly.equal (Annotation.kind a) Annotation.Loop)
   with
-  | [] -> Ok { S.invariants = []; state_invariants = []; loop_variant = [] }
+  | [] ->
+      Ok { S.invariants = []; state_invariants = []; loop_variant = []; loop_raises = [] }
   | [ a ] -> Annotation.loop_spec a
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
 
@@ -26,8 +27,9 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     scope but a [for] loop's [counter], which goes one beyond. Names free in [spec]'s
     invariants are existentially quantified, as [k] in [invariant own i.contents k];
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
-    as the value of the loop's condition. *)
-let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
+    as the value of the loop's condition. The invariants of [spec] hold under [guard] if
+    given, as for a loop that may raise, when it has not. *)
+let rec loop_invariants ?(counter = "") ?guard ctx ~at (spec : S.loop_spec)
     ~(relation : ((string * string) * R.Expr.t) list -> R.Expr.t option State.t) =
   let open State.Syntax in
   let l = loc at in
@@ -94,17 +96,21 @@ let rec loop_invariants ?(counter = "") ctx ~at (spec : S.loop_spec)
   in
   let+ facts = State.gets (fun (s : State.state) -> s.carried.facts) in
   let invariants = invariants @ Option.to_list related in
+  let guarded e =
+    R.Spec.make
+      (Option.value_map guard ~default:e ~f:(fun g -> R.Expr.binary ~loc:l Impl g e))
+  in
   let user =
     match (free, invariants) with
     | _, [] -> []
-    | [], _ -> List.map invariants ~f:R.Spec.make
+    | [], _ -> List.map invariants ~f:guarded
     | _, i :: is ->
         let vars =
           List.map free ~f:(fun (_, raven, _, typ, l) ->
               R.Var.make ~loc:l (ident ~loc:l raven) typ)
         in
         let conj = List.fold is ~init:i ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
-        [ R.Spec.make (R.Expr.exists ~loc:l vars conj) ]
+        [ guarded (R.Expr.exists ~loc:l vars conj) ]
   in
   let ranges =
     List.filter_map scope ~f:(fun (_, (raven, t)) ->

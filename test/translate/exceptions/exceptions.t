@@ -47,3 +47,13 @@ A match's exception cases catch the scrutinee's exceptions, not its value cases'
 
   $ caravan --shh match_exception.ml
   Verification successful.
+
+A loop that may raise stops when it does, and the exception then propagates. Its
+invariant holds while it has not raised; when it has, the function's raises clauses hold
+if the exception leaves the function, or the loop's own raises clauses.
+
+  $ caravan --shh loops.ml
+  Verification successful.
+  $ caravan --shh --emit-rav loops.ml > loops.rav
+  $ raven --shh loops.rav
+  Verification successful.

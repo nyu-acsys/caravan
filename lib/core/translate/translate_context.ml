@@ -227,6 +227,8 @@ module State_monad = struct
         (** The function's return values before its outcome, returned as they are when it
             raises. *)
     allowed : raise_set;
+    raises_terms : S.term list;
+        (** What holds when it raises, over [outcome_name], as its contract says. *)
   }
   (** How a function that may raise leaves when it raises. *)
 
@@ -2155,6 +2157,9 @@ let opaque_module_types env =
   env.ctx.given.proof_support.strict_source_types
   || List.exists env.ctx.given.types ~f:(fun data ->
       List.exists data.Datatypes.paths ~f:(opaque_module_path env))
+
+(** The name of a function's outcome in the terms of its contract. *)
+let outcome_name = "caravan$raised"
 
 (** The OCaml type of a function's outcome: the exception it raised, if any. *)
 let outcome_type = Predef.type_option Predef.type_exn

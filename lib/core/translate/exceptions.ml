@@ -3,6 +3,7 @@
     raise. *)
 
 open Base
+module S = Caravan_spec.Spec_ast
 
 let ( let* ) = Result.( >>= )
 
@@ -250,14 +251,6 @@ let uses (body : Typedtree.expression) =
   in
   scan [] 0 body
 
-(** The raises and calls of [uses] in loops, with their locations. *)
-let rec in_loops (uses : uses) =
-  List.concat_map uses ~f:(fun (use, in_loop) ->
-      match use with
-      | (Raise (_, at) | Reraise (_, at) | Call (_, at)) when in_loop -> [ (use, at) ]
-      | Raise _ | Reraise _ | Call _ -> []
-      | Handled { protected; cases; _ } -> in_loops protected @ in_loops cases)
-
 let union = Translate_context.union_raises
 
 (** The exceptions of [contract]'s [raises] clauses. *)
@@ -325,3 +318,62 @@ let raise_sets procedures ~resolve =
   in
   List.filter (fixed_point initial) ~f:(fun (_, set) ->
       match set with S.Raises [] -> false | _ -> true)
+
+let outcome_term ~at =
+  S.mk_term (Tvar (Qid (S.mk_id ~loc:at Translate_context.outcome_name))) at
+
+let pattern ~at desc = { S.pat_desc = desc; pat_loc = at }
+
+let constructor_pattern ~at name argument =
+  pattern ~at (Pconstr (Qid (S.mk_id ~loc:at name), argument))
+
+(** The postcondition [t] of a function that may raise, holding when it returns. *)
+let on_return (t : S.term) =
+  let at = t.term_loc in
+  S.mk_term
+    (Tmatch
+       ( outcome_term ~at,
+         [
+           (constructor_pattern ~at "None" None, t);
+           (pattern ~at Pwild, S.mk_term Ttrue at);
+         ] ))
+    at
+
+(** The postconditions of a function, or a loop, that may raise the exceptions [set], with
+    its [raises] clauses [clauses]: what holds when it raises each, and that it raises no
+    other. *)
+let raises_postconditions types ~at clauses set =
+  let some p = constructor_pattern ~at "Some" (Some p) in
+  let true_ = S.mk_term Ttrue at in
+  let holds =
+    List.filter_map clauses ~f:(fun (p, post) ->
+        Option.map post ~f:(fun post ->
+            S.mk_term
+              (Tmatch (outcome_term ~at, [ (some p, post); (pattern ~at Pwild, true_) ]))
+              at))
+  in
+  let raised =
+    match (clauses, set) with
+    | _ :: _, _ -> Some (List.map clauses ~f:fst)
+    | [], Translate_context.State_monad.Raises names ->
+        Some
+          (List.map names ~f:(fun name ->
+               let argument =
+                 match Datatypes.find_ctor types name with
+                 | Some (_, { fields = _ :: _; _ }) -> Some (pattern ~at Pwild)
+                 | _ -> None
+               in
+               constructor_pattern ~at name argument))
+    | [], Translate_context.State_monad.Raises_any -> None
+  in
+  let only =
+    Option.map raised ~f:(fun patterns ->
+        S.mk_term
+          (Tmatch
+             ( outcome_term ~at,
+               (constructor_pattern ~at "None" None, true_)
+               :: List.map patterns ~f:(fun p -> (some p, true_))
+               @ [ (pattern ~at Pwild, S.mk_term Tfalse at) ] ))
+          at)
+  in
+  holds @ Option.to_list only

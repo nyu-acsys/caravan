@@ -26,15 +26,6 @@ What a raises clause says must hold when the function raises.
   Related Location: This assertion may not hold.
   [1]
 
-Raising in a loop is not supported yet.
-
-  $ caravan --shh in_loop.ml
-  [Error] File "in_loop.ml", line 6, columns 19-29:
-  6 |     if !i = 5 then raise Stop;
-                         ^^^^^^^^^^
-  Unsupported Error: Raising an exception in a loop is not supported yet.
-  [1]
-
 An exception that a handler does not catch, or re-raises, must be declared; what a
 handler computes is checked.
 
@@ -59,4 +50,34 @@ handler computes is checked.
   10 |     ensures r <> d *)
                    ^^^^^^
   Related Location: This assertion may not hold.
+  [1]
+
+A loop that may raise maintains what holds when it does: the function's raises clauses
+if the exception leaves the function, or the loop's own. Its condition may not raise yet.
+
+  $ caravan --shh loop_wrong.ml
+  [Error] File "loop_wrong.ml", line 6, column 2 to line 10, column 6:
+  6 |   while !i < n do
+        ^^^^^^^^^^^^^^^
+  Verification Error: This loop invariant may not be maintained.
+  File "loop_wrong.ml", line 14, columns 21-26:
+  14 |     raises Stop k -> k = a *)
+                            ^^^^^
+  Related Location: This assertion may not hold.
+  [1]
+  $ caravan --shh loop_clause_wrong.ml
+  [Error] File "loop_clause_wrong.ml", line 7, column 5 to line 12, column 9:
+  7 |      while !i < n do
+           ^^^^^^^^^^^^^^^
+  Verification Error: This loop invariant may not be maintained.
+  File "loop_clause_wrong.ml", line 9, columns 48-57:
+  9 |            raises Stop m -> own i.contents a && m = a + 1 *)
+                                                      ^^^^^^^^^
+  Related Location: This assertion may not hold.
+  [1]
+  $ caravan --shh loop_condition.ml
+  [Error] File "loop_condition.ml", line 9, columns 8-19:
+  9 |   while positive !i do
+              ^^^^^^^^^^^
+  Unsupported Error: A loop condition that may raise is not supported yet.
   [1]
