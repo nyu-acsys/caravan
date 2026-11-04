@@ -250,10 +250,23 @@ let function_types polymorphic_functions f types =
   | None -> types
   | Some worker ->
       List.mapi worker.scheme.variables ~f:(fun index variable ->
-          Datatypes.variable_type ~variable
-            ~owner:(String.split worker.name ~on:'.')
-            ~parameter:("A" ^ Int.to_string index)
-            ~at:worker.loc)
+          let data =
+            Datatypes.variable_type ~variable
+              ~owner:(String.split worker.name ~on:'.')
+              ~parameter:("A" ^ Int.to_string index)
+              ~at:worker.loc
+          in
+          (* A locally abstract type stands for the variable of its name. *)
+          match Types.get_desc variable with
+          | Tunivar (Some name) ->
+              begin match
+                Env.find_type_by_name (Longident.Lident name) f.body.exp_env
+              with
+              | Pident id, _ -> { data with id = Some id }
+              | _ -> data
+              | exception Stdlib.Not_found -> data
+              end
+          | _ -> data)
       @ types
 
 let predicate_destination ~generic_predicates ~declaration_context key =
@@ -876,6 +889,29 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               | true, Some parent -> parent.Polymorphic_functions.name
               | _ -> proposed
             in
+            (* The universal variables of an explicit annotation are bound by locally
+               abstract types of their names, which the body's types use. *)
+            let* () =
+              if
+                List.for_all scheme.variables ~f:(fun variable ->
+                    match Types.get_desc variable with
+                    | Tunivar (Some name) -> (
+                        match
+                          Env.find_type_by_name (Longident.Lident name) f.body.exp_env
+                        with
+                        | Pident _, _ -> true
+                        | _ -> false
+                        | exception Stdlib.Not_found -> false)
+                    | Tunivar None -> false
+                    | _ -> true)
+              then Ok ()
+              else
+                unsupported f.loc
+                  "An explicitly polymorphic annotation without locally abstract types"
+            in
+            let* witness =
+              Witnesses.parameter types ~at:f.loc ~variables:scheme.variables f.params
+            in
             Ok
               (Some
                  Polymorphic_functions.
@@ -884,6 +920,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                      paths = f.paths;
                      scheme;
                      restriction;
+                     witness;
                      name = Generic_family_plan.runtime family_plan f.id name;
                      loc = f.loc;
                    })
@@ -1716,6 +1753,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                                paths = [ path ];
                                scheme;
                                restriction = None;
+                               witness = None;
                                name =
                                  lib.library_name ^ "."
                                  ^ Fresh_names.fresh ("Poly$" ^ value.val_name.txt);

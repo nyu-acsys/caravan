@@ -256,8 +256,13 @@ let formals ?(names = []) ctx (f : func) =
           let* typ = State.typ ctx ~at:pat_loc pat_type in
           let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.bind_name ~typ:pat_type id in
+          let spec =
+            match witness_condition ctx ~loc:(loc pat_loc) f.id i x with
+            | Some condition -> Some (R.Spec.make condition)
+            | None -> value_spec ctx ~loc:(loc pat_loc) pat_type x
+          in
           ( Some (Ident.name id, x),
-            value_spec ctx ~loc:(loc pat_loc) pat_type x,
+            spec,
             R.Var.make ~loc:(loc pat_loc) (ident ~loc:(loc pat_loc) x) typ )
       | Tparam_pat
           { pat_desc = Tpat_construct (_, { cstr_name = "()"; _ }, [], _); pat_loc; _ } ->
@@ -601,12 +606,14 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
   in
   let* ensures = State.all (clauses (fun c -> c.ensures)) ~f:(Spec_terms.formula env) in
   let domains =
-    List.filter_map (List.zip_exn f.params formals)
-      ~f:(fun ((parameter : Typedtree.function_param), (formal_name, _, _)) ->
+    List.filter_mapi (List.zip_exn f.params formals)
+      ~f:(fun position ((parameter : Typedtree.function_param), (formal_name, _, _)) ->
         match (parameter.fp_kind, formal_name) with
         | Tparam_pat pattern, Some (_, name) ->
-            Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
-              (R.Expr.var ~loc:l (R.Name.make ~loc:l name))
+            Option.first_some
+              (witness_condition ctx ~loc:l f.id position name)
+              (Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
+                 (R.Expr.var ~loc:l (R.Name.make ~loc:l name)))
         | _ -> None)
   in
   let requires = domains @ requires in

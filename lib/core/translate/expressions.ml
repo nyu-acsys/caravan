@@ -271,6 +271,11 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                | _ -> unsupported c.c_lhs.pat_loc "An exception case"))
       in
       let total = match partial with Total -> true | Partial -> false in
+      let* arm =
+        State.of_result
+          (Witnesses.arms ctx.given.types ~at ~current:ctx.given.current_polymorphic
+             ~scrutinee:scrutinee.exp_type ~result:e.exp_type cases)
+      in
       (* A match on the value of a read that left the atomic update open closes it. *)
       let* state = au_state in
       let commits =
@@ -280,7 +285,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       let+ stmts =
         branch ctx e (fun target ->
-            match_cases ?commits ~tail ctx ~at v cases ~total target)
+            match_cases ?commits ?arm ~tail ctx ~at v cases ~total target)
       in
       (scrutinee_stmts @ naming @ fst stmts, snd stmts)
   | Texp_match (_, _, _ :: _, _) -> State.of_result (unsupported at "An effect handler")
@@ -832,7 +837,7 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f ->
             let* actual_target, type_instance =
-              State.polymorphic_application ctx ~at ~path
+              State.polymorphic_application ~values:args ctx ~at ~path
                 ~declaration:declaration.val_type ~occurrence ~target:f
             in
             call ~actual_target ?type_instance ctx e f args
@@ -1297,7 +1302,7 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 
 (** The cases of a match on the value [v], with the value of the matching one assigned to
     [target] if there is one; [total] if OCaml found them exhaustive. *)
-and match_cases ?commits ?otherwise ~tail ctx ~at v
+and match_cases ?commits ?otherwise ?arm ~tail ctx ~at v
     (cases : (Typedtree.pattern * Typedtree.expression) list) ~total target =
   let l = loc at in
   let* before = pending_count in
@@ -1332,7 +1337,22 @@ and match_cases ?commits ?otherwise ~tail ctx ~at v
                R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
                @ assert_admissible ctx ~loc:l t x)
          in
-         let* stmts, value = expr ~tail ctx rhs in
+         (* A case of a match on a witness has its own types, and its value is converted
+            to the type the witness selects. *)
+         let rhs_ctx, conversion =
+           match arm with
+           | None -> (ctx, None)
+           | Some arm ->
+               let types, conversion = arm rhs in
+               ({ ctx with given = { ctx.given with types } }, conversion)
+         in
+         let* stmts, value = expr ~tail rhs_ctx rhs in
+         let value =
+           Option.value_map conversion ~default:value ~f:(fun conversion ->
+               R.Expr.call ~loc:l
+                 (Qualified_name.raven ~loc:l (Qualified_name.of_string conversion))
+                 [ value ])
+         in
          let* finish = finish_arm ctx ~tail value in
          let assignment =
            Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])

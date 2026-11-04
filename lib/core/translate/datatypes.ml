@@ -560,6 +560,18 @@ let substitution parameters arguments =
 let instantiate_alias parameters arguments body =
   Option.map (substitution parameters arguments) ~f:(fun substitute -> substitute body)
 
+(** The locally abstract type [id] as an abbreviation of [body], as a GADT match's case
+    refines it. *)
+let local_alias id body =
+  {
+    list with
+    id = Some id;
+    module_name = Ident.name id;
+    ctors = [];
+    parameters = [];
+    alias = Some body;
+  }
+
 let alias_body types typ =
   match Types.get_desc typ with
   | Tconstr (path, arguments, _) ->
@@ -1342,6 +1354,11 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
            (Qualified_name.raven ~loc:l
               (Qualified_name.of_string (Option.value_exn d.atomic_procedure))))
   | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
+      let d = Option.value_exn (find types p) in
+      Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
+  (* A witness is one of its tags, whatever types it selects. *)
+  | Tconstr (p, _ :: _, _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.witness) ->
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
   | Ttuple components ->

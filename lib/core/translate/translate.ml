@@ -1109,14 +1109,31 @@ let program_with_diagnostics ?(history = History.default) (source : Source.t) :
     | Runtime_worker worker ->
         let destination = Module_context.Function_worker (worker, parent) in
         let l = loc worker.loc in
-        R.Member.module_ ~loc:l
-          ~params:
-            (List.mapi worker.scheme.variables ~f:(fun index _ ->
-                 ( ident ~loc:l ("A" ^ Int.to_string index),
-                   qualified_name ~loc:l Prelude.value_interface )))
+        let value_interface = qualified_name ~loc:l Prelude.value_interface in
+        let parameter index = "A" ^ Int.to_string index in
+        (* A witness worker takes the witness, whose dictionaries its variables are. *)
+        let params, witness_members =
+          match worker.witness with
+          | None ->
+              ( List.mapi worker.scheme.variables ~f:(fun index _ ->
+                    (ident ~loc:l (parameter index), value_interface)),
+                [] )
+          | Some witness ->
+              ( (ident ~loc:l "W", qualified_name ~loc:l witness.interface)
+                :: List.filter_mapi witness.members ~f:(fun index member ->
+                    Option.some_if (Option.is_none member)
+                      (ident ~loc:l (parameter index), value_interface)),
+                List.filter_mapi witness.members ~f:(fun index member ->
+                    Option.map member ~f:(fun position ->
+                        R.Member.alias ~loc:l ~typ:value_interface
+                          (ident ~loc:l (parameter index))
+                          (qualified_name ~loc:l ("W." ^ parameter position)))) )
+        in
+        R.Member.module_ ~loc:l ~params
           (ident ~loc:l (Qualified_name.of_string worker.name).name)
-          (emit_context_members destination ~at:l ~representations:[] ~native_resources:[]
-             ~applications:[] ~late_members:[])
+          (witness_members
+          @ emit_context_members destination ~at:l ~representations:[]
+              ~native_resources:[] ~applications:[] ~late_members:[])
   in
   let deferred_function_workers =
     List.filter_map root_callable_workers ~f:(fun worker ->

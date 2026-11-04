@@ -191,3 +191,133 @@ let members types (data : Datatypes.t) =
                     (List.find_exn data.ctors ~f:(fun c -> String.equal c.raven ctor)),
                   member )),
           templates [ interface ] )
+
+(** The witness data type and arguments of [typ], if it is a witness. *)
+let witness_type types typ =
+  match Datatypes.desc types typ with
+  | Tconstr (path, arguments, _) ->
+      Option.bind (Datatypes.find types path) ~f:(fun data ->
+          Option.map data.Datatypes.witness ~f:(fun witness -> (data, witness, arguments)))
+  | _ -> None
+
+(** Whether [argument], a type in a function's body, is its scheme's [variable]: the
+    variable itself, or the locally abstract type of its name. *)
+let denotes variable argument =
+  Polymorphic_functions.same_variable variable argument
+  ||
+  match (Types.get_desc variable, Types.get_desc argument) with
+  | Tunivar (Some name), Tconstr (Pident id, [], _) -> String.equal (Ident.name id) name
+  | _ -> false
+
+(** The witness parameter of a function with [params], whose scheme has [variables]: one
+    of a witness type whose arguments are distinct variables of the scheme. *)
+let parameter types ~at ~variables (params : Typedtree.function_param list) =
+  let candidates =
+    List.filter_mapi params ~f:(fun position (param : Typedtree.function_param) ->
+        match param.fp_kind with
+        | Tparam_pat pattern ->
+            Option.map (witness_type types pattern.pat_type) ~f:(fun found ->
+                (position, found))
+        | Tparam_optional_default _ -> None)
+  in
+  match candidates with
+  | [] -> Ok None
+  | _ :: _ :: _ -> Report.unsupported at "A function with several witness parameters"
+  | [ (position, (data, _, arguments)) ] ->
+      let members =
+        List.map variables ~f:(fun variable ->
+            List.findi arguments ~f:(fun _ argument -> denotes variable argument)
+            |> Option.map ~f:fst)
+      in
+      let covered = List.filter_opt members in
+      if
+        List.length covered = List.length arguments
+        && List.length (List.dedup_and_sort covered ~compare:Int.compare)
+           = List.length covered
+      then
+        Ok
+          (Some
+             Polymorphic_functions.
+               { parameter = position; interface = interface_name data; members })
+      else
+        Report.unsupported at
+          "A witness parameter whose types are not the function's distinct type variables"
+
+(** The witness of the worker [current], if a witness with the type [arguments] is its
+    own: its type parameters are the worker's variables that the witness's are. *)
+let own_witness (current : Polymorphic_functions.t option) arguments =
+  Option.bind current ~f:(fun worker ->
+      Option.bind worker.witness ~f:(fun witness ->
+          let mine =
+            List.for_alli arguments ~f:(fun position argument ->
+                List.existsi witness.members ~f:(fun index member ->
+                    Option.equal Int.equal member (Some position)
+                    && denotes (List.nth_exn worker.scheme.variables index) argument))
+          in
+          Option.some_if mine (worker.name ^ ".W")))
+
+(** For a match of type [result] on a value of the witness type [scrutinee], in the worker
+    [current]: per case, by its right-hand side, the data types in which the locally
+    abstract types its constructor refines are its index types, and the conversion of its
+    value to [result] if that is an index; [None] if [scrutinee] is no witness. *)
+let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~result
+    (cases : (Typedtree.pattern * Typedtree.expression) list) =
+  match witness_type types scrutinee with
+  | None -> Ok None
+  | Some (_, witness, arguments) ->
+      let same left right =
+        match (Types.get_desc left, Types.get_desc right) with
+        | Tconstr (Pident a, [], _), Tconstr (Pident b, [], _) -> Ident.same a b
+        | _ -> Types.eq_type left right
+      in
+      let result_index =
+        List.findi (List.zip_exn witness.indices arguments) ~f:(fun _ (index, argument) ->
+            index && same argument result)
+        |> Option.map ~f:fst
+      in
+      let own = own_witness current arguments in
+      let* () =
+        match (result_index, own) with
+        | Some _, None ->
+            Report.unsupported at "A match on a witness other than the function's own"
+        | _ -> Ok ()
+      in
+      let constructor (p : Typedtree.pattern) =
+        match p.pat_desc with
+        | Tpat_construct (_, cstr, [], _) -> Some (String.uncapitalize cstr.cstr_name)
+        | _ -> None
+      in
+      Ok
+        (Some
+           (fun (rhs : Typedtree.expression) ->
+             let ctor =
+               List.find_map cases ~f:(fun (p, candidate) ->
+                   Option.some_if (phys_equal candidate rhs) p)
+               |> Option.bind ~f:constructor
+             in
+             match ctor with
+             | None -> (types, None)
+             | Some ctor ->
+                 let results =
+                   List.Assoc.find_exn witness.results ctor ~equal:String.equal
+                 in
+                 let ordinary =
+                   List.filter_map
+                     (List.zip_exn witness.indices (List.zip_exn results arguments))
+                     ~f:(fun (index, pair) -> Option.some_if (not index) pair)
+                 in
+                 let parameters, actuals = List.unzip ordinary in
+                 let aliases =
+                   List.filter_map
+                     (List.zip_exn witness.indices (List.zip_exn results arguments))
+                     ~f:(fun (index, (index_type, argument)) ->
+                       match Types.get_desc argument with
+                       | Tconstr (Pident id, [], _) when index ->
+                           Option.map
+                             (Datatypes.instantiate_alias parameters actuals index_type)
+                             ~f:(Datatypes.local_alias id)
+                       | _ -> None)
+                 in
+                 ( aliases @ types,
+                   Option.map2 result_index own ~f:(fun position own ->
+                       own ^ "." ^ conversion ctor position) )))

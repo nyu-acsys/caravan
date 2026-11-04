@@ -43,12 +43,15 @@ Polymorphic ordering remains unsupported; generic mutable storage is supported.
   $ caravan --shh storage.ml
   Verification successful.
 
-Explicit quantified source annotations are rejected until their binder mapping
-is supported. Generic proof obligations still reject false contracts.
+Locally abstract types bind the variables of a function's scheme. Explicitly
+quantified annotations without them are rejected until their binder mapping is
+supported. Generic proof obligations still reject false contracts.
 
+  $ caravan --shh locally_abstract.ml
+  Verification successful.
   $ caravan --shh explicit_scheme.ml > explicit_scheme.out 2>&1
   [1]
-  $ grep -q 'explicitly polymorphic function types' explicit_scheme.out
+  $ grep -q 'explicitly polymorphic annotation without locally abstract types' explicit_scheme.out
   $ caravan --shh bad_contract.ml > bad_contract.out 2>&1
   [1]
   $ grep -q 'Verification Error:' bad_contract.out

@@ -7,11 +7,20 @@ let ( let* ) result f = Result.bind result ~f
 type scheme = { typ : Types.type_expr; variables : Types.type_expr list }
 type restriction = { source : scheme; arguments : Types.type_expr list }
 
+type witness = {
+  parameter : int;  (** The position of the GADT witness among the parameters. *)
+  interface : string;  (** The interface of the witness's implementations. *)
+  members : int option list;
+      (** Per variable, the witness's type parameter it is, whose dictionary it takes. *)
+}
+(** The witness of a function whose result types a GADT witness parameter selects. *)
+
 type t = {
   id : Ident.t;
   paths : Path.t list;
   scheme : scheme;
   restriction : restriction option;
+  witness : witness option;
   name : string;
   loc : Location.t;
 }
@@ -75,14 +84,15 @@ let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
             && not (List.mem excluded typ ~equal:same_variable)
           in
           Ok (seen, if quantified then typ :: variables else variables)
+      | Tunivar _ -> Ok (seen, typ :: variables)
       | Tconstr (_, arguments, _) ->
           List.fold_result arguments ~init:(seen, variables) ~f:value
       | Ttuple components ->
           List.fold_result components ~init:(seen, variables)
             ~f:(fun state (_, component) -> value state component)
       | Tpoly (body, []) -> value (seen, variables) body
-      | Tarrow _ | Tpoly _ | Tunivar _ | Tobject _ | Tfield _ | Tnil | Tlink _ | Tsubst _
-      | Tvariant _ | Tpackage _ | Tfunctor _ ->
+      | Tarrow _ | Tpoly _ | Tobject _ | Tfield _ | Tnil | Tlink _ | Tsubst _ | Tvariant _
+      | Tpackage _ | Tfunctor _ ->
           unsupported ()
   in
   let rec function_type state typ =
@@ -92,16 +102,19 @@ let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
         let* state = value state argument in
         function_type state result
     | Tpoly (body, []) -> function_type state body
+    (* An explicitly polymorphic function, as one with locally abstract types. *)
+    | Tpoly (body, _ :: _) -> function_type state body
     | _ -> value state typ
   in
   let* state = function_type (Set.empty (module Int), []) typ in
   let* _, variables = List.fold_result additional ~init:state ~f:value in
   Ok { typ; variables = List.rev variables }
 
-(** [typ] after [expand], without trivial [Tpoly] wrappers. *)
+(** [typ] after [expand], without [Tpoly] wrappers: trivial ones, and those of explicitly
+    polymorphic functions, whose universal variables are then the scheme's. *)
 let rec monomorphic ~expand typ =
   let typ = expand typ in
-  match Types.get_desc typ with Tpoly (body, []) -> monomorphic ~expand body | _ -> typ
+  match Types.get_desc typ with Tpoly (body, _) -> monomorphic ~expand body | _ -> typ
 
 (** Whether [left] and [right] are the same type, structurally after [expand]. *)
 let same_type ?(expand = Fn.id) left right =

@@ -1124,6 +1124,20 @@ let value_spec ctx ~loc typ variable =
     (Datatypes.admissible ~loc ctx.given.types typ (R.Expr.var ~loc (name ~loc variable)))
     ~f:R.Spec.make
 
+(** That [variable], the parameter at [position] of the function [id], is the tag of the
+    witness its worker takes, if it is that worker's witness parameter. *)
+let witness_condition ctx ~loc id position variable =
+  match ctx.given.current_polymorphic with
+  | Some { id = worker; witness = Some witness; name = worker_name; _ }
+    when Ident.same worker id && witness.parameter = position ->
+      Some
+        (R.Expr.binary ~loc Eq
+           (R.Expr.var ~loc (name ~loc variable))
+           (R.Expr.var ~loc
+              (Qualified_name.raven ~loc
+                 (Qualified_name.of_string (worker_name ^ ".W.tag")))))
+  | _ -> None
+
 let assert_admissible ctx ~loc typ variable =
   Option.value_map (value_spec ctx ~loc typ variable) ~default:[] ~f:(fun spec ->
       [ R.Stmt.assert_ ~loc spec ])
@@ -1187,36 +1201,76 @@ module State = struct
               { state.tables with call_targets = request :: state.tables.call_targets };
           })
 
-  let value_instance_given (given : inputs) ~at ~target ~arguments =
+  (** The value dictionaries of the types [arguments], requested for declaration. *)
+  let dictionaries_given (given : inputs) ~at arguments =
     let* () = note_families given.types arguments in
-    let* dictionaries =
-      all arguments ~f:(fun argument ->
-          match Datatypes.dictionary_name given.types argument with
-          | None -> of_result (unsupported at "This polymorphic type argument")
-          | Some dictionary ->
-              let* () =
-                modify (fun state ->
-                    if
-                      List.exists state.tables.dictionaries ~f:(fun request ->
-                          Option.equal String.equal
-                            (Datatypes.dictionary_name request.domain_types
-                               request.domain_type)
-                            (Some dictionary))
-                    then state
-                    else
-                      {
-                        state with
-                        tables =
-                          {
-                            state.tables with
-                            dictionaries =
-                              state.tables.dictionaries
-                              @ [ { domain_types = given.types; domain_type = argument } ];
-                          };
-                      })
-              in
-              return dictionary)
+    all arguments ~f:(fun argument ->
+        match Datatypes.dictionary_name given.types argument with
+        | None -> of_result (unsupported at "This polymorphic type argument")
+        | Some dictionary ->
+            let* () =
+              modify (fun state ->
+                  if
+                    List.exists state.tables.dictionaries ~f:(fun request ->
+                        Option.equal String.equal
+                          (Datatypes.dictionary_name request.domain_types
+                             request.domain_type)
+                          (Some dictionary))
+                  then state
+                  else
+                    {
+                      state with
+                      tables =
+                        {
+                          state.tables with
+                          dictionaries =
+                            state.tables.dictionaries
+                            @ [ { domain_types = given.types; domain_type = argument } ];
+                        };
+                    })
+            in
+            return dictionary)
+
+  (** The instance of [target] at the modules [dictionaries] in the current namespace. *)
+  let instance_given (given : inputs) ~target ~dictionaries =
+    let namespace = given.primitive_namespace in
+    let* instances = gets (fun state -> state.tables.function_instances) in
+    let* instance =
+      match
+        List.find instances ~f:(fun instance ->
+            List.equal String.equal namespace instance.instance_namespace
+            && String.equal target instance.instance_worker
+            && List.equal String.equal dictionaries instance.instance_arguments)
+      with
+      | Some instance -> return instance.instance_name
+      | None ->
+          let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
+          let* instance_name = fresh base in
+          let instance =
+            {
+              instance_namespace = namespace;
+              instance_name;
+              instance_worker = target;
+              instance_arguments = dictionaries;
+            }
+          in
+          let* () =
+            modify (fun state ->
+                {
+                  state with
+                  tables =
+                    {
+                      state.tables with
+                      function_instances = state.tables.function_instances @ [ instance ];
+                    };
+                })
+          in
+          return instance_name
     in
+    return (String.concat ~sep:"." (namespace @ [ instance ]))
+
+  let value_instance_given (given : inputs) ~at ~target ~arguments =
+    let* dictionaries = dictionaries_given given ~at arguments in
     let namespace = given.primitive_namespace in
     let self = String.concat ~sep:"." namespace in
     let self_arguments =
@@ -1225,49 +1279,83 @@ module State = struct
     if String.equal target self then
       if List.equal String.equal dictionaries self_arguments then return self
       else of_result (unsupported at "A nonregular cyclic generic family")
-    else
-      let* instances = gets (fun state -> state.tables.function_instances) in
-      let* instance =
-        match
-          List.find instances ~f:(fun instance ->
-              List.equal String.equal namespace instance.instance_namespace
-              && String.equal target instance.instance_worker
-              && List.equal String.equal dictionaries instance.instance_arguments)
-        with
-        | Some instance -> return instance.instance_name
-        | None ->
-            let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
-            let* instance_name = fresh base in
-            let instance =
-              {
-                instance_namespace = namespace;
-                instance_name;
-                instance_worker = target;
-                instance_arguments = dictionaries;
-              }
-            in
-            let* () =
-              modify (fun state ->
-                  {
-                    state with
-                    tables =
-                      {
-                        state.tables with
-                        function_instances =
-                          state.tables.function_instances @ [ instance ];
-                      };
-                  })
-            in
-            return instance_name
-      in
-      return (String.concat ~sep:"." (namespace @ [ instance ]))
+    else instance_given given ~target ~dictionaries
 
   let value_instance ctx ~at ~target ~arguments =
     value_instance_given ctx.given ~at ~target ~arguments
 
-  let polymorphic_application ctx ~at ~path ~declaration ~occurrence ~target =
+  (** The witness that a call passes as [value] for [witness], with the types [arguments]
+      for the callee's variables: the implementation of a constructor at the dictionaries
+      of the ordinary parameters, or the caller's own witness. *)
+  let witness_argument ctx ~at (witness : Polymorphic_functions.witness) arguments
+      (value : Typedtree.expression) =
+    match (value.exp_desc, Witnesses.witness_type ctx.given.types value.exp_type) with
+    | Texp_construct (_, cstr, []), Some (data, _, _) ->
+        let ctor =
+          List.find_exn data.ctors ~f:(fun c -> String.equal c.ocaml cstr.cstr_name)
+        in
+        let ordinary =
+          List.filter_mapi witness.members ~f:(fun index member ->
+              Option.bind member ~f:(fun position ->
+                  Option.some_if
+                    (not (List.nth_exn (Option.value_exn data.witness).indices position))
+                    (position, List.nth_exn arguments index)))
+          |> List.sort ~compare:(fun (a, _) (b, _) -> Int.compare a b)
+          |> List.map ~f:snd
+        in
+        value_instance ctx ~at
+          ~target:(Witnesses.functor_name data ctor)
+          ~arguments:ordinary
+    | Texp_ident (Pident _, _, _), Some (_, _, types) ->
+        begin match Witnesses.own_witness ctx.given.current_polymorphic types with
+        | Some own -> return own
+        | None ->
+            of_result
+              (unsupported value.exp_loc
+                 "A witness argument other than a constructor or the caller's own witness")
+        end
+    | _ ->
+        of_result
+          (unsupported value.exp_loc
+             "A witness argument other than a constructor or the caller's own witness")
+
+  let polymorphic_application ?(values = []) ctx ~at ~path ~declaration ~occurrence
+      ~target =
     match Path_bindings.find ctx.given.polymorphic_functions path with
     | None -> return (target, None)
+    | Some ({ witness = Some witness; _ } as worker) ->
+        let* arguments =
+          of_result
+            (Polymorphic_functions.instantiate_worker
+               ~expand:(Datatypes.expand ctx.given.types)
+               ~at worker ~declaration ~occurrence)
+        in
+        let stem = (Qualified_name.of_string target).name in
+        let* value =
+          of_result
+            (Report.expect ~at "The witness argument of this call"
+               (List.nth values witness.parameter))
+        in
+        let* witness_module = witness_argument ctx ~at witness arguments value in
+        let recursive =
+          Option.exists ctx.given.current_polymorphic ~f:(fun current ->
+              String.equal current.name worker.name)
+        in
+        if recursive then
+          if String.equal witness_module (worker.name ^ ".W") then
+            return (worker.name ^ "." ^ stem, Some (worker, arguments))
+          else of_result (unsupported at "Polymorphic recursion")
+        else
+          let* others =
+            dictionaries_given ctx.given ~at
+              (List.filter_mapi witness.members ~f:(fun index member ->
+                   Option.some_if (Option.is_none member) (List.nth_exn arguments index)))
+          in
+          let+ instance =
+            instance_given ctx.given ~target:worker.name
+              ~dictionaries:(witness_module :: others)
+          in
+          (instance ^ "." ^ stem, Some (worker, arguments))
     | Some worker ->
         let* arguments =
           of_result
