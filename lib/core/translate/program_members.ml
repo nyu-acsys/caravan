@@ -1711,17 +1711,17 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* _ =
     all translated ~f:(fun (name, f, _) ->
         match
-          List.find (Exceptions.uses f.body) ~f:(fun (use, in_loop) ->
-              in_loop
-              &&
+          List.find
+            (Exceptions.in_loops (Exceptions.uses f.body))
+            ~f:(fun (use, _) ->
               match use with
-              | Raise _ -> true
+              | Raise _ | Reraise _ -> true
               | Call (path, _) ->
                   Option.exists (resolve name path) ~f:(fun callee ->
-                      List.Assoc.mem raising callee ~equal:String.equal))
+                      List.Assoc.mem raising callee ~equal:String.equal)
+              | Handled _ -> false)
         with
-        | Some ((Raise (_, at) | Call (_, at)), _) ->
-            unsupported at "Raising an exception in a loop"
+        | Some (_, at) -> unsupported at "Raising an exception in a loop"
         | None -> Ok ())
   in
   let* procs, state =

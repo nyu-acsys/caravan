@@ -230,8 +230,22 @@ module State_monad = struct
   }
   (** How a function that may raise leaves when it raises. *)
 
+  type handler = {
+    outcome : R.Expr.t;
+        (** The variable of the exception raised in its protected part. *)
+    outcome_type : R.Type.t;
+    reaching : raise_set;  (** The exceptions its protected part may raise so far. *)
+  }
+  (** An exception handler whose protected part is being translated. *)
+
   type carried = {
     exit : exit option;
+    handlers : handler list;  (** The enclosing handlers, innermost first. *)
+    pending : R.Stmt.t list;
+        (** The points after which an exception may be pending for the innermost handler:
+            [nest] guards the statements after them. *)
+    caught : (Ident.t * raise_set) list;
+        (** The variables that handler patterns bind, with the exceptions they hold. *)
     ghost_returns : (string * string * Types.type_expr) list;
     proof_state : (R.Expr.t * Types.type_expr) option;
     outline_exports : (string * (R.Expr.t * Types.type_expr)) list;
@@ -444,6 +458,9 @@ module State_monad = struct
       invariants = [];
       au_results = None;
       exit = None;
+      handlers = [];
+      pending = [];
+      caught = [];
     }
 
   let empty_names = { used = Set.empty (module String); bound = []; scope = [] }
@@ -2161,32 +2178,113 @@ let raise_set_names = function
   | State.Raises names -> String.concat ~sep:", " names
   | Raises_any -> "any exception"
 
-(** The statements leaving the function at [at] with the outcome [outcome], an exception
-    of [set]: returning its values as they are, if its contract allows [set]. *)
-let propagate ~(at : Location.t) outcome set =
+let union_raises left right =
+  match (left, right) with
+  | State.Raises_any, _ | _, State.Raises_any -> State.Raises_any
+  | Raises a, Raises b -> Raises (List.dedup_and_sort (a @ b) ~compare:String.compare)
+
+(** [set] without the exceptions [handled] names, or none if [catch_all]. *)
+let unhandled set ~handled ~catch_all =
+  match set with
+  | _ when catch_all -> State.Raises []
+  | State.Raises_any -> Raises_any
+  | Raises names ->
+      Raises
+        (List.filter names ~f:(fun n -> not (List.mem handled n ~equal:String.equal)))
+
+(** A point after which an exception may be pending for the innermost handler. *)
+let pending_point ~loc =
   let open State.Syntax in
-  let* exit = State.gets (fun (s : State.state) -> s.carried.exit) in
-  let undeclared () =
-    State.of_result
-      (error at
-         (Printf.sprintf
-            "This may raise %s, which the contract of the function does not declare: add \
-             a raises clause"
-            (raise_set_names set)))
-  in
-  match exit with
-  | None -> undeclared ()
-  | Some exit ->
-      let allowed =
-        match (exit.allowed, set) with
-        | Raises_any, _ -> true
-        | Raises _, Raises_any -> false
-        | Raises allowed, Raises raised ->
-            List.for_all raised ~f:(List.mem allowed ~equal:String.equal)
+  let point = R.Stmt.ghost_block ~loc [] in
+  let+ () = State.modify_carried (fun c -> { c with pending = point :: c.pending }) in
+  point
+
+(** The statements leaving the scope at [at] with the outcome [outcome], of the Raven type
+    [typ], an exception of [set], if [certain], or else if [outcome] is one: in a
+    handler's protected part, recording it for the handler and marking the point; in the
+    function, returning its values as they are, if its contract allows [set]. *)
+let propagate ~(at : Location.t) ~certain ~typ outcome set =
+  let open State.Syntax in
+  let l = loc at in
+  let* (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+  match carried.handlers with
+  | handler :: outer ->
+      let* () =
+        State.modify_carried (fun c ->
+            {
+              c with
+              handlers =
+                { handler with reaching = union_raises handler.reaching set } :: outer;
+            })
       in
-      if allowed then
-        State.return [ R.Stmt.return ~loc:(loc at) (exit.results @ [ outcome ]) ]
-      else undeclared ()
+      let+ point = pending_point ~loc:l in
+      [ R.Stmt.assign ~loc:l [ handler.outcome ] (R.Stmt.expr_rhs outcome); point ]
+  | [] -> (
+      let undeclared () =
+        State.of_result
+          (error at
+             (Printf.sprintf
+                "This may raise %s, which the contract of the function does not declare: \
+                 add a raises clause"
+                (raise_set_names set)))
+      in
+      match carried.exit with
+      | None -> undeclared ()
+      | Some exit ->
+          let allowed =
+            match (exit.allowed, set) with
+            | Raises_any, _ -> true
+            | Raises _, Raises_any -> false
+            | Raises allowed, Raises raised ->
+                List.for_all raised ~f:(List.mem allowed ~equal:String.equal)
+          in
+          if not allowed then undeclared ()
+          else
+            let leave = [ R.Stmt.return ~loc:l (exit.results @ [ outcome ]) ] in
+            State.return
+              (if certain then leave
+               else
+                 [
+                   R.Stmt.if_ ~loc:l
+                     (R.Expr.binary ~loc:l Neq outcome (no_exception ~loc:l typ))
+                     leave [];
+                 ]))
+
+(** [stmts] with the statements after each pending point guarded by the innermost
+    handler's outcome being none, so that they do not run once an exception is pending. *)
+let nest stmts =
+  let open State.Syntax in
+  let+ (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+  match carried.handlers with
+  | [] -> stmts
+  | handler :: _ ->
+      let pending stmt = List.exists carried.pending ~f:(phys_equal stmt) in
+      List.fold_right stmts ~init:[] ~f:(fun stmt rest ->
+          if pending stmt then
+            match rest with
+            | [] -> []
+            | _ ->
+                let loc = R.Loc.none in
+                [
+                  R.Stmt.if_ ~loc
+                    (R.Expr.binary ~loc Eq handler.outcome
+                       (no_exception ~loc handler.outcome_type))
+                    rest [];
+                ]
+          else stmt :: rest)
+
+(** The number of pending points so far, to tell whether a branch's arms have one. *)
+let pending_count = State.gets (fun (s : State.state) -> List.length s.carried.pending)
+
+(** A pending point after a branch whose arms marked one since [before] points. *)
+let after_branch ~loc before =
+  let open State.Syntax in
+  let* (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
+  if List.is_empty carried.handlers || List.length carried.pending = before then
+    State.return []
+  else
+    let+ point = pending_point ~loc in
+    [ point ]
 
 (** An arbitrary carrier value, without a source admissibility assumption. *)
 let raw_default ctx ~at typ =

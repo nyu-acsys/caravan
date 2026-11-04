@@ -30,3 +30,20 @@ The emitted program verifies too.
   $ caravan --shh --emit-rav raise.ml > raise.rav
   $ raven --shh raise.rav
   Verification successful.
+
+Handlers catch the exceptions of their protected part: the rest of the part does not run
+after a raise, an exception no case catches propagates, a handler can re-raise what it
+caught, and a function whose handler catches everything raises nothing.
+
+  $ caravan --shh handlers.ml
+  Verification successful.
+  $ caravan --shh --emit-rav handlers.ml > handlers.rav
+  $ raven --shh handlers.rav
+  Verification successful.
+  $ caravan --shh handler_helper.ml
+  Verification successful.
+
+A match's exception cases catch the scrutinee's exceptions, not its value cases'.
+
+  $ caravan --shh match_exception.ml
+  Verification successful.

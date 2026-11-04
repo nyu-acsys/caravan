@@ -34,3 +34,29 @@ Raising in a loop is not supported yet.
                          ^^^^^^^^^^
   Unsupported Error: Raising an exception in a loop is not supported yet.
   [1]
+
+An exception that a handler does not catch, or re-raises, must be declared; what a
+handler computes is checked.
+
+  $ caravan --shh handler_leak.ml
+  [Error] File "handler_leak.ml", line 13, columns 23-58:
+  13 | let first_checked xs = try check (head xs) with Bad _ -> 0
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: This may raise Empty, which the contract of the function does not declare: add a raises clause.
+  [1]
+  $ caravan --shh handler_reraise.ml
+  [Error] File "handler_reraise.ml", line 9, columns 37-44:
+  9 | let first xs = try head xs with e -> raise e
+                                           ^^^^^^^
+  Type Error: This may raise Empty, which the contract of the function does not declare: add a raises clause.
+  [1]
+  $ caravan --shh handler_wrong.ml
+  [Error] File "handler_wrong.ml", line 8, columns 46-46:
+  8 | let head_or xs d = try head xs with Empty -> d
+                                                    ^
+  Verification Error: A postcondition may not hold at this return point.
+  File "handler_wrong.ml", line 10, columns 12-18:
+  10 |     ensures r <> d *)
+                   ^^^^^^
+  Related Location: This assertion may not hold.
+  [1]

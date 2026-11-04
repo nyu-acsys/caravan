@@ -217,6 +217,38 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           (value_stmts @ record_stmts @ [ writing ], unit_value ~loc:l)
       | _ -> State.of_result (unsupported at "This field")
     end
+  | Texp_match (scrutinee, cases, [], partial)
+    when List.exists cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+             Option.is_some (snd (Typedtree.split_pattern c.c_lhs))) ->
+      (* The scrutinee is protected; its value's cases are not. *)
+      let* cases =
+        State.of_result
+          (all cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+               match (Typedtree.split_pattern c.c_lhs, c.c_guard) with
+               | _, Some guard -> unsupported guard.exp_loc "A guard"
+               | (Some p, None), None -> Ok (`Value (p, c.c_rhs))
+               | (None, Some p), None -> Ok (`Exception (p, c.c_rhs))
+               | (_, _), None -> unsupported c.c_lhs.pat_loc "A value and exception case"))
+      in
+      let values =
+        List.filter_map cases ~f:(function `Value c -> Some c | `Exception _ -> None)
+      and exceptions =
+        List.filter_map cases ~f:(function `Exception c -> Some c | `Value _ -> None)
+      in
+      let* typ = State.typ ctx ~at:scrutinee.exp_loc scrutinee.exp_type in
+      let* x = State.fresh "scrutinee" in
+      let v = R.Expr.var ~loc:l (name ~loc:l x) in
+      let+ stmts, value =
+        handled ctx ~at ~tail e ~cases:exceptions
+          ~protected:(fun _ ->
+            let+ stmts, s = expr ctx scrutinee in
+            stmts @ [ assign (x, l) s ])
+          ~normal:(fun target ->
+            match_cases ~tail ctx ~at v values
+              ~total:(match partial with Total -> true | Partial -> false)
+              target)
+      in
+      (R.Stmt.local ~loc:l ~const:false ~typ (ident ~loc:l x) @ stmts, value)
   | Texp_match (scrutinee, cases, [], partial) ->
       let* read = is_read_value scrutinee in
       let* scrutinee_stmts, v = expr ctx scrutinee in
@@ -252,16 +284,38 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       (scrutinee_stmts @ naming @ fst stmts, snd stmts)
   | Texp_match (_, _, _ :: _, _) -> State.of_result (unsupported at "An effect handler")
+  | Texp_try (body, handlers, []) ->
+      let* cases =
+        State.of_result
+          (all handlers ~f:(fun (c : Typedtree.value Typedtree.case) ->
+               match c.c_guard with
+               | Some guard -> unsupported guard.exp_loc "A guard"
+               | None -> Ok (c.c_lhs, c.c_rhs)))
+      in
+      handled ctx ~at ~tail e ~cases
+        ~protected:(fun target ->
+          let+ stmts, v = expr ctx body in
+          stmts @ Option.value_map target ~default:[] ~f:(fun t -> [ assign t v ]))
+        ~normal:(fun _ -> State.return [])
+  | Texp_try _ -> State.of_result (unsupported at "An effect handler")
   | Texp_apply _ when Option.is_some (Exceptions.raised_argument e) ->
       let argument = Option.value_exn (Exceptions.raised_argument e) in
       let* stmts, v = expr ctx argument in
+      let* caught = State.gets (fun (s : State.state) -> s.carried.caught) in
       let set =
-        match Exceptions.named argument with
-        | Some name -> State.Raises [ name ]
-        | None -> State.Raises_any
+        match (Exceptions.named argument, argument.exp_desc) with
+        | Some name, _ -> State.Raises [ name ]
+        | None, Texp_ident (Pident id, _, _) ->
+            (* Re-raising what a handler caught. *)
+            Option.value
+              (List.Assoc.find caught id ~equal:Ident.same)
+              ~default:State.Raises_any
+        | None, _ -> State.Raises_any
       in
       let* outcome = State.typ ctx ~at outcome_type in
-      let* leave = propagate ~at (raised_exception ~loc:l outcome v) set in
+      let* leave =
+        propagate ~at ~certain:true ~typ:outcome (raised_exception ~loc:l outcome v) set
+      in
       (* The raise's value, which no code after it reads. *)
       if is_unit e.exp_type then State.return (stmts @ leave, unit_value ~loc:l)
       else
@@ -637,20 +691,24 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
           let then_, else_ =
             match op with And -> (`Rhs, `Value false) | _ -> (`Value true, `Rhs)
           in
-          let+ stmts, v =
+          let* before = pending_count in
+          let* stmts, v =
             branch ctx e (fun target ->
-                let+ target =
+                let* target =
                   State.of_result
                     (Report.expect ~at:e.exp_loc
                        "The variable of a Boolean operator's value" target)
                 in
                 let arm = function
-                  | `Rhs -> b_stmts @ [ assign target b ]
-                  | `Value v -> [ assign target (R.Expr.bool ~loc:l v) ]
+                  | `Rhs -> nest (b_stmts @ [ assign target b ])
+                  | `Value v -> State.return [ assign target (R.Expr.bool ~loc:l v) ]
                 in
-                [ R.Stmt.if_ ~loc:l a (arm then_) (arm else_) ])
+                let* then_ = arm then_ in
+                let+ else_ = arm else_ in
+                [ R.Stmt.if_ ~loc:l a then_ else_ ])
           in
-          (a_stmts @ stmts, v)
+          let+ pending = after_branch ~loc:l before in
+          (a_stmts @ stmts @ pending, v)
     | Some ((Eq | Neq) as op), _, [ a; b ]
       when is_physical path && not (exact_physical ctx.given.types a b) -> (
         let* b_stmts, b = expr ctx b in
@@ -1012,15 +1070,8 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
         let* typ = State.typ ctx ~at:e.exp_loc outcome_type in
         let* x = State.fresh "raised" in
         let v = R.Expr.var ~loc:l (name ~loc:l x) in
-        let+ leave = propagate ~at:e.exp_loc v set in
-        Some
-          ( R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
-            v,
-            [
-              R.Stmt.if_ ~loc:l
-                (R.Expr.binary ~loc:l Neq v (no_exception ~loc:l typ))
-                leave [];
-            ] )
+        let+ leave = propagate ~at:e.exp_loc ~certain:false ~typ v set in
+        Some (R.Stmt.local ~loc:l ~typ (ident ~loc:l x), v, leave)
   in
   let ghost_decls =
     List.concat_map public ~f:snd @ ghost_decls
@@ -1156,9 +1207,10 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
 
 (** The cases of a match on the value [v], with the value of the matching one assigned to
     [target] if there is one; [total] if OCaml found them exhaustive. *)
-and match_cases ?commits ~tail ctx ~at v
+and match_cases ?commits ?otherwise ~tail ctx ~at v
     (cases : (Typedtree.pattern * Typedtree.expression) list) ~total target =
   let l = loc at in
+  let* before = pending_count in
   let* enclosing_names = State.get_scope in
   (* Each case starts in the state of the atomic update before the match. *)
   let* start = get_path in
@@ -1195,16 +1247,23 @@ and match_cases ?commits ~tail ctx ~at v
          let assignment =
            Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
          in
-         let+ assigned, join = end_arm ctx join ~start:start.positions in
-         (entry @ List.concat defs @ stmts @ finish @ assignment @ assigned, join))
+         let* assigned, join = end_arm ctx join ~start:start.positions in
+         let+ stmts =
+           nest (entry @ List.concat defs @ stmts @ finish @ assignment @ assigned)
+         in
+         (stmts, join))
     in
     (stmts, join, ended)
   in
+  (* No case matching is a failure, or what [otherwise] does. *)
   let not_exhaustive () =
-    let+ check =
-      State.check ~at "This match may not be exhaustive" (R.Expr.bool ~loc:l false)
-    in
-    [ check ]
+    match otherwise with
+    | Some otherwise -> State.return otherwise
+    | None ->
+        let+ check =
+          State.check ~at "This match may not be exhaustive" (R.Expr.bool ~loc:l false)
+        in
+        [ check ]
   in
   let* flat = flat_cases ctx v cases in
   let* stmts, join, ends =
@@ -1262,7 +1321,7 @@ and match_cases ?commits ~tail ctx ~at v
          (List.reduce (List.filter_map ends ~f:state) ~f:join_au)
          (state start))
   in
-  let+ () =
+  let* () =
     modify_path (fun path ->
         {
           path with
@@ -1272,7 +1331,8 @@ and match_cases ?commits ~tail ctx ~at v
               (List.map ends ~f:(fun ended -> ended.positions));
         })
   in
-  join.decls @ stmts
+  let+ pending = after_branch ~loc:l before in
+  join.decls @ stmts @ pending
 
 (** The cases of a Raven match on [v] for [cases], if their patterns are flat: distinct
     constructors with variables or [_] as arguments, possibly followed by a variable or
@@ -1343,7 +1403,7 @@ and flat_cases ctx v cases =
   result
 
 (** [if c then e1 else e2], with its value assigned to [target] if there is one. *)
-and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
+and conditional_arms ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
     (e2 : Typedtree.expression option) target =
   let l = loc at in
   (* Each arm starts in the state of the atomic update before the branch; if [c] is the
@@ -1365,8 +1425,9 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
              in
              stmts @ finish @ assignment
        in
-       let+ assigned, join = end_arm ctx join ~start:start.positions in
-       (entry @ stmts @ assigned, join))
+       let* assigned, join = end_arm ctx join ~start:start.positions in
+       let+ stmts = nest (entry @ stmts @ assigned) in
+       (stmts, join))
   in
   let* (then_, join), then_end = arm empty_join true (Some e1) in
   let* (else_, join), else_end = arm join false e2 in
@@ -1383,6 +1444,83 @@ and conditional ctx ~at ?polarity ~tail c (e1 : Typedtree.expression)
         })
   in
   join.decls @ [ R.Stmt.if_ ~loc:l c then_ else_ ]
+
+(** [if c then e1 else e2], with a pending point after it if an arm has one. *)
+and conditional ctx ~at ?polarity ~tail c e1 e2 target =
+  let* before = pending_count in
+  let* stmts = conditional_arms ctx ~at ?polarity ~tail c e1 e2 target in
+  let+ pending = after_branch ~loc:(loc at) before in
+  stmts @ pending
+
+(** The statements and value of [e], whose [protected] statements, computing its value
+    into a target, may raise: if they do, the handler [cases] match the exception, and one
+    no case catches propagates; if not, the [normal] statements follow. *)
+and handled ctx ~at ~tail (e : Typedtree.expression) ~cases ~protected ~normal =
+  let l = loc at in
+  let* typ = State.typ ctx ~at outcome_type in
+  let* k = State.fresh "raised" in
+  let outcome = R.Expr.var ~loc:l (name ~loc:l k) in
+  let* before = pending_count in
+  let* stmts, v =
+    branch ctx e (fun target ->
+        (* The protected part, after which an exception may be pending. *)
+        let* (enclosing : State.carried) =
+          State.gets (fun (s : State.state) -> s.carried)
+        in
+        let* () =
+          State.modify_carried (fun c ->
+              {
+                c with
+                handlers =
+                  { outcome; outcome_type = typ; reaching = Raises [] } :: c.handlers;
+              })
+        in
+        let* stmts = protected target in
+        let* protected = nest stmts in
+        let* reaching =
+          State.gets (fun (s : State.state) ->
+              match s.carried.handlers with
+              | handler :: _ -> handler.reaching
+              | [] -> Raises [])
+        in
+        let* () =
+          State.modify_carried (fun c ->
+              {
+                c with
+                handlers = enclosing.handlers;
+                caught =
+                  List.concat_map cases ~f:(fun (p, _) ->
+                      List.map (Typedtree.pat_bound_idents p) ~f:(fun id ->
+                          (id, reaching)))
+                  @ c.caught;
+              })
+        in
+        (* The cases, on the exception raised; one no case catches propagates. *)
+        let handled, catch_all = Exceptions.handled (List.map cases ~f:fst) in
+        let* otherwise =
+          match unhandled reaching ~handled ~catch_all with
+          | Raises [] -> State.return []
+          | set -> propagate ~at ~certain:true ~typ outcome set
+        in
+        let* handling =
+          match_cases ~otherwise ~tail ctx ~at
+            (R.Expr.field ~loc:l outcome (qualified_name ~loc:l "value"))
+            cases ~total:catch_all target
+        in
+        let* () = State.modify_carried (fun c -> { c with caught = enclosing.caught }) in
+        let+ normal = normal target in
+        R.Stmt.local ~loc:l ~const:false ~typ
+          ~init:(R.Stmt.expr_rhs (no_exception ~loc:l typ))
+          (ident ~loc:l k)
+        @ protected
+        @ [
+            R.Stmt.if_ ~loc:l
+              (R.Expr.binary ~loc:l Neq outcome (no_exception ~loc:l typ))
+              handling normal;
+          ])
+  in
+  let+ pending = after_branch ~loc:l before in
+  (stmts @ pending, v)
 
 (** The statements [make target] computing the value of [e] into a new variable [target],
     and that variable; no variable if [e] is of type unit. *)

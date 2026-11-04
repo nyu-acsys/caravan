@@ -138,45 +138,127 @@ let raised_argument (e : Typedtree.expression) =
       Some argument
   | _ -> None
 
+(** The exceptions that handler patterns [patterns] catch whatever their payloads, and
+    whether one catches every exception. *)
+let handled (patterns : Typedtree.pattern list) =
+  let rec irrefutable (p : Typedtree.pattern) =
+    match p.pat_desc with
+    | Tpat_any | Tpat_var _ -> true
+    | Tpat_alias (q, _, _, _, _) -> irrefutable q
+    | Tpat_tuple ps -> List.for_all ps ~f:(fun (_, q) -> irrefutable q)
+    | _ -> false
+  in
+  let rec catches (p : Typedtree.pattern) =
+    match p.pat_desc with
+    | Tpat_any | Tpat_var _ -> ([], true)
+    | Tpat_alias (q, _, _, _, _) -> catches q
+    | Tpat_construct (_, cstr, args, _) when List.for_all args ~f:irrefutable -> (
+        match cstr.cstr_tag with
+        | Cstr_extension _ -> ([ cstr.cstr_name ], false)
+        | _ -> ([], false))
+    | Tpat_or (a, b, _) ->
+        let a, all_a = catches a and b, all_b = catches b in
+        (a @ b, all_a || all_b)
+    | _ -> ([], false)
+  in
+  List.fold patterns ~init:([], false) ~f:(fun (names, all) p ->
+      let more, every = catches p in
+      (names @ more, all || every))
+
 type use =
   | Raise of string option * Location.t
       (** A raise of the exception named, or of an exception value. *)
+  | Reraise of uses * Location.t
+      (** A raise of what a handler caught, from its protected part's uses. *)
   | Call of Path.t * Location.t
+  | Handled of { protected : uses; handled : string list; catch_all : bool; cases : uses }
 
-(** The raises and calls of [body], outside the local functions it defines, each with
-    whether it is in a loop. *)
+and uses = (use * bool) list
+(** Uses, each with whether it is in a loop. *)
+
+(** The raises and calls of [body], outside the local functions it defines. *)
 let uses (body : Typedtree.expression) =
-  let found = ref [] and loops = ref 0 in
-  let record use = found := (use, !loops > 0) :: !found in
-  let iterator =
-    {
-      Tast_iterator.default_iterator with
-      expr =
-        (fun self e ->
-          match (e.exp_desc, raised_argument e) with
-          | _, Some argument ->
-              record (Raise (named argument, e.exp_loc));
-              self.expr self argument
-          | Texp_function _, None -> ()
-          | (Texp_while _ | Texp_for _), None ->
-              Int.incr loops;
-              Tast_iterator.default_iterator.expr self e;
-              Int.decr loops
-          | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _), None ->
-              record (Call (path, e.exp_loc));
-              Tast_iterator.default_iterator.expr self e
-          | _ -> Tast_iterator.default_iterator.expr self e);
-    }
+  let rec scan caught loops (e : Typedtree.expression) : uses =
+    let sub = scan caught loops in
+    match (e.exp_desc, raised_argument e) with
+    | _, Some argument ->
+        let raised =
+          match (named argument, argument.exp_desc) with
+          | Some name, _ -> Raise (Some name, e.exp_loc)
+          | None, Texp_ident (Pident id, _, _) -> (
+              match List.Assoc.find caught id ~equal:Ident.same with
+              | Some protected -> Reraise (protected, e.exp_loc)
+              | None -> Raise (None, e.exp_loc))
+          | None, _ -> Raise (None, e.exp_loc)
+        in
+        sub argument @ [ (raised, loops > 0) ]
+    | Texp_function _, None -> []
+    | Texp_try (protected, cases, _), None ->
+        let protected = sub protected in
+        let handled, catch_all =
+          handled
+            (List.map cases ~f:(fun (c : Typedtree.value Typedtree.case) -> c.c_lhs))
+        in
+        let cases =
+          List.concat_map cases ~f:(fun (c : Typedtree.value Typedtree.case) ->
+              let caught =
+                List.map (Typedtree.pat_bound_idents c.c_lhs) ~f:(fun id ->
+                    (id, protected))
+                @ caught
+              in
+              scan caught loops c.c_rhs)
+        in
+        [ (Handled { protected; handled; catch_all; cases }, loops > 0) ]
+    | Texp_match (scrutinee, match_cases, _, _), None
+      when List.exists match_cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+               Option.is_some (snd (Typedtree.split_pattern c.c_lhs))) ->
+        let protected = sub scrutinee in
+        let split =
+          List.map match_cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+              (Typedtree.split_pattern c.c_lhs, c.c_rhs))
+        in
+        let exception_cases =
+          List.filter_map split ~f:(fun ((_, p), rhs) ->
+              Option.map p ~f:(fun p -> (p, rhs)))
+        in
+        let handled, catch_all = handled (List.map exception_cases ~f:fst) in
+        let cases =
+          List.concat_map exception_cases ~f:(fun (p, rhs) ->
+              let caught =
+                List.map (Typedtree.pat_bound_idents p) ~f:(fun id -> (id, protected))
+                @ caught
+              in
+              scan caught loops rhs)
+        in
+        (Handled { protected; handled; catch_all; cases }, loops > 0)
+        :: List.concat_map split ~f:(fun ((value, _), rhs) ->
+            if Option.is_some value then sub rhs else [])
+    | (Texp_while _ | Texp_for _), None -> children (scan caught (loops + 1)) e
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _), None ->
+        (Call (path, e.exp_loc), loops > 0) :: children sub e
+    | _ -> children sub e
+  and children f (e : Typedtree.expression) =
+    let found = ref [] in
+    let iterator =
+      {
+        Tast_iterator.default_iterator with
+        expr = (fun _ child -> found := f child :: !found);
+      }
+    in
+    Tast_iterator.default_iterator.expr iterator e;
+    List.concat (List.rev !found)
   in
-  iterator.expr iterator body;
-  List.rev !found
+  scan [] 0 body
 
-let union left right =
-  match (left, right) with
-  | Translate_context.State_monad.Raises_any, _
-  | _, Translate_context.State_monad.Raises_any ->
-      Translate_context.State_monad.Raises_any
-  | Raises a, Raises b -> Raises (List.dedup_and_sort (a @ b) ~compare:String.compare)
+(** The raises and calls of [uses] in loops, with their locations. *)
+let rec in_loops (uses : uses) =
+  List.concat_map uses ~f:(fun (use, in_loop) ->
+      match use with
+      | (Raise (_, at) | Reraise (_, at) | Call (_, at)) when in_loop -> [ (use, at) ]
+      | Raise _ | Reraise _ | Call _ -> []
+      | Handled { protected; cases; _ } -> in_loops protected @ in_loops cases)
+
+let union = Translate_context.union_raises
 
 (** The exceptions of [contract]'s [raises] clauses. *)
 let declared_raises (contract : Caravan_spec.Spec_ast.contract) =
@@ -187,31 +269,35 @@ let declared_raises (contract : Caravan_spec.Spec_ast.contract) =
          | Pconstr (Qdot (_, id), _) -> Some id.pid_str
          | _ -> None))
 
+(** The exceptions that [uses] may raise, with [callee] the exceptions of a call. *)
+let rec raised ~callee (uses : uses) =
+  List.fold uses ~init:(Translate_context.State_monad.Raises []) ~f:(fun set (use, _) ->
+      union set
+        (match use with
+        | Raise (Some name, _) -> Raises [ name ]
+        | Raise (None, _) -> Raises_any
+        | Reraise (protected, _) -> raised ~callee protected
+        | Call (path, _) -> callee path
+        | Handled { protected; handled; catch_all; cases } ->
+            union
+              (Translate_context.unhandled (raised ~callee protected) ~handled ~catch_all)
+              (raised ~callee cases)))
+
 (** The exceptions each procedure may raise, for those that may raise any: [procedures]
     gives each procedure's name, contract and body, and [resolve] the procedure a path
     calls from it. A function with a contract raises what its [raises] clauses say; one
     without raises what its body raises and its calls may raise. *)
 let raise_sets procedures ~resolve =
   let module S = Translate_context.State_monad in
-  let direct =
-    List.map procedures ~f:(fun (name, contract, body) ->
-        let uses = uses body in
-        ( name,
-          contract,
-          List.fold uses ~init:(S.Raises []) ~f:(fun set (use, _) ->
-              match use with
-              | Raise (Some e, _) -> union set (S.Raises [ e ])
-              | Raise (None, _) -> union set S.Raises_any
-              | Call _ -> set),
-          List.filter_map uses ~f:(fun (use, _) ->
-              match use with Call (path, _) -> resolve name path | Raise _ -> None) ))
+  let bodies =
+    List.map procedures ~f:(fun (name, contract, body) -> (name, contract, uses body))
   in
   let initial =
-    List.map direct ~f:(fun (name, contract, own, _) ->
+    List.map bodies ~f:(fun (name, contract, _) ->
         ( name,
           match (contract : Caravan_spec.Spec_ast.contract option) with
           | Some contract -> declared_raises contract
-          | None -> own ))
+          | None -> S.Raises [] ))
   in
   let same left right =
     match (left, right) with
@@ -221,15 +307,18 @@ let raise_sets procedures ~resolve =
   in
   let rec fixed_point sets =
     let next =
-      List.map direct ~f:(fun (name, contract, own, callees) ->
+      List.map bodies ~f:(fun (name, contract, uses) ->
           match contract with
           | Some _ -> (name, List.Assoc.find_exn sets name ~equal:String.equal)
           | None ->
-              ( name,
-                List.fold callees ~init:own ~f:(fun set callee ->
-                    Option.value_map
+              let callee path =
+                Option.value_map (resolve name path) ~default:(S.Raises [])
+                  ~f:(fun callee ->
+                    Option.value
                       (List.Assoc.find sets callee ~equal:String.equal)
-                      ~default:set ~f:(union set)) ))
+                      ~default:(S.Raises []))
+              in
+              (name, raised ~callee uses))
     in
     if List.for_all2_exn sets next ~f:(fun (_, a) (_, b) -> same a b) then sets
     else fixed_point next
