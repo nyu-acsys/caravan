@@ -835,6 +835,8 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
     | None, None, _ -> (
         let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
         match resolved_call ctx.given.functions ctx.given.libraries path with
+        | Some f when List.mem ctx.given.raising_library_calls f ~equal:String.equal ->
+            State.of_result (unsupported at "A call of a library function that may raise")
         | Some f ->
             let* actual_target, type_instance =
               State.polymorphic_application ~values:args ctx ~at ~path
@@ -964,12 +966,20 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   let args = prefix @ args @ ghosts in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
      its place, with the atomic update's values of the implicit parameters, as does a call
-     of a function that continues the update. *)
+     of a function that continues the update, or of another atomic function. *)
+  let* au_state = au_state in
   let* retry =
     match ctx.au with
     | Some au
       when String.equal au.self (Option.value actual_target ~default:f)
            || Option.exists role ~f:(fun r -> Ident.same r au.role) ->
+        let+ opened = open_for_call au ~at:e.exp_loc in
+        Option.map opened ~f:(fun (opening, values) -> (au, opening, values))
+    (* A call of another atomic function before this one linearizes delegates its update
+       to it, as Saturn's [let pop_opt t = pop_as t Backoff.default Option]. *)
+    | Some au
+      when List.mem ctx.given.atomic_procedures f ~equal:String.equal
+           && Poly.equal au_state (Some Pending) ->
         let+ opened = open_for_call au ~at:e.exp_loc in
         Option.map opened ~f:(fun (opening, values) -> (au, opening, values))
     | _ -> State.return None
@@ -1137,9 +1147,33 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
   in
   let public_values = List.map public ~f:fst in
   (* A callee that may raise returns its outcome last, which the caller propagates. *)
+  (* A call with a witness constructor raises what the callee does for it. *)
+  let witness_set =
+    Option.bind (List.Assoc.find ctx.given.witness_raising f ~equal:String.equal)
+      ~f:(fun (position, sets) ->
+        match Option.map (List.nth ocaml_args position) ~f:(fun a -> a.exp_desc) with
+        | Some (Texp_construct (_, cstr, [])) ->
+            List.Assoc.find sets cstr.cstr_name ~equal:String.equal
+        | _ -> None)
+  in
   let* outcome =
-    match List.Assoc.find ctx.given.raising f ~equal:String.equal with
+    match
+      Option.map (List.Assoc.find ctx.given.raising f ~equal:String.equal) ~f:(fun set ->
+          Option.value witness_set ~default:set)
+    with
     | None -> State.return None
+    | Some (State.Raises []) ->
+        (* The callee returns its outcome, which is none for this witness. *)
+        let* typ = State.typ ctx ~at:e.exp_loc outcome_type in
+        let+ x = State.fresh "raised" in
+        let v = R.Expr.var ~loc:l (name ~loc:l x) in
+        Some
+          ( R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
+            v,
+            [
+              R.Stmt.assert_ ~loc:l
+                (R.Spec.make (R.Expr.binary ~loc:l Eq v (no_exception ~loc:l typ)));
+            ] )
     | Some set ->
         let* handlers = State.gets (fun (s : State.state) -> s.carried.handlers) in
         (* Leaving the function must commit its atomic update: only a retry does. *)
@@ -1571,7 +1605,7 @@ and loop_raising ctx ~at ~(spec : S.loop_spec) (cond : Typedtree.expression opti
   let l = loc at in
   let raises (e : Typedtree.expression) =
     Exceptions.raised
-      ~callee:(fun path ->
+      ~callee:(fun path _ ->
         Option.value_map (resolved_call ctx.given.functions ctx.given.libraries path)
           ~default:(State.Raises []) ~f:(fun f ->
             Option.value

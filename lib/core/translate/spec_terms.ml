@@ -362,7 +362,11 @@ let equality_check env (id : S.id) operator a b =
   | "===" | "=/=" ->
       begin match (term_type env a, term_type env b) with
       | Some left, Some right
-        when not (Ctype.is_equal env.ctx.given.env false [ left ] [ right ]) ->
+        when not
+               (Ctype.is_equal env.ctx.given.env false [ left ] [ right ]
+               (* As a case of a match on a witness refines them. *)
+               || Polymorphic_functions.same_type ~expand:(Datatypes.expand env.data) left
+                    right) ->
           let operator = S.mk_term (Tvar (Qid id)) id.pid_loc in
           let application = S.mk_term (Tapply (operator, a)) a.term_loc in
           let comparison = S.mk_term (Tapply (application, b)) id.pid_loc in
@@ -1688,7 +1692,46 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
     let types =
       Option.value_map scrutinee_type ~default:[] ~f:(fun t -> pattern_types env p t)
     in
-    { env with var_types = types @ env.var_types }
+    let env = { env with var_types = types @ env.var_types } in
+    (* A case of a match on a witness refines the types it selects, and reads the
+       variables of those types at the case's. *)
+    let refined =
+      match (scrutinee_type, p.pat_desc) with
+      | Some scrutinee, Pconstr ((Qid id | Qdot (_, id)), None) ->
+          Witnesses.contract_case env.data ~current:env.ctx.given.current_polymorphic
+            ~scrutinee ~var_types:env.var_types id.pid_str
+      | _ -> None
+    in
+    match refined with
+    | None -> env
+    | Some (aliases, reads) ->
+        let vars =
+          List.fold reads ~init:env.vars ~f:(fun vars (x, conversion) ->
+              let value =
+                match List.Assoc.find vars x ~equal:String.equal with
+                | Some (Raven y) -> Some (R.Expr.var ~loc:l (name ~loc:l y))
+                | Some (Value v) -> Some v
+                | Some (State _) | None -> None
+              in
+              Option.value_map value ~default:vars ~f:(fun value ->
+                  ( x,
+                    Value
+                      (R.Expr.call ~loc:l
+                         (Qualified_name.raven ~loc:l
+                            (Qualified_name.of_string conversion))
+                         [ value ]) )
+                  :: vars))
+        in
+        {
+          env with
+          data = aliases @ env.data;
+          vars;
+          ctx =
+            {
+              env.ctx with
+              given = { env.ctx.given with types = aliases @ env.ctx.given.types };
+            };
+        }
   in
   let flat_arg (p : S.pat) =
     match p.pat_desc with Pwild -> Some None | Pid id -> Some (Some id) | _ -> None

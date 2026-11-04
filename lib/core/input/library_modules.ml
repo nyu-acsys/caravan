@@ -96,7 +96,7 @@ let flatten libraries =
     List.fold_result signature.Typedtree.sig_items ~init:[] ~f:(fun names item ->
         let* added =
           match item.sig_desc with
-          | Tsig_value _ | Tsig_type _ | Tsig_attribute _ -> Ok []
+          | Tsig_value _ | Tsig_type _ | Tsig_attribute _ | Tsig_exception _ -> Ok []
           | Tsig_module declaration -> collect_type interface declaration.md_type
           | Tsig_modtype declaration ->
               begin match declaration.mtd_type with
@@ -112,7 +112,7 @@ let flatten libraries =
               Report.unsupported item.sig_loc "Recursive imported modules"
           | Tsig_open _ -> Report.unsupported item.sig_loc "Explicit signature opens"
           | Tsig_include _ -> Report.unsupported item.sig_loc "Signature includes"
-          | Tsig_typext _ | Tsig_exception _ | Tsig_class _ | Tsig_class_type _ ->
+          | Tsig_typext _ | Tsig_class _ | Tsig_class_type _ ->
               Report.unsupported item.sig_loc "This item of a library's interface"
         in
         Ok (List.rev_append added names))

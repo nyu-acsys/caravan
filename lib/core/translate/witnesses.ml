@@ -15,6 +15,9 @@ let functor_name (data : Datatypes.t) (ctor : Datatypes.ctor) =
 
 let parameter index = "A" ^ Int.to_string index
 let conversion ctor index = ctor ^ "$to$" ^ parameter index
+let conversion_from ctor index = ctor ^ "$from$" ^ parameter index
+let arbitrary index = "any$" ^ parameter index
+let arbitrary_index ctor index = "any$" ^ ctor ^ "$" ^ parameter index
 
 (** The data types with the ordinary ones of [arguments], a constructor's result
     arguments, as the dictionaries [A<i>] of [owner]. *)
@@ -66,40 +69,78 @@ let members types (data : Datatypes.t) =
           []
       in
       let x = R.Expr.var ~loc:l (name "x") in
-      (* The conversions of [owner], with [body] for the constructor and index. *)
-      let conversions ~owner ~ensures ~body =
+      (* The conversions of [owner], to and from each constructor's index types: the
+         interface's, specified, if [own] is [None], or those of the implementation of
+         the constructor [own], the identity for it and arbitrary for the others. *)
+      let conversions ~owner ~own =
         all_results witness.results ~f:(fun (ctor, arguments) ->
             let types = bind types ~owner ~at:data.at witness arguments in
             all_results (index_types witness arguments) ~f:(fun (position, index_type) ->
-                let* formal = Datatypes.typ types ~at:data.at index_type in
-                let ensures =
-                  if ensures then
-                    let admissible =
-                      Option.to_list (Datatypes.admissible ~loc:l types index_type x)
-                    in
-                    [
-                      R.Spec.make
-                        (R.Expr.binary ~loc:l Impl
-                           (List.reduce_exn ~f:(R.Expr.binary ~loc:l And)
-                              (R.Expr.binary ~loc:l Eq
-                                 (R.Expr.var ~loc:l (name "tag"))
-                                 (tag ctor)
-                              :: admissible))
-                           (call
-                              (parameter position ^ ".holds")
-                              [ R.Expr.var ~loc:l (name "y") ]));
-                    ]
-                  else []
+                let* index = Datatypes.typ types ~at:data.at index_type in
+                let to_ = conversion ctor position
+                and from = conversion_from ctor position in
+                let variable text = R.Expr.var ~loc:l (name text) in
+                let when_tag conditions conclusion =
+                  R.Spec.make
+                    (R.Expr.binary ~loc:l Impl
+                       (List.reduce_exn ~f:(R.Expr.binary ~loc:l And)
+                          (R.Expr.binary ~loc:l Eq (variable "tag") (tag ctor)
+                          :: conditions))
+                       conclusion)
                 in
-                Ok
-                  (R.Member.callable
-                     (R.Callable.func ~loc:l
-                        ~formals:[ R.Var.make ~loc:l (ident "x") formal ]
-                        ~returns:[ R.Var.make ~loc:l (ident "y") (carrier position) ]
-                        ~ensures
-                        (ident (conversion ctor position))
-                        (body ctor position)))))
-        |> Result.map ~f:List.concat
+                let admissible =
+                  Option.to_list (Datatypes.admissible ~loc:l types index_type x)
+                in
+                let holds = call (parameter position ^ ".holds") [ variable "y" ] in
+                let to_ensures, from_ensures =
+                  match own with
+                  | Some _ -> ([], [])
+                  | None ->
+                      ( [
+                          when_tag admissible holds;
+                          when_tag []
+                            (R.Expr.binary ~loc:l Eq (call from [ variable "y" ]) x);
+                        ],
+                        [
+                          when_tag [ holds ]
+                            (Option.value (List.hd admissible)
+                               ~default:(R.Expr.bool ~loc:l true));
+                          when_tag []
+                            (R.Expr.binary ~loc:l Eq (call to_ [ x ]) (variable "y"));
+                        ] )
+                in
+                let body own_value other =
+                  Option.map own ~f:(fun own ->
+                      if String.equal own ctor then own_value else variable other)
+                in
+                let members =
+                  [
+                    R.Member.callable
+                      (R.Callable.func ~loc:l
+                         ~formals:[ R.Var.make ~loc:l (ident "x") index ]
+                         ~returns:[ R.Var.make ~loc:l (ident "y") (carrier position) ]
+                         ~ensures:to_ensures (ident to_)
+                         (body x (arbitrary position)));
+                    R.Member.callable
+                      (R.Callable.func ~loc:l
+                         ~formals:[ R.Var.make ~loc:l (ident "y") (carrier position) ]
+                         ~returns:[ R.Var.make ~loc:l (ident "x") index ]
+                         ~ensures:from_ensures (ident from)
+                         (body (variable "y") (arbitrary_index ctor position)));
+                  ]
+                in
+                (* An implementation's arbitrary values of the other constructors' index
+                   types. *)
+                match own with
+                | Some own when not (String.equal own ctor) ->
+                    Ok
+                      (R.Member.free
+                         (R.Member.value ~loc:l ~typ:index
+                            (ident (arbitrary_index ctor position))
+                            None)
+                      :: members)
+                | _ -> Ok members))
+        |> Result.map ~f:(fun members -> List.concat (List.concat members))
       in
       let requested owner =
         List.concat_map witness.results ~f:(fun (_, arguments) ->
@@ -121,9 +162,7 @@ let members types (data : Datatypes.t) =
       in
       let interface = interface_name data in
       let* local, external_ = declarations [ interface ] in
-      let* interface_conversions =
-        conversions ~owner:[ interface ] ~ensures:true ~body:(fun _ _ -> None)
-      in
+      let* interface_conversions = conversions ~owner:[ interface ] ~own:None in
       let interface_member =
         R.Member.module_ ~loc:l ~interface:true (ident interface)
           (List.mapi witness.indices ~f:(fun position _ ->
@@ -153,13 +192,7 @@ let members types (data : Datatypes.t) =
                            (name dictionary))
                   | None -> Report.unsupported data.at "This witness index's dictionary")
             in
-            let arbitrary position = "any$" ^ parameter position in
-            let* own_conversions =
-              conversions ~owner ~ensures:false ~body:(fun other position ->
-                  Some
-                    (if String.equal other ctor then x
-                     else R.Expr.var ~loc:l (name (arbitrary position))))
-            in
+            let* own_conversions = conversions ~owner ~own:(Some ctor) in
             Ok
               (R.Member.module_ ~loc:l
                  ~params:
@@ -256,6 +289,50 @@ let own_witness (current : Polymorphic_functions.t option) arguments =
           in
           Option.some_if mine (worker.name ^ ".W")))
 
+(** In a case for the constructor [ctor] of a match on a witness with the type
+    [arguments]: the locally abstract types among its indices as abbreviations of the
+    constructor's index types, and those types with their positions. *)
+let refinement (witness : Datatypes.witness) arguments ctor =
+  let results = List.Assoc.find_exn witness.results ctor ~equal:String.equal in
+  let positions = List.zip_exn witness.indices (List.zip_exn results arguments) in
+  let parameters, actuals =
+    List.unzip
+      (List.filter_map positions ~f:(fun (index, pair) -> Option.some_if (not index) pair))
+  in
+  List.filter_mapi positions ~f:(fun position (index, (index_type, argument)) ->
+      match Types.get_desc argument with
+      | Tconstr (Pident id, [], _) when index ->
+          Option.map (Datatypes.instantiate_alias parameters actuals index_type)
+            ~f:(fun body -> (Datatypes.local_alias id body, (id, position)))
+      | _ -> None)
+  |> List.unzip
+
+(** For a contract's case for the constructor [ctor] of a match on a value of the witness
+    type [scrutinee], in the worker [current]: the abbreviations there, and the variables
+    of [var_types] whose types it refines, each with the conversion that reads it at the
+    constructor's index type. *)
+let contract_case types ~(current : Polymorphic_functions.t option) ~scrutinee ~var_types
+    ctor =
+  match witness_type types scrutinee with
+  | None -> None
+  | Some (_, witness, arguments) ->
+      let own = own_witness current arguments in
+      let ctor = String.uncapitalize ctor in
+      if not (List.Assoc.mem witness.results ctor ~equal:String.equal) then None
+      else
+        let aliases, refined = refinement witness arguments ctor in
+        let reads =
+          List.filter_map var_types ~f:(fun (x, typ) ->
+              match Types.get_desc typ with
+              | Tconstr (Pident id, [], _) ->
+                  Option.bind (List.Assoc.find refined id ~equal:Ident.same)
+                    ~f:(fun position ->
+                      Option.map own ~f:(fun own ->
+                          (x, own ^ "." ^ conversion_from ctor position)))
+              | _ -> None)
+        in
+        Some (aliases, reads)
+
 (** For a match of type [result] on a value of the witness type [scrutinee], in the worker
     [current]: per case, by its right-hand side, the data types in which the locally
     abstract types its constructor refines are its index types, and the conversion of its
@@ -298,26 +375,7 @@ let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~resul
              match ctor with
              | None -> (types, None)
              | Some ctor ->
-                 let results =
-                   List.Assoc.find_exn witness.results ctor ~equal:String.equal
-                 in
-                 let ordinary =
-                   List.filter_map
-                     (List.zip_exn witness.indices (List.zip_exn results arguments))
-                     ~f:(fun (index, pair) -> Option.some_if (not index) pair)
-                 in
-                 let parameters, actuals = List.unzip ordinary in
-                 let aliases =
-                   List.filter_map
-                     (List.zip_exn witness.indices (List.zip_exn results arguments))
-                     ~f:(fun (index, (index_type, argument)) ->
-                       match Types.get_desc argument with
-                       | Tconstr (Pident id, [], _) when index ->
-                           Option.map
-                             (Datatypes.instantiate_alias parameters actuals index_type)
-                             ~f:(Datatypes.local_alias id)
-                       | _ -> None)
-                 in
+                 let aliases, _ = refinement witness arguments ctor in
                  ( aliases @ types,
                    Option.map2 result_index own ~f:(fun position own ->
                        own ^ "." ^ conversion ctor position) )))

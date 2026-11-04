@@ -22,6 +22,31 @@ val push : 'a t -> 'a -> unit
     atomic requires stack t xs
     atomic ensures stack t (v :: xs) *)
 
+exception Empty
+
+val peek_opt : 'a t -> 'a option
+(*@ r = atomic peek_opt t
+    atomic requires stack t xs
+    atomic ensures stack t xs && match xs with [] -> r = None | x :: _ -> r === Some x *)
+
+val peek_exn : 'a t -> 'a
+(*@ r = atomic peek_exn t
+    atomic requires stack t xs
+    atomic ensures stack t xs && match xs with [] -> false | x :: _ -> r === x
+    atomic raises Empty -> xs = [] && stack t [] *)
+
+val pop_exn : 'a t -> 'a
+(*@ r = atomic pop_exn t
+    atomic requires stack t xs
+    atomic ensures match xs with [] -> false | x :: xs' -> r === x && stack t xs'
+    atomic raises Empty -> xs = [] && stack t [] *)
+
+val drop_exn : 'a t -> unit
+(*@ atomic drop_exn t
+    atomic requires stack t xs
+    atomic ensures match xs with [] -> false | _ :: xs' -> stack t xs'
+    atomic raises Empty -> xs = [] && stack t [] *)
+
 val pop_opt : 'a t -> 'a option
 (*@ r = atomic pop_opt t
     atomic requires stack t xs

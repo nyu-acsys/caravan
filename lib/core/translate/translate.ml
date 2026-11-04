@@ -85,11 +85,13 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           {
             Worker_groups.name = worker.Polymorphic_functions.name;
             arity = List.length worker.scheme.variables;
+            witness = Option.is_some worker.witness;
           })
       @ List.map (proofs @ assets) ~f:(fun worker ->
           {
             Worker_groups.name = worker.Generic_parameters.name;
             arity = List.length worker.variables;
+            witness = false;
           })
     in
     ( Generic_family_plan.

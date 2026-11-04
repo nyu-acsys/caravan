@@ -7,7 +7,24 @@ proof of_list = on return fold stack t list
 
 proof is_empty = at (Atomic.get t) commit
 
-(* The recursive helpers; the wrappers of the same name take only [t]. *)
-proof pop_opt t backoff = at (Atomic.get t) returning [] -> commit
+(* The witness-generic helpers; their wrappers delegate to them. *)
+proof r = atomic peek_as t poly
+  atomic requires (stack t xs)
+  atomic ensures (stack t xs && match poly with
+    | Option -> (match xs with [] -> r === None | x :: _ -> r === Some x)
+    | Value -> (match xs with [] -> false | x :: _ -> r === x))
+  atomic raises Empty -> ((match poly with Option -> false | Value -> true) && xs = [] && stack t [])
+  = at (Atomic.get t) commit
+
+proof r = atomic pop_as t backoff poly
+  atomic requires (stack t xs)
+  atomic ensures (match poly with
+    | Option -> (match xs with [] -> r === None && stack t [] | x :: xs' -> r === Some x && stack t xs')
+    | Value -> (match xs with [] -> false | x :: xs' -> r === x && stack t xs')
+    | Unit -> (match xs with [] -> false | _ :: xs' -> stack t xs'))
+  atomic raises Empty -> ((match poly with Option -> false | Value -> true | Unit -> true) && xs = [] && stack t [])
+  = at (Atomic.get t) returning [] -> commit
+
+(* The recursive helper; the wrapper of the same name takes only [t]. *)
 
 proof pop_all t backoff = at (Atomic.get t) returning [] -> commit

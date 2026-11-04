@@ -331,6 +331,9 @@ outline_clause:
 | ENSURES LEFTPAR term RIGHTPAR {}
 | ATOMIC_REQUIRES LEFTPAR term RIGHTPAR {}
 | ATOMIC_ENSURES LEFTPAR term RIGHTPAR {}
+| RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
+| RAISES mpat_app {}
+| ATOMIC_RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
 ;
 
 (* Steps in program order. [let p = at (a) (fun step -> e) in ...] exports the value that

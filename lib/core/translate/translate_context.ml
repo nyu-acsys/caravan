@@ -1052,6 +1052,12 @@ type inputs = {
   procedure_signatures : (string * procedure_signature) list;
   raising : (string * State_monad.raise_set) list;
       (** The procedures that may raise, by name, with what they may raise. *)
+  witness_raising : (string * (int * (string * State_monad.raise_set) list)) list;
+      (** For functions over a witness, by name: the witness's position among the
+          parameters, and what they raise when called with each constructor. *)
+  atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
+  raising_library_calls : string list;
+      (** The library functions that may raise, whose calls are not supported yet. *)
   libraries : string list Path_bindings.t;
       (** The modules of the libraries, with their names: trusted Raven modules. *)
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
@@ -1112,6 +1118,9 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     return_proofs = [];
     procedure_signatures = [];
     raising = [];
+    witness_raising = [];
+    atomic_procedures = [];
+    raising_library_calls = [];
     initializations = [];
     linearizations = [];
     shared;

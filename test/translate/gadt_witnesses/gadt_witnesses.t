@@ -27,6 +27,21 @@ The emitted program verifies too.
   $ raven --shh functions.rav
   Verification successful.
 
+A call with a witness raises only what the callee raises for it, and contracts match on
+the witness: each case reads the result at the type the witness selects there.
+
+  $ caravan --shh raise_sets.ml
+  Verification successful.
+  $ caravan --shh contracts.ml
+  Verification successful.
+  $ caravan --shh contracts_fail.ml 2>&1 | grep -c "^\[Error\]"
+  2
+
+A wrapper delegates its atomic update to an atomic function it calls before it linearizes.
+
+  $ caravan --shh delegation/stack.ml
+  Verification successful.
+
 A witness argument other than a constructor or the caller's own witness is rejected.
 
   $ caravan --shh witness_value.ml

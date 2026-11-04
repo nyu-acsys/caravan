@@ -8,7 +8,9 @@ open Base
 
 let ( let* ) result f = Result.bind result ~f
 
-type worker = { name : string; arity : int }
+type worker = { name : string; arity : int; witness : bool }
+(** A worker with the number of its type parameters; a witness's takes its witness rather
+    than their dictionaries, so it shares no functor. *)
 
 type use = { namespace : string list; target : string; arguments : string list option }
 (** A use of [target], a worker at the dictionaries [arguments] or a member of a module,
@@ -124,6 +126,7 @@ let create ~generic_modules ~applications workers uses =
         | order -> order)
     | order -> order
   in
+  let workers = List.filter workers ~f:(fun worker -> not worker.witness) in
   Ok
     (List.sort_and_group workers ~compare:(fun left right ->
          compare_key (key left) (key right))

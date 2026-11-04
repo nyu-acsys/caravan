@@ -310,13 +310,19 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   let contract =
                     Option.map (List.Assoc.find contracts x ~equal:String.equal) ~f:fst
                   in
-                  let+ member = library_function ctx ~at ~name:x ~args ~result contract in
-                  let member = R.Member.free (R.Member.callable member) in
-                  begin match worker with
-                  | None -> ([ member ], [])
-                  | Some worker -> ([], [ (worker.name, [ member ]) ])
-                  end
-              | Psig_type _ | Psig_attribute _ -> State.return ([], [])
+                  if Option.exists contract ~f:raising_contract then
+                    (* Its calls are rejected; see [raising_library_calls]. *)
+                    State.return ([], [])
+                  else
+                    let+ member =
+                      library_function ctx ~at ~name:x ~args ~result contract
+                    in
+                    let member = R.Member.free (R.Member.callable member) in
+                    begin match worker with
+                    | None -> ([ member ], [])
+                    | Some worker -> ([], [ (worker.name, [ member ]) ])
+                    end
+              | Psig_type _ | Psig_attribute _ | Psig_exception _ -> State.return ([], [])
               | _ ->
                   State.of_result
                     (unsupported item.psig_loc "This item of a library's interface"))
@@ -1696,17 +1702,53 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
       (List.find translated ~f:(fun (n, _, _) -> String.equal n name))
       ~f:(fun (_, _, functions) -> resolved_call functions (library_paths libraries) path)
   in
-  let raising =
+  (* The witness parameter of a function over a witness, with its position and the
+     witness's constructors. *)
+  let witness_parameter f =
+    let ( let* ) value f = Option.bind value ~f in
+    let* worker = Program_declarations.enclosing_worker polymorphic_functions f in
+    let* witness = worker.witness in
+    let* () = Option.some_if (Ident.same worker.id f.id) () in
+    let* param = List.nth f.params witness.parameter in
+    match param.fp_kind with
+    | Tparam_pat ({ pat_desc = Tpat_var (id, _, _); _ } as pattern) ->
+        let data, _, _, _, _, _ = body_context f in
+        Option.map (Witnesses.witness_type data pattern.pat_type)
+          ~f:(fun (witness_data, _, _) ->
+            ( witness.parameter,
+              id,
+              List.map witness_data.Datatypes.ctors ~f:(fun c -> c.Datatypes.ocaml) ))
+    | _ -> None
+  in
+  let raising, by_constructor =
     Exceptions.raise_sets
-      (List.map translated ~f:(fun (name, f, _) -> (name, f.contract, f.body)))
+      (List.map translated ~f:(fun (name, f, _) ->
+           ( name,
+             f.contract,
+             f.body,
+             Option.map (witness_parameter f) ~f:(fun (_, id, constructors) ->
+                 (id, constructors)) )))
       ~resolve
   in
   (* By the names calls use, and by the procedures' own, as a worker's. *)
-  let raising =
-    raising
+  let by_own_names sets =
+    sets
     @ List.filter_map translated ~f:(fun (name, f, _) ->
-        Option.map (List.Assoc.find raising name ~equal:String.equal) ~f:(fun set ->
+        Option.map (List.Assoc.find sets name ~equal:String.equal) ~f:(fun set ->
             (body_proc_name f, set)))
+  in
+  let raising = by_own_names raising in
+  let atomic_procedures =
+    List.concat_map translated ~f:(fun (name, f, _) ->
+        if Option.exists f.contract ~f:(fun c -> c.atomic) then [ name; body_proc_name f ]
+        else [])
+  in
+  let witness_raising =
+    by_own_names
+      (List.filter_map translated ~f:(fun (name, f, _) ->
+           Option.bind (witness_parameter f) ~f:(fun (position, _, _) ->
+               Option.map (List.Assoc.find by_constructor name ~equal:String.equal)
+                 ~f:(fun sets -> (name, (position, sets))))))
   in
   let* procs, state =
     State.run_from state
@@ -1742,7 +1784,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   ghost_args;
                   procedure_signatures;
                   raising;
+                  witness_raising;
+                  atomic_procedures;
                   libraries = library_paths libraries;
+                  raising_library_calls = raising_library_calls libraries;
                   annotations;
                   proof_lemmas =
                     (let context = body_module_context f in

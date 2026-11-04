@@ -23,3 +23,12 @@ Draining consumes the original contents rather than preserving them in the stack
                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: This predicate may not hold.
   [1]
+
+The interface's raising functions cannot be called through it yet.
+
+  $ caravan --shh raising_call.ml
+  [Error] File "raising_call.ml", line 1, columns 16-43:
+  1 | let top stack = Treiber_stack.pop_exn stack
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Unsupported Error: A call of a library function that may raise is not supported yet.
+  [1]

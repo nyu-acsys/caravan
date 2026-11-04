@@ -1556,13 +1556,54 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       (Option.value_map f.contract ~default:[] ~f:(fun c -> c.raises))
       set
   in
+  (* A function over a witness raises, with each constructor, only what it does for it,
+     which calls with that constructor rely on. *)
+  let witness_raises_terms =
+    match
+      (raising, List.Assoc.find ctx.given.witness_raising proc_name ~equal:String.equal)
+    with
+    | Some (set, _), Some (position, sets) ->
+        let at = f.loc in
+        let witness_name =
+          let header =
+            Option.bind f.contract ~f:(fun c ->
+                Option.bind c.header ~f:(fun h -> List.nth h.hd_args position))
+          in
+          match
+            (header, Option.map (List.nth f.params position) ~f:(fun p -> p.fp_kind))
+          with
+          | Some (S.Lvar id), _ -> Some id.pid_str
+          | _, Some (Tparam_pat { pat_desc = Tpat_var (id, _, _); _ }) ->
+              Some (Ident.name id)
+          | _ -> None
+        in
+        Option.value_map witness_name ~default:[] ~f:(fun witness_name ->
+            List.filter_map sets ~f:(fun (constructor, constructor_set) ->
+                let only =
+                  if Poly.equal constructor_set set then None
+                  else
+                    List.last
+                      (Exceptions.raises_postconditions ctx.given.types ~at []
+                         constructor_set)
+                in
+                Option.map only ~f:(fun only ->
+                    S.mk_term
+                      (Tmatch
+                         ( S.mk_term (Tvar (Qid (S.mk_id ~loc:at witness_name))) at,
+                           [
+                             (Exceptions.constructor_pattern ~at constructor None, only);
+                             (Exceptions.pattern ~at Pwild, S.mk_term Ttrue at);
+                           ] ))
+                      at)))
+    | _ -> []
+  in
   let* ensures =
     let posts = Option.value_map f.contract ~default:[] ~f:(fun c -> c.ensures) in
     match raising with
     | None -> postconditions posts
     | Some (set, _) ->
         let* normal = postconditions (List.map posts ~f:Exceptions.on_return) in
-        let+ exceptional = postconditions (raises_terms set) in
+        let+ exceptional = postconditions (raises_terms set @ witness_raises_terms) in
         normal @ exceptional
   in
   let atomic_posts =
@@ -1583,7 +1624,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                (List.map
                   (Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_raises))
                   ~f:(fun (p, t) -> (p, Some t)))
-               (State.Raises []))
+               (State.Raises [])
+            @ if atomic then witness_raises_terms else [])
         in
         normal @ exceptional
   in
@@ -1870,7 +1912,7 @@ let entry_of_args types (f : func) (names : string option list) (element : S.ter
 (** [funcs], where a function without a contract that a wrapper calls with its own
     parameters first, as [push t value Backoff.default] in [let push t value = ...], has
     the wrapper's contract, and its other parameters are free; it continues the wrapper's
-    atomic update. *)
+    atomic update. A call passing a GADT witness's constructor is not such a wrapper. *)
 let inherit_contracts (funcs : func list) =
   let param_ids (f : func) =
     Option.all
@@ -1895,8 +1937,18 @@ let inherit_contracts (funcs : func list) =
                   | Typedtree.Arg { exp_desc = Texp_ident (Pident x, _, _); _ } -> Some x
                   | _ -> None)
             in
+            (* A wrapper passing a GADT witness's constructor selects one of its
+               callee's behaviors, which has a contract of its own. *)
+            let witness =
+              List.exists args ~f:(fun (_, arg) ->
+                  match arg with
+                  | Typedtree.Arg { exp_desc = Texp_construct (_, cstr, _); _ } ->
+                      cstr.cstr_generalized
+                  | _ -> false)
+            in
             Option.some_if
-              (List.length passed = List.length params
+              ((not witness)
+              && List.length passed = List.length params
               && List.for_all2_exn passed params ~f:(fun x p ->
                   Option.exists x ~f:(Ident.same p)))
               (g, contract, List.length params)
@@ -2095,3 +2147,18 @@ let interface_contracts (interface : Source.interface) =
         | _ -> Ok None)
   in
   Ok (List.filter_opt contracts)
+
+(** Whether [contract] says its function may raise. *)
+let raising_contract (contract : S.contract) =
+  not (List.is_empty contract.raises && List.is_empty contract.atomic_raises)
+
+(** The library functions whose contracts say they may raise, by their qualified names:
+    exceptions of libraries are not supported yet, so their calls are rejected. *)
+let raising_library_calls (libraries : Library_modules.t list) =
+  List.concat_map libraries ~f:(fun lib ->
+      Option.value_map
+        (Result.ok (interface_contracts lib.library))
+        ~default:[]
+        ~f:(fun contracts ->
+          List.filter_map contracts ~f:(fun (name, (contract, _)) ->
+              Option.some_if (raising_contract contract) (lib.library_name ^ "." ^ name))))

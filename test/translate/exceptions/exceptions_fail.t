@@ -84,7 +84,8 @@ if the exception leaves the function, or the loop's own. Its condition may not r
 
 A raise leaving a function with an atomic contract must follow the step that linearizes
 it; what its atomic raises clauses say is checked; and a raising call in such a function
-must be a retry.
+must linearize it, as a retry or a call of another atomic function before it has
+linearized: a second call after the first is rejected.
 
   $ mkdir early wrong twice
   $ cp atomic_stack.ml atomic_stack.mli early/
@@ -120,8 +121,8 @@ must be a retry.
   $ cat atomic_stack_twice.ml >> twice/atomic_stack.ml
   $ cat atomic_stack_twice.mli >> twice/atomic_stack.mli
   $ caravan --shh twice/atomic_stack.ml
-  [Error] File "twice/atomic_stack.ml", line 18, columns 10-19:
-  18 |   let _ = pop_exn t in
-                 ^^^^^^^^^
+  [Error] File "twice/atomic_stack.ml", line 19, columns 2-11:
+  19 |   pop_exn t
+         ^^^^^^^^^
   Unsupported Error: A call that may raise, other than a retry, in a function with an atomic contract is not supported yet.
   [1]

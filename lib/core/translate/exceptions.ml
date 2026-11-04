@@ -166,22 +166,53 @@ let handled (patterns : Typedtree.pattern list) =
       let more, every = catches p in
       (names @ more, all || every))
 
+type witness_argument =
+  | Constructor of string  (** A witness constructor. *)
+  | Forwarded  (** The caller's own witness. *)
+
 type use =
   | Raise of string option * Location.t
       (** A raise of the exception named, or of an exception value. *)
   | Reraise of uses * Location.t
       (** A raise of what a handler caught, from its protected part's uses. *)
-  | Call of Path.t * Location.t
+  | Call of Path.t * Location.t * witness_argument option
   | Handled of { protected : uses; handled : string list; catch_all : bool; cases : uses }
+  | Witness_cases of (string list option * uses) list
+      (** A match on the function's witness: its cases, each with the constructors it
+          matches, [None] for any. *)
 
 and uses = (use * bool) list
 (** Uses, each with whether it is in a loop. *)
 
-(** The raises and calls of [body], outside the local functions it defines. *)
-let uses (body : Typedtree.expression) =
+(** The constructors that [p] matches, [None] if any. *)
+let rec matched_constructors (p : Typedtree.pattern) =
+  match p.pat_desc with
+  | Tpat_construct (_, cstr, _, _) -> Some [ cstr.cstr_name ]
+  | Tpat_or (a, b, _) ->
+      Option.map2 (matched_constructors a) (matched_constructors b) ~f:( @ )
+  | Tpat_alias (p, _, _, _, _) -> matched_constructors p
+  | _ -> None
+
+(** The raises and calls of [body], outside the local functions it defines; [witness] is
+    the function's witness parameter, whose matches record their cases. *)
+let uses ?witness (body : Typedtree.expression) =
   let rec scan caught loops (e : Typedtree.expression) : uses =
     let sub = scan caught loops in
     match (e.exp_desc, raised_argument e) with
+    | Texp_match ({ exp_desc = Texp_ident (Pident id, _, _); _ }, cases, [], _), None
+      when Option.exists witness ~f:(Ident.same id) ->
+        [
+          ( Witness_cases
+              (List.map cases ~f:(fun (c : Typedtree.computation Typedtree.case) ->
+                   let constructors =
+                     match Typedtree.split_pattern c.c_lhs with
+                     | Some p, None -> matched_constructors p
+                     | _ -> None
+                   in
+                   ( constructors,
+                     Option.value_map c.c_guard ~default:[] ~f:sub @ sub c.c_rhs ))),
+            loops > 0 );
+        ]
     | _, Some argument ->
         let raised =
           match (named argument, argument.exp_desc) with
@@ -235,8 +266,19 @@ let uses (body : Typedtree.expression) =
         :: List.concat_map split ~f:(fun ((value, _), rhs) ->
             if Option.is_some value then sub rhs else [])
     | (Texp_while _ | Texp_for _), None -> children (scan caught (loops + 1)) e
-    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _), None ->
-        (Call (path, e.exp_loc), loops > 0) :: children sub e
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args), None ->
+        let witness_argument =
+          List.find_map args ~f:(fun (_, arg) ->
+              match arg with
+              | Typedtree.Arg { exp_desc = Texp_construct (_, cstr, []); _ }
+                when cstr.cstr_generalized ->
+                  Some (Constructor cstr.cstr_name)
+              | Arg { exp_desc = Texp_ident (Pident id, _, _); _ }
+                when Option.exists witness ~f:(Ident.same id) ->
+                  Some Forwarded
+              | _ -> None)
+        in
+        (Call (path, e.exp_loc, witness_argument), loops > 0) :: children sub e
     | _ -> children sub e
   and children f (e : Typedtree.expression) =
     let found = ref [] in
@@ -265,35 +307,62 @@ let declared_raises (contract : Caravan_spec.Spec_ast.contract) =
          | _ -> None)
     |> List.dedup_and_sort ~compare:String.compare)
 
-(** The exceptions that [uses] may raise, with [callee] the exceptions of a call. *)
-let rec raised ~callee (uses : uses) =
+(** The exceptions that [uses] may raise, with [callee] the exceptions of a call; only in
+    the cases for the witness constructor [constructor] if given. *)
+let rec raised ?constructor ~callee (uses : uses) =
+  let raised = raised ?constructor ~callee in
   List.fold uses ~init:(Translate_context.State_monad.Raises []) ~f:(fun set (use, _) ->
       union set
         (match use with
         | Raise (Some name, _) -> Raises [ name ]
         | Raise (None, _) -> Raises_any
-        | Reraise (protected, _) -> raised ~callee protected
-        | Call (path, _) -> callee path
+        | Reraise (protected, _) -> raised protected
+        | Call (path, _, witness_argument) ->
+            (* A call passing the caller's witness raises what the callee does for the
+               same constructor. *)
+            let witness_argument =
+              match (witness_argument, constructor) with
+              | Some Forwarded, Some c -> Some (Constructor c)
+              | Some Forwarded, None -> None
+              | argument, _ -> argument
+            in
+            callee path witness_argument
         | Handled { protected; handled; catch_all; cases } ->
             union
-              (Translate_context.unhandled (raised ~callee protected) ~handled ~catch_all)
-              (raised ~callee cases)))
+              (Translate_context.unhandled (raised protected) ~handled ~catch_all)
+              (raised cases)
+        | Witness_cases cases ->
+            List.fold cases ~init:(Translate_context.State_monad.Raises [])
+              ~f:(fun set (constructors, uses) ->
+                let reached =
+                  match (constructor, constructors) with
+                  | Some c, Some cs -> List.mem cs c ~equal:String.equal
+                  | None, _ | _, None -> true
+                in
+                if reached then union set (raised uses) else set)))
+
+(** The exceptions in both [left] and [right]. *)
+let intersection left right =
+  match (left, right) with
+  | Translate_context.State_monad.Raises_any, set
+  | set, Translate_context.State_monad.Raises_any ->
+      set
+  | Raises a, Raises b -> Raises (List.filter a ~f:(List.mem b ~equal:String.equal))
 
 (** The exceptions each procedure may raise, for those that may raise any: [procedures]
-    gives each procedure's name, contract and body, and [resolve] the procedure a path
-    calls from it. A function with a contract raises what its [raises] clauses say; one
-    without raises what its body raises and its calls may raise. *)
+    gives each procedure's name, contract, body and witness parameter with its
+    constructors, and [resolve] the procedure a path calls from it. A function with a
+    contract raises what its [raises] clauses say; one without raises what its body raises
+    and its calls may raise. Also, per witness constructor, what each function with a
+    witness parameter raises when called with it. *)
 let raise_sets procedures ~resolve =
   let module S = Translate_context.State_monad in
   let bodies =
-    List.map procedures ~f:(fun (name, contract, body) -> (name, contract, uses body))
-  in
-  let initial =
-    List.map bodies ~f:(fun (name, contract, _) ->
+    List.map procedures ~f:(fun (name, contract, body, witness) ->
         ( name,
-          match (contract : Caravan_spec.Spec_ast.contract option) with
-          | Some contract -> declared_raises contract
-          | None -> S.Raises [] ))
+          (contract : Caravan_spec.Spec_ast.contract option),
+          uses ?witness:(Option.map witness ~f:fst) body,
+          Option.map witness ~f:snd ))
   in
   let same left right =
     match (left, right) with
@@ -301,26 +370,65 @@ let raise_sets procedures ~resolve =
     | Raises a, Raises b -> List.equal String.equal a b
     | _ -> false
   in
-  let rec fixed_point sets =
-    let next =
-      List.map bodies ~f:(fun (name, contract, uses) ->
-          match contract with
-          | Some _ -> (name, List.Assoc.find_exn sets name ~equal:String.equal)
+  (* What each procedure raises, and per witness constructor what those over a witness
+     do, from none: every exception raised comes from a raise. *)
+  let rec fixed_point (sets, by_constructor) =
+    let callee name path witness_argument =
+      Option.value_map (resolve name path) ~default:(S.Raises []) ~f:(fun callee ->
+          let constructor_set =
+            match witness_argument with
+            | Some (Constructor c) ->
+                Option.bind (List.Assoc.find by_constructor callee ~equal:String.equal)
+                  ~f:(fun sets -> List.Assoc.find sets c ~equal:String.equal)
+            | Some Forwarded | None -> None
+          in
+          match constructor_set with
+          | Some set -> set
           | None ->
-              let callee path =
-                Option.value_map (resolve name path) ~default:(S.Raises [])
-                  ~f:(fun callee ->
-                    Option.value
-                      (List.Assoc.find sets callee ~equal:String.equal)
-                      ~default:(S.Raises []))
-              in
-              (name, raised ~callee uses))
+              Option.value
+                (List.Assoc.find sets callee ~equal:String.equal)
+                ~default:(S.Raises []))
     in
-    if List.for_all2_exn sets next ~f:(fun (_, a) (_, b) -> same a b) then sets
-    else fixed_point next
+    let declared_or contract inferred =
+      match contract with
+      | Some contract -> intersection (declared_raises contract) (Lazy.force inferred)
+      | None -> Lazy.force inferred
+    in
+    let next_sets =
+      List.map bodies ~f:(fun (name, contract, uses, _) ->
+          match contract with
+          | Some contract -> (name, declared_raises contract)
+          | None -> (name, raised ~callee:(callee name) uses))
+    in
+    let next_by_constructor =
+      List.filter_map bodies ~f:(fun (name, contract, uses, constructors) ->
+          Option.map constructors ~f:(fun constructors ->
+              ( name,
+                List.map constructors ~f:(fun constructor ->
+                    ( constructor,
+                      declared_or contract
+                        (lazy (raised ~constructor ~callee:(callee name) uses)) )) )))
+    in
+    let stable =
+      List.for_all2_exn sets next_sets ~f:(fun (_, a) (_, b) -> same a b)
+      && List.for_all2_exn by_constructor next_by_constructor ~f:(fun (_, a) (_, b) ->
+          List.for_all2_exn a b ~f:(fun (_, a) (_, b) -> same a b))
+    in
+    if stable then (sets, by_constructor) else fixed_point (next_sets, next_by_constructor)
   in
-  List.filter (fixed_point initial) ~f:(fun (_, set) ->
-      match set with S.Raises [] -> false | _ -> true)
+  let initial =
+    ( List.map bodies ~f:(fun (name, contract, _, _) ->
+          ( name,
+            match contract with
+            | Some contract -> declared_raises contract
+            | None -> S.Raises [] )),
+      List.filter_map bodies ~f:(fun (name, _, _, constructors) ->
+          Option.map constructors ~f:(fun constructors ->
+              (name, List.map constructors ~f:(fun c -> (c, S.Raises []))))) )
+  in
+  let sets, by_constructor = fixed_point initial in
+  ( List.filter sets ~f:(fun (_, set) -> match set with S.Raises [] -> false | _ -> true),
+    by_constructor )
 
 let outcome_term ~at =
   S.mk_term (Tvar (Qid (S.mk_id ~loc:at Translate_context.outcome_name))) at
