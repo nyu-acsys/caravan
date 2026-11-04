@@ -60,35 +60,93 @@ let blame ~explicit_proof_files (d : R.Diagnostic.t) : R.Diagnostic.t =
       }
   | _ -> d
 
-(** Verifies [file], with the libraries in [include_dirs], encoding histories in [history]
-    and giving the solver [smt_timeout] milliseconds a query; whether it verified. With
-    [emit_rav], the Raven program is printed instead. *)
-let file ~(include_dirs : string list) ~(history : History.encoding) ~(emit_rav : bool)
-    ~(smt_timeout : int) (file : string) : bool =
-  match Source.load ~include_dirs file with
+type result = {
+  file : string;
+  verified : bool;
+  diagnostics : R.Diagnostic.t list;
+  dependencies : string list;
+}
+
+type prepared = {
+  program : R.Program.t;
+  origins : Translate_context.origin list;
+  warnings : R.Diagnostic.t list;
+  explicit_proof_files : string list;
+  dependencies : string list;
+}
+
+let sibling_dependencies file =
+  let base = Stdlib.Filename.remove_extension file in
+  [ file; base ^ ".mli"; base ^ ".proof" ]
+
+let source_dependencies (source : Source.t) =
+  sibling_dependencies source.file
+  @ List.map source.libraries ~f:(fun library ->
+      library.Source.library.scope.location.loc_start.pos_fname)
+  @ List.map source.proof_scopes.declarations ~f:(fun entry ->
+      entry.Proof_scopes.name.pid_loc.loc_start.pos_fname)
+  |> List.filter ~f:(fun file -> not (String.is_empty file))
+  |> List.dedup_and_sort ~compare:String.compare
+
+let prepare ~include_dirs ~history file =
+  let ( let* ) result f = Result.bind result ~f in
+  let* source = Source.load ~include_dirs file in
+  let* program, origins, warnings = Translate.program_with_diagnostics ~history source in
+  let explicit_proof_files =
+    List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+        match entry.Proof_scopes.declaration with
+        | Caravan_spec.Spec_ast.Proof_lemma _ ->
+            Some entry.name.pid_loc.loc_start.pos_fname
+        | _ when Option.is_some entry.scope.owner ->
+            Some entry.name.pid_loc.loc_start.pos_fname
+        | _ -> None)
+  in
+  Ok
+    {
+      program;
+      origins;
+      warnings;
+      explicit_proof_files;
+      dependencies = source_dependencies source;
+    }
+
+let verify ~smt_timeout prepared =
+  let result =
+    R.verify ~options:{ R.default_options with smt_timeout } prepared.program
+  in
+  ( result.verified,
+    prepared.warnings
+    @ List.map result.diagnostics ~f:(fun diagnostic ->
+        blame ~explicit_proof_files:prepared.explicit_proof_files
+          (explain prepared.origins diagnostic)) )
+
+(** Structured verification results shared by the command line and editors. *)
+let run ~include_dirs ~history ~smt_timeout file =
+  match prepare ~include_dirs ~history file with
   | Error error ->
-      Report.print error;
-      false
-  | Ok source -> (
-      match Translate.program ~history source with
-      | Error error ->
-          Report.print error;
-          false
-      | Ok (program, _) when emit_rav ->
-          Logs.app (fun m -> m "%a" R.Program.pr program);
-          true
-      | Ok (program, origins) ->
-          let result = R.verify ~options:{ R.default_options with smt_timeout } program in
-          let explicit_proof_files =
-            List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
-                match entry.Proof_scopes.declaration with
-                | Caravan_spec.Spec_ast.Proof_lemma _ ->
-                    Some entry.name.pid_loc.loc_start.pos_fname
-                | _ when Option.is_some entry.scope.owner ->
-                    Some entry.name.pid_loc.loc_start.pos_fname
-                | _ -> None)
-          in
-          List.iter result.diagnostics ~f:(fun d ->
-              Report.print_diagnostic (blame ~explicit_proof_files (explain origins d)));
-          if result.verified then Logs.app (fun m -> m "Verification successful.");
-          result.verified)
+      {
+        file;
+        verified = false;
+        diagnostics = [ Report.to_diagnostic error ];
+        dependencies = sibling_dependencies file;
+      }
+  | Ok prepared ->
+      let verified, diagnostics = verify ~smt_timeout prepared in
+      { file; verified; diagnostics; dependencies = prepared.dependencies }
+
+(** The human-readable command line, including the generated-program escape hatch. *)
+let file ~include_dirs ~history ~emit_rav ~smt_timeout file =
+  if emit_rav then (
+    match prepare ~include_dirs ~history file with
+    | Error error ->
+        Report.print error;
+        false
+    | Ok prepared ->
+        List.iter prepared.warnings ~f:Report.print_diagnostic;
+        Logs.app (fun m -> m "%a" R.Program.pr prepared.program);
+        true)
+  else
+    let result = run ~include_dirs ~history ~smt_timeout file in
+    List.iter result.diagnostics ~f:Report.print_diagnostic;
+    if result.verified then Logs.app (fun m -> m "Verification successful.");
+    result.verified

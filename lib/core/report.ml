@@ -56,11 +56,11 @@ let print_diagnostic (d : R.Diagnostic.t) =
 
 let print (e : error) = print_diagnostic (to_diagnostic e)
 
-(** Prints the warning [message] at [at]. *)
-let warn (at : Location.t) message =
-  print_diagnostic
-    { severity = Warning; kind = Other; code = None; loc = loc at; message; related = [] }
+(** The warning [message] at [at]. *)
+let warning (at : Location.t) message : R.Diagnostic.t =
+  { severity = Warning; kind = Other; code = None; loc = loc at; message; related = [] }
 
+let warn at message = print_diagnostic (warning at message)
 let unsupported loc what = Error (error Unsupported loc (what ^ " is not supported yet"))
 
 (** A broken invariant of Caravan's own, stated by [message], noticed at [loc]. *)

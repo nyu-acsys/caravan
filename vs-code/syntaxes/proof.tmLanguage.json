@@ -1,0 +1,12 @@
+{
+  "name": "Caravan Proof",
+  "scopeName": "source.caravan.proof",
+  "patterns": [
+    {
+      "include": "source.caravan.spec"
+    },
+    {
+      "include": "source.ocaml"
+    }
+  ]
+}

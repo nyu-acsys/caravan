@@ -1,0 +1,54 @@
+{
+  "name": "caravan",
+  "displayName": "Caravan",
+  "icon": "images/icon.png",
+  "description": "Verification for multicore OCaml programs.",
+  "version": "0.1.0",
+  "publisher": "nyu-acsys",
+  "repository": { "type": "git", "url": "https://github.com/nyu-acsys/caravan.git", "directory": "vs-code" },
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages", "Linters"],
+  "main": "./out/client/extension.js",
+  "activationEvents": ["onLanguage:ocaml", "onLanguage:ocaml.interface", "onLanguage:caravan-proof"],
+  "extensionDependencies": ["ocamllabs.ocaml-platform"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "scripts": {
+    "compile": "tsc -p . && node scripts/prepare-assets.cjs",
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test test/*.test.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12",
+    "vscode-uri": "^3.0.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.7.0",
+    "vscode-textmate": "^9.2.0",
+    "vscode-oniguruma": "^2.0.1"
+  },
+  "contributes": {
+    "commands": [{"command": "caravan.verify", "title": "Caravan: Verify Saved File"}],
+    "languages": [{"id": "caravan-proof", "aliases": ["Caravan Proof"], "extensions": [".proof"], "configuration": "./language-configuration.json"}],
+    "grammars": [
+      {"language": "caravan-proof", "scopeName": "source.caravan.proof", "path": "./syntaxes/proof.tmLanguage.json"},
+      {"scopeName": "source.caravan.spec", "path": "./syntaxes/spec.tmLanguage.json"},
+      {"scopeName": "caravan.ocaml.injection", "path": "./syntaxes/ocaml-injection.tmLanguage.json", "injectTo": ["source.ocaml", "source.ocaml.interface"]}
+    ],
+    "configuration": {
+      "title": "Caravan",
+      "properties": {
+        "caravan.executable": {"type": "string", "default": "caravan", "scope": "resource", "description": "Caravan executable or launcher program. Runs without a shell."},
+        "caravan.arguments": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Arguments before Caravan's verification flags and file path. For opam use executable opam and arguments [exec, --, caravan]."},
+        "caravan.cwd": {"type": "string", "default": "", "scope": "resource", "description": "Working directory, relative to the containing workspace folder or absolute. Empty uses the workspace folder, or the file directory outside a workspace."},
+        "caravan.includePaths": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Include directories passed with -I, resolved from the working directory."},
+        "caravan.smtTimeout": {"type": "integer", "minimum": 1, "default": 10000, "scope": "resource", "description": "SMT solver timeout in milliseconds."},
+        "caravan.verifyOnSave": {"type": "boolean", "default": true, "scope": "resource", "description": "Verify supported files after saving."}
+      }
+    }
+  }
+}

@@ -12,4 +12,5 @@
   logs.fmt
   raven-ivl.api
   caravan_config
+  caravan_editor
   caravan_core))

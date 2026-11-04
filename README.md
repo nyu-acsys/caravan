@@ -625,6 +625,13 @@ steps end`, and an outline in a proof module proves a function of the source
 module of its name. Outlines with steps other than linearizations are manual
 proofs. A program with outlines has no proof annotations in its `.ml`.
 
+## VS Code
+
+The [VS Code extension](vs-code/) adds highlighting for `.proof` files and inline
+specifications alongside OCaml Platform. It verifies saved files on demand or on
+save, with diagnostics in Problems and verification status in the status bar.
+See its README for installation and tool configuration.
+
 ## Building
 
 Caravan needs OCaml 5.5 and the library `raven-ivl.api` of Raven, which is not on opam yet.

@@ -1,0 +1,27 @@
+{
+  "name": "Caravan OCaml annotations",
+  "scopeName": "caravan.ocaml.injection",
+  "injectionSelector": "L:source.ocaml - comment - string, L:source.ocaml.interface - comment - string",
+  "patterns": [
+    {
+      "name": "meta.embedded.block.caravan",
+      "begin": "\\(\\*@",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.annotation.begin.caravan"
+        }
+      },
+      "end": "\\*\\)",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.annotation.end.caravan"
+        }
+      },
+      "patterns": [
+        {
+          "include": "source.caravan.spec"
+        }
+      ]
+    }
+  ]
+}

@@ -1,2 +1,5 @@
 (cram
- (deps %{bin:caravan}))
+ (deps
+  %{bin:caravan}
+  (glob_files *.ml)
+  check_editor_report.py))

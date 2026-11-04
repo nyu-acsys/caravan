@@ -306,6 +306,7 @@ module State_monad = struct
     names : names;
     tables : tables;
     origins : origin list;  (** The checks generated so far, latest first. *)
+    warnings : R.Diagnostic.t list;
   }
 
   type 'a t = state -> ('a, error) Result.t * state
@@ -489,6 +490,7 @@ module State_monad = struct
           dynamic_indices = false;
         };
       origins = [];
+      warnings = [];
     }
 
   type local = { local_path : path; local_carried : carried; local_names : names }
@@ -510,7 +512,9 @@ module State_monad = struct
           names = local.local_names;
         }
     in
-    let s = { s with tables = after.tables; origins = after.origins } in
+    let s =
+      { s with tables = after.tables; origins = after.origins; warnings = after.warnings }
+    in
     match r with
     | Ok a ->
         ( Ok

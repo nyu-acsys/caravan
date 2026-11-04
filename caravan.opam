@@ -19,6 +19,7 @@ depends: [
   "logs" {>= "0.7.0"}
   "fmt" {>= "0.9.0"}
   "cmdliner" {>= "1.2.0"}
+  "yojson" {>= "2.0.0"}
   "odoc" {with-doc}
 ]
 build: [

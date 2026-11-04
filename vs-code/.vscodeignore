@@ -1,0 +1,13 @@
+client/**
+server/**
+shared/**
+scripts/**
+test/**
+tsconfig.json
+node_modules/typescript/**
+node_modules/@types/**
+node_modules/vscode-textmate/**
+node_modules/vscode-oniguruma/**
+**/*.map
+.gitignore
+dune

@@ -24,8 +24,8 @@ let callable_location = function
 
 (** The Raven program translating [source], with its histories encoded in [history], and
     the origins of its proof obligations. *)
-let program ?(history = History.default) (source : Source.t) :
-    (R.Program.t * origin list, error) Result.t =
+let program_with_diagnostics ?(history = History.default) (source : Source.t) :
+    (R.Program.t * origin list * R.Diagnostic.t list, error) Result.t =
   let* scopes = Program_scopes.run source in
   let* scopes = Program_declarations.specialize_continuations scopes in
   let {
@@ -1670,4 +1670,10 @@ let program ?(history = History.default) (source : Source.t) :
            else [])
         @ imported_resource_members @ modules @ value_factories @ ready_domains
         @ ready_cells @ fields @ library_modules @ root_members),
-      state.origins )
+      state.origins,
+      List.rev state.warnings )
+
+let program ?history source =
+  let* program, origins, warnings = program_with_diagnostics ?history source in
+  List.iter warnings ~f:Report.print_diagnostic;
+  Ok (program, origins)

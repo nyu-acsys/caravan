@@ -1630,9 +1630,17 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   in
   if f.trusted then begin
     (* Its contract, assumed: the body is not translated. *)
-    Report.warn f.loc
-      (Printf.sprintf "%s is trusted: its contract is assumed, not verified"
-         (Ident.name f.id));
+    let* () =
+      State.modify (fun (state : State.state) ->
+          {
+            state with
+            warnings =
+              Report.warning f.loc
+                (Printf.sprintf "%s is trusted: its contract is assumed, not verified"
+                   (Ident.name f.id))
+              :: state.warnings;
+          })
+    in
     State.return
       (R.Callable.proc ~loc:l ~formals:all_formals
          ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
