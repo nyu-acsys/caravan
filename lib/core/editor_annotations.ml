@@ -1,16 +1,19 @@
-(** Contracts attached by the front end, with their original source text. *)
+(** Contracts and proof steps attached by the front end, with their source text. *)
 
 open Base
 open Caravan_spec
 
 type clause = { keyword : string; text : string; loc : Location.t }
 
-type t = {
+type contract = {
   loc : Location.t;
   source : string;
   source_loc : Location.t;
   clauses : clause list;
 }
+
+type proof_step = { loc : Location.t; source_loc : Location.t; text : string }
+type t = Contract of contract | Proof_step of proof_step
 
 let keyword = function
   | Spec_parser.REQUIRES -> Some "requires"
@@ -27,22 +30,8 @@ let keyword = function
 
 let source_start annotation = (Annotation.lexbuf annotation).lex_curr_p
 
-let advance (start : Lexing.position) text =
-  String.fold text ~init:start ~f:(fun position character ->
-      let pos_cnum = position.pos_cnum + 1 in
-      if Char.equal character '\n' then
-        { position with pos_cnum; pos_lnum = position.pos_lnum + 1; pos_bol = pos_cnum }
-      else { position with pos_cnum })
-
 let source_location (annotation : Annotation.t) =
-  match annotation.origin with
-  | None -> annotation.loc
-  | Some loc_start ->
-      {
-        Location.loc_start;
-        loc_end = advance loc_start annotation.text;
-        loc_ghost = false;
-      }
+  match annotation.origin with None -> annotation.loc | Some origin -> origin.loc
 
 let clauses (annotation : Annotation.t) =
   let base = (source_start annotation).pos_cnum in
@@ -78,7 +67,7 @@ let clauses (annotation : Annotation.t) =
   in
   Annotation.parse annotation scan
 
-let collect (scopes : Program_scopes.t) =
+let contracts (scopes : Program_scopes.t) =
   List.filter_map scopes.funcs ~f:(fun (func : Procedures.func) ->
       Option.bind func.contract_origin ~f:(fun annotation ->
           let source_loc = source_location annotation in
@@ -92,13 +81,29 @@ let collect (scopes : Program_scopes.t) =
             | Error _ -> None
             | Ok clauses ->
                 Some
-                  {
-                    loc = func.name_loc;
-                    source =
-                      String.concat ~sep:"." (func.namespace @ [ Ident.name func.id ]);
-                    source_loc;
-                    clauses;
-                  }
+                  ({
+                     loc = func.name_loc;
+                     source =
+                       String.concat ~sep:"." (func.namespace @ [ Ident.name func.id ]);
+                     source_loc;
+                     clauses;
+                   }
+                    : contract)
           else None))
-  |> List.dedup_and_sort ~compare:(fun left right ->
+  |> List.dedup_and_sort ~compare:(fun (left : contract) (right : contract) ->
       Poly.compare (left.loc, left.source_loc) (right.loc, right.source_loc))
+
+let proof_steps (scopes : Program_scopes.t) =
+  List.filter_map scopes.source.outline_annotations ~f:(fun (annotation : Annotation.t) ->
+      match (annotation.origin, Annotation.kind annotation) with
+      | Some origin, (Scope | Proof | Linearization | Initializes) ->
+          Some
+            (Proof_step
+               { loc = annotation.loc; source_loc = origin.loc; text = annotation.text })
+      | ( _,
+          ( Contract | Loop | Predicate | Ghost_module | Ghost | Scope | Returns | Proof
+          | Manual | Linearization | Initially | Initializes | Trusted ) ) ->
+          None)
+
+let collect scopes =
+  List.map (contracts scopes) ~f:(fun contract -> Contract contract) @ proof_steps scopes

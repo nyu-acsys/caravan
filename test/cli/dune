@@ -5,4 +5,5 @@
   (glob_files *.mli)
   (glob_files *.proof)
   check_editor_report.py
-  check_contract_annotations.py))
+  check_contract_annotations.py
+  check_proof_annotations.py))

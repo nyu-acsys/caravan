@@ -21,13 +21,19 @@ export interface NormalizedContract {
 	location: SourceLocation; source: string; sourceLocation: SourceLocation;
 	clauses: { keyword: string; text: string; location: SourceLocation }[];
 }
+export interface ProofStep extends RavenLocation {
+	kind: 'ProofStep'; source_loc: RavenLocation; text: string;
+}
+export interface NormalizedProofStep {
+	location: SourceLocation; sourceLocation: SourceLocation; text: string;
+}
 interface RavenError extends RavenLocation {
 	file: string; start_line: number; start_col: number; end_line: number; end_col: number;
 	kind: string; message: string[];
 }
 export interface RavenReport {
 	errors: RavenError[]; dependencies: string[];
-	annotations: InheritedContract[]; members: unknown[]; references: unknown[]; symbols: unknown[];
+	annotations: InheritedContract[]; proofSteps: ProofStep[]; members: unknown[]; references: unknown[]; symbols: unknown[];
 }
 const auxiliaryKinds = new Set(['RelatedLoc', 'Warning', 'Limit', 'Counterexample', 'Branch']);
 function object(value: unknown): value is Record<string, unknown> {
@@ -52,6 +58,10 @@ function inheritedContract(value: unknown): value is InheritedContract {
 		&& Array.isArray(value.clauses) && value.clauses.every(clause => ravenLocation(clause)
 			&& object(clause) && typeof clause.keyword === 'string' && !!clause.keyword && typeof clause.text === 'string');
 }
+function proofStep(value: unknown): value is ProofStep {
+	return ravenLocation(value) && object(value) && value.kind === 'ProofStep'
+		&& ravenLocation(value.source_loc) && typeof value.text === 'string';
+}
 export function parseReport(text: string, exitCode: number | null): RavenReport {
 	let value: unknown;
 	try { value = JSON.parse(text); } catch { throw new Error('Caravan returned invalid JSON'); }
@@ -61,9 +71,11 @@ export function parseReport(text: string, exitCode: number | null): RavenReport 
 		|| !Array.isArray(value.references) || !Array.isArray(value.symbols)) throw new Error('Caravan returned an invalid Raven LSP report');
 	const annotations = value.annotations.filter(item => object(item) && item.kind === 'InheritedContract');
 	if (!annotations.every(inheritedContract)) throw new Error('Caravan returned an invalid inherited contract annotation');
+	const proofSteps = value.annotations.filter(item => object(item) && item.kind === 'ProofStep');
+	if (!proofSteps.every(proofStep)) throw new Error('Caravan returned an invalid proof step annotation');
 	const failed = value.errors.some(error => !auxiliaryKinds.has(error.kind));
 	if (exitCode !== (failed ? 1 : 0)) throw new Error(`Caravan report disagrees with exit code ${exitCode}`);
-	return { errors: value.errors, dependencies: value.dependencies, annotations,
+	return { errors: value.errors, dependencies: value.dependencies, annotations, proofSteps,
 		members: value.members, references: value.references, symbols: value.symbols };
 }
 
@@ -101,6 +113,10 @@ export function normalizeContracts(report: RavenReport, cwd: string, readText: (
 		sourceLocation: location(annotation.source_loc), clauses: annotation.clauses.map(clause => ({
 			keyword: clause.keyword, text: clause.text, location: location(clause)
 		})) }));
+}
+export function normalizeProofSteps(report: RavenReport, cwd: string, readText: (file: string) => string | undefined): NormalizedProofStep[] {
+	const location = locationNormalizer(cwd, readText);
+	return report.proofSteps.map(step => ({ location: location(step), sourceLocation: location(step.source_loc), text: step.text }));
 }
 
 export function normalizeReport(report: RavenReport, root: string, cwd: string, readText: (file: string) => string | undefined): FileResult {

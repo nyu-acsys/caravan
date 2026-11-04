@@ -40,7 +40,13 @@ if mode in {"alias", "value", "mismatch", "type"}:
         assert any(e["kind"] == "RelatedLoc" and e["file"].endswith(".mli")
                    for e in report["errors"])
 else:
-    for annotation in annotations:
+    contracts = [a for a in annotations if a["kind"] == "InheritedContract"]
+    steps = [a for a in annotations if a["kind"] == "ProofStep"]
+    assert len(contracts) + len(steps) == len(annotations)
+    if mode != "proof":
+        assert steps == []
+    annotations = contracts
+    for annotation in contracts:
         assert annotation["kind"] == "InheritedContract"
         assert annotation["file"].endswith(".ml")
         assert source_slice(annotation) == annotation["source"].split(".")[-1]
@@ -97,6 +103,11 @@ else:
         assert [c["text"] for c in annotation["clauses"]] == [
             "(specified >= 0)", "(result = specified + 1)",
         ]
+        assert len(steps) == 1
+        step = steps[0]
+        assert source_slice(step) == ""
+        assert source_slice(step["source_loc"]) == "assert (result = specified + 1)"
+        assert step["text"] == "proof " + source_slice(step["source_loc"])
     elif mode == "failure":
         assert any(e["kind"] == "Verification" for e in report["errors"])
         assert len(annotations) == 1

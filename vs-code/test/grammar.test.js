@@ -82,6 +82,15 @@ test('proof files share lexical rules and retain OCaml fallback', async () => {
   has(lines[3], '0xF', 'constant.numeric.caravan');
 });
 
+test('combined proof views highlight inserted annotations and companion declarations', async () => {
+  const lines = tokenize(await grammar('source.caravan.proof'),
+    'val create : unit -> t\n(*@ requires true\nensures stack t [] *)\npredicate stack t xs = own t xs');
+  has(lines[0], 'val', 'keyword.other.ocaml');
+  has(lines[1], 'requires', 'keyword.other.caravan');
+  has(lines[2], 'ensures', 'keyword.other.caravan');
+  has(lines[3], 'predicate', 'storage.type.caravan');
+});
+
 for (const scope of ['source.ocaml', 'source.ocaml.interface']) {
   test(`${scope}: annotations nest comments and protect terminators in strings`, async () => {
     const lines = tokenize(await grammar(scope), '(*@ requires true\n(* nested (* ensures *) comment *)\nensures "*) requires"\nreturns false *)\nval outside : int\n(* ordinary (*@ requires *) *)\n"(*@ ensures *)"');

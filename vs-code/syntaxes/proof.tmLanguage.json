@@ -3,6 +3,9 @@
   "scopeName": "source.caravan.proof",
   "patterns": [
     {
+      "include": "caravan.ocaml.injection"
+    },
+    {
       "include": "source.caravan.spec"
     },
     {

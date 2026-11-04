@@ -8,12 +8,18 @@ function externalContract(contract: NormalizedContract, root: string): boolean {
 	return contract.location.file === root && /\.(mli|proof)$/.test(contract.sourceLocation.file);
 }
 
-function excerpt(location: SourceLocation, readText: (file: string) => string | undefined): string | undefined {
+export function sourceExcerpt(location: SourceLocation, readText: (file: string) => string | undefined): string | undefined {
 	const text = readText(location.file);
 	if (text === undefined) return undefined;
 	const lines = text.split('\n');
 	const offset = (position: Position) => lines.slice(0, position.line).reduce((sum, line) => sum + line.length + 1, 0) + position.character;
 	return text.slice(offset(location.start), offset(location.end)).trim();
+}
+
+export function contractBody(contract: NormalizedContract, readText: (file: string) => string | undefined): string {
+	const original = sourceExcerpt(contract.sourceLocation, readText)
+		|| contract.clauses.map(clause => `${clause.keyword} ${clause.text}`.trimEnd()).join('\n');
+	return original.startsWith('(*@') && original.endsWith('*)') ? original.slice(3, -2).trim() : original;
 }
 
 export function contractHover(contracts: NormalizedContract[], root: string, position: Position,
@@ -23,9 +29,7 @@ export function contractHover(contracts: NormalizedContract[], root: string, pos
 		&& !before(position, contract.location.start) && before(position, contract.location.end));
 	if (!contract) return null;
 	const origin = contract.sourceLocation;
-	const original = excerpt(origin, readText) || contract.clauses.map(clause => `${clause.keyword} ${clause.text}`.trimEnd()).join('\n');
-	const text = original.startsWith('(*@') && original.endsWith('*)')
-		? original.slice(3, -2).trim() : original;
+	const text = contractBody(contract, readText);
 	const ticks = (text.match(/`+/g) ?? []).reduce((longest, run) => Math.max(longest, run.length), 2);
 	const fence = '`'.repeat(ticks + 1);
 	const file = (path.relative(workspace, origin.file) || path.basename(origin.file)).split(path.sep).join('/');

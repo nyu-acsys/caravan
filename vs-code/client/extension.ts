@@ -5,6 +5,8 @@ import { LanguageClient, LanguageClientOptions, ServerOptions, State, TransportK
 import { verificationStateNotification, verifyNotification, toolchainNotification, type VerificationState, type VerificationStateParams } from '../shared/protocol';
 import { VerifierUpdates } from './updates';
 import { registerContractNavigation } from './contracts';
+import { registerProofViews } from './proofView';
+import { proofViewRequest, proofViewChangedNotification, type ProofViewResult } from '../shared/protocol';
 
 let client: LanguageClient | undefined;
 
@@ -76,6 +78,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const activeClient = client;
   context.subscriptions.push(output, status,
     registerContractNavigation(),
+    registerProofViews(async (uri, token) => {
+      if (!activeClient.isRunning()) throw new Error('The Caravan language server is unavailable. See the Caravan output channel.');
+      return activeClient.sendRequest<ProofViewResult>(proofViewRequest, { uri }, token);
+    }, listener => vscode.Disposable.from(
+      activeClient.onNotification(proofViewChangedNotification, listener),
+      activeClient.onDidChangeState(() => listener()))),
     activeClient.onNotification(verificationStateNotification, (value: VerificationStateParams) => {
       const document = vscode.workspace.textDocuments.find(item => item.uri.toString() === value.uri);
       if (!document || value.version !== document.version) return;

@@ -395,7 +395,12 @@ let synthesized ?(prefix = "") ?outline ~proof_text ~(origin : Location.t) posit
   {
     Annotation.text = prefix ^ slice proof_text origin;
     loc = at_position position;
-    origin = Some { start with pos_cnum = start.pos_cnum - String.length prefix };
+    origin =
+      Some
+        {
+          position = { start with pos_cnum = start.pos_cnum - String.length prefix };
+          loc = origin;
+        };
     outline;
   }
 

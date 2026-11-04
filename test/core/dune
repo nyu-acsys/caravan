@@ -24,6 +24,11 @@
  (libraries base caravan_core caravan_spec compiler-libs.common))
 
 (test
+ (name outline_annotations)
+ (modules outline_annotations)
+ (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
  (name annotation_env)
  (modules annotation_env)
  (libraries base caravan_core compiler-libs.common)

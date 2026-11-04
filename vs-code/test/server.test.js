@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { URI } = require('vscode-uri');
 const { spawn } = require('node:child_process');
-const { parseReport, normalizeReport, utf16Column } = require('../out/server/report');
+const { parseReport, normalizeReport, normalizeProofSteps, utf16Column } = require('../out/server/report');
 const { VerificationProcesses } = require('../out/server/verificationProcesses');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -33,6 +33,12 @@ if(process.argv.includes('--lsp-annotations-only')) {
  report.dependencies.push(origin,path.join(path.dirname(file),'metadata-only.ml'));
  if(text.includes('contract')) report.annotations=[{...location,kind:'InheritedContract',source:'Main.f',source_loc:originLocation,
   clauses:[{...originLocation,keyword:'requires',text:'  x > 0\\n  && true  '},{...originLocation,keyword:'ensures',text:'result > x'}]}];
+ if(text.includes('proof-step')) {
+  const proof = file.replace(/\\.ml$/, '.proof');
+  report.dependencies.push(proof);
+  report.annotations.push({...location,start_col:Buffer.byteLength(text),end_col:Buffer.byteLength(text),kind:'ProofStep',
+   source_loc:{file:proof,start_line:1,start_col:0,end_line:1,end_col:6},text:'commit'});
+ }
  if(text.includes('metadata-invalid')) report.annotations[0].source_loc.start_line=0;
  if(text.includes('metadata-unsupported')) {console.error('unknown option --lsp-annotations-only');process.exit(2);}
  const answerMetadata=()=>{process.stdout.write(JSON.stringify(report));process.exit(0);};
@@ -346,6 +352,33 @@ const hover = (f, position = { line: 0, character: 2 }, target = f.file) =>
 	f.request('textDocument/hover', { textDocument: { uri: uri(target) }, position });
 const runs = async f => (await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim().split('\n').map(JSON.parse);
 
+test('read-only proof views reuse discovery, preserve context, and reject dirty or invalid sources', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
+	f.settings.showContractLenses = false;
+	f.settings.verifyOnSave = false;
+	const proof = f.file.replace(/\.ml$/, '.proof');
+	await fs.writeFile(proof, 'commit');
+	await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'é😀contract');
+	await f.open();
+	await f.open(proof);
+	await f.state('unchecked');
+	const view = await f.request('caravan/proofView', { uri: uri(f.file) });
+	assert.ok(view.text.includes('(*@ commit *)'));
+	assert.ok(view.text.includes('Companion source:'));
+	assert.ok(view.links.some(link => link.target.startsWith(uri(proof) + '#L1')));
+	assert.equal((await runs(f)).length, 1);
+	assert.deepEqual(await f.request('caravan/proofView', { uri: uri(proof) }), view);
+	assert.equal((await runs(f)).length, 1);
+	assert.equal(f.messages.some(message => ['verified', 'verifying'].includes(message.params?.state)), false);
+	const changed = f.messages.length;
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'dirty' }] });
+	await assert.rejects(f.request('caravan/proofView', { uri: uri(f.file) }), /Save changed/);
+	assert.equal((await runs(f)).length, 1);
+	assert.ok(f.messages.slice(changed).some(message => message.method === 'caravan/proofViewChanged'));
+	await assert.rejects(f.request('caravan/proofView', { uri: 'untitled:main.ml' }), /saved OCaml/);
+	await assert.rejects(f.request('caravan/proofView', {}), /Open an OCaml/);
+});
+
 test('contract lenses discover frontend metadata, cache it, and preserve unchecked state', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract fail unicode');
 	const origin = f.file.replace(/\.ml$/, '.mli');
@@ -479,4 +512,18 @@ test('known contract annotations validate strictly while unknown annotations are
 	assert.equal(parseReport(JSON.stringify(report), 0).annotations.length, 1);
 	report.annotations[0].clauses[0].end_col = -1;
 	assert.throws(() => parseReport(JSON.stringify(report), 0), /invalid inherited contract/);
+});
+
+test('proof-step reports validate and normalize implementation and original UTF-8 ranges', () => {
+	const location = { file: 'main.ml', start_line: 1, start_col: 6, end_line: 1, end_col: 6 };
+	const step = { ...location, kind: 'ProofStep', source_loc: { ...location, file: 'main.proof', end_col: 12 }, text: 'commit' };
+	const report = { errors: [], dependencies: ['main.ml', 'main.proof'], annotations: [step], members: [], references: [], symbols: [] };
+	const parsed = parseReport(JSON.stringify(report), 0);
+	assert.deepEqual(parsed.annotations, []);
+	const [normalized] = normalizeProofSteps(parsed, process.cwd(), () => 'é😀commit');
+	assert.deepEqual(normalized.location.start, { line: 0, character: 3 });
+	assert.deepEqual(normalized.sourceLocation.end, { line: 0, character: 9 });
+	assert.equal(normalized.text, 'commit');
+	step.source_loc.start_col = -1;
+	assert.throws(() => parseReport(JSON.stringify(report), 0), /invalid proof step/);
 });

@@ -8,8 +8,9 @@ const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const core = require('../out/client/verifier');
 const { systemPath } = require('../out/shared/toolchain');
-const { parseReport, normalizeContracts } = require('../out/server/report');
+const { parseReport, normalizeContracts, normalizeProofSteps } = require('../out/server/report');
 const { contractLenses, contractHover } = require('../out/server/contracts');
+const { renderProofView } = require('../out/server/proofView');
 const { readFileSync } = require('node:fs');
 const run = promisify(execFile);
 
@@ -68,6 +69,13 @@ test('native release installs and verifies Saturn with its relocated compiler an
       assert.ok(hover.contents.value.includes('Contract from [test/saturn/treiber\\_stack/treiber\\_stack.mli:'));
       assert.match(hover.contents.value, /```caravan-proof\nt = create \(\)/);
       assert.equal(hover.contents.value.includes('(*@'), false);
+      const steps = normalizeProofSteps(report, repository, file => readFileSync(file, 'utf8'));
+      assert.ok(steps.length > 0);
+      const view = renderProofView(source, readFileSync(source, 'utf8'), { contracts, steps },
+        file => { try { return readFileSync(file, 'utf8'); } catch { return undefined; } }, repository);
+      assert.ok(view.text.includes('(*@ proof fold stack t [] *)'));
+      assert.ok(view.text.includes('predicate stack'));
+      assert.ok(view.links.some(link => link.target.includes('/treiber_stack.proof#')));
       const result = await run(selected.executable, ['--shh', ...includes, source],
         { env: environment, timeout: 120000 });
       assert.match(result.stdout, /Verification successful/);

@@ -14,10 +14,16 @@ type outline = {
 }
 (** What a step of a proof outline shares with the other steps. *)
 
+type origin = {
+  position : Lexing.position;
+      (** The lexer position, accounting for synthetic prefixes. *)
+  loc : Location.t;  (** The original text's range in the proof outline. *)
+}
+
 type t = {
   text : string;
   loc : Location.t;
-  origin : Lexing.position option;
+  origin : origin option;
       (** Where [text] is written, if not in the comment at [loc]: in a proof outline. *)
   outline : outline option;
 }
@@ -34,7 +40,7 @@ let lexbuf (annotation : t) =
   let lexbuf = Lexing.from_string annotation.text in
   let start =
     match annotation.origin with
-    | Some origin -> origin
+    | Some origin -> origin.position
     | None ->
         let start = annotation.loc.loc_start in
         { start with pos_cnum = start.pos_cnum + 3 }

@@ -125,6 +125,20 @@ build. Build included libraries first so that their interfaces and compilation
 artifacts are available. Verification requires a trusted workspace. If the tool
 is unavailable, inspect the **Caravan** output channel for details.
 
+### Read-only proof view
+
+Run **Caravan: Show Proof View** from an implementation, interface, or companion
+proof file. A read-only view opens beside it, showing the implementation with
+external contracts and outline steps at their resolved attachment points.
+The full companion files follow, so shared predicates, lemmas, and outline
+bindings remain available. Follow the source links to edit the originals.
+
+The view uses Caravan syntax highlighting and refreshes when its saved inputs or
+toolchain change. Save changes in the implementation and companion files before
+opening or refreshing it. Discovery does not run the solver or mark the file as
+verified. The assembled view is for reading, rather than a standalone proof file;
+verification and editing continue to use the original sources.
+
 ## Configuration
 
 Verification settings can be set per workspace or folder. Update settings apply
@@ -200,13 +214,16 @@ with Raven's `--lsp-mode --lsp-annotations` options. Reports use the same JSON
 shape: `errors`, `dependencies`, `annotations`, `members`, `references`, and
 `symbols`. Source lines are one-based and columns are UTF-8 byte offsets; the
 server converts them to LSP UTF-16 positions. The annotation table includes
-external contracts in Raven's `InheritedContract` format; member, reference, and
-symbol tables are currently empty.
+external contracts in Raven's `InheritedContract` format and Caravan `ProofStep`
+entries with source locations and annotation text. Member, reference, and symbol
+tables are currently empty.
 
 Adding `--lsp-annotations-only` collects these attachments using the same front-end
 resolution as verification, without generating Raven code or running SMT checks.
-The server uses this mode for CodeLens requests, with a separate worker queue and
-cache so ongoing verification does not delay contract display.
+The server shares this mode, worker queue, and dependency cache between contract
+lenses, hovers, and proof views, so ongoing verification does not delay discovery.
+The client requests a combined view with `caravan/proofView` and refreshes its
+read-only virtual document on `caravan/proofViewChanged` notifications.
 
 `caravan --manifest` reports its version, editor protocol, minimum Z3 version,
 OCaml compiler version, and linked Raven API version. A native archive carries

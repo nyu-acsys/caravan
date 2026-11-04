@@ -18,3 +18,12 @@ export interface ContractLocation {
 	uri: string;
 	range: { start: { line: number; character: number }; end: { line: number; character: number } };
 }
+
+export const showProofViewCommand = 'caravan.showProofView';
+export const proofViewScheme = 'caravan-proof-view';
+export const proofViewRequest = 'caravan/proofView';
+export const proofViewChangedNotification = 'caravan/proofViewChanged';
+export interface ProofViewResult {
+	text: string;
+	links: { range: ContractLocation['range']; target: string }[];
+}

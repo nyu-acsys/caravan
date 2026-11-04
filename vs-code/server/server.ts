@@ -6,8 +6,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { toolchainEnvironment } from '../shared/toolchain';
 import { VerificationProcesses } from './verificationProcesses';
-import { parseReport, normalizeReport, normalizeContracts, type RavenReport, type NormalizedContract } from './report';
+import { parseReport, normalizeReport, normalizeContracts, normalizeProofSteps, type RavenReport } from './report';
 import { contractLenses, contractHover } from './contracts';
+import { renderProofView, type ProofMetadata } from './proofView';
+import { proofViewRequest, proofViewChangedNotification } from '../shared/protocol';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
@@ -19,7 +21,8 @@ interface Owner {
 	diagnostics: Map<string, Diagnostic[]>;
 	state: VerificationState; message?: string;
 	annotationGeneration: number; annotationAbort?: AbortController;
-	annotations?: Promise<NormalizedContract[]>; annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
+	annotations?: Promise<ProofMetadata | undefined>; annotationError?: string;
+	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 }
 const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, cwd: '' };
 const connection = createConnection();
@@ -37,6 +40,7 @@ let workspaceFolders = false;
 let globalSettings: unknown = {};
 let folders: WorkspaceFolder[] = [];
 let shuttingDown = false;
+let initialized = false;
 let toolchain: ToolchainSelection | undefined;
 
 function fileOf(uri: string): string | undefined {
@@ -86,10 +90,12 @@ function clearAnnotations(owner: Owner): void {
 	owner.annotationAbort?.abort();
 	owner.annotationAbort = undefined;
 	owner.annotations = undefined;
+	owner.annotationError = undefined;
 	owner.annotationStamps = undefined;
 }
 function refreshAnnotations(): void {
 	if (codeLensRefresh && !shuttingDown) void connection.sendRequest('workspace/codeLens/refresh').catch(() => undefined);
+	if (initialized && !shuttingDown) connection.sendNotification(proofViewChangedNotification);
 }
 function invalidate(file: string): void {
 	if (!relevant(file)) return;
@@ -183,6 +189,10 @@ function reportDependencies(report: RavenReport, root: string, cwd: string): Set
 		dependencies.add(path.resolve(cwd, annotation.source_loc.file));
 		for (const clause of annotation.clauses) dependencies.add(path.resolve(cwd, clause.file));
 	}
+	for (const step of report.proofSteps) {
+		dependencies.add(path.resolve(cwd, step.file));
+		dependencies.add(path.resolve(cwd, step.source_loc.file));
+	}
 	return dependencies;
 }
 function checkedReport(stdout: string, code: number | null, root: string, cwd: string): RavenReport {
@@ -192,46 +202,49 @@ function checkedReport(stdout: string, code: number | null, root: string, cwd: s
 	}
 	return parsed;
 }
-async function annotations(root: string, uri: string, owner: Owner): Promise<NormalizedContract[]> {
+async function annotations(root: string, uri: string, owner: Owner): Promise<ProofMetadata | undefined> {
 	const generation = owner.annotationGeneration;
 	try {
 		const config = await settings(uri);
-		if (shuttingDown || generation !== owner.annotationGeneration) return [];
+		if (shuttingDown || generation !== owner.annotationGeneration) return undefined;
 		const known = knownDependencies(root, owner);
-		if (hasDirty(known) || !fs.existsSync(root)) return [];
+		if (hasDirty(known) || !fs.existsSync(root)) return undefined;
 		const snapshot = new Map(revisions);
 		const { executable, args, cwd, env } = launch(root, config, true);
 		const abort = new AbortController();
 		owner.annotationAbort = abort;
 		const output = await annotationProcesses.run(executable, args, cwd, abort.signal, env);
-		if (shuttingDown || abort.signal.aborted || generation !== owner.annotationGeneration) return [];
+		if (shuttingDown || abort.signal.aborted || generation !== owner.annotationGeneration) return undefined;
 		const report = checkedReport(output.stdout, output.code, root, cwd);
 		const dependencies = reportDependencies(report, root, cwd);
 		owner.annotationDependencies = dependencies;
-		if (hasDirty(dependencies) || [...dependencies].some(file => (revisions.get(file) ?? 0) !== (snapshot.get(file) ?? 0))) return [];
+		if (hasDirty(dependencies) || [...dependencies].some(file => (revisions.get(file) ?? 0) !== (snapshot.get(file) ?? 0))) return undefined;
 		owner.annotationStamps = new Map([...dependencies].map(file => [file, diskStamp(file)]));
-		return normalizeContracts(report, cwd, sourceText);
-	} catch {
+		const error = normalizeReport(report, root, cwd, sourceText).diagnostics.find(diagnostic => diagnostic.severity === 'error');
+		if (error) throw new Error(error.message);
+		return { contracts: normalizeContracts(report, cwd, sourceText), steps: normalizeProofSteps(report, cwd, sourceText) };
+	} catch (error) {
 		// Older toolchains may not support frontend-only annotation reports.
-		return [];
+		if (generation === owner.annotationGeneration) owner.annotationError = error instanceof Error ? error.message : String(error);
+		return undefined;
 	} finally {
 		if (generation === owner.annotationGeneration) owner.annotationAbort = undefined;
 	}
 }
-async function contractsFor(uri: string): Promise<NormalizedContract[]> {
+async function metadataFor(uri: string): Promise<ProofMetadata | undefined> {
 	const root = fileOf(uri);
-	if (!root || !root.endsWith('.ml') || shuttingDown) return [];
+	if (!root || !root.endsWith('.ml') || shuttingDown) return undefined;
 	const owner = ownerOf(root);
 	if (owner.annotationStamps) {
 		for (const [file, stamp] of owner.annotationStamps) {
 			if (diskStamp(file) !== stamp) { invalidate(file); break; }
 		}
 	}
-	if (hasDirty(knownDependencies(root, owner))) return [];
+	if (hasDirty(knownDependencies(root, owner))) return undefined;
 	const generation = owner.annotationGeneration;
 	owner.annotations ??= annotations(root, uri, owner);
 	const result = await owner.annotations;
-	return generation !== owner.annotationGeneration || hasDirty(knownDependencies(root, owner)) ? [] : result;
+	return generation !== owner.annotationGeneration || hasDirty(knownDependencies(root, owner)) ? undefined : result;
 }
 async function verify(uri: string, onSave = false): Promise<void> {
 	const file = fileOf(uri);
@@ -308,6 +321,7 @@ connection.onInitialize((params: InitializeParams) => {
 		workspace: { workspaceFolders: { supported: true, changeNotifications: true } } } };
 });
 connection.onInitialized(() => {
+	initialized = true;
 	if (!workspaceFolders) return;
 	connection.workspace.onDidChangeWorkspaceFolders(event => {
 		folders = folders.filter(folder => !event.removed.some(removed => removed.uri === folder.uri)).concat(event.added);
@@ -334,14 +348,32 @@ connection.onCodeLens(async (params, token) => {
 	const root = fileOf(params.textDocument.uri);
 	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return [];
 	if (!(await settings(params.textDocument.uri)).showContractLenses) return [];
-	const result = await contractsFor(params.textDocument.uri);
-	return token.isCancellationRequested ? [] : contractLenses(result, root);
+	const result = await metadataFor(params.textDocument.uri);
+	return token.isCancellationRequested ? [] : contractLenses(result?.contracts ?? [], root);
 });
 connection.onHover(async (params, token) => {
 	const root = fileOf(params.textDocument.uri);
 	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return null;
-	const result = await contractsFor(params.textDocument.uri);
-	return token.isCancellationRequested ? null : contractHover(result, root, params.position, sourceText, workspaceFor(root));
+	const result = await metadataFor(params.textDocument.uri);
+	return token.isCancellationRequested ? null : contractHover(result?.contracts ?? [], root, params.position, sourceText, workspaceFor(root));
+});
+connection.onRequest(proofViewRequest, async (params: unknown, token) => {
+	if (typeof params !== 'object' || params === null || !('uri' in params) || typeof params.uri !== 'string') {
+		throw new Error('Open an OCaml implementation, interface, or proof file to show its proof view.');
+	}
+	const file = fileOf(params.uri);
+	if (!file || !relevant(file)) throw new Error('Proof views require a saved OCaml source file.');
+	const root = rootOf(file);
+	const uri = URI.file(root).toString();
+	if (!fs.existsSync(root)) throw new Error(`No implementation found: ${root}`);
+	const owner = ownerOf(root);
+	if (hasDirty(knownDependencies(root, owner))) throw new Error('Save changed OCaml and proof files before opening the proof view.');
+	const metadata = await metadataFor(uri);
+	if (token.isCancellationRequested) throw new Error('Proof view request cancelled.');
+	if (!metadata) throw new Error(owner.annotationError ?? 'Save changed files and retry the proof view; run verification for analysis diagnostics.');
+	const source = sourceText(root);
+	if (source === undefined) throw new Error(`No implementation found: ${root}`);
+	return renderProofView(root, source, metadata, sourceText, workspaceFor(root));
 });
 connection.onNotification(toolchainNotification, selectToolchain);
 connection.onNotification(verifyNotification, (params: VerifyParams) => {

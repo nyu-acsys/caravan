@@ -1,0 +1,18 @@
+predicate cell (c : t) (v [@implicit] : int) = own c v
+
+proof make = on return fold cell c v
+proof get = at (Atomic.get c) commit
+
+proof diff =
+  let unchanged = true in
+  let first = at (let a = Atomic.get c) (fun step ->
+    unfold cell c;
+    let result = step () in
+    fold cell c;
+    (result, result)) in
+  at (let b = Atomic.get c) (fun step ->
+    unfold cell c;
+    let result = step () in
+    fold cell c;
+    assert ((* 🙂 *) unchanged && result = first);
+    result)

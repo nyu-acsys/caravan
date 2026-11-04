@@ -38,6 +38,7 @@
   "contributes": {
     "commands": [
       {"command": "caravan.verify", "title": "Caravan: Verify Saved File"},
+      {"command": "caravan.showProofView", "title": "Caravan: Show Proof View"},
       {"command": "caravan.updateVerifier", "title": "Caravan: Update Verifier"},
       {"command": "caravan.showVerifierVersion", "title": "Caravan: Show Verifier Version"},
       {"command": "caravan.useBundledVerifier", "title": "Caravan: Use Bundled Verifier"}
