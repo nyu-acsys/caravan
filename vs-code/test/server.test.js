@@ -121,7 +121,7 @@ async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = fal
 		}
 		await fs.rm(dir, { recursive: true, force: true });
 	});
-	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport } } }, initializationOptions: { toolchain } });
+	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport }, inlayHint: { refreshSupport } } }, initializationOptions: { toolchain } });
 	notify('initialized', {});
 	return { dir, file, settings, messages, requests, request, notify, wait, state, open };
 }
@@ -351,6 +351,45 @@ const lenses = (f, target = f.file) => f.request('textDocument/codeLens', { text
 const hover = (f, position = { line: 0, character: 2 }, target = f.file) =>
 	f.request('textDocument/hover', { textDocument: { uri: uri(target) }, position });
 const runs = async f => (await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim().split('\n').map(JSON.parse);
+const proofHints = (f, range = { start: { line: 0, character: 0 }, end: { line: 100, character: 0 } }, target = f.file) =>
+	f.request('textDocument/inlayHint', { textDocument: { uri: uri(target) }, range });
+
+test('proof hints share discovery with hovers and views and invalidate without a source version change', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
+	f.settings.verifyOnSave = false;
+	const proof = f.file.replace(/\.ml$/, '.proof');
+	await fs.writeFile(proof, 'commit');
+	await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'é😀contract');
+	await f.open();
+	await f.open(proof);
+	await f.state('unchecked');
+	const result = await proofHints(f);
+	assert.equal(result.length, 1);
+	assert.equal(result[0].label[0].value, 'commit');
+	assert.equal(result[0].label[0].location.uri, uri(proof));
+	assert.match(result[0].tooltip.value, /```caravan-proof\ncommit\n```/);
+	assert.equal(result[0].position.character, 'é😀contract proof-step unicode'.length);
+	assert.deepEqual(await proofHints(f, undefined, proof), []);
+	assert.deepEqual(await proofHints(f, { start: { line: 1, character: 0 }, end: { line: 2, character: 0 } }), []);
+	assert.ok(await hover(f, { line: 0, character: 3 }));
+	assert.ok((await f.request('caravan/proofView', { uri: uri(f.file) })).text.includes('(*@ commit *)'));
+	assert.equal((await runs(f)).length, 1);
+	assert.equal(f.messages.some(message => ['verified', 'verifying'].includes(message.params?.state)), false);
+	const changed = f.requests.length;
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'dirty' }] });
+	assert.deepEqual(await proofHints(f), []);
+	assert.equal((await runs(f)).length, 1);
+	assert.ok(f.requests.slice(changed).some(message => message.method === 'workspace/inlayHint/refresh'));
+	await fs.writeFile(proof, 'commit');
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 3 }, contentChanges: [{ text: 'commit' }] });
+	assert.equal((await proofHints(f)).length, 1);
+	assert.equal((await runs(f)).length, 2);
+	f.settings.showProofHints = false;
+	f.notify('workspace/didChangeConfiguration', { settings: {} });
+	assert.deepEqual(await proofHints(f), []);
+	assert.equal((await runs(f)).length, 2);
+	assert.equal((await lenses(f)).length, 1);
+});
 
 test('read-only proof views reuse discovery, preserve context, and reject dirty or invalid sources', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
@@ -468,14 +507,16 @@ test('companion edits, dependencies, configuration and toolchains invalidate con
 	assert.equal((await runs(f)).length, 7);
 });
 
-test('stale frontend metadata cannot reinstall lenses after a companion edit', { timeout: 15000 }, async t => {
-	const f = await fixture(t, 'contract metadata-slow');
+test('stale frontend metadata cannot reinstall lenses or proof hints after a companion edit', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'contract proof-step metadata-slow');
 	const origin = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(origin, 'contract');
+	await fs.writeFile(f.file.replace(/\.ml$/, '.proof'), 'commit');
 	await f.open();
 	await f.open(origin);
 	const first = lenses(f);
 	const firstHover = hover(f);
+	const firstHints = proofHints(f);
 	while (true) {
 		try { if ((await runs(f)).length) break; } catch { }
 		await delay(10);
@@ -483,8 +524,10 @@ test('stale frontend metadata cannot reinstall lenses after a companion edit', {
 	f.notify('textDocument/didChange', { textDocument: { uri: uri(origin), version: 2 }, contentChanges: [{ text: 'dirty' }] });
 	assert.deepEqual(await first, []);
 	assert.equal(await firstHover, null);
+	assert.deepEqual(await firstHints, []);
 	assert.deepEqual(await lenses(f), []);
 	assert.equal(await hover(f), null);
+	assert.deepEqual(await proofHints(f), []);
 	await delay(1300);
 	assert.deepEqual(await lenses(f), []);
 	assert.equal((await runs(f)).length, 1);
@@ -497,6 +540,7 @@ test('older tools and malformed metadata quietly cache empty lenses and verifica
 		await f.open();
 		assert.deepEqual(await lenses(f), []);
 		assert.deepEqual(await lenses(f), []);
+		assert.deepEqual(await proofHints(f), []);
 		assert.equal((await runs(f)).length, 1);
 		assert.equal(f.messages.some(message => message.params?.state === 'unavailable'), false);
 		f.notify('caravan/verify', { uri: uri(f.file) });

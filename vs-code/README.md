@@ -102,6 +102,13 @@ saved inputs can be analyzed again. If discovery fails, run verification to see
 the diagnostics. Older Caravan builds without annotation discovery still support
 verification, but do not provide these lenses.
 
+Short inline labels show external proof steps at their attachment points, such as
+`commit` and `fold stack t []`. Hover over a label for the full annotation with
+Caravan highlighting and a source link; follow the label's location to open the
+original proof. Longer scopes use a compact `proof` label. These hints share
+discovery and invalidation with contract displays and appear without verification.
+They require VS Code's `editor.inlayHints.enabled` setting to permit inlay hints.
+
 Open an annotated `.ml`, its `.mli`, or a `.proof` file. Save the file to verify it,
 or run **Caravan: Verify Saved File** from the Command Palette. Clicking the
 **Caravan:** status item also verifies the active file. For `.mli` and `.proof`
@@ -163,6 +170,8 @@ to the VS Code window:
 * `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
 * `caravan.showContractLenses`: Show external contracts above implementation
   functions. Defaults to `true`.
+* `caravan.showProofHints`: Show inline proof-step labels with full annotation
+  hovers and source navigation. Defaults to `true`.
 
 The executable is launched directly without a shell. Give the program and each
 argument separately; do not put shell quoting or a complete command line into a

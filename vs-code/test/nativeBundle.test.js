@@ -11,6 +11,7 @@ const { systemPath } = require('../out/shared/toolchain');
 const { parseReport, normalizeContracts, normalizeProofSteps } = require('../out/server/report');
 const { contractLenses, contractHover } = require('../out/server/contracts');
 const { renderProofView } = require('../out/server/proofView');
+const { proofHints } = require('../out/server/proofHints');
 const { readFileSync } = require('node:fs');
 const run = promisify(execFile);
 
@@ -71,6 +72,11 @@ test('native release installs and verifies Saturn with its relocated compiler an
       assert.equal(hover.contents.value.includes('(*@'), false);
       const steps = normalizeProofSteps(report, repository, file => readFileSync(file, 'utf8'));
       assert.ok(steps.length > 0);
+      const hints = proofHints(steps, source, { start: { line: 0, character: 0 },
+        end: { line: readFileSync(source, 'utf8').split('\n').length, character: 0 } }, repository);
+      assert.equal(hints.length, steps.length);
+      assert.ok(hints.some(hint => hint.label[0].value === 'fold stack t []'));
+      assert.ok(hints.every(hint => hint.label[0].location.uri.endsWith('/treiber_stack.proof')));
       const view = renderProofView(source, readFileSync(source, 'utf8'), { contracts, steps },
         file => { try { return readFileSync(file, 'utf8'); } catch { return undefined; } }, repository);
       assert.ok(view.text.includes('(*@ proof fold stack t [] *)'));

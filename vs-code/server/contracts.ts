@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import { URI } from 'vscode-uri';
-import type { CodeLens, Hover } from 'vscode-languageserver/node';
+import type { CodeLens, Hover, MarkupContent } from 'vscode-languageserver/node';
 import { openContractCommand, type ContractLocation } from '../shared/protocol';
 import type { NormalizedContract, Position, SourceLocation } from './report';
 
@@ -22,22 +22,24 @@ export function contractBody(contract: NormalizedContract, readText: (file: stri
 	return original.startsWith('(*@') && original.endsWith('*)') ? original.slice(3, -2).trim() : original;
 }
 
-export function contractHover(contracts: NormalizedContract[], root: string, position: Position,
-	readText: (file: string) => string | undefined, workspace: string): Hover | null {
-	const before = (left: Position, right: Position) => left.line < right.line || (left.line === right.line && left.character < right.character);
-	const contract = contracts.find(contract => externalContract(contract, root)
-		&& !before(position, contract.location.start) && before(position, contract.location.end));
-	if (!contract) return null;
-	const origin = contract.sourceLocation;
-	const text = contractBody(contract, readText);
+export function annotationMarkdown(title: string, text: string, origin: SourceLocation, workspace: string): MarkupContent {
 	const ticks = (text.match(/`+/g) ?? []).reduce((longest, run) => Math.max(longest, run.length), 2);
 	const fence = '`'.repeat(ticks + 1);
 	const file = (path.relative(workspace, origin.file) || path.basename(origin.file)).split(path.sep).join('/');
 	const label = `${file}:${origin.start.line + 1}`
 		.replace(/[\\`*_[\]<>]/g, '\\$&');
 	const target = URI.file(origin.file).with({ fragment: `L${origin.start.line + 1},${origin.start.character + 1}` }).toString();
+	return { kind: 'markdown', value: `${title} from [${label}](<${target}>)\n\n${fence}caravan-proof\n${text}\n${fence}` };
+}
+
+export function contractHover(contracts: NormalizedContract[], root: string, position: Position,
+	readText: (file: string) => string | undefined, workspace: string): Hover | null {
+	const before = (left: Position, right: Position) => left.line < right.line || (left.line === right.line && left.character < right.character);
+	const contract = contracts.find(contract => externalContract(contract, root)
+		&& !before(position, contract.location.start) && before(position, contract.location.end));
+	if (!contract) return null;
 	return { range: { start: contract.location.start, end: contract.location.end },
-		contents: { kind: 'markdown', value: `Contract from [${label}](<${target}>)\n\n${fence}caravan-proof\n${text}\n${fence}` } };
+		contents: annotationMarkdown('Contract', contractBody(contract, readText), contract.sourceLocation, workspace) };
 }
 
 export function contractLenses(contracts: NormalizedContract[], root: string): CodeLens[] {

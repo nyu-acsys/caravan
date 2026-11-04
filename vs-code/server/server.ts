@@ -9,12 +9,13 @@ import { VerificationProcesses } from './verificationProcesses';
 import { parseReport, normalizeReport, normalizeContracts, normalizeProofSteps, type RavenReport } from './report';
 import { contractLenses, contractHover } from './contracts';
 import { renderProofView, type ProofMetadata } from './proofView';
+import { proofHints } from './proofHints';
 import { proofViewRequest, proofViewChangedNotification } from '../shared/protocol';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
 	executable: string; arguments: string[]; includePaths: string[];
-	smtTimeout: number; verifyOnSave: boolean; showContractLenses: boolean; cwd: string;
+	smtTimeout: number; verifyOnSave: boolean; showContractLenses: boolean; showProofHints: boolean; cwd: string;
 }
 interface Owner {
 	generation: number; dependencies?: Set<string>; abort?: AbortController;
@@ -24,7 +25,7 @@ interface Owner {
 	annotations?: Promise<ProofMetadata | undefined>; annotationError?: string;
 	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 }
-const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, cwd: '' };
+const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, showProofHints: true, cwd: '' };
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const processes = new VerificationProcesses(2);
@@ -35,6 +36,7 @@ const dirty = new Set<string>();
 const initialChanges = new Set<string>();
 const diskStamps = new Map<string, string>();
 let codeLensRefresh = false;
+let inlayHintRefresh = false;
 let configuration = false;
 let workspaceFolders = false;
 let globalSettings: unknown = {};
@@ -95,6 +97,7 @@ function clearAnnotations(owner: Owner): void {
 }
 function refreshAnnotations(): void {
 	if (codeLensRefresh && !shuttingDown) void connection.sendRequest('workspace/codeLens/refresh').catch(() => undefined);
+	if (inlayHintRefresh && !shuttingDown) void connection.languages.inlayHint.refresh().catch(() => undefined);
 	if (initialized && !shuttingDown) connection.sendNotification(proofViewChangedNotification);
 }
 function invalidate(file: string): void {
@@ -144,6 +147,7 @@ function settingsFrom(value: unknown): Settings {
 		smtTimeout: typeof v.smtTimeout === 'number' && Number.isInteger(v.smtTimeout) && v.smtTimeout > 0 ? v.smtTimeout : defaults.smtTimeout,
 		verifyOnSave: typeof v.verifyOnSave === 'boolean' ? v.verifyOnSave : defaults.verifyOnSave,
 		showContractLenses: typeof v.showContractLenses === 'boolean' ? v.showContractLenses : defaults.showContractLenses,
+		showProofHints: typeof v.showProofHints === 'boolean' ? v.showProofHints : defaults.showProofHints,
 		cwd: typeof v.cwd === 'string' ? v.cwd : ''
 	};
 }
@@ -314,10 +318,11 @@ async function verify(uri: string, onSave = false): Promise<void> {
 connection.onInitialize((params: InitializeParams) => {
 	selectToolchain(params.initializationOptions?.toolchain);
 	codeLensRefresh = params.capabilities.workspace?.codeLens?.refreshSupport === true;
+	inlayHintRefresh = params.capabilities.workspace?.inlayHint?.refreshSupport === true;
 	configuration = params.capabilities.workspace?.configuration === true;
 	workspaceFolders = params.capabilities.workspace?.workspaceFolders === true;
 	folders = params.workspaceFolders ?? (params.rootUri ? [{ uri: params.rootUri, name: 'workspace' }] : []);
-	return { capabilities: { hoverProvider: true, codeLensProvider: { resolveProvider: false }, textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
+	return { capabilities: { hoverProvider: true, codeLensProvider: { resolveProvider: false }, inlayHintProvider: { resolveProvider: false }, textDocumentSync: { openClose: true, change: TextDocumentSyncKind.Incremental, save: { includeText: false } },
 		workspace: { workspaceFolders: { supported: true, changeNotifications: true } } } };
 });
 connection.onInitialized(() => {
@@ -356,6 +361,13 @@ connection.onHover(async (params, token) => {
 	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return null;
 	const result = await metadataFor(params.textDocument.uri);
 	return token.isCancellationRequested ? null : contractHover(result?.contracts ?? [], root, params.position, sourceText, workspaceFor(root));
+});
+connection.languages.inlayHint.on(async (params, token) => {
+	const root = fileOf(params.textDocument.uri);
+	if (!root || !root.endsWith('.ml') || shuttingDown || token.isCancellationRequested) return [];
+	if (!(await settings(params.textDocument.uri)).showProofHints) return [];
+	const metadata = await metadataFor(params.textDocument.uri);
+	return token.isCancellationRequested ? [] : proofHints(metadata?.steps ?? [], root, params.range, workspaceFor(root));
 });
 connection.onRequest(proofViewRequest, async (params: unknown, token) => {
 	if (typeof params !== 'object' || params === null || !('uri' in params) || typeof params.uri !== 'string') {
