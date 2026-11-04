@@ -1155,6 +1155,12 @@ let program ?(history = History.default) (source : Source.t) :
   let* value_family_parts =
     all (List.rev family_types) ~f:(Datatypes.value_family_members types)
   in
+  let* witness_parts =
+    all
+      (List.filter types ~f:(fun data -> Option.is_some data.Datatypes.witness))
+      ~f:(Witnesses.members types)
+  in
+  let value_family_parts = value_family_parts @ witness_parts in
   let value_factory_templates = List.concat_map value_family_parts ~f:snd in
   let dictionary_for ~at binding id =
     let concrete = checked_raw_types types binding in

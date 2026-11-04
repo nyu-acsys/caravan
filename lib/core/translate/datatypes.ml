@@ -49,6 +49,13 @@ type family_instance = {
   family_name : string;
 }
 
+type witness = {
+  indices : bool list;  (** Per type parameter, whether it is an index. *)
+  results : (string * Types.type_expr list) list;
+      (** Per constructor, by its Raven name, the arguments of its result type. *)
+}
+(** A GADT whose constructors are constant: a witness selecting types. *)
+
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
   paths : Path.t list;  (** Other paths naming the same implementation type. *)
@@ -75,6 +82,7 @@ type t = {
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
+  witness : witness option;
   at : Location.t;
 }
 
@@ -100,6 +108,7 @@ let list =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    witness = None;
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -129,6 +138,7 @@ let option =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    witness = None;
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -136,14 +146,91 @@ let option =
     at = Location.none;
   }
 
-(** The data type that [decl] declares, if it is a variant type. *)
+let rec type_variables variables t =
+  match Types.get_desc t with
+  | Tvar _ -> t :: variables
+  | _ -> Btype.fold_type_expr type_variables variables t
+
+(** The witness that [decl], a GADT, declares. Its constructors are constant; a parameter
+    is ordinary when it is a variable in every constructor's result, distinct from the
+    earlier ordinary ones, and an index otherwise, its types mentioning only the ordinary
+    variables. *)
+let witness_of_declaration (decl : Typedtree.type_declaration) cds =
+  let unsupported at = Report.unsupported at "A GADT beyond constant witnesses" in
+  let* results =
+    Result.all
+      (List.map cds ~f:(fun (cd : Typedtree.constructor_declaration) ->
+           match (cd.cd_res, cd.cd_args) with
+           | Some result, Cstr_tuple [] ->
+               begin match Types.get_desc result.ctyp_type with
+               | Tconstr (_, arguments, _) -> Ok (cd, arguments)
+               | _ -> unsupported cd.cd_loc
+               end
+           | _ -> unsupported cd.cd_loc))
+  in
+  let is_variable t = match Types.get_desc t with Tvar _ -> true | _ -> false in
+  let ordinary_at index earlier =
+    List.for_all results ~f:(fun (_, arguments) ->
+        let argument = List.nth_exn arguments index in
+        is_variable argument
+        && not
+             (List.exists earlier ~f:(fun earlier ->
+                  Types.eq_type (List.nth_exn arguments earlier) argument)))
+  in
+  let _, indices =
+    List.foldi decl.typ_params ~init:([], []) ~f:(fun index (earlier, indices) _ ->
+        if ordinary_at index earlier then (index :: earlier, false :: indices)
+        else (earlier, true :: indices))
+  in
+  let indices = List.rev indices in
+  let* () =
+    List.fold_result results ~init:() ~f:(fun () (cd, arguments) ->
+        let ordinary, index_types =
+          List.partition_map (List.zip_exn indices arguments) ~f:(fun (index, t) ->
+              if index then Second t else First t)
+        in
+        let distinct =
+          List.length
+            (List.dedup_and_sort ordinary ~compare:(fun a b ->
+                 Int.compare (Types.get_id a) (Types.get_id b)))
+          = List.length ordinary
+        in
+        let bound t = List.exists ordinary ~f:(Types.eq_type t) in
+        if
+          distinct
+          && List.for_all (List.fold index_types ~init:[] ~f:type_variables) ~f:bound
+        then Ok ()
+        else unsupported cd.cd_loc)
+  in
+  Ok
+    {
+      indices;
+      results =
+        List.map results ~f:(fun (cd, arguments) ->
+            (String.uncapitalize cd.cd_name.txt, arguments));
+    }
+
+(** The data type that [decl] declares, if it is a variant type. A GADT witness declares
+    its constructors as a data type without parameters, the witness's tags. *)
 let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Result.t =
   let at = decl.typ_loc in
   match decl.typ_kind with
   | Ttype_variant cds ->
+      let* witness =
+        if List.exists cds ~f:(fun cd -> Option.is_some cd.cd_res) then
+          Result.map (witness_of_declaration decl cds) ~f:Option.some
+        else Ok None
+      in
       let ctor (cd : Typedtree.constructor_declaration) =
         match (cd.cd_res, cd.cd_args) with
-        | Some _, _ -> Report.unsupported cd.cd_loc "A GADT constructor"
+        | Some _, _ ->
+            Ok
+              {
+                ocaml = cd.cd_name.txt;
+                raven = String.uncapitalize cd.cd_name.txt;
+                fields = [];
+                args = [];
+              }
         | None, Cstr_tuple cts ->
             let raven = String.uncapitalize cd.cd_name.txt in
             Ok
@@ -166,7 +253,8 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           ctors;
           heap = None;
           parameters =
-            List.map decl.typ_params ~f:(fun (parameter, _) -> parameter.ctyp_type);
+            (if Option.is_some witness then []
+             else List.map decl.typ_params ~f:(fun (parameter, _) -> parameter.ctyp_type));
           alias = None;
           collection = None;
           mathematical_integer = false;
@@ -176,6 +264,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          witness;
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -237,6 +326,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          witness = None;
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -263,6 +353,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          witness = None;
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -325,6 +416,7 @@ let library_type ~library ~library_id ~at name =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    witness = None;
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -408,6 +500,7 @@ let collection id kind =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    witness = None;
     backend_type = None;
     module_path = None;
     cell_namespace = None;

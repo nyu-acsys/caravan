@@ -26,7 +26,7 @@ Unsupported datatype forms are rejected before verification.
 
   $ caravan --shh gadt.ml > gadt.out 2>&1
   [1]
-  $ grep -q 'A GADT constructor' gadt.out
+  $ grep -q 'A GADT beyond constant witnesses' gadt.out
   $ caravan --shh nonregular.ml > nonregular.out 2>&1
   [1]
   $ grep -q 'A nonregular recursive datatype' nonregular.out

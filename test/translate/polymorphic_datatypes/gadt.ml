@@ -1,1 +1,1 @@
-type _ witness = Integer : int witness
+type _ value = Integer : int -> int value
