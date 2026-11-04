@@ -86,8 +86,10 @@ test('native release installs and verifies Saturn with its relocated compiler an
       assert.ok(view.links.some(link => link.target.includes('/treiber_stack.proof#')));
       const phases = [];
       const snapshots = [];
+      const verificationArgs = ['--lsp-mode', '--lsp-annotations', '--cache-dir',
+        path.join(storage, 'verification-cache'), ...includes, source];
       const result = await new VerificationProcesses(1).serve(selected.executable, [],
-        ['--lsp-mode', '--lsp-annotations', ...includes, source], repository,
+        verificationArgs, repository,
         new AbortController().signal, environment, (stdout, phase) => {
           phases.push(phase);
           snapshots.push(normalizeMembers(parseReport(stdout), repository,
@@ -102,6 +104,13 @@ test('native release installs and verifies Saturn with its relocated compiler an
         file => readFileSync(file, 'utf8'));
       assert.ok(verified.some(member => member.name === 'create' && member.status === 'verified'));
       assert.ok(memberLenses(verified, source, 'verified').length >= 6);
+      const reused = await new VerificationProcesses(1).serve(selected.executable, [],
+        verificationArgs, repository, new AbortController().signal, environment, () => {});
+      assert.equal(reused.code, 0, reused.stderr);
+      const cached = normalizeMembers(parseReport(reused.stdout, reused.code), repository,
+        file => readFileSync(file, 'utf8'));
+      assert.ok(cached.some(member => member.name === 'create' && member.cached));
+      assert.ok(memberLenses(cached, source, 'verified').some(lens => lens.command.title.includes('(cached)')));
     } finally {
       await new Promise(resolve => server.close(resolve));
       await fs.rm(storage, { recursive: true, force: true });

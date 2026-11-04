@@ -22,7 +22,8 @@ function title(member: NormalizedMember, members: NormalizedMember[], state: Ver
 	if (state === 'outdated') return '○ outdated';
 	if (state === 'unavailable') return '○ unavailable';
 	const { glyph, words } = presentation[member.status];
-	if (!member.group) return `${glyph} ${words}`;
+	const cached = member.status === 'verified' && member.cached ? ' (cached)' : '';
+	if (!member.group) return `${glyph} ${words}${cached}`;
 	const counted = summaryOrder.filter(status => (member.counts[status] ?? 0) > 0);
 	const parts = counted.map(status => `${member.counts[status]} ${presentation[status].words}`);
 	const countedRank = Math.max(0, ...counted.map(status => rank[status]));
@@ -33,8 +34,8 @@ function title(member: NormalizedMember, members: NormalizedMember[], state: Ver
 			? 'file' : member.kind.replace(/[-_]/g, ' ');
 		parts.push(`${boundary} checks ${words}`);
 	}
-	if (parts.length === 0) return `${glyph} ${member.kind === 'file' ? `file checks ${words}` : words}`;
-	return `${glyph} ${parts.join(', ')}`;
+	if (parts.length === 0) return `${glyph} ${member.kind === 'file' ? `file checks ${words}` : words}${cached}`;
+	return `${glyph} ${parts.join(', ')}${cached}`;
 }
 
 /** Source counts already exclude nested group summaries and generated obligations. */

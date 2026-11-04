@@ -82,6 +82,7 @@ let member ~fallback (m : Caravan_core.Editor_members.member) =
         ("extent", `Assoc (location ~fallback (Caravan_core.Report.loc m.extent)));
         ("group", `Bool m.group);
         ("status", status m.status);
+        ("cached", `Bool m.cached);
         ("own_status", status m.own_status);
         ("own_checks", `Int (List.length m.checks));
         ( "counts",

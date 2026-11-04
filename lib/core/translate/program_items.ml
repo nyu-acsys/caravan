@@ -440,9 +440,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           scheme_type = vb.vb_pat.pat_type;
           source_scheme = None;
           lexical_owner = Some outer.id;
-          raven_name =
-            (if List.is_empty outer.namespace then Ident.name id
-             else String.concat ~sep:"_" [ outer.raven_name; Ident.name id ]);
+          raven_name = outer.raven_name ^ "$local$" ^ Ident.name id;
           params = prefix_params @ captured_params @ params;
           body;
           loc = vb.vb_loc;

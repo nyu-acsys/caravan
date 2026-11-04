@@ -38,13 +38,16 @@ let fresh base =
   given := Set.add !given name;
   name
 
-(** The name of the program for the structural [key], the same for every use of [key]: a
-    fresh name for [base] the first time. Generated declarations identified by long
-    structural keys thus get short, readable names. *)
+(** Structural keys can embed earlier generated names, so retaining their complete text in
+    names would grow recursively. The digest bounds names and makes them independent of
+    request order; collisions abort rather than identify different declarations. *)
 let for_key ~key base =
   match Map.find !keyed key with
   | Some name -> name
   | None ->
-      let name = fresh base in
+      let name = base ^ "$" ^ Stdlib.Digest.(to_hex (string key)) in
+      if Set.mem !given name then
+        failwith ("A generated structural name collides: " ^ name);
+      given := Set.add !given name;
       keyed := Map.set !keyed ~key ~data:name;
       name

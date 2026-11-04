@@ -120,6 +120,9 @@ Status lenses appear above reported source members in `.ml`, `.mli`, and `.proof
 files. `○ type-checked` records successful front-end checking; `✓ verified` records
 completed proof checks, while `– trusted` identifies assumed contracts. During
 verification, `⋯ checking` remains until all checks generated for a member finish.
+Reused results display `(cached)`. This label appears only when every proof check
+for the member came from the cache; mixed cached and newly checked members display
+ordinary verification success.
 Failures, solver timeouts, and skipped checks remain visible as `✗ failed`,
 `⏱ timed out`, and `– skipped`. A failure elsewhere leaves independently verified
 members verified. These lenses display information; verification still runs for
@@ -184,6 +187,8 @@ to the VS Code window:
   the working directory. Defaults to `[]`.
 * `caravan.smtTimeout`: The time limit in milliseconds for each SMT query.
   Defaults to `10000`.
+* `caravan.cache`: Reuse successful proof fingerprints in extension storage.
+  Defaults to `true`; disable to run every proof check again.
 * `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
 * `caravan.showContractLenses`: Show external contracts above implementation
   functions. Defaults to `true`; member status lenses remain available independently.
@@ -244,12 +249,14 @@ server converts them to LSP UTF-16 positions. The annotation table includes
 external contracts in Raven's `InheritedContract` format and Caravan `ProofStep`
 entries with source locations and annotation text. The `members` table describes
 source declarations: `id`, `name`, `kind`, the declaration's location fields,
-`extent`, optional `parent`, `group`, `status`, `own_status`, `own_checks`, and
+`extent`, optional `parent`, `group`, `status`, `cached`, `own_status`, `own_checks`, and
 `counts`. Locations use `file`, `start_line`, `start_col`, `end_line`, and `end_col`;
 `extent` spans the declaration's text. `status` includes nested members and
 prerequisites, while `own_status` and `own_checks` describe its own backend checks.
 Group `counts` count source leaves by status. Status values are `unchecked`,
 `checked`, `trusted`, `verified`, `pending`, `skipped`, `timeout`, and `failed`.
+`cached` is true only for entirely cached verified members or groups; clients
+accept its absence in reports from older tools as false.
 The reference and symbol tables remain empty.
 
 Verification uses `caravan --server`, with Raven's JSON-line framing. Each request
@@ -258,8 +265,13 @@ and implementation path. Partial responses contain the same `id`, a `phase`
 (`typed`, `scheduled`, or `progress`), and `partial`, a JSON report encoded as a
 string. The final response contains `id`, `exit`, `stdout`, and `stderr`, with the
 final report in `stdout`. The extension starts one process per verification run;
-it does not keep a persistent verifier session or reuse proof fingerprints.
+it does not keep a persistent verifier session. Successful proof fingerprints are
+reused across runs through Raven's cache in extension storage. Fingerprints cover
+the obligation and its dependencies, including contracts and relevant automatic
+lemmas, and are tied to the executable build and solver version. Parsing, type
+checking, translation and lowering still run to establish the current obligations.
 An older executable that explicitly rejects `--server` falls back to a batch run.
+This compatibility path omits the automatic cache option.
 A malformed stream is reported as an error without a batch retry.
 
 Streamed reports use the same worker queue, cancellation, dirty-input checks, and

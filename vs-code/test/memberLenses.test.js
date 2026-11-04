@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { memberLenses } = require('../out/server/memberLenses');
+const { parseReport, normalizeMembers } = require('../out/server/report');
 
 const file = path.resolve('members.ml');
 function member(id, status, options = {}) {
@@ -23,6 +24,34 @@ test('failed document status preserves independently verified members', () => {
   for (const state of ['verified', 'verifiedWithWarnings']) {
     assert.deepEqual(titles([member('unproved', 'checked')], state), ['○ type-checked']);
   }
+});
+
+test('cached results are identified only for current verified members and groups', () => {
+  const cached = member('cached', 'verified', { cached: true });
+  const fresh = member('fresh', 'verified', { cached: false });
+  const group = member('group', 'verified', { cached: true, group: true,
+    kind: 'module', counts: { verified: 2 } });
+  assert.deepEqual(titles([cached, fresh, group]), [
+    '✓ verified (cached)', '✓ verified', '✓ 2 verified (cached)'
+  ]);
+  assert.deepEqual(titles([cached], 'outdated'), ['○ outdated']);
+  assert.deepEqual(titles([cached], 'unavailable'), ['○ unavailable']);
+  for (const status of ['unchecked', 'checked', 'trusted', 'pending', 'skipped', 'timeout', 'failed']) {
+    assert.ok(titles([member('stale', status, { cached: true })]).every(title => !title.includes('cached')));
+  }
+});
+
+test('member reports preserve cache provenance and accept older reports without it', () => {
+  const location = { file, start_line: 1, start_col: 0, end_line: 1, end_col: 4 };
+  const row = { ...location, id: 'f', name: 'f', kind: 'function', extent: location,
+    group: false, status: 'verified', own_status: 'verified', own_checks: 1, counts: { verified: 1 } };
+  const report = row => JSON.stringify({ errors: [], dependencies: [], annotations: [],
+    members: [row], references: [], symbols: [] });
+  const normalize = row => normalizeMembers(parseReport(report(row), 0), process.cwd(), () => undefined)[0];
+  assert.equal(normalize(row).cached, false);
+  assert.equal(normalize({ ...row, cached: true }).cached, true);
+  assert.equal(normalize({ ...row, cached: false }).cached, false);
+  assert.throws(() => normalize({ ...row, cached: 'true' }), /invalid member status/);
 });
 
 test('outdated and unavailable documents do not retain positive result summaries', () => {

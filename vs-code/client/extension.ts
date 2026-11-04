@@ -64,7 +64,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const clientOptions: LanguageClientOptions = {
     initializationOptions: () => {
       const selected = updates.current ?? toolchain;
-      return { toolchain: { executable: selected.executable, bundleRoot: selected.bundleRoot } };
+      return { toolchain: { executable: selected.executable, bundleRoot: selected.bundleRoot },
+        cacheDir: path.join(context.globalStorageUri.fsPath, 'verification-cache') };
     },
     documentSelector: [
       { scheme: 'file', language: 'ocaml', pattern: '**/*.ml' },

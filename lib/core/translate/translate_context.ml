@@ -1277,8 +1277,12 @@ module State = struct
       with
       | Some instance -> return instance.instance_name
       | None ->
-          let base = "Poly$Instance$" ^ Int.to_string (List.length instances) in
-          let* instance_name = fresh base in
+          let path name = Datatypes.framed (String.split name ~on:'.') in
+          let instance_name =
+            "Poly$Instance$"
+            ^ Datatypes.framed
+                [ path target; Datatypes.framed (List.map dictionaries ~f:path) ]
+          in
           let instance =
             {
               instance_namespace = namespace;
@@ -1437,13 +1441,30 @@ module State = struct
   (** The field of atomics with contents of type [elt]. *)
   let atomic_field given ~at elt = cell_field given ~at elt "atomic"
 
+  let primitive_name key base =
+    let path name = Datatypes.framed (String.split name ~on:'.') in
+    let operation =
+      match key.operation with
+      | Atomic op -> "atomic$" ^ Primitives.op_name op
+      | Ordinary op -> Primitives.ordinary_name ~field:"ordinary" op
+    in
+    base ^ "$"
+    ^ Datatypes.framed
+        [
+          path key.field;
+          Datatypes.key_name key.payload;
+          operation;
+          Bool.to_string key.exact;
+          Bool.to_string key.bounded;
+          Datatypes.framed (List.map (Option.to_list key.admissibility) ~f:path);
+        ]
+
   let add_primitive ~namespace ~key ~base proc =
     let* declared = gets (fun s -> primitives_in s.tables namespace) in
     match List.find declared ~f:(fun primitive -> Poly.equal primitive.key key) with
     | Some primitive -> return primitive.name
     | None ->
-        let used = Set.of_list (module String) (List.map declared ~f:(fun p -> p.name)) in
-        let name = Fresh_names.unused used base in
+        let name = primitive_name key base in
         let declaration_name = (Qualified_name.of_string name).name in
         let primitive = { key; name; member = proc declaration_name } in
         let+ () =

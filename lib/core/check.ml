@@ -130,7 +130,7 @@ let prepare_scopes ~history (source, scopes, annotations, members) =
 let prepare ~include_dirs ~history file =
   Result.bind (analyze ~include_dirs file) ~f:(prepare_scopes ~history)
 
-let verify ?on_progress ~collect_members ~smt_timeout prepared =
+let verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
   let explain diagnostic =
     blame ~explicit_proof_files:prepared.explicit_proof_files
       (explain prepared.origins diagnostic)
@@ -182,7 +182,9 @@ let verify ?on_progress ~collect_members ~smt_timeout prepared =
     let on_progress =
       if collect_members || Option.is_some on_progress then Some update else None
     in
-    R.verify ~options:{ R.default_options with smt_timeout } ?on_progress prepared.program
+    R.verify
+      ~options:{ R.default_options with smt_timeout }
+      ?cache_dir ?on_progress prepared.program
   in
   ( result.verified,
     prepared.warnings @ List.map result.diagnostics ~f:explain,
@@ -212,7 +214,8 @@ let annotations_only ~include_dirs file =
         members;
       }
 
-let run ?on_progress ?(collect_members = true) ~include_dirs ~history ~smt_timeout file =
+let run ?cache_dir ?on_progress ?(collect_members = true) ~include_dirs ~history
+    ~smt_timeout file =
   match analyze ~include_dirs file with
   | Error error -> analysis_error file error
   | Ok ((source, _, annotations, members) as analysis) ->
@@ -228,7 +231,7 @@ let run ?on_progress ?(collect_members = true) ~include_dirs ~history ~smt_timeo
           }
       | Ok prepared ->
           let verified, diagnostics, members =
-            verify ?on_progress ~collect_members ~smt_timeout prepared
+            verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared
           in
           {
             file;
@@ -241,7 +244,7 @@ let run ?on_progress ?(collect_members = true) ~include_dirs ~history ~smt_timeo
       end
 
 (** The human-readable command line, including the generated-program escape hatch. *)
-let file ~include_dirs ~history ~emit_rav ~smt_timeout file =
+let file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout file =
   if emit_rav then (
     match prepare ~include_dirs ~history file with
     | Error error ->
@@ -252,7 +255,9 @@ let file ~include_dirs ~history ~emit_rav ~smt_timeout file =
         Logs.app (fun m -> m "%a" R.Program.pr prepared.program);
         true)
   else
-    let result = run ~collect_members:false ~include_dirs ~history ~smt_timeout file in
+    let result =
+      run ?cache_dir ~collect_members:false ~include_dirs ~history ~smt_timeout file
+    in
     List.iter result.diagnostics ~f:Report.print_diagnostic;
     if result.verified then Logs.app (fun m -> m "Verification successful.");
     result.verified

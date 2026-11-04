@@ -121,6 +121,25 @@ let () =
   let members = project inventory [ cached; { first with name = "OtherWorker.f" } ] in
   assert (List.length (find members f.id).checks = 2);
   assert (Poly.equal (find members f.id).status M.Verified);
+  assert (not (find members f.id).cached);
+  let members = project inventory [ cached ] in
+  assert (find members f.id).cached;
+  assert (find members inner.id).cached;
+  assert (find members root.id).cached;
+  let members = project inventory [ cached; module_check ] in
+  assert (find members f.id).cached;
+  assert (not (find members inner.id).cached);
+  List.iter
+    [ [ cached; first ]; [ first; cached ]; [ cached; second ] ]
+    ~f:(fun checks ->
+      let members = project inventory checks in
+      assert (not (find members f.id).cached));
+  let members = project inventory [ cached; { unknown with outcome = Pending } ] in
+  assert (find members f.id).cached;
+  assert (not (find members inner.id).cached);
+  let members = M.finish ~verified:true (project inventory []) in
+  assert (not (find members f.id).cached);
+  assert (not (find members root.id).cached);
   let members = M.finish ~verified:false (project inventory [ first; second ]) in
   assert (Poly.equal (find members f.id).status M.Skipped);
   assert (Poly.equal (find members root.id).status M.Skipped);

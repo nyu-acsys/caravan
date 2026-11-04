@@ -26,6 +26,7 @@ type member = {
   ranges : Location.t list;
   own_status : status;
   status : status;
+  cached : bool;
   checks : R.Progress.check list;
   counts : (status * int) list;
 }
@@ -59,6 +60,7 @@ let make ?parent ?(group = false) ?(trusted = false) ?ranges ~name ~kind ~name_l
     ranges = Option.value ranges ~default:[ extent ];
     own_status = status;
     status;
+    cached = false;
     checks = [];
     counts = [];
   }
@@ -310,14 +312,16 @@ let same_check (a : R.Progress.check) (b : R.Progress.check) =
   && Declaration_scope.same_place (check_location a) (check_location b)
 
 let dedup_checks (checks : R.Progress.check list) =
+  let outcome_rank = function
+    | R.Progress.Cached -> 0
+    | outcome -> 1 + rank (outcome_status outcome)
+  in
   List.fold checks ~init:[] ~f:(fun checks (check : R.Progress.check) ->
       match List.find checks ~f:(same_check check) with
       | None -> check :: checks
       | Some previous ->
           let selected =
-            if
-              rank (outcome_status check.outcome) > rank (outcome_status previous.outcome)
-            then check
+            if outcome_rank check.outcome > outcome_rank previous.outcome then check
             else previous
           in
           List.map checks ~f:(fun other ->
@@ -360,7 +364,16 @@ let summarize members =
             in
             List.Assoc.add counts child.own_status (count + 1) ~equal:Poly.equal)
       in
-      { member with status; counts })
+      let checks =
+        member.checks @ List.concat_map children ~f:(fun child -> child.checks)
+      in
+      let cached =
+        Poly.equal status Verified
+        && (not (List.is_empty checks))
+        && List.for_all checks ~f:(fun check ->
+            Poly.equal check.outcome R.Progress.Cached)
+      in
+      { member with status; cached; counts })
 
 let project inventory (progress : R.Progress.t) =
   let root = List.find inventory ~f:(fun member -> String.equal member.kind "file") in

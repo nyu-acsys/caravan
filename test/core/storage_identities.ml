@@ -47,4 +47,51 @@ let () =
     assert (String.equal unbounded alias_write)
   in
   let (), state = get (State.run_from State.initial computation) in
-  assert (List.length (State.primitives_in state.tables []) = 4)
+  assert (List.length (State.primitives_in state.tables []) = 4);
+  let requests =
+    [
+      read "A_B.x" Predef.type_int;
+      read "A.B_x" Predef.type_int;
+      write Predef.type_int;
+      write integer;
+    ]
+  in
+  let names requests =
+    fst (get (State.run_from State.initial (State.all requests ~f:State.in_procedure)))
+  in
+  assert (List.equal String.equal (names requests) (List.rev (names (List.rev requests))));
+  let instance target dictionaries = State.instance_given given ~target ~dictionaries in
+  let requests =
+    [
+      instance "A_B.x" [ "Values.Int" ];
+      instance "A.B_x" [ "Values.Int" ];
+      instance "Worker" [ "A.B"; "C" ];
+      instance "Worker" [ "A"; "B.C" ];
+    ]
+  in
+  let first = names requests in
+  assert (List.equal String.equal first (List.rev (names (List.rev requests))));
+  assert (List.length (List.dedup_and_sort first ~compare:String.compare) = 4);
+  let repeated, _ =
+    get
+      (State.run_from State.initial
+         (State.all (requests @ requests) ~f:State.in_procedure))
+  in
+  assert (List.equal String.equal repeated (first @ first))
+
+let () =
+  let module Names = C.Fresh_names in
+  let allocate keys =
+    Names.reset ();
+    List.map keys ~f:(fun key -> Names.for_key ~key "Values$Shared")
+  in
+  let keys = [ "first"; "second"; "first"; "third" ] in
+  let forward = allocate keys in
+  assert (List.equal String.equal forward (List.rev (allocate (List.rev keys))));
+  assert (List.length (List.dedup_and_sort forward ~compare:String.compare) = 3);
+  let reserved = Names.for_key ~key:"reserved" "Values$Shared" in
+  Names.reset ();
+  Names.reserve [ reserved ];
+  match Names.for_key ~key:"reserved" "Values$Shared" with
+  | exception Failure _ -> ()
+  | _ -> failwith "A reserved structural name must abort rather than change with order"

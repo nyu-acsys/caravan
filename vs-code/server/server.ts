@@ -16,7 +16,7 @@ import { verificationStateNotification, verifyNotification, type VerificationSta
 
 interface Settings {
 	executable: string; arguments: string[]; includePaths: string[];
-	smtTimeout: number; verifyOnSave: boolean; showContractLenses: boolean; showProofHints: boolean; cwd: string;
+	smtTimeout: number; cache: boolean; verifyOnSave: boolean; showContractLenses: boolean; showProofHints: boolean; cwd: string;
 }
 interface Owner {
 	generation: number; dependencies?: Set<string>; abort?: AbortController;
@@ -27,7 +27,7 @@ interface Owner {
 	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 	members?: NormalizedMember[];
 }
-const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, verifyOnSave: true, showContractLenses: true, showProofHints: true, cwd: '' };
+const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, cache: true, verifyOnSave: true, showContractLenses: true, showProofHints: true, cwd: '' };
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const processes = new VerificationProcesses(2);
@@ -47,6 +47,7 @@ let shuttingDown = false;
 let initialized = false;
 let memberRefreshScheduled = false;
 let toolchain: ToolchainSelection | undefined;
+let cacheDir: string | undefined;
 
 function fileOf(uri: string): string | undefined {
 	const parsed = URI.parse(uri);
@@ -177,6 +178,7 @@ function settingsFrom(value: unknown): Settings {
 		executable: typeof v.executable === 'string' && v.executable.trim() ? v.executable : defaults.executable,
 		arguments: strings(v.arguments) ? v.arguments : [], includePaths: strings(v.includePaths) ? v.includePaths : [],
 		smtTimeout: typeof v.smtTimeout === 'number' && Number.isInteger(v.smtTimeout) && v.smtTimeout > 0 ? v.smtTimeout : defaults.smtTimeout,
+		cache: typeof v.cache === 'boolean' ? v.cache : defaults.cache,
 		verifyOnSave: typeof v.verifyOnSave === 'boolean' ? v.verifyOnSave : defaults.verifyOnSave,
 		showContractLenses: typeof v.showContractLenses === 'boolean' ? v.showContractLenses : defaults.showContractLenses,
 		showProofHints: typeof v.showProofHints === 'boolean' ? v.showProofHints : defaults.showProofHints,
@@ -208,6 +210,7 @@ function launch(root: string, config: Settings, annotationsOnly = false): { exec
 	const env = bundleRoot ? toolchainEnvironment(bundleRoot) : undefined;
 	const args = [...config.arguments, '--lsp-mode', '--lsp-annotations',
 		...(annotationsOnly ? ['--lsp-annotations-only'] : ['--smt-timeout', String(config.smtTimeout)]),
+		...(!annotationsOnly && config.cache && cacheDir ? ['--cache-dir', cacheDir] : []),
 		...config.includePaths.flatMap(directory => ['-I', path.resolve(cwd, directory)]), root];
 	return { executable, args, cwd, env };
 }
@@ -328,7 +331,7 @@ async function verify(uri: string, onSave = false): Promise<void> {
 			output = await processes.serve(executable, config.arguments, args.slice(config.arguments.length), cwd, abort.signal, env, partial);
 		} catch (error) {
 			if (!(error instanceof UnsupportedServerError) || !current()) throw error;
-			output = await processes.run(executable, args, cwd, abort.signal, env);
+			output = await processes.run(executable, launch(root, { ...config, cache: false }).args, cwd, abort.signal, env);
 		}
 		if (shuttingDown || abort.signal.aborted || generation !== owner.generation) return;
 		let parsed;
@@ -360,6 +363,8 @@ async function verify(uri: string, onSave = false): Promise<void> {
 
 connection.onInitialize((params: InitializeParams) => {
 	selectToolchain(params.initializationOptions?.toolchain);
+	const requestedCache = params.initializationOptions?.cacheDir;
+	cacheDir = typeof requestedCache === 'string' && path.isAbsolute(requestedCache) ? requestedCache : undefined;
 	codeLensRefresh = params.capabilities.workspace?.codeLens?.refreshSupport === true;
 	inlayHintRefresh = params.capabilities.workspace?.inlayHint?.refreshSupport === true;
 	configuration = params.capabilities.workspace?.configuration === true;

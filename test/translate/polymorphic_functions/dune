@@ -2,6 +2,7 @@
  (deps
   %{bin:caravan}
   %{bin:raven}
+  check_worker_groups.py
   (glob_files *.ml)
   (glob_files *.mli)
   (glob_files *.proof)))

@@ -56,7 +56,7 @@ function answer() {
 if(text.includes('slow')) setTimeout(answer,1200); else answer();
 `;
 
-async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = false) {
+async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = false, useCache = false) {
 	const dir = URI.file(await fs.mkdtemp(path.join(os.tmpdir(), 'caravan lsp '))).fsPath;
 	const file = path.join(dir, 'main.ml');
 	const script = path.join(dir, 'fake verifier.cjs');
@@ -122,7 +122,7 @@ async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = fal
 		}
 		await fs.rm(dir, { recursive: true, force: true });
 	});
-	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport }, inlayHint: { refreshSupport } } }, initializationOptions: { toolchain } });
+	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport }, inlayHint: { refreshSupport } } }, initializationOptions: { toolchain, ...(useCache ? { cacheDir: path.join(dir, 'verification cache') } : {}) } });
 	notify('initialized', {});
 	return { dir, file, settings, messages, requests, request, notify, wait, state, open };
 }
@@ -148,6 +148,15 @@ test('save and manual verification resolve companions, flags and related diagnos
 	f.notify('caravan/verify', { uri: uri(proof) });
 	await f.state('failed', from, proof);
 	assert.equal((await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim().split('\n').length, 2);
+});
+
+test('legacy batch fallback omits the automatic verification cache option', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'let x = 1', undefined, false, true);
+	await f.open();
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified');
+	const args = JSON.parse((await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim());
+	assert.equal(args.includes('--cache-dir'), false);
 });
 
 test('dirty buffers and dependency edits invalidate results and cancel stale runs', { timeout: 15000 }, async t => {
@@ -376,6 +385,7 @@ if(process.argv.at(-1)!=='--server') {
  let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',data=>input+=data);
  process.stdin.on('end',()=>{
   const request=JSON.parse(input),file=request.args.at(-1),dir=path.dirname(file);
+  fs.appendFileSync(path.join(dir,'stream-runs'),JSON.stringify(request.args)+'\\n');
   const send=(phase,value)=>process.stdout.write(JSON.stringify({id:request.id,phase,partial:JSON.stringify(value)})+'\\n');
   send('typed',report(file,'checked','checked'));
   send('scheduled',report(file,'pending','pending'));
@@ -393,8 +403,8 @@ if(process.argv.at(-1)!=='--server') {
 }
 `;
 
-async function streamingFixture(t, fails = false, early = false) {
-	const f = await fixture(t, 'module Work = struct\n  let first () = ()\n  let second () = ()\nend\n' + (fails ? '(* fail-run *)' : '') + (early ? '(* early-fail *)' : ''), undefined, true);
+async function streamingFixture(t, fails = false, early = false, useCache = false) {
+	const f = await fixture(t, 'module Work = struct\n  let first () = ()\n  let second () = ()\nend\n' + (fails ? '(* fail-run *)' : '') + (early ? '(* early-fail *)' : ''), undefined, true, useCache);
 	f.settings.showContractLenses = false;
 	f.settings.verifyOnSave = false;
 	await fs.writeFile(path.join(f.dir, 'fake verifier.cjs'), streamingVerifier);
@@ -410,6 +420,23 @@ async function mixedMemberLenses(f, completed = '✓ verified') {
 	}
 	throw new Error('No live mixed member statuses before verification completed');
 }
+
+test('streaming verification passes persistent cache storage and respects disabling it', { timeout: 15000 }, async t => {
+	const f = await streamingFixture(t, false, false, true);
+	await fs.writeFile(path.join(f.dir, 'finish'), 'done');
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified');
+	let runs = (await fs.readFile(path.join(f.dir, 'stream-runs'), 'utf8')).trim().split('\n').map(JSON.parse);
+	assert.equal(runs[0][runs[0].indexOf('--cache-dir') + 1], path.join(f.dir, 'verification cache'));
+	f.settings.cache = false;
+	f.notify('workspace/didChangeConfiguration', { settings: {} });
+	const from = f.messages.length;
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	runs = (await fs.readFile(path.join(f.dir, 'stream-runs'), 'utf8')).trim().split('\n').map(JSON.parse);
+	assert.equal(runs.length, 2);
+	assert.equal(runs[1].includes('--cache-dir'), false);
+});
 
 test('verification streams member lenses and module summaries before the final result', { timeout: 15000 }, async t => {
 	const f = await streamingFixture(t, true);

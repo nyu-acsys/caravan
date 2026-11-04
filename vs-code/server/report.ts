@@ -31,11 +31,13 @@ export type MemberStatus = 'unchecked' | 'checked' | 'trusted' | 'verified' | 'p
 export interface RavenMember extends RavenLocation {
 	id: string; name: string; kind: string; extent: RavenLocation; parent?: string;
 	group: boolean; status: MemberStatus; own_status: MemberStatus; own_checks: number;
+	cached?: boolean;
 	counts: Partial<Record<MemberStatus, number>>;
 }
 export interface NormalizedMember {
 	id: string; name: string; kind: string; location: SourceLocation; extent: SourceLocation; parent?: string;
 	group: boolean; status: MemberStatus; ownStatus: MemberStatus; ownChecks: number;
+	cached: boolean;
 	counts: Partial<Record<MemberStatus, number>>;
 }
 interface RavenError extends RavenLocation {
@@ -79,6 +81,7 @@ function ravenMember(value: unknown): value is RavenMember {
 		&& typeof value.name === 'string' && typeof value.kind === 'string' && !!value.kind && ravenLocation(value.extent)
 		&& (value.parent === undefined || typeof value.parent === 'string')
 		&& typeof value.group === 'boolean' && typeof value.status === 'string' && memberStatuses.has(value.status)
+		&& (value.cached === undefined || typeof value.cached === 'boolean')
 		&& typeof value.own_status === 'string' && memberStatuses.has(value.own_status)
 		&& Number.isSafeInteger(value.own_checks) && (value.own_checks as number) >= 0 && object(value.counts)
 		&& Object.entries(value.counts).every(([key, count]) => memberStatuses.has(key) && Number.isSafeInteger(count) && (count as number) >= 0);
@@ -144,7 +147,8 @@ export function normalizeMembers(report: RavenReport, cwd: string, readText: (fi
 	const location = locationNormalizer(cwd, readText);
 	return report.members.map(member => ({ id: member.id, name: member.name, kind: member.kind,
 		location: location(member), extent: location(member.extent), parent: member.parent, group: member.group,
-		status: member.status, ownStatus: member.own_status, ownChecks: member.own_checks, counts: member.counts }));
+		status: member.status, cached: member.cached ?? false,
+		ownStatus: member.own_status, ownChecks: member.own_checks, counts: member.counts }));
 }
 
 export function normalizeReport(report: RavenReport, root: string, cwd: string, readText: (file: string) => string | undefined): FileResult {

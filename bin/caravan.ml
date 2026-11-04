@@ -64,6 +64,10 @@ let smt_timeout =
     & opt int Raven_api.default_options.smt_timeout
     & info [ "smt-timeout" ] ~docv:"MS" ~doc)
 
+let cache_dir =
+  let doc = "Reuse successful verification results from the cache in $(docv)." in
+  Arg.(value & opt (some string) None & info [ "cache-dir" ] ~docv:"DIR" ~doc)
+
 let history =
   let doc =
     "How histories of states are encoded: $(b,sets), by the set of the states that the \
@@ -95,7 +99,7 @@ let print text =
   Protocol.app (fun m -> m "%s" text)
 
 let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_rav
-    manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout files =
+    manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout cache_dir files =
   if manifest then begin
     emit
       (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
@@ -117,7 +121,8 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
         List.map (Caravan_core.Check.annotations_only ~include_dirs) files
       else
         List.map
-          (Caravan_core.Check.run ?on_progress ~include_dirs ~history ~smt_timeout)
+          (Caravan_core.Check.run ?cache_dir ?on_progress ~include_dirs ~history
+             ~smt_timeout)
           files
     in
     emit (Caravan_editor.Editor_report.to_string ~annotations:lsp_annotations results);
@@ -136,7 +141,7 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
     (* Every file is checked, also after one that fails. *)
     let results =
       List.map
-        (Caravan_core.Check.file ~include_dirs ~history ~emit_rav ~smt_timeout)
+        (Caravan_core.Check.file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout)
         files
     in
     let verified = List.for_all Fun.id results in
@@ -149,7 +154,7 @@ let cmd ?emit ?on_progress () =
     Term.(
       const (main ?emit ?on_progress)
       $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest $ lsp_mode
-      $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ files)
+      $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ cache_dir $ files)
 
 let serve defaults =
   Logs.set_reporter (Logs_fmt.reporter ());

@@ -636,6 +636,8 @@ and proof modules. They distinguish unchecked, type-checked, trusted, and verifi
 declarations, retain failures and timeouts, and keep members pending until all their
 generated checks finish. Summaries count source members once and show module or file
 prerequisites separately when they prevent verification.
+Successful proof results are cached across runs; member lenses mark reused results
+with `(cached)`. The CLI enables the same cache with `--cache-dir DIR`.
 A read-only proof view combines the implementation with external annotations
 and companion files, with links back to the original sources.
 Platform packages include Caravan, its linked Raven verifier, Z3, and matching
