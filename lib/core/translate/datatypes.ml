@@ -545,6 +545,94 @@ let find (types : t list) (p : Path.t) =
   else if Path.same p Predef.path_option then Some option
   else List.find types ~f:(fun d -> declares d p)
 
+(** Compiler aliases of referenced external types share their underlying representation.
+*)
+let compiler_aliases ?(modules = []) types (structure : Typedtree.structure) =
+  let rec persistent = function
+    | Path.Pident id -> Ident.persistent id
+    | Pdot (parent, _) -> persistent parent
+    | Papply _ | Pextra_ty _ -> false
+  in
+  let collect environment types typ =
+    let rec visit (seen, types) typ =
+      let id = Types.get_id typ in
+      if Set.mem seen id then (seen, types)
+      else
+        let seen = Set.add seen id in
+        let state =
+          match Types.get_desc typ with
+          | Tconstr (path, _, _) when persistent path && Option.is_none (find types path)
+            ->
+              let declaration =
+                try Some (Env.find_type path environment) with Stdlib.Not_found -> None
+              in
+              begin match declaration with
+              | Some
+                  ({ type_private = Public; type_manifest = Some body; _ } as declaration)
+                ->
+                  let alias =
+                    {
+                      list with
+                      paths = [ path ];
+                      ctors = [];
+                      module_name = Path.name path;
+                      parameters = declaration.type_params;
+                      alias = Some body;
+                      at = declaration.type_loc;
+                    }
+                  in
+                  visit (seen, alias :: types) body
+              | Some _ | None -> (seen, types)
+              end
+          | _ -> (seen, types)
+        in
+        Btype.fold_type_expr visit state typ
+    in
+    snd (visit (Set.empty (module Int), types) typ)
+  in
+  let types =
+    List.fold modules ~init:types ~f:(fun types (path, environment) ->
+        let signature =
+          if not (persistent path) then None
+          else
+            try
+              let declaration = Env.find_module path environment in
+              match Mtype.scrape environment declaration.md_type with
+              | Mty_signature signature -> Some signature
+              | Mty_ident _ | Mty_functor _ | Mty_alias _ -> None
+            with Stdlib.Not_found -> None
+        in
+        List.fold (Option.value signature ~default:[]) ~init:types
+          ~f:(fun types -> function
+          | Types.Sig_type (id, declaration, _, Exported) ->
+              collect environment types
+                (Ctype.newconstr
+                   (Path.Pdot (path, Ident.name id))
+                   declaration.type_params)
+          | _ -> types))
+  in
+  let types = ref types in
+  let default = Tast_iterator.default_iterator in
+  let iterator =
+    {
+      default with
+      expr =
+        (fun self expression ->
+          types := collect expression.Typedtree.exp_env !types expression.exp_type;
+          default.expr self expression);
+      pat =
+        (fun (type k) self (pattern : k Typedtree.general_pattern) ->
+          types := collect pattern.pat_env !types pattern.pat_type;
+          default.pat self pattern);
+      typ =
+        (fun self typ ->
+          types := collect typ.Typedtree.ctyp_env !types typ.ctyp_type;
+          default.typ self typ);
+    }
+  in
+  iterator.structure iterator structure;
+  !types
+
 let collection_kind types p = Option.bind (find types p) ~f:(fun d -> d.collection)
 
 let is_collection types p kind =

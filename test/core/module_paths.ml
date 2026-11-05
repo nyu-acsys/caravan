@@ -56,13 +56,19 @@ let () =
   let root = Path.Pident (Ident.create_local "M") in
   let other_root = Path.Pident (Ident.create_local "M") in
   let nested = Path.Pdot (root, "N") in
-  let libraries = C.Path_bindings.of_list [ (root, [ "M" ]); (nested, [ "M"; "N" ]) ] in
+  let libraries =
+    C.Path_bindings.of_list
+      [
+        (Path.Pdot (root, "f"), [ "M"; "f" ]); (Path.Pdot (nested, "f"), [ "M"; "N"; "f" ]);
+      ]
+  in
   let resolve = C.Translate_context.resolved_call functions libraries in
   assert (Poly.equal (resolve first) (Some "first"));
   assert (Poly.equal (resolve second) (Some "second"));
   assert (Poly.equal (resolve (Path.Pdot (root, "f"))) (Some "M.f"));
   assert (Poly.equal (resolve (Path.Pdot (nested, "f"))) (Some "M.N.f"));
   assert (Option.is_none (resolve unknown));
+  assert (Option.is_none (resolve (Path.Pdot (root, "unsupported"))));
   assert (Option.is_none (resolve (Path.Pdot (other_root, "f"))));
   assert (Option.is_none (resolve (Path.Pdot (Path.Pdot (other_root, "N"), "f"))));
   assert (Option.is_none (resolve (Path.Papply (root, other_root))));

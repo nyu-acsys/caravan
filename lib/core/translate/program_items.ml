@@ -580,7 +580,7 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
     List.fold checked ~init:functions ~f:(fun functions path ->
         Path_bindings.add functions path ())
   in
-  let libraries = library_paths libraries in
+  let libraries = library_calls libraries in
   let is_target (e : Typedtree.expression) =
     match e.exp_desc with
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
@@ -588,9 +588,7 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
             not (String.is_prefix op ~prefix:"make"))
         ||
         match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
-        | Ok path ->
-            Path_bindings.mem functions path
-            || Option.is_some (Path_bindings.member libraries path)
+        | Ok path -> Path_bindings.mem functions path || Path_bindings.mem libraries path
         | Error _ -> false)
     | _ -> false
   in
@@ -1592,6 +1590,7 @@ type prepared_callable = {
   prepared_returns : R.Var.t list;
   prepared_requires : R.Spec.t list;
   prepared_ensures : R.Spec.t list;
+  prepared_logical_ensures : R.Spec.t list;
 }
 (** The contract declaration shared by imports and checked forwarding procedures. *)
 
@@ -1716,14 +1715,15 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
       Signature_contract.terms ~expected:Predef.type_bool ~logical_types:ctx.given.types
         ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
+  let* logical_requires = State.all requires ~f:(formula env) in
   let clauses ?atomic terms =
     State.all terms ~f:(fun t ->
         State.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
   in
-  let* requires = clauses requires in
+  let requires = List.map logical_requires ~f:R.Spec.make in
   let* atomic_requires = clauses ~atomic:true atomic_requires in
-  let* ensures =
-    contract_postconditions env ~at
+  let* logical_ensures =
+    contract_postcondition_formulas env ~at
       (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
       @ Option.value_map outcome ~default:[] ~f:(fun (set, _, _) ->
           Exceptions.raises_postconditions ctx.given.types ~at raises set))
@@ -1736,8 +1736,24 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
             (List.map atomic_raises ~f:(fun (p, t) -> (p, Some t)))
             (State.Raises [])))
   in
-  let in_range =
-    List.filter_map params ~f:(fun (_, raven, typ, _) -> value_spec ctx ~loc:l typ raven)
+  let ensures = List.map logical_ensures ~f:R.Spec.make in
+  let input_domains =
+    List.filter_map params ~f:(fun (_, raven, typ, _) ->
+        Datatypes.admissible ~loc:l ctx.given.types typ
+          (R.Expr.var ~loc:l (Translate_context.name ~loc:l raven)))
+  in
+  let in_range = List.map input_domains ~f:R.Spec.make in
+  let prepared_logical_ensures =
+    let result_domain =
+      Datatypes.admissible ~loc:l ctx.given.types result
+        (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
+    in
+    List.map
+      (Option.to_list result_domain @ logical_ensures)
+      ~f:(fun post ->
+        R.Spec.make
+          (List.fold_right (input_domains @ logical_requires) ~init:post
+             ~f:(fun pre post -> R.Expr.binary ~loc:l Impl pre post)))
   in
   let result_in_range =
     match outcome with
@@ -1767,6 +1783,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
     prepared_returns = returns;
     prepared_requires = in_range @ requires @ atomic_requires;
     prepared_ensures = result_in_range @ ensures @ atomic_ensures;
+    prepared_logical_ensures;
   }
 
 let prepared_member ~at ~name body prepared =
@@ -1837,6 +1854,79 @@ let contains_atomic_token types typ =
     | _ -> false
   in
   contains [] typ
+
+(** The logical counterpart of an explicitly pure imported procedure. *)
+let library_pure_name name = name ^ "$pure"
+
+let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
+    (contract : S.contract) =
+  let open State.Syntax in
+  let l = loc at in
+  let* () =
+    if List.is_empty args then
+      State.of_result (unsupported at "A pure contract on a non-function library value")
+    else State.return ()
+  in
+  let* () =
+    if
+      contract.atomic || raising_contract contract
+      || not
+           (List.is_empty contract.atomic_requires
+           && List.is_empty contract.atomic_ensures)
+    then State.of_result (unsupported at "An atomic or raising pure library function")
+    else State.return ()
+  in
+  let* () =
+    let env =
+      {
+        ctx;
+        var_types = [];
+        logical_definition = false;
+        data = ctx.given.types;
+        funcs = ctx.given.spec_funcs;
+        vars = [];
+      }
+    in
+    let resource_dependent term =
+      List.exists (term_references [] term) ~f:(fun q ->
+          String.equal (qualid_key q) "own"
+          || List.Assoc.mem ctx.given.preds (logical_key env q) ~equal:String.equal
+          || Option.is_some (atomic_method env q))
+    in
+    if List.exists (contract.requires @ contract.ensures) ~f:resource_dependent then
+      State.of_result
+        (unsupported at "A pure library function whose contract depends on heap resources")
+    else State.return ()
+  in
+  let* prepared = prepare_callable ctx ~at ~args ~result (Some contract) in
+  let* () =
+    if List.is_empty prepared.prepared_implicit then State.return ()
+    else State.of_result (unsupported at "A pure library function with ghost parameters")
+  in
+  let logical_name = library_pure_name name in
+  let* result_type = State.typ ctx ~at result in
+  let logical_returns = [ R.Var.make ~loc:l (ident ~loc:l "r") result_type ] in
+  let logical =
+    R.Callable.func ~loc:l ~formals:prepared.prepared_formals ~returns:logical_returns
+      ~ensures:prepared.prepared_logical_ensures (ident ~loc:l logical_name) None
+  in
+  let equality =
+    if is_unit result then []
+    else
+      [
+        R.Spec.make
+          (R.Expr.binary ~loc:l Eq
+             (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
+             (R.Expr.call ~loc:l
+                (Translate_context.name ~loc:l logical_name)
+                prepared.prepared_args));
+      ]
+  in
+  let procedure =
+    prepared_member ~at ~name None
+      { prepared with prepared_ensures = prepared.prepared_ensures @ equality }
+  in
+  State.return [ logical; procedure ]
 
 (** An assumed library value or procedure, using the shared contract preparation. *)
 let library_function ?raising ctx ~(at : Location.t) ~name ~args ~result contract =

@@ -435,6 +435,13 @@ let run (source : Source.t) : (t, error) Result.t =
   in
   let types = List.concat library_types @ types @ source.proof_types in
   let types =
+    Datatypes.compiler_aliases
+      ~modules:
+        (List.map libraries ~f:(fun library ->
+             (library.Library_modules.library_path, source.env)))
+      types inventory.structure
+  in
+  let types =
     List.map types ~f:(fun data ->
         let declared =
           data.Datatypes.paths @ Option.to_list data.library

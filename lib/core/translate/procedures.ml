@@ -577,14 +577,12 @@ and implicit_vars env (f : func) =
             R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ )))
 
 (** Translates each contract channel, quantifying its postcondition-only names. *)
-let contract_postconditions env ~at ?atomic posts =
+let contract_postcondition_formulas env ~at posts =
   let open State.Syntax in
   let l = loc at in
   let* free = free_typed env posts ~at in
   match (free, posts) with
-  | [], _ | _, [] ->
-      State.all posts ~f:(fun t ->
-          State.map (Spec_terms.formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
+  | [], _ | _, [] -> State.all posts ~f:(Spec_terms.formula env)
   | _ ->
       let env =
         List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
@@ -596,7 +594,12 @@ let contract_postconditions env ~at ?atomic posts =
         List.map free ~f:(fun (_, raven, _, typ, var_loc) ->
             R.Var.make ~loc:var_loc (ident ~loc:var_loc raven) typ)
       in
-      [ R.Spec.make ?atomic (R.Expr.exists ~loc:l vars conj) ]
+      [ R.Expr.exists ~loc:l vars conj ]
+
+let contract_postconditions env ~at ?atomic posts =
+  State.map
+    (contract_postcondition_formulas env ~at posts)
+    ~f:(List.map ~f:(R.Spec.make ?atomic))
 
 (** The function that contracts call for [f], defined by its body; [funcs] are the
     functions it may call, by their compiler paths, and [spec_funcs] by their OCaml names.

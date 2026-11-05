@@ -95,6 +95,10 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   let at = e.exp_loc in
   let l = loc at in
   match e.exp_desc with
+  | Texp_struct_item
+      ({ str_desc = Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ }; _ }, body)
+    ->
+      expr ~tail ~keep_scope ctx body
   | Texp_ident (Pident id, _, _) -> (
       let* x = State.find_name id in
       match x with
@@ -102,9 +106,13 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | None -> State.of_result (unsupported at "A function used as a value"))
   | Texp_ident (path, _, _) -> (
       let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
-      match Path_bindings.member ctx.given.libraries path with
+      match Path_bindings.find ctx.given.libraries path with
       | Some member ->
-          State.return ([], R.Expr.call ~loc:l (Qualified_name.raven ~loc:l member) [])
+          State.return
+            ( [],
+              R.Expr.call ~loc:l
+                (qualified_name ~loc:l (String.concat ~sep:"." member))
+                [] )
       | None ->
           begin match stdlib_name path with
           | Some "max_int" -> State.return ([], R.Expr.int ~loc:l Prelude.max_int)
@@ -126,7 +134,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) ->
       State.return ([], unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match occurrence_constructor ctx.given.types e.exp_type cstr with
+      begin match
+        occurrence_constructor ~environment:e.exp_env ctx.given.types e.exp_type cstr
+      with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (d, c) ->
           let* stmts, values = operands ctx args in
@@ -891,8 +901,8 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f ->
             let* actual_target, type_instance =
-              State.polymorphic_application ~values:args ctx ~at ~path
-                ~declaration:declaration.val_type ~occurrence ~target:f
+              State.polymorphic_application ~values:args ~environment:e.exp_env ctx ~at
+                ~path ~declaration:declaration.val_type ~occurrence ~target:f
             in
             call ~actual_target ?type_instance ctx e f args
         | None -> (
@@ -1371,7 +1381,9 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
           [] )
   | Tpat_construct (_, { cstr_name = "()"; _ }, [], _) -> State.return ([], None, [])
   | Tpat_construct (_, cstr, ps, _) ->
-      begin match occurrence_constructor ctx.given.types p.pat_type cstr with
+      begin match
+        occurrence_constructor ~environment:p.pat_env ctx.given.types p.pat_type cstr
+      with
       | None -> State.of_result (unsupported at "This constructor")
       | Some (_, c) ->
           let is_c, fields =
@@ -1570,7 +1582,8 @@ and flat_cases ctx v cases =
         begin match p.pat_desc with
         | Tpat_construct (_, cstr, ps, _) ->
             begin match
-              ( occurrence_constructor ctx.given.types p.pat_type cstr,
+              ( occurrence_constructor ~environment:p.pat_env ctx.given.types p.pat_type
+                  cstr,
                 Option.all (List.map ps ~f:flat_arg) )
             with
             (* A shared functor body's exception is matched through its module. *)
@@ -1869,6 +1882,10 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
   in
   let* names = State.gets (fun (s : State.state) -> s.names) in
   match e.exp_desc with
+  | Texp_struct_item
+      ({ str_desc = Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ }; _ }, body)
+    ->
+      pure_in values body
   | Texp_unreachable -> raw_default ctx ~at e.exp_type
   | Texp_ident (Pident id, _, _) ->
       begin match
@@ -1890,7 +1907,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       State.return (R.Expr.bool ~loc:l (String.equal b "true"))
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) -> State.return (unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
-      begin match occurrence_constructor ctx.given.types e.exp_type cstr with
+      begin match
+        occurrence_constructor ~environment:e.exp_env ctx.given.types e.exp_type cstr
+      with
       | None -> not_pure "This constructor"
       | Some (d, c) ->
           let* args = State.all args ~f:(pure_in values) in
@@ -1993,8 +2012,8 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
                 State.of_result (captured_arguments ~at ~values names captured)
               in
               let+ actual_target =
-                State.polymorphic_call ctx ~at ~path ~declaration:declaration.val_type
-                  ~occurrence:callee.exp_type ~target:f
+                State.polymorphic_call ~environment:e.exp_env ctx ~at ~path
+                  ~declaration:declaration.val_type ~occurrence:callee.exp_type ~target:f
               in
               R.Expr.call ~loc:l (qualified_name ~loc:l actual_target) (captured @ args)
           | None -> not_pure ("A call of " ^ Path.name path)

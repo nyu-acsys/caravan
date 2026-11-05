@@ -293,6 +293,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           ctx.given with
                           types;
                           primitive_namespace = String.split worker.name ~on:'.';
+                          current_polymorphic = Some worker;
                         };
                     }
               in
@@ -311,7 +312,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               let* () =
                 State.of_result
                   (Option.value_map contract ~default:(Ok ()) ~f:(fun contract ->
-                       Signature_contract.lowerable source signature ~environment contract))
+                       Signature_contract.lowerable
+                         ~value_paths:(Library_modules.value_paths lib)
+                         source signature ~environment contract))
               in
               (* One that may raise raises what its contract declares. *)
               let raising =
@@ -321,13 +324,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          ~resolve:(Exceptions.resolver ctx.given.types ctx.given.env)
                          contract))
               in
-              let+ member =
-                library_function ?raising ctx ~at ~name:x ~args ~result contract
+              let+ members =
+                match contract with
+                | Some contract when contract.pure ->
+                    library_pure_members ctx ~at ~name:x ~args ~result contract
+                | _ ->
+                    State.map
+                      (library_function ?raising ctx ~at ~name:x ~args ~result contract)
+                      ~f:List.return
               in
-              let member = R.Member.free (R.Member.callable member) in
+              let members =
+                List.map members ~f:(fun member ->
+                    R.Member.free (R.Member.callable member))
+              in
               begin match worker with
-              | None -> ([ member ], [])
-              | Some worker -> ([], [ (worker.name, [ member ]) ])
+              | None -> (members, [])
+              | Some worker -> ([], [ (worker.name, members) ])
               end)
         in
         let ordinary_predicates =
@@ -1528,7 +1540,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let pure_functions =
     Path_bindings.of_list
       (List.concat_map pure ~f:(fun f ->
-           List.map f.paths ~f:(fun path -> (path, pure_name f))))
+           List.map f.paths ~f:(fun path -> (path, pure_name f)))
+      @ List.map proof_support.runtime_functions.entries ~f:(fun (path, target) ->
+          (path, Qualified_name.to_string target)))
   in
   let* runtime_contexts =
     all runtime_destinations ~f:(fun destination ->
@@ -1747,7 +1761,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let resolve name path =
     Option.bind
       (List.find translated ~f:(fun (n, _, _) -> String.equal n name))
-      ~f:(fun (_, _, functions) -> resolved_call functions (library_paths libraries) path)
+      ~f:(fun (_, _, functions) -> resolved_call functions (library_calls libraries) path)
   in
   (* The witness parameter of a function over a witness, with its position and the
      witness's constructors. *)
@@ -1932,7 +1946,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   raising;
                   witness_raising;
                   atomic_procedures;
-                  libraries = library_paths libraries;
+                  libraries = library_calls libraries;
                   shared_exceptions = shared_exceptions_of f;
                   specialized_witness =
                     Option.bind f.copy_for ~f:(fun copy ->

@@ -230,9 +230,10 @@ let lexbuf_of file =
   Location.init lexbuf file;
   lexbuf
 
-(** The interface in [file], parsed. *)
-let load_interface file =
-  let lexbuf = lexbuf_of file in
+(** An interface source, parsed with its annotation locations. *)
+let parse_interface ~file text =
+  let lexbuf = Lexing.from_string text in
+  Location.init lexbuf file;
   Location.input_name := file;
   Lexer.init ();
   let signature = Parse.interface lexbuf in
@@ -242,6 +243,8 @@ let load_interface file =
     interface_comments = Lexer.comments ();
     scope = Declaration_scope.of_lexbuf ~file lexbuf;
   }
+
+let load_interface file = parse_interface ~file (Stdio.In_channel.read_all file)
 
 (** Uses OCaml's inclusion checker before specializing the implementation. *)
 let check_interface env signature interface =
@@ -265,6 +268,48 @@ let check_interface env signature interface =
           | [] -> Location.none
         in
         Error (Report.error Type loc (Stdlib.Printexc.to_string exn)))
+
+(** Parsed sources are reusable; typed signatures belong to each compiler environment. *)
+let standard_interface_sources =
+  lazy
+    (List.map Stdlib_sources.sources ~f:(fun (name, text) ->
+         let file = "caravan/stdlib/" ^ String.uncapitalize name ^ ".mli" in
+         (name, parse_interface ~file text)))
+
+(** Trusted contract subsets checked against the compiler's actual standard library. *)
+let standard_interfaces env =
+  List.map (Lazy.force standard_interface_sources) ~f:(fun (name, library) ->
+      let path, _ =
+        Env.find_module_by_name
+          (Ldot (Location.mknoloc (Longident.Lident "Stdlib"), Location.mknoloc name))
+          env
+      in
+      let path = Env.normalize_module_path None env path in
+      let declaration = Env.find_module path env in
+      let* library_id =
+        match path with
+        | Pident id -> Ok id
+        | Pdot _ | Papply _ | Pextra_ty _ ->
+            Error
+              (Report.error Type library.scope.location
+                 ("The standard library module " ^ name ^ " has no persistent identity"))
+      in
+      let* actual =
+        match Mtype.scrape env declaration.md_type with
+        | Mty_signature signature -> Ok signature
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            Error
+              (Report.error Type library.scope.location
+                 ("The standard library module " ^ name ^ " has no signature"))
+      in
+      let* library = check_interface env actual library in
+      Ok
+        {
+          library_name = "Caravan_stdlib_" ^ String.uncapitalize name;
+          library_id;
+          library;
+        })
+  |> Result.all
 
 (** Links the type variables of [impl], the type of a value, to what they stand for in
     [iface], the type its interface gives it, expanding abbreviations as needed. *)
@@ -445,6 +490,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
+    let* standard_libraries = standard_interfaces env in
     let libraries =
       List.map (library_files ~include_dirs file) ~f:(fun file ->
           ( String.capitalize Stdlib.Filename.(remove_extension (basename file)),
@@ -481,7 +527,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
           let library = { library with typed_signature } in
           (typed.sig_final_env, { library_name; library_id; library } :: libraries))
     in
-    let libraries = List.rev libraries in
+    let libraries = standard_libraries @ List.rev libraries in
     let text = Stdio.In_channel.read_all file in
     let lexbuf = Lexing.from_string text in
     Location.init lexbuf file;
@@ -1260,15 +1306,48 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
     typing the signature anew for each one dominated the translation. *)
 let signature_environments : (Env.t * Env.t) list ref = ref []
 
+(** Collection helpers are available only when their lexical carriers have the right
+    arity. *)
+let logical_check_interface env =
+  let available name arity =
+    Option.exists (find_type_by_name env name) ~f:(fun (_, declaration) ->
+        declaration.Types.type_arity = arity)
+  in
+  let mapper =
+    {
+      Ast_mapper.default_mapper with
+      typ =
+        (fun self typ ->
+          match typ.Parsetree.ptyp_desc with
+          | Ptyp_constr ({ txt = Lident "integer"; loc }, [])
+            when Option.is_none (find_type_by_name env "integer") ->
+              Ast_helper.Typ.constr ~loc { txt = Lident "int"; loc } []
+          | _ -> Ast_mapper.default_mapper.typ self typ);
+      signature =
+        (fun self items ->
+          List.filter_map items ~f:(fun item ->
+              let keep =
+                match item.Parsetree.psig_desc with
+                | Psig_module { pmd_name = { txt = Some "Set"; _ }; _ } ->
+                    available "set" 1
+                | Psig_module { pmd_name = { txt = Some "Finset"; _ }; _ } ->
+                    available "finset" 1
+                | Psig_module { pmd_name = { txt = Some "Map"; _ }; _ } ->
+                    available "map" 2
+                | _ -> true
+              in
+              Option.some_if keep (Ast_mapper.default_mapper.signature_item self item)));
+    }
+  in
+  mapper.signature mapper (Parse.interface (Lexing.from_string logical_check_signature))
+
 (** [env] with [logical_check_signature], typed once for each environment. *)
 let with_logical_check_signature env =
   match List.Assoc.find !signature_environments env ~equal:phys_equal with
   | Some extended -> extended
   | None ->
       let extended =
-        (Typemod.type_interface env
-           (Parse.interface (Lexing.from_string logical_check_signature)))
-          .sig_final_env
+        (Typemod.type_interface env (logical_check_interface env)).sig_final_env
       in
       signature_environments := List.take ((env, extended) :: !signature_environments) 64;
       extended

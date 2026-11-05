@@ -1,5 +1,13 @@
 (include_subdirs unqualified)
 
+(rule
+ (target stdlib_sources.ml)
+ (deps ../stdlib/list.mli)
+ (action
+  (write-file
+   %{target}
+   "let sources = [ (\"List\", {caravan|%{read:../stdlib/list.mli}|caravan}) ]")))
+
 (library
  (name caravan_core)
  (package caravan)

@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
 - Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
 - Contracts can use list concatenation, membership, and length, and call verified pure functions.
+- Bundled standard-library contracts support `List.rev` and `List.rev_append`, and explicitly pure imported functions can be called in specifications.
 - Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
 - Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
 - Specifications provide unbounded `integer` indices while OCaml `int` fields and quantifiers retain machine bounds.

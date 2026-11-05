@@ -1406,16 +1406,23 @@ module State = struct
           (unsupported value.exp_loc
              "A witness argument other than a constructor or the caller's own witness")
 
-  let polymorphic_application ?(values = []) ctx ~at ~path ~declaration ~occurrence
-      ~target =
+  let polymorphic_application ?(values = []) ?environment ctx ~at ~path ~declaration
+      ~occurrence ~target =
+    let environment = Option.value environment ~default:ctx.given.env in
+    let expand typ =
+      let typ = Datatypes.expand ctx.given.types typ in
+      match Types.get_desc typ with
+      | Tconstr (path, _, _) when Option.is_some (Datatypes.find ctx.given.types path) ->
+          typ
+      | _ -> Ctype.expand_head environment typ
+    in
     match Path_bindings.find ctx.given.polymorphic_functions path with
     | None -> return (target, None)
     | Some ({ witness = Some witness; _ } as worker) ->
         let* arguments =
           of_result
-            (Polymorphic_functions.instantiate_worker
-               ~expand:(Datatypes.expand ctx.given.types)
-               ~at worker ~declaration ~occurrence)
+            (Polymorphic_functions.instantiate_worker ~expand ~at worker ~declaration
+               ~occurrence)
         in
         let stem = (Qualified_name.of_string target).name in
         let* value =
@@ -1446,9 +1453,8 @@ module State = struct
     | Some worker ->
         let* arguments =
           of_result
-            (Polymorphic_functions.instantiate_worker
-               ~expand:(Datatypes.expand ctx.given.types)
-               ~at worker ~declaration ~occurrence)
+            (Polymorphic_functions.instantiate_worker ~expand ~at worker ~declaration
+               ~occurrence)
         in
         let stem = (Qualified_name.of_string target).name in
         let recursive =
@@ -1473,9 +1479,9 @@ module State = struct
           let+ instance = value_instance ctx ~at ~target:worker.name ~arguments in
           (instance ^ "." ^ stem, Some (worker, arguments))
 
-  let polymorphic_call ctx ~at ~path ~declaration ~occurrence ~target =
+  let polymorphic_call ?environment ctx ~at ~path ~declaration ~occurrence ~target =
     let+ target, _ =
-      polymorphic_application ctx ~at ~path ~declaration ~occurrence ~target
+      polymorphic_application ?environment ctx ~at ~path ~declaration ~occurrence ~target
     in
     target
 
@@ -1891,7 +1897,14 @@ let qualid_key q = Qualified_name.to_string (Qualified_name.of_spec q)
 let resolved_call functions libraries path =
   match Path_bindings.find functions path with
   | Some name -> Some name
-  | None -> Option.map (Path_bindings.member libraries path) ~f:Qualified_name.to_string
+  | None -> Option.map (Path_bindings.find libraries path) ~f:(String.concat ~sep:".")
+
+(** Only declarations covered by an imported contract subset are translatable. *)
+let library_calls libraries =
+  Path_bindings.of_list
+    (List.concat_map libraries ~f:(fun (lib : Library_modules.t) ->
+         List.map lib.signature.signature_values ~f:(fun (name, _) ->
+             (Path.Pdot (lib.library_path, name), [ lib.library_name; name ]))))
 
 let library_paths libraries =
   Path_bindings.of_list
@@ -1948,18 +1961,43 @@ let logical_key env q =
           end
       end
 
-let occurrence_constructor types occurrence
+(** Resolves known layouts before expanding transparent compiler abbreviations. *)
+let resolve_constructor ?occurrence ~environment types
     (description : Data_types.constructor_description) =
-  Option.bind (Datatypes.find_cstr types description) ~f:(fun (data, constructor) ->
-      let data = Option.value (Datatypes.instantiated types occurrence) ~default:data in
-      match (Types.get_desc description.cstr_res, Datatypes.desc types occurrence) with
-      | Tconstr (_, parameters, _), Tconstr (_, arguments, _) ->
-          Option.map
-            (Option.all
-               (List.map description.cstr_args
-                  ~f:(Datatypes.instantiate_alias parameters arguments)))
-            ~f:(fun args -> (data, { constructor with args }))
-      | _ -> None)
+  let resolve description occurrence =
+    Option.bind (Datatypes.find_cstr types description) ~f:(fun (data, constructor) ->
+        match occurrence with
+        | None -> Some (data, constructor)
+        | Some occurrence -> (
+            let data =
+              Option.value (Datatypes.instantiated types occurrence) ~default:data
+            in
+            match
+              (Types.get_desc description.cstr_res, Datatypes.desc types occurrence)
+            with
+            | Tconstr (_, parameters, _), Tconstr (_, arguments, _) ->
+                Option.map
+                  (Option.all
+                     (List.map description.cstr_args
+                        ~f:(Datatypes.instantiate_alias parameters arguments)))
+                  ~f:(fun args -> (data, { constructor with args }))
+            | _ -> None))
+  in
+  match resolve description occurrence with
+  | Some _ as found -> found
+  | None ->
+      let expand = Ctype.expand_head environment in
+      let description =
+        {
+          description with
+          cstr_res = expand description.cstr_res;
+          cstr_args = List.map description.cstr_args ~f:expand;
+        }
+      in
+      resolve description (Option.map occurrence ~f:expand)
+
+let occurrence_constructor ~environment types occurrence description =
+  resolve_constructor ~occurrence ~environment types description
 
 (** The prefix of the name that Caravan gives an exception by its key, in contracts it
     makes. *)
@@ -1972,10 +2010,9 @@ let find_constructor ?occurrence env q =
       let key = String.chop_prefix_exn pid_str ~prefix:exception_constructor_prefix in
       Datatypes.find_ctor env.data key
   | _ ->
-      Option.bind (Source.constructor env.ctx.given.env q) ~f:(fun description ->
-          match occurrence with
-          | Some occurrence -> occurrence_constructor env.data occurrence description
-          | None -> Datatypes.find_cstr env.data description)
+      Option.bind
+        (Source.constructor env.ctx.given.env q)
+        ~f:(resolve_constructor ?occurrence ~environment:env.ctx.given.env env.data)
 
 (** The functions of OCaml's standard library on lists that contracts can use, as Raven's
     [List]'s. *)
@@ -2247,7 +2284,8 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
       | S.Qid id as q ->
           let key = logical_key env q in
           Option.some_if
-            (List.Assoc.mem env.ctx.given.preds key ~equal:String.equal
+            (Option.is_some (runtime_spec env q)
+            || List.Assoc.mem env.ctx.given.preds key ~equal:String.equal
             || List.Assoc.mem env.ctx.given.proof_support.logical_functions key
                  ~equal:String.equal
             || List.Assoc.mem env.ctx.given.proof_lemmas key ~equal:String.equal)

@@ -15,7 +15,22 @@ type t = {
 }
 
 let environment (source : Source.t) library =
-  match Env.open_signature Asttypes.Override library.library_path source.env with
+  let lexical =
+    Option.value_map library.library.typed_signature ~default:source.env
+      ~f:(fun signature -> signature.Typedtree.sig_final_env)
+  in
+  let rec root = function
+    | Path.Pident id -> id
+    | Pdot (parent, _) -> root parent
+    | Papply _ | Pextra_ty _ -> library.library_id
+  in
+  let root = root library.library_path in
+  let declaration = Env.find_module (Pident root) source.env in
+  let lexical =
+    Env.add_module_declaration ~check:false root Mp_present declaration lexical
+  in
+  let lexical = Source.annotation_env source lexical in
+  match Env.open_signature Asttypes.Override library.library_path lexical with
   | Ok environment -> Ok environment
   | Error (`Not_found | `Functor) ->
       Error
@@ -34,6 +49,13 @@ let abstract_types library =
 
 let value library (value : Module_inventory.signature_value) =
   { value with substitution = Subst.compose value.substitution library.projection }
+
+(** Imported contract references retain the identity of their source declaration. *)
+let value_paths library =
+  Path_bindings.of_list
+    (List.map library.signature.signature_values ~f:(fun (name, value) ->
+         let declaration = value.Module_inventory.declaration in
+         (Path.Pident declaration.val_id, Path.Pdot (library.library_path, name))))
 
 let resource_type library (resource : Module_inventory.signature_resource) typ =
   Subst.type_expr library.projection (Subst.type_expr resource.substitution typ)

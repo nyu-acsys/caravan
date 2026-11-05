@@ -122,6 +122,24 @@ clauses separately; Raven checks ownership and invariant restoration at calls.
 Their implementations must be verified separately against the same interface.
 A logically atomic contract does not declare a physically atomic operation.
 
+An imported function explicitly marked `pure` can also be called in specifications.
+Its runtime calls and logical calls share the interface contract; no separate
+mapping annotation is needed. This trusts that the implementation is pure,
+deterministic, terminates when its precondition holds, and satisfies its contract.
+Atomic or raising functions and functions with ghost parameters are not supported
+as pure imports.
+Specification calls denote a total mathematical extension: their results are
+unconstrained outside the precondition or source type domain. Runtime calls must
+establish the precondition.
+
+Caravan bundles annotated `.mli` subsets of supported standard-library modules in
+[`lib/stdlib`](lib/stdlib). These contracts attach to the compiler's actual module
+identities, including aliases, without replacing the standard library or capturing
+user modules with the same names. OCaml checks each subset's type compatibility;
+the behavioral contracts are trusted. Currently `List.rev` and `List.rev_append`
+are supported in implementations and specifications. Other runtime operations
+still require support of their own.
+
 Module types can declare abstract resources using the same annotation forms. A
 constrained alias checks the actual operations against the requested contracts:
 

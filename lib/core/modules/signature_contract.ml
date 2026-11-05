@@ -747,8 +747,8 @@ let check ?(logical_types = []) ?(restricted = false) ?predicates ?environment s
     ~expected:Predef.type_int contract.variant
 
 (** Lowering shares the implementation's lexical names only when their meanings agree. *)
-let lowerable source (view : Module_inventory.signature_value) ~environment
-    (contract : S.contract) =
+let lowerable ?(value_paths = Path_bindings.empty) source
+    (view : Module_inventory.signature_value) ~environment (contract : S.contract) =
   let original = Source.annotation_env source view.site.environment in
   let environment = Source.annotation_env source environment in
   let unavailable at =
@@ -806,6 +806,12 @@ let lowerable source (view : Module_inventory.signature_value) ~environment
             | Some path when proof_path path -> Ok ()
             | Some _ -> unavailable (S.qualid_loc q)
             end
+        | Some path when Path_bindings.mem value_paths path ->
+            let expected = Option.value_exn (Path_bindings.find value_paths path) in
+            begin match Source.value_path environment q with
+            | Some body when Path.same expected body -> Ok ()
+            | _ -> unavailable (S.qualid_loc q)
+            end
         | Some path when signature_resource_path path ->
             let expected = Subst.module_path view.substitution path in
             begin match Source.value_path environment q with
@@ -831,7 +837,7 @@ let lowerable source (view : Module_inventory.signature_value) ~environment
         | Some implemented ->
             let* equal =
               compiler ~at:(S.qualid_loc q) (fun () ->
-                  Ctype.is_equal environment false
+                  Ctype.is_equal environment true
                     [ Subst.type_expr view.substitution declared.cstr_res ]
                     [ implemented.cstr_res ])
             in

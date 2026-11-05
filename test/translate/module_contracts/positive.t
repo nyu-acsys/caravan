@@ -23,6 +23,7 @@
   client
   Checked_original.checked_original_touch
   Checked_original.checked_original_read
+  Ocaml_ListValue_1.$holds_contract
 
   $ caravan --shh nested.ml
   Verification successful.
@@ -69,3 +70,4 @@
   client
   Checked_original.checked_original_touch
   Checked_original.checked_original_read
+  Ocaml_ListValue_1.$holds_contract

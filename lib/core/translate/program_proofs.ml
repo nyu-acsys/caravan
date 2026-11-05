@@ -839,16 +839,28 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                 { signature with lemma_inputs = inputs; lemma_outputs = outputs } )
         | _ -> None)
   in
+  let* imported_pure =
+    all libraries ~f:(fun library ->
+        let* contracts = library_contracts library in
+        Ok
+          (List.filter_map contracts ~f:(fun (name, (contract, _)) ->
+               Option.some_if contract.S.pure
+                 ( Path.Pdot (library.library_path, name),
+                   Qualified_name.of_string
+                     (library.library_name ^ "." ^ library_pure_name name) ))))
+  in
+  let imported_pure = List.concat imported_pure in
   let resources, ghost_fields = proof_assets None in
   let proof_support =
     {
       runtime_functions =
         Path_bindings.of_list
-          (List.concat_map pure ~f:(fun f ->
-               List.filter_map f.paths ~f:(fun path ->
-                   match path with
-                   | Path.Pdot _ when not (List.is_empty f.signature_sites) -> None
-                   | _ -> Some (path, pure_reference f))));
+          (imported_pure
+          @ List.concat_map pure ~f:(fun f ->
+              List.filter_map f.paths ~f:(fun path ->
+                  match path with
+                  | Path.Pdot _ when not (List.is_empty f.signature_sites) -> None
+                  | _ -> Some (path, pure_reference f))));
       predicate_views =
         Path_bindings.of_list
           (List.map checked_resource_entries ~f:(fun (path, key, _, _) -> (path, key)));
