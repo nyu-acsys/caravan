@@ -67,7 +67,8 @@
   ../saturn/michael_scott_queue/michael_scott_queue.ml
   ../saturn/michael_scott_queue/michael_scott_queue.mli
   ../saturn/michael_scott_queue/michael_scott_queue_intf.mli
-  ../saturn/treiber_stack/treiber_stack.ml))
+  ../saturn/treiber_stack/treiber_stack.ml
+  ../saturn/treiber_stack/treiber_stack.mli))
 
 (test
  (name source_paths)
