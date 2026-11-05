@@ -83,5 +83,5 @@ Start with [a first verified file](/getting-started/). For the underlying logic,
 the [Raven tutorial](https://nyu-acsys.github.io/raven/tutorial/) introduces
 ownership, invariants, and atomic contracts through worked examples.
 
-Caravan is developed in the [ACSys group](https://github.com/nyu-acsys) at New York
+Caravan is developed in the [ACSys group](https://cs.nyu.edu/acsys) at New York
 University and is available under the MIT license.
