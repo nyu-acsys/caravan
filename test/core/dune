@@ -66,7 +66,8 @@
  (deps
   ../saturn/michael_scott_queue/michael_scott_queue.ml
   ../saturn/michael_scott_queue/michael_scott_queue.mli
-  ../saturn/michael_scott_queue/michael_scott_queue_intf.mli))
+  ../saturn/michael_scott_queue/michael_scott_queue_intf.mli
+  ../saturn/treiber_stack/treiber_stack.ml))
 
 (test
  (name source_paths)
@@ -78,3 +79,13 @@
  (name stdlib_interfaces)
  (modules stdlib_interfaces)
  (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
+ (name stdlib_zero_arity)
+ (modules stdlib_zero_arity)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))

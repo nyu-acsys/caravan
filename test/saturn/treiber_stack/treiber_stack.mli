@@ -22,6 +22,11 @@ val push : 'a t -> 'a -> unit
     atomic requires stack t xs
     atomic ensures stack t (v :: xs) *)
 
+val push_all : 'a t -> 'a list -> unit
+(*@ atomic push_all t values
+    atomic requires stack t xs
+    atomic ensures stack t (List.rev values @ xs) *)
+
 exception Empty
 
 val peek_opt : 'a t -> 'a option

@@ -610,7 +610,8 @@ type au = {
       (** The type of the function's outcome, if it may raise: then its commits pass the
           outcome after its other results. *)
   token : R.Expr.t;  (** The update's token. *)
-  commit_only : at:Location.t -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
+  commit_only :
+    unfold:bool -> at:Location.t -> value:R.Expr.t -> R.Stmt.t list State_monad.t;
       (** Opens the update and commits it with [value] at once, at the step at [at], the
           invariants left as they are. *)
 }
@@ -1120,9 +1121,8 @@ type inputs = {
   access_proofs : ((int * int) * Annotation.t) list;
   return_proofs : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
-  linearizations : (int * Annotation.t) list;
-      (** The annotations on atomic steps, by the offset of the end of the step they
-          follow. *)
+  linearizations : ((int * int) * Annotation.t) list;
+      (** The annotations on atomic operations and unit commits, by source expression. *)
   shared : shared;
 }
 (** What a context is given when it is made: the same throughout its translation. *)

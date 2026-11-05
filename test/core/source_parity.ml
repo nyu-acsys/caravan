@@ -1,7 +1,7 @@
 open Base
 
 (* Saturn ocaml-multicore/saturn commit 50d8d9d0a99b40434ab05bee49200cd5ffa028f5,
-   src/michael_scott_queue. Hashes cover the original source bytes. *)
+   src/michael_scott_queue and src/treiber_stack.ml. Hashes cover original source bytes. *)
 let sources =
   [
     ("michael_scott_queue.ml", "44f261d5d6d292d459bf2565a3373d02");
@@ -60,3 +60,35 @@ let () =
         failwith
           ("Upstream source parity failed for " ^ name ^ ": expected " ^ expected
          ^ ", got " ^ actual))
+
+let () =
+  let path = "../saturn/treiber_stack/treiber_stack.ml" in
+  let text = Stdio.In_channel.read_all path in
+  let lexbuf = Lexing.from_string text in
+  Location.init lexbuf path;
+  Lexer.init ();
+  let structure = Parse.implementation lexbuf in
+  List.iter
+    [
+      ("push_all_", "b43dadcc185a8df2b1a900978e4de2ee");
+      ("push_all", "265a3e199aa8b99d214fb412b079435b");
+    ]
+    ~f:(fun (name, expected) ->
+      let item =
+        List.find_exn structure ~f:(fun item ->
+            match item.Parsetree.pstr_desc with
+            | Pstr_value (_, bindings) ->
+                List.exists bindings ~f:(fun binding ->
+                    match binding.Parsetree.pvb_pat.ppat_desc with
+                    | Ppat_var id -> String.equal id.txt name
+                    | _ -> false)
+            | _ -> false)
+      in
+      let at = item.pstr_loc in
+      let definition =
+        String.sub text ~pos:at.loc_start.pos_cnum
+          ~len:(at.loc_end.pos_cnum - at.loc_start.pos_cnum)
+      in
+      let actual = Stdlib.Digest.(to_hex (string definition)) in
+      if not (String.equal expected actual) then
+        failwith ("Upstream source parity failed for Treiber " ^ name))

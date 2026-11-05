@@ -467,23 +467,6 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           universal = None;
         })
 
-(** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
-*)
-let atomic_steps (structure : Typedtree.structure) : int list =
-  let found = ref [] in
-  let expr iterator (e : Typedtree.expression) =
-    begin match e.exp_desc with
-    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _)
-      when Option.is_some (atomic_name path) ->
-        found := step_end e :: !found
-    | _ -> ()
-    end;
-    Tast_iterator.default_iterator.expr iterator e
-  in
-  let iterator = { Tast_iterator.default_iterator with expr } in
-  iterator.structure iterator structure;
-  !found
-
 (** Resolves annotations to one source expression, including nested calls. *)
 let attached_annotations ?(all_expressions = false) ?(innermost = false)
     (source : Source.t) typed annotations ~kind ~is_target ~description =
@@ -512,6 +495,7 @@ let attached_annotations ?(all_expressions = false) ?(innermost = false)
     else
       begin match e.exp_desc with
       | Texp_apply _ | Texp_record _ -> expressions := (e, eligible) :: !expressions
+      | _ when eligible -> expressions := (e, true) :: !expressions
       | _ -> ()
       end;
     Tast_iterator.default_iterator.expr iterator e
@@ -554,6 +538,17 @@ let attached_annotations ?(all_expressions = false) ?(innermost = false)
         error annotation.loc "This expression has more than one annotation of this kind"
   in
   Ok attached
+
+let linearization_annotations source typed annotations =
+  let is_target (expression : Typedtree.expression) =
+    match expression.exp_desc with
+    | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) ->
+        Option.is_some (atomic_name path)
+    | Texp_construct (_, { cstr_name = "()"; _ }, []) -> true
+    | _ -> false
+  in
+  attached_annotations source typed annotations ~kind:Annotation.Linearization ~is_target
+    ~description:"This annotation does not follow an atomic step, as Atomic.get t"
 
 let initialization_annotations source typed annotations =
   let is_target (e : Typedtree.expression) =

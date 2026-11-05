@@ -10,7 +10,7 @@ open Proof_declarations
 
 type t = {
   annotations : Annotation.t list;
-  linearizations : (int * Annotation.t) list;
+  linearizations : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
   source : Source.t;
   implementation : Source.proof_resource -> string option;
@@ -93,29 +93,9 @@ let proof_worker ~(module_contexts : Module_context.registry)
 
 let run (source : Source.t) : (t, error) Result.t =
   let annotations = Source.annotations source in
-  (* Each annotation on an atomic step, by the end of the code it follows. *)
-  let linearizations =
-    List.filter_map annotations ~f:(fun a ->
-        if Poly.equal (Annotation.kind a) Annotation.Linearization then
-          let rec anchor i =
-            if i > 0 && Char.is_whitespace source.text.[i - 1] then anchor (i - 1) else i
-          in
-          Some (anchor a.loc.loc_start.pos_cnum, a)
-        else None)
-  in
-  (* Each follows an application of an [Atomic] operation. *)
   let typed = without_application_operators source.typed in
-  let steps = atomic_steps typed in
+  let* linearizations = linearization_annotations source typed annotations in
   let* initializations = initialization_annotations source typed annotations in
-  let* () =
-    match
-      List.find linearizations ~f:(fun (anchor, _) ->
-          not (List.mem steps anchor ~equal:Int.equal))
-    with
-    | Some (_, a) ->
-        error a.loc "This annotation does not follow an atomic step, as Atomic.get t"
-    | None -> Ok ()
-  in
   Fresh_names.reset ();
   Fresh_names.reserve
     [

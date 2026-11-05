@@ -1,0 +1,9 @@
+let reverse (value : int) : int = value
+
+lemma local_helper (ignored : unit)
+  ensures (reverse 7 === 7) = ()
+
+lemma mathematical_extension (ignored : unit)
+  ensures (
+    Stdlib_model.List.reverse (Stdlib_model.List.reverse [max_int + 1])
+      === [max_int + 1]) = ()

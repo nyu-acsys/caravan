@@ -470,6 +470,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
       in
       let+ body = proof_expression body_env targets lemma_body in
       R.Callable.proc ~loc:l ~kind:Lemma
+        ~auto:(List.mem lemma_name.pid_attrs "auto" ~equal:String.equal)
         ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
         ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
         ~requires ~ensures ~decreases
@@ -1144,14 +1145,34 @@ let pure_logical_body env (t : S.term) =
              "A pure logical function cannot use ownership or predicates"
          else Ok ()))
 
-(** Nonrecursive logical definitions are checked with the rest of the proof. *)
+(** Logical definitions and their termination measures are checked with the proof. *)
 let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?member_name
     ?(primitive_namespace = []) ?(generic_predicates = []) ?polymorphic_functions
     ?signature ~as_value declaration =
   match declaration with
-  | S.Proof_function { function_name; function_params; function_result; function_body } ->
+  | S.Proof_function
+      {
+        function_name;
+        function_params;
+        function_result;
+        function_body;
+        function_recursive;
+        function_variant;
+      } ->
       let open State.Syntax in
       let l = loc function_name.pid_loc in
+      let* () =
+        if function_recursive && List.is_empty function_variant then
+          State.of_result
+            (error function_name.pid_loc "A recursive logical function needs a variant")
+        else if function_recursive && List.is_empty function_params then
+          State.of_result
+            (error function_name.pid_loc "A recursive logical definition needs parameters")
+        else if (not function_recursive) && not (List.is_empty function_variant) then
+          State.of_result
+            (error function_name.pid_loc "Only a recursive logical function has a variant")
+        else State.return ()
+      in
       let* inputs, output, generic =
         State.of_result
           (match signature with
@@ -1212,6 +1233,7 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
              declaration)
       in
       let* body = formula env function_body in
+      let* decreases = State.all function_variant ~f:(formula env) in
       let+ result = State.fresh "result" in
       let member =
         ident ~loc:l (Option.value member_name ~default:function_name.pid_str)
@@ -1220,7 +1242,7 @@ let proof_function types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?m
       if as_value then R.Member.value ~loc:l ~typ:result_type member (Some body)
       else
         R.Member.callable
-          (R.Callable.func ~loc:l
+          (R.Callable.func ~loc:l ~decreases
              ~formals:(List.map params ~f:(fun (_, _, _, v) -> v))
              ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_type ]
              member (Some body))

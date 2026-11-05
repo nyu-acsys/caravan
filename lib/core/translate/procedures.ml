@@ -849,13 +849,18 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
       token = R.Expr.var ~loc:(loc at) (name ~loc:(loc at) phi);
       commit_only;
     }
-  and commit_only ~at ~value =
+  and commit_only ~unfold:with_unfold ~at ~value =
     let open State.Syntax in
     let l = loc at in
     let* decls = implicit_values ~at ~const:None in
     let values = List.map decls ~f:snd in
-    let* unfolds = each pres ~at unfold (opened values) in
-    let* folds = each posts ~at (with_views ctx fold) (opened ~value values) in
+    let* unfolds =
+      if with_unfold then each pres ~at unfold (opened values) else State.return []
+    in
+    let* folds =
+      if with_unfold then each posts ~at (with_views ctx fold) (opened ~value values)
+      else State.return []
+    in
     let+ () =
       State.record_origin
         {

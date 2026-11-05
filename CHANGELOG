@@ -16,12 +16,12 @@ All notable changes to this project will be documented in this file.
 - Source-level verification errors retain solver timeout explanations.
 - `--history=monotone` encodes histories of states by their current state and its lower bounds.
 - Qualified specification names retain their full paths, and contract attachment respects enclosing source scopes.
-- Proof files support checked lemmas with inferable trailing arguments, implicit predicate parameters, inline predicates, general invariants, logical variant and record types, and sets and maps.
+- Proof files support terminating logical definitions, automatic lemmas, checked lemmas with inferable trailing arguments, implicit predicate parameters, inline predicates, general invariants, logical variant and record types, and sets and maps.
 - First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
 - Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
 - Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
 - Contracts can use list concatenation, membership, and length, and call verified pure functions.
-- Bundled standard-library contracts support `List.rev` and `List.rev_append`, and explicitly pure imported functions can be called in specifications.
+- Bundled standard-library contracts support `List.rev` and `List.rev_append` with checked models and reusable algebra, and pure imports are usable in specifications.
 - Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
 - Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
 - Specifications provide unbounded `integer` indices while OCaml `int` fields and quantifiers retain machine bounds.
@@ -32,7 +32,7 @@ All notable changes to this project will be documented in this file.
 - Shadowed function definitions and wrappers retain their contracts and atomic updates.
 - Atomic operations support physical comparison and wrapping integer read-modify-write operations.
 - Logically atomic contracts generate linearization proofs, including branches that return results.
-- Read linearization points can be selected with `commit` and conditional `returning` annotations.
+- Linearization points can be selected with `commit` and conditional `returning` annotations, including no-op unit branches.
 - Contracts can reside in `.mli` interfaces checked for OCaml implementation compatibility, with predicate definitions in companion `.proof` files.
 - Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses, including stateful nested reads.
 - Shared structures support persistent invariants and exclusive views of their ghost state.
@@ -44,7 +44,7 @@ All notable changes to this project will be documented in this file.
 - Trusted library interfaces support abstract types, invariant and predicate declarations, and ordinary and logically atomic function contracts.
 - Functions marked `trusted` assume their contracts and emit a warning.
 - Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
-- Saturn case studies include Treiber stack, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
+- Saturn case studies include Treiber stack with bulk push, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
 - `--emit-rav` prints the generated Raven program for standalone parsing and verification.
 - `--smt-timeout` controls the solver timeout for each query.
 - `-I` adds directories to the library interface search path.

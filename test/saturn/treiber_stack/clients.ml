@@ -27,3 +27,25 @@ let exception_client () =
   assert (top = 7 && popped = 7);
   assert (peek_opt stack = None);
   match pop_exn stack with _ -> assert false | exception Empty -> ()
+
+let bulk_empty_client () =
+  let stack = of_list [ 17; 23 ] in
+  push_all stack [];
+  assert (pop_all stack = [ 17; 23 ])
+
+let bulk_order_client () =
+  let stack = create () in
+  push_all stack [ 1; 2; 3 ];
+  assert (pop_opt stack = Some 3);
+  assert (pop_all stack = [ 2; 1 ])
+
+let bulk_existing_client () =
+  let stack = of_list [ 9; 8 ] in
+  push_all stack [ 1; 2 ];
+  push_all stack [ 3 ];
+  assert (pop_all stack = [ 3; 2; 1; 9; 8 ])
+
+let bulk_boolean_client () =
+  let stack = of_list [ false ] in
+  push_all stack [ true; false ];
+  assert (pop_all stack = [ false; true; false ])

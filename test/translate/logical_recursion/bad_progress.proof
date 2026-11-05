@@ -1,0 +1,2 @@
+let rec repeat (values : 'a list) : 'a list
+  variant (values) = repeat values

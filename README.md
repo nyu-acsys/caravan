@@ -140,6 +140,15 @@ the behavioral contracts are trusted. Currently `List.rev` and `List.rev_append`
 are supported in implementations and specifications. Other runtime operations
 still require support of their own.
 
+Their companion `.proof` files define total mathematical models and reusable
+algebraic lemmas. For example, `Stdlib_model.List.reverse` is the mathematical model of
+`List.rev`; its algebra applies to mathematical lists independently of source
+value constraints. `Stdlib_model` is available only in specifications.
+Clients import the checked library facts without checking
+their proofs again. Run `caravan --check-stdlib` to verify the bundled models and
+lemmas, or add `--emit-rav` to inspect their verification program. These checks
+also run in the regression suite.
+
 Module types can declare abstract resources using the same annotation forms. A
 constrained alias checks the actual operations against the requested contracts:
 
@@ -330,7 +339,7 @@ writes require full ownership. Raven consequently rejects these accesses while a
 shared invariant or atomic update is open. `Atomic` operations retain their
 atomic contracts.
 
-Proof files can define nonrecursive pure logical functions with typed parameters
+Proof files can define pure logical functions with typed parameters
 and results. A set comprehension uses an OCaml-style binder:
 
 ```ocaml
@@ -342,6 +351,12 @@ Logical definitions can call previously declared logical functions and use
 `let`, `if`, and `match`; they cannot read heap ownership or call predicates.
 OCaml checks their bodies and arguments before translation, including reference
 element types. Matches must be exhaustive.
+
+Recursive definitions use `let rec` and an explicit decreasing measure, such as
+`variant values` for recursion over a list. Raven checks that the measure
+decreases at recursive calls. Lexicographic measures use tuples, as in
+`variant xs, ys` or `variant (xs, ys)`. A checked `lemma [@auto]` makes its facts available
+automatically when its module is instantiated.
 
 Proof datatypes, logical functions, and lemmas can have type parameters using
 OCaml syntax:
@@ -648,6 +663,9 @@ local function's outline is nested where it is defined, as `proof g y = begin
 steps end`, and an outline in a proof module proves a function of the source
 module of its name. A contract-only outline ends with `= ()` and retains automatic
 reasoning; continuation contracts can include `continues f`.
+
+A no-op unit branch can use `at (()) commit`. The proof must establish the
+atomic postcondition from the unchanged abstract resources, with invariants closed.
 
 `initially { fields }` gives a constructor's initial state, with optional ghost
 bindings as `initially let x = e in { fields }`. Initializers and linearization

@@ -476,6 +476,10 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
     decls
   in
   let generic_callable ~key ~at ~explicit parameters =
+    let library =
+      Option.bind (scoped_binding key) ~f:(fun binding ->
+          Source.library_proof_for_owner source binding.entry.scope.owner)
+    in
     let context =
       Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
         ~unapplied_proofs:scopes.unapplied_proofs key
@@ -492,7 +496,19 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
     let worker =
       { worker with name = Generic_family_plan.proof family_plan key worker.name }
     in
-    if List.is_empty worker.variables then Ok None else Ok (Some worker)
+    let worker =
+      match library with
+      | None -> worker
+      | Some (library, _) ->
+          {
+            worker with
+            name =
+              library.library_name ^ ".Math$"
+              ^ Int.to_string (List.length worker.variables);
+          }
+    in
+    if List.is_empty worker.variables && Option.is_none library then Ok None
+    else Ok (Some worker)
   in
   let au_application_view =
     Program_declarations.au_application_view ~untyped_scoped_proofs:scopes.scoped_proofs

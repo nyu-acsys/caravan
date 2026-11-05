@@ -40,7 +40,7 @@
       "patterns": [
         {
           "name": "keyword.control.caravan",
-          "match": "(?<![A-Za-z0-9_'])\\b(?:else|exists|forall|if|end|as|assert|at|begin|commit|fold|fun|in|let|match|mod|not|of|old|then|unfold|with)(?![A-Za-z0-9_'])"
+          "match": "(?<![A-Za-z0-9_'])\\b(?:else|exists|forall|if|end|as|assert|at|begin|commit|fold|fun|in|let|rec|match|mod|not|of|old|then|unfold|with)(?![A-Za-z0-9_'])"
         },
         {
           "name": "keyword.other.caravan",

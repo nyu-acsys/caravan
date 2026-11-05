@@ -282,6 +282,8 @@ type proof_decl =
       function_name : id;
       function_params : (id * pty) list;
       function_result : pty;
+      function_recursive : bool;
+      function_variant : term list;
       function_body : term;
     }
   | Proof_lemma of {

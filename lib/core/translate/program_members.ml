@@ -248,6 +248,13 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                    ~equal:String.equal) ~f:(fun inputs -> (local, inputs)))
         in
         let ctx =
+          let scope =
+            Option.bind (Source.library_model source lib.library_path) ~f:(fun owner ->
+                Proof_scopes.find_owner source.proof_scopes (Some owner))
+          in
+          let preds, spec_funcs, proof_support =
+            proof_context scope preds spec_funcs proof_support
+          in
           scoped_contract_context types ~shared ~environment ~proof_support ~preds
             ~primitive_namespace:[ lib.library_name ] ~generic_predicates ~spec_funcs
             ~own_preds ~own_inputs ()
@@ -268,7 +275,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let+ value_members =
           State.in_procedure
           @@ State.all lib.signature.signature_values ~f:(fun (x, signature) ->
-              let signature = Library_modules.value lib signature in
+              let* signature =
+                State.of_result (Library_modules.value source lib signature)
+              in
               let at = signature.declaration.val_loc in
               let value = Env.find_value (Pdot (lib.library_path, x)) source.env in
               let worker =
@@ -656,9 +665,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                                     ~equal:String.equal )
                               with
                              | Some contract, Some signature ->
-                                 Signature_contract.lowerable source
-                                   (Library_modules.value lib signature)
-                                   ~environment contract
+                                 Result.bind (Library_modules.value source lib signature)
+                                   ~f:(fun signature ->
+                                     Signature_contract.lowerable source signature
+                                       ~environment contract)
                              | None, _ -> Ok ()
                              | Some _, None ->
                                  unsupported at
@@ -1429,6 +1439,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            let previous =
              List.map (List.take logical_declarations i) ~f:(fun declaration ->
                  (Proof_scopes.name declaration).pid_str)
+           in
+           let previous =
+             match declaration with
+             | S.Proof_function { function_recursive = true; _ } ->
+                 declaration_name :: previous
+             | _ -> previous
            in
            let implementation_key backend =
              Option.value

@@ -31,10 +31,12 @@ let declaration_references = function
         ~f:
           (Translate_context.term_references
              (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str)))
-  | Proof_function { function_params; function_body; _ } ->
-      Translate_context.term_references
-        (List.map function_params ~f:(fun (id, _) -> id.S.pid_str))
-        function_body
+  | Proof_function { function_params; function_body; function_variant; _ } ->
+      List.concat_map
+        (function_body :: function_variant)
+        ~f:
+          (Translate_context.term_references
+             (List.map function_params ~f:(fun (id, _) -> id.S.pid_str)))
   | Proof_lemma
       {
         lemma_params;

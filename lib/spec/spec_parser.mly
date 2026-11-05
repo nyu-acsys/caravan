@@ -147,7 +147,7 @@
 
 (* Keywords *)
 
-%token ELSE EXISTS FALSE FORALL IF IN LET MATCH NOT OLD THEN TRUE WITH
+%token ELSE EXISTS FALSE FORALL IF IN LET REC MATCH NOT OLD THEN TRUE WITH
 
 (* Symbols *)
 
@@ -433,7 +433,8 @@ proof_decl:
       Proof_au { au_name = n; au_operation = target } }
 | MODULE n = uident EQUAL f = uqualid args = proof_module_argument*
     { Proof_resource { resource_name = n; resource_functor = f; resource_arguments = args } }
-| LET n = lident ps = pred_param* COLON ty = typ EQUAL body = term
+| LET recursive = boption(REC) n = lident ps = pred_param* COLON ty = typ
+    variants = list(preceded(VARIANT, proof_variant)) EQUAL body = term
     { let field_type = match ty with
         | PTtyapp (Qdot (Qid m, field), [_; _])
           when m.pid_str = "Ghost" && field.pid_str = "field" -> true
@@ -445,14 +446,17 @@ proof_decl:
         | _ -> false
       in
       if ps = [] && (field_type || field_init) then begin
+        if recursive || variants <> [] then
+          raise (Syntax_error (n.pid_loc, "A ghost field cannot be recursive"));
         if not (field_type && field_init) then
           raise (Syntax_error (n.pid_loc,
             "A ghost field declaration requires (owner, value) Ghost.field = Ghost.field ()"));
         Proof_field { field_name = n; field_type = ty }
       end else
         Proof_function { function_name = n; function_params = ps;
-          function_result = ty; function_body = body } }
-| LEMMA n = lident ps = lemma_param* rs = lemma_returns?
+          function_result = ty; function_recursive = recursive;
+          function_variant = List.concat variants; function_body = body } }
+| LEMMA attribute = ATTRIBUTE? n = lident ps = lemma_param* rs = lemma_returns?
     cs = lemma_clause* EQUAL body = proof_expr
     { let requires, ensures, variant =
         List.fold_left
@@ -462,11 +466,16 @@ proof_decl:
             | `Variant t -> (requires, ensures, t :: variant))
           ([], [], []) cs
       in
+      let n = match attribute with
+        | None -> n
+        | Some "auto" -> add_attr n "auto"
+        | Some _ -> raise (Syntax_error (mk_loc $loc(attribute), "A lemma's attribute is [@auto]"))
+      in
       Proof_lemma {
         lemma_name = n; lemma_params = ps;
         lemma_returns = (match rs with None -> [] | Some rs -> rs);
         lemma_requires = List.rev requires; lemma_ensures = List.rev ensures;
-        lemma_variant = List.rev variant; lemma_body = body;
+        lemma_variant = List.concat (List.rev variant); lemma_body = body;
       } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
     { Proof_state { state_name = n; state_params = ps; state_fields = fs } }
@@ -516,7 +525,13 @@ lemma_returns:
 lemma_clause:
 | REQUIRES LEFTPAR t = term RIGHTPAR { `Requires t }
 | ENSURES LEFTPAR t = term RIGHTPAR { `Ensures t }
-| VARIANT LEFTPAR t = term RIGHTPAR { `Variant t }
+| VARIANT t = proof_variant { `Variant t }
+;
+
+proof_variant:
+| t = term_arg
+    { match t.term_desc with Ttuple ts -> ts | _ -> [t] }
+| ts = comma_list2(term_arg) { ts }
 ;
 
 helps:

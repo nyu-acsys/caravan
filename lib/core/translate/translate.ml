@@ -316,22 +316,28 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           member :: parts
         else [])
   in
+  let proof_member key member =
+    if
+      Option.exists (scoped_binding key) ~f:(fun binding ->
+          Source.trusted_proof source binding.entry.scope.owner)
+    then R.Member.free member
+    else member
+  in
   let proof_lemma_members =
-    List.zip_exn
-      (List.map lemma_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
-      lemma_members
+    List.map2_exn lemma_declarations lemma_members ~f:(fun declaration member ->
+        let name = Proof_scopes.name declaration in
+        let member = R.Member.callable member in
+        (name.pid_str, proof_member name.pid_str member))
   in
   let logical_members =
-    List.zip_exn
-      (List.map logical_declarations ~f:(fun d -> (Proof_scopes.name d).pid_str))
-      logical_members
+    List.map2_exn logical_declarations logical_members ~f:(fun declaration member ->
+        let name = Proof_scopes.name declaration in
+        (name.pid_str, proof_member name.pid_str member))
   in
   let proof_members =
     List.concat_map predicate_members ~f:(fun (name, (member, parts)) ->
         List.map (member :: parts) ~f:(fun member -> (name, R.Member.callable member)))
-    @ List.map proof_lemma_members ~f:(fun (name, member) ->
-        (name, R.Member.callable member))
-    @ logical_members
+    @ proof_lemma_members @ logical_members
   in
   (* A proof member's callables: a predicate's come with its parts'. *)
   let members_named backend =
@@ -1090,8 +1096,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
       | `Pure_functions ->
           List.map (owned destination pure_funcs) ~f:(fun (_, member) ->
               R.Member.callable member)
-      | `Lemmas ->
-          List.map (emitted_proofs destination proof_lemma_members) ~f:R.Member.callable
+      | `Lemmas -> emitted_proofs destination proof_lemma_members
       | `Logical_functions -> emitted_proofs destination logical_members
       | `Procedures -> (
           List.map (owned destination procs) ~f:procedure_member

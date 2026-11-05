@@ -110,7 +110,8 @@ let declaration_shape declaration =
         false,
         lemma_body.proof_loc
         :: List.map (lemma_requires @ lemma_ensures @ lemma_variant) ~f:term )
-  | Proof_function { function_body; _ } -> ("function", false, [ term function_body ])
+  | Proof_function { function_body; function_variant; _ } ->
+      ("function", false, List.map (function_body :: function_variant) ~f:term)
   | Proof_invariant { inv_body; _ } -> ("invariant", false, [ term inv_body ])
   | Proof_view { view_value; _ } -> ("view", false, [ term view_value ])
   | Proof_action { action_consumes; action_update; action_helps; _ } ->

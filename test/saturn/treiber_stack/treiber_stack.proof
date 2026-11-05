@@ -28,3 +28,9 @@ proof r = atomic pop_as t backoff poly
 (* The recursive helper; the wrapper of the same name takes only [t]. *)
 
 proof pop_all t backoff = at (Atomic.get t) returning [] -> commit
+
+proof result = atomic push_all_ t backoff values
+  atomic requires (stack t xs)
+  atomic ensures (stack t (values @ xs)) = ()
+
+proof push_all = at (()) commit

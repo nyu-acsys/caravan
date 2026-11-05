@@ -132,7 +132,8 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   | Texp_construct ({ txt = Lident "false"; _ }, _, []) ->
       State.return ([], R.Expr.bool ~loc:l false)
   | Texp_construct ({ txt = Lident "()"; _ }, _, []) ->
-      State.return ([], unit_value ~loc:l)
+      let+ commit = unit_linearization ctx e in
+      (commit, unit_value ~loc:l)
   | Texp_construct (_, cstr, args) ->
       begin match
         occurrence_constructor ~environment:e.exp_env ctx.given.types e.exp_type cstr

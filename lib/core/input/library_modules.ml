@@ -14,6 +14,19 @@ type t = {
   projection : Subst.t;
 }
 
+let model_environment (source : Source.t) library environment =
+  match Source.library_model source library.library_path with
+  | None -> Ok environment
+  | Some model ->
+      let environment = Source.annotation_env source environment in
+      begin match Env.open_signature Asttypes.Override model environment with
+      | Ok environment -> Ok environment
+      | Error (`Not_found | `Functor) ->
+          Error
+            (Report.error Type library.library.scope.location
+               ("Cannot resolve the imported model of " ^ library.source_name))
+      end
+
 let environment (source : Source.t) library =
   let lexical =
     Option.value_map library.library.typed_signature ~default:source.env
@@ -30,12 +43,16 @@ let environment (source : Source.t) library =
     Env.add_module_declaration ~check:false root Mp_present declaration lexical
   in
   let lexical = Source.annotation_env source lexical in
-  match Env.open_signature Asttypes.Override library.library_path lexical with
-  | Ok environment -> Ok environment
-  | Error (`Not_found | `Functor) ->
-      Error
-        (Report.error Type library.library.scope.location
-           ("Cannot resolve imported module " ^ library.source_name))
+  let open_module path environment =
+    match Env.open_signature Asttypes.Override path environment with
+    | Ok environment -> Ok environment
+    | Error (`Not_found | `Functor) ->
+        Error
+          (Report.error Type library.library.scope.location
+             ("Cannot resolve imported module " ^ library.source_name))
+  in
+  let* environment = open_module library.library_path lexical in
+  model_environment source library environment
 
 (** Source declarations retain the compiler variables of parameterized abstract types. *)
 let abstract_types library =
@@ -47,8 +64,14 @@ let abstract_types library =
             "A library type other than an abstract type")
   |> Result.all
 
-let value library (value : Module_inventory.signature_value) =
-  { value with substitution = Subst.compose value.substitution library.projection }
+let value source library (value : Module_inventory.signature_value) =
+  let* environment = model_environment source library value.site.environment in
+  Ok
+    {
+      value with
+      site = { value.site with environment };
+      substitution = Subst.compose value.substitution library.projection;
+    }
 
 (** Imported contract references retain the identity of their source declaration. *)
 let value_paths library =

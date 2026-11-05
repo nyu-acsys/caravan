@@ -95,9 +95,9 @@ let source_dependencies (source : Source.t) =
   |> List.filter ~f:(fun file -> not (String.is_empty file))
   |> List.dedup_and_sort ~compare:String.compare
 
-let analyze ~include_dirs file =
+let analyze ?(check_standard_library = false) ~include_dirs file =
   let ( let* ) result f = Result.bind result ~f in
-  let* source = Source.load ~include_dirs file in
+  let* source = Source.load ~include_dirs ~check_standard_library file in
   let* scopes = Program_scopes.run source in
   Ok (source, scopes, Editor_annotations.collect scopes, Editor_members.collect scopes)
 
@@ -261,3 +261,29 @@ let file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout file =
     List.iter result.diagnostics ~f:Report.print_diagnostic;
     if result.verified then Logs.app (fun m -> m "Verification successful.");
     result.verified
+
+(** Checks the bundled mathematical models and lemmas against their imported contracts. *)
+let standard_library ?cache_dir ~history ~emit_rav ~smt_timeout () =
+  let file = "caravan/stdlib/check.ml" in
+  let prepared =
+    Result.bind
+      (analyze ~check_standard_library:true ~include_dirs:[] file)
+      ~f:(prepare_scopes ~history)
+  in
+  match prepared with
+  | Error error ->
+      Report.print error;
+      false
+  | Ok prepared ->
+      List.iter prepared.warnings ~f:Report.print_diagnostic;
+      if emit_rav then begin
+        Logs.app (fun m -> m "%a" R.Program.pr prepared.program);
+        true
+      end
+      else
+        let verified, diagnostics, _ =
+          verify ?cache_dir ~collect_members:false ~smt_timeout prepared
+        in
+        List.iter diagnostics ~f:Report.print_diagnostic;
+        if verified then Logs.app (fun m -> m "Verification successful.");
+        verified

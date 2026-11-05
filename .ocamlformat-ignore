@@ -1,6 +1,7 @@
-# Preserve upstream formatting in the Saturn queue sources.
+# Preserve upstream formatting in the Saturn sources.
 test/saturn/michael_scott_queue/michael_scott_queue.ml
 test/saturn/michael_scott_queue/michael_scott_queue.mli
 test/saturn/michael_scott_queue/michael_scott_queue_intf.mli
 test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
 test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli
+test/saturn/treiber_stack/treiber_stack.ml

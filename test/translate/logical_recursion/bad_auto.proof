@@ -1,0 +1,2 @@
+lemma [@auto] impossible (value : bool)
+  ensures (value === not value) = ()

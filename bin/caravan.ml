@@ -35,6 +35,10 @@ let emit_rav =
   let doc = "Print the Raven program generated for the files instead of verifying it." in
   Arg.(value & flag & info [ "emit-rav" ] ~doc)
 
+let check_stdlib =
+  let doc = "Verify the bundled standard-library mathematical models and lemmas." in
+  Arg.(value & flag & info [ "check-stdlib" ] ~doc)
+
 let manifest =
   let doc = "Print the tool version and compatibility information as JSON, then exit." in
   Arg.(value & flag & info [ "manifest" ] ~doc)
@@ -99,7 +103,8 @@ let print text =
   Protocol.app (fun m -> m "%s" text)
 
 let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_rav
-    manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout cache_dir files =
+    check_stdlib manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout
+    cache_dir files =
   if manifest then begin
     emit
       (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
@@ -109,6 +114,11 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
   end
   else if lsp_mode && emit_rav then begin
     Logs.err (fun m -> m "--lsp-mode and --emit-rav cannot be used together");
+    1
+  end
+  else if check_stdlib && (lsp_mode || files <> []) then begin
+    Logs.err (fun m ->
+        m "--check-stdlib cannot be combined with --lsp-mode or source files");
     1
   end
   else if lsp_annotations_only && not (lsp_mode && lsp_annotations) then begin
@@ -138,14 +148,23 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
     if List.for_all succeeded results then 0 else 1)
   else begin
     if not no_greeting then Logs.app (fun m -> m "%s" greeting);
-    (* Every file is checked, also after one that fails. *)
-    let results =
-      List.map
-        (Caravan_core.Check.file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout)
-        files
-    in
-    let verified = List.for_all Fun.id results in
-    if verified then 0 else 1
+    if check_stdlib then
+      begin if
+        Caravan_core.Check.standard_library ?cache_dir ~history ~emit_rav ~smt_timeout ()
+      then 0
+      else 1
+      end
+    else begin
+      (* Every file is checked, also after one that fails. *)
+      let results =
+        List.map
+          (Caravan_core.Check.file ?cache_dir ~include_dirs ~history ~emit_rav
+             ~smt_timeout)
+          files
+      in
+      let verified = List.for_all Fun.id results in
+      if verified then 0 else 1
+    end
   end
 
 let cmd ?emit ?on_progress () =
@@ -153,8 +172,9 @@ let cmd ?emit ?on_progress () =
   Cmd.v info
     Term.(
       const (main ?emit ?on_progress)
-      $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ manifest $ lsp_mode
-      $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ cache_dir $ files)
+      $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ check_stdlib $ manifest
+      $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ cache_dir
+      $ files)
 
 let serve defaults =
   Logs.set_reporter (Logs_fmt.reporter ());

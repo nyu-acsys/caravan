@@ -269,6 +269,25 @@ let check_interface env signature interface =
         in
         Error (Report.error Type loc (Stdlib.Printexc.to_string exn)))
 
+(** The proof source, parsed with its original locations. *)
+let parse_proof ~file text : (S.proof_file, Report.error) Result.t =
+  let lexbuf = Lexing.from_string text in
+  Location.init lexbuf file;
+  let lexeme_loc () =
+    {
+      Location.loc_start = Lexing.lexeme_start_p lexbuf;
+      loc_end = Lexing.lexeme_end_p lexbuf;
+      loc_ghost = false;
+    }
+  in
+  try Ok (Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token lexbuf) with
+  | Caravan_spec.Spec_lexer.Error (loc, message) ->
+      Error (Report.error Syntax loc message)
+  | Caravan_spec.Spec_parser.Error ->
+      Error (Report.error Syntax (lexeme_loc ()) "Syntax error")
+
+let load_proof file = parse_proof ~file (Stdio.In_channel.read_all file)
+
 (** Parsed sources are reusable; typed signatures belong to each compiler environment. *)
 let standard_interface_sources =
   lazy
@@ -277,7 +296,7 @@ let standard_interface_sources =
          (name, parse_interface ~file text)))
 
 (** Trusted contract subsets checked against the compiler's actual standard library. *)
-let standard_interfaces env =
+let standard_interfaces ?(check_proofs = false) env =
   List.map (Lazy.force standard_interface_sources) ~f:(fun (name, library) ->
       let path, _ =
         Env.find_module_by_name
@@ -303,11 +322,36 @@ let standard_interfaces env =
                  ("The standard library module " ^ name ^ " has no signature"))
       in
       let* library = check_interface env actual library in
+      let* library_proof =
+        match List.Assoc.find Stdlib_sources.proofs name ~equal:String.equal with
+        | None -> Ok None
+        | Some proof_text ->
+            let proof_file = "caravan/stdlib/" ^ String.uncapitalize name ^ ".proof" in
+            let* proof = parse_proof ~file:proof_file proof_text in
+            let* () =
+              match proof.outlines with
+              | [] -> Ok ()
+              | outline :: _ ->
+                  Report.unsupported outline.outline_loc
+                    "An implementation outline in a standard-library proof"
+            in
+            Ok
+              (Some
+                 {
+                   proof_module = name;
+                   proof_owner = None;
+                   proof_file;
+                   proof_text;
+                   proof_declarations = proof.declarations;
+                   proof_checked = check_proofs;
+                 })
+      in
       Ok
         {
           library_name = "Caravan_stdlib_" ^ String.uncapitalize name;
           library_id;
           library;
+          library_proof;
         })
   |> Result.all
 
@@ -434,22 +478,6 @@ let specialize_to_interface _env (typed : Typedtree.structure)
       Option.iter interface.typed_signature ~f:(fun declared ->
           structure declared.sig_final_env Subst.identity typed declared.sig_type))
 
-(** The declarations of the proof in [file]. *)
-let load_proof file : (S.proof_file, Report.error) Result.t =
-  let lexbuf = lexbuf_of file in
-  let lexeme_loc () =
-    {
-      Location.loc_start = Lexing.lexeme_start_p lexbuf;
-      loc_end = Lexing.lexeme_end_p lexbuf;
-      loc_ghost = false;
-    }
-  in
-  try Ok (Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token lexbuf) with
-  | Caravan_spec.Spec_lexer.Error (loc, message) ->
-      Error (Report.error Syntax loc message)
-  | Caravan_spec.Spec_parser.Error ->
-      Error (Report.error Syntax (lexeme_loc ()) "Syntax error")
-
 (** The interfaces without an implementation next to them in [file]'s directory, then in
     [include_dirs] in order, each the first of its module's name; not [file]'s own. *)
 let library_files ~include_dirs file =
@@ -473,10 +501,152 @@ let library_files ~include_dirs file =
   |> List.stable_dedup ~compare:(fun f g ->
       String.compare Stdlib.Filename.(basename f) Stdlib.Filename.(basename g))
 
+(** Imported mathematical declarations extend annotation environments only. *)
+let library_proof_scopes ~runtime_env env libraries =
+  let* env, model_id, model_declaration =
+    let name = "Stdlib_model" in
+    let* () =
+      try
+        let _, declaration = Env.find_module_by_name (Lident name) env in
+        Error
+          (Report.error Type declaration.md_loc
+             ("The module " ^ name ^ " is reserved for specifications"))
+      with Stdlib.Not_found -> Ok ()
+    in
+    let declaration =
+      Ast_helper.Sig.module_
+        (Ast_helper.Md.mk (Location.mknoloc (Some name)) (Ast_helper.Mty.signature []))
+    in
+    let typed = Typemod.type_interface env [ declaration ] in
+    match typed.sig_type with
+    | [ Types.Sig_module (id, _, declaration, _, _) ] ->
+        Ok (typed.sig_final_env, id, declaration)
+    | _ ->
+        Error
+          (Report.error Type Location.none "Cannot create the library model namespace")
+  in
+  let* env, scopes, entries, _, libraries =
+    List.fold_result libraries ~init:(env, [], [], [], [])
+      ~f:(fun (env, scopes, entries, model_members, imported) library ->
+        match library.library_proof with
+        | None -> Ok (env, scopes, entries, model_members, library :: imported)
+        | Some proof ->
+            let* () =
+              Result.all_unit
+                (List.map proof.proof_declarations ~f:(function
+                  | S.Proof_function _ | Proof_lemma _ -> Ok ()
+                  | declaration ->
+                      Report.unsupported (Proof_scopes.name declaration).pid_loc
+                        "A declaration other than a function or lemma in a library proof"))
+            in
+            let library_path = Path.Pident library.library_id in
+            let declaration = Env.find_module library_path env in
+            let lexical =
+              Option.value_map library.library.typed_signature ~default:env
+                ~f:(fun signature -> signature.Typedtree.sig_final_env)
+            in
+            let lexical =
+              Env.add_module_declaration ~check:false library.library_id Mp_present
+                declaration lexical
+              |> add_spec_bindings (specification_bindings runtime_env env)
+            in
+            let* lexical =
+              match Env.open_signature Asttypes.Override library_path lexical with
+              | Ok lexical -> Ok lexical
+              | Error (`Not_found | `Functor) ->
+                  Error
+                    (Report.error Type library.library.scope.location
+                       "Cannot resolve the library proof's module")
+            in
+            let* proof_env, _, _, _, _ =
+              Proof_types.elaborate_proof_types ~add_standard:false lexical None
+                proof.proof_declarations
+            in
+            let bindings = specification_bindings lexical proof_env in
+            let member_id = Ident.create_local proof.proof_module in
+            let owner = Path.Pdot (Pident model_id, proof.proof_module) in
+            let location = Location.in_file proof.proof_file in
+            let stop =
+              {
+                location.loc_end with
+                pos_cnum = String.length proof.proof_text;
+                pos_lnum = 1 + String.count proof.proof_text ~f:(Char.equal '\n');
+                pos_bol =
+                  Option.value_map
+                    (String.rfindi proof.proof_text ~f:(fun _ c -> Char.equal c '\n'))
+                    ~default:0 ~f:(( + ) 1);
+              }
+            in
+            let location = { location with loc_end = stop } in
+            let model_members =
+              model_members
+              @ [
+                  Types.Sig_module
+                    ( member_id,
+                      Mp_present,
+                      {
+                        model_declaration with
+                        md_type = Mty_signature bindings;
+                        md_loc = location;
+                      },
+                      Trec_not,
+                      Exported );
+                ]
+            in
+            let env =
+              Env.add_module_declaration ~check:false model_id Mp_present
+                { model_declaration with md_type = Mty_signature model_members }
+                env
+            in
+            let structure, _, _, _, _ = Typemod.type_structure proof_env [] in
+            let scope =
+              Proof_scopes.
+                {
+                  owner = Some owner;
+                  declaration_id = Some member_id;
+                  namespace = [ library.library_name ];
+                  parent = None;
+                  environment = proof_env;
+                  parameters = [];
+                  structure;
+                  public_type = None;
+                  sealed = false;
+                  definition = None;
+                  source_location = location;
+                  proof_location = Some location;
+                }
+            in
+            let additions =
+              List.map proof.proof_declarations ~f:(fun declaration ->
+                  let member = Proof_scopes.name declaration in
+                  Proof_scopes.
+                    {
+                      id = Ident.create_local member.pid_str;
+                      name = member;
+                      declaration;
+                      scope;
+                    })
+            in
+            let library =
+              {
+                library with
+                library_proof = Some { proof with proof_owner = Some owner };
+              }
+            in
+            Ok
+              ( env,
+                scopes @ [ scope ],
+                entries @ additions,
+                model_members,
+                library :: imported ))
+  in
+  Ok (env, scopes, entries, List.rev libraries)
+
 (** Parses and type-checks [file], in the environment of the standard library and the
     libraries in its directory and [include_dirs]. The front end reports errors by
     raising; they are returned here. *)
-let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
+let load ?(include_dirs = []) ?(check_standard_library = false) (file : string) :
+    (t, Report.error) Result.t =
   try
     let standard_library =
       let root = Stdlib.Filename.(dirname (dirname Stdlib.Sys.executable_name)) in
@@ -490,9 +660,13 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
-    let* standard_libraries = standard_interfaces env in
+    let* standard_libraries =
+      standard_interfaces ~check_proofs:check_standard_library env
+    in
     let libraries =
-      List.map (library_files ~include_dirs file) ~f:(fun file ->
+      List.map
+        (if check_standard_library then [] else library_files ~include_dirs file)
+        ~f:(fun file ->
           ( String.capitalize Stdlib.Filename.(remove_extension (basename file)),
             load_interface file ))
     in
@@ -525,10 +699,11 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
             | _ -> (Ident.create_local library_name, None)
           in
           let library = { library with typed_signature } in
-          (typed.sig_final_env, { library_name; library_id; library } :: libraries))
+          ( typed.sig_final_env,
+            { library_name; library_id; library; library_proof = None } :: libraries ))
     in
     let libraries = standard_libraries @ List.rev libraries in
-    let text = Stdio.In_channel.read_all file in
+    let text = if check_standard_library then "" else Stdio.In_channel.read_all file in
     let lexbuf = Lexing.from_string text in
     Location.init lexbuf file;
     Location.input_name := file;
@@ -542,7 +717,10 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     let interface_env = env in
     let typed, signature, _, _, env = Typemod.type_structure env parsed in
     let runtime_env = env in
-    let interface = Option.map (sibling file ".mli") ~f:load_interface in
+    let interface =
+      if check_standard_library then None
+      else Option.map (sibling file ".mli") ~f:load_interface
+    in
     let* interface =
       match interface with
       | None -> Ok None
@@ -602,7 +780,7 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
           interface.interface_comments)
       @ List.concat_map libraries ~f:(fun library -> library.library.interface_comments)
     in
-    let proof_file = sibling file ".proof" in
+    let proof_file = if check_standard_library then None else sibling file ".proof" in
     let proof =
       Option.value_map proof_file
         ~default:(Ok { S.declarations = []; outlines = [] })
@@ -625,6 +803,9 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
         in
         let* env, imported_resources =
           Proof_types.imported_proof_resources env libraries
+        in
+        let* env, imported_scopes, imported_entries, libraries =
+          library_proof_scopes ~runtime_env env libraries
         in
         let prepare_definition (root_env, resources) parent module_name module_interface =
           let declaration =
@@ -699,6 +880,13 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
         let* (env, definitions), proof_scopes =
           Proof_scopes.resolve_prepared ~location:scope.location ~environment:env
             ~state:(env, imported_resources) ~prepare_definition typed proof
+        in
+        let proof_scopes =
+          {
+            proof_scopes with
+            scopes = imported_scopes @ proof_scopes.scopes;
+            declarations = imported_entries @ proof_scopes.declarations;
+          }
         in
         let applications = Functor_context.collect proof_scopes in
         let merge_resources existing additions =
@@ -1763,7 +1951,15 @@ let infer_ghost_bindings ?(flexible = []) env ~at ~parameters ~variables ~constr
             List.zip_exn flexible solved_flexible )
 
 let check_logical_function env ~functions = function
-  | S.Proof_function { function_params; function_result; function_body; function_name } ->
+  | S.Proof_function
+      {
+        function_params;
+        function_result;
+        function_body;
+        function_name;
+        function_variant;
+        _;
+      } ->
       let* types =
         ocaml_types env ~at:function_name.pid_loc
           (List.map function_params ~f:snd @ [ function_result ])
@@ -1773,7 +1969,13 @@ let check_logical_function env ~functions = function
         List.map2_exn function_params inputs ~f:(fun (id, _) typ -> (id.S.pid_str, typ))
       in
       let expected = List.hd_exn outputs in
-      check_logical_expression env ~functions ~variables ~expected function_body
+      let* () =
+        check_logical_expression env ~functions ~variables ~expected function_body
+      in
+      Result.all_unit
+        (List.map function_variant ~f:(fun measure ->
+             Result.map (infer_logical_expression env ~functions ~variables measure)
+               ~f:(fun _ -> ())))
   | _ -> Ok ()
 
 (** Compiler paths retain the identity selected by lexical module aliases. *)

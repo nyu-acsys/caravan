@@ -1767,13 +1767,46 @@ let step_end (e : Typedtree.expression) =
     it, as [Atomic.get t (*@ commit *)]. *)
 let linearization ctx (e : Typedtree.expression) =
   match
-    List.find ctx.given.linearizations ~f:(fun (anchor, _) -> anchor = step_end e)
+    List.find ctx.given.linearizations ~f:(fun ((first, last), _) ->
+        first = e.exp_loc.loc_start.pos_cnum && last = e.exp_loc.loc_end.pos_cnum)
   with
   | None -> Ok None
   | Some (_, a) when ctx.given.manual ->
       error a.loc
         "Automatic linearization annotations cannot be used in a manual function proof"
   | Some (_, a) -> Result.map (Annotation.linearization a) ~f:Option.some
+
+(** A unit expression can commit an update by returning its abstract resources unchanged.
+*)
+let unit_linearization ctx (expression : Typedtree.expression) =
+  let open State.Syntax in
+  let at = expression.exp_loc in
+  let* annotation = State.of_result (linearization ctx expression) in
+  match annotation with
+  | None -> State.return []
+  | Some S.Commit ->
+      let* update = open_update ctx in
+      begin match update with
+      | Some (au, { au_state = Pending; _ })
+        when (not au.has_result) && List.is_empty au.ghost_results ->
+          let* commit =
+            au.commit_only ~unfold:false ~at ~value:(R.Expr.tuple ~loc:(loc at) [])
+          in
+          let+ () =
+            modify_au (fun path -> { path with au_state = Committed; au_step = at })
+          in
+          [ R.Stmt.atomic_block ~loc:(loc at) commit ]
+      | Some (au, _) when au.has_result || not (List.is_empty au.ghost_results) ->
+          State.of_result
+            (error at "A unit step can only commit an atomic function without results")
+      | Some _ ->
+          State.of_result
+            (error at "This unit step has no pending atomic update to commit")
+      | None ->
+          State.of_result (error at "A unit commit needs an atomic function contract")
+      end
+  | Some _ ->
+      State.of_result (error at "A unit expression supports only a commit annotation")
 
 (** The statements committing the open update [au], opened by the step at [step], of a
     function that linearized: at once if it has no result, and otherwise at the end of the
@@ -1891,7 +1924,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
     match o with
     | Commits_with t ->
         let* v = commit_value env ~at t in
-        let* commit = au.commit_only ~at ~value:v in
+        let* commit = au.commit_only ~unfold:true ~at ~value:v in
         let* fold = use_invariants ctx ~at ~fold:true in
         let+ () = modify_path (fun path -> { path with snapshots }) in
         commit @ fold @ ends registrations false
@@ -2142,7 +2175,7 @@ let collect ctx (au : au) (r : registered) ~(at : Location.t) ~value (p : S.pat)
   let open State.Syntax in
   let l = loc at in
   let* matches, result = collected_terms ctx p value result in
-  let* commit = au.commit_only ~at ~value:result in
+  let* commit = au.commit_only ~unfold:true ~at ~value:result in
   let commit =
     match matches with Some c -> [ R.Stmt.if_ ~loc:l c commit [] ] | None -> commit
   in

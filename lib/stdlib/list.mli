@@ -2,10 +2,8 @@
 
 val rev : 'a list -> 'a list
 (*@ result = rev xs pure
-    ensures result === (match xs with
-      | [] -> []
-      | head :: tail -> rev tail @ [head]) *)
+    ensures result === reverse xs *)
 
 val rev_append : 'a list -> 'a list -> 'a list
 (*@ result = rev_append xs ys pure
-    ensures result === rev xs @ ys *)
+    ensures result === reverse xs @ ys *)

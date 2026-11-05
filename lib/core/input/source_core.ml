@@ -13,7 +13,21 @@ type interface = {
   scope : Declaration_scope.t;
 }
 
-type library = { library_name : string; library_id : Ident.t; library : interface }
+type library_proof = {
+  proof_module : string;
+  proof_owner : Path.t option;
+  proof_file : string;
+  proof_text : string;
+  proof_declarations : S.proof_decl list;
+  proof_checked : bool;
+}
+
+type library = {
+  library_name : string;
+  library_id : Ident.t;
+  library : interface;
+  library_proof : library_proof option;
+}
 (** A library that the file uses, which an interface [m.mli] without an implementation
     next to it declares: the module [M], trusted. *)
 
@@ -124,6 +138,24 @@ type t = {
   libraries : library list;
   spec_bindings : Types.signature;
 }
+
+let library_proof_for_owner source owner =
+  Option.bind owner ~f:(fun owner ->
+      List.find_map source.libraries ~f:(fun library ->
+          Option.bind library.library_proof ~f:(fun proof ->
+              Option.some_if
+                (Option.exists proof.proof_owner ~f:(Path.same owner))
+                (library, proof))))
+
+let trusted_proof source owner =
+  Option.exists (library_proof_for_owner source owner) ~f:(fun (_, proof) ->
+      not proof.proof_checked)
+
+let library_model source path =
+  List.find_map source.libraries ~f:(fun library ->
+      if Path.same path (Path.Pident library.library_id) then
+        Option.bind library.library_proof ~f:(fun proof -> proof.proof_owner)
+      else None)
 
 (** The annotations of the implementation: its own, or those of its proof outlines. *)
 let annotations source =

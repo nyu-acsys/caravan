@@ -1,0 +1,1 @@
+let rec infinite (value : int) : int = infinite value

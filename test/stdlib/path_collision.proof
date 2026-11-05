@@ -1,0 +1,5 @@
+lemma forged_scalar (ignored : unit)
+  ensures (false) = ()
+
+lemma forged_polymorphic (value : 'a)
+  ensures (false) = ()

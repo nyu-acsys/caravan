@@ -1,0 +1,5 @@
+predicate cell (c : 'a t) (value [@implicit] : 'a) = own c value
+
+proof skip = at (()) commit
+
+proof set_unit = at (Atomic.set cell ()) commit
