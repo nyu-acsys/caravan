@@ -1,0 +1,6 @@
+proof result = choose cell witness
+  requires (true)
+  ensures (true) =
+  on return match witness with
+  | Ref -> assert (result === result)
+  | Number -> ()

@@ -1594,22 +1594,20 @@ let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) 
         in
         (* Inference placeholders share the scope of the rigid source variables. *)
         let rec freeze typ =
-          if List.is_empty substitutions then typ
-          else
-            match
-              List.find substitutions ~f:(fun (variable, _, _) ->
-                  Types.eq_type variable typ)
-            with
-            | Some (_, _, frozen) -> frozen
-            | None ->
-                begin match Types.get_desc typ with
-                | Tvar _ ->
-                    Option.value
-                      (List.Assoc.find placeholders typ ~equal:Types.eq_type)
-                      ~default:typ
-                | Tunivar _ -> typ
-                | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
-                end
+          match
+            List.find substitutions ~f:(fun (variable, _, _) ->
+                Types.eq_type variable typ)
+          with
+          | Some (_, _, frozen) -> frozen
+          | None ->
+              begin match Types.get_desc typ with
+              | Tvar _ ->
+                  Option.value
+                    (List.Assoc.find placeholders typ ~equal:Types.eq_type)
+                    ~default:typ
+              | Tunivar _ -> typ
+              | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
+              end
         in
         let env, annotation_aliases =
           List.fold type_variables ~init:(env, [])

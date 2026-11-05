@@ -333,28 +333,7 @@ let implementation_projection (application : Module_inventory.specialization) pa
         substitution)
 
 let function_id plan ?(instance = plan.group.Generic_modules.representative) path =
-  let originals = Module_inventory.function_members plan.scope.structure in
-  let original =
-    match path with
-    | Path.Pident id ->
-        List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)
-    | _ ->
-        Option.bind (Source.scoped_value_name plan.scope path) ~f:(fun name ->
-            let bindings =
-              List.concat_map plan.scope.structure.str_items ~f:(fun item ->
-                  match item.Typedtree.str_desc with
-                  | Tstr_value (_, bindings) -> bindings
-                  | _ -> [])
-            in
-            let id =
-              List.find_map (List.rev bindings) ~f:(fun binding ->
-                  match binding.Typedtree.vb_pat.pat_desc with
-                  | Tpat_var (id, _, _) when String.equal name (Ident.name id) -> Some id
-                  | _ -> None)
-            in
-            Option.bind id ~f:(fun id ->
-                List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)))
-  in
+  let original = Module_inventory.function_member plan.scope path in
   Option.bind original ~f:(fun (key, _) ->
       List.Assoc.find instance.body_members key ~equal:String.equal)
 
@@ -495,11 +474,14 @@ let applications (source : Source.t) (inventory : Module_inventory.t)
   in
   Ok (List.concat views)
 
-let model_types source inventory plans =
+let model_types ?(representation = fun _ _ -> None) source inventory plans =
   List.concat_map plans ~f:(fun plan ->
       let symbolic =
-        symbolic_models source plan
-          ~owner:(String.split plan.group.name ~on:'.' @ [ "Layout" ])
+        List.map (models source plan) ~f:(fun data ->
+            Option.value (representation plan data)
+              ~default:
+                (model_descriptor data
+                   ~owner:(String.split plan.group.name ~on:'.' @ [ "Layout" ])))
       in
       let concrete =
         List.concat_map plan.group.applications ~f:(fun instance ->
@@ -549,7 +531,8 @@ let model_types source inventory plans =
                           (rest, { ctor with args }))
                     in
                     let representation =
-                      model_descriptor data ~owner:[ canonical.layout ]
+                      Option.value (representation plan data)
+                        ~default:(model_descriptor data ~owner:[ canonical.layout ])
                     in
                     let paths =
                       Option.value_map data.id ~default:[] ~f:(fun id ->
@@ -558,7 +541,22 @@ let model_types source inventory plans =
                             Path.Pdot (instance.source.identity, Ident.name id);
                           ])
                     in
-                    { representation with id = None; paths; parameters; alias; ctors })))
+                    let family =
+                      Option.map representation.family
+                        ~f:
+                          (Generic_assets.rebase_family
+                             ~namespace:(String.split canonical.name ~on:'.')
+                             ~scope:(Qualified_name.of_string canonical.name).path)
+                    in
+                    {
+                      representation with
+                      id = None;
+                      paths;
+                      parameters;
+                      alias;
+                      ctors;
+                      family;
+                    })))
       in
       symbolic @ concrete)
 

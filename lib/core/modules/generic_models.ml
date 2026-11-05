@@ -52,6 +52,7 @@ let decorate plan data =
           member = worker.member ^ ".T";
           dictionary = "Values$" ^ worker.member;
           scope = (Qualified_name.of_string worker_name).path;
+          argument_projection = None;
         };
   }
 

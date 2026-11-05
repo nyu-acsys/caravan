@@ -190,9 +190,9 @@ A binding inside a nested block does not escape its lexical scope.
 A match expression in a lemma must handle every reachable case.
 
   $ caravan --shh lemmas_partial_match.ml
-  [Error] File "lemmas_partial_match.proof", line 2, columns 2-34:
+  [Error] File "lemmas_partial_match.proof", line 2, columns 15-25:
   2 |   match x with Some value -> value
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     ^^^^^^^^^^
   Verification Error: This match may not be exhaustive.
   [1]
 

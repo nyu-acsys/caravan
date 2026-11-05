@@ -48,3 +48,52 @@ let mutable_payload () =
   | Some result ->
       assert (result == value);
       assert (!result = 7)
+
+let peek_and_remove () =
+  let q = Michael_scott_queue_lseg.of_list [ 17; 23; 42 ] in
+  assert (Michael_scott_queue_lseg.peek_opt q = Some 17);
+  assert (Michael_scott_queue_lseg.peek_exn q = 17);
+  assert (Michael_scott_queue_lseg.pop_exn q = 17);
+  assert (Michael_scott_queue_lseg.peek_opt q = Some 23);
+  Michael_scott_queue_lseg.drop_exn q;
+  assert (Michael_scott_queue_lseg.peek_exn q = 42);
+  assert (Michael_scott_queue_lseg.pop_exn q = 42);
+  assert (Michael_scott_queue_lseg.peek_opt q = None);
+  assert (Michael_scott_queue_lseg.is_empty q)
+
+let empty_exceptions () =
+  let q : int Michael_scott_queue_lseg.t = Michael_scott_queue_lseg.create () in
+  begin match Michael_scott_queue_lseg.peek_exn q with
+  | _ -> assert false
+  | exception Michael_scott_queue_lseg.Empty -> ()
+  end;
+  begin match Michael_scott_queue_lseg.pop_exn q with
+  | _ -> assert false
+  | exception Michael_scott_queue_lseg.Empty -> ()
+  end;
+  begin match Michael_scott_queue_lseg.drop_exn q with
+  | _ -> assert false
+  | exception Michael_scott_queue_lseg.Empty -> ()
+  end;
+  assert (Michael_scott_queue_lseg.peek_opt q = None);
+  Michael_scott_queue_lseg.push q 7;
+  assert (Michael_scott_queue_lseg.pop_exn q = 7);
+  assert (Michael_scott_queue_lseg.is_empty q)
+
+let mutable_peek_payload () =
+  let first = ref 7 in
+  let second = ref 23 in
+  let q = Michael_scott_queue_lseg.of_list [ first; second ] in
+  begin match Michael_scott_queue_lseg.peek_opt q with
+  | None -> assert false
+  | Some result -> assert (result == first)
+  end;
+  let peeked = Michael_scott_queue_lseg.peek_exn q in
+  assert (peeked == first);
+  peeked := 11;
+  let popped = Michael_scott_queue_lseg.pop_exn q in
+  assert (popped == first);
+  assert (!popped = 11);
+  assert (Michael_scott_queue_lseg.peek_exn q == second);
+  Michael_scott_queue_lseg.drop_exn q;
+  assert (Michael_scott_queue_lseg.is_empty q)

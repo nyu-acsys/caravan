@@ -346,6 +346,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 ("committed", token :: (args @ [ result ]), Predef.type_bool);
                 ("abort", token :: args, Predef.type_unit);
                 ("commit", token :: (args @ [ result ]), Predef.type_unit);
+                ("commit_raise", token :: (args @ [ Predef.type_exn ]), Predef.type_unit);
+                ("raised", token :: (args @ [ Predef.type_exn ]), Predef.type_bool);
               ]
             in
             let env =

@@ -8,6 +8,12 @@ let sources =
     ("michael_scott_queue/michael_scott_queue.mli", "03b452397d50b26d0cd1395328ff3484");
     ( "michael_scott_queue/michael_scott_queue_intf.mli",
       "1ae5fc2cd8772b89f798abbcd6af52c4" );
+    ( "michael_scott_queue_lseg/michael_scott_queue_lseg.ml",
+      "44f261d5d6d292d459bf2565a3373d02" );
+    ( "michael_scott_queue_lseg/michael_scott_queue_lseg.mli",
+      "03b452397d50b26d0cd1395328ff3484" );
+    ( "michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli",
+      "1ae5fc2cd8772b89f798abbcd6af52c4" );
     ("treiber_stack/treiber_stack.ml", "4cb46bd94b98e275e25c9cffcc159cc9");
     ("treiber_stack/treiber_stack.mli", "8fce1984f67b2eb286143e8ebf3ea2fd");
   ]
@@ -64,6 +70,14 @@ let strip_annotations text =
   Buffer.add_substring buffer text ~pos:final ~len:(length - final);
   Buffer.contents buffer
 
+let normalize_module_name name source =
+  if String.equal name "michael_scott_queue_lseg/michael_scott_queue_lseg.mli" then
+    let suffix = "include Michael_scott_queue_lseg_intf.MS_QUEUE\n" in
+    match String.chop_suffix source ~suffix with
+    | Some prefix -> prefix ^ "include Michael_scott_queue_intf.MS_QUEUE\n"
+    | None -> source
+  else source
+
 let () =
   List.iter sources ~f:(fun (name, expected) ->
       let path = "../saturn/" ^ name in
@@ -71,6 +85,7 @@ let () =
       let source =
         if String.is_suffix name ~suffix:".ml" then source else strip_annotations source
       in
+      let source = normalize_module_name name source in
       let actual = Stdlib.Digest.(to_hex (string source)) in
       if not (String.equal expected actual) then
         failwith

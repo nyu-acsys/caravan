@@ -454,10 +454,23 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                     ~f:(fun _ -> ())))
          ~f:(fun _ -> ()))
   in
+  let model_families =
+    List.filter types ~f:(fun data ->
+        (not (List.is_empty data.Datatypes.ctors))
+        && Option.exists data.family ~f:(fun family ->
+            List.exists generic_model_workers ~f:(fun (worker, _) ->
+                String.equal family.Datatypes.worker worker.Generic_parameters.name)))
+    |> List.fold
+         ~init:(Set.empty (module String), [])
+         ~f:(fun (seen, models) data ->
+           let key = Generic_models.name data in
+           if Set.mem seen key then (seen, models) else (Set.add seen key, data :: models))
+    |> snd |> List.rev
+  in
   let* (), state =
     State.run_from state
       (State.map
-         (State.all types ~f:(fun data ->
+         (State.all model_families ~f:(fun data ->
               match data.Datatypes.family with
               | Some _ when not (List.is_empty data.ctors) ->
                   let worker = Generic_models.worker data in
@@ -632,6 +645,39 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
       ~additional:(Generic_proofs.layout_dependencies generic_proofs)
       layouts request.domain_types request.domain_type
   in
+  let _, family_types =
+    List.fold types
+      ~init:(Set.empty (module String), [])
+      ~f:(fun (seen, families) data ->
+        let name = Datatypes.value_family_name data in
+        let generic_model =
+          List.exists generic_proofs ~f:(fun plan ->
+              List.exists (Generic_proofs.models source plan) ~f:(fun model ->
+                  Poly.equal model.Datatypes.at data.Datatypes.at))
+        in
+        if
+          generic_model
+          || (not (Datatypes.is_value_family data))
+          || Option.value_map data.module_path ~default:false ~f:(fun path ->
+              List.length path <> 1)
+          || Set.mem seen name
+        then (seen, families)
+        else (Set.add seen name, data :: families))
+  in
+  let* value_family_parts =
+    all (List.rev family_types) ~f:(Datatypes.value_family_members types)
+  in
+  let* witness_parts =
+    all
+      (List.filter types ~f:(fun data -> Option.is_some data.Datatypes.witness))
+      ~f:(Witnesses.members types)
+  in
+  let value_family_parts = value_family_parts @ witness_parts in
+  let value_factory_templates = List.concat_map value_family_parts ~f:snd in
+  let value_factory_names =
+    List.concat_map value_family_parts ~f:(fun (members, _) -> List.map members ~f:fst)
+    |> Set.of_list (module String)
+  in
   let* domain_groups =
     let* registered =
       all registered_domains ~f:(fun request ->
@@ -659,8 +705,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     in
     Ok (registered @ arguments @ fields)
   in
+  (* Factory prerequisites retain their declaration order. *)
   let value_domains =
     Datatypes.unique_domain_members (List.concat_map domain_groups ~f:snd)
+    |> List.filter ~f:(fun (name, _) -> not (Set.mem value_factory_names name))
   in
   let ordinary_value_templates =
     List.concat_map registered_domains ~f:(fun request ->
@@ -1160,35 +1208,6 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
              Module_context.Flat ~at:l ~representations:[] ~native_resources:[]
              ~applications:[] ~late_members:members))
   in
-  let _, family_types =
-    List.fold types
-      ~init:(Set.empty (module String), [])
-      ~f:(fun (seen, families) data ->
-        let name = Datatypes.value_family_name data in
-        let generic_model =
-          List.exists generic_proofs ~f:(fun plan ->
-              List.exists (Generic_proofs.models source plan) ~f:(fun model ->
-                  Poly.equal model.Datatypes.at data.Datatypes.at))
-        in
-        if
-          generic_model
-          || (not (Datatypes.is_value_family data))
-          || Option.value_map data.module_path ~default:false ~f:(fun path ->
-              List.length path <> 1)
-          || Set.mem seen name
-        then (seen, families)
-        else (Set.add seen name, data :: families))
-  in
-  let* value_family_parts =
-    all (List.rev family_types) ~f:(Datatypes.value_family_members types)
-  in
-  let* witness_parts =
-    all
-      (List.filter types ~f:(fun data -> Option.is_some data.Datatypes.witness))
-      ~f:(Witnesses.members types)
-  in
-  let value_family_parts = value_family_parts @ witness_parts in
-  let value_factory_templates = List.concat_map value_family_parts ~f:snd in
   let dictionary_for ~at binding id =
     let concrete = checked_raw_types types binding in
     Report.expect ~at
@@ -1267,7 +1286,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             in
             let model_types =
               Option.value_map proof_plan ~default:[] ~f:(fun plan ->
-                  Generic_proofs.symbolic_models source plan ~owner:[ world; "Shape" ])
+                  Generic_proofs.symbolic_models source plan ~owner:[ world; "Shape" ]
+                  |> List.filter ~f:(fun data ->
+                      not (Generic_models.dependent types data)))
             in
             let parameter_types =
               Option.value_map proof_plan ~default:[] ~f:(fun plan ->

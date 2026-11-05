@@ -108,6 +108,32 @@ let function_members (body : Typedtree.structure) =
   iterator.structure iterator body;
   List.rev !found
 
+(** The stable body-member key of a value in its original implementation scope. *)
+let function_member (scope : Proof_scopes.scope) path =
+  let originals = function_members scope.structure in
+  let original =
+    match path with
+    | Path.Pident id ->
+        List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)
+    | _ ->
+        Option.bind (Source.scoped_value_name scope path) ~f:(fun name ->
+            let bindings =
+              List.concat_map scope.structure.str_items ~f:(fun item ->
+                  match item.Typedtree.str_desc with
+                  | Tstr_value (_, bindings) -> bindings
+                  | _ -> [])
+            in
+            let id =
+              List.find_map (List.rev bindings) ~f:(fun binding ->
+                  match binding.Typedtree.vb_pat.pat_desc with
+                  | Tpat_var (id, _, _) when String.equal name (Ident.name id) -> Some id
+                  | _ -> None)
+            in
+            Option.bind id ~f:(fun id ->
+                List.find originals ~f:(fun (_, candidate) -> Ident.same id candidate)))
+  in
+  original
+
 let proof_scope_matches (application : specialization) (scope : Proof_scopes.scope) =
   match application.context with
   | Some context -> Functor_context.same_scope scope context.scope

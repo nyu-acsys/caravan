@@ -307,6 +307,14 @@ let refinement (witness : Datatypes.witness) arguments ctor =
       | _ -> None)
   |> List.unzip
 
+(** Applies only the type equalities established by a witness case, including nested
+    occurrences such as the indices of nominal AU tokens. *)
+let rec refined_type aliases typ =
+  let typ = Datatypes.expand aliases typ in
+  match Types.get_desc typ with
+  | Tvar _ | Tunivar _ -> typ
+  | desc -> Ctype.newty (Btype.copy_type_desc (refined_type aliases) desc)
+
 (** For a contract's case for the constructor [ctor] of a match on a value of the witness
     type [scrutinee], in the worker [current]: the abbreviations there, and the variables
     of [var_types] whose types it refines, each with the conversion that reads it at the

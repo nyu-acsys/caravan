@@ -619,6 +619,19 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
             (List.map cases ~f:(fun (p, body) ->
                  let* () = pattern p in
                  let* variables = bind_pattern variables p typ in
+                 let aliases =
+                   match (typ, p.pat_desc) with
+                   | Some scrutinee, Pconstr ((Qid id | Qdot (_, id)), None) ->
+                       Option.value_map
+                         (Witnesses.contract_case logical_types ~current:None ~scrutinee
+                            ~var_types:[] id.pid_str)
+                         ~default:[] ~f:fst
+                   | _ -> []
+                 in
+                 let variables =
+                   List.map variables ~f:(fun (name, typ) ->
+                       (name, Option.map typ ~f:(Witnesses.refined_type aliases)))
+                 in
                  walk variables body))
         in
         let known = List.filter_opt results in

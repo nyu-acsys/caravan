@@ -15,6 +15,27 @@ type t = {
   result : Datatypes.t;  (** The universal result type. *)
 }
 
+(** Source argument positions retained by a universal procedure's worker. *)
+let argument_projection ~at specializations (worker : Polymorphic_functions.t) =
+  match
+    List.find specializations ~f:(fun specialization ->
+        Ident.same specialization.universal.id worker.id)
+  with
+  | None -> Ok None
+  | Some specialization ->
+      let* source =
+        Polymorphic_functions.discover ~at specialization.original.scheme_type
+      in
+      let* positions =
+        Result.all
+          (List.map worker.scheme.variables ~f:(fun variable ->
+               Report.expect ~at "A source argument for the AU carrier"
+                 (List.findi source.variables ~f:(fun _ source ->
+                      Polymorphic_functions.same_variable source variable)
+                 |> Option.map ~f:fst)))
+      in
+      Ok (Some positions)
+
 (** The witness parameter of [f], with its position, the witness and its arguments. *)
 let witness_parameter types (f : Procedures.func) =
   List.find_mapi f.params ~f:(fun position (param : Typedtree.function_param) ->
@@ -142,13 +163,14 @@ let scheme (f : Procedures.func) (witness : Datatypes.witness) arguments ~result
 
 (** [funcs] with each function over a witness that [helped] names replaced by its
     universal procedure, the universal procedures, and their result types. *)
-let run types ~helped (funcs : Procedures.func list) =
+let run types ~helped ~targets (funcs : Procedures.func list) =
   let* specialized =
     Result.all
       (List.filter_map funcs ~f:(fun (f : Procedures.func) ->
            match witness_parameter types f with
            | Some (position, witness_id, (data, witness), arguments)
-             when List.mem helped (Ident.name f.id) ~equal:String.equal ->
+             when List.mem helped (Ident.name f.id) ~equal:String.equal
+                  || List.mem targets f.id ~equal:Ident.same ->
                Some
                  (let name = Fresh_names.fresh (data.module_name ^ "$Result") in
                   let* result_id, result = result_type ~name data witness in

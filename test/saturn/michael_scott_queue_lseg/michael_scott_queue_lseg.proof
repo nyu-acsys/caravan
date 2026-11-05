@@ -216,7 +216,13 @@ let view_queue : ('a node Atomic.t Atomic.t, 'a list) Ghost.field = Ghost.field 
 module Empty = Ghost.AU (struct let operation = is_empty end)
 module Push = Ghost.AU (struct let operation = push end)
 module Pop = Ghost.AU (struct let operation = pop_as end)
-module PopOpt = Ghost.AU (struct let operation = pop_opt end)
+module Peek = Ghost.AU (struct let operation = peek_as end)
+
+type 'a request =
+  | Empty_request of 'a Empty.token
+  | Peek_option of ('a, 'a option) Peek.token
+  | Peek_value of ('a, 'a) Peek.token
+  | Peek_unit of ('a, unit) Peek.token
 
 let facts_of (published : 'a node Atomic.t finset) (links : 'a edge finset)
     (seen : 'a node Atomic.t finset) (waiting : Ghost.t finset) : 'a fact set =
@@ -242,23 +248,50 @@ lemma facts_grow (before_pub : 'a node Atomic.t finset)
 
 let waiting_watched : (Ghost.t, 'a node Atomic.t) Ghost.field = Ghost.field ()
 let waiting_linked : (Ghost.t, bool) Ghost.field = Ghost.field ()
-let waiting_token : (Ghost.t, 'a Empty.token) Ghost.field = Ghost.field ()
+let waiting_token : (Ghost.t, 'a request) Ghost.field = Ghost.field ()
 let waiting_retired : (Ghost.t, bool) Ghost.field = Ghost.field ()
+let waiting_result : (Ghost.t, 'a node) Ghost.field = Ghost.field ()
 
-predicate waiting_registration (reg : Ghost.t) (q : 'a t) =
-  exists token : 'a Empty.token, linked : bool, retired : bool.
-    own ~fraction:Permission.half (Ghost.at waiting_token reg) token
+predicate waiting_registration (reg : Ghost.t) (q : 'a t)
+    (observed [@implicit] : 'a node) =
+  exists request : 'a request, linked : bool, retired : bool.
+    own ~fraction:Permission.half (Ghost.at waiting_token reg) request
     && own ~fraction:Permission.half (Ghost.at waiting_linked reg) linked
     && own ~fraction:Permission.half (Ghost.at waiting_retired reg) retired
-    && (if retired then true
-        else if linked then Empty.committed token q false
-        else Empty.pending token q)
+    && own ~fraction:Permission.half (Ghost.at waiting_result reg) observed
+    && (if retired then true else
+      match request with
+      | Empty_request token ->
+          if linked then Empty.committed token q false else Empty.pending token q
+      | Peek_option token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Option q
+          | Next (value, _) -> Peek.committed token q.head Option q (Some value))
+      | Peek_value token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Value q
+          | Next (value, _) -> Peek.committed token q.head Value q value)
+      | Peek_unit token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Unit q
+          | Next (_, _) -> Peek.committed token q.head Unit q ()))
+
+predicate [@inline] waiting_entry (reg : Ghost.t) (q : 'a t)
+    (watched : 'a node Atomic.t) (linked : bool) (edges : 'a edge finset) =
+  exists observed : 'a node.
+    own ~fraction:Permission.half (Ghost.at waiting_linked reg) linked
+    && own ~fraction:Permission.half (Ghost.at waiting_result reg) observed
+    && (if linked then match observed with
+          | Nil -> false
+          | Next (value, next) -> Finset.mem (Edge (watched, value, next)) edges
+        else observed === Nil)
+    && waiting_registration reg q observed
 
 predicate queue (q : 'a t) (xs [@implicit] : 'a list) =
   own ~fraction:Permission.half (Ghost.at view_queue q.head) xs
 
 (* The invariant's witnesses: the cells of the queue's two segments, their values, links
-   and footprints, and the registered is_empty calls. *)
+   and footprints, and the registered observations. *)
 type 'a state = {
   root : 'a node Atomic.t; head : 'a node Atomic.t; last : 'a node Atomic.t; tail : 'a node Atomic.t;
   retired_values : 'a list; values : 'a list;
@@ -303,10 +336,9 @@ invariant is_queue (q : 'a t) =
           Finset.mem reg s.waiting ->
             own ~fraction:Permission.half (Ghost.at waiting_watched reg)
               (Map.get s.waiting_on reg)
-            && Finset.mem (Map.get s.waiting_on reg) (footprint s)
-            && own ~fraction:Permission.half (Ghost.at waiting_linked reg)
-                 (Map.get s.waiting_on reg != s.last)
-            && waiting_registration reg q)
+            && Finset.mem (Map.get s.waiting_on reg) (seen s)
+            && waiting_entry reg q (Map.get s.waiting_on reg)
+                 (Map.get s.waiting_on reg != s.last) (links s))
     && own ~fraction:Permission.half (Ghost.at view_queue q.head) s.values
     && own (Ghost.at facts_auth q.head)
          (Fact_auth.auth (Facts.set (facts s)))
@@ -400,45 +432,75 @@ lemma restore (s : 'a state) (cell : 'a node Atomic.t) (e : 'a exposure)
       segment_restore s.root cell s.head s.retired_values s.retired_fp s.retired_links p
   | Active p -> segment_restore s.head cell s.last s.values s.active_fp s.active_links p
 
-lemma waiting_help (q : 'a t) (cell : 'a node Atomic.t) (xs : 'a list)
-    (waiting : Ghost.t finset)
+lemma waiting_help (q : 'a t) (cell : 'a node Atomic.t) (value : 'a)
+    (next : 'a node Atomic.t) (xs : 'a list) (waiting : Ghost.t finset)
     (waiting_on : (Ghost.t, 'a node Atomic.t) map)
-    (linkedflags : Ghost.t set)
+    (linkedflags : Ghost.t set) (edges : 'a edge finset)
+  requires (exists source_value : 'a. source_value === value)
   requires (xs =/= [])
   requires (own ~fraction:Permission.half (Ghost.at view_queue q.head) xs)
   requires (forall reg : Ghost.t.
     Finset.mem reg waiting ->
-      own ~fraction:Permission.half (Ghost.at waiting_linked reg)
-        (Set.mem reg linkedflags)
-      && waiting_registration reg q
-      && (Map.get waiting_on reg == cell -> not (Set.mem reg linkedflags)))
+      waiting_entry reg q (Map.get waiting_on reg) (Set.mem reg linkedflags) edges
+      && (Map.get waiting_on reg == cell ->
+        not (Set.mem reg linkedflags) && xs === [value]))
   ensures (own ~fraction:Permission.half (Ghost.at view_queue q.head) xs)
   ensures (forall reg : Ghost.t.
     Finset.mem reg waiting ->
-      own ~fraction:Permission.half (Ghost.at waiting_linked reg)
+      waiting_entry reg q (Map.get waiting_on reg)
         (Set.mem reg linkedflags || Map.get waiting_on reg == cell)
-      && waiting_registration reg q)
-  variant (waiting) =
+        (Finset.union edges (Finset.singleton (Edge (cell, value, next)))))
+  variant waiting =
   if waiting <> Finset.empty then begin
     let reg = Finset.choose waiting in
     let rest = Finset.diff waiting (Finset.singleton reg) in
-    waiting_help q cell xs rest waiting_on linkedflags;
+    let observed : 'a node = Ghost.read (Ghost.at waiting_result reg) in
+    assert (waiting_entry reg q (Map.get waiting_on reg) (Set.mem reg linkedflags) edges);
+    waiting_help q cell value next xs rest waiting_on linkedflags edges;
     if Map.get waiting_on reg == cell then begin
-      let (token, linked, retired) =
-        unfold waiting_registration reg q {token; linked; retired} in
+      assert (observed === Nil);
+      let (request, linked, retired) =
+        unfold waiting_registration reg q Nil {request; linked; retired} in
       if not retired then begin
-        let observed = Empty.access token q in
-        unfold queue q observed;
-        assert (observed === xs);
-        assert (observed =/= []);
-        fold queue q observed;
-        Empty.commit token q false
+        match request with
+        | Empty_request token ->
+            let observed = Empty.access token q in
+            unfold queue q observed;
+            assert (observed === xs);
+            fold queue q observed;
+            Empty.commit token q false
+        | Peek_option token ->
+            let observed = Peek.access token q.head Option q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Option q (Some value)
+        | Peek_value token ->
+            let observed = Peek.access token q.head Value q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Value q value
+        | Peek_unit token ->
+            let observed = Peek.access token q.head Unit q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Unit q ()
       end else ();
       Ghost.write (Ghost.at waiting_linked reg) true;
-      fold waiting_registration reg q
-        {token = token; linked = true; retired = retired}
-    end else ()
+      Ghost.write (Ghost.at waiting_result reg) (Next (value, next) : 'a node);
+      fold waiting_registration reg q (Next (value, next))
+        {request = request; linked = true; retired = retired}
+    end else ();
+    assert (waiting_entry reg q (Map.get waiting_on reg)
+      (Set.mem reg linkedflags || Map.get waiting_on reg == cell)
+      (Finset.union edges (Finset.singleton (Edge (cell, value, next)))))
   end else ()
+
+lemma disjoint_member (left : 'a finset) (right : 'a finset) (item : 'a)
+  requires (Finset.inter left right === Finset.empty && Finset.mem item right)
+  ensures (not (Finset.mem item left)) = ()
 
 lemma segment_excludes_owned (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
     (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset)
@@ -578,8 +640,8 @@ proof push =
         Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
         fold queue q (s.values @ [value]);
         Push.commit token q value ();
-        waiting_help q s.last (s.values @ [value]) s.waiting s.waiting_on
-          (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last));
+        waiting_help q s.last value fresh (s.values @ [value]) s.waiting s.waiting_on
+          (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last)) (links s);
         segment_append s.head s.last fresh s.values s.active_fp s.active_links value;
         let s' = { s with last = fresh; values = s.values @ [value];
           active_fp = Finset.union s.active_fp (Finset.singleton s.last);
@@ -649,8 +711,8 @@ proof push =
       Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
       fold queue q (s.values @ [value]);
       Push.commit token q value ();
-      waiting_help q s.last (s.values @ [value]) s.waiting s.waiting_on
-        (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last));
+      waiting_help q s.last value new_tail (s.values @ [value]) s.waiting s.waiting_on
+        (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last)) (links s);
       segment_append s.head s.last new_tail s.values s.active_fp s.active_links value;
       let s' = { s with last = new_tail; values = s.values @ [value];
         active_fp = Finset.union s.active_fp (Finset.singleton s.last);
@@ -701,14 +763,21 @@ proof push =
     let result = invoke q in
     result)
 
-proof result = atomic pop_as q initial_backoff
-  requires (is_queue q)
+proof result = atomic pop_as [q : 'a t] head initial_backoff poly
+  requires (is_queue q && head == q.head)
   atomic requires (queue q xs)
-  atomic ensures (match xs with
-    | [] -> result === None && queue q []
-    | value :: rest -> result === Some value && queue q rest) =
+  atomic ensures (match poly with
+    | Option -> (match xs with
+        | [] -> result === None && queue q []
+        | value :: rest -> result === Some value && queue q rest)
+    | Value -> (match xs with
+        | [] -> false | value :: rest -> result === value && queue q rest)
+    | Unit -> (match xs with [] -> false | _ :: rest -> queue q rest))
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+      && xs === [] && queue q xs) =
   let token = Pop.bind () in
-  at (Atomic.get q.head) (fun step ->
+  at (Atomic.get head) (fun step ->
     let s = unfold is_queue q in
     let result = step () in
     issue_fact q s (Head_seen result);
@@ -724,19 +793,23 @@ proof result = atomic pop_as q initial_backoff
     restore s old_head exposure;
     begin match result with
     | Nil ->
-        let xs = Pop.access token q initial_backoff in
+        let xs = Pop.access token head initial_backoff poly q in
         unfold queue q xs;
         assert (xs === []);
         fold queue q xs;
-        Pop.commit token q initial_backoff None
+        begin match poly with
+        | Option -> Pop.commit token head initial_backoff poly q None
+        | Value -> Pop.commit_raise token head initial_backoff poly q Empty
+        | Unit -> Pop.commit_raise token head initial_backoff poly q Empty
+        end
     | Next (value, next) ->
         issue_fact q s (Linked (Edge (old_head, value, next)))
     end;
     fold is_queue q;
     result);
-  at (Atomic.compare_and_set q.head old_head next) (fun step ->
+  at (Atomic.compare_and_set head old_head next) (fun step ->
     let s = unfold is_queue q in
-    let xs = Pop.access token q initial_backoff in
+    let xs = Pop.access token head initial_backoff poly q in
     unfold queue q xs;
     assert (xs === s.values);
     observe_fact q s (Head_seen old_head);
@@ -761,9 +834,18 @@ proof result = atomic pop_as q initial_backoff
       in
       assert (first === value);
       segment_info next s.last;
+      assert (next == s.last || Finset.mem next suffix_fp);
+      if next != s.last then begin
+        assert (Finset.mem next s.active_fp);
+        disjoint_member s.retired_fp s.active_fp next
+      end else ();
       Ghost.write (Ghost.at view_queue q.head) rest;
       fold queue q rest;
-      Pop.commit token q initial_backoff (Some value);
+      begin match poly with
+      | Option -> Pop.commit token head initial_backoff poly q (Some value)
+      | Value -> Pop.commit token head initial_backoff poly q value
+      | Unit -> Pop.commit token head initial_backoff poly q ()
+      end;
       segment_append s.root s.head next s.retired_values s.retired_fp
         s.retired_links value;
       let s' = { s with head = next; retired_values = s.retired_values @ [value];
@@ -776,23 +858,19 @@ proof result = atomic pop_as q initial_backoff
       fold is_queue q s'
     end else begin
       fold queue q xs;
-      Pop.abort token q initial_backoff;
+      Pop.abort token head initial_backoff poly q;
       fold is_queue q
     end;
     result);
-  at (pop_as q backoff) (fun invoke ->
-    let xs = Pop.access token q initial_backoff in
-    let result = invoke () in
-    Pop.commit token q initial_backoff result;
+  at (pop_as head backoff poly) (fun invoke ->
+    let xs = Pop.access token head initial_backoff poly q in
+    let (result, raised) = invoke q in
+    begin match raised with
+    | None -> Pop.commit token head initial_backoff poly q result
+    | Some exception_ -> Pop.commit_raise token head initial_backoff poly q exception_
+    end;
     result)
 
-proof pop_opt =
-  at (pop_as q Backoff.default) (fun invoke ->
-    let token = PopOpt.bind () in
-    let xs = PopOpt.access token q in
-    let result = invoke () in
-    PopOpt.commit token q result;
-    result)
 
 proof is_empty =
   let token = Empty.bind () in
@@ -826,11 +904,12 @@ proof is_empty =
         let registration = Ghost.alloc [
           Ghost.init waiting_watched result;
           Ghost.init waiting_linked false;
-          Ghost.init waiting_token token;
+          Ghost.init waiting_token (Empty_request token : 'a request);
+          Ghost.init waiting_result (Nil : 'a node);
           Ghost.init waiting_retired false
         ] in
-        fold waiting_registration registration q
-          {token = token; linked = false; retired = false};
+        fold waiting_registration registration q Nil
+          {request = Empty_request token; linked = false; retired = false};
         let s' = { s with waiting = Finset.union s.waiting (Finset.singleton
           registration);
           waiting_on = Map.set s.waiting_on registration result } in
@@ -865,8 +944,14 @@ proof is_empty =
         end
     | Waiting_on registration ->
         assert (Map.get s.waiting_on registration == old_head);
-        let (token, linked, retired) =
-          unfold waiting_registration registration q {token; linked; retired} in
+        let observed : 'a node = Ghost.read (Ghost.at waiting_result registration) in
+        let (request, linked, retired) =
+          unfold waiting_registration registration q observed {request; linked; retired} in
+        let token = match request with
+          | Empty_request token -> token
+          | Peek_option _ -> assert false
+          | Peek_value _ -> assert false
+          | Peek_unit _ -> assert false in
         begin match result with
         | Nil ->
             let xs = Empty.access token q in
@@ -877,11 +962,124 @@ proof is_empty =
         | Next (_, _) -> assert linked
         end;
         Ghost.write (Ghost.at waiting_retired registration) true;
-        fold waiting_registration registration q
-          {token = token; linked = linked; retired = true}
+        fold waiting_registration registration q observed
+          {request = request; linked = linked; retired = true}
     end;
     fold is_queue q;
     result)
+
+proof r = atomic peek_as [q : 'a t] head poly
+  requires (is_queue q && head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (queue q xs && match poly with
+    | Option -> (match xs with [] -> r === None | value :: _ -> r === Some value)
+    | Value -> (match xs with [] -> false | value :: _ -> r === value)
+    | Unit -> xs =/= [])
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+      && xs === [] && queue q xs) =
+  let token = Peek.bind () in
+  let (old_head, observation) = at (Atomic.get head) (fun step ->
+    let s = unfold is_queue q in
+    let result = step () in
+    issue_fact q s (Head_seen result);
+    let observation =
+      if result != s.last then begin
+        segment_info s.head s.last;
+        let (next, rest_fp, rest_links) =
+          unfold segment s.head s.last s.values s.active_fp s.active_links
+            {next; tail_cells; tail_edges} in
+        let (value, rest) =
+          match s.values with
+          | [] -> assert false
+          | value :: rest -> (value, rest)
+        in
+        fold segment s.head s.last s.values s.active_fp s.active_links
+          {next = next; tail_cells = rest_fp; tail_edges = rest_links};
+        let link = Edge (result, value, next) in
+        issue_fact q s (Linked link);
+        let xs = Peek.access token head poly q in
+        unfold queue q xs;
+        assert (xs === value :: rest);
+        fold queue q xs;
+        begin match poly with
+        | Option -> Peek.commit token head poly q (Some value)
+        | Value -> Peek.commit token head poly q value
+        | Unit -> Peek.commit token head poly q ()
+        end;
+        fold is_queue q;
+        Observed_link link
+      end else begin
+        let request : 'a request = match poly with
+          | Option -> Peek_option token
+          | Value -> Peek_value token
+          | Unit -> Peek_unit token in
+        let registration = Ghost.alloc [
+          Ghost.init waiting_watched result;
+          Ghost.init waiting_linked false;
+          Ghost.init waiting_token request;
+          Ghost.init waiting_result (Nil : 'a node);
+          Ghost.init waiting_retired false
+        ] in
+        fold waiting_registration registration q Nil
+          {request = request; linked = false; retired = false};
+        let s' = { s with waiting = Finset.union s.waiting (Finset.singleton
+          registration);
+          waiting_on = Map.set s.waiting_on registration result } in
+        grow_facts q s s';
+        issue_fact q s' (Registered registration);
+        fold is_queue q s';
+        Waiting_on registration
+      end
+    in
+    (result, (result, observation))) in
+  at (Atomic.get old_head) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Head_seen old_head);
+    begin match observation with
+    | Observed_link link -> observe_fact q s (Linked link)
+    | Waiting_on registration -> observe_fact q s (Registered registration)
+    end;
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_head in
+    let result = step () in
+    restore s old_head exposure;
+    consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+      s.retired_fp s.active_fp s.retired_links s.active_links;
+    begin match observation with
+    | Observed_link link ->
+        begin match result with
+        | Nil -> assert false
+        | Next (_, _) -> ()
+        end
+    | Waiting_on registration ->
+        assert (Map.get s.waiting_on registration == old_head);
+        let observed : 'a node = Ghost.read (Ghost.at waiting_result registration) in
+        let (request, linked, retired) =
+          unfold waiting_registration registration q observed {request; linked; retired} in
+        begin match result with
+        | Nil ->
+            let xs = Peek.access token head poly q in
+            unfold queue q xs;
+            assert (xs === []);
+            fold queue q xs;
+            begin match poly with
+            | Option -> Peek.commit token head poly q None
+            | Value -> Peek.commit_raise token head poly q Empty
+            | Unit -> Peek.commit_raise token head poly q Empty
+            end
+        | Next (value, next) ->
+            assert linked;
+            assert (observed === Next (value, next))
+        end;
+        Ghost.write (Ghost.at waiting_retired registration) true;
+        fold waiting_registration registration q observed
+          {request = request; linked = linked; retired = true}
+    end;
+    fold is_queue q;
+    result)
+
 
 proof of_list =
   proof result = build_next xs

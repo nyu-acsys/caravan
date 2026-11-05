@@ -40,7 +40,14 @@ type family = {
   member : string;
   dictionary : string;
   scope : string list;
+  argument_projection : int list option;
+      (** Source type arguments supplying the worker's dictionaries, in worker order. *)
 }
+
+let project_family_arguments family arguments =
+  match family.argument_projection with
+  | None -> Some arguments
+  | Some positions -> Option.all (List.map positions ~f:(List.nth arguments))
 
 type family_instance = {
   family_namespace : string list;
@@ -742,6 +749,7 @@ let instantiate (data : t) arguments =
 let is_value_family (data : t) =
   (not (List.is_empty data.parameters))
   && Option.is_none data.family && Option.is_none data.alias && Option.is_none data.heap
+  && Option.is_none data.atomic_procedure
 
 let value_family_name (data : t) =
   String.concat ~sep:"." (Option.value data.module_path ~default:[ data.module_name ])
@@ -1007,12 +1015,13 @@ let rec type_key types t =
       when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
         let data = Option.value_exn (find types path) in
         let family = Option.value_exn data.family in
-        Option.map
-          (Option.all (List.map arguments ~f:(dictionary_type_key types)))
-          ~f:(fun arguments ->
-            Applied_key
-              ( String.split family.worker ~on:'.' @ String.split family.member ~on:'.',
-                arguments ))
+        Option.bind (project_family_arguments family arguments) ~f:(fun arguments ->
+            Option.map
+              (Option.all (List.map arguments ~f:(dictionary_type_key types)))
+              ~f:(fun arguments ->
+                Applied_key
+                  ( String.split family.worker ~on:'.' @ String.split family.member ~on:'.',
+                    arguments )))
     | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
         let data = Option.value_exn (find types p) in
         Option.map
@@ -1020,6 +1029,12 @@ let rec type_key types t =
           ~f:(fun arguments ->
             Applied_key
               (Option.value data.module_path ~default:[ data.module_name ], arguments))
+    | Tconstr (path, _, _)
+      when Option.exists (find types path) ~f:(fun data ->
+               Option.is_some data.atomic_procedure) ->
+        Option.bind (find types path) ~f:(fun data ->
+            Option.map data.atomic_procedure ~f:(fun operation ->
+                Atomic_token_key (String.split operation ~on:'.')))
     | Tconstr (p, [], _) ->
         Option.map (find types p) ~f:(fun data ->
             match (data.heap, data.atomic_procedure, data.backend_type) with
@@ -1042,6 +1057,7 @@ and dictionary_type_key types t =
   | Tconstr (path, arguments, _)
     when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
       let family = Option.value_exn (Option.value_exn (find types path)).family in
+      let* arguments = project_family_arguments family arguments in
       let* arguments = Option.all (List.map arguments ~f:(dictionary_type_key types)) in
       Some
         (Applied_key
@@ -1201,6 +1217,9 @@ let domain_identity types t =
     | Tconstr (path, arguments, _)
       when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
         let family = Option.value_exn (Option.value_exn (find types path)).family in
+        let arguments =
+          Option.value (project_family_arguments family arguments) ~default:arguments
+        in
         family.scope :: List.concat_map arguments ~f:(scopes seen)
     | Tconstr (path, arguments, _) when Option.exists (find types path) ~f:is_value_family
       ->
@@ -1355,6 +1374,7 @@ and family_instance types (data : t) arguments =
   let ( let* ) value f = Option.bind value ~f in
   let* family = data.family in
   let* _ = Option.some_if (List.length arguments = List.length data.parameters) () in
+  let* arguments = project_family_arguments family arguments in
   let* family_arguments = Option.all (List.map arguments ~f:(dictionary_name types)) in
   let scopes =
     family.scope
@@ -1496,7 +1516,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
         (R.Type.named ~loc:l
            (Qualified_name.raven ~loc:l (Option.value_exn d.backend_type))
            [])
-  | Tconstr (p, [], _)
+  | Tconstr (p, _, _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
       let d = Option.value_exn (find types p) in
       Ok
@@ -1585,7 +1605,12 @@ let family_argument_types types requested =
   let _, arguments =
     fold_families types requested
       ~init:(Set.empty (module Int), [])
-      ~f:(fun state _ arguments ->
+      ~f:(fun state data arguments ->
+        let arguments =
+          Option.bind data.family ~f:(fun family ->
+              project_family_arguments family arguments)
+          |> Option.value ~default:arguments
+        in
         List.fold arguments ~init:state ~f:(fun (seen, arguments) argument ->
             let id = Types.get_id argument in
             if Set.mem seen id then (seen, arguments)

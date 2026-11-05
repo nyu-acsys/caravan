@@ -2215,7 +2215,7 @@ let linearize ?step ?value ?access_type ?contents ctx ~at
     | Some annotation, Some result, Some result_type ->
         State.map ~f:fst
           (access_proof ctx annotation ~result_type (fun _ ->
-               State.return (access, result, [])))
+               State.return (access, result, [], [])))
     | Some annotation, _, _ ->
         State.of_result
           (error annotation.loc "This operation does not support an access proof")

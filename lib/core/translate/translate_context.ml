@@ -397,8 +397,13 @@ module State_monad = struct
                   ])
         in
         let dictionaries =
+          (* Preload available carriers; worker indices require their dictionaries. *)
+          let carriers =
+            List.filter requested ~f:(fun typ ->
+                Option.is_some (Datatypes.dictionary_name types typ))
+          in
           List.fold
-            (requested @ Datatypes.family_argument_types types requested)
+            (carriers @ Datatypes.family_argument_types types requested)
             ~init:state.tables.dictionaries
             ~f:(fun previous typ ->
               if List.is_empty instances then previous
@@ -670,6 +675,12 @@ type atomic_shape = {
   implicit : Types.type_expr list;
 }
 
+type atomic_universal = {
+  au_witness_position : int;
+  au_result_arguments : Types.type_expr list;
+  au_universal_result : Datatypes.t;
+}
+
 type atomic_signature = {
   au_key : string;
   au_generic : Generic_parameters.t option;
@@ -681,6 +692,10 @@ type atomic_signature = {
   au_inputs : Types.type_expr list;
   au_result : Types.type_expr;
   au_returns_value : bool;
+  au_raises : bool;
+  au_argument_projection : int list option;
+  au_bind_arguments : Types.type_expr list;
+  au_universal : atomic_universal option;
   au_ghost_outputs : Types.type_expr list;
   au_implicit : Types.type_expr list;
 }
@@ -711,6 +726,11 @@ let map_atomic_types signature ~f =
           { generic with parameters; variables })
     and+ au_source = atomic_source_types signature.au_source
     and+ au_private = shape signature.au_private
+    and+ au_universal =
+      option signature.au_universal ~f:(fun universal ->
+          let+ au_result_arguments = list universal.au_result_arguments ~f:typ in
+          { universal with au_result_arguments })
+    and+ au_bind_arguments = list signature.au_bind_arguments ~f:typ
     and+ au_token = typ signature.au_token
     and+ au_inputs = list signature.au_inputs ~f:typ
     and+ au_result = typ signature.au_result
@@ -721,6 +741,8 @@ let map_atomic_types signature ~f =
       au_generic;
       au_source;
       au_private;
+      au_universal;
+      au_bind_arguments;
       au_token;
       au_inputs;
       au_result;
@@ -1926,7 +1948,7 @@ let logical_key env q =
   let atomic_key =
     Option.bind (atomic_method env q) ~f:(fun (signature, method_) ->
         Option.some_if
-          (List.mem [ "pending"; "committed" ] method_ ~equal:String.equal)
+          (List.mem [ "pending"; "committed"; "raised" ] method_ ~equal:String.equal)
           (signature.au_key ^ "." ^ method_))
   in
   match
@@ -2038,6 +2060,10 @@ let atomic_inputs signature method_ =
         ( (token :: signature.au_inputs)
           @ (signature.au_result :: signature.au_ghost_outputs),
           [] )
+  | ("commit_raise" | "raised") when signature.au_raises ->
+      Some
+        ( (token :: signature.au_inputs) @ (Predef.type_exn :: signature.au_ghost_outputs),
+          if String.equal method_ "raised" then [ Predef.type_bool ] else [] )
   | "pending" -> Some (token :: signature.au_inputs, [ Predef.type_bool ])
   | "committed" ->
       Some
@@ -2047,15 +2073,43 @@ let atomic_inputs signature method_ =
   | _ -> None
 
 (** Raven takes the concrete inputs and outputs as tuples, including empty ones. *)
-let atomic_arguments ~loc:l signature method_ values =
+let atomic_arguments ~loc:l ?raising ?raised_result signature method_ values =
   match values with
   | [] -> []
   | token :: rest ->
       let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
       let inputs = R.Expr.tuple ~loc:l inputs in
-      if List.mem [ "commit"; "committed" ] method_ ~equal:String.equal then
+      if
+        List.mem
+          [ "commit"; "committed"; "commit_raise"; "raised" ]
+          method_ ~equal:String.equal
+      then
         let outputs =
-          if signature.au_returns_value then outputs else List.drop outputs 1
+          match (method_, raising, outputs) with
+          | ("commit_raise" | "raised"), Some typ, exception_ :: ghosts ->
+              let raised =
+                R.Expr.annotated
+                  (R.Expr.call ~loc:l
+                     (Datatypes.ctor_name ~loc:l Datatypes.option
+                        (List.last_exn Datatypes.option.ctors))
+                     [ exception_ ])
+                  typ
+              in
+              Option.to_list raised_result @ ghosts @ [ raised ]
+          | _ ->
+              let outputs =
+                if signature.au_returns_value then outputs else List.drop outputs 1
+              in
+              let outcome =
+                Option.map raising ~f:(fun typ ->
+                    R.Expr.annotated
+                      (R.Expr.call ~loc:l
+                         (Datatypes.ctor_name ~loc:l Datatypes.option
+                            (List.hd_exn Datatypes.option.ctors))
+                         [])
+                      typ)
+              in
+              outputs @ Option.to_list outcome
         in
         [ token; inputs; R.Expr.tuple ~loc:l outputs ]
       else [ token; inputs ]

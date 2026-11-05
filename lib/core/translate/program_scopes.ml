@@ -275,8 +275,49 @@ let run (source : Source.t) : (t, error) Result.t =
       | Proof_module { module_declarations; _ } -> helped module_declarations
       | _ -> [])
   in
-  let helped = helped source.proof in
-  let* funcs, specialized = Specializations.run types ~helped (funcs @ lifted) in
+  let facade_functions (au : Source.proof_au) =
+    let direct =
+      List.filter funcs ~f:(fun f ->
+          List.mem f.Procedures.paths au.au_operation_path ~equal:Path.same)
+    in
+    let template =
+      match au.au_application with None -> au.au_id | Some (_, template) -> template
+    in
+    let binding =
+      List.find unapplied_proofs.bindings ~f:(fun binding ->
+          match binding.Proof_bindings.kind with
+          | Atomic original -> Ident.same original.au_id template
+          | _ -> false)
+    in
+    let applied =
+      Option.value_map binding ~default:[] ~f:(fun binding ->
+          match binding.kind with
+          | Atomic original ->
+              Option.value_map
+                (Module_inventory.function_member binding.entry.scope
+                   original.au_operation_path) ~default:[] ~f:(fun (key, _) ->
+                  List.concat_map inventory.specializations ~f:(fun application ->
+                      if
+                        not
+                          (Module_inventory.proof_scope_matches application
+                             binding.entry.scope)
+                      then []
+                      else
+                        Option.value_map
+                          (List.Assoc.find application.body_members key
+                             ~equal:String.equal) ~default:[] ~f:(fun id ->
+                            List.filter funcs ~f:(fun f -> Ident.same f.Procedures.id id))))
+          | _ -> [])
+    in
+    direct @ applied
+  in
+  let targets =
+    List.concat_map source.proof_aus ~f:(fun au ->
+        List.map (facade_functions au) ~f:(fun f -> f.Procedures.id))
+  in
+  let* funcs, specialized =
+    Specializations.run types ~helped:(helped source.proof) ~targets (funcs @ lifted)
+  in
   let funcs = inherit_contracts funcs in
   let* access_proofs =
     access_annotations ~libraries
@@ -285,7 +326,11 @@ let run (source : Source.t) : (t, error) Result.t =
              List.concat_map binding.Module_inventory.paths ~f:(fun path ->
                  List.map binding.expected.signature_values ~f:(fun (member, _) ->
                      Path.Pdot (path, member)))))
-      source typed annotations ~functions:funcs
+      source typed annotations
+      ~functions:
+        (funcs
+        @ List.map specialized ~f:(fun specialized ->
+            specialized.Specializations.original))
   in
   let state_targets = ref [] and nested_reads = ref [] in
   let remember (e : Typedtree.expression) =

@@ -46,7 +46,9 @@ type t = {
 
 let atomic_predicates_of signatures =
   List.concat_map signatures ~f:(fun signature ->
-      List.map [ "pending"; "committed" ] ~f:(fun method_ ->
+      List.map
+        ([ "pending"; "committed" ] @ if signature.au_raises then [ "raised" ] else [])
+        ~f:(fun method_ ->
           let inputs, _ = Option.value_exn (atomic_inputs signature method_) in
           let key = signature.au_key ^ "." ^ method_ in
           (key, (key, inputs))))
@@ -999,13 +1001,48 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
     State.run_from state
     @@ State.all atomic_operations ~f:(fun (au_source, f) ->
         let open State.Syntax in
+        let backend = f in
+        let specialized =
+          List.find scopes.specialized ~f:(fun specialized ->
+              Ident.same specialized.Specializations.universal.id backend.id)
+        in
+        let f =
+          Option.value_map specialized ~default:f ~f:(fun specialized ->
+              specialized.original)
+        in
         let* scheme =
           State.of_result
             (Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
                f.scheme_type)
         in
+        let source_arguments =
+          List.map scheme.variables ~f:(fun variable ->
+              match Types.get_desc variable with
+              | Tunivar (Some name) ->
+                  begin match
+                    Env.find_type_by_name (Longident.Lident name) f.body.exp_env
+                  with
+                  | path, _ -> Ctype.newconstr path []
+                  | exception Stdlib.Not_found -> variable
+                  end
+              | _ -> variable)
+        in
+        let rec source_type typ =
+          match
+            List.findi source_arguments ~f:(fun _ argument ->
+                match (Types.get_desc argument, Types.get_desc typ) with
+                | Tconstr (left, [], _), Tconstr (right, [], _) -> Path.same left right
+                | _ -> Types.eq_type argument typ)
+          with
+          | Some (position, _) -> List.nth_exn scheme.variables position
+          | None ->
+              begin match Types.get_desc typ with
+              | Tvar _ | Tunivar _ -> typ
+              | desc -> Ctype.newty (Btype.copy_type_desc source_type desc)
+              end
+        in
         let preds, spec_funcs, proof_support =
-          proof_context ~current_procedure:(proc_name f) ~at:f.loc
+          proof_context ~current_procedure:(proc_name backend) ~at:f.loc
             (Proof_bindings.scope_for_location scoped_proofs f.loc)
             preds spec_funcs proof_support
         in
@@ -1015,27 +1052,40 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
               ~module_contexts:scopes.module_contexts
               ~context_for_group:
                 (Program_scopes.context_for_group ~module_contexts:scopes.module_contexts)
-              ~generics f
+              ~generics backend
           in
           module_context context
             ~projection:
-              (Program_declarations.source_function_projection ~generics context f)
+              (Program_declarations.source_function_projection ~generics context backend)
             (preds, spec_funcs, proof_support)
         in
         let* signature =
           State.of_result
             (Report.expect ~at:f.loc
-               ("The signature of procedure " ^ proc_name f)
-               (List.Assoc.find procedure_signatures (proc_name f) ~equal:String.equal))
+               ("The signature of procedure " ^ proc_name backend)
+               (List.Assoc.find procedure_signatures (proc_name backend)
+                  ~equal:String.equal))
         in
         let groups =
           Option.value_map (au_plan au_source) ~default:[] ~f:(fun plan ->
               [ plan.Generic_proofs.group ])
         in
-        let worker =
+        let backend_worker =
           Program_declarations.applied_function_worker ~generics
-            ~polymorphic_functions:decls.polymorphic_functions ~groups ~canonical:Fn.id f
-          |> Option.map ~f:(fun worker ->
+            ~polymorphic_functions:decls.polymorphic_functions ~groups ~canonical:Fn.id
+            backend
+        in
+        let* au_argument_projection =
+          match (specialized, backend_worker) with
+          | None, _ -> State.return None
+          | Some _, None -> State.return (Some [])
+          | Some _, Some worker ->
+              State.of_result
+                (Specializations.argument_projection ~at:au_source.au_at
+                   scopes.specialized worker)
+        in
+        let worker =
+          Option.map backend_worker ~f:(fun worker ->
               { worker with Polymorphic_functions.id = f.id; paths = f.paths; scheme })
         in
         let types = Program_declarations.function_types (Option.to_list worker) f types in
@@ -1050,6 +1100,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
             ~proof_support ~generic_predicates:decls.generic_predicates
             ~primitive_namespace ()
         in
+        let procedure = au_procedure au_source backend in
         let ctx =
           {
             ctx with
@@ -1057,7 +1108,10 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
               {
                 ctx.given with
                 current_polymorphic = worker;
-                current_procedure = Some (au_procedure au_source f);
+                procedure_signatures =
+                  List.Assoc.add procedure_signatures ~equal:String.equal procedure
+                    signature;
+                current_procedure = Some procedure;
               };
           }
         in
@@ -1077,7 +1131,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                  match au_plan au_source with
                  | Some plan -> Subst.type_expr (Generic_proofs.source_projection plan)
                  | None ->
-                     begin match Generic_modules.member generics f.id with
+                     begin match Generic_modules.member generics backend.id with
                      | Some (_, application, _) ->
                          let path =
                            match au_source.au_operation_path with
@@ -1092,10 +1146,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                in
                let shape =
                  {
-                   inputs = au_inputs;
-                   result = f.body.exp_type;
-                   ghost_outputs = List.map signature.procedure_outputs ~f:snd;
-                   implicit = List.map implicit ~f:(fun (_, _, ty, _) -> ty);
+                   inputs = List.map au_inputs ~f:source_type;
+                   result = source_type f.body.exp_type;
+                   ghost_outputs =
+                     List.map signature.procedure_outputs ~f:(fun (_, ty) ->
+                         source_type ty);
+                   implicit = List.map implicit ~f:(fun (_, _, ty, _) -> source_type ty);
                  }
                in
                let key =
@@ -1126,16 +1182,24 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                      end
                in
                let au_generic =
-                 Option.map worker ~f:(fun worker ->
+                 let name =
+                   match (worker, specialized) with
+                   | Some worker, _ -> Some worker.Polymorphic_functions.name
+                   | None, Some _ when not (List.is_empty scheme.variables) ->
+                       Some (au_procedure au_source backend)
+                   | _ -> None
+                 in
+                 Option.map name ~f:(fun name ->
                      Generic_parameters.
                        {
                          key;
                          member =
-                           (Qualified_name.of_string (au_procedure au_source f)).name;
-                         name = worker.name;
+                           (Qualified_name.of_string (au_procedure au_source backend))
+                             .name;
+                         name;
                          loc = au_source.au_at;
-                         parameters = [ worker.scheme.typ ];
-                         variables = worker.scheme.variables;
+                         parameters = [ scheme.typ ];
+                         variables = scheme.variables;
                          explicit = 0;
                        })
                in
@@ -1148,10 +1212,26 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                      au_private = shape;
                      au_token = au_source.au_token;
                      au_source;
-                     au_procedure = au_procedure au_source f;
+                     au_procedure = au_procedure au_source backend;
                      au_inputs = shape.inputs;
                      au_result = shape.result;
                      au_returns_value = not (is_unit f.body.exp_type);
+                     au_raises = Option.exists f.contract ~f:raising_contract;
+                     au_bind_arguments = source_arguments;
+                     au_argument_projection;
+                     au_universal =
+                       Option.bind specialized ~f:(fun specialized ->
+                           Option.map (Specializations.witness_parameter types f)
+                             ~f:(fun (position, _, (_, witness), arguments) ->
+                               {
+                                 au_witness_position = position;
+                                 au_result_arguments =
+                                   List.filter_map
+                                     (List.zip_exn witness.indices arguments)
+                                     ~f:(fun (index, argument) ->
+                                       Option.some_if (not index) (source_type argument));
+                                 au_universal_result = specialized.result;
+                               }));
                      au_ghost_outputs = shape.ghost_outputs;
                      au_implicit = shape.implicit;
                    }

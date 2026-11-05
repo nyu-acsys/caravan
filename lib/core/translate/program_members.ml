@@ -1754,6 +1754,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         ~f:(fun environment (original, target) ->
           Source.project_ghost_parameter source ~original ~target environment)
     in
+    let environment = Source.annotation_env ~at:f.loc source environment in
     let environment =
       List.fold (Module_context.runtime_pairs context) ~init:environment
         ~f:(fun environment (original, target) ->
@@ -1771,8 +1772,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           in
           Env.add_type ~check:false original.typ_id declaration environment)
     in
-    if List.is_empty context.parameters then Ok environment
-    else Ok (Source.annotation_env ~at:f.loc source environment)
+    Ok environment
   in
   let* pure_funcs, state =
     State.run_from state
@@ -1961,6 +1961,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
       Module_context.local_name (body_destination f) (body_proc_name f)
     in
     let primitive_namespace = body_primitive_namespace f in
+    let procedure_signatures =
+      Option.value_map
+        (List.Assoc.find procedure_signatures (proc_name f) ~equal:String.equal)
+        ~default:procedure_signatures
+        ~f:(fun signature ->
+          List.Assoc.add procedure_signatures ~equal:String.equal (body_proc_name f)
+            signature)
+    in
     let given =
       {
         (declaration_inputs data ~shared:(body_shared f) ~env:f.environment

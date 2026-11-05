@@ -1,0 +1,44 @@
+module Make () = struct
+  module Read = Ghost.AU (struct let operation = read_as end)
+
+  type 'a request =
+    | Value_request of ('a, 'a) Read.token
+    | Option_request of ('a, 'a option) Read.token
+    | Unit_request of ('a, unit) Read.token
+
+  let waiting : (Ghost.t, 'a request) Ghost.field = Ghost.field ()
+  let cached : (Ghost.t, 'a option) Ghost.field = Ghost.field ()
+
+  proof result = atomic read_as [q : 'a container] cell poly
+    requires (cell == q.cell)
+    atomic requires (own q.cell value)
+    atomic ensures (own q.cell value && match poly with
+      | Option -> result === Some value
+      | Value -> result === value
+      | Unit -> true) =
+    at (Atomic.get cell) (fun step ->
+      let token = Read.bind () in
+      let value = Read.access token cell poly q in
+      let result = step () in
+      let request = match poly with
+        | Option -> Option_request token
+        | Value -> Value_request token
+        | Unit -> Unit_request token in
+      let registration = Ghost.alloc [Ghost.init waiting (request : 'a request)] in
+      begin match poly with
+      | Option -> Read.commit token cell poly q (Some result)
+      | Value -> Read.commit token cell poly q result
+      | Unit -> Read.commit token cell poly q ()
+      end;
+      result)
+
+  proof both =
+    on return
+      let cache = Ghost.alloc [Ghost.init cached (None : 'a option)] in
+      ()
+end
+
+proof result = client left right
+  requires (own left.cell 17 && own right.cell true)
+  ensures (own left.cell 17 && own right.cell true &&
+    result === ((Some 17, 17, ()), (Some true, true, ()))) = ()

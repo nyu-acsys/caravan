@@ -67,6 +67,9 @@
   ../saturn/michael_scott_queue/michael_scott_queue.ml
   ../saturn/michael_scott_queue/michael_scott_queue.mli
   ../saturn/michael_scott_queue/michael_scott_queue_intf.mli
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli
   ../saturn/treiber_stack/treiber_stack.ml
   ../saturn/treiber_stack/treiber_stack.mli))
 

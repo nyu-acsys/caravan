@@ -908,12 +908,36 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
                   State.return
                     ( Path.Pident id,
                       { declaration with val_type = scheme },
-                      Some (instance, List.hd_exn ctor.fields) )
+                      Some (instance, Some (List.hd_exn ctor.fields)) )
               | None ->
-                  State.of_result
-                    (unsupported at
-                       "A call of a function whose calls wait to be helped, with a \
-                        witness other than a constructor"))
+                  begin match (ctx.given.universal_result, List.nth args position) with
+                  | Some own, Some witness when Option.equal Ident.same own.id result.id
+                    ->
+                      let* _, shape, arguments =
+                        State.of_result
+                          (Report.expect ~at "A recursive universal call's witness"
+                             (Witnesses.witness_type ctx.given.types witness.exp_type))
+                      in
+                      let ordinary =
+                        List.filter_map (List.zip_exn shape.indices arguments)
+                          ~f:(fun (index, argument) ->
+                            Option.some_if (not index) argument)
+                      in
+                      let instance =
+                        Ctype.newconstr
+                          (Path.Pident (Option.value_exn result.id))
+                          ordinary
+                      in
+                      State.return
+                        ( Path.Pident id,
+                          { declaration with val_type = scheme },
+                          Some (instance, None) )
+                  | _ ->
+                      State.of_result
+                        (unsupported at
+                           "A call of a function whose calls wait to be helped, with a \
+                            witness other than a constructor")
+                  end)
         in
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f ->
@@ -993,14 +1017,21 @@ and call ?actual_target ?type_instance ?universal ctx (e : Typedtree.expression)
       ~default:(not (is_unit e.exp_type))
       ~f:(fun signature -> signature.procedure_returns_value)
   in
-  let run explicit =
-    call_prepared ?actual_target ?universal ctx e f ocaml_args args ~explicit
-      ~returns_value ~signature_outputs:outputs
-  in
   let annotation =
     List.Assoc.find ctx.given.access_proofs
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum)
       ~equal:Poly.equal
+  in
+  let* capture_outcome =
+    match annotation with
+    | Some annotation when List.Assoc.mem ctx.given.raising f ~equal:String.equal ->
+        State.of_result
+          (access_captures_outcome annotation ~outputs:(List.length outputs))
+    | _ -> State.return false
+  in
+  let run explicit =
+    call_prepared ?actual_target ?universal ctx e f ocaml_args args ~explicit
+      ~capture_outcome ~returns_value ~signature_outputs:outputs
   in
   match annotation with
   | None when List.mem ctx.given.local_calls f ~equal:String.equal ->
@@ -1029,18 +1060,20 @@ and call ?actual_target ?type_instance ?universal ctx (e : Typedtree.expression)
               ],
             value )
   | None ->
-      let+ statements, value, _ = run None in
-      (arguments @ statements, value)
+      let+ statements, value, _, after_call = run None in
+      (arguments @ statements @ after_call, value)
   | Some annotation ->
       let+ statements, value =
         access_proof ctx annotation ~result_type:e.exp_type
-          ~input_types:(List.map inputs ~f:snd) ~output_types:(List.map outputs ~f:snd)
+          ~input_types:(List.map inputs ~f:snd)
+          ~output_types:
+            (List.map outputs ~f:snd @ if capture_outcome then [ outcome_type ] else [])
           (fun values -> run (Some values))
       in
       (arguments @ statements, value)
 
 and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f ocaml_args
-    args ~explicit ~returns_value ~signature_outputs =
+    args ~explicit ~capture_outcome ~returns_value ~signature_outputs =
   let l = loc e.exp_loc in
   let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
@@ -1359,6 +1392,12 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
     Option.value_map outcome ~default:[] ~f:(fun (_, _, leave) -> leave)
   in
   let outcome_value = Option.map outcome ~f:(fun (_, v, _) -> v) in
+  let public_values =
+    public_values @ if capture_outcome then Option.to_list outcome_value else []
+  in
+  let propagation, after_call =
+    if capture_outcome then ([], propagation) else (propagation, [])
+  in
   if is_unit e.exp_type && not returns_value then
     let+ closing = closing (unit_value ~loc:l) outcome_value in
     let call =
@@ -1366,7 +1405,10 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
       | [] -> [ R.Stmt.call ~loc:l callee ]
       | _ -> ghost_decls @ [ R.Stmt.assign ~loc:l ghosts (R.Stmt.expr_rhs callee) ]
     in
-    (stmts @ opening @ call @ closing @ propagation, unit_value ~loc:l, public_values)
+    ( stmts @ opening @ call @ closing @ propagation,
+      unit_value ~loc:l,
+      public_values,
+      after_call )
   else
     (* A call of a universal procedure returns its universal result, of which the value
        is the case of the call's witness. *)
@@ -1377,7 +1419,8 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
     let result = R.Expr.var ~loc:l (name ~loc:l x) in
     let v =
       Option.value_map universal ~default:result ~f:(fun (_, field) ->
-          R.Expr.field ~loc:l result (qualified_name ~loc:l field))
+          Option.value_map field ~default:result ~f:(fun field ->
+              R.Expr.field ~loc:l result (qualified_name ~loc:l field)))
     in
     let def =
       match ghosts with
@@ -1387,17 +1430,8 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
           @ ghost_decls
           @ [ R.Stmt.assign ~loc:l (result :: ghosts) (R.Stmt.expr_rhs callee) ]
     in
-    let* closing = closing v outcome_value in
-    (* A retry that raised committed the update with its result, which the function
-       returns. *)
-    let+ (carried : State.carried) = State.gets (fun (s : State.state) -> s.carried) in
-    let returned =
-      match (retry, outcome_value, carried.exit) with
-      | Some (au, _, _), Some _, Some { results = result :: _; _ } when au.has_result ->
-          [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs v) ]
-      | _ -> []
-    in
-    (stmts @ opening @ def @ closing @ returned @ propagation, v, public_values)
+    let+ closing = closing v outcome_value in
+    (stmts @ opening @ def @ closing @ propagation, v, public_values, after_call)
 
 (** The constructor argument [arg], with value [value], named and checked admissible if it
     is a nested constructor application. A literal's admissibility is then established one

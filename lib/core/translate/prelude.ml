@@ -188,6 +188,25 @@ let value_functors ?(integers = true) ?(lists = true) ?(options = true) ~tuple_a
     ~f:(fun (needed, member) -> Option.some_if needed member)
   @ List.map (List.dedup_and_sort tuple_arities ~compare:Int.compare) ~f:tuple
 
+(** The canonical carrier value used where an exception leaves no runtime result. *)
+let unspecified_value ~loc typ =
+  R.Expr.annotated
+    (R.Expr.call ~loc (R.Name.make ~loc ~path:[ "Ocaml$Unspecified" ] "value") [])
+    typ
+
+let unspecified_member =
+  let carrier = R.Type.named ~loc (R.Name.make ~loc "E") [] in
+  R.Member.module_ ~loc
+    ~params:[ (R.Ident.make ~loc "E", R.Name.make ~loc ~path:[ "Library" ] "Type") ]
+    (R.Ident.make ~loc "Ocaml$Unspecified")
+    [
+      R.Member.callable
+        (R.Callable.func ~loc ~inline:true
+           ~returns:[ R.Var.make ~loc (R.Ident.make ~loc "result") carrier ]
+           (R.Ident.make ~loc "value")
+           (Some (R.Expr.var ~loc (R.Name.make ~loc ~path:[ "E" ] "default"))));
+    ]
+
 let members : R.Member.t list =
   let a = var "a" and b = var "b" in
   let ocaml_div x y = R.Expr.call ~loc (R.Name.make ~loc div) [ x; y ] in
@@ -195,6 +214,7 @@ let members : R.Member.t list =
   let bound op n = R.Expr.binary ~loc op x (R.Expr.int ~loc n) in
   [
     value_signature;
+    unspecified_member;
     R.Member.callable
       (R.Callable.func ~loc ~inline:true
          ~formals:[ int_var "x" ]

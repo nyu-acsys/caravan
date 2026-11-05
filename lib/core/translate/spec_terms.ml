@@ -49,10 +49,17 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
           match (inference, method_, expected, env.ctx.given.current_polymorphic) with
           | Ok arguments, _, _, _ -> Ok arguments
           | Error _, "bind", None, Some current
-            when String.equal current.name generic.name
+            when Option.is_none signature.au_universal
+                 && String.equal current.name generic.name
                  && List.length current.scheme.variables = List.length generic.variables
             ->
               Ok current.scheme.variables
+          | Error _, "bind", None, _
+            when Option.equal String.equal env.ctx.given.current_procedure
+                   (Some signature.au_procedure) ->
+              if List.length signature.au_bind_arguments = List.length generic.variables
+              then Ok signature.au_bind_arguments
+              else inference
           | Error error, _, _, _ -> Error error
         in
         let* substitute =
@@ -66,7 +73,18 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
     concatenation. *)
 let rec term_type env (t : S.term) =
   match (t.term_desc, spine (S.chain t) []) with
-  | Tcast (_, ty), _ -> Result.ok (source_type env.ctx.given ~at:t.term_loc ty)
+  | Tcast (_, ty), _ ->
+      begin match source_type env.ctx.given ~at:t.term_loc ty with
+      | Ok ty -> Some ty
+      | Error _ ->
+          Result.ok
+            (Source.infer_logical_expression
+               ~type_variables:(source_type_variables env.ctx.given)
+               ~is_list:(is_list_term env) env.ctx.given.env
+               ~functions:(List.map env.funcs ~f:fst)
+               ~variables:(Logical_context.variables env)
+               t)
+      end
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
   | ( _,
@@ -347,6 +365,84 @@ let rec spec_pattern env (p : S.pat) (v : R.Expr.t) =
           Ok (conjoin (Some is_c :: conds), binds)
       end
 
+let spec_case_env env ?scrutinee ?scrutinee_type (p : S.pat) =
+  let types =
+    Option.value_map scrutinee_type ~default:[] ~f:(fun t -> pattern_types env p t)
+  in
+  let env = { env with var_types = types @ env.var_types } in
+  let env =
+    match (scrutinee, p.pat_desc) with
+    | Some { S.term_desc = Tvar (Qid source); _ }, Pconstr (q, None) ->
+        begin match find_constructor env q with
+        | Some (data, ctor) when Option.is_some data.witness ->
+            bind env source.pid_str
+              (Value
+                 (R.Expr.call ~loc:(loc p.pat_loc)
+                    (Datatypes.ctor_name ~loc:(loc p.pat_loc) data ctor)
+                    []))
+        | _ -> env
+        end
+    | _ -> env
+  in
+  (* A case of a match on a witness refines the types it selects, and reads the
+       variables of those types at the case's. *)
+  let refined =
+    match (scrutinee_type, p.pat_desc) with
+    | Some scrutinee, Pconstr ((Qid id | Qdot (_, id)), None) ->
+        Witnesses.contract_case ?universal:env.ctx.given.universal_result env.data
+          ~current:env.ctx.given.current_polymorphic ~scrutinee ~var_types:env.var_types
+          id.pid_str
+    | _ -> None
+  in
+  match refined with
+  | None -> env
+  | Some (aliases, reads) ->
+      let vars =
+        List.fold reads ~init:env.vars ~f:(fun vars (x, conversion) ->
+            let value =
+              match List.Assoc.find vars x ~equal:String.equal with
+              | Some (Raven y) ->
+                  Some (R.Expr.var ~loc:(loc p.pat_loc) (name ~loc:(loc p.pat_loc) y))
+              | Some (Value v) -> Some v
+              | Some (State _) | None -> None
+            in
+            Option.value_map value ~default:vars ~f:(fun value ->
+                ( x,
+                  Value
+                    (match conversion with
+                    | Witnesses.Conversion conversion ->
+                        R.Expr.call ~loc:(loc p.pat_loc)
+                          (Qualified_name.raven ~loc:(loc p.pat_loc)
+                             (Qualified_name.of_string conversion))
+                          [ value ]
+                    | Payload field ->
+                        R.Expr.field ~loc:(loc p.pat_loc) value
+                          (qualified_name ~loc:(loc p.pat_loc) field)) )
+                :: vars))
+      in
+      (* A universal result read by case has no OCaml type there that the contract's
+           other variables share: Raven types the payload. *)
+      let var_types =
+        List.map env.var_types ~f:(fun (x, t) ->
+            if
+              List.exists reads ~f:(fun (y, read) ->
+                  String.equal x y
+                  && match read with Witnesses.Payload _ -> true | Conversion _ -> false)
+            then (x, Ctype.newvar ())
+            else (x, Witnesses.refined_type aliases t))
+      in
+      {
+        env with
+        data = aliases @ env.data;
+        vars;
+        var_types;
+        ctx =
+          {
+            env.ctx with
+            given = { env.ctx.given with types = aliases @ env.ctx.given.types };
+          };
+      }
+
 let generic_operands env operands =
   let rec generic typ =
     match Datatypes.desc env.data typ with
@@ -428,6 +524,14 @@ let equality_check env (id : S.id) operator a b =
             "Physical equality on boxed values is unsupported in specifications"
   | _ -> Ok ()
 
+let atomic_backend_result signature =
+  match signature.au_universal with
+  | None -> signature.au_result
+  | Some universal ->
+      Ctype.newconstr
+        (Path.Pident (Option.value_exn universal.au_universal_result.id))
+        universal.au_result_arguments
+
 let instantiate_atomic_signature env ~at ?expected signature method_ args =
   let open State.Syntax in
   let* signature, instance =
@@ -438,7 +542,15 @@ let instantiate_atomic_signature env ~at ?expected signature method_ args =
   let* signature =
     match instance with
     | None -> State.return signature
+    | Some (_, _)
+      when Option.equal (List.equal Int.equal) signature.au_argument_projection (Some [])
+      ->
+        State.return signature
     | Some (generic, arguments) ->
+        let arguments =
+          Option.value_map signature.au_argument_projection ~default:arguments
+            ~f:(fun positions -> List.map positions ~f:(List.nth_exn arguments))
+        in
         let+ instance =
           State.value_instance env.ctx ~at ~target:generic.name ~arguments
         in
@@ -449,10 +561,11 @@ let instantiate_atomic_signature env ~at ?expected signature method_ args =
         }
   in
   let* () = State.note_call env.ctx.given signature.au_procedure in
+  let result = atomic_backend_result signature in
   let* () =
     State.note_families env.data
       (signature.au_token
-      :: (signature.au_inputs @ [ signature.au_result ] @ signature.au_ghost_outputs
+      :: (signature.au_inputs @ [ result ] @ signature.au_ghost_outputs
         @ signature.au_implicit))
   in
   State.return signature
@@ -663,6 +776,87 @@ let pending_registrations env ~at s field =
 
 (** Whether [t] matches on an exception that Caravan names by its key, as in the
     postconditions it makes for raised exceptions. *)
+let atomic_completion env ~at signature method_ args values =
+  let open State.Syntax in
+  if
+    not
+      (List.mem
+         [ "commit"; "committed"; "commit_raise"; "raised" ]
+         method_ ~equal:String.equal)
+  then State.return (values, None)
+  else
+    let l = loc at in
+    let source_type = atomic_backend_result signature in
+    let* result_type = State.typ env.ctx ~at source_type in
+    let universal = signature.au_universal in
+    match method_ with
+    | "commit_raise" | "raised" ->
+        State.return
+          ( values,
+            Option.some_if signature.au_returns_value
+              (Prelude.unspecified_value ~loc:l result_type) )
+    | "commit" | "committed" ->
+        begin match universal with
+        | None -> State.return (values, None)
+        | Some universal ->
+            let witness = List.nth_exn args (universal.au_witness_position + 1) in
+            let tag =
+              match witness.S.term_desc with
+              | Tvar (Qid id) when is_constructor id.pid_str -> Some id.pid_str
+              | Tvar (Qdot (_, id)) when is_constructor id.pid_str -> Some id.pid_str
+              | Tvar (Qid id) ->
+                  Option.bind (List.Assoc.find env.vars id.pid_str ~equal:String.equal)
+                    ~f:(function
+                    | Value value ->
+                        List.find_map universal.au_universal_result.ctors
+                          ~f:(fun result_ctor ->
+                            let constructor = S.Qid (S.mk_id ~loc:at result_ctor.ocaml) in
+                            Option.bind (find_constructor env constructor)
+                              ~f:(fun (tag, ctor) ->
+                                Option.some_if
+                                  (R.Expr.alpha_equal value
+                                     (R.Expr.call ~loc:l
+                                        (Datatypes.ctor_name ~loc:l tag ctor)
+                                        []))
+                                  result_ctor.ocaml))
+                    | Raven _ | State _ -> None)
+              | _ -> None
+            in
+            let inputs, outputs =
+              List.split_n values (List.length signature.au_inputs + 1)
+            in
+            begin match (tag, outputs) with
+            | Some tag, result :: ghosts ->
+                let* ctor =
+                  State.of_result
+                    (Report.expect ~at "The result case of a universal atomic update"
+                       (List.find universal.au_universal_result.ctors ~f:(fun ctor ->
+                            String.equal ctor.ocaml tag)))
+                in
+                let result =
+                  R.Expr.annotated
+                    (R.Expr.call ~loc:l
+                       (Datatypes.ctor_name ~loc:l universal.au_universal_result ctor)
+                       [ result ])
+                    result_type
+                in
+                State.return (inputs @ (result :: ghosts), None)
+            | _ ->
+                begin match Datatypes.desc env.data signature.au_result with
+                | Tconstr (Pident id, _, _)
+                  when Option.exists universal.au_universal_result.id ~f:(Ident.same id)
+                  ->
+                    State.return (values, None)
+                | _ ->
+                    State.of_result
+                      (unsupported at
+                         "A universal atomic update completion without a known witness \
+                          constructor")
+                end
+            end
+        end
+    | _ -> State.return (values, None)
+
 let rec names_exception_by_key (t : S.term) =
   let rec in_pattern (p : S.pat) =
     match p.pat_desc with
@@ -925,7 +1119,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let* scrutinee_type =
         State.of_result (Result.map (equality_term_type env scrutinee) ~f:Option.some)
       in
-      spec_match env ~at ?scrutinee_type v cases
+      spec_match env ~at ~scrutinee ?scrutinee_type v cases
   | Tattr (_, t) -> formula env t
   | Tcast (t, ty) ->
       let* ty = State.of_result (source_type env.ctx.given ~at ty) in
@@ -1195,7 +1389,7 @@ and application env (t : S.term) =
   | Tvar q, args when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
       begin match (method_, atomic_inputs signature method_) with
-      | ("pending" | "committed"), Some _ ->
+      | ("pending" | "committed" | "raised"), Some _ ->
           let* signature = instantiate_atomic_signature env ~at signature method_ args in
           let* inputs, _ =
             State.of_result
@@ -1203,11 +1397,25 @@ and application env (t : S.term) =
                  ("The signature of AU method " ^ method_)
                  (atomic_inputs signature method_))
           in
-          let+ values = typed_arguments env ~at inputs args in
-          let values = atomic_arguments ~loc:l signature method_ values in
+          let* values = typed_arguments env ~at inputs args in
+          let* raising =
+            if signature.au_raises then
+              let+ typ = State.typ env.ctx ~at outcome_type in
+              Some typ
+            else State.return None
+          in
+          let* values, raised_result =
+            atomic_completion env ~at signature method_ args values
+          in
+          let values =
+            atomic_arguments ~loc:l ?raising ?raised_result signature method_ values
+          in
           let procedure = qualified_name ~loc:l signature.au_procedure in
-          if String.equal method_ "pending" then R.Expr.au ~loc:l procedure values
-          else R.Expr.au_commit ~loc:l procedure values
+          let result =
+            if String.equal method_ "pending" then R.Expr.au ~loc:l procedure values
+            else R.Expr.au_commit ~loc:l procedure values
+          in
+          State.return result
       | _ ->
           State.of_result
             (error at "An AU operation is only allowed in a proof expression")
@@ -1732,7 +1940,11 @@ and constructor ?expected env (t : S.term) args =
               expected_formula env (Some typ) argument)
         else State.all args ~f:(formula env)
       in
-      let value = R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data ctor) args in
+      let value =
+        match shared_exception env.ctx ctor with
+        | Some app -> shared_exception_call ~loc:l app "make" ctor args
+        | None -> R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data ctor) args
+      in
       begin match expected with
       | Some expected when not (List.is_empty data.parameters) ->
           let+ typ = State.typ env.ctx ~at expected in
@@ -1794,74 +2006,8 @@ and record ?expected env (t : S.term) base updates =
 
 (** A match on the value [v] in a contract: a Raven match if the cases are flat, and
     otherwise conditional expressions, whose last case is not tested. *)
-and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
+and spec_match env ~at ?scrutinee ?scrutinee_type v (cases : (S.pat * S.term) list) =
   let l = loc at in
-  (* The environment of a case's body, with the types of its pattern's variables. *)
-  let typed env (p : S.pat) =
-    let types =
-      Option.value_map scrutinee_type ~default:[] ~f:(fun t -> pattern_types env p t)
-    in
-    let env = { env with var_types = types @ env.var_types } in
-    (* A case of a match on a witness refines the types it selects, and reads the
-       variables of those types at the case's. *)
-    let refined =
-      match (scrutinee_type, p.pat_desc) with
-      | Some scrutinee, Pconstr ((Qid id | Qdot (_, id)), None) ->
-          Witnesses.contract_case ?universal:env.ctx.given.universal_result env.data
-            ~current:env.ctx.given.current_polymorphic ~scrutinee ~var_types:env.var_types
-            id.pid_str
-      | _ -> None
-    in
-    match refined with
-    | None -> env
-    | Some (aliases, reads) ->
-        let vars =
-          List.fold reads ~init:env.vars ~f:(fun vars (x, conversion) ->
-              let value =
-                match List.Assoc.find vars x ~equal:String.equal with
-                | Some (Raven y) -> Some (R.Expr.var ~loc:l (name ~loc:l y))
-                | Some (Value v) -> Some v
-                | Some (State _) | None -> None
-              in
-              Option.value_map value ~default:vars ~f:(fun value ->
-                  ( x,
-                    Value
-                      (match conversion with
-                      | Witnesses.Conversion conversion ->
-                          R.Expr.call ~loc:l
-                            (Qualified_name.raven ~loc:l
-                               (Qualified_name.of_string conversion))
-                            [ value ]
-                      | Payload field ->
-                          R.Expr.field ~loc:l value (qualified_name ~loc:l field)) )
-                  :: vars))
-        in
-        (* A universal result read by case has no OCaml type there that the contract's
-           other variables share: Raven types the payload. *)
-        let var_types =
-          List.map env.var_types ~f:(fun (x, t) ->
-              if
-                List.exists reads ~f:(fun (y, read) ->
-                    String.equal x y
-                    &&
-                    match read with
-                    | Witnesses.Payload _ -> true
-                    | Conversion _ -> false)
-              then (x, Ctype.newvar ())
-              else (x, t))
-        in
-        {
-          env with
-          data = aliases @ env.data;
-          vars;
-          var_types;
-          ctx =
-            {
-              env.ctx with
-              given = { env.ctx.given with types = aliases @ env.ctx.given.types };
-            };
-        }
-  in
   let flat_arg (p : S.pat) =
     match p.pat_desc with Pwild -> Some None | Pid id -> Some (Some id) | _ -> None
   in
@@ -1898,7 +2044,9 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
               Option.value_map id ~default:env ~f:(fun id ->
                   bind env id.S.pid_str (Value v))
             in
-            let+ body = quantified (typed env p) body in
+            let+ body =
+              quantified (spec_case_env env ?scrutinee ?scrutinee_type p) body
+            in
             (R.Expr.Default, body)
         | `Ctor ((c : Datatypes.ctor), args), (p, body) ->
             if env.logical_definition then begin
@@ -1907,7 +2055,9 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
                 List.fold bindings ~init:env ~f:(fun env (x, value) ->
                     bind env x (Value value))
               in
-              let+ body = quantified (typed env p) body in
+              let+ body =
+                quantified (spec_case_env env ?scrutinee ?scrutinee_type p) body
+              in
               ( R.Expr.Case
                   (ident ~loc:l c.raven, List.map args ~f:(fun _ -> ident ~loc:l "_")),
                 body )
@@ -1922,7 +2072,9 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
                   | None -> env
                   | Some (id : S.id) -> bind env id.pid_str (Raven id.pid_str))
               in
-              let+ body = quantified (typed env p) body in
+              let+ body =
+                quantified (spec_case_env env ?scrutinee ?scrutinee_type p) body
+              in
               (R.Expr.Case (ident ~loc:l c.raven, List.map args ~f:var), body)
             end
       in
@@ -1931,8 +2083,8 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
   | None ->
       let case_body p binds body =
         quantified
-          (List.fold binds ~init:(typed env p) ~f:(fun env (x, value) ->
-               bind env x (Value value)))
+          (List.fold binds ~init:(spec_case_env env ?scrutinee ?scrutinee_type p)
+             ~f:(fun env (x, value) -> bind env x (Value value)))
           body
       in
       let rec chain = function

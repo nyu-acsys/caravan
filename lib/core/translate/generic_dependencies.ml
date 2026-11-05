@@ -206,7 +206,18 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
     List.find_map workers ~f:(fun worker ->
         Option.some_if (String.equal worker.Generic_parameters.key key) worker.name)
   in
-  let au_worker au = runtime_path au.Source.au_operation_path in
+  let au_worker (au : Source.proof_au) =
+    match
+      List.find decls.atomic_operations ~f:(fun (actual, _) ->
+          Source.au_has_path actual au.au_path
+          || Path.same actual.au_token_path au.au_token_path)
+    with
+    | None -> runtime_path au.au_operation_path
+    | Some (_, operation) ->
+        Option.first_some
+          (runtime_path (Path.Pident operation.id))
+          (List.find_map operation.paths ~f:runtime_path)
+  in
   let resource_worker resource = worker_key resource.Source.resource_backend in
   let model_worker data =
     Option.map data.Datatypes.family ~f:(fun family -> family.Datatypes.worker)

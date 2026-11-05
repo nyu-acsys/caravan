@@ -575,6 +575,11 @@ or more ghost results, it yields `(runtime_result, ghost_results)`, where
 multiple ghost results form a tuple. A stateful call scope can pass its current
 state as the ghost input and return a new state after the call.
 
+For a call that may raise and has no declared ghost results, binding
+`let (result, outcome) = invoke inputs` also exposes its outcome as an `exn option`.
+The scope can complete its ghost restoration before the exception propagates;
+the attached call still returns or raises exactly as the implementation does.
+
 Manual and automatic proofs share runtime translation, primitive implementations,
 and ghost-expression lowering. Raven checks permissions, invariant closure,
 atomicity, and contracts; Caravan checks the annotation shape that preserves the
@@ -600,6 +605,11 @@ For example, an operation with one ghost input and output uses
 `Read.access token cell expected` and
 `Read.commit token cell expected result seen`. A unit runtime result is still
 passed as `()`, separately from any unit-valued ghost result.
+
+For operations with exceptional contracts, `Read.commit_raise token cell exception_`
+establishes the exceptional postcondition. `Read.raised token cell exception_`
+describes its completed resource. These methods take any declared ghost results
+after the exception, in the same order as `commit`.
 
 For example, with `contents cell value` defined as `own cell value`:
 
@@ -634,8 +644,8 @@ without a separate abort-restoration proof at that primitive call.
 
 The [List/segment Michael–Scott queue](test/saturn/michael_scott_queue_lseg/)
 combines these features in a complete manual proof. Its FIFO contracts cover
-`create`, `of_list`, `push`, `pop_opt`, and `is_empty`, including the empty-check
-helping protocol; the recursive enqueue/tail helpers are also checked.
+all nine public operations, including helping for `is_empty` and `peek_as` and
+the `Empty` exception; the recursive enqueue/tail helpers are also checked.
 The proof uses algebraic lists, heap segments, and monotone fact snapshots.
 It retains explicit witnesses and resource updates as a reference for future
 automation. The original sequence/history queue remains a separate case study in

@@ -154,9 +154,96 @@ let contract_names (f : func) (header : S.header option) n =
         let* args = all h.hd_args ~f:arg in
         Ok (result, args)
 
+(** The source identities of locally abstract variables inside the implementation. *)
+let body_type_projection ~parameters (f : func) =
+  let arguments =
+    List.map parameters ~f:(fun parameter ->
+        match Types.get_desc parameter with
+        | Tunivar (Some name) ->
+            begin match Env.find_type_by_name (Longident.Lident name) f.body.exp_env with
+            | path, _ -> Ctype.newconstr path []
+            | exception Stdlib.Not_found -> parameter
+            end
+        | _ -> parameter)
+  in
+  Option.value_exn (Datatypes.substitution parameters arguments)
+
+(** Checked source signatures retain annotation variable names when native instances have
+    anonymous compiler variables. Nominal normalization is confined to recovering this
+    correspondence, not specification compatibility. *)
+let declared_type_variables ~types ~parameters (f : func) =
+  let body_type = body_type_projection ~parameters f in
+  let rec normalize typ =
+    let typ = Datatypes.expand types typ in
+    match Types.get_desc typ with
+    | Tvar _ | Tunivar _ -> typ
+    | Tconstr (path, arguments, _) ->
+        let path =
+          Option.value_map (Datatypes.find types path) ~default:path ~f:(fun data ->
+              Option.value_map data.id ~default:path ~f:(fun id -> Path.Pident id))
+        in
+        Ctype.newconstr path (List.map arguments ~f:normalize)
+    | desc -> Ctype.newty (Btype.copy_type_desc normalize desc)
+  in
+  let named scheme =
+    List.filter_map scheme.Polymorphic_functions.variables ~f:(fun typ ->
+        match Types.get_desc typ with
+        | Tvar (Some name) | Tunivar (Some name) -> Some (name, typ)
+        | _ -> None)
+  in
+  let declared (view : Module_inventory.signature_value) =
+    let variables = ref [] in
+    let typ self (typ : Typedtree.core_type) =
+      begin match typ.ctyp_desc with
+      | Ttyp_var name -> variables := (name, typ.ctyp_type) :: !variables
+      | _ -> ()
+      end;
+      Tast_iterator.default_iterator.typ self typ
+    in
+    let iterator = { Tast_iterator.default_iterator with typ } in
+    iterator.typ iterator view.declaration.val_desc;
+    let variables = List.rev !variables in
+    let related =
+      Compiler_types.map_group
+        (view.declaration.val_desc.ctyp_type :: List.map variables ~f:snd)
+        ~f:(Subst.type_expr view.substitution)
+    in
+    ( List.hd_exn related,
+      List.map2_exn variables (List.tl_exn related) ~f:(fun (name, _) typ -> (name, typ))
+    )
+  in
+  let candidates =
+    Option.to_list
+      (Option.map f.source_scheme ~f:(fun scheme -> (scheme.typ, named scheme)))
+    @ List.map f.signature_sites ~f:declared
+  in
+  List.find_map candidates ~f:(fun (declaration, names) ->
+      if List.is_empty names then None
+      else
+        let correspondence =
+          let* scheme =
+            Polymorphic_functions.discover ~expand:normalize ~at:f.loc declaration
+          in
+          let* arguments =
+            Polymorphic_functions.instantiate ~expand:normalize ~at:f.loc scheme
+              ~declaration ~occurrence:f.scheme_type
+          in
+          Ok
+            (List.filter_map names ~f:(fun (name, typ) ->
+                 Option.map
+                   (List.findi scheme.variables ~f:(fun _ variable ->
+                        Types.eq_type variable typ))
+                   ~f:(fun (position, _) ->
+                     (name, body_type (List.nth_exn arguments position)))))
+        in
+        match correspondence with
+        | Ok (_ :: _ as variables) -> Some variables
+        | Ok [] | Error _ -> None)
+  |> Option.value ~default:[]
+
 (** Ghost header variables are inferred from the native signature and checked contract
     expressions, independently of the compiler's choice of variable names. *)
-let ghost_signature ?(flexible = []) ~parameters (f : func) =
+let ghost_signature ?(flexible = []) ~types ~parameters (f : func) =
   let inputs = ghost_params f in
   let outputs = ghost_results f in
   let declarations = inputs @ outputs in
@@ -240,17 +327,24 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
         @ contract.atomic_ensures)
   in
   let constraints = List.concat_map terms ~f:constraints in
-  (* In a universal procedure, the terms on the witness have results of each
-     constructor's types, which say nothing of the ghost variables. *)
+  (* Witness-selected results do not constrain ghost header types. *)
+  let* witness =
+    match f.universal with
+    | Some _ -> Ok None
+    | None -> Witnesses.parameter types ~at:f.loc ~variables:parameters f.params
+  in
+  let witness_names =
+    Option.value_map witness ~default:[] ~f:(fun witness ->
+        Option.to_list (Option.join (List.nth argument_names witness.parameter)))
+    @ Option.value_map f.universal ~default:[] ~f:(fun universal ->
+        [ Ident.name universal.witness ])
+  in
   let constraints =
-    match Option.map f.universal ~f:(fun universal -> universal.witness) with
-    | None -> constraints
-    | Some witness ->
-        List.filter constraints ~f:(fun term ->
-            not
-              (List.exists (term_references [] term) ~f:(function
-                | S.Qid id -> String.equal id.pid_str (Ident.name witness)
-                | Qdot _ -> false)))
+    List.filter constraints ~f:(fun term ->
+        not
+          (List.exists (term_references [] term) ~f:(function
+            | S.Qid id -> List.mem witness_names id.pid_str ~equal:String.equal
+            | Qdot _ -> false)))
   in
   let witnesses =
     List.concat_map constraints ~f:(term_references [])
@@ -266,6 +360,12 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
   in
   let inputs, outputs = List.split_n declarations (List.length inputs) in
   let named = List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ)) in
+  let body_type = body_type_projection ~parameters f in
+  let variables =
+    List.map variables ~f:(fun (name, typ) -> (name, body_type typ))
+    @ declared_type_variables ~types ~parameters f
+    |> List.stable_dedup ~compare:(fun (left, _) (right, _) -> String.compare left right)
+  in
   Ok (named inputs, named outputs, variables, specialization)
 
 (** The parameters of [f]: their OCaml and Raven names, unless unit, their range, and
@@ -371,12 +471,16 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
     Option.bind ctx.given.current_procedure ~f:(fun procedure ->
         List.Assoc.find ctx.given.procedure_signatures procedure ~equal:String.equal)
   in
+  let body_type =
+    Option.value_map signature ~default:Fn.id ~f:(fun signature ->
+        body_type_projection ~parameters:signature.procedure_parameters f)
+  in
   let declared_type select id annotation =
     match
       Option.bind signature ~f:(fun signature ->
           List.Assoc.find (select signature) id.S.pid_str ~equal:String.equal)
     with
-    | Some typ -> Ok typ
+    | Some typ -> Ok (body_type typ)
     | None -> source_type ctx.given ~at:id.pid_loc annotation
   in
   let header = Option.bind f.contract ~f:(fun c -> c.header) in
@@ -783,6 +887,18 @@ let rec uses ctx env ~(at : Location.t) make (t : S.term) =
 let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implicit ~pres
     ~posts ~past_results =
   let open State.Syntax in
+  let* exceptional_result =
+    match (result, raising) with
+    | Some result, Some _ ->
+        let* typ =
+          State.of_result
+            (Report.expect ~at "The atomic operation's result type"
+               (List.Assoc.find env.var_types result ~equal:String.equal))
+        in
+        let+ typ = State.typ ctx ~at typ in
+        Some (Prelude.unspecified_value ~loc:(loc at) typ)
+    | _ -> State.return None
+  in
   let* phi = State.fresh "phi" in
   let au_call ~l f args =
     R.Expr.call ~loc:l (name ~loc:l f) (R.Expr.var ~loc:l (name ~loc:l phi) :: args)
@@ -899,6 +1015,15 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
               | Returned -> no_exception ~loc:l typ
               | Raised (e, _) -> raised_exception ~loc:l typ e
               | Outcome o -> o)
+        in
+        let value =
+          match (exceptional_result, raising, outcome) with
+          | Some default, _, Raised _ -> default
+          | Some default, Some typ, Outcome outcome ->
+              R.Expr.ite ~loc:l
+                (R.Expr.binary ~loc:l Eq outcome (no_exception ~loc:l typ))
+                value default
+          | _ -> value
         in
         let value =
           match (au.ghost_results, outcome_value) with
@@ -1922,7 +2047,13 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
          None)
   end
   else
-    (* Raising leaves the function with its other results as they are. *)
+    (* Exceptional returns have no normal result; its carrier value is canonical. *)
+    let* exceptional_result =
+      if Option.is_some raising && not (List.is_empty returns) then
+        let+ typ = State.typ ctx ~at:f.loc f.body.exp_type in
+        Some (Prelude.unspecified_value ~loc:l typ)
+      else State.return None
+    in
     let* () =
       State.modify_carried (fun c ->
           {
@@ -1932,8 +2063,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                   let raises_terms = raises_terms allowed in
                   {
                     State.results =
-                      (if List.is_empty returns then []
-                       else [ R.Expr.var ~loc:l (name ~loc:l result) ])
+                      Option.to_list exceptional_result
                       @ List.map ghost_returns ~f:(fun (_, raven, _) ->
                           R.Expr.var ~loc:l (name ~loc:l raven));
                     allowed;

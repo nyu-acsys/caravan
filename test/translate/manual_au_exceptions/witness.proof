@@ -1,0 +1,44 @@
+predicate contents (cell : 'a Atomic.t) (value [@implicit] : 'a) = own cell value
+
+module Read = Ghost.AU (struct let operation = read_as end)
+
+type 'a saved =
+  | Saved_value of ('a, 'a) Read.token
+  | Saved_option of ('a, 'a option) Read.token
+
+let saved : (Ghost.t, 'a saved) Ghost.field = Ghost.field ()
+
+lemma preserve_value (cell : 'a Atomic.t) (token : ('a, 'a) Read.token) (value : 'a)
+  requires (Read.committed token cell Value value)
+  ensures (Read.committed token cell Value value) = ()
+
+proof result = atomic read_as cell kind
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && match kind with
+    | Value -> result === value
+    | Option -> result === Some value) =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    let value = Read.access token cell kind in
+    unfold contents cell value;
+    let result = step () in
+    fold contents cell value;
+    let request = match kind with
+      | Value -> Saved_value token
+      | Option -> Saved_option token in
+    let registration = Ghost.alloc [Ghost.init saved request] in
+    begin match kind with
+    | Value ->
+        Read.commit token cell kind result;
+        preserve_value cell token result
+    | Option -> Read.commit token cell kind (Some result)
+    end;
+    result)
+
+proof result = atomic read_value cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && result === value) = ()
+
+proof result = atomic read_option cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && result === Some value) = ()

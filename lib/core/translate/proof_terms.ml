@@ -415,7 +415,10 @@ let atomic_proof_signature env t =
   match head.S.term_desc with
   | Tvar q ->
       Option.bind (atomic_method env q) ~f:(fun (signature, method_) ->
-          if List.mem [ "bind"; "access"; "abort"; "commit" ] method_ ~equal:String.equal
+          if
+            List.mem
+              [ "bind"; "access"; "abort"; "commit"; "commit_raise" ]
+              method_ ~equal:String.equal
           then
             Option.map (atomic_inputs signature method_) ~f:(fun (inputs, outputs) ->
                 {
@@ -452,16 +455,25 @@ let proof_call ?expected env t =
         else State.return ()
       in
       let l = loc t.term_loc in
+      let* raising =
+        if signature.au_raises then
+          let+ typ = State.typ env.ctx ~at:t.term_loc outcome_type in
+          Some typ
+        else State.return None
+      in
+      let* values, raised_result =
+        atomic_completion env ~at:t.term_loc signature method_ args values
+      in
       let values =
         if String.equal method_ "bind" then []
-        else atomic_arguments ~loc:l signature method_ values
+        else atomic_arguments ~loc:l ?raising ?raised_result signature method_ values
       in
       let method_ =
         match method_ with
         | "bind" -> "bindAU"
         | "access" -> "openAU"
         | "abort" -> "abortAU"
-        | "commit" -> "commitAU"
+        | "commit" | "commit_raise" -> "commitAU"
         | _ -> method_
       in
       State.return (R.Expr.call ~loc:l (name ~loc:l method_) values, outputs)
@@ -567,7 +579,16 @@ let ghost_initializers env ~owner t =
                      in
                      match specialize None with
                      | Ok _ as field -> field
-                     | Error _ -> specialize (term_type env value))
+                     | Error _ ->
+                         let value_type =
+                           match (term_type env value, value.term_desc) with
+                           | None, Tcast (_, annotation) ->
+                               Result.map
+                                 (source_type env.ctx.given ~at:value.term_loc annotation)
+                                 ~f:Option.some
+                           | value_type, _ -> Ok value_type
+                         in
+                         Result.bind value_type ~f:specialize)
                 in
                 let* field =
                   match instance with
@@ -1015,8 +1036,7 @@ let rec proof_result_types ?expected env (body : S.proof_expr) =
               Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env p)
             in
             let branch_env =
-              List.fold types
-                ~init:{ env with var_types = types @ env.var_types }
+              List.fold types ~init:(spec_case_env env ~scrutinee ?scrutinee_type p)
                 ~f:(fun env (x, _) -> bind env x (Raven x))
             in
             proof_result_types ?expected branch_env body)
@@ -1274,17 +1294,20 @@ let rec proof_expression env targets (body : S.proof_expr) =
                        (Printf.sprintf "Duplicate proof variable %s" x))
             in
             let* condition, bindings = State.of_result (spec_pattern env pattern value) in
-            let types =
-              Option.value_map scrutinee_type ~default:[] ~f:(pattern_types env pattern)
-            in
             let branch_env =
               List.fold bindings
-                ~init:{ env with var_types = types @ env.var_types }
+                ~init:(spec_case_env env ~scrutinee ?scrutinee_type pattern)
                 ~f:(fun env (x, value) -> bind env x (Value value))
             in
             let* branch = proof_expression branch_env targets body in
             begin match condition with
             | None -> State.return branch
+            | Some condition when List.is_empty rest ->
+                let+ check =
+                  State.check ~at:pattern.pat_loc "This match may not be exhaustive"
+                    condition
+                in
+                check :: branch
             | Some condition ->
                 let+ rest = chain rest in
                 [ R.Stmt.if_ ~loc:l condition branch rest ]
@@ -1447,6 +1470,29 @@ let nested_stateful_read access_proofs e =
       Ok (Option.some_if (outer && inner) argument)
   | _ -> Ok None
 
+(** An extra result pattern explicitly requests the exception outcome of a call. *)
+let access_captures_outcome annotation ~outputs =
+  let* scope = Annotation.scope annotation in
+  let rec captures (pattern : S.pat) =
+    match pattern.pat_desc with
+    | Ptuple [ _; _ ] -> outputs = 0
+    | Pcast (pattern, _) -> captures pattern
+    | _ -> false
+  in
+  let rec binding (body : S.proof_expr) =
+    match body.proof_desc with
+    | Proof_let (pattern, { proof_desc = Proof_value term; _ }, rest) ->
+        begin match spine term [] with
+        | { term_desc = Tvar (Qid operation); _ }, [ _ ]
+          when String.equal operation.pid_str scope.scope_operation.pid_str ->
+            captures pattern
+        | _ -> binding rest
+        end
+    | Proof_let (_, _, rest) | Proof_seq (_, rest) -> binding rest
+    | _ -> false
+  in
+  Ok (binding scope.scope_body)
+
 (** A checked wrapper invokes the original operation once: its statements, and the value
     of the operation, which [run] gives. *)
 let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
@@ -1581,7 +1627,7 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
         in
         let* argument = expected_formula env (Some (packed_type input_types)) argument in
         let arguments = unpacked_value ~loc:(loc rhs.proof_loc) input_types argument in
-        let* statements, result, outputs = run arguments in
+        let* statements, result, outputs, after_call = run arguments in
         let result_value, result_ty =
           if List.is_empty output_types then (result, result_type)
           else
@@ -1605,7 +1651,7 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
                      (List.mem (pat_names pattern) operation.pid_str ~equal:String.equal))
                 ~result_name:id.pid_str ~result_visible:true rest
             in
-            (statements @ rest, result)
+            (statements @ rest @ after_call, result)
         end
     | Proof_let (pattern, rhs, rest) ->
         let* () = reject_operation visible rhs in

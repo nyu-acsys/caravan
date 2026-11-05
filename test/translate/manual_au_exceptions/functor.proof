@@ -1,0 +1,21 @@
+module Make () = struct
+  module Read = Ghost.AU (struct let operation = read end)
+
+  proof result = atomic read cell
+    atomic requires (own cell value)
+    atomic ensures (own cell value && match value with
+      | None -> false
+      | Some expected -> result === expected)
+    atomic raises Empty -> (own cell None) =
+    at (Atomic.get cell) (fun step ->
+      let token = Read.bind () in
+      let value = Read.access token cell in
+      let result = step () in
+      begin match result with
+      | None ->
+          Read.commit_raise token cell Empty;
+          assert (Read.raised token cell Empty)
+      | Some expected -> Read.commit token cell expected
+      end;
+      result)
+end

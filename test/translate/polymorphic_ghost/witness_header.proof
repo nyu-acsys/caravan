@@ -1,0 +1,27 @@
+predicate contents (q : 'a container) (value [@implicit] : 'a) = own q.cell value
+
+module Read = Ghost.AU (struct let operation = read_as end)
+
+proof result = atomic read_as [q : 'a container] cell poly
+  requires (cell == q.cell)
+  atomic requires (contents q value)
+  atomic ensures (contents q value && match poly with
+    | Option -> result === Some value
+    | Value -> result === value
+    | Unit -> true) =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    let value = Read.access token cell poly q in
+    unfold contents q value;
+    let result = step () in
+    fold contents q value;
+    begin match poly with
+    | Option -> Read.commit token cell poly q (Some result)
+    | Value -> Read.commit token cell poly q result
+    | Unit -> Read.commit token cell poly q ()
+    end;
+    result)
+
+proof result = both q
+  requires (contents q expected)
+  ensures (contents q expected && result === (Some expected, expected, ())) = ()

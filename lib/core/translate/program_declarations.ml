@@ -172,7 +172,7 @@ let specialize_continuations (scopes : Program_scopes.t) =
                   ~at:f.loc f.scheme_type
               in
               let* _, _, _, specialization =
-                Procedures.ghost_signature ~flexible:local.variables
+                Procedures.ghost_signature ~flexible:local.variables ~types:scopes.types
                   ~parameters:source_scheme.variables f
               in
               let specialization =
@@ -1000,7 +1000,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               worker.Polymorphic_functions.scheme.variables)
         in
         let* procedure_inputs, procedure_outputs, procedure_variables, _ =
-          Procedures.ghost_signature ~parameters:procedure_parameters f
+          Procedures.ghost_signature ~types ~parameters:procedure_parameters f
         in
         Ok
           ( proc_name f,
@@ -1047,8 +1047,14 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           match au_plan au with
           | None ->
               Option.first_some
-                (List.find funcs ~f:(fun f ->
-                     List.mem f.paths au.au_operation_path ~equal:Path.same))
+                (Option.first_some
+                   (List.find funcs ~f:(fun f ->
+                        List.mem f.paths au.au_operation_path ~equal:Path.same))
+                   (List.find_map scopes.specialized ~f:(fun specialized ->
+                        Option.some_if
+                          (List.mem specialized.Specializations.original.paths
+                             au.au_operation_path ~equal:Path.same)
+                          specialized.universal)))
                 (applied_atomic_operation au)
           | Some plan ->
               Option.bind (Generic_proofs.function_id plan au.au_operation_path)
@@ -1061,8 +1067,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             error au.au_at "An AU facade requires a logically atomic contract"
         | Some f -> Ok (au, f))
   in
-  let token_types =
-    List.map atomic_operations ~f:(fun (au, f) ->
+  let* token_types =
+    all atomic_operations ~f:(fun (au, f) ->
         let data =
           Datatypes.with_paths
             (Datatypes.atomic_token ~path:au.Source.au_token_path
@@ -1077,8 +1083,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           applied_function_worker ~generics ~polymorphic_functions ~groups
             ~canonical:Fn.id f
         with
-        | None -> data
+        | None -> Ok { data with parameters = au.au_parameters }
         | Some worker ->
+            let* argument_projection =
+              Specializations.argument_projection ~at:f.loc scopes.specialized worker
+            in
             let scope =
               match (au.au_application, Generic_modules.member generics f.id) with
               | Some _, Some (_, application, _) ->
@@ -1088,21 +1097,43 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               | Some _, None | None, _ -> (Qualified_name.of_string worker.name).path
             in
             let member = "Token$" ^ au.au_name in
-            {
-              data with
-              parameters = au.au_parameters;
-              mathematical = true;
-              family =
-                Some
-                  {
-                    Datatypes.worker = worker.name;
-                    member;
-                    dictionary = "Values$" ^ member;
-                    scope;
-                  };
-            })
+            Ok
+              {
+                data with
+                parameters = au.au_parameters;
+                mathematical = true;
+                family =
+                  Some
+                    {
+                      Datatypes.worker = worker.name;
+                      member;
+                      dictionary = "Values$" ^ member;
+                      scope;
+                      argument_projection;
+                    };
+              })
   in
-  let generic_models = Generic_proofs.model_types source inventory generic_proofs in
+  let dependent_generic_models =
+    List.concat_map generic_proofs ~f:(fun plan ->
+        List.filter_map (Generic_proofs.models source plan) ~f:(fun data ->
+            Option.some_if
+              (Generic_models.dependent (token_types @ types) data)
+              ( plan,
+                Generic_models.decorate family_plan
+                  (Generic_proofs.model_descriptor data
+                     ~owner:(String.split plan.group.name ~on:'.')) )))
+  in
+  let generic_model_representation plan data =
+    List.find_map dependent_generic_models ~f:(fun (owner, representation) ->
+        Option.some_if
+          (phys_equal owner plan
+          && Poly.equal representation.Datatypes.at data.Datatypes.at)
+          representation)
+  in
+  let generic_models =
+    Generic_proofs.model_types ~representation:generic_model_representation source
+      inventory generic_proofs
+  in
   let generic_model data =
     List.exists generic_proofs ~f:(fun plan ->
         List.exists (Generic_proofs.models source plan) ~f:(fun model ->
@@ -1128,16 +1159,33 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         in
         Ok
           (List.filter_map (Generic_proofs.runtime_types plan) ~f:(fun declaration ->
-               Option.map
-                 (List.find layouts ~f:(fun descriptor ->
-                      Option.exists descriptor.Datatypes.id ~f:(fun id ->
-                          String.equal (Ident.name id) declaration.Typedtree.typ_name.txt)
-                      && Poly.equal descriptor.at declaration.typ_loc))
-                 ~f:(fun descriptor ->
+               let witness = Datatypes.is_witness_declaration declaration in
+               let descriptor =
+                 if witness then
+                   Option.bind
+                     (Generic_proofs.matching_type declaration
+                        plan.group.representative.declarations) ~f:(fun actual ->
+                       Option.first_some
+                         (Datatypes.find types (Path.Pident actual.typ_id))
+                         (Datatypes.find types
+                            (Path.Pdot
+                               (plan.group.representative.identity, actual.typ_name.txt))))
+                 else
+                   List.find layouts ~f:(fun descriptor ->
+                       Option.exists descriptor.Datatypes.id ~f:(fun id ->
+                           String.equal (Ident.name id) declaration.Typedtree.typ_name.txt)
+                       && Poly.equal descriptor.at declaration.typ_loc)
+               in
+               Option.map descriptor ~f:(fun descriptor ->
                    {
                      descriptor with
                      id = Some declaration.typ_id;
-                     paths = [];
+                     paths =
+                       (if witness then
+                          Option.to_list
+                            (Option.map plan.scope.owner ~f:(fun owner ->
+                                 Path.Pdot (owner, declaration.typ_name.txt)))
+                        else []);
                      library = None;
                    }))))
     |> Result.map ~f:List.concat
@@ -1166,7 +1214,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           (List.exists dependent_models ~f:(fun model ->
                String.equal (Generic_models.name model) (Generic_models.name data))))
   in
-  let* generic_model_workers = all dependent_models ~f:(Generic_models.members types) in
+  let* generic_model_workers =
+    all
+      (List.map dependent_generic_models ~f:snd @ dependent_models)
+      ~f:(Generic_models.members types)
+  in
   (* Each data type's module, given the ones declared before it; a record type that is a
      reference has fields instead. *)
   let* modules =

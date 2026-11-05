@@ -65,6 +65,7 @@ let decorate_resource resource =
             member = member_name;
             dictionary;
             scope = (Qualified_name.of_string worker.name).path;
+            argument_projection = None;
           }
       in
       let descriptor =
