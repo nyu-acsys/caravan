@@ -9,7 +9,8 @@ let clamp (x : int) lo hi = if x < lo then lo else if x > hi then hi else x
 
 let is_even n = n mod 2 = 0
 (*@ b = is_even n
-    ensures b <-> exists k: int. n = 2 * k
+    ensures b <-> n mod 2 = 0
+    ensures (exists k: int. n = 2 * k) -> b
     ensures not b -> n mod 2 <> 0 *)
 
 let succ_pos n = n + 1
