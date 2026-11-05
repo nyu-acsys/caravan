@@ -1,4 +1,9 @@
 (test
+ (name interface_dependencies)
+ (modules interface_dependencies)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
  (name diagnostics)
  (modules diagnostics)
  (libraries caravan_core compiler-libs.common raven-ivl.api))

@@ -1348,7 +1348,8 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let expected =
                       Compiler_types.map_group raw ~f:(fun typ ->
                           Subst.type_expr check_projection
-                            (Subst.type_expr constraint_.substitution typ))
+                            (Subst.type_expr constraint_.substitution
+                               (Subst.type_expr formal.substitution typ)))
                     in
                     let* equal =
                       Signature_contract.compiler ~at (fun () ->

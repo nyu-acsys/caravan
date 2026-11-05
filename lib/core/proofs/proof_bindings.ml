@@ -761,7 +761,9 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                       ~default:constraint_.substitution
                   in
                   let signature =
-                    Compiler_types.map_group signature ~f:(Subst.type_expr substitution)
+                    Compiler_types.map_group signature ~f:(fun typ ->
+                        Subst.type_expr substitution
+                          (Subst.type_expr formal.substitution typ))
                   in
                   let* scheme =
                     Generic_parameters.discover ~key:view_name.pid_str
@@ -818,7 +820,9 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                 Option.value_map scope.owner ~default:projection ~f:(fun owner ->
                     signature_type_projection projection owner signature)
               in
-              Ok (Compiler_types.map_group types ~f:(Subst.type_expr projection))
+              Ok
+                (Compiler_types.map_group types ~f:(fun typ ->
+                     Subst.type_expr projection (Subst.type_expr formal.substitution typ)))
         in
         let base =
           String.uncapitalize

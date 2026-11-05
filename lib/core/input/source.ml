@@ -441,13 +441,19 @@ let load ?(include_dirs = []) (file : string) : (t, Report.error) Result.t =
     (* Caravan reports what OCaml warns about that matters to it, as a non-exhaustive match. *)
     let (_ : Warnings.alert option) = Warnings.parse_options false "-a" in
     let env = Compmisc.initial_env () in
+    let libraries =
+      List.map (library_files ~include_dirs file) ~f:(fun file ->
+          ( String.capitalize Stdlib.Filename.(remove_extension (basename file)),
+            load_interface file ))
+    in
+    let* libraries =
+      Interface_dependencies.order libraries ~name:fst
+        ~signature:(fun (_, interface) -> interface.signature)
+        ~at:(fun (_, interface) -> interface.scope.location)
+    in
     let env, libraries =
-      List.fold (library_files ~include_dirs file) ~init:(env, [])
-        ~f:(fun (env, libraries) f ->
-          let library = load_interface f in
-          let library_name =
-            String.capitalize Stdlib.Filename.(remove_extension (basename f))
-          in
+      List.fold libraries ~init:(env, [])
+        ~f:(fun (env, libraries) (library_name, library) ->
           let declaration =
             Ast_helper.Sig.module_
               (Ast_helper.Md.mk

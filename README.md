@@ -85,11 +85,13 @@ A client in the same source file uses the module's concrete type encoding.
 Clients verified against interface-only dependencies use abstract types instead.
 
 Imported interfaces can expose nested modules with ordinary or logically atomic
-contracts. The module client in
+contracts. Signature `include` inherits types, nested modules, predicates, invariants,
+and function contracts from local or imported signatures. Includes of signatures
+with abstract proof modules remain unsupported. The module client in
 [`test/examples/module_stack_drain`](test/examples/module_stack_drain)
 uses these contracts through an alias of the stack module.
 
-Recursive and local modules, `open`, `include`, and module
+Recursive and local modules, `open`, structure `include`, and module
 initialization expressions are not supported yet. Specification calls through
 constrained module signatures, nested implementation predicates, and shared-state
 declarations remain outside this module support.

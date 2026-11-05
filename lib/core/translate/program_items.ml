@@ -29,6 +29,11 @@ let items source (inventory : Module_inventory.t) =
             in
             Ok
               (List.map constraint_.signature.signature_values ~f:(fun (_, value) ->
+                   let parameters =
+                     Compiler_types.map_group parameters ~f:(fun typ ->
+                         Subst.type_expr value.origin_projection
+                           (Subst.type_expr resource.substitution typ))
+                   in
                    (value.declaration.val_id, name, parameters)))))
   in
   let signature_predicates = List.concat (List.concat signature_predicates) in

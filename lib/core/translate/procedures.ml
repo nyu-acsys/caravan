@@ -2204,26 +2204,16 @@ let marked_after ?scope (annotations : Annotation.t list) kind ~(item_loc : Loca
 let trusted_after ?scope annotations = marked_after ?scope annotations Annotation.Trusted
 let manual_after ?scope annotations = marked_after ?scope annotations Annotation.Manual
 
-(** The contracts of the values of [interface], by their names: an annotation after the
-    value's declaration. *)
-let interface_contracts (interface : Source.interface) =
-  let annotations = Annotation.of_comments interface.interface_comments in
-  let items = interface.signature in
-  let nexts =
-    List.map (List.drop items 1) ~f:(fun (i : Parsetree.signature_item) ->
-        Some i.psig_loc)
-    @ if List.is_empty items then [] else [ None ]
-  in
+(** Imported contracts retain the declaration site of their source signature. *)
+let library_contracts (library : Library_modules.t) =
   let* contracts =
-    all (List.zip_exn items nexts) ~f:(fun ((item : Parsetree.signature_item), next) ->
-        match item.psig_desc with
-        | Psig_value vd ->
-            let* contract =
-              contract_after ~scope:interface.scope annotations ~item_loc:item.psig_loc
-                ~next
-            in
-            Ok (Option.map contract ~f:(fun c -> (vd.pval_name.txt, (c, item.psig_loc))))
-        | _ -> Ok None)
+    all library.signature.signature_values ~f:(fun (name, value) ->
+        let site = value.Module_inventory.site in
+        let* contract =
+          contract_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+            ~next:site.next
+        in
+        Ok (Option.map contract ~f:(fun contract -> (name, (contract, site.item_loc)))))
   in
   Ok (List.filter_opt contracts)
 
@@ -2236,7 +2226,7 @@ let raising_contract (contract : S.contract) =
 let raising_library_calls (libraries : Library_modules.t list) =
   List.concat_map libraries ~f:(fun lib ->
       Option.value_map
-        (Result.ok (interface_contracts lib.library))
+        (Result.ok (library_contracts lib))
         ~default:[]
         ~f:(fun contracts ->
           List.filter_map contracts ~f:(fun (name, (contract, _)) ->

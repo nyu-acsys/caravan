@@ -16,6 +16,7 @@ type signature_value = {
   declaration : Typedtree.value_description;
   site : site;
   substitution : Subst.t;  (** Signature identities qualified for this implementation. *)
+  origin_projection : Subst.t;  (** Exported identities in the annotation's source view. *)
 }
 
 type value = {
@@ -36,6 +37,7 @@ type signature_resource = {
   declaration : Caravan_spec.Spec_ast.predicate;
   declaration_id : Ident.t;
   site : site;
+  substitution : Subst.t;
 }
 
 type signature_ghost_module = {
@@ -140,6 +142,7 @@ type t = {
   bindings : checked_binding list;
   specializations : specialization list;
   constraints : resource_constraint list;
+  library_signatures : (Source.library * signature_view) list;
 }
 
 type module_view = {
@@ -202,6 +205,152 @@ let bind bindings name value =
   (name, value) :: List.Assoc.remove bindings name ~equal:String.equal
 
 let member bindings name = List.Assoc.find bindings name ~equal:String.equal
+
+(** Preserve source annotation environments while rebinding an include's exports. *)
+let rec include_signature ~at ~environment ~origin_projection substitution expanded
+    signature =
+  let named find name = List.find_map expanded ~f:(fun item -> find name item) in
+  let type_member =
+    named (fun name -> function
+      | Types.Sig_type (id, declaration, _, _) when String.equal name (Ident.name id) ->
+          Some (id, declaration)
+      | _ -> None)
+  in
+  let module_member =
+    named (fun name -> function
+      | Types.Sig_module (id, _, declaration, _, _) when String.equal name (Ident.name id)
+        ->
+          Some (id, declaration)
+      | _ -> None)
+  in
+  let modtype_member =
+    named (fun name -> function
+      | Types.Sig_modtype (id, declaration, _) when String.equal name (Ident.name id) ->
+          Some declaration
+      | _ -> None)
+  in
+  let missing name =
+    Error (Report.error Type at ("Missing expanded signature member " ^ name))
+  in
+  let* () =
+    match signature.signature_ghost_modules with
+    | [] -> Ok ()
+    | _ -> Report.unsupported at "An include of a signature with abstract proof modules"
+  in
+  let* substitution =
+    List.fold_result signature.signature_types ~init:substitution
+      ~f:(fun substitution (name, declaration) ->
+        match type_member name with
+        | None -> missing name
+        | Some (id, _) ->
+            Ok (Subst.add_type declaration.typ_id (Path.Pident id) substitution))
+  in
+  let origin_projection =
+    List.fold signature.signature_types ~init:origin_projection
+      ~f:(fun projection (name, declaration) ->
+        match type_member name with
+        | None -> projection
+        | Some (id, _) -> Subst.add_type id (Path.Pident declaration.typ_id) projection)
+  in
+  let* substitution =
+    List.fold_result signature.signature_modules ~init:substitution
+      ~f:(fun substitution (name, nested) ->
+        match (nested.signature_id, module_member name) with
+        | Some old, Some (id, _) ->
+            Ok (Subst.add_module old (Path.Pident id) substitution)
+        | None, Some _ -> Ok substitution
+        | _, None -> missing name)
+  in
+  let origin_projection =
+    List.fold signature.signature_modules ~init:origin_projection
+      ~f:(fun projection (name, nested) ->
+        match (nested.signature_id, module_member name) with
+        | Some old, Some (id, _) -> Subst.add_module id (Path.Pident old) projection
+        | None, _ | _, None -> projection)
+  in
+  let* signature_types =
+    List.map signature.signature_types ~f:(fun (name, declaration) ->
+        match type_member name with
+        | None -> missing name
+        | Some (typ_id, typ_type) -> Ok (name, { declaration with typ_id; typ_type }))
+    |> Result.all
+  in
+  let nested body signature =
+    match Mtype.scrape environment body with
+    | Types.Mty_signature expanded ->
+        include_signature ~at ~environment ~origin_projection substitution expanded
+          signature
+    | _ -> Report.unsupported at "An unexpanded included module signature"
+  in
+  let* signature_modules =
+    List.map signature.signature_modules ~f:(fun (name, signature) ->
+        match module_member name with
+        | None -> missing name
+        | Some (id, declaration) ->
+            let* signature_body =
+              match signature.signature_alias with
+              | Some _ -> Ok signature.signature_body
+              | None -> nested declaration.md_type signature.signature_body
+            in
+            Ok
+              ( name,
+                {
+                  signature_id = Some id;
+                  signature_body;
+                  signature_alias =
+                    Option.map signature.signature_alias
+                      ~f:(Subst.module_path substitution);
+                } ))
+    |> Result.all
+  in
+  let* signature_modtypes =
+    List.map signature.signature_modtypes ~f:(fun (name, signature) ->
+        match modtype_member name with
+        | Some { mtd_type = Some body; _ } ->
+            let* signature = nested body signature in
+            Ok (name, signature)
+        | Some { mtd_type = None; _ } | None -> missing name)
+    |> Result.all
+  in
+  Ok
+    {
+      signature with
+      signature_types;
+      signature_modules;
+      signature_modtypes;
+      signature_values =
+        List.map signature.signature_values ~f:(fun (name, value) ->
+            ( name,
+              {
+                value with
+                substitution = Subst.compose value.substitution substitution;
+                origin_projection =
+                  Subst.compose origin_projection value.origin_projection;
+              } ));
+      signature_resources =
+        List.map signature.signature_resources ~f:(fun (name, resource) ->
+            ( name,
+              {
+                resource with
+                declaration_id = Ident.create_local name;
+                substitution = Subst.compose resource.substitution substitution;
+              } ));
+    }
+
+let merge_signature view included =
+  let merge left right =
+    List.fold right ~init:left ~f:(fun bindings (name, value) -> bind bindings name value)
+  in
+  {
+    signature_values = merge view.signature_values (List.rev included.signature_values);
+    signature_types = merge view.signature_types (List.rev included.signature_types);
+    signature_resources = merge view.signature_resources included.signature_resources;
+    signature_ghost_modules =
+      merge view.signature_ghost_modules included.signature_ghost_modules;
+    signature_modules = merge view.signature_modules (List.rev included.signature_modules);
+    signature_modtypes =
+      merge view.signature_modtypes (List.rev included.signature_modtypes);
+  }
 
 let add_path paths path =
   if List.mem paths path ~equal:Path.same then paths else paths @ [ path ]
@@ -325,6 +474,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             imported_signatures := { named; annotations } :: !imported_signatures;
             Option.iter named.mtd_type ~f:(imported_type annotations)
         | Tsig_module declaration -> imported_type annotations declaration.md_type
+        | Tsig_include declaration -> imported_type annotations declaration.incl_mod
         | _ -> ())
   in
   List.iter source.libraries ~f:(fun library ->
@@ -400,41 +550,40 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           match item.sig_desc with
           | Tsig_module declaration -> Some declaration.md_loc
           | Tsig_modtype declaration -> Some declaration.mtd_loc
+          | Tsig_include declaration -> Some declaration.incl_loc
           | _ -> None)
     in
     let annotations = annotations_in declaration_scope children annotations in
     let* () =
-      if imported then Ok ()
-      else
-        List.fold_result annotations ~init:() ~f:(fun () annotation ->
-            match Annotation.kind annotation with
-            | Contract ->
-                let rec attached = function
-                  | [] -> false
-                  | (item : Typedtree.signature_item) :: rest ->
-                      let next =
-                        Option.map (List.hd rest) ~f:(fun item -> item.Typedtree.sig_loc)
-                      in
-                      (match item.sig_desc with
-                        | Tsig_value _ ->
-                            Declaration_scope.following ~scope:declaration_scope
-                              ~item_loc:item.sig_loc ~next annotation.loc
-                        | _ -> false)
-                      || attached rest
-                in
-                if attached signature.sig_items then Ok ()
-                else
-                  Error
-                    (Report.error Type annotation.loc
-                       "This contract is outside a signature value declaration")
-            | Predicate | Ghost_module -> Ok ()
-            | Loop when Annotation.invariant_declaration annotation -> Ok ()
-            | Loop | Ghost | Scope | Returns | Proof | Manual | Linearization | Initially
-            | Initializes | Trusted ->
-                if shared then Ok ()
-                else
-                  unavailable annotation.loc
-                    "A declaration annotation in a nested module signature")
+      List.fold_result annotations ~init:() ~f:(fun () annotation ->
+          match Annotation.kind annotation with
+          | Contract ->
+              let rec attached = function
+                | [] -> false
+                | (item : Typedtree.signature_item) :: rest ->
+                    let next =
+                      Option.map (List.hd rest) ~f:(fun item -> item.Typedtree.sig_loc)
+                    in
+                    (match item.sig_desc with
+                      | Tsig_value _ ->
+                          Declaration_scope.following ~scope:declaration_scope
+                            ~item_loc:item.sig_loc ~next annotation.loc
+                      | _ -> false)
+                    || attached rest
+              in
+              if attached signature.sig_items then Ok ()
+              else
+                Error
+                  (Report.error Type annotation.loc
+                     "This contract is outside a signature value declaration")
+          | Predicate | Ghost_module -> Ok ()
+          | Loop when Annotation.invariant_declaration annotation -> Ok ()
+          | Loop | Ghost | Scope | Returns | Proof | Manual | Linearization | Initially
+          | Initializes | Trusted ->
+              if shared then Ok ()
+              else
+                unavailable annotation.loc
+                  "A declaration annotation in a nested module signature")
     in
     let rec items ghost_declarations view = function
       | [] -> Ok view
@@ -460,7 +609,14 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           let* view =
             match item.sig_desc with
             | Tsig_value declaration ->
-                let value = { declaration; site; substitution = Subst.identity } in
+                let value =
+                  {
+                    declaration;
+                    site;
+                    substitution = Subst.identity;
+                    origin_projection = Subst.identity;
+                  }
+                in
                 Ok
                   {
                     view with
@@ -533,8 +689,35 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 end
             | Tsig_attribute _ -> Ok view
             | Tsig_open _ -> unavailable item.sig_loc "An open in a module signature"
-            | Tsig_include _ ->
-                unavailable item.sig_loc "An include in a module signature"
+            | Tsig_include declaration ->
+                let* included =
+                  signature_type ~imported all_annotations declaration.incl_mod
+                in
+                let* included =
+                  include_signature ~at:declaration.incl_loc ~environment
+                    ~origin_projection:Subst.identity Subst.identity declaration.incl_type
+                    included
+                in
+                let* () =
+                  List.fold_result included.signature_resources ~init:()
+                    ~f:(fun () (name, _) ->
+                      match member view.signature_resources name with
+                      | None -> Ok ()
+                      | Some _ ->
+                          Error
+                            (Report.error Type declaration.incl_loc
+                               ("The included resource " ^ name ^ " is already declared")))
+                in
+                List.iter included.signature_modules ~f:(fun (_, nested) ->
+                    Option.iter nested.signature_id ~f:(fun id ->
+                        publish_signature (Path.Pident id) nested.signature_body));
+                List.iter declaration.incl_type ~f:(function
+                  | Types.Sig_modtype (id, _, _) ->
+                      Option.iter
+                        (member included.signature_modtypes (Ident.name id))
+                        ~f:(register modtypes (Path.Pident id))
+                  | _ -> ());
+                Ok (merge_signature view included)
             | Tsig_recmodule _ -> unavailable item.sig_loc "Recursive signature modules"
             | Tsig_typesubst _ | Tsig_modsubst _ | Tsig_modtypesubst _ ->
                 unavailable item.sig_loc "A substitution in a module signature"
@@ -576,8 +759,18 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 declaration;
                 declaration_id = Ident.create_local declaration.pred_name.pid_str;
                 site;
+                substitution = Subst.identity;
               } ))
       |> Result.all
+    in
+    let* () =
+      List.fold_result signature_resources ~init:[] ~f:(fun names (name, resource) ->
+          if List.mem names name ~equal:String.equal then
+            Error
+              (Report.error Type resource.site.item_loc
+                 ("The signature resource " ^ name ^ " is already declared"))
+          else Ok (name :: names))
+      |> Result.map ~f:(fun _ -> ())
     in
     let* signature_ghost_modules =
       List.filter annotations ~f:(fun annotation ->
@@ -680,8 +873,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
         | Some target -> register aliases path (Subst.module_path substitution target)
         | None -> signature_aliases substitution path nested.signature_body)
   in
-  let* () =
-    List.fold_result source.libraries ~init:() ~f:(fun () library ->
+  let* library_signatures =
+    List.map source.libraries ~f:(fun library ->
         match library.Source.library.typed_signature with
         | None ->
             unavailable library.library.scope.location "An untyped imported signature"
@@ -694,7 +887,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             let path = Path.Pident library.library_id in
             publish_signature path signature;
             signature_aliases Subst.identity path signature;
-            Ok ())
+            Ok (library, signature))
+    |> Result.all
   in
   let actual_ghost_resource view name at =
     let rec owner_paths path =
@@ -829,7 +1023,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 let signature_value =
                   {
                     signature_value with
-                    substitution;
+                    substitution = Subst.compose signature_value.substitution substitution;
                     site = { signature_value.site with environment };
                   }
                 in
@@ -1587,6 +1781,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       aliases = List.rev !aliases;
       bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
       constraints = List.rev !constraints;
+      library_signatures;
       specializations =
         List.rev_map !specializations
           ~f:(fun

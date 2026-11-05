@@ -1522,7 +1522,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             Ok
               {
                 view with
-                types = Compiler_types.map_group raw ~f:(Subst.type_expr projection);
+                types =
+                  Compiler_types.map_group raw ~f:(fun typ ->
+                      Subst.type_expr projection (Subst.type_expr formal.substitution typ));
               }
         | _ -> Ok view)
   in
@@ -1668,20 +1670,21 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
      whose parameters' types are the library's own where it declares them. *)
   let* library_preds =
     all libraries ~f:(fun (lib : Library_modules.t) ->
-        let* environment = Library_modules.environment source lib in
-        all
-          (List.filter
-             (Annotation.of_comments lib.library.interface_comments)
-             ~f:(Annotation.predicate_declaration ~interface:true))
-          ~f:(fun a ->
-            let* p = Annotation.predicate a in
+        all lib.signature.signature_resources ~f:(fun (_, resource) ->
+            let p = resource.Module_inventory.declaration in
+            let at = p.S.pred_name.pid_loc in
             let* () =
               match p.pred_body with
-              | Some _ -> unsupported a.loc "A predicate of a library with a definition"
+              | Some _ -> unsupported at "A predicate of a library with a definition"
               | None -> Ok ()
             in
+            let environment = Source.annotation_env source resource.site.environment in
             let* types =
-              Source.ocaml_types environment ~at:a.loc (List.map p.pred_params ~f:snd)
+              Source.ocaml_types environment ~at (List.map p.pred_params ~f:snd)
+            in
+            let types =
+              Compiler_types.map_group types
+                ~f:(Library_modules.resource_type lib resource)
             in
             Ok (lib, p, types)))
   in
@@ -1733,45 +1736,36 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   let generic_predicates = generic_predicates @ List.filter_opt application_predicates in
   let* imported_functions =
     all libraries ~f:(fun lib ->
-        match lib.Library_modules.library.typed_signature with
-        | None ->
-            unsupported lib.library.scope.location
-              "An imported interface without typed declarations"
-        | Some signature ->
-            all signature.sig_items ~f:(fun item ->
-                match item.Typedtree.sig_desc with
-                | Tsig_value value ->
-                    let path = Path.Pdot (lib.library_path, value.val_name.txt) in
-                    let declaration = Env.find_value path source.env in
-                    let* scheme =
-                      Polymorphic_functions.discover ~expand:(Datatypes.expand types)
-                        ~at:value.val_loc declaration.val_type
-                    in
-                    if List.is_empty scheme.variables then Ok None
-                    else if
-                      not
-                        (match Datatypes.desc types declaration.val_type with
-                        | Tarrow _ -> true
-                        | _ -> false)
-                    then
-                      unsupported value.val_loc
-                        "Polymorphic values in imported interfaces"
-                    else
-                      Ok
-                        (Some
-                           Polymorphic_functions.
-                             {
-                               id = value.val_id;
-                               paths = [ path ];
-                               scheme;
-                               restriction = None;
-                               witness = None;
-                               name =
-                                 lib.library_name ^ "."
-                                 ^ Fresh_names.fresh ("Poly$" ^ value.val_name.txt);
-                               loc = value.val_loc;
-                             })
-                | _ -> Ok None))
+        all lib.Library_modules.signature.signature_values ~f:(fun (_, entry) ->
+            let value = entry.Module_inventory.declaration in
+            let path = Path.Pdot (lib.library_path, value.val_name.txt) in
+            let declaration = Env.find_value path source.env in
+            let* scheme =
+              Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                ~at:value.val_loc declaration.val_type
+            in
+            if List.is_empty scheme.variables then Ok None
+            else if
+              not
+                (match Datatypes.desc types declaration.val_type with
+                | Tarrow _ -> true
+                | _ -> false)
+            then unsupported value.val_loc "Polymorphic values in imported interfaces"
+            else
+              Ok
+                (Some
+                   Polymorphic_functions.
+                     {
+                       id = value.val_id;
+                       paths = [ path ];
+                       scheme;
+                       restriction = None;
+                       witness = None;
+                       name =
+                         lib.library_name ^ "."
+                         ^ Fresh_names.fresh ("Poly$" ^ value.val_name.txt);
+                       loc = value.val_loc;
+                     })))
   in
   let polymorphic_functions =
     polymorphic_functions @ List.filter_opt (List.concat imported_functions)

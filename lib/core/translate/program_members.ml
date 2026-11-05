@@ -264,68 +264,65 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           }
         in
         let* pred_members = State.of_result pred_members in
-        let* contracts = State.of_result (interface_contracts lib.library) in
+        let* contracts = State.of_result (library_contracts lib) in
         let+ value_members =
           State.in_procedure
-          @@ State.all lib.library.signature ~f:(fun (item : Parsetree.signature_item) ->
-              match item.psig_desc with
-              | Psig_value vd ->
-                  let at = vd.pval_loc in
-                  let x = vd.pval_name.txt in
-                  let value = Env.find_value (Pdot (lib.library_path, x)) source.env in
-                  let worker =
-                    Path_bindings.find library_registry (Pdot (lib.library_path, x))
-                  in
-                  let ctx =
-                    match worker with
-                    | None -> ctx
-                    | Some worker ->
-                        let types =
-                          List.mapi worker.scheme.variables ~f:(fun index variable ->
-                              Datatypes.variable_type ~variable
-                                ~owner:(String.split worker.name ~on:'.')
-                                ~parameter:("A" ^ Int.to_string index)
-                                ~at:worker.loc)
-                          @ types
-                        in
-                        {
-                          ctx with
-                          given =
-                            {
-                              ctx.given with
-                              types;
-                              primitive_namespace = String.split worker.name ~on:'.';
-                            };
-                        }
-                  in
-                  let rec arrows (t : Types.type_expr) =
-                    match Types.get_desc t with
-                    | Tarrow (Nolabel, a, r, _) ->
-                        let args, result = arrows r in
-                        (Datatypes.expand types a :: args, result)
-                    | Tpoly (t, []) -> arrows t
-                    | _ -> ([], t)
-                  in
-                  let args, result = arrows value.val_type in
-                  let contract =
-                    Option.map (List.Assoc.find contracts x ~equal:String.equal) ~f:fst
-                  in
-                  if Option.exists contract ~f:raising_contract then
-                    (* Its calls are rejected; see [raising_library_calls]. *)
-                    State.return ([], [])
-                  else
-                    let+ member =
-                      library_function ctx ~at ~name:x ~args ~result contract
+          @@ State.all lib.signature.signature_values ~f:(fun (x, signature) ->
+              let signature = Library_modules.value lib signature in
+              let at = signature.declaration.val_loc in
+              let value = Env.find_value (Pdot (lib.library_path, x)) source.env in
+              let worker =
+                Path_bindings.find library_registry (Pdot (lib.library_path, x))
+              in
+              let ctx =
+                match worker with
+                | None -> ctx
+                | Some worker ->
+                    let types =
+                      List.mapi worker.scheme.variables ~f:(fun index variable ->
+                          Datatypes.variable_type ~variable
+                            ~owner:(String.split worker.name ~on:'.')
+                            ~parameter:("A" ^ Int.to_string index)
+                            ~at:worker.loc)
+                      @ types
                     in
-                    let member = R.Member.free (R.Member.callable member) in
-                    begin match worker with
-                    | None -> ([ member ], [])
-                    | Some worker -> ([], [ (worker.name, [ member ]) ])
-                    end
-              | Psig_type _ | Psig_attribute _ | Psig_exception _ -> State.return ([], [])
-              | _ ->
-                  State.of_result
-                    (unsupported item.psig_loc "This item of a library's interface"))
+                    {
+                      ctx with
+                      given =
+                        {
+                          ctx.given with
+                          types;
+                          primitive_namespace = String.split worker.name ~on:'.';
+                        };
+                    }
+              in
+              let rec arrows (t : Types.type_expr) =
+                match Types.get_desc t with
+                | Tarrow (Nolabel, a, r, _) ->
+                    let args, result = arrows r in
+                    (Datatypes.expand types a :: args, result)
+                | Tpoly (t, []) -> arrows t
+                | _ -> ([], t)
+              in
+              let args, result = arrows value.val_type in
+              let contract =
+                Option.map (List.Assoc.find contracts x ~equal:String.equal) ~f:fst
+              in
+              let* () =
+                State.of_result
+                  (Option.value_map contract ~default:(Ok ()) ~f:(fun contract ->
+                       Signature_contract.lowerable source signature ~environment contract))
+              in
+              if Option.exists contract ~f:raising_contract then
+                (* Its calls are rejected; see [raising_library_calls]. *)
+                State.return ([], [])
+              else
+                let+ member = library_function ctx ~at ~name:x ~args ~result contract in
+                let member = R.Member.free (R.Member.callable member) in
+                begin match worker with
+                | None -> ([ member ], [])
+                | Some worker -> ([], [ (worker.name, [ member ]) ])
+                end)
         in
         let ordinary_predicates =
           List.filter_map pred_members ~f:(function
@@ -362,6 +359,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           let* ts =
             Proof_bindings.parameter_types environment formal.declaration.pred_params
           in
+          let ts =
+            Compiler_types.map_group ts ~f:(fun typ ->
+                Subst.type_expr signature.origin_projection
+                  (Subst.type_expr formal.substitution typ))
+          in
           Ok (formal.declaration, resource.resource_backend, ts))
     in
     let own_preds =
@@ -382,8 +384,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            ~f:(fun (_, formal) -> formal.Module_inventory.ghost_declaration))
         (Source.annotation_env source signature.site.environment)
     in
+    let types =
+      List.map view.view_types ~f:(fun data ->
+          Datatypes.with_paths data
+            (List.map
+               (data.Datatypes.paths
+               @ Option.to_list (Option.map data.id ~f:(fun id -> Path.Pident id)))
+               ~f:(Subst.type_path signature.origin_projection)))
+    in
     let ctx =
-      scoped_contract_context view.view_types ~shared ~environment
+      scoped_contract_context types ~shared ~environment
         ~proof_support:{ proof_support with strict_source_types = true }
         ~preds ~spec_funcs ~own_preds ~own_inputs:(List.filter_opt own_inputs)
         ~primitive_namespace ~generic_predicates ()
@@ -589,9 +599,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                               "A checked module argument without a supported operation \
                                contract")
                      | Some lib ->
-                         let* contracts =
-                           State.of_result (interface_contracts lib.library)
-                         in
+                         let* contracts = State.of_result (library_contracts lib) in
                          let contract =
                            Option.map
                              (List.Assoc.find contracts member ~equal:String.equal)
@@ -621,6 +629,23 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          in
                          let* environment =
                            State.of_result (Library_modules.environment source lib)
+                         in
+                         let* () =
+                           State.of_result
+                             (match
+                                ( contract,
+                                  List.Assoc.find lib.signature.signature_values member
+                                    ~equal:String.equal )
+                              with
+                             | Some contract, Some signature ->
+                                 Signature_contract.lowerable source
+                                   (Library_modules.value lib signature)
+                                   ~environment contract
+                             | None, _ -> Ok ()
+                             | Some _, None ->
+                                 unsupported at
+                                   "An imported module operation without a source \
+                                    declaration")
                          in
                          let actual_ctx =
                            scoped_contract_context types ~shared ~environment
@@ -676,7 +701,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                    Ctype.is_equal
                      (Source.annotation_env source binding.site.environment)
                      false
-                     [ Subst.type_expr view.view_actual_substitution a ]
+                     [
+                       Subst.type_expr view.view_actual_substitution
+                         (Subst.type_expr signature.substitution a);
+                     ]
                      [
                        Subst.type_expr binding.parameter_substitution
                          (Subst.type_expr actual_projection b);
@@ -807,6 +835,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let l = loc p.pred_name.pid_loc in
         let environment = Source.annotation_env source formal.site.environment in
         let* parameter_types = Proof_bindings.parameter_types environment p.pred_params in
+        let parameter_types =
+          Compiler_types.map_group parameter_types
+            ~f:(Subst.type_expr formal.substitution)
+        in
         let* vars =
           all (List.zip_exn p.pred_params parameter_types) ~f:(fun ((id, _), t) ->
               let* typ = Datatypes.typ view.view_types ~at:id.S.pid_loc t in

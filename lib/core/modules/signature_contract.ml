@@ -782,6 +782,13 @@ let lowerable source (view : Module_inventory.signature_value) ~environment
             | Sig_class_type (id, _, _, _)
             -> Ident.same root id))
   in
+  let signature_resource_path path =
+    Option.exists (root path) ~f:(fun id ->
+        List.exists source.Source.signature_resources ~f:(fun (_, resource) ->
+            Ident.same id resource.Source.resource_id
+            || Option.exists resource.resource_public ~f:(fun resource ->
+                Ident.same id resource.Source.resource_id)))
+  in
   let standard_library path =
     Option.exists (root path) ~f:(fun id ->
         Ident.persistent id
@@ -798,6 +805,12 @@ let lowerable source (view : Module_inventory.signature_value) ~environment
             | None -> Ok ()
             | Some path when proof_path path -> Ok ()
             | Some _ -> unavailable (S.qualid_loc q)
+            end
+        | Some path when signature_resource_path path ->
+            let expected = Subst.module_path view.substitution path in
+            begin match Source.value_path environment q with
+            | Some body when Path.same expected body -> Ok ()
+            | _ -> unavailable (S.qualid_loc q)
             end
         | Some path when proof_path path || standard_library path ->
             begin match Source.value_path environment q with

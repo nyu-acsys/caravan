@@ -615,6 +615,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                   let* raw =
                     Proof_bindings.parameter_types environment declaration.pred_params
                   in
+                  let raw =
+                    Compiler_types.map_group raw ~f:(Subst.type_expr formal.substitution)
+                  in
                   let projected =
                     Compiler_types.map_group raw ~f:(Subst.type_expr actual_substitution)
                   in
@@ -942,7 +945,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                         formal.declaration.pred_params
                     in
                     let ts =
-                      Compiler_types.map_group ts ~f:(Subst.type_expr substitution)
+                      Compiler_types.map_group ts ~f:(fun typ ->
+                          Subst.type_expr substitution
+                            (Subst.type_expr formal.substitution typ))
                     in
                     let* implicit = implicit_parameters formal.declaration in
                     let stem =

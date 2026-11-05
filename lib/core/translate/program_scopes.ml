@@ -277,16 +277,11 @@ let run (source : Source.t) : (t, error) Result.t =
         Option.map (definition_target binding) ~f:(fun _ -> binding.entry.name.pid_str))
   in
   let typed = inventory.structure in
-  let* libraries = Library_modules.flatten source.libraries in
+  let* libraries = Library_modules.flatten inventory.library_signatures in
 
   List.iter libraries ~f:(fun lib ->
-      List.iter lib.Library_modules.library.signature ~f:(fun item ->
-          match item.Parsetree.psig_desc with
-          | Psig_type (_, decls) ->
-              List.iter decls ~f:(fun decl ->
-                  Fresh_names.reserve
-                    [ lib.library_name ^ "_" ^ decl.Parsetree.ptype_name.txt ])
-          | _ -> ()));
+      List.iter lib.Library_modules.signature.signature_types ~f:(fun (name, _) ->
+          Fresh_names.reserve [ lib.library_name ^ "_" ^ name ]));
   let* types, funcs = items source inventory in
   let* lifted = all funcs ~f:(fun f -> local_functions ~source f annotations) in
   let lifted =
