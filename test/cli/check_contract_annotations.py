@@ -10,7 +10,7 @@ def source_slice(location):
     lines = pathlib.Path(location["file"]).read_bytes().splitlines(keepends=True)
     start = sum(map(len, lines[:location["start_line"] - 1])) + location["start_col"]
     end = sum(map(len, lines[:location["end_line"] - 1])) + location["end_col"]
-    return b"".join(lines)[start:end].decode("utf-8")
+    return b"".join(lines)[start:end].decode("utf-8").replace("\r\n", "\n")
 
 
 mode, path = sys.argv[1:]
@@ -87,7 +87,7 @@ else:
         assert report["errors"] == []
         assert len(annotations) == 1
         annotation = annotations[0]
-        assert annotation["source_loc"]["file"] == "./editor_contract_api.mli"
+        assert pathlib.Path(annotation["source_loc"]["file"]) == pathlib.Path("editor_contract_api.mli")
         assert annotation["clauses"][0]["text"] == "result = specified + 1"
     elif mode == "proof":
         assert report["errors"] == []

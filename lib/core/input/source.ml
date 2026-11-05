@@ -414,11 +414,15 @@ let library_files ~include_dirs file =
       (List.sort (Array.to_list (Stdlib.Sys.readdir dir)) ~compare:String.compare)
       ~f:(fun f ->
         let base = Stdlib.Filename.remove_extension f in
+        let path = Stdlib.Filename.concat dir f in
+        let path =
+          if Stdlib.Sys.win32 then String.tr path ~target:'\\' ~replacement:'/' else path
+        in
         Option.some_if
           (Stdlib.Filename.check_suffix f ".mli"
           && (not (String.equal base own))
           && not (Stdlib.Sys.file_exists (Stdlib.Filename.concat dir (base ^ ".ml"))))
-          (Stdlib.Filename.concat dir f))
+          path)
   in
   List.concat_map (Stdlib.Filename.dirname file :: include_dirs) ~f:in_dir
   |> List.stable_dedup ~compare:(fun f g ->

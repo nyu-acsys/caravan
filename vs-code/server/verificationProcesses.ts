@@ -61,21 +61,26 @@ export class VerificationProcesses {
 					stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe']
 				});
 				let failure: Error | undefined;
+				let inputFailure: Error | undefined;
 				const fail = (error: Error) => { failure ??= error; terminate(child); };
 				const abort = () => terminate(child);
 				signal.addEventListener('abort', abort, { once: true });
 				child.on('error', fail);
-				// A rejected command may close stdin before reading the request.
-				child.stdin?.on('error', error => {
-					if ((error as NodeJS.ErrnoException).code !== 'EPIPE') fail(error);
-				});
+				// Drain diagnostics before classifying a rejected request's stdin error.
+				child.stdin?.on('error', error => { inputFailure ??= error; });
 				const finish = listen(child, fail);
 				child.on('close', code => {
 					signal.removeEventListener('abort', abort);
 					if (signal.aborted) reject(new Error('Verification cancelled'));
 					else if (failure) reject(failure);
 					else {
-						try { resolve(finish(code)); } catch (error) { reject(error); }
+						try {
+							const result = finish(code);
+							if (inputFailure) reject(inputFailure);
+							else resolve(result);
+						} catch (error) {
+							reject(error);
+						}
 					}
 				});
 			});
@@ -158,7 +163,7 @@ export class VerificationProcesses {
 				const diagnostic = Buffer.concat(stderr).toString('utf8');
 				const plainDiagnostic = diagnostic.replace(/\x1b\[[0-9;:]*m/g, '');
 				if (lineBytes) throw new Error('Unterminated Caravan server frame');
-				if (!validFrames && code !== 0 &&
+				if (!validFrames && code !== null && code !== 0 &&
 					/\b(?:unknown|unrecognized)\s+option(?:\s*:\s*|\s+)[`'"]?--server(?:[`'".,:;!?]|\s|$)/i.test(plainDiagnostic)) {
 					throw new UnsupportedServerError(diagnostic.trim());
 				}

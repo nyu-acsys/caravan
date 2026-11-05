@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const childProcess = require('node:child_process');
 const { VerificationProcesses, UnsupportedServerError } = require('../out/server/verificationProcesses');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -174,9 +175,46 @@ test('unsupported server detection preserves colored stderr when a child exits w
 		// Fill the pipe so an immediate exit also exercises the stdin error handler.
 		await fs.writeFile(f.script, `require('node:fs').writeSync(2, ${JSON.stringify(diagnostic)}); process.exit(2);`);
 		await assert.rejects(f.serve(undefined, undefined, ['x'.repeat(1024 * 1024)]), error => {
-			assert.ok(error instanceof UnsupportedServerError);
+			assert.ok(error instanceof UnsupportedServerError, `${error.stack ?? error} (code: ${error.code})`);
 			assert.equal(error.message, diagnostic.trim());
 			return true;
 		});
+	}
+});
+
+test('stdin transport errors preserve explicit rejection diagnostics without broadening fallback', { timeout: 15000 }, async t => {
+	const spawn = childProcess.spawn;
+	let inputError;
+	t.mock.method(childProcess, 'spawn', (...args) => {
+		const child = spawn(...args);
+		if (Array.isArray(args[1]) && args[1].includes('--server')) {
+			queueMicrotask(() => child.stdin.emit('error', inputError));
+		}
+		return child;
+	});
+	for (const code of ['ECONNRESET', 'EOF']) {
+		inputError = Object.assign(new Error(`stdin ${code}`), { code });
+		const diagnostic = "caravan: unknown option '\u001b[1m--server\u001b[0m'.";
+		const rejected = await fixture(t, `setTimeout(() => { process.stderr.write(${JSON.stringify(diagnostic)}); process.exitCode=2; }, 20);`);
+		await assert.rejects(rejected.serve(), error => {
+			assert.ok(error instanceof UnsupportedServerError, `${error.stack ?? error} (code: ${error.code})`);
+			assert.equal(error.message, diagnostic);
+			return true;
+		});
+		const completed = await fixture(t, `final();`);
+		await assert.rejects(completed.serve(), error => error === inputError);
+		for (const body of [
+			`process.stderr.write('solver crashed'); process.exitCode=2;`,
+			`process.stderr.write('unknown option --server');`,
+			`partial('started'); process.stderr.write('unknown option --server'); process.exitCode=2;`,
+			`process.stdout.write('malformed\\n'); process.stderr.write('unknown option --server'); process.exitCode=2;`
+		]) {
+			const f = await fixture(t, body);
+			await assert.rejects(f.serve(), error => {
+				assert.ok(error instanceof Error && !(error instanceof UnsupportedServerError));
+				if (body.includes('solver crashed')) assert.match(error.message, /solver crashed/);
+				return true;
+			});
+		}
 	}
 });

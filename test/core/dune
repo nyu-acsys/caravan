@@ -67,3 +67,9 @@
   ../saturn/michael_scott_queue/michael_scott_queue.ml
   ../saturn/michael_scott_queue/michael_scott_queue.mli
   ../saturn/michael_scott_queue/michael_scott_queue_intf.mli))
+
+(test
+ (name source_paths)
+ (modules source_paths)
+ (libraries base caravan_core compiler-libs.common)
+ (deps source_paths_fixture.mli))

@@ -56,13 +56,15 @@ An incorrect model function or generic lemma is rejected.
 Generic logical functions remain declaration ordered and nonrecursive.
 
   $ cp models.ml models_forward.ml
-  $ sed '/  type model = Empty | Item of Cell.t/a\  let premature (cell : Cell.t) : bool = is_empty (Item cell)' models.proof > models_forward.proof
+  $ sed '/  type model = Empty | Item of Cell.t/a\
+  >   let premature (cell : Cell.t) : bool = is_empty (Item cell)' models.proof > models_forward.proof
   $ ! caravan --shh models_forward.ml > models_forward.out 2>&1
   $ grep -F 'A logical function can only call earlier logical definitions.' models_forward.out
   Type Error: A logical function can only call earlier logical definitions.
 
   $ cp models.ml models_recursive.ml
-  $ sed '/  type model = Empty | Item of Cell.t/a\  let circular (cell : Cell.t) : model = circular cell' models.proof > models_recursive.proof
+  $ sed '/  type model = Empty | Item of Cell.t/a\
+  >   let circular (cell : Cell.t) : model = circular cell' models.proof > models_recursive.proof
   $ ! caravan --shh models_recursive.ml > models_recursive.out 2>&1
   $ grep -F 'A logical function can only call earlier logical definitions.' models_recursive.out
   Type Error: A logical function can only call earlier logical definitions.
