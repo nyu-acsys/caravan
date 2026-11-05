@@ -100,3 +100,74 @@ lemma expose_built_chain (head : 'a node Atomic.t Atomic.t option)
         ()
   in
   cells
+
+proof create =
+  initially { cells = [ next ]; values = []; head = 0; tail = 0 }
+
+(* Read observations that linearize immediately or wait for a linking action. *)
+proof is_empty =
+  at (Atomic.get head) returning c ->
+    if c != s.cells.(length s.values) then commit false
+    else wait in s.waiting on c;
+  at (Atomic.get (Atomic.get head)) returning Nil -> commit true
+
+proof of_list =
+  proof result = build_next xs
+    requires (own tail_ Nil)
+    ensures (own tail_ Nil && built_chain result tail_ xs) = begin
+    on return fold built_chain result tail_ xs
+  end;
+  initially
+    let cell_list = expose_built_chain (Some q.head) tail_ list in
+    { cells = to_sequence cell_list; values = to_sequence list;
+      head = 0; tail = List.length list }
+
+proof r = atomic pop_as [q : 'a t] head backoff poly
+  requires (is_queue q)
+  requires (head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (match poly with
+    | Option ->
+        if length xs = 0 then r = None && queue q xs
+        else r === Some xs.(0) && queue q (drop 1 xs)
+    | Value -> length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
+    | Unit -> length xs > 0 && queue q (drop 1 xs))
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+    && length xs = 0 && queue q xs) =
+  at (Atomic.get old_head) returning Nil -> commit
+
+proof r = atomic peek_as [q : 'a t] head poly
+  requires (is_queue q)
+  requires (head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (queue q xs && match poly with
+    | Option -> if length xs = 0 then r === None else r === Some xs.(0)
+    | Value -> length xs > 0 && r === xs.(0)
+    | Unit -> length xs > 0)
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+    && length xs = 0 && queue q xs) =
+  at (Atomic.get head) returning c ->
+    if c != s.cells.(length s.values) then
+      commit
+        (match poly with
+        | Option -> Some s.values.(s.head)
+        | Value -> s.values.(s.head)
+        | Unit -> ())
+    else wait in s.peeking on c;
+  at (Atomic.get old_head) returning Nil -> commit
+
+proof fix_tail [q : 'a t] tail new_tail
+  requires (is_queue q)
+  requires (tail == q.tail)
+  requires (past (mem new_tail s.cells)) = ()
+
+proof push =
+  proof find_tail_and_enq curr_end node
+    continues push
+    requires (past (mem curr_end s.cells))
+    requires (node === Next (v, c) && own c Nil)
+    ensures (past (mem c s.cells)) = begin
+    ()
+  end

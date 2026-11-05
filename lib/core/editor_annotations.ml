@@ -96,7 +96,7 @@ let contracts (scopes : Program_scopes.t) =
 let proof_steps (scopes : Program_scopes.t) =
   List.filter_map scopes.source.outline_annotations ~f:(fun (annotation : Annotation.t) ->
       match (annotation.origin, Annotation.kind annotation) with
-      | Some origin, (Scope | Proof | Linearization | Initializes) ->
+      | Some origin, (Scope | Proof | Linearization | Initially | Initializes) ->
           Some
             (Proof_step
                { loc = annotation.loc; source_loc = origin.loc; text = annotation.text })

@@ -25,3 +25,9 @@ history queue preserves Saturn's interface text and documentation, with Caravan
 annotations inserted beside its declarations. The segment variant exposes its
 currently verified subset with a list-valued specification. These interfaces are
 excluded from `ocamlformat` to preserve their upstream formatting.
+
+The history queue implementation is the unchanged file from Saturn commit
+`50d8d9d0a99b40434ab05bee49200cd5ffa028f5`; its annotations live in the companion
+proof and interfaces. The source-parity regression checks its exact bytes and
+the original interface bytes after removing inserted annotations. Formatting
+excludes this implementation too, and its source files use LF line endings.

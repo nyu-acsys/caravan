@@ -23,9 +23,9 @@ Incorrect initial contents fail at the exposing lemma's precondition.
   $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue.ml > wrong_contents/michael_scott_queue.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue.ml
-  [Error] File "wrong_contents/michael_scott_queue.ml", line 147, columns 18-61:
-  147 |   let cell_list = expose_built_chain (Some q.head) tail_ list in
-                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  [Error] File "wrong_contents/michael_scott_queue.proof", line 121, columns 20-63:
+  121 |     let cell_list = expose_built_chain (Some q.head) tail_ list in
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: A precondition may not hold for this call.
   File "wrong_contents/michael_scott_queue.proof", line 75, columns 29-64:
   75 |   requires (own limit Nil && built_chain first limit items cells)
@@ -39,9 +39,9 @@ The builder must return its designated terminal cell.
   $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue.ml > wrong_terminal/michael_scott_queue.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue.ml
-  [Error] File "wrong_terminal/michael_scott_queue.ml", line 139, columns 13-40:
-  139 |     (*@ fold built_chain result tail_ xs *)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  [Error] File "wrong_terminal/michael_scott_queue.proof", line 118, columns 19-46:
+  118 |     on return fold built_chain result tail_ xs
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: Failed to fold predicate. The body of the predicate may not hold at this point.
   File "wrong_terminal/michael_scott_queue.proof", line 46, columns 10-24:
   46 |   | [] -> first == limit && cells === [limit]

@@ -383,7 +383,7 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
           | Export { key; pattern; _ } -> Some (key, pattern)
           | Pure _ -> None);
       lets =
-        List.filter_map in_order ~f:(function
+        List.filter_map (List.rev in_order) ~f:(function
           | Pure { pattern; value; _ } -> Some (pattern, value)
           | Export _ -> None);
     }
@@ -472,6 +472,20 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
               synthesized ~prefix:"proof " ~outline ~proof_text ~origin:return_loc place
             in
             Ok (previous, visible, annotation :: annotations)
+        | Initially { initialization_loc } ->
+            let place = definition.at.loc_end in
+            let* context =
+              uses ~visible ~step_loc:initialization_loc ~regions:[] ~place:place.pos_cnum
+                (slice proof_text initialization_loc)
+            in
+            if not (List.is_empty context.imports) then
+              error initialization_loc
+                "An initially step cannot use values exported by scopes"
+            else
+              let annotation =
+                synthesized ~outline:context ~proof_text ~origin:initialization_loc place
+              in
+              Ok (previous, visible, annotation :: annotations)
         | Let { pattern; value } ->
             let binding =
               Pure { pattern; value; text = slice proof_text value.proof_loc }
@@ -483,8 +497,8 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
   let manual =
     if
       List.exists outline.outline_steps ~f:(function
-        | S.At { action = Linearize; _ } | Let _ -> false
-        | At _ | On_return _ | Nested _ -> true)
+        | S.At { action = Linearize; _ } | Let _ | Nested _ | Initially _ -> false
+        | At _ | On_return _ -> true)
     then
       [
         {

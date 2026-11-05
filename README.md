@@ -628,8 +628,16 @@ later steps; it can be used where the exporting code runs on every path to the s
 with parenthesized clauses: `proof r = f x requires (p) ensures (q) = steps`. A
 local function's outline is nested where it is defined, as `proof g y = begin
 steps end`, and an outline in a proof module proves a function of the source
-module of its name. Outlines with steps other than linearizations are manual
-proofs. A program with outlines has no proof annotations in its `.ml`.
+module of its name. A contract-only outline ends with `= ()` and retains automatic
+reasoning; continuation contracts can include `continues f`.
+
+`initially { fields }` gives a constructor's initial state, with optional ghost
+bindings as `initially let x = e in { fields }`. Initializers and linearization
+steps retain automatic reasoning. Access scopes and `on return` ghost code make
+their function manual; a local helper's outline controls only that helper's mode.
+A program with outlines has no proof annotations in its `.ml`. The
+[history queue](test/saturn/michael_scott_queue/) uses an unchanged Saturn
+implementation with its proof annotations in the companion `.proof` and interfaces.
 
 ## VS Code
 

@@ -1,0 +1,13 @@
+predicate held (c : int Atomic.t) (value : int) = own c value
+
+type state = { value : int }
+
+invariant shared (c : t) (s : state) = own c.anchor 0 && held c.contents s.value
+
+view cell (c : t) = s.value
+
+proof make =
+  proof result = build value
+    ensures (held result value) = begin
+    on return fold held result value
+  end

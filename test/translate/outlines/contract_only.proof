@@ -1,0 +1,6 @@
+proof result = identity value
+  ensures (result = value) = ()
+
+proof twice =
+  proof result = helper item
+    ensures (result = item) = begin () end

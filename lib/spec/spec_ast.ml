@@ -224,6 +224,8 @@ type outline_step =
       (** [let p = e in ...]: pure ghost code for the later steps, which run it where they
           use it. *)
   | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
+  | Initially of { initialization_loc : Location.t }
+      (** The constructor's initial shared state. *)
   | Nested of outline  (** The outline of a local function. *)
 
 (** What a step does at its code. *)

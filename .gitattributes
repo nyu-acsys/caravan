@@ -1,0 +1,3 @@
+test/saturn/michael_scott_queue/michael_scott_queue.ml text eol=lf
+test/saturn/michael_scott_queue/michael_scott_queue.mli text eol=lf
+test/saturn/michael_scott_queue/michael_scott_queue_intf.mli text eol=lf

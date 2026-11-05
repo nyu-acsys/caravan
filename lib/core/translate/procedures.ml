@@ -1150,7 +1150,15 @@ let initializer_annotation ctx (f : func) =
   in
   match List.filter ctx.given.annotations ~f:window with
   | [] -> Ok None
-  | [ a ] -> Result.map (Annotation.initially a) ~f:(fun initial -> Some (a, initial))
+  | [ a ] ->
+      Result.map (Annotation.initially a) ~f:(fun initial ->
+          let initial =
+            List.fold_right
+              (Option.value_map a.outline ~default:[] ~f:(fun o -> o.Annotation.lets))
+              ~init:initial
+              ~f:(fun (pattern, value) body -> S.Initial_let (pattern, value, body))
+          in
+          Some (a, initial))
   | _ :: a :: _ -> error a.loc "A constructor has at most one initially annotation"
 
 let check_initial_fields ctx established fields =

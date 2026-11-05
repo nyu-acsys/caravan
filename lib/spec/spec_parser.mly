@@ -327,6 +327,7 @@ outline_body(steps):
 
 (* A clause of an outline's contract, parenthesized as a lemma's. *)
 outline_clause:
+| CONTINUES lident {}
 | REQUIRES LEFTPAR term RIGHTPAR {}
 | ENSURES LEFTPAR term RIGHTPAR {}
 | ATOMIC_REQUIRES LEFTPAR term RIGHTPAR {}
@@ -340,6 +341,7 @@ outline_clause:
    the scope returns with the result to the later steps; [let x = e in ...] binds pure
    ghost code for them. *)
 outline_steps:
+| LEFTPAR RIGHTPAR { [] }
 | s = outline_step { [s] }
 | s = outline_step SEMICOLON ss = outline_steps { s :: ss }
 | LET p = pat EQUAL AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
@@ -356,6 +358,8 @@ nested_steps:
 ;
 
 outline_step:
+| INITIALLY initial_expression
+    { Initially { initialization_loc = mk_loc $loc } }
 | AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
     { let action, action_loc = action in
       At { anchor; anchor_loc = mk_loc $loc(anchor); action; action_loc; export = None } }
