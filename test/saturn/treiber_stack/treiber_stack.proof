@@ -5,6 +5,8 @@ proof create = on return fold stack t []
 
 proof of_list = on return fold stack t list
 
+proof of_seq = on return fold stack t values
+
 proof is_empty = at (Atomic.get t) commit
 
 (* The witness-generic helpers; their wrappers delegate to them. *)
@@ -34,3 +36,5 @@ proof result = atomic push_all_ t backoff values
   atomic ensures (stack t (values @ xs)) = ()
 
 proof push_all = at (()) commit
+
+proof to_seq = at (Atomic.get t) commit

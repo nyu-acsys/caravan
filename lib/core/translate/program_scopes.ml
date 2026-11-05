@@ -419,6 +419,13 @@ let run (source : Source.t) : (t, error) Result.t =
   in
   let types =
     Datatypes.compiler_aliases
+      ~values:
+        (List.concat_map libraries ~f:(fun (library : Library_modules.t) ->
+             List.map library.signature.signature_values ~f:(fun (name, _) ->
+                 let value =
+                   Env.find_value (Pdot (library.library_path, name)) source.env
+                 in
+                 (source.env, value.val_type))))
       ~modules:
         (List.map libraries ~f:(fun library ->
              (library.Library_modules.library_path, source.env)))

@@ -52,11 +52,12 @@ let rebind ~expand ~at declaration parameters =
     Ok { rebound with member = declaration.member }
   else Report.unsupported at "A generic proof signature with different type parameters"
 
-let instantiate ?environment ~expand ~at predicate actuals =
+let instantiate ?environment ?(opaque = fun _ -> false) ~expand ~at predicate actuals =
   let canonical typ =
     let typ =
       Option.value_map environment ~default:typ ~f:(fun environment ->
-          Ctype.expand_head environment (Compiler_types.scheme_structure typ))
+          if opaque typ then typ
+          else Ctype.expand_head environment (Compiler_types.scheme_structure typ))
     in
     match (environment, Types.get_desc typ) with
     | Some environment, Tconstr (path, arguments, _) ->

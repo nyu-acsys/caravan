@@ -843,6 +843,7 @@ let atomic_update ctx env ~at ~self ~role ~result ~raising ~raised_posts implici
       ghost_results =
         List.concat_map past_results ~f:(fun (_, _, _, (snapshot, k)) -> [ snapshot; k ]);
       has_result = Option.is_some result;
+      implicit_names = List.map implicit ~f:(fun (name, _, _, _) -> name);
       open_;
       close;
       raising;
@@ -1329,18 +1330,30 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
               ])
       end
 
-(** The procedure of [f], named [proc_name]; if [f] is pure, its result is the value of
-    its function. [funcs] are the functions contracts can call, by their OCaml names. *)
-let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
-    : R.Callable.t State.t =
+type proc_preparation = {
+  context : context;
+  func : func;
+  past_pres : past list;
+  past_posts : past list;
+  result_name : string;
+  arg_names : string option list;
+  formals : ((string * string) option * R.Spec.t option * R.Var.t) list;
+  bound : R.Stmt.t list;
+  result : string;
+  returns : R.Var.t list;
+  environment : env;
+  implicit : (string * string * Types.type_expr * R.Var.t) list;
+  ghosts : (string * string * Types.type_expr) list;
+}
+
+(** The shared parameter and contract environment of a procedure. *)
+let prepare_proc ~given ~past_structures ~proc_name (f : func) =
   let ctx =
     {
       given = { given with current_procedure = Some proc_name; manual = f.manual };
       au = None;
     }
   in
-  State.in_procedure
-  @@
   let open State.Syntax in
   let l = loc f.loc in
   (* Facts about earlier states are ghost parameters and results. *)
@@ -1398,8 +1411,71 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       let+ typ = State.typ ctx ~at:f.body.exp_loc f.body.exp_type in
       [ R.Var.make ~loc:l (ident ~loc:l result) typ ]
   in
-  let* _, env, implicit, ghosts =
+  let+ _, env, implicit, ghosts =
     contract_env ctx ~spec_funcs:ctx.given.spec_funcs f formals ~result
+  in
+  {
+    context = ctx;
+    func = f;
+    past_pres;
+    past_posts;
+    result_name;
+    arg_names;
+    formals;
+    bound;
+    result;
+    returns;
+    environment = env;
+    implicit;
+    ghosts;
+  }
+
+(** Inspect the exact implicit signature without changing translation state or names. *)
+let procedure_implicit_names ~given ~past_structures ~proc_name f state =
+  let saved = Fresh_names.save () in
+  let preparation =
+    let open State.Syntax in
+    let+ prepared = prepare_proc ~given ~past_structures ~proc_name f in
+    List.map prepared.implicit ~f:(fun (name, _, _, _) -> name)
+  in
+  let result, _ = State.in_procedure preparation state in
+  Fresh_names.restore saved;
+  (result, state)
+
+(** The procedure of [f], with its verified contract and atomic update. *)
+let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
+    : R.Callable.t State.t =
+  State.in_procedure
+  @@
+  let open State.Syntax in
+  let* {
+         context = ctx;
+         func = f;
+         past_pres;
+         past_posts;
+         result_name;
+         arg_names;
+         formals;
+         bound;
+         result;
+         returns;
+         environment = env;
+         implicit;
+         ghosts;
+       } =
+    prepare_proc ~given ~past_structures ~proc_name f
+  in
+  let l = loc f.loc in
+  let* () =
+    State.modify (fun state ->
+        let names = List.map implicit ~f:(fun (name, _, _, _) -> name) in
+        let keys = proc_name :: Option.to_list given.current_procedure in
+        let procedure_implicits =
+          List.fold keys ~init:state.State.tables.procedure_implicits
+            ~f:(fun signatures key ->
+              List.Assoc.add signatures key names ~equal:String.equal)
+        in
+        { state with tables = { state.tables with procedure_implicits } })
   in
   (* A function that may raise returns its outcome, the exception it raised, last. *)
   let* raising =
@@ -1803,6 +1879,28 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let all_formals =
     List.map formals ~f:(fun (_, _, v) -> v) @ ghost_formals @ past_formals @ implicit
   in
+  let* () =
+    State.of_result
+      (Result.all_unit
+         (List.map f.signature_sites ~f:(fun signature ->
+              let declaration = signature.Module_inventory.declaration in
+              Result.bind (Contract_attributes.local declaration.val_attributes)
+                ~f:(fun local ->
+                  if local then
+                    unsupported declaration.val_loc
+                      "The local attribute is supported only on trusted imports"
+                  else Ok ()))))
+  in
+  let* opens =
+    State.of_result
+      (Result.map
+         (Result.all
+            (List.map f.signature_sites ~f:(fun signature ->
+                 Contract_attributes.empty_opens
+                   signature.Module_inventory.declaration.val_attributes)))
+         ~f:(fun clauses ->
+           Option.map (List.find_map clauses ~f:Fn.id) ~f:(fun at -> (loc at, []))))
+  in
   if f.trusted then begin
     (* Its contract, assumed: the body is not translated. *)
     let* () =
@@ -1817,7 +1915,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
           })
     in
     State.return
-      (R.Callable.proc ~loc:l ~formals:all_formals
+      (R.Callable.proc ~loc:l ?opens ~formals:all_formals
          ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
          ~requires ~ensures
          (ident ~loc:l (Option.value declaration_name ~default:proc_name))
@@ -1966,7 +2064,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       no_outcome @ bind_au @ bound @ first @ stmts @ assignment @ establish @ last
       @ history_returns
     in
-    R.Callable.proc ~loc:l ~formals:all_formals
+    R.Callable.proc ~loc:l ?opens ~formals:all_formals
       ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
       ~requires ~ensures
       (ident ~loc:l (Option.value declaration_name ~default:proc_name))

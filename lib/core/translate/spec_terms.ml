@@ -41,6 +41,7 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
         in
         let inference =
           Generic_parameters.instantiate ~environment:env.ctx.given.env
+            ~opaque:(Datatypes.is_opaque env.data)
             ~expand:(Datatypes.expand env.data) ~at generic
             (actuals @ expected_outputs env outputs expected)
         in
@@ -502,6 +503,7 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
         let outputs = expected_outputs env signature.lemma_outputs result in
         let instantiate supplied =
           Generic_parameters.instantiate ~environment:env.ctx.given.env
+            ~opaque:(Datatypes.is_opaque env.data)
             ~expand:(Datatypes.expand env.data) ~at worker (supplied @ outputs)
         in
         let supplied = supplied @ omitted in
@@ -581,6 +583,7 @@ let predicate_instance env ~at ~key ~target args =
       in
       let* arguments =
         Generic_predicates.instantiate ~environment:env.ctx.given.env
+          ~opaque:(Datatypes.is_opaque env.data)
           ~expand:(Datatypes.expand env.data) ~at worker
           (List.map args ~f:(term_type env))
       in

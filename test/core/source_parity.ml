@@ -63,32 +63,10 @@ let () =
 
 let () =
   let path = "../saturn/treiber_stack/treiber_stack.ml" in
-  let text = Stdio.In_channel.read_all path in
-  let lexbuf = Lexing.from_string text in
-  Location.init lexbuf path;
-  Lexer.init ();
-  let structure = Parse.implementation lexbuf in
-  List.iter
-    [
-      ("push_all_", "b43dadcc185a8df2b1a900978e4de2ee");
-      ("push_all", "265a3e199aa8b99d214fb412b079435b");
-    ]
-    ~f:(fun (name, expected) ->
-      let item =
-        List.find_exn structure ~f:(fun item ->
-            match item.Parsetree.pstr_desc with
-            | Pstr_value (_, bindings) ->
-                List.exists bindings ~f:(fun binding ->
-                    match binding.Parsetree.pvb_pat.ppat_desc with
-                    | Ppat_var id -> String.equal id.txt name
-                    | _ -> false)
-            | _ -> false)
-      in
-      let at = item.pstr_loc in
-      let definition =
-        String.sub text ~pos:at.loc_start.pos_cnum
-          ~len:(at.loc_end.pos_cnum - at.loc_start.pos_cnum)
-      in
-      let actual = Stdlib.Digest.(to_hex (string definition)) in
-      if not (String.equal expected actual) then
-        failwith ("Upstream source parity failed for Treiber " ^ name))
+  let source = Stdio.In_channel.read_all path in
+  let expected = "4cb46bd94b98e275e25c9cffcc159cc9" in
+  let actual = Stdlib.Digest.(to_hex (string source)) in
+  if not (String.equal expected actual) then
+    failwith
+      ("Upstream source parity failed for treiber_stack.ml: expected " ^ expected
+     ^ ", got " ^ actual)

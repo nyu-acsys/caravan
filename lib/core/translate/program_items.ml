@@ -1638,6 +1638,8 @@ type prepared_callable = {
   prepared_requires : R.Spec.t list;
   prepared_ensures : R.Spec.t list;
   prepared_logical_ensures : R.Spec.t list;
+  prepared_pre_formulas : R.Expr.t list;
+  prepared_post_formulas : R.Expr.t list;
 }
 (** The contract declaration shared by imports and checked forwarding procedures. *)
 
@@ -1831,10 +1833,16 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
     prepared_requires = in_range @ requires @ atomic_requires;
     prepared_ensures = result_in_range @ ensures @ atomic_ensures;
     prepared_logical_ensures;
+    prepared_pre_formulas = input_domains @ logical_requires;
+    prepared_post_formulas =
+      Option.to_list
+        (Datatypes.admissible ~loc:l ctx.given.types result
+           (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r")))
+      @ logical_ensures;
   }
 
-let prepared_member ~at ~name body prepared =
-  R.Callable.proc ~loc:(loc at) ~formals:prepared.prepared_formals
+let prepared_member ?opens ~at ~name body prepared =
+  R.Callable.proc ~loc:(loc at) ?opens ~formals:prepared.prepared_formals
     ~returns:prepared.prepared_returns ~requires:prepared.prepared_requires
     ~ensures:prepared.prepared_ensures
     (ident ~loc:(loc at) name)
@@ -1976,7 +1984,7 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
   State.return [ logical; procedure ]
 
 (** An assumed library value or procedure, using the shared contract preparation. *)
-let library_function ?raising ctx ~(at : Location.t) ~name ~args ~result contract =
+let library_function ?raising ?opens ctx ~(at : Location.t) ~name ~args ~result contract =
   match (args, contract) with
   | [], None ->
       let open State.Syntax in
@@ -1993,4 +2001,121 @@ let library_function ?raising ctx ~(at : Location.t) ~name ~args ~result contrac
   | _ ->
       State.map
         (prepare_callable ?raising ctx ~at ~args ~result contract)
-        ~f:(prepared_member ~at ~name None)
+        ~f:(prepared_member ?opens ~at ~name None)
+
+(** Stable import facts neither consume ownership nor inspect mutable state. *)
+let stable_library_contract ctx ~at ~persistent ~description (contract : S.contract) =
+  let* () =
+    if
+      contract.S.atomic || contract.pure
+      || (not
+            (List.is_empty contract.requires
+            && List.is_empty contract.atomic_requires
+            && List.is_empty contract.atomic_ensures
+            && List.is_empty contract.raises
+            && List.is_empty contract.atomic_raises
+            && List.is_empty contract.variant))
+      || Option.is_some contract.continues
+    then unsupported at (description ^ " with preconditions, effects, or modifiers")
+    else Ok ()
+  in
+  let env =
+    {
+      ctx;
+      var_types = [];
+      logical_definition = false;
+      data = ctx.given.types;
+      funcs = ctx.given.spec_funcs;
+      vars = [];
+    }
+  in
+  let consumable q =
+    String.equal (qualid_key q) "own"
+    || Option.is_some (atomic_method env q)
+    || Option.exists
+         (List.Assoc.find ctx.given.preds (logical_key env q) ~equal:String.equal)
+         ~f:(fun (backend, _) -> not (List.mem persistent backend ~equal:String.equal))
+  in
+  let rec field_read (term : S.term) =
+    match term.term_desc with
+    | Tfield _ -> true
+    | _ -> List.exists (subterms term) ~f:field_read
+  in
+  let* () =
+    if
+      List.exists contract.ensures ~f:(fun term ->
+          List.exists (term_references [] term) ~f:consumable)
+    then unsupported at (description ^ " granting consumable resources")
+    else Ok ()
+  in
+  if List.exists contract.ensures ~f:field_read then
+    unsupported at (description ^ " reading fields")
+  else Ok ()
+
+(** Reading a constant preserves its identity and acquires only duplicable facts. *)
+let library_value_members ctx ~(at : Location.t) ~name ~result ~persistent contract =
+  let open State.Syntax in
+  let* constant = library_function ctx ~at ~name ~args:[] ~result None in
+  match contract with
+  | None -> State.return [ constant ]
+  | Some contract ->
+      let* () =
+        State.of_result
+          (stable_library_contract ctx ~at ~persistent
+             ~description:"An imported value contract" contract)
+      in
+      let* prepared = prepare_callable ctx ~at ~args:[] ~result (Some contract) in
+      let* result_type = State.typ ctx ~at result in
+      let l = loc at in
+      let equality =
+        R.Spec.make
+          (R.Expr.binary ~loc:l Eq
+             (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
+             (R.Expr.call ~loc:l (Translate_context.name ~loc:l name) []))
+      in
+      State.return
+        [
+          constant;
+          R.Callable.proc ~loc:l ~kind:Lemma
+            ~formals:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
+            ~requires:[ equality ] ~ensures:prepared.prepared_ensures
+            (ident ~loc:l (library_value_accessor name))
+            None;
+        ]
+
+(** A local import's trusted contract describes no shared-memory transitions. *)
+let library_local_members ctx ~at ~name ~args ~result ~persistent contract =
+  let open State.Syntax in
+  let* contract =
+    State.of_result
+      (Report.expect ~at "A contract for a local imported operation" contract)
+  in
+  let* () =
+    State.of_result
+      (stable_library_contract ctx ~at ~persistent
+         ~description:"A local imported contract" contract)
+  in
+  let* prepared = prepare_callable ctx ~at ~args ~result (Some contract) in
+  let* () =
+    State.of_result
+      (if List.is_empty prepared.prepared_implicit then Ok ()
+       else unsupported at "A local imported contract with ghost parameters")
+  in
+  let l = loc at in
+  let conjunction terms =
+    List.fold_right terms ~init:(R.Expr.bool ~loc:l true) ~f:(fun term rest ->
+        R.Expr.binary ~loc:l And term rest)
+  in
+  let predicate suffix formals formulas =
+    R.Callable.func ~loc:l ~kind:Pred ~inline:true ~formals
+      (ident ~loc:l (name ^ suffix))
+      (Some (conjunction formulas))
+  in
+  State.return
+    [
+      prepared_member ~at ~name None prepared;
+      predicate "$local_pre" prepared.prepared_formals prepared.prepared_pre_formulas;
+      predicate "$local_post"
+        (prepared.prepared_formals @ prepared.prepared_returns)
+        prepared.prepared_post_formulas;
+    ]

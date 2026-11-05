@@ -104,15 +104,30 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       match x with
       | Some x -> State.return ([], R.Expr.var ~loc:l (name ~loc:l x))
       | None -> State.of_result (unsupported at "A function used as a value"))
-  | Texp_ident (path, _, _) -> (
+  | Texp_ident (path, _, declaration) -> (
       let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
       match Path_bindings.find ctx.given.libraries path with
       | Some member ->
-          State.return
-            ( [],
+          let* () =
+            State.of_result
+              (match Datatypes.desc ctx.given.types e.exp_type with
+              | Tarrow _ -> unsupported at "An imported function used as a value"
+              | _ -> Ok ())
+          in
+          let* target =
+            State.polymorphic_call ~environment:e.exp_env ctx ~at ~path
+              ~declaration:declaration.val_type ~occurrence:e.exp_type
+              ~target:(String.concat ~sep:"." member)
+          in
+          let value = R.Expr.call ~loc:l (qualified_name ~loc:l target) [] in
+          if Path_bindings.mem ctx.given.contracted_values path then
+            let call =
               R.Expr.call ~loc:l
-                (qualified_name ~loc:l (String.concat ~sep:"." member))
-                [] )
+                (qualified_name ~loc:l (library_value_accessor target))
+                [ value ]
+            in
+            State.return ([ R.Stmt.call ~loc:l call ], value)
+          else State.return ([], value)
       | None ->
           begin match stdlib_name path with
           | Some "max_int" -> State.return ([], R.Expr.int ~loc:l Prelude.max_int)
@@ -988,6 +1003,31 @@ and call ?actual_target ?type_instance ?universal ctx (e : Typedtree.expression)
       ~equal:Poly.equal
   in
   match annotation with
+  | None when List.mem ctx.given.local_calls f ~equal:String.equal ->
+      let l = loc e.exp_loc in
+      let target = Option.value actual_target ~default:f in
+      let contract suffix values =
+        R.Spec.make (R.Expr.call ~loc:l (qualified_name ~loc:l (target ^ suffix)) values)
+      in
+      let precondition = R.Stmt.exhale ~loc:l (contract "$local_pre" args) in
+      if is_unit e.exp_type then
+        State.return
+          ( arguments
+            @ [ precondition; R.Stmt.inhale ~loc:l (contract "$local_post" args) ],
+            unit_value ~loc:l )
+      else
+        let* result_type = State.typ ctx ~at:e.exp_loc e.exp_type in
+        let* result = State.fresh "local_result" in
+        let value = R.Expr.var ~loc:l (name ~loc:l result) in
+        State.return
+          ( arguments
+            @ R.Stmt.local ~loc:l ~typ:result_type (ident ~loc:l result)
+            @ [
+                precondition;
+                R.Stmt.havoc ~loc:l (name ~loc:l result);
+                R.Stmt.inhale ~loc:l (contract "$local_post" (args @ [ value ]));
+              ],
+            value )
   | None ->
       let+ statements, value, _ = run None in
       (arguments @ statements, value)
@@ -1084,10 +1124,19 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
     (* A call of another atomic function before this one linearizes delegates its update
        to it, as Saturn's [let pop_opt t = pop_as t Backoff.default Option]. *)
     | Some au
-      when List.mem ctx.given.atomic_procedures f ~equal:String.equal
+      when List.Assoc.mem ctx.given.atomic_procedures f ~equal:String.equal
            && Poly.equal au_state (Some Pending) ->
+        let forward =
+          Option.exists
+            (Option.bind
+               (List.Assoc.find ctx.given.atomic_procedures f ~equal:String.equal)
+               ~f:(fun target ->
+                 List.Assoc.find s.tables.procedure_implicits target ~equal:String.equal))
+            ~f:(List.equal String.equal au.implicit_names)
+        in
         let+ opened = open_for_call au ~at:e.exp_loc in
-        Option.map opened ~f:(fun (opening, values) -> (au, opening, values))
+        Option.map opened ~f:(fun (opening, values) ->
+            (au, opening, if forward then values else []))
     | _ -> State.return None
   in
   let opening, implicit =
@@ -1178,6 +1227,7 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
             let* arguments =
               State.of_result
                 (Generic_parameters.instantiate ~environment:env.ctx.given.env
+                   ~opaque:(Datatypes.is_opaque env.data)
                    ~expand:(Datatypes.expand env.data) ~at:e.exp_loc worker
                    (List.init (List.length prefix) ~f:(fun _ -> None)
                    @ List.map ocaml_args ~f:(fun (argument : Typedtree.expression) ->

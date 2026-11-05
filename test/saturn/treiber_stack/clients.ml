@@ -49,3 +49,33 @@ let bulk_boolean_client () =
   let stack = of_list [ false ] in
   push_all stack [ true; false ];
   assert (pop_all stack = [ false; true; false ])
+
+let sequence_empty_client () =
+  let stack : int t = of_seq Seq.empty in
+  add_seq stack Seq.empty;
+  assert (is_empty stack)
+
+let sequence_order_client () =
+  let stack = of_seq (List.to_seq [ 1; 2; 3 ]) in
+  assert (pop_opt stack = Some 1);
+  add_seq stack (List.to_seq [ 4; 5 ]);
+  assert (pop_all stack = [ 5; 4; 2; 3 ])
+
+let sequence_boolean_client () =
+  let stack = of_seq (List.to_seq [ true; false ]) in
+  assert (pop_all stack = [ true; false ])
+
+let sequence_snapshot_client () =
+  let stack = of_list [ 17; 23 ] in
+  let snapshot = to_seq stack in
+  push stack 42;
+  assert (List.of_seq snapshot = [ 17; 23 ]);
+  assert (List.of_seq snapshot = [ 17; 23 ]);
+  assert (pop_all stack = [ 42; 17; 23 ])
+
+let sequence_copy_client () =
+  let original = of_list [ 7; 9 ] in
+  let copied = of_seq (to_seq original) in
+  push original 11;
+  assert (pop_all copied = [ 7; 9 ]);
+  assert (pop_all original = [ 11; 7; 9 ])

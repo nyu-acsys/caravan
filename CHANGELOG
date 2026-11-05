@@ -21,7 +21,7 @@ All notable changes to this project will be documented in this file.
 - Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
 - Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
 - Contracts can use list concatenation, membership, and length, and call verified pure functions.
-- Bundled standard-library contracts support `List.rev` and `List.rev_append` with checked models and reusable algebra, and pure imports are usable in specifications.
+- Bundled standard-library contracts support list reversal with checked algebra and reusable finite `Seq` snapshots, and pure imports are usable in specifications.
 - Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
 - Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
 - Specifications provide unbounded `integer` indices while OCaml `int` fields and quantifiers retain machine bounds.
@@ -41,10 +41,10 @@ All notable changes to this project will be documented in this file.
 - Actions describe ghost-state transitions, infer matching atomic steps, and check that growing fields remain monotone.
 - Pending-call registrations and helping actions support proofs in which another operation completes a call.
 - Ghost parameters can be declared in contracts and inferred at call sites.
-- Trusted library interfaces support abstract types, invariant and predicate declarations, and ordinary and logically atomic function contracts.
+- Trusted library interfaces support abstract types, resources, value contracts, local operations, empty invariant masks, and ordinary and logically atomic function contracts.
 - Functions marked `trusted` assume their contracts and emit a warning.
 - Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
-- Saturn case studies include Treiber stack with bulk push, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
+- Saturn case studies include the unchanged Treiber stack implementation, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
 - `--emit-rav` prints the generated Raven program for standalone parsing and verification.
 - `--smt-timeout` controls the solver timeout for each query.
 - `-I` adds directories to the library interface search path.

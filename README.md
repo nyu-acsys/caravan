@@ -137,8 +137,12 @@ Caravan bundles annotated `.mli` subsets of supported standard-library modules i
 identities, including aliases, without replacing the standard library or capturing
 user modules with the same names. OCaml checks each subset's type compatibility;
 the behavioral contracts are trusted. Currently `List.rev` and `List.rev_append`
-are supported in implementations and specifications. Other runtime operations
-still require support of their own.
+are supported in implementations and specifications. `Seq.empty`, `List.to_seq`,
+and `List.of_seq` support finite, reusable snapshots. The specification resource
+`Seq.persistent sequence values` describes such a snapshot; its list of values
+can be inferred. A snapshot remains usable after its originating data structure
+changes. Stateful or one-shot sequences, user-defined producers, and direct
+thunk calls require higher-order support and are not yet supported.
 
 Their companion `.proof` files define total mathematical models and reusable
 algebraic lemmas. For example, `Stdlib_model.List.reverse` is the mathematical model of
@@ -148,6 +152,17 @@ Clients import the checked library facts without checking
 their proofs again. Run `caravan --check-stdlib` to verify the bundled models and
 lemmas, or add `--emit-rav` to inspect their verification program. These checks
 also run in the regression suite.
+
+Trusted imported values can have contracts granting persistent facts; reading a
+value preserves its identity and acquires those facts without a runtime action.
+An imported operation marked `[@@caravan.local]` promises to take no shared-memory
+steps or invoke callbacks. Its contract is expanded directly, with an arbitrary
+result satisfying the postcondition. This supports allocation of opaque values
+without identifying separate allocations. Local import contracts currently have
+no preconditions and grant only field-free pure facts or persistent resources.
+The marker is a trusted library promise, not a consequence of the postcondition.
+`[@@caravan.opens []]` specifies that an operation opens no invariants; Raven
+checks this restriction for implementations being verified.
 
 Module types can declare abstract resources using the same annotation forms. A
 constrained alias checks the actual operations against the requested contracts:

@@ -63,3 +63,24 @@ val pop_all : 'a t -> 'a list
 (*@ r = atomic pop_all t
     atomic requires stack t xs
     atomic ensures r === xs && stack t [] *)
+
+val to_seq : 'a t -> 'a Seq.t
+(** [to_seq stack] takes a snapshot of [stack] and returns its value top to bottom. *)
+(*@ result = atomic to_seq t
+    atomic requires stack t xs
+    atomic ensures stack t xs && Seq.persistent result xs *)
+
+val of_seq : 'a Seq.t -> 'a t
+[@@caravan.opens []]
+(** [of_seq seq] creates a stack from a finite sequence. *)
+(*@ t = of_seq seq
+    requires Seq.persistent seq values
+    ensures stack t values *)
+
+val add_seq : 'a t -> 'a Seq.t -> unit
+[@@caravan.opens []]
+(** [add_seq stack seq] adds all elements of the finite [seq] to the top of [stack]. *)
+(*@ atomic add_seq t seq
+    requires Seq.persistent seq values
+    atomic requires Seq.persistent seq values && stack t xs
+    atomic ensures stack t (List.rev values @ xs) *)

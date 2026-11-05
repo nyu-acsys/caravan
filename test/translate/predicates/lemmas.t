@@ -137,9 +137,9 @@ Recursive lemmas need a variant that decreases.
   [1]
 
   $ caravan --shh lemmas_non_decreasing.ml
-  [Error] File "lemmas_non_decreasing.proof", line 1, columns 30-31:
+  [Error] File "lemmas_non_decreasing.proof", line 1, columns 29-32:
   1 | lemma loop (n : int) variant (n) = loop n
-                                    ^
+                                   ^^^
   Verification Error: This decreases clause's termination measure may not decrease on this recursive call.
   [1]
 

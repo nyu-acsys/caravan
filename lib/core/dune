@@ -2,11 +2,11 @@
 
 (rule
  (target stdlib_sources.ml)
- (deps ../stdlib/list.mli ../stdlib/list.proof)
+ (deps ../stdlib/seq.mli ../stdlib/list.mli ../stdlib/list.proof)
  (action
   (write-file
    %{target}
-   "let sources = [ (\"List\", {caravan|%{read:../stdlib/list.mli}|caravan}) ]\nlet proofs = [ (\"List\", {caravan|%{read:../stdlib/list.proof}|caravan}) ]")))
+   "let sources = [ (\"Seq\", {caravan|%{read:../stdlib/seq.mli}|caravan}); (\"List\", {caravan|%{read:../stdlib/list.mli}|caravan}) ]\nlet proofs = [ (\"List\", {caravan|%{read:../stdlib/list.proof}|caravan}) ]")))
 
 (library
  (name caravan_core)

@@ -194,6 +194,38 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
       (List.concat_map library_polymorphic_functions ~f:(fun worker ->
            List.map worker.paths ~f:(fun path -> (path, worker))))
   in
+  let* contracted_values =
+    all libraries ~f:(fun (library : Library_modules.t) ->
+        let* contracts = library_contracts library in
+        Ok
+          (List.filter_map library.signature.signature_values ~f:(fun (member, value) ->
+               let path = Path.Pdot (library.library_path, member) in
+               let declaration = Env.find_value path source.env in
+               let callable =
+                 match Datatypes.desc types declaration.val_type with
+                 | Tarrow _ -> true
+                 | _ -> false
+               in
+               Option.some_if
+                 ((not callable) && List.Assoc.mem contracts member ~equal:String.equal)
+                 (path, ()))))
+    |> Result.map ~f:(fun values -> Path_bindings.of_list (List.concat values))
+  in
+  let persistent =
+    List.filter_map library_preds ~f:(fun ((library : Library_modules.t), predicate, _) ->
+        Option.some_if predicate.S.pred_persistent
+          (library.library_name ^ "." ^ predicate.pred_name.pid_str))
+  in
+  let local_attribute (value : Typedtree.value_description) =
+    Contract_attributes.local value.val_attributes
+  in
+  let* local_calls =
+    all libraries ~f:(fun (library : Library_modules.t) ->
+        all library.signature.signature_values ~f:(fun (name, value) ->
+            let* local = local_attribute value.Module_inventory.declaration in
+            Ok (Option.some_if local (library.library_name ^ "." ^ name))))
+    |> Result.map ~f:(fun members -> List.filter_opt (List.concat members))
+  in
   let* library_emissions, state =
     State.run_from state
     @@ State.all libraries ~f:(fun (lib : Library_modules.t) ->
@@ -333,13 +365,26 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                          ~resolve:(Exceptions.resolver ctx.given.types ctx.given.env)
                          contract))
               in
+              let* local = State.of_result (local_attribute signature.declaration) in
               let+ members =
-                match contract with
-                | Some contract when contract.pure ->
+                match (args, contract) with
+                | [], _ ->
+                    library_value_members ctx ~at ~name:x ~result ~persistent contract
+                | _ when local ->
+                    library_local_members ctx ~at ~name:x ~args ~result ~persistent
+                      contract
+                | _, Some contract when contract.pure ->
                     library_pure_members ctx ~at ~name:x ~args ~result contract
                 | _ ->
+                    let* opens =
+                      State.of_result
+                        (Contract_attributes.empty_opens
+                           signature.declaration.val_attributes)
+                    in
+                    let opens = Option.map opens ~f:(fun at -> (loc at, [])) in
                     State.map
-                      (library_function ?raising ctx ~at ~name:x ~args ~result contract)
+                      (library_function ?raising ?opens ctx ~at ~name:x ~args ~result
+                         contract)
                       ~f:List.return
               in
               let members =
@@ -1893,11 +1938,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   let atomic_procedures =
     List.concat_map translated ~f:(fun (name, f, _) ->
-        if Option.exists f.contract ~f:(fun c -> c.atomic) then [ name; body_proc_name f ]
+        if Option.exists f.contract ~f:(fun c -> c.atomic) then
+          let implementation = body_proc_name f in
+          [ (name, implementation); (implementation, implementation) ]
         else [])
-    |> List.map ~f:(fun name -> (name, ()))
-    |> for_applications ~rename:(fun ~key:_ () -> ())
-    |> List.map ~f:fst
+    |> for_applications ~rename:(fun ~key:_ implementation -> implementation)
   in
   let witness_raising =
     for_applications ~rename:(fun ~key (position, sets) ->
@@ -1908,76 +1953,104 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   Option.map (List.Assoc.find by_constructor name ~equal:String.equal)
                     ~f:(fun sets -> (name, (position, sets))))))
   in
+  let procedure_context (f : Procedures.func) =
+    let* environment = body_environment f in
+    let f = { f with environment } in
+    let data, predicates, functions, _, spec_funcs, proof_support = body_context f in
+    let declaration_name =
+      Module_context.local_name (body_destination f) (body_proc_name f)
+    in
+    let primitive_namespace = body_primitive_namespace f in
+    let given =
+      {
+        (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
+           ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace
+           ~polymorphic_functions:(body_polymorphic_registry f) ~generic_predicates
+           ?current_polymorphic:
+             (Program_declarations.enclosing_worker polymorphic_functions f)
+           ())
+        with
+        functions;
+        lifted;
+        pasts;
+        past_returns;
+        ghost_args;
+        procedure_signatures;
+        raising;
+        witness_raising;
+        atomic_procedures;
+        libraries = library_calls libraries;
+        contracted_values;
+        local_calls;
+        shared_exceptions = shared_exceptions_of f;
+        universal_result = Option.map f.universal ~f:(fun u -> u.result);
+        specialized_calls;
+        annotations;
+        proof_lemmas =
+          (let context = body_module_context f in
+           module_lemmas context
+             ~project:(Module_context.project_type context)
+             (lemma_context ~at:f.loc (Some context.scope)));
+        predicate_bodies =
+          (let context = body_module_context f in
+           List.map (body_contexts ~at:f.loc (Some context.scope)) ~f:(fun (key, body) ->
+               ( key,
+                 {
+                   body with
+                   project_type =
+                     (fun typ ->
+                       Module_context.project_type context (body.project_type typ));
+                 } )));
+        access_proofs;
+        return_proofs;
+        initializations;
+        linearizations;
+      }
+    in
+    Ok (f, given, declaration_name)
+  in
+  let* procedure_contexts =
+    all
+      (List.filter funcs ~f:(fun f ->
+           match body_owner f with Some (_, false) -> false | _ -> true))
+      ~f:procedure_context
+  in
   let* procs, state =
     State.run_from state
-    @@ State.all funcs ~f:(fun f ->
-        let open State.Syntax in
-        match body_owner f with
-        | Some (_, false) -> State.return None
-        | _ ->
-            let* environment = State.of_result (body_environment f) in
-            let f = { f with environment } in
-            let data, predicates, functions, _, spec_funcs, proof_support =
-              body_context f
-            in
-            let declaration_name =
-              Module_context.local_name (body_destination f) (body_proc_name f)
-            in
-            let primitive_namespace = body_primitive_namespace f in
-            let+ member =
-              let given =
-                {
-                  (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
-                     ~preds:predicates ~spec_funcs ~proof_support ~primitive_namespace
-                     ~polymorphic_functions:(body_polymorphic_registry f)
-                     ~generic_predicates
-                     ?current_polymorphic:
-                       (Program_declarations.enclosing_worker polymorphic_functions f)
-                     ())
-                  with
-                  functions;
-                  lifted;
-                  pasts;
-                  past_returns;
-                  ghost_args;
-                  procedure_signatures;
-                  raising;
-                  witness_raising;
-                  atomic_procedures;
-                  libraries = library_calls libraries;
-                  shared_exceptions = shared_exceptions_of f;
-                  universal_result = Option.map f.universal ~f:(fun u -> u.result);
-                  specialized_calls;
-                  annotations;
-                  proof_lemmas =
-                    (let context = body_module_context f in
-                     module_lemmas context
-                       ~project:(Module_context.project_type context)
-                       (lemma_context ~at:f.loc (Some context.scope)));
-                  predicate_bodies =
-                    (let context = body_module_context f in
-                     List.map (body_contexts ~at:f.loc (Some context.scope))
-                       ~f:(fun (key, body) ->
-                         ( key,
-                           {
-                             body with
-                             project_type =
-                               (fun typ ->
-                                 Module_context.project_type context
-                                   (body.project_type typ));
-                           } )));
-                  access_proofs;
-                  return_proofs;
-                  initializations;
-                  linearizations;
-                }
-              in
-              proc ~given
+    @@
+    let open State.Syntax in
+    let* signatures =
+      State.all procedure_contexts ~f:(fun (f, given, _) ->
+          if not (Option.exists f.contract ~f:(fun contract -> contract.atomic)) then
+            State.return None
+          else
+            let+ parameters =
+              procedure_implicit_names ~given
                 ~past_structures:(past_structures ~symbolic:true f)
-                ~proc_name:(body_proc_name f) ~pure:(is_pure f) ~declaration_name
-                ~pure_name:(body_pure_reference f) f
+                ~proc_name:(body_proc_name f) f
             in
-            Some (f, member))
+            Some (body_proc_name f, parameters))
+    in
+    let* () =
+      State.modify (fun (state : State.state) ->
+          {
+            state with
+            tables =
+              {
+                state.tables with
+                procedure_implicits =
+                  List.filter_opt signatures @ state.tables.procedure_implicits;
+              };
+          })
+    in
+    State.all procedure_contexts ~f:(fun (f, given, declaration_name) ->
+        let+ member =
+          proc ~given
+            ~past_structures:(past_structures ~symbolic:true f)
+            ~proc_name:(body_proc_name f) ~pure:(is_pure f) ~declaration_name
+            ~pure_name:(body_pure_reference f) f
+        in
+        Some (f, member))
   in
   let pure_funcs = List.filter_opt pure_funcs and procs = List.filter_opt procs in
   Ok

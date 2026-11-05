@@ -10,7 +10,10 @@ let () =
     | Ok libraries -> libraries
     | Error _ -> failwith "Cannot load standard-library contracts"
   in
-  let library = List.hd_exn libraries in
+  let library =
+    List.find_exn libraries ~f:(fun library ->
+        String.equal library.Source.library_name "Caravan_stdlib_list")
+  in
   let lookup member =
     let mk_id = S.mk_id ~loc:Location.none in
     let q = S.Qdot (Qdot (Qid (mk_id "Stdlib"), mk_id "List"), mk_id member) in

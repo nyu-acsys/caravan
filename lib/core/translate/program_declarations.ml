@@ -1639,7 +1639,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 in
                 let* arguments =
                   Generic_parameters.instantiate ~environment
-                    ~expand:(Datatypes.expand types) ~at scheme
+                    ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                    ~at scheme
                     (List.map inputs ~f:Option.some @ [ None ])
                 in
                 let parameters = Generic_parameters.parameter_types scheme arguments in
@@ -1745,12 +1746,6 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 ~at:value.val_loc declaration.val_type
             in
             if List.is_empty scheme.variables then Ok None
-            else if
-              not
-                (match Datatypes.desc types declaration.val_type with
-                | Tarrow _ -> true
-                | _ -> false)
-            then unsupported value.val_loc "Polymorphic values in imported interfaces"
             else
               Ok
                 (Some

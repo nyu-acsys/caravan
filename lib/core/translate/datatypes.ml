@@ -547,7 +547,8 @@ let find (types : t list) (p : Path.t) =
 
 (** Compiler aliases of referenced external types share their underlying representation.
 *)
-let compiler_aliases ?(modules = []) types (structure : Typedtree.structure) =
+let compiler_aliases ?(modules = []) ?(values = []) types
+    (structure : Typedtree.structure) =
   let rec persistent = function
     | Path.Pident id -> Ident.persistent id
     | Pdot (parent, _) -> persistent parent
@@ -563,13 +564,26 @@ let compiler_aliases ?(modules = []) types (structure : Typedtree.structure) =
           match Types.get_desc typ with
           | Tconstr (path, _, _) when persistent path && Option.is_none (find types path)
             ->
+              let represented =
+                Option.bind
+                  (Env.try_normalize_type_path None environment path)
+                  ~f:(find types)
+              in
               let declaration =
                 try Some (Env.find_type path environment) with Stdlib.Not_found -> None
               in
-              begin match declaration with
-              | Some
-                  ({ type_private = Public; type_manifest = Some body; _ } as declaration)
-                ->
+              begin match (represented, declaration) with
+              | Some represented, _ ->
+                  let types =
+                    List.map types ~f:(fun data ->
+                        if phys_equal data represented then with_paths data [ path ]
+                        else data)
+                  in
+                  (seen, types)
+              | ( None,
+                  Some
+                    ({ type_private = Public; type_manifest = Some body; _ } as
+                     declaration) ) ->
                   let alias =
                     {
                       list with
@@ -582,7 +596,7 @@ let compiler_aliases ?(modules = []) types (structure : Typedtree.structure) =
                     }
                   in
                   visit (seen, alias :: types) body
-              | Some _ | None -> (seen, types)
+              | None, (Some _ | None) -> (seen, types)
               end
           | _ -> (seen, types)
         in
@@ -610,6 +624,10 @@ let compiler_aliases ?(modules = []) types (structure : Typedtree.structure) =
                    (Path.Pdot (path, Ident.name id))
                    declaration.type_params)
           | _ -> types))
+  in
+  let types =
+    List.fold values ~init:types ~f:(fun types (environment, typ) ->
+        collect environment types typ)
   in
   let types = ref types in
   let default = Tast_iterator.default_iterator in
@@ -703,6 +721,13 @@ let rec expand_parameterized types t =
   | _ -> t
 
 let desc types t = Types.get_desc (expand types t)
+
+(** Trusted abstract views retain their carriers across compiler alias expansion. *)
+let is_opaque types typ =
+  match desc types typ with
+  | Tconstr (path, _, _) ->
+      Option.exists (find types path) ~f:(fun data -> Option.is_some data.library)
+  | _ -> false
 
 let instantiate (data : t) arguments =
   let substitute = instantiate_alias data.parameters arguments in

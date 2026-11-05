@@ -304,6 +304,8 @@ module State_monad = struct
     dictionaries : domain_request list;
     function_instances : function_instance list;
     call_targets : (string list * string) list;
+    procedure_implicits : (string * string list) list;
+        (** The actual implicit parameters of procedures already translated. *)
     defaults : default_request list;
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
@@ -495,6 +497,7 @@ module State_monad = struct
           dictionaries = [];
           function_instances = [];
           call_targets = [];
+          procedure_implicits = [];
           defaults = [];
           dynamic_indices = false;
         };
@@ -593,6 +596,7 @@ type au = {
       (** The ghost results witnessing facts about earlier states, which the update
           commits with. *)
   has_result : bool;
+  implicit_names : string list;
   open_ :
     invariants_open:bool ->
     contents:Types.type_expr option ->
@@ -1042,16 +1046,10 @@ let implicit_parameter_count ~kind parameters =
   in
   check false 0 parameters
 
-(** The number of [predicate]'s implicit parameters, those marked [[@implicit]]; an
-    invariant has none. *)
+(** The number of trailing parameters marked [[@implicit]]. *)
 let implicit_parameters (predicate : S.predicate) =
   let* count = implicit_parameter_count ~kind:"predicate" predicate.pred_params in
-  match count with
-  | Some _ when predicate.pred_persistent ->
-      error predicate.pred_name.pid_loc
-        "Implicit parameter annotations require an ordinary predicate"
-  | Some count -> Ok count
-  | None -> Ok 0
+  match count with Some count -> Ok count | None -> Ok 0
 
 type predicate_body = {
   definition : S.term;
@@ -1089,7 +1087,8 @@ type inputs = {
   witness_raising : (string * (int * (string * State_monad.raise_set) list)) list;
       (** For functions over a witness, by name: the witness's position among the
           parameters, and what they raise when called with each constructor. *)
-  atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
+  atomic_procedures : (string * string) list;
+      (** Atomic call targets and the implementations whose signatures they share. *)
   universal_result : Datatypes.t option;
       (** In a universal procedure of a function over a witness: its result type, into
           whose case for a constructor the cases of its matches on the witness put their
@@ -1104,6 +1103,10 @@ type inputs = {
           constructors it stands for. *)
   libraries : string list Path_bindings.t;
       (** The modules of the libraries, with their names: trusted Raven modules. *)
+  contracted_values : unit Path_bindings.t;
+      (** Imported constants whose persistent facts are acquired by an accessor. *)
+  local_calls : string list;
+      (** Trusted imports without shared-memory steps, expanded by their contracts. *)
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   proof_lemmas : (string * lemma_signature) list;
   proof_support : proof_support;
@@ -1171,6 +1174,8 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     shared;
     ghost_args = [];
     libraries = Path_bindings.empty;
+    contracted_values = Path_bindings.empty;
+    local_calls = [];
   }
 
 let value_spec ctx ~loc typ variable =
@@ -1896,6 +1901,8 @@ let library_calls libraries =
          List.map lib.signature.signature_values ~f:(fun (name, _) ->
              (Path.Pdot (lib.library_path, name), [ lib.library_name; name ]))))
 
+let library_value_accessor name = name ^ "$get"
+
 let library_paths libraries =
   Path_bindings.of_list
     (List.map libraries ~f:(fun (lib : Library_modules.t) ->
@@ -2353,6 +2360,7 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
                   in
                   let* actuals =
                     Generic_predicates.instantiate ~environment:env.ctx.given.env
+                      ~opaque:(Datatypes.is_opaque env.data)
                       ~expand:(Datatypes.expand env.data) ~at predicate actuals
                   in
                   Ok (Generic_predicates.parameter_types predicate actuals)

@@ -1,0 +1,1 @@
+proof inspect = at (Atomic.get cell) commit

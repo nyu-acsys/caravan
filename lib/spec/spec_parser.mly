@@ -260,7 +260,7 @@ predicate:
 ;
 
 invariant_declaration:
-| INVARIANT n = lident ps = pred_param+ EOF
+| INVARIANT n = lident ps = predicate_param+ EOF
     { { pred_name = n; pred_params = ps; pred_body = None;
         pred_persistent = true; pred_inline = false } }
 ;
@@ -749,7 +749,7 @@ clause:
 ;
 
 header_app:
-| nm=lident_rich args=fun_arg+
+| nm=lident_rich args=fun_arg*
     { nm, args }
 |  arg1=fun_arg nm=op_symbol arg2=fun_arg
     { let nm = mk_id ~loc:(mk_loc $loc(nm)) nm in
