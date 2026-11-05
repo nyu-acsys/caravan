@@ -15,7 +15,7 @@ let binding_name_location (binding : Typedtree.value_binding) =
 
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
-let items source (inventory : Module_inventory.t) =
+let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t) =
   let* signature_predicates =
     all
       (List.filter inventory.constraints ~f:(fun constraint_ ->
@@ -51,7 +51,8 @@ let items source (inventory : Module_inventory.t) =
         in
         Ok { data with heap })
   in
-  let* exceptions = Exceptions.datatype inventory.structure in
+  let* library = Exceptions.library_declared source.env libraries in
+  let* exceptions = Exceptions.datatype ~library inventory.structure in
   let data = data @ Option.to_list exceptions in
   let same_scope (a : Module_inventory.value) (b : Module_inventory.value) =
     let a = a.site.scope.location and b = b.site.scope.location in
@@ -720,23 +721,6 @@ let chain_of ~state (t : S.term) =
       | _ -> None
       end
   | _ -> None
-
-(** The direct subterms of [t]. *)
-let subterms (t : S.term) =
-  match t.term_desc with
-  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
-  | Tfield (t, _)
-  | Tquant (_, _, t)
-  | Tcomprehension (_, t)
-  | Tattr (_, t)
-  | Tcast (t, _)
-  | Told t ->
-      [ t ]
-  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) -> [ a; b ]
-  | Tif (a, b, c) -> [ a; b; c ]
-  | Tmatch (t, cases) -> t :: List.map cases ~f:snd
-  | Ttuple ts -> ts
-  | Trecord (base, fields) -> Option.to_list base @ List.map fields ~f:snd
 
 (** The fields of the state [state] that [t] mentions, as [s.f]. *)
 let rec state_fields ~state (t : S.term) =
@@ -1611,7 +1595,7 @@ type prepared_callable = {
 }
 (** The contract declaration shared by imports and checked forwarding procedures. *)
 
-let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
+let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~result
     (contract : S.contract option) =
   let l = loc at in
   let header = Option.bind contract ~f:(fun c -> c.header) in
@@ -1653,8 +1637,19 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
         let+ () = State.note_domain ctx.given.types t in
         (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
+  (* A function that may raise, as [raising] says, returns its outcome last. *)
+  let* outcome =
+    match raising with
+    | None -> State.return None
+    | Some set ->
+        let* typ = State.typ ctx ~at outcome_type in
+        let+ raised = State.fresh "raised" in
+        Some (set, raised, typ)
+  in
   let returns =
-    if is_unit result then [] else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ]
+    (if is_unit result then [] else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ])
+    @ Option.value_map outcome ~default:[] ~f:(fun (_, raised, typ) ->
+        [ R.Var.make ~loc:l (ident ~loc:l raised) typ ])
   in
   let named =
     (result_name, "r", result)
@@ -1673,6 +1668,20 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   in
   let env =
     if is_unit result then bind env result_name (Value (unit_value ~loc:l)) else env
+  in
+  let env =
+    Option.value_map outcome ~default:env ~f:(fun (_, raised, _) ->
+        {
+          (bind env outcome_name (Raven raised)) with
+          var_types = (outcome_name, outcome_type) :: env.var_types;
+        })
+  in
+  let raises = Option.value_map contract ~default:[] ~f:(fun c -> c.raises) in
+  let atomic_raises =
+    Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_raises)
+  in
+  let on_return terms =
+    if Option.is_some outcome then List.map terms ~f:Exceptions.on_return else terms
   in
   let requires = Option.value_map contract ~default:[] ~f:(fun c -> c.requires) in
   let atomic_requires =
@@ -1715,16 +1724,37 @@ let prepare_callable ?(validate = false) ctx ~(at : Location.t) ~args ~result
   let* atomic_requires = clauses ~atomic:true atomic_requires in
   let* ensures =
     contract_postconditions env ~at
-      (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
+      (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
+      @ Option.value_map outcome ~default:[] ~f:(fun (set, _, _) ->
+          Exceptions.raises_postconditions ctx.given.types ~at raises set))
   in
   let+ atomic_ensures =
     contract_postconditions env ~at ~atomic:true
-      (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
+      (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
+      @ Option.value_map outcome ~default:[] ~f:(fun _ ->
+          Exceptions.raises_postconditions ~only:false ctx.given.types ~at
+            (List.map atomic_raises ~f:(fun (p, t) -> (p, Some t)))
+            (State.Raises [])))
   in
   let in_range =
     List.filter_map params ~f:(fun (_, raven, typ, _) -> value_spec ctx ~loc:l typ raven)
   in
-  let result_in_range = Option.to_list (value_spec ctx ~loc:l result "r") in
+  let result_in_range =
+    match outcome with
+    | None -> Option.to_list (value_spec ctx ~loc:l result "r")
+    | Some (_, raised, typ) ->
+        Option.to_list
+          (Option.map
+             (Datatypes.admissible ~loc:l ctx.given.types result
+                (R.Expr.var ~loc:l (name ~loc:l "r")))
+             ~f:(fun admissible ->
+               R.Spec.make
+                 (R.Expr.binary ~loc:l Impl
+                    (R.Expr.binary ~loc:l Eq
+                       (R.Expr.var ~loc:l (name ~loc:l raised))
+                       (no_exception ~loc:l typ))
+                    admissible)))
+  in
   {
     prepared_formals =
       List.map params ~f:(fun (_, _, _, v) -> v)
@@ -1809,7 +1839,7 @@ let contains_atomic_token types typ =
   contains [] typ
 
 (** An assumed library value or procedure, using the shared contract preparation. *)
-let library_function ctx ~(at : Location.t) ~name ~args ~result contract =
+let library_function ?raising ctx ~(at : Location.t) ~name ~args ~result contract =
   match (args, contract) with
   | [], None ->
       let open State.Syntax in
@@ -1825,5 +1855,5 @@ let library_function ctx ~(at : Location.t) ~name ~args ~result contract =
         (unsupported at "A contract of a library's value other than a function")
   | _ ->
       State.map
-        (prepare_callable ctx ~at ~args ~result contract)
+        (prepare_callable ?raising ctx ~at ~args ~result contract)
         ~f:(prepared_member ~at ~name None)

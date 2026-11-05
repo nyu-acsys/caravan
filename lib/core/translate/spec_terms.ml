@@ -678,10 +678,30 @@ let pending_registrations env ~at s field =
       | [] -> error at "waiting takes a field of pending calls of the state, as s.waiting"
       | pendings -> Ok pendings)
 
+(** Whether [t] matches on an exception that Caravan names by its key, as in the
+    postconditions it makes for raised exceptions. *)
+let rec names_exception_by_key (t : S.term) =
+  let rec in_pattern (p : S.pat) =
+    match p.pat_desc with
+    | Pconstr (Qid id, _)
+      when String.is_prefix id.pid_str ~prefix:exception_constructor_prefix ->
+        true
+    | Pconstr (_, Some p) | Pcast (p, _) -> in_pattern p
+    | Ptuple ps -> List.exists ps ~f:in_pattern
+    | Pconstr (_, None) | Pwild | Pid _ | Pconst _ -> false
+  in
+  match t.term_desc with
+  | Tmatch (scrutinee, cases) ->
+      names_exception_by_key scrutinee
+      || List.exists cases ~f:(fun (p, body) ->
+          in_pattern p || names_exception_by_key body)
+  | _ -> List.exists (subterms t) ~f:names_exception_by_key
+
 (** The formula [t] of a contract. *)
 let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   let* () =
-    if opaque_module_types env then
+    (* Caravan's own terms on raised exceptions name them outside OCaml's scopes. *)
+    if opaque_module_types env && not (names_exception_by_key t) then
       State.of_result
         (Signature_contract.expression ~logical_types:env.data
            ~environment:env.ctx.given.env

@@ -104,11 +104,41 @@ let declared (structure : Typedtree.structure) =
         (Printf.sprintf "Two exceptions named %s, or one named as a predefined one" name)
   | None -> Ok declared
 
-(** The data type of [exn], with the exceptions of [structure], if it mentions any. *)
-let datatype (structure : Typedtree.structure) =
-  if not (mentioned structure) then Ok None
+(** The exceptions that the interfaces of [libraries] declare, named by the libraries'
+    paths, as the program's environment [env] has them. *)
+let library_declared env (libraries : Library_modules.t list) =
+  Result.all
+    (List.concat_map libraries ~f:(fun lib ->
+         match Env.find_module lib.library_path env with
+         | exception Stdlib.Not_found -> []
+         | declaration -> (
+             match Mtype.scrape env declaration.md_type with
+             | Mty_signature items ->
+                 List.filter_map items ~f:(function
+                   | Types.Sig_typext (id, ext, Text_exception, _) ->
+                       Some
+                         (match ext.ext_args with
+                         | Cstr_tuple args ->
+                             Ok
+                               {
+                                 name = Path.name (Pdot (lib.library_path, Ident.name id));
+                                 uid = ext.ext_uid;
+                                 args;
+                                 at = ext.ext_loc;
+                               }
+                         | Cstr_record _ ->
+                             Report.unsupported ext.ext_loc
+                               "An exception with a record or a GADT payload")
+                   | _ -> None)
+             | _ -> [])))
+
+(** The data type of [exn], with the exceptions of [structure] and [library], those the
+    program's libraries declare, if it mentions any or they declare any. *)
+let datatype ?(library = []) (structure : Typedtree.structure) =
+  if not (mentioned structure || not (List.is_empty library)) then Ok None
   else
     let* declared = declared structure in
+    let declared = library @ declared in
     let ctor name args =
       let raven = String.uncapitalize (String.tr ~target:'.' ~replacement:'$' name) in
       {
@@ -384,7 +414,7 @@ let intersection left right =
     contract raises what its [raises] clauses say; one without raises what its body raises
     and its calls may raise. Also, per witness constructor, what each function with a
     witness parameter raises when called with it. *)
-let raise_sets ~key procedures ~resolve =
+let raise_sets ?(library = []) ~key procedures ~resolve =
   let module S = Translate_context.State_monad in
   let bodies =
     List.map procedures ~f:(fun (name, contract, body, witness, resolve) ->
@@ -417,7 +447,9 @@ let raise_sets ~key procedures ~resolve =
           | Some set -> set
           | None ->
               Option.value
-                (List.Assoc.find sets callee ~equal:String.equal)
+                (Option.first_some
+                   (List.Assoc.find sets callee ~equal:String.equal)
+                   (List.Assoc.find library callee ~equal:String.equal))
                 ~default:(S.Raises []))
     in
     let declared_or contract inferred =

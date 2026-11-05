@@ -889,8 +889,6 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
                         witness other than a constructor"))
         in
         match resolved_call ctx.given.functions ctx.given.libraries path with
-        | Some f when List.mem ctx.given.raising_library_calls f ~equal:String.equal ->
-            State.of_result (unsupported at "A call of a library function that may raise")
         | Some f ->
             let* actual_target, type_instance =
               State.polymorphic_application ~values:args ctx ~at ~path

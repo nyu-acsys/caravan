@@ -3,7 +3,13 @@
 (library
  (name caravan_saturn_stack_drain)
  (wrapped false)
- (modules stack_drain wrong_contents wrong_result raising_call)
+ (modules
+  stack_drain
+  wrong_contents
+  wrong_result
+  raising_call
+  undeclared_raise
+  wrong_raise)
  (libraries caravan_saturn_treiber_stack))
 
 (cram

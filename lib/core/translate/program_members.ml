@@ -313,16 +313,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   (Option.value_map contract ~default:(Ok ()) ~f:(fun contract ->
                        Signature_contract.lowerable source signature ~environment contract))
               in
-              if Option.exists contract ~f:raising_contract then
-                (* Its calls are rejected; see [raising_library_calls]. *)
-                State.return ([], [])
-              else
-                let+ member = library_function ctx ~at ~name:x ~args ~result contract in
-                let member = R.Member.free (R.Member.callable member) in
-                begin match worker with
-                | None -> ([ member ], [])
-                | Some worker -> ([], [ (worker.name, [ member ]) ])
-                end)
+              (* One that may raise raises what its contract declares. *)
+              let raising =
+                Option.bind contract ~f:(fun contract ->
+                    Option.some_if (raising_contract contract)
+                      (Exceptions.declared_raises
+                         ~resolve:(Exceptions.resolver ctx.given.types ctx.given.env)
+                         contract))
+              in
+              let+ member =
+                library_function ?raising ctx ~at ~name:x ~args ~result contract
+              in
+              let member = R.Member.free (R.Member.callable member) in
+              begin match worker with
+              | None -> ([ member ], [])
+              | Some worker -> ([], [ (worker.name, [ member ]) ])
+              end)
         in
         let ordinary_predicates =
           List.filter_map pred_members ~f:(function
@@ -1767,8 +1773,23 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   List.map witness_data.Datatypes.ctors ~f:(fun c -> c.Datatypes.ocaml) ))
         | _ -> None)
   in
+  (* The library functions that may raise, by the names calls use, with what their
+     contracts declare. *)
+  let* library_raising =
+    all libraries ~f:(fun lib ->
+        let* environment = Library_modules.environment source lib in
+        let* contracts = library_contracts lib in
+        Ok
+          (List.filter_map contracts ~f:(fun (name, (contract, _)) ->
+               Option.some_if (raising_contract contract)
+                 ( lib.library_name ^ "." ^ name,
+                   Exceptions.declared_raises
+                     ~resolve:(Exceptions.resolver decls.types environment)
+                     contract ))))
+    |> Result.map ~f:List.concat
+  in
   let raising, by_constructor =
-    Exceptions.raise_sets ~key:(Exceptions.key decls.types)
+    Exceptions.raise_sets ~library:library_raising ~key:(Exceptions.key decls.types)
       (List.map translated ~f:(fun (name, f, _) ->
            ( name,
              f.contract,
@@ -1800,7 +1821,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      List.Assoc.find sets copy.constructor ~equal:String.equal)) )
         | _ -> (name, set))
   in
-  let raising = by_own_names raising in
+  let raising = by_own_names raising @ library_raising in
   (* The calls of functions copied per witness constructor, which call the copies. *)
   let specialized_calls =
     List.map scopes.specialized ~f:(fun (s : Specializations.t) ->
@@ -1912,7 +1933,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   witness_raising;
                   atomic_procedures;
                   libraries = library_paths libraries;
-                  raising_library_calls = raising_library_calls libraries;
                   shared_exceptions = shared_exceptions_of f;
                   specialized_witness =
                     Option.bind f.copy_for ~f:(fun copy ->

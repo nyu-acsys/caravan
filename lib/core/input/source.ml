@@ -1713,6 +1713,10 @@ let module_path env q =
     Some (Env.normalize_module_path None env path)
   with Stdlib.Not_found -> None
 
+(** The prefix of the constructor patterns that name an exception by its key, whatever the
+    scope. *)
+let exception_constructor_prefix = "caravan$exception$"
+
 let constructor env q =
   try Some (Env.find_constructor_by_name (longident q) env)
   with Stdlib.Not_found -> None

@@ -2220,14 +2220,3 @@ let library_contracts (library : Library_modules.t) =
 (** Whether [contract] says its function may raise. *)
 let raising_contract (contract : S.contract) =
   not (List.is_empty contract.raises && List.is_empty contract.atomic_raises)
-
-(** The library functions whose contracts say they may raise, by their qualified names:
-    exceptions of libraries are not supported yet, so their calls are rejected. *)
-let raising_library_calls (libraries : Library_modules.t list) =
-  List.concat_map libraries ~f:(fun lib ->
-      Option.value_map
-        (Result.ok (library_contracts lib))
-        ~default:[]
-        ~f:(fun contracts ->
-          List.filter_map contracts ~f:(fun (name, (contract, _)) ->
-              Option.some_if (raising_contract contract) (lib.library_name ^ "." ^ name))))

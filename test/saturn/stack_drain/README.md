@@ -18,3 +18,7 @@ interface, then verifies this client against the generated copy. There is no
 separately maintained library specification, and the client cannot use the stack's
 representation predicate definition. The negative tests reject an always-empty
 result and preservation of the original stack contents.
+
+`raising_call.ml` calls the interface's `pop_exn`, handling its `Empty` in one client
+and declaring it in the other's `raises` clause. The negative tests reject an undeclared
+raise and a `raises` clause that the interface's contract does not imply.

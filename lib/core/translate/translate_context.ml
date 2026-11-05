@@ -1064,8 +1064,6 @@ type inputs = {
       (** For functions over a witness, by name: the witness's position among the
           parameters, and what they raise when called with each constructor. *)
   atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
-  raising_library_calls : string list;
-      (** The library functions that may raise, whose calls are not supported yet. *)
   specialized_witness : (Ident.t * string) option;
       (** In a copy of a function over a witness for one of its constructors: its witness
           parameter and the constructor, whose cases its matches select. *)
@@ -1139,7 +1137,6 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     raising = [];
     witness_raising = [];
     atomic_procedures = [];
-    raising_library_calls = [];
     specialized_witness = None;
     specialized_calls = [];
     shared_exceptions = None;
@@ -1954,7 +1951,7 @@ let occurrence_constructor types occurrence
 
 (** The prefix of the name that Caravan gives an exception by its key, in contracts it
     makes. *)
-let exception_constructor_prefix = "caravan$exception$"
+let exception_constructor_prefix = Source.exception_constructor_prefix
 
 let find_constructor ?occurrence env q =
   match q with
@@ -2163,6 +2160,23 @@ let rec term_names (t : S.term) : string list =
   | Ttuple ts -> List.concat_map ts ~f:term_names
   | Trecord (base, fields) -> List.concat_map (S.record_terms base fields) ~f:term_names
   | Tattr (_, t) | Tcast (t, _) | Told t | Tfield (t, _) -> term_names t
+
+(** The direct subterms of [t]. *)
+let subterms (t : S.term) =
+  match t.term_desc with
+  | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
+  | Tfield (t, _)
+  | Tquant (_, _, t)
+  | Tcomprehension (_, t)
+  | Tattr (_, t)
+  | Tcast (t, _)
+  | Told t ->
+      [ t ]
+  | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) -> [ a; b ]
+  | Tif (a, b, c) -> [ a; b; c ]
+  | Tmatch (t, cases) -> t :: List.map cases ~f:snd
+  | Ttuple ts -> ts
+  | Trecord (base, fields) -> Option.to_list base @ List.map fields ~f:snd
 
 let rec term_references bound (t : S.term) =
   let refs = term_references bound in

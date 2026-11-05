@@ -282,7 +282,7 @@ let run (source : Source.t) : (t, error) Result.t =
   List.iter libraries ~f:(fun lib ->
       List.iter lib.Library_modules.signature.signature_types ~f:(fun (name, _) ->
           Fresh_names.reserve [ lib.library_name ^ "_" ^ name ]));
-  let* types, funcs = items source inventory in
+  let* types, funcs = items ~libraries source inventory in
   let* lifted = all funcs ~f:(fun f -> local_functions ~source f annotations) in
   let lifted =
     List.map (List.concat lifted) ~f:(fun f ->

@@ -24,11 +24,25 @@ Draining consumes the original contents rather than preserving them in the stack
   Related Location: This predicate may not hold.
   [1]
 
-The interface's raising functions cannot be called through it yet.
+A raise of the interface's function that the client's contract does not declare is
+rejected.
 
-  $ caravan --shh raising_call.ml
-  [Error] File "raising_call.ml", line 1, columns 16-43:
-  1 | let top stack = Treiber_stack.pop_exn stack
+  $ caravan --shh undeclared_raise.ml
+  [Error] File "undeclared_raise.ml", line 1, columns 16-43:
+  1 | let pop stack = Treiber_stack.pop_exn stack
                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A call of a library function that may raise is not supported yet.
+  Type Error: This may raise Treiber_stack.Empty, which the contract of the function does not declare: add a raises clause.
+  [1]
+
+A raises clause that the interface's contract does not imply fails.
+
+  $ caravan --shh wrong_raise.ml
+  [Error] File "wrong_raise.ml", line 1, columns 16-43:
+  1 | let pop stack = Treiber_stack.pop_exn stack
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Verification Error: A postcondition may not hold at this return point.
+  File "wrong_raise.ml", line 7, columns 34-42:
+  7 |     raises Treiber_stack.Empty -> xs <> [] *)
+                                        ^^^^^^^^
+  Related Location: This assertion may not hold.
   [1]
