@@ -1,0 +1,6 @@
+(library
+ (name caravan_docs_examples)
+ (modules negate))
+
+(cram
+ (deps %{bin:caravan} negate.ml))

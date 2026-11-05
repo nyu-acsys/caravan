@@ -1,0 +1,12 @@
+node_modules/
+.site-kit/
+.site-kit-*/
+.vitepress/dist/
+.vitepress/cache/
+.vitepress/section-registry.json
+.vitepress/examples-manifest.json
+public/logo.png
+public/logo-small.png
+public/**/*.ml
+public/**/*.mli
+public/**/*.proof

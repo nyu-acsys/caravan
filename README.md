@@ -7,6 +7,8 @@
   <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg"/></a>
 </p>
 
+> **[nyu-acsys.github.io/caravan](https://nyu-acsys.github.io/caravan/)** — project page and [getting-started guide](https://nyu-acsys.github.io/caravan/getting-started/).
+
 Caravan verifies multicore OCaml programs. It translates OCaml 5 code, with
 specifications written in comments, to [Raven](https://github.com/nyu-acsys/raven), an
 SMT-based verifier for concurrent separation logic, and reports what Raven finds in terms
@@ -38,8 +40,10 @@ parameters remains unsupported.
 Variants and immutable records can have type parameters, including regular recursive
 definitions. Their carriers are shared across callers, source modules and supported
 functors. Constructor and record annotations use the surrounding type when payloads
-alone cannot determine it. GADTs, inline constructor records and nonregular recursive
-datatypes remain unsupported.
+alone cannot determine it. Functions over constant GADT witnesses, such as Saturn's
+`pop_as`, are verified once for all witnesses, with contracts matching on them.
+General GADTs, inline constructor records and nonregular recursive datatypes remain
+unsupported.
 
 Functions and types can be grouped in `module ... = struct ... end`,
 including nested modules. Calls and annotations resolve names in their enclosing

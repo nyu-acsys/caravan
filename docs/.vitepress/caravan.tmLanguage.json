@@ -1,0 +1,13 @@
+{
+  "name": "Caravan OCaml",
+  "scopeName": "source.caravan.ocaml",
+  "patterns": [
+    { "include": "caravan.ocaml.injection" },
+    { "include": "source.ocaml" }
+  ],
+  "injections": {
+    "L:source.caravan.ocaml - comment - string": {
+      "patterns": [{ "include": "caravan.ocaml.injection" }]
+    }
+  }
+}
