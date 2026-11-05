@@ -118,6 +118,181 @@ let action_checks ctx (st : structure) =
                    (Some []));
             ])
 
+(** For each pending field of [st] whose calls the action [a] helps, the lemma carrying
+    its registrations from the state before the action to the state after: it helps the
+    calls waiting on the key, and leaves none waiting on the key of the state after. The
+    steps performing the action call it rather than unfolding the registrations, keeping
+    their instances out of the steps' proofs. Its parameters are the invariant's [params],
+    its [existentials], and the action's; it assumes the invariant's facts without
+    ownership, [pure], and that what the action appends to fields owned by index is not
+    among their entries. *)
+let transition_lemmas ctx (st : structure) (a : action) ~params ~existentials ~pure ~env =
+  let open State.Syntax in
+  let at = a.action_at in
+  let l = loc at in
+  let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+  let bin op x y = R.Expr.binary ~loc:l op x y in
+  let helped =
+    List.filter_map st.parts ~f:(fun part ->
+        match part.part_source with
+        | `Pending field
+          when List.exists a.helps ~f:(fun (f, _, _) -> String.equal f field) ->
+            Option.map
+              (List.find st.pendings ~f:(fun p -> String.equal p.pending_field field))
+              ~f:(fun p -> (part, p))
+        | `Pending _ | `Conjunct _ -> None)
+  in
+  if List.is_empty helped then State.return []
+  else
+    let args = List.map params ~f:(fun (_, raven, _, _) -> var raven) in
+    let state_value values =
+      State (List.map2_exn st.fields values ~f:(fun (f, _, _, t, _) v -> (f, (v, t))))
+    in
+    let opened_values = List.map st.fields ~f:(fun (_, raven, _, _, _) -> var raven) in
+    let param_types =
+      action_parameter_types (bind env a.state (state_value opened_values)) a
+    in
+    let* typed =
+      State.all a.params ~f:(fun x ->
+          match List.Assoc.find param_types x ~equal:String.equal with
+          | Some t ->
+              let+ raven = State.fresh x in
+              Some (x, raven, t)
+          | None -> State.return None)
+    in
+    match Option.all typed with
+    | None ->
+        State.of_result
+          (unsupported at
+             "Helping by an action whose parameters' types its step does not give")
+    | Some action_params ->
+        let* action_vars =
+          State.all action_params ~f:(fun (_, raven, t) ->
+              let+ typ = State.typ ctx ~at t in
+              R.Var.make ~loc:l (ident ~loc:l raven) typ)
+        in
+        let opened =
+          {
+            values = opened_values;
+            indices =
+              List.map st.chains ~f:(fun (field, raven) -> (field, var raven))
+              @ List.map st.pendings ~f:(fun p -> (p.pending_field, var p.pending_on));
+          }
+        in
+        let performing =
+          {
+            performed = a;
+            bindings = List.map action_params ~f:(fun (x, raven, _) -> (x, var raven));
+            invariant = Some st.invariant;
+          }
+        in
+        let* next, indices, appended =
+          next_state ctx st ~inv_params:st.params args opened performing
+        in
+        let values = List.map next ~f:fst in
+        let after =
+          {
+            values;
+            indices =
+              List.map opened.indices ~f:(fun (field, e) ->
+                  ( field,
+                    Option.value
+                      (Option.bind (List.Assoc.find st.chains field ~equal:String.equal)
+                         ~f:(fun index ->
+                           List.Assoc.find indices index ~equal:String.equal))
+                      ~default:e ));
+          }
+        in
+        (* What the action appends to a field owned by index is not among its entries: not
+           at the position its index map gives it. *)
+        let fresh =
+          List.filter_map appended ~f:(fun (field, e, _) ->
+              Option.both
+                (List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field))
+                (List.Assoc.find st.chains field ~equal:String.equal)
+              |> Option.map ~f:(fun ((_, raven, _, _, _), index) ->
+                  let i = R.Expr.index ~loc:l (var index) e in
+                  R.Expr.not_ ~loc:l
+                    (List.reduce_exn ~f:(bin And)
+                       [
+                         bin Leq (R.Expr.int ~loc:l 0) i;
+                         bin Lt i
+                           (R.Expr.call ~loc:l
+                              (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
+                              [ var raven ]);
+                         bin Eq (R.Expr.index ~loc:l (var raven) i) e;
+                       ])))
+        in
+        let* views = views_after ctx st args values in
+        let structure = List.hd_exn args in
+        let structure =
+          match anchor_location ctx.given.types st.structure_type with
+          | Some anchor -> anchor ~loc:l structure
+          | None -> structure
+        in
+        let view_owned =
+          List.map views ~f:(fun (v, _, value) ->
+              View_storage.own ~loc:l
+                ~field:(view_field_in ctx.given.shared v)
+                structure value 0.5)
+        in
+        let call f es =
+          R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l f) es)
+        in
+        State.all helped ~f:(fun (part, p) ->
+            let old_args = part_args part ~args (opened_bindings st opened) in
+            let new_args = part_args part ~args (opened_bindings st after) in
+            let one =
+              {
+                performing with
+                performed =
+                  {
+                    a with
+                    helps =
+                      List.filter a.helps ~f:(fun (f, _, _) ->
+                          String.equal f p.pending_field);
+                  };
+              }
+            in
+            let* help = helping ctx st args opened one values ~la:l ~lemma:call in
+            let helping_state, helping_key, _ = p.helping in
+            let+ key =
+              formula (bind env helping_state (state_value values)) helping_key
+            in
+            let i, _ =
+              List.findi_exn st.fields ~f:(fun _ (f, _, _, _, _) ->
+                  String.equal f p.pending_field)
+            in
+            let hc = var "hc" in
+            let unwatched =
+              R.Expr.forall ~loc:l
+                [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
+                (bin Impl
+                   (bin In hc (List.nth_exn values i))
+                   (bin Neq
+                      (R.Expr.index ~loc:l
+                         (List.Assoc.find_exn after.indices p.pending_field
+                            ~equal:String.equal)
+                         hc)
+                      key))
+            in
+            let pred = qualified_name ~loc:l part.part_pred in
+            R.Callable.proc ~loc:l ~kind:Lemma
+              ~formals:
+                (List.map params ~f:(fun (_, _, _, v) -> v) @ existentials @ action_vars)
+              ~requires:
+                (List.map
+                   ((R.Expr.call ~loc:l pred old_args :: pure) @ fresh @ view_owned)
+                   ~f:R.Spec.make)
+              ~ensures:
+                (List.map
+                   ((R.Expr.call ~loc:l pred new_args :: view_owned) @ [ unwatched ])
+                   ~f:R.Spec.make)
+              (generated_ident ~loc:l (transition_name st p a.action))
+              (Some
+                 ((R.Stmt.unfold ~loc:l pred old_args :: help)
+                 @ [ R.Stmt.fold ~loc:l pred new_args ])))
+
 (** The context translating the specifications of declarations, outside functions. *)
 let spec_context types ~shared ~ocaml_env ~preds ~spec_funcs
     ?(proof_support = empty_proof_support) ?(generic_predicates = [])
@@ -503,10 +678,20 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                    part. *)
                 let+ wf, owned = chain owned in
                 let owned, part = held (`Conjunct n) owned in
-                (bin And wf owned, part)
+                ((bin And wf owned, part), Some wf)
             | _ ->
                 let+ e = quantified state_env t in
-                held (`Conjunct n) e)
+                let e, part = held (`Conjunct n) e in
+                ((e, part), Option.some_if (Option.is_none part && not (mentions_own t)) e))
+      in
+      (* The facts of the invariant, without ownership, which the transition lemmas of its
+         parts assume. *)
+      let pure = List.filter_map body ~f:snd in
+      let body = List.map body ~f:fst in
+      let* transitions =
+        State.map ~f:List.concat
+        @@ State.all st.actions ~f:(fun a ->
+            transition_lemmas ctx st a ~params ~existentials ~pure ~env)
       in
       (* The registered calls, each waiting on a key, helped once the key is not the one
          that the helping action helps any more, and their registrations. *)
@@ -686,7 +871,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       in
       State.return
         ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body),
-          List.filter_opt parts )
+          List.filter_opt parts @ transitions )
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A

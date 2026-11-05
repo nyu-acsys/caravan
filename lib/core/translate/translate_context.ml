@@ -863,6 +863,18 @@ let opened_bindings st (opened : opened) =
       Option.map (List.Assoc.find opened.indices p.pending_field ~equal:String.equal)
         ~f:(fun v -> (p.pending_on, v)))
 
+(** The name of the lemma carrying the registrations of [p] through the action [action],
+    which helps their calls. *)
+let transition_name st (p : pending) action = pending_name st p ("after_" ^ action)
+
+(** The names of the existentials of [st]'s invariant, in the order its transition lemmas
+    take them: the fields, the keys of the pending fields' registrations, and the index
+    maps. *)
+let invariant_existentials st =
+  List.map st.fields ~f:(fun (_, raven, _, _, _) -> raven)
+  @ List.map st.pendings ~f:(fun p -> p.pending_on)
+  @ List.map st.chains ~f:snd
+
 (** The arguments of [part]'s predicate for the invariant's arguments [args] and the
     existentials' values [bindings]. *)
 let part_args part ~args bindings =

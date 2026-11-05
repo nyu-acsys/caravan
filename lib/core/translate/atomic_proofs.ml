@@ -889,7 +889,8 @@ let part_needed types ~contents part =
     in the state [opened], for the state [after]: unfolding those the opening did not
     unfold but whose arguments change, or that [force] says, and folding them back with
     their arguments after. *)
-let reconcile_parts st ~l ~la inv args (opened : opened) (after : opened) ~force =
+let reconcile_parts ?(except = fun _ -> false) st ~l ~la inv args (opened : opened)
+    (after : opened) ~force =
   let open State.Syntax in
   let+ path = get_path in
   let unfolded =
@@ -897,7 +898,9 @@ let reconcile_parts st ~l ~la inv args (opened : opened) (after : opened) ~force
   in
   let before = opened_bindings st opened and after = opened_bindings st after in
   let closing =
-    List.filter_map st.parts ~f:(fun part ->
+    List.filter_map
+      (List.filter st.parts ~f:(Fn.non except))
+      ~f:(fun part ->
         let pred = qualified_name ~loc:l part.part_pred in
         let old_args = part_args part ~args before
         and new_args = part_args part ~args after in
@@ -1136,20 +1139,60 @@ let use_invariants ?performs ?(no_action = false) ?contents ctx ~(at : Location.
                               @ path.positions;
                           })
                     in
-                    (* The calls the action helps, committed in the state after it. *)
-                    let* helping = helping ctx st args opened p values ~la ~lemma in
+                    (* The registrations of the calls the action helps, carried to the
+                       state after it by their transition lemmas, which commit them. *)
+                    let helped part =
+                      match part.part_source with
+                      | `Pending field ->
+                          List.find st.pendings ~f:(fun q ->
+                              String.equal q.pending_field field
+                              && List.exists p.performed.helps ~f:(fun (f, _, _) ->
+                                  String.equal f field))
+                      | `Conjunct _ -> None
+                    in
+                    let transited =
+                      List.filter st.parts ~f:(Fn.compose Option.is_some helped)
+                    in
+                    let* path = get_path in
+                    let unfolded =
+                      Option.value
+                        (List.Assoc.find path.unfolded inv ~equal:String.equal)
+                        ~default:[]
+                    in
+                    let bindings = opened_bindings st opened in
+                    let existentials =
+                      List.map (invariant_existentials st) ~f:(fun x ->
+                          List.Assoc.find_exn bindings x ~equal:String.equal)
+                    in
+                    let action_args =
+                      List.map p.performed.params ~f:(fun x ->
+                          List.Assoc.find_exn p.bindings x ~equal:String.equal)
+                    in
+                    let transitions =
+                      List.concat_map transited ~f:(fun part ->
+                          let pending = Option.value_exn (helped part) in
+                          let pred = qualified_name ~loc:l part.part_pred in
+                          (if List.mem unfolded part.part_pred ~equal:String.equal then
+                             [ R.Stmt.fold ~loc:l pred (part_args part ~args bindings) ]
+                           else [])
+                          @ [
+                              lemma
+                                (transition_name st pending p.performed.action)
+                                (args @ existentials @ action_args);
+                            ])
+                    in
                     let* unfolds, folds =
-                      reconcile_parts st ~l ~la inv args opened state ~force:(fun part ->
-                          (not (List.is_empty helping))
-                          &&
-                          match part.part_owns with
-                          | Ghost -> true
-                          | Atomics _ | Unknown -> false)
+                      reconcile_parts st ~l ~la inv args opened state
+                        ~except:(fun part ->
+                          List.exists transited ~f:(fun t ->
+                              String.equal t.part_pred part.part_pred))
+                        ~force:(fun _ -> false)
                     in
                     if has_history st then
                       let+ snapshot = snapshot st state in
-                      unfolds @ helping @ learn @ (snapshot :: folds) @ fold ~witnesses ()
-                    else State.return (unfolds @ folds @ fold ~witnesses ())
+                      unfolds @ transitions @ learn @ (snapshot :: folds)
+                      @ fold ~witnesses ()
+                    else State.return (unfolds @ transitions @ folds @ fold ~witnesses ())
                 | (None | Some _) when has_history st ->
                     let* _, folds =
                       reconcile_parts st ~l ~la inv args opened opened ~force:(fun _ ->
