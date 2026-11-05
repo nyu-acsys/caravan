@@ -1,3 +1,8 @@
+(copy_files ../../saturn/michael_scott_queue/michael_scott_queue_intf.mli)
+
+(copy_files
+ ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli)
+
 (rule
  (target history_queue.ml)
  (deps
@@ -88,6 +93,8 @@
  (deps
   %{bin:caravan}
   %{bin:raven}
+  michael_scott_queue_intf.mli
+  michael_scott_queue_lseg_intf.mli
   history_queue.ml
   history_queue.proof
   history_api.mli

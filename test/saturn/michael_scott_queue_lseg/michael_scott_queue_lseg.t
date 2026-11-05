@@ -10,14 +10,14 @@ The emitted proof parses and type-checks as standalone Raven.
 Clients initialize empty, singleton, and longer queues and exercise FIFO operations.
 
   $ mkdir client
-  $ cp michael_scott_queue_lseg.mli of_list_client.ml client/
+  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli of_list_client.ml client/
   $ caravan --shh -I ../backoff client/of_list_client.ml
   Verification successful.
 
 Building an empty chain cannot establish the input contents.
 
   $ mkdir wrong_contents
-  $ cp michael_scott_queue_lseg.mli wrong_contents/
+  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.ml > wrong_contents/michael_scott_queue_lseg.ml
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.proof > wrong_contents/michael_scott_queue_lseg.proof
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue_lseg.ml
@@ -34,7 +34,7 @@ Building an empty chain cannot establish the input contents.
 The builder must return the owned terminal cell at the end of the chain.
 
   $ mkdir wrong_terminal
-  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg.proof wrong_terminal/
+  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli michael_scott_queue_lseg.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue_lseg.ml > wrong_terminal/michael_scott_queue_lseg.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue_lseg.ml
   [Error] File "wrong_terminal/michael_scott_queue_lseg.proof", line 892, columns 19-68:

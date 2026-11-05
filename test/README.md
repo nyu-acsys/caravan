@@ -19,3 +19,9 @@ The Saturn sources and clients also have ordinary Dune library stanzas, so
 Platform. Select the project's OCaml 5.5 switch in the editor and build from the
 repository root. Backoff is an interface-only dependency; these stanzas compile
 the examples but do not provide an executable Backoff implementation.
+
+The queue interfaces use separate `MS_QUEUE` module types, as Saturn does. The
+history queue preserves Saturn's interface text and documentation, with Caravan
+annotations inserted beside its declarations. The segment variant exposes its
+currently verified subset with a list-valued specification. These interfaces are
+excluded from `ocamlformat` to preserve their upstream formatting.

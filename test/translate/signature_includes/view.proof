@@ -1,0 +1,5 @@
+type 'a state = { value : 'a list }
+
+invariant is_cell (q : 'a t) (s : 'a state) = own q s.value
+
+view cell (q : 'a t) = s.value

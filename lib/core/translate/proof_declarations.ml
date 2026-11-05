@@ -894,15 +894,18 @@ let direct_source_comments (source : Source.t) =
          | _ -> None))
     source.comments
 
-let direct_interface_comments (interface : Source.interface) =
-  outside_scopes
-    (List.filter_map interface.signature ~f:(fun item ->
-         match item.Parsetree.psig_desc with
-         | Psig_module _ | Psig_modtype _ -> Some item.psig_loc
-         | _ -> None))
-    interface.interface_comments
+let root_interface_constraints (source : Source.t) (inventory : Module_inventory.t) =
+  Option.value_map source.interface ~default:[] ~f:(fun interface ->
+      List.filter inventory.constraints ~f:(fun constraint_ ->
+          Option.is_none constraint_.Module_inventory.owner
+          && Declaration_scope.same_place constraint_.at interface.scope.location))
 
-let predicates (source : Source.t) =
+let root_interface_resources source inventory =
+  List.concat_map (root_interface_constraints source inventory) ~f:(fun constraint_ ->
+      List.map constraint_.signature.signature_resources ~f:(fun (_, resource) ->
+          (constraint_, resource)))
+
+let predicates (source : Source.t) inventory =
   let of_annotations ~interface comments =
     all
       (List.filter
@@ -913,12 +916,33 @@ let predicates (source : Source.t) =
         Ok (a.loc, p))
   in
   let* declared =
-    Option.value_map source.interface ~default:(Ok []) ~f:(fun i ->
-        of_annotations ~interface:true (direct_interface_comments i))
+    all (root_interface_resources source inventory) ~f:(fun (constraint_, resource) ->
+        let p = resource.Module_inventory.declaration in
+        let at = resource.site.item_loc in
+        let* () =
+          if
+            Option.is_some p.pred_body
+            && Option.exists source.interface ~f:(fun interface ->
+                not
+                  (Declaration_scope.same_place resource.site.scope.location
+                     interface.scope.location))
+          then unsupported at "An inherited predicate definition in a module interface"
+          else Ok ()
+        in
+        let environment = Source.annotation_env source resource.site.environment in
+        let* types = Source.ocaml_types environment ~at (List.map p.pred_params ~f:snd) in
+        let types =
+          Compiler_types.map_group types ~f:(fun typ ->
+              Subst.type_expr constraint_.Module_inventory.substitution
+                (Subst.type_expr resource.substitution typ))
+        in
+        Ok (at, p, Option.map p.pred_body ~f:(fun body -> Body body), types))
   in
   let* annotated = of_annotations ~interface:false (direct_source_comments source) in
   let name (p : S.predicate) = p.pred_name.pid_str in
-  let declaration x = List.find declared ~f:(fun (_, p) -> String.equal (name p) x) in
+  let declaration x =
+    List.find declared ~f:(fun (_, p, _, _) -> String.equal (name p) x)
+  in
   let states =
     List.filter_map source.proof ~f:(function
       | Proof_state { state_name; state_params; state_fields } ->
@@ -974,7 +998,8 @@ let predicates (source : Source.t) =
                  Some definition ))
       | Proof_view { view_name; view_params; view_value } ->
           begin match declaration view_name.pid_str with
-          | Some (_, d) when List.length d.pred_params = List.length view_params + 1 ->
+          | Some (_, d, _, _) when List.length d.pred_params = List.length view_params + 1
+            ->
               let value = List.last_exn d.pred_params in
               Ok
                 (Some
@@ -987,7 +1012,7 @@ let predicates (source : Source.t) =
                        pred_inline = false;
                      },
                      Some (View { value = view_value }) ))
-          | Some (at, _) ->
+          | Some (at, _, _, _) ->
               error view_name.pid_loc
                 ~related:[ (at, "Its declaration") ]
                 "A view has the parameters of its declaration but the last, its value"
@@ -1004,15 +1029,29 @@ let predicates (source : Source.t) =
     let* types =
       match def with
       | Some (Invariant { parameter_types; _ }) -> Ok parameter_types
-      | Some (Body _ | Direct_invariant _ | View _) | None ->
+      | Some (View _) ->
+          let* parameters =
+            Source.ocaml_types source.env ~at
+              (List.map (List.drop_last_exn p.pred_params) ~f:snd)
+          in
+          begin match declaration (name p) with
+          | Some (declaration_at, _, _, types) ->
+              if Ctype.is_equal source.env true parameters (List.drop_last_exn types) then
+                Ok types
+              else
+                error at
+                  ~related:[ (declaration_at, "Its declaration") ]
+                  (Printf.sprintf
+                     "The predicate %s is defined with other parameter types than it is \
+                      declared with"
+                     (name p))
+          | None -> error at "A view without an interface declaration"
+          end
+      | Some (Body _ | Direct_invariant _) | None ->
           Source.ocaml_types source.env ~at (List.map p.pred_params ~f:snd)
     in
     let* _ = implicit_parameters p in
     Ok (at, p, def, types)
-  in
-  let* declared =
-    all declared ~f:(fun (at, p) ->
-        typed (at, p, Option.map p.pred_body ~f:(fun b -> Body b)))
   in
   let* defined =
     all

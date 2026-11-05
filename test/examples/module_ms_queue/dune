@@ -1,3 +1,5 @@
+(copy_files ../../saturn/michael_scott_queue/michael_scott_queue_intf.mli)
+
 (rule
  (target module_queue.ml)
  (deps
@@ -41,6 +43,7 @@
  (deps
   %{bin:caravan}
   %{bin:raven}
+  michael_scott_queue_intf.mli
   module_queue.ml
   module_queue.proof
   queue_api.mli

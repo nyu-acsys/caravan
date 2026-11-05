@@ -156,11 +156,7 @@ let run (source : Source.t) : (t, error) Result.t =
       (Annotation.of_comments comments)
       ~f:(Annotation.predicate_declaration ~interface)
   in
-  let declarations =
-    declarations ~interface:false (direct_source_comments source)
-    @ Option.value_map source.interface ~default:[] ~f:(fun interface ->
-        declarations ~interface:true (direct_interface_comments interface))
-  in
+  let declarations = declarations ~interface:false (direct_source_comments source) in
   let* declared_predicates = all declarations ~f:Annotation.predicate in
   let reserved =
     reserved @ List.map declared_predicates ~f:(fun p -> p.S.pred_name.pid_str)
@@ -270,6 +266,9 @@ let run (source : Source.t) : (t, error) Result.t =
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))
   in
   let* inventory = Module_inventory.build source typed in
+  Fresh_names.reserve
+    (List.map (root_interface_resources source inventory) ~f:(fun (_, resource) ->
+         resource.Module_inventory.declaration.pred_name.pid_str));
   let* unapplied_proofs = Proof_bindings.build source inventory in
   let scoped_binding = scoped_binding ~unapplied_proofs in
   let definition_member_name name =

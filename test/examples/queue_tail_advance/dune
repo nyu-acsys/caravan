@@ -39,8 +39,10 @@
   %{bin:caravan}
   michael_scott_queue.ml
   michael_scott_queue.mli
+  michael_scott_queue_intf.mli
   michael_scott_queue.proof
   michael_scott_queue_lseg.ml
   michael_scott_queue_lseg.mli
+  michael_scott_queue_lseg_intf.mli
   michael_scott_queue_lseg.proof
   ../../saturn/backoff/backoff.mli))

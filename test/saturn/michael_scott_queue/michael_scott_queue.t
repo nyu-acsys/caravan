@@ -13,14 +13,14 @@ Clients use the polymorphic interface for empty, singleton, longer and mixed int
 queues, and a generic round trip.
 
   $ mkdir client
-  $ cp michael_scott_queue.mli of_list_client.ml client/
+  $ cp michael_scott_queue.mli michael_scott_queue_intf.mli of_list_client.ml client/
   $ caravan --shh -I ../backoff client/of_list_client.ml
   Verification successful.
 
 Incorrect initial contents fail at the exposing lemma's precondition.
 
   $ mkdir wrong_contents
-  $ cp michael_scott_queue.mli michael_scott_queue.proof wrong_contents/
+  $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue.ml > wrong_contents/michael_scott_queue.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue.ml
   [Error] File "wrong_contents/michael_scott_queue.ml", line 147, columns 18-61:
@@ -36,7 +36,7 @@ Incorrect initial contents fail at the exposing lemma's precondition.
 The builder must return its designated terminal cell.
 
   $ mkdir wrong_terminal
-  $ cp michael_scott_queue.mli michael_scott_queue.proof wrong_terminal/
+  $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue.ml > wrong_terminal/michael_scott_queue.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue.ml
   [Error] File "wrong_terminal/michael_scott_queue.ml", line 139, columns 13-40:

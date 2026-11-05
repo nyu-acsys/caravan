@@ -1497,7 +1497,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   let lifted = with_body_names lifted in
   let ocaml_env = source.env in
   (* The predicates' signatures first, for their bodies and the contracts to use. *)
-  let* predicates = predicates source in
+  let* predicates = predicates source inventory in
   let* () = check_scoped_resources ~types source inventory untyped_scoped_proofs in
   let* applications =
     all untyped_scoped_proofs.applications ~f:(fun view ->

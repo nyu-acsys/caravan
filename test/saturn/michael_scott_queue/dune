@@ -1,6 +1,7 @@
 (library
  (name caravan_saturn_michael_scott_queue)
  (wrapped false)
+ (modules_without_implementation michael_scott_queue_intf)
  (libraries caravan_saturn_backoff))
 
 (cram

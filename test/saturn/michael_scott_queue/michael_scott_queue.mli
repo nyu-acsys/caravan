@@ -1,62 +1,12 @@
-(** The Michael-Scott queue, after Saturn's. *)
+(** Michael-Scott classic lock-free multi-producer multi-consumer queue.
 
-type 'a t
+    All functions are lockfree. It is the recommended starting point when
+    needing FIFO structure. It is inspired by
+    {{:https://www.cs.rochester.edu/~scott/papers/1996_PODC_queues.pdf} Simple,
+     Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms}.
 
-(*@ invariant is_queue (q : 'a t) *)
-(*@ predicate queue (q : 'a t) (xs [@implicit] : 'a sequence) *)
+    If you need a [length] function, you can use the bounded queue
+    {!Saturn.Bounded_queue} instead with maximun capacity (default value).
+    However, this adds a general overhead to the operation. *)
 
-val create : unit -> 'a t
-(*@ q = create ()
-    ensures is_queue q && queue q [] *)
-
-val push : 'a t -> 'a -> unit
-(*@ atomic push q v
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures queue q (xs ++ [ v ]) *)
-
-val is_empty : 'a t -> bool
-(*@ b = atomic is_empty q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures queue q xs && b = (length xs = 0) *)
-
-exception Empty
-
-val pop_exn : 'a t -> 'a
-(*@ r = atomic pop_exn q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
-    atomic raises Empty -> length xs = 0 && queue q xs *)
-
-val peek_opt : 'a t -> 'a option
-(*@ r = atomic peek_opt q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures queue q xs && if length xs = 0 then r = None else r === Some xs.(0) *)
-
-val peek_exn : 'a t -> 'a
-(*@ r = atomic peek_exn q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures queue q xs && length xs > 0 && r === xs.(0)
-    atomic raises Empty -> length xs = 0 && queue q xs *)
-
-val drop_exn : 'a t -> unit
-(*@ atomic drop_exn q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures length xs > 0 && queue q (drop 1 xs)
-    atomic raises Empty -> length xs = 0 && queue q xs *)
-
-val pop_opt : 'a t -> 'a option
-(*@ r = atomic pop_opt q
-    requires is_queue q
-    atomic requires queue q xs
-    atomic ensures if length xs = 0 then r = None && queue q xs
-      else r === Some xs.(0) && queue q (drop 1 xs) *)
-
-val of_list : 'a list -> 'a t
-(*@ q = of_list xs
-    ensures is_queue q && queue q (to_sequence xs) *)
+include Michael_scott_queue_intf.MS_QUEUE
