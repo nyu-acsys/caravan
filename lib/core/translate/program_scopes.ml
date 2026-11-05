@@ -21,7 +21,7 @@ type t = {
   libraries : Library_modules.t list;
   funcs : Procedures.func list;
   specialized : Specializations.t list;
-      (** The functions over a witness copied per constructor, which calls select. *)
+      (** The functions over a witness whose calls wait, as universal procedures. *)
   access_proofs : ((int * int) * Annotation.t) list;
   return_proofs : ((int * int) * Annotation.t) list;
   types : Datatypes.t list;
@@ -433,7 +433,10 @@ let run (source : Source.t) : (t, error) Result.t =
                Datatypes.with_paths descriptor
                  [ Path.Pdot (lib.library_path, declaration.typ_name.txt) ])))
   in
-  let types = List.concat library_types @ types @ source.proof_types in
+  let types =
+    List.concat library_types @ types @ source.proof_types
+    @ List.map specialized ~f:(fun (s : Specializations.t) -> s.result)
+  in
   let types =
     Datatypes.compiler_aliases
       ~modules:
@@ -483,11 +486,11 @@ let run (source : Source.t) : (t, error) Result.t =
           ~f:(fun (member, _) ->
             List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))))
   in
-  let copies =
+  let universal =
     List.map specialized ~f:(fun (s : Specializations.t) ->
-        (s.original.id, List.map s.copies ~f:(fun copy -> copy.copy_id)))
+        (s.original.id, s.universal.id))
   in
-  let* generics = generic_modules ~copies source ~types ~functions:funcs inventory in
+  let* generics = generic_modules ~universal source ~types ~functions:funcs inventory in
   let* module_scopes = Module_context.collect_scopes source.proof_scopes in
   let* generic_proofs = Generic_proofs.plan generics module_scopes in
   let module_contexts = Module_context.plan ~scopes:module_scopes generic_proofs in

@@ -61,31 +61,11 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
         let instantiated = map_atomic_types signature ~f:substitute in
         Ok ({ instantiated with au_generic = None }, Some (generic, arguments))
 
-(** The constructors that the contract pattern [p] matches, [None] if any. *)
-let spec_constructors (p : S.pat) =
-  match p.pat_desc with
-  | Pconstr ((Qid id | Qdot (_, id)), _) -> Some [ id.pid_str ]
-  | Pwild | Pid _ -> None
-  | _ -> Some []
-
-(** The case of the match [t] on the witness of a copy for a witness's constructor, for
-    that constructor, if [t] is one. *)
-let specialized_body ctx (t : S.term) =
-  match t.term_desc with
-  | Tmatch ({ term_desc = Tvar (Qid { pid_str = scrutinee; _ }); _ }, cases) ->
-      Option.map
-        (specialized_case ctx ~scrutinee cases ~constructors:(fun (p, _) ->
-             spec_constructors p))
-        ~f:snd
-  | _ -> None
-
 (** The OCaml type of [t], where it is known: a variable's, or a sequence's slice or
     concatenation. *)
 let rec term_type env (t : S.term) =
   match (t.term_desc, spine (S.chain t) []) with
   | Tcast (_, ty), _ -> Result.ok (source_type env.ctx.given ~at:t.term_loc ty)
-  | Tmatch _, _ when Option.is_some (specialized_body env.ctx t) ->
-      term_type env (Option.value_exn (specialized_body env.ctx t))
   | Tconst (Pconst_integer _), _ -> Some Predef.type_int
   | (Ttrue | Tfalse), _ -> Some Predef.type_bool
   | ( _,
@@ -807,9 +787,11 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
               }
             in
             let+ rest = formula env rest in
-            R.Expr.forall ~loc:l
+            (* Instantiated only for registrations, not for every read of their keys. *)
+            let registered = R.Expr.binary ~loc:l In hc registrations in
+            R.Expr.forall ~loc:l ~triggers:[ [ registered ] ]
               [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
-              (R.Expr.binary ~loc:l Impl (R.Expr.binary ~loc:l In hc registrations) rest))
+              (R.Expr.binary ~loc:l Impl registered rest))
       in
       List.reduce_exn each ~f:(R.Expr.binary ~loc:l And)
   | Tquant (q, binders, body) ->
@@ -935,39 +917,6 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let+ ts = State.all ts ~f:(formula env) in
       R.Expr.tuple ~loc:l ts
   | Trecord (base, updates) -> record env t base updates
-  | Tmatch ({ term_desc = Tvar (Qid { pid_str = scrutinee; _ }); _ }, cases)
-    when Option.is_some
-           (specialized_case env.ctx ~scrutinee cases ~constructors:(fun (p, _) ->
-                spec_constructors p)) ->
-      (* In a copy for a witness's constructor, a match on the witness is its case, in
-         which the types it selects are the constructor's. *)
-      let _, body =
-        Option.value_exn
-          (specialized_case env.ctx ~scrutinee cases ~constructors:(fun (p, _) ->
-               spec_constructors p))
-      in
-      let aliases =
-        match
-          ( env.ctx.given.specialized_witness,
-            Option.bind
-              (List.Assoc.find env.var_types scrutinee ~equal:String.equal)
-              ~f:(Witnesses.witness_type env.data) )
-        with
-        | Some (_, ctor), Some (_, witness, arguments) ->
-            fst (Witnesses.refinement witness arguments (String.uncapitalize ctor))
-        | _ -> []
-      in
-      formula
-        {
-          env with
-          data = aliases @ env.data;
-          ctx =
-            {
-              env.ctx with
-              given = { env.ctx.given with types = aliases @ env.ctx.given.types };
-            };
-        }
-        body
   | Tmatch (scrutinee, cases) ->
       let* v = formula env scrutinee in
       let* scrutinee_type =
@@ -1855,8 +1804,9 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
     let refined =
       match (scrutinee_type, p.pat_desc) with
       | Some scrutinee, Pconstr ((Qid id | Qdot (_, id)), None) ->
-          Witnesses.contract_case env.data ~current:env.ctx.given.current_polymorphic
-            ~scrutinee ~var_types:env.var_types id.pid_str
+          Witnesses.contract_case ?universal:env.ctx.given.universal_result env.data
+            ~current:env.ctx.given.current_polymorphic ~scrutinee ~var_types:env.var_types
+            id.pid_str
       | _ -> None
     in
     match refined with
@@ -1873,16 +1823,35 @@ and spec_match env ~at ?scrutinee_type v (cases : (S.pat * S.term) list) =
               Option.value_map value ~default:vars ~f:(fun value ->
                   ( x,
                     Value
-                      (R.Expr.call ~loc:l
-                         (Qualified_name.raven ~loc:l
-                            (Qualified_name.of_string conversion))
-                         [ value ]) )
+                      (match conversion with
+                      | Witnesses.Conversion conversion ->
+                          R.Expr.call ~loc:l
+                            (Qualified_name.raven ~loc:l
+                               (Qualified_name.of_string conversion))
+                            [ value ]
+                      | Payload field ->
+                          R.Expr.field ~loc:l value (qualified_name ~loc:l field)) )
                   :: vars))
+        in
+        (* A universal result read by case has no OCaml type there that the contract's
+           other variables share: Raven types the payload. *)
+        let var_types =
+          List.map env.var_types ~f:(fun (x, t) ->
+              if
+                List.exists reads ~f:(fun (y, read) ->
+                    String.equal x y
+                    &&
+                    match read with
+                    | Witnesses.Payload _ -> true
+                    | Conversion _ -> false)
+              then (x, Ctype.newvar ())
+              else (x, t))
         in
         {
           env with
           data = aliases @ env.data;
           vars;
+          var_types;
           ctx =
             {
               env.ctx with

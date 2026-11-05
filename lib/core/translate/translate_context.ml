@@ -112,11 +112,13 @@ type performing = {
 type pending = {
   pending_field : string;
   pending_on : string;  (** The existential of the keys of the registrations. *)
+  pending_witness : string option;
+      (** For calls of a universal procedure, the existential of their witnesses. *)
   key_type : Types.type_expr;
   helped : Ident.t;  (** The function whose calls wait. *)
-  specialized : (Ident.t * string) option;
-      (** For a copy of a function over a witness, the witness parameter and the
-          constructor it is copied for. *)
+  universal : (Ident.t * Datatypes.t * Types.type_expr) option;
+      (** For a function over a witness, its witness parameter, its universal result type,
+          and the witness's type. *)
   helping : string * S.term * S.helped_result;
       (** The key whose calls the action that helps commits, in terms of the state before
           the action, named as the action names it, and the result. *)
@@ -853,15 +855,26 @@ let generated_module_member ~loc module_name member =
 (** The names of the members generated for the pending field [p] of [st]. *)
 let pending_name st (p : pending) suffix = member_name st (p.pending_field ^ "_" ^ suffix)
 
+(** The key under which an opened state has the witnesses of [p]'s registrations. *)
+let witness_key (p : pending) = p.pending_field ^ "#witness"
+
+(** The maps of the registrations of [st]'s pending fields, their keys and their
+    witnesses, as existentials of its invariant with their keys in an opened state. *)
+let pending_maps st =
+  List.concat_map st.pendings ~f:(fun p ->
+      (p.pending_on, p.pending_field)
+      :: Option.value_map p.pending_witness ~default:[] ~f:(fun w ->
+          [ (w, witness_key p) ]))
+
 (** The values of the existentials of [st]'s invariant in the state [opened], by name. *)
 let opened_bindings st (opened : opened) =
   List.map2_exn st.fields opened.values ~f:(fun (_, raven, _, _, _) v -> (raven, v))
   @ List.filter_map st.chains ~f:(fun (field, raven) ->
       Option.map (List.Assoc.find opened.indices field ~equal:String.equal) ~f:(fun v ->
           (raven, v)))
-  @ List.filter_map st.pendings ~f:(fun p ->
-      Option.map (List.Assoc.find opened.indices p.pending_field ~equal:String.equal)
-        ~f:(fun v -> (p.pending_on, v)))
+  @ List.filter_map (pending_maps st) ~f:(fun (existential, key) ->
+      Option.map (List.Assoc.find opened.indices key ~equal:String.equal) ~f:(fun v ->
+          (existential, v)))
 
 (** The name of the lemma carrying the registrations of [p] through the action [action],
     which helps their calls. *)
@@ -872,7 +885,7 @@ let transition_name st (p : pending) action = pending_name st p ("after_" ^ acti
     maps. *)
 let invariant_existentials st =
   List.map st.fields ~f:(fun (_, raven, _, _, _) -> raven)
-  @ List.map st.pendings ~f:(fun p -> p.pending_on)
+  @ List.map (pending_maps st) ~f:fst
   @ List.map st.chains ~f:snd
 
 (** The arguments of [part]'s predicate for the invariant's arguments [args] and the
@@ -1076,13 +1089,14 @@ type inputs = {
       (** For functions over a witness, by name: the witness's position among the
           parameters, and what they raise when called with each constructor. *)
   atomic_procedures : string list;  (** The procedures with atomic contracts, by name. *)
-  specialized_witness : (Ident.t * string) option;
-      (** In a copy of a function over a witness for one of its constructors: its witness
-          parameter and the constructor, whose cases its matches select. *)
-  specialized_calls :
-    (Path.t list * int * (string * Ident.t * Types.type_expr) list) list;
-      (** The functions over a witness copied per constructor: their paths, the witness's
-          position, and per constructor the copy and its type. *)
+  universal_result : Datatypes.t option;
+      (** In a universal procedure of a function over a witness: its result type, into
+          whose case for a constructor the cases of its matches on the witness put their
+          values. *)
+  specialized_calls : (Path.t list * int * Ident.t * Types.type_expr * Datatypes.t) list;
+      (** The functions over a witness whose calls wait to be helped: their paths, the
+          witness's position, their universal procedure, its type, and its universal
+          result type. *)
   shared_exceptions : (string * string list) option;
       (** In a functor body that its applications share: the module that gives each
           application's exceptions, and the keys of the representative's, whose
@@ -1149,7 +1163,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     raising = [];
     witness_raising = [];
     atomic_procedures = [];
-    specialized_witness = None;
+    universal_result = None;
     specialized_calls = [];
     shared_exceptions = None;
     initializations = [];
@@ -1196,30 +1210,6 @@ let shared_exception_call ~loc app kind (c : Datatypes.ctor) arguments =
     (Qualified_name.raven ~loc
        (Qualified_name.of_string (app ^ "." ^ shared_exception_member kind c.ocaml)))
     arguments
-
-(** That [variable], the parameter [parameter] of type [typ], is the constructor of the
-    copy of a function over a witness, if it is the copy's witness parameter. *)
-let specialized_condition ctx ~loc parameter typ variable =
-  match (ctx.given.specialized_witness, Witnesses.witness_type ctx.given.types typ) with
-  | Some (witness, ctor), Some (data, _, _) when Ident.same witness parameter ->
-      Option.map
-        (List.find data.ctors ~f:(fun c -> String.equal c.ocaml ctor))
-        ~f:(fun c ->
-          R.Expr.binary ~loc Eq
-            (R.Expr.var ~loc (name ~loc variable))
-            (R.Expr.call ~loc (Datatypes.ctor_name ~loc data c) []))
-  | _ -> None
-
-(** Of [cases], matching the witness [scrutinee] of a copy for one of its constructors,
-    the one for that constructor. *)
-let specialized_case ctx ~scrutinee cases ~constructors =
-  Option.bind ctx.given.specialized_witness ~f:(fun (parameter, ctor) ->
-      if not (String.equal scrutinee (Ident.name parameter)) then None
-      else
-        List.find cases ~f:(fun case ->
-            match constructors case with
-            | Some names -> List.mem names ctor ~equal:String.equal
-            | None -> true))
 
 let assert_admissible ctx ~loc typ variable =
   Option.value_map (value_spec ctx ~loc typ variable) ~default:[] ~f:(fun spec ->

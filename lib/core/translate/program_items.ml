@@ -195,7 +195,7 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                  prefix_count = 0;
                  captured = [];
                  role = None;
-                 copy_for = None;
+                 universal = None;
                  manual =
                    manual_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
                      ~next:site.next;
@@ -464,7 +464,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
           trusted =
             trusted_after annotations ~item_loc:vb.vb_loc ~next:(Some rest.exp_loc);
           role = Option.map continues ~f:(fun _ -> outer.id);
-          copy_for = None;
+          universal = None;
         })
 
 (** The offsets of the ends of the applications of [Atomic]'s operations in [structure].
@@ -743,11 +743,7 @@ let invariant_parts types (st : structure) body =
     let existential field = st.state ^ "_" ^ field in
     (* In the order of the invariant's existentials. *)
     let ordered uses =
-      List.filter
-        (List.map st.fields ~f:(fun (_, raven, _, _, _) -> raven)
-        @ List.map st.pendings ~f:(fun p -> p.pending_on)
-        @ List.map st.chains ~f:snd)
-        ~f:(List.mem uses ~equal:String.equal)
+      List.filter (invariant_existentials st) ~f:(List.mem uses ~equal:String.equal)
     in
     let contents field =
       match List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field) with
@@ -795,10 +791,12 @@ let invariant_parts types (st : structure) body =
             part_uses =
               ordered
                 (existential p.pending_field :: p.pending_on
-                 :: List.concat_map st.chains ~f:(fun (field, index) ->
-                     [ index; existential field ])
-                @ List.map (state_fields ~state:helping_state helping_key) ~f:existential
-                );
+                :: (Option.to_list p.pending_witness
+                   @ List.concat_map st.chains ~f:(fun (field, index) ->
+                       [ index; existential field ])
+                   @ List.map
+                       (state_fields ~state:helping_state helping_key)
+                       ~f:existential));
             part_owns = Ghost;
           })
     in
@@ -1140,22 +1138,13 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
               match param.Typedtree.fp_kind with
               | Tparam_pat p | Tparam_optional_default (p, _) -> Some p.pat_type
             in
-            match (name, pattern_type, helped.copy_for, structure) with
-            | Some name, Some t, Some copy, _
-              when String.equal name (Ident.name copy.witness) ->
-                begin match Witnesses.witness_type ctx.given.types t with
-                | Some (data, _, _) ->
-                    let c =
-                      List.find_exn data.ctors ~f:(fun c ->
-                          String.equal c.Datatypes.ocaml copy.constructor)
-                    in
-                    State.return
-                      ( Some name,
-                        R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l data c) [],
-                        Witnesses.substitute_newtypes copy.newtypes t )
-                | None -> State.of_result (error at "A copy's witness of no witness type")
-                end
-            | Some name, Some _, _, Some structure ->
+            match (name, pattern_type, structure) with
+            | Some name, Some t, _
+              when Option.exists helped.universal ~f:(fun u ->
+                       String.equal name (Ident.name u.witness)) ->
+                (* A universal procedure's call is at the registration's witness. *)
+                State.return (Some name, var "w", t)
+            | Some name, Some _, Some structure ->
                 begin match field_of name with
                 | Some (ghost, field) ->
                     let env = bind env ghost (Raven structure) in
@@ -1208,8 +1197,26 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
     let* contents = State.of_result (key_contents ctx.given.types ~at p.key_type) in
     State.typ ctx ~at contents
   in
+  (* A universal procedure's result is the case of the registration's witness, [w] in
+     the registration and [ws] of it in the helping lemma. *)
+  let universal_at witness =
+    State.of_result (pending_universal ctx.given.types ~at st p witness)
+  in
+  let* universal = universal_at (var "w") in
   let* result, result_type =
-    helped_value env ~at ~key_type:p.key_type helped_result (var "contents")
+    helped_value ?universal env ~at ~key_type:p.key_type helped_result (var "contents")
+  in
+  let* universal_at_hc = universal_at (R.Expr.index ~loc:l (var "ws") (var "hc")) in
+  let* result_at_hc, _ =
+    helped_value ?universal:universal_at_hc env ~at ~key_type:p.key_type helped_result
+      (var "contents")
+  in
+  let* witness_decl =
+    match (p.pending_witness, p.universal) with
+    | Some _, Some (_, _, witness_type) ->
+        let+ typ = State.typ ctx ~at witness_type in
+        Some typ
+    | _ -> State.return None
   in
   let* result_typ = State.typ ctx ~at result_type in
   let* helped_proc =
@@ -1240,8 +1247,14 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   in
   let token_typ = R.Type.atomic_token ~loc:l (qualified_name ~loc:l helped_proc) in
   let registration = pending_name st p "registration" in
+  (* The registration of [hc], whose call has the witness [ws] of [hc] if any. *)
+  let registration_args hc =
+    (hc :: args)
+    @ Option.value_map witness_decl ~default:[] ~f:(fun _ ->
+        [ R.Expr.index ~loc:l (var "ws") hc ])
+  in
   let registered hc =
-    R.Expr.call ~loc:l (qualified_name ~loc:l registration) (hc :: args)
+    R.Expr.call ~loc:l (qualified_name ~loc:l registration) (registration_args hc)
   in
   let fields =
     [
@@ -1250,7 +1263,8 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
       ("token", token_typ);
       ("retired", bool_typ);
     ]
-    @ if carried then [ ("result", result_typ) ] else []
+    @ (if carried then [ ("result", result_typ) ] else [])
+    @ Option.value_map witness_decl ~default:[] ~f:(fun typ -> [ ("witness", typ) ])
   in
   let ghost_fields =
     List.map fields ~f:(fun (f, t) ->
@@ -1272,7 +1286,9 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
   in
   let registration_pred =
     R.Callable.func ~loc:l ~kind:Pred
-      ~formals:(decl "hc" ref_typ :: List.map params ~f:(fun (_, _, d) -> d))
+      ~formals:
+        ((decl "hc" ref_typ :: List.map params ~f:(fun (_, _, d) -> d))
+        @ Option.value_map witness_decl ~default:[] ~f:(fun typ -> [ decl "w" typ ]))
       (generated_ident ~loc:l registration)
       (Some
          (R.Expr.exists ~loc:l
@@ -1330,36 +1346,66 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
         View_storage.own ~loc:l ~field:view_field (anchored structure) (var x) 0.5)
   in
   (* The helped function's atomic postcondition, for the result, without its predicates. *)
-  let post_env =
-    List.fold view_values
-      ~init:
-        (List.fold helped_args ~init:env ~f:(fun env (name, value, t) ->
-             match name with
-             | Some name ->
-                 {
-                   (bind env name (Value value)) with
-                   var_types = (name, t) :: env.var_types;
-                 }
-             | None -> env))
-      ~f:(fun env (x, v, _, t, _) ->
-        match List.find bindings ~f:(fun (_, w, _) -> String.equal v w) with
-        | Some (implicit, _, _) ->
-            {
-              (bind env implicit (Raven x)) with
-              var_types = (implicit, t) :: env.var_types;
-            }
-        | None -> env)
-  in
-  let post_env =
-    {
-      (bind post_env result_name (Value result)) with
-      var_types = (result_name, result_type) :: post_env.var_types;
-    }
-  in
-  let+ posts =
+  (* The postconditions for a call whose witness is [witness], with the result [result];
+     a universal procedure's result is read by case, as its index type. *)
+  let posts_at ~witness ~result =
+    let post_env =
+      List.fold view_values
+        ~init:
+          (List.fold helped_args ~init:env ~f:(fun env (name, value, t) ->
+               match name with
+               | Some name ->
+                   let value =
+                     if
+                       Option.exists helped.universal ~f:(fun u ->
+                           String.equal name (Ident.name u.witness))
+                     then witness
+                     else value
+                   in
+                   {
+                     (bind env name (Value value)) with
+                     var_types = (name, t) :: env.var_types;
+                   }
+               | None -> env))
+        ~f:(fun env (x, v, _, t, _) ->
+          match List.find bindings ~f:(fun (_, w, _) -> String.equal v w) with
+          | Some (implicit, _, _) ->
+              {
+                (bind env implicit (Raven x)) with
+                var_types = (implicit, t) :: env.var_types;
+              }
+          | None -> env)
+    in
+    let post_env =
+      match helped.universal with
+      | Some u ->
+          (* Read by case, with the constructors of the scope of its contract. *)
+          {
+            (bind post_env result_name (Value result)) with
+            var_types = (result_name, helped.body.exp_type) :: post_env.var_types;
+            ctx =
+              {
+                post_env.ctx with
+                given =
+                  {
+                    post_env.ctx.given with
+                    universal_result = Some u.result;
+                    env = helped.environment;
+                  };
+              };
+          }
+      | None ->
+          {
+            (bind post_env result_name (Value result)) with
+            var_types = (result_name, result_type) :: post_env.var_types;
+          }
+    in
     State.all
       (Option.value_map helped.contract ~default:[] ~f:(fun c -> c.atomic_ensures))
       ~f:(fun t -> formula post_env (without_predicates scope_env t))
+  in
+  let+ posts =
+    posts_at ~witness:(R.Expr.index ~loc:l (var "ws") (var "hc")) ~result:result_at_hc
   in
   let c = var "c" and regs = var "regs" and on = var "on" and ls = var "ls" in
   let each body =
@@ -1406,15 +1452,18 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
               @ (if carried then [ var "contents" ] else [])
               @ List.map view_values ~f:(fun (x, _, _, _, _) -> var x)
               @ [ R.Expr.call ~loc:l (n "--") [ regs; R.Expr.set ~loc:l [ hc ] ]; on; ls ]
-              );
+              @ Option.value_map witness_decl ~default:[] ~f:(fun _ -> [ var "ws" ]));
             R.Stmt.if_ ~loc:l waits_on_c
               (local "tok" token_typ @ local "r" bool_typ
+              @ Option.value_map witness_decl ~default:[] ~f:(fun typ ->
+                  local "w" typ
+                    ~init:(R.Stmt.expr_rhs (R.Expr.index ~loc:l (var "ws") hc)))
               @ [
                   R.Stmt.unfold ~loc:l
                     ~witnesses:
                       [ (ident ~loc:l "tok", var "tok"); (ident ~loc:l "r", var "r") ]
                     (qualified_name ~loc:l registration)
-                    (hc :: args);
+                    (registration_args hc);
                   R.Stmt.if_ ~loc:l (R.Expr.not_ ~loc:l (var "r")) commit [];
                 ]
               @ (if carried then
@@ -1433,7 +1482,7 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
                        ]
                       @ if carried then [ (ident ~loc:l "res", result) ] else [])
                     (qualified_name ~loc:l registration)
-                    (hc :: args);
+                    (registration_args hc);
                 ])
               [];
           ])
@@ -1451,7 +1500,9 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
             decl "regs" (R.Type.fin_set ~loc:l ref_typ);
             decl "on" (R.Type.map ~loc:l ref_typ key_typ);
             decl "ls" (R.Type.map ~loc:l ref_typ bool_typ);
-          ])
+          ]
+        @ Option.value_map witness_decl ~default:[] ~f:(fun typ ->
+            [ decl "ws" (R.Type.map ~loc:l ref_typ typ) ]))
       ~requires:
         (List.map view_owned ~f:R.Spec.make
         @ [
@@ -1480,7 +1531,8 @@ let pending_members ctx (st : structure) (p : pending) (helped : func) ~helped_p
                     @
                     if carried then
                       [
-                        R.Expr.ite ~loc:l waits_on_c (half hc "result" result)
+                        R.Expr.ite ~loc:l waits_on_c
+                          (half hc "result" result_at_hc)
                           (R.Expr.bool ~loc:l true);
                       ]
                     else [])));

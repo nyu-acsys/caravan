@@ -1223,27 +1223,18 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                           (Generic_proofs.source_projection plan)
                           helped.scheme_type
                   in
-                  (* For a copy for a witness's constructor, results matching on the
-                     witness select its case. *)
-                  let specialize (ctx : context) =
-                    {
-                      ctx with
-                      given = { ctx.given with specialized_witness = p.specialized };
-                    }
-                  in
                   State.in_procedure
                     (pending_members
-                       (specialize
-                       @@ spec_context types
-                            ~shared:(shared_for_proof st.invariant)
-                            ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
-                            ~primitive_namespace:
-                              (Option.value_map st.generic
-                                 ~default:(declaration_context st.invariant).namespace
-                                 ~f:(fun worker -> String.split worker.name ~on:'.'))
-                            ~polymorphic_functions:
-                              (polymorphic_registry (owner_destination st.invariant))
-                            ~generic_predicates ())
+                       (spec_context types
+                          ~shared:(shared_for_proof st.invariant)
+                          ~ocaml_env:st.environment ~preds ~spec_funcs ~proof_support
+                          ~primitive_namespace:
+                            (Option.value_map st.generic
+                               ~default:(declaration_context st.invariant).namespace
+                               ~f:(fun worker -> String.split worker.name ~on:'.'))
+                          ~polymorphic_functions:
+                            (polymorphic_registry (owner_destination st.invariant))
+                          ~generic_predicates ())
                        st p helped ~helped_declaration
                        ~helped_proc:
                          (match owner_destination st.invariant with
@@ -1767,11 +1758,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
      witness's constructors. *)
   let witness_parameter (f : Procedures.func) =
     let ( let* ) value f = Option.bind value ~f in
-    match f.copy_for with
-    | Some copy ->
-        (* A copy is over its constructor only. *)
-        let* position, _, _, _ = Specializations.witness_parameter decls.types f in
-        Some (position, copy.witness, [ copy.constructor ])
+    match f.universal with
+    | Some universal ->
+        let* position, _, (data, _), _ =
+          Specializations.witness_parameter decls.types f
+        in
+        Some
+          ( position,
+            universal.witness,
+            List.map data.Datatypes.ctors ~f:(fun c -> c.Datatypes.ocaml) )
     | None -> (
         let* worker = Program_declarations.enclosing_worker polymorphic_functions f in
         let* witness = worker.witness in
@@ -1820,29 +1815,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         Option.map (List.Assoc.find sets name ~equal:String.equal) ~f:(fun set ->
             (body_proc_name f, set)))
   in
-  (* A copy raises what it does for its constructor. *)
-  let raising =
-    List.map raising ~f:(fun (name, set) ->
-        match
-          List.find_map translated ~f:(fun (n, (f : Procedures.func), _) ->
-              Option.some_if (String.equal n name) f.copy_for)
-        with
-        | Some (Some copy) ->
-            ( name,
-              Option.value ~default:set
-                (Option.bind (List.Assoc.find by_constructor name ~equal:String.equal)
-                   ~f:(fun sets ->
-                     List.Assoc.find sets copy.constructor ~equal:String.equal)) )
-        | _ -> (name, set))
-  in
   let raising = by_own_names raising @ library_raising in
-  (* The calls of functions copied per witness constructor, which call the copies. *)
+  (* The calls of functions over a witness whose calls wait, which call their universal
+     procedures. *)
   let specialized_calls =
     List.map scopes.specialized ~f:(fun (s : Specializations.t) ->
         ( Path.Pident s.original.id :: s.original.paths,
           s.position,
-          List.map s.copies ~f:(fun copy -> (copy.constructor, copy.copy_id, copy.scheme))
-        ))
+          s.universal.id,
+          s.universal.scheme_type,
+          s.result ))
   in
   (* A functor body its applications share raises, called through each application, what
      it raises through the representative's, with the exceptions it declares the
@@ -1948,10 +1930,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   atomic_procedures;
                   libraries = library_calls libraries;
                   shared_exceptions = shared_exceptions_of f;
-                  specialized_witness =
-                    Option.bind f.copy_for ~f:(fun copy ->
-                        Option.map (Specializations.witness_parameter decls.types f)
-                          ~f:(fun (_, id, _, _) -> (id, copy.constructor)));
+                  universal_result = Option.map f.universal ~f:(fun u -> u.result);
                   specialized_calls;
                   annotations;
                   proof_lemmas =

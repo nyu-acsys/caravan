@@ -8,13 +8,14 @@ open Proof_terms
 open Atomic_proofs
 open Expressions
 
-type copy_for = {
-  constructor : string;  (** By its OCaml name. *)
+type universal = {
   witness : Ident.t;  (** The witness parameter. *)
+  result : Datatypes.t;  (** The universal result type, a case per constructor. *)
   newtypes : (Ident.t * Types.type_expr) list;
-      (** The locally abstract types it selects, with its types for them. *)
+      (** The witness's index types, the universal result where they type results. *)
 }
-(** A copy of a function over a GADT witness for one of its constructors. *)
+(** A function over a GADT witness as one procedure over all of its constructors,
+    returning a universal result. *)
 
 type func = {
   id : Ident.t;
@@ -46,9 +47,9 @@ type func = {
       (** Whether the function is trusted, as [(*@ trusted *)] after it says: its contract
           assumed, its body not translated. *)
   role : Ident.t option;  (** The function whose atomic update it continues. *)
-  copy_for : copy_for option;
-      (** For a copy of a function over a GADT witness for one of its constructors: the
-          constructor, whose case matches on the witness select. *)
+  universal : universal option;
+      (** For a function over a GADT witness whose calls wait to be helped: its witness,
+          and its universal result. *)
 }
 (** A top-level function [f] with its parameters [params] and [body], and its contract, or
     a local function lifted to the top level. *)
@@ -141,18 +142,10 @@ let contract_names (f : func) (header : S.header option) n =
           hd_args = List.filter h.hd_args ~f:(function S.Lghost _ -> false | _ -> true);
         }
       in
-      (* A copy for a witness's constructor has its function's contract. *)
-      let name =
-        match f.copy_for with
-        | Some { constructor; _ } ->
-            Option.value
-              (String.chop_suffix (Ident.name f.id) ~suffix:("$" ^ constructor))
-              ~default:(Ident.name f.id)
-        | None -> Ident.name f.id
-      in
-      if not (String.equal h.hd_name.pid_str name) then
+      if not (String.equal h.hd_name.pid_str (Ident.name f.id)) then
         error h.hd_name.pid_loc
-          (Printf.sprintf "This contract is for %s, not %s" h.hd_name.pid_str name)
+          (Printf.sprintf "This contract is for %s, not %s" h.hd_name.pid_str
+             (Ident.name f.id))
       else if List.length h.hd_args <> n then
         error h.hd_name.pid_loc
           (Printf.sprintf "This contract names %d arguments, but %s has %d"
@@ -177,15 +170,7 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
             @ List.map (Typedtree.pat_bound_idents_full pattern)
                 ~f:(fun (_, name, typ, _) -> (name.txt, typ)))
   in
-  (* A copy for a witness's constructor has its types for the ones it selects. *)
-  let copy_type t =
-    Option.value_map f.copy_for ~default:t ~f:(fun copy ->
-        Witnesses.substitute_newtypes copy.newtypes t)
-  in
-  let variables =
-    List.map ((result_name, f.body.exp_type) :: parameters_named) ~f:(fun (name, t) ->
-        (name, copy_type t))
-  in
+  let variables = (result_name, f.body.exp_type) :: parameters_named in
   let known_names = List.map declarations ~f:(fun (id, _) -> id.S.pid_str) in
   let known q =
     match q with
@@ -255,16 +240,16 @@ let ghost_signature ?(flexible = []) ~parameters (f : func) =
         @ contract.atomic_ensures)
   in
   let constraints = List.concat_map terms ~f:constraints in
-  (* In a copy for a witness's constructor, the terms on the witness select results of
-     its other constructors' types, which say nothing of the ghost variables. *)
+  (* In a universal procedure, the terms on the witness have results of each
+     constructor's types, which say nothing of the ghost variables. *)
   let constraints =
-    match f.copy_for with
+    match Option.map f.universal ~f:(fun universal -> universal.witness) with
     | None -> constraints
-    | Some copy ->
+    | Some witness ->
         List.filter constraints ~f:(fun term ->
             not
               (List.exists (term_references [] term) ~f:(function
-                | S.Qid id -> String.equal id.pid_str (Ident.name copy.witness)
+                | S.Qid id -> String.equal id.pid_str (Ident.name witness)
                 | Qdot _ -> false)))
   in
   let witnesses =
@@ -299,11 +284,7 @@ let formals ?(names = []) ctx (f : func) =
           let* () = State.note_domain ctx.given.types pat_type in
           let+ x = State.bind_name ~typ:pat_type id in
           let spec =
-            match
-              Option.first_some
-                (witness_condition ctx ~loc:(loc pat_loc) f.id i x)
-                (specialized_condition ctx ~loc:(loc pat_loc) id pat_type x)
-            with
+            match witness_condition ctx ~loc:(loc pat_loc) f.id i x with
             | Some condition -> Some (R.Spec.make condition)
             | None -> value_spec ctx ~loc:(loc pat_loc) pat_type x
           in
@@ -659,16 +640,9 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
       ~f:(fun position ((parameter : Typedtree.function_param), (formal_name, _, _)) ->
         match (parameter.fp_kind, formal_name) with
         | Tparam_pat pattern, Some (_, name) ->
-            let specialized =
-              match pattern.pat_desc with
-              | Tpat_var (id, _, _) ->
-                  specialized_condition ctx ~loc:l id pattern.pat_type name
-              | _ -> None
-            in
             List.find_map ~f:Fn.id
               [
                 witness_condition ctx ~loc:l f.id position name;
-                specialized;
                 Datatypes.admissible ~loc:l ctx.given.types pattern.pat_type
                   (R.Expr.var ~loc:l (R.Name.make ~loc:l name));
               ]
@@ -1279,10 +1253,28 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
           in
           let index_statements, indices = List.unzip indexed in
           (* The keys of no registrations: an arbitrary key of the declared type. *)
+          (* The registrations' maps, of their keys and witnesses, empty. *)
           let* ons =
-            State.all st.pendings ~f:(fun p ->
-                let+ key = raw_default ctx ~at p.key_type in
-                (ident ~loc:l p.pending_on, R.Expr.map_literal ~loc:l [] key))
+            State.map ~f:List.concat
+            @@ State.all st.pendings ~f:(fun p ->
+                let* key = raw_default ctx ~at p.key_type in
+                let+ witness =
+                  match (p.pending_witness, p.universal) with
+                  | Some w, Some (_, _, witness_type) ->
+                      (* A witness's constructors are constants. *)
+                      begin match Witnesses.witness_type ctx.given.types witness_type with
+                      | Some (tag, _, _) ->
+                          let default =
+                            R.Expr.call ~loc:l
+                              (Datatypes.ctor_name ~loc:l tag (List.hd_exn tag.ctors))
+                              []
+                          in
+                          State.return [ (w, R.Expr.map_literal ~loc:l [] default) ]
+                      | None -> State.of_result (error at "A witness of no witness type")
+                      end
+                  | _ -> State.return []
+                in
+                (p.pending_on, R.Expr.map_literal ~loc:l [] key) :: witness)
           in
           let history =
             if has_history st then
@@ -1312,7 +1304,7 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
           let bindings =
             List.map values ~f:(fun (raven, v, _) -> (raven, v))
             @ List.map2_exn st.chains indices ~f:(fun (_, index) (_, v) -> (index, v))
-            @ List.map2_exn st.pendings ons ~f:(fun p (_, v) -> (p.pending_on, v))
+            @ ons
           in
           let parts =
             List.map st.parts ~f:(fun part ->
@@ -1326,7 +1318,8 @@ let establish_invariant ctx ~(f : func) ~at ~env ~initial inv args =
                 R.Stmt.fold ~loc:l
                   ~witnesses:
                     (List.map values ~f:(fun (raven, v, _) -> (ident ~loc:l raven, v))
-                    @ indices @ ons)
+                    @ indices
+                    @ List.map ons ~f:(fun (x, v) -> (ident ~loc:l x, v)))
                   (qualified_name ~loc:l inv) args;
               ])
       end
@@ -1689,15 +1682,6 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let atomic_posts =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
   in
-  (* A copy for a witness's constructor raises only what it does for it, which atomic
-     calls rely on before they commit. *)
-  let copy_raises_terms =
-    match (raising, f.copy_for) with
-    | Some (set, _), Some _ when atomic ->
-        Option.to_list
-          (List.last (Exceptions.raises_postconditions ctx.given.types ~at:f.loc [] set))
-    | _ -> []
-  in
   let* atomic_ensures =
     match raising with
     | None -> postconditions ~atomic:true atomic_posts
@@ -1714,8 +1698,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                   (Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_raises))
                   ~f:(fun (p, t) -> (p, Some t)))
                (State.Raises [])
-            @ (if atomic then witness_raises_terms else [])
-            @ copy_raises_terms)
+            @ if atomic then witness_raises_terms else [])
         in
         normal @ exceptional
   in
@@ -1762,10 +1745,55 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       ]
     else []
   in
+  (* A universal procedure returns its witness's case, when it returns. *)
+  let* cases =
+    match f.universal with
+    | None -> State.return []
+    | Some universal -> (
+        let witness_type =
+          List.find_map f.params ~f:(fun param ->
+              match param.fp_kind with
+              | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; _ }
+                when Ident.same id universal.witness ->
+                  Some pat_type
+              | _ -> None)
+        in
+        match Option.bind witness_type ~f:(Witnesses.witness_type ctx.given.types) with
+        | None -> State.of_result (error f.loc "A universal procedure's witness")
+        | Some (tag, _, _) ->
+            let+ witness =
+              Spec_terms.formula env
+                (S.mk_term
+                   (Tvar (Qid (S.mk_id ~loc:f.loc (Ident.name universal.witness))))
+                   f.loc)
+            in
+            let returned body =
+              match raising with
+              | None -> body
+              | Some (_, outcome_typ) ->
+                  R.Expr.binary ~loc:l Impl
+                    (R.Expr.binary ~loc:l Eq raised_var (no_exception ~loc:l outcome_typ))
+                    body
+            in
+            List.filter_map tag.ctors ~f:(fun t ->
+                Option.map
+                  (List.find universal.result.ctors ~f:(fun u ->
+                       String.equal u.ocaml t.ocaml))
+                  ~f:(fun u ->
+                    returned
+                      (R.Expr.binary ~loc:l Impl
+                         (R.Expr.binary ~loc:l Eq witness
+                            (R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l tag t) []))
+                         (R.Expr.is_ ~loc:l
+                            (R.Expr.var ~loc:l (name ~loc:l result))
+                            (ident ~loc:l u.raven))))))
+  in
   let requires = in_range @ requires @ List.map past_params ~f:snd @ atomic_requires in
   let ensures =
     Option.to_list result_in_range
     @ defined @ ensures @ List.map past_results ~f:snd @ atomic_ensures
+    @ List.map cases ~f:R.Spec.make
+    @ if atomic then List.map cases ~f:(R.Spec.make ~atomic:true) else []
   in
   let all_formals =
     List.map formals ~f:(fun (_, _, v) -> v) @ ghost_formals @ past_formals @ implicit

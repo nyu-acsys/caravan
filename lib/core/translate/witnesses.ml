@@ -311,8 +311,12 @@ let refinement (witness : Datatypes.witness) arguments ctor =
     type [scrutinee], in the worker [current]: the abbreviations there, and the variables
     of [var_types] whose types it refines, each with the conversion that reads it at the
     constructor's index type. *)
-let contract_case types ~(current : Polymorphic_functions.t option) ~scrutinee ~var_types
-    ctor =
+type read =
+  | Conversion of string  (** A worker's conversion function from the index type. *)
+  | Payload of string  (** The field of a universal result's case. *)
+
+let contract_case ?universal types ~(current : Polymorphic_functions.t option) ~scrutinee
+    ~var_types ctor =
   match witness_type types scrutinee with
   | None -> None
   | Some (_, witness, arguments) ->
@@ -321,14 +325,24 @@ let contract_case types ~(current : Polymorphic_functions.t option) ~scrutinee ~
       if not (List.Assoc.mem witness.results ctor ~equal:String.equal) then None
       else
         let aliases, refined = refinement witness arguments ctor in
+        (* In a universal procedure, a variable of an index type is a universal result,
+           whose case's payload the constructor's case reads. *)
+        let read position =
+          match (universal, own) with
+          | Some (result : Datatypes.t), _ ->
+              Option.map
+                (List.find result.ctors ~f:(fun c -> String.equal c.raven ctor))
+                ~f:(fun c -> Payload (List.hd_exn c.fields))
+          | None, Some own ->
+              Some (Conversion (own ^ "." ^ conversion_from ctor position))
+          | None, None -> None
+        in
         let reads =
           List.filter_map var_types ~f:(fun (x, typ) ->
               match Types.get_desc typ with
               | Tconstr (Pident id, [], _) ->
                   Option.bind (List.Assoc.find refined id ~equal:Ident.same)
-                    ~f:(fun position ->
-                      Option.map own ~f:(fun own ->
-                          (x, own ^ "." ^ conversion_from ctor position)))
+                    ~f:(fun position -> Option.map (read position) ~f:(fun r -> (x, r)))
               | _ -> None)
         in
         Some (aliases, reads)
@@ -337,8 +351,8 @@ let contract_case types ~(current : Polymorphic_functions.t option) ~scrutinee ~
     [current]: per case, by its right-hand side, the data types in which the locally
     abstract types its constructor refines are its index types, and the conversion of its
     value to [result] if that is an index; [None] if [scrutinee] is no witness. *)
-let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~result
-    (cases : (Typedtree.pattern * Typedtree.expression) list) =
+let arms ?universal types ~at ~(current : Polymorphic_functions.t option) ~scrutinee
+    ~result (cases : (Typedtree.pattern * Typedtree.expression) list) =
   match witness_type types scrutinee with
   | None -> Ok None
   | Some (_, witness, arguments) ->
@@ -354,10 +368,21 @@ let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~resul
       in
       let own = own_witness current arguments in
       let* () =
-        match (result_index, own) with
-        | Some _, None ->
+        match (result_index, own, universal) with
+        | Some _, None, None ->
             Report.unsupported at "A match on a witness other than the function's own"
         | _ -> Ok ()
+      in
+      (* In a universal procedure, a case's value is its constructor's case of the
+         universal result. *)
+      let convert ctor position =
+        match (universal, own) with
+        | Some (result : Datatypes.t), _ ->
+            Option.map
+              (List.find result.ctors ~f:(fun c -> String.equal c.raven ctor))
+              ~f:(fun c -> result.module_name ^ "." ^ c.raven)
+        | None, Some own -> Some (own ^ "." ^ conversion ctor position)
+        | None, None -> None
       in
       let constructor (p : Typedtree.pattern) =
         match p.pat_desc with
@@ -377,15 +402,4 @@ let arms types ~at ~(current : Polymorphic_functions.t option) ~scrutinee ~resul
              | Some ctor ->
                  let aliases, _ = refinement witness arguments ctor in
                  ( aliases @ types,
-                   Option.map2 result_index own ~f:(fun position own ->
-                       own ^ "." ^ conversion ctor position) )))
-
-(** [t] with the locally abstract types [newtypes] binds replaced by their types. *)
-let rec substitute_newtypes newtypes t =
-  match Types.get_desc t with
-  | Tconstr (Pident id, [], _) when List.Assoc.mem newtypes id ~equal:Ident.same ->
-      List.Assoc.find_exn newtypes id ~equal:Ident.same
-  | Tconstr _ | Ttuple _ | Tarrow _ | Tpoly _ ->
-      Btype.newgenty
-        (Btype.copy_type_desc (substitute_newtypes newtypes) (Types.get_desc t))
-  | _ -> t
+                   Option.bind result_index ~f:(fun position -> convert ctor position) )))

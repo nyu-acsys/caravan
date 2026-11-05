@@ -774,10 +774,145 @@ let rec matched_subterms (p : S.pat) (t : S.term) =
       matched_subterms p argument
   | _ -> None
 
+type universal_call = {
+  witness_value : R.Expr.t;  (** The call's witness. *)
+  witness_name : string;  (** The witness parameter, as the result names it. *)
+  result_data : Datatypes.t;  (** The universal result type. *)
+  tag : Datatypes.t;  (** The witness type. *)
+  instance : Types.type_expr;  (** The universal result type at the call's types. *)
+}
+(** A call of a universal procedure that waits to be helped. *)
+
+(** The universal result of [call] that the match [result] on its witness gives: each
+    case's value in its constructor's case, as the call's witness selects. *)
+let universal_value env ~at (call : universal_call) (result : S.term) =
+  let open State.Syntax in
+  let l = loc at in
+  match result.term_desc with
+  | Tmatch ({ term_desc = Tvar (Qid scrutinee); _ }, cases)
+    when String.equal scrutinee.pid_str call.witness_name ->
+      let* typ = State.typ env.ctx ~at call.instance in
+      let* arms =
+        State.all cases ~f:(fun ((p : S.pat), body) ->
+            match p.pat_desc with
+            | Pconstr ((Qid c | Qdot (_, c)), None) -> (
+                match
+                  ( List.find call.result_data.ctors ~f:(fun u ->
+                        String.equal u.ocaml c.pid_str),
+                    List.find call.tag.ctors ~f:(fun t -> String.equal t.ocaml c.pid_str)
+                  )
+                with
+                | Some u, Some t ->
+                    let+ value = formula env body in
+                    ( R.Expr.binary ~loc:l Eq call.witness_value
+                        (R.Expr.call ~loc:l (Datatypes.ctor_name ~loc:l call.tag t) []),
+                      R.Expr.annotated
+                        (R.Expr.call ~loc:l
+                           (Datatypes.ctor_name ~loc:l call.result_data u)
+                           [ value ])
+                        typ )
+                | _ ->
+                    State.of_result (error p.pat_loc "Not a constructor of the witness"))
+            | _ ->
+                State.of_result
+                  (unsupported p.pat_loc "A case on a witness other than a constructor"))
+      in
+      begin match List.rev arms with
+      | [] -> State.of_result (error at "A match without cases")
+      | (_, last) :: rest ->
+          State.return
+            ( List.fold rest ~init:last ~f:(fun otherwise (condition, value) ->
+                  R.Expr.ite ~loc:l condition value otherwise),
+              call.instance )
+      end
+  | _ ->
+      State.of_result
+        (unsupported at
+           "Helping the calls of a function over a witness with a result other than a \
+            match on the witness")
+
+(** The value [t] with which a step commits: in a universal procedure, a match on its
+    witness, its universal result. *)
+let commit_value env ~at (t : S.term) =
+  let open State.Syntax in
+  match (env.ctx.given.universal_result, t.term_desc) with
+  | Some (result_data : Datatypes.t), Tmatch ({ term_desc = Tvar (Qid scrutinee); _ }, _)
+    -> (
+      match
+        Option.bind
+          (List.Assoc.find env.var_types scrutinee.pid_str ~equal:String.equal)
+          ~f:(Witnesses.witness_type env.data)
+      with
+      | Some (tag, witness, arguments) ->
+          let* witness_value = formula env (S.mk_term (Tvar (Qid scrutinee)) at) in
+          let ordinary =
+            List.filter_map (List.zip_exn witness.indices arguments) ~f:(fun (index, t) ->
+                Option.some_if (not index) t)
+          in
+          let instance =
+            Btype.newgenty
+              (Tconstr
+                 (Path.Pident (Option.value_exn result_data.id), ordinary, ref Types.Mnil))
+          in
+          State.map ~f:fst
+            (universal_value env ~at
+               {
+                 witness_value;
+                 witness_name = scrutinee.pid_str;
+                 result_data;
+                 tag;
+                 instance;
+               }
+               t)
+      | None -> formula env t)
+  | _ -> formula env t
+
+(** In a universal procedure whose calls wait in [p], its own witness, as [env] binds it.
+*)
+let own_witness env ~at (p : pending) =
+  let open State.Syntax in
+  match p.universal with
+  | None -> State.return None
+  | Some (witness, _, _) ->
+      let+ value =
+        formula env (S.mk_term (Tvar (Qid (S.mk_id ~loc:at (Ident.name witness)))) at)
+      in
+      Some value
+
+(** For the calls of [p], of a universal procedure, the call whose witness is
+    [witness_value]: its result at the types of [st]'s structure. *)
+let pending_universal types ~at (st : structure) (p : pending) witness_value =
+  match p.universal with
+  | None -> Ok None
+  | Some (witness, (result_data : Datatypes.t), witness_type) -> (
+      let structure_type = snd (List.hd_exn st.params) in
+      match
+        ( Witnesses.witness_type types witness_type,
+          Datatypes.desc types structure_type,
+          result_data.id )
+      with
+      | Some (tag, _, _), Tconstr (_, arguments, _), Some id
+        when List.length arguments = List.length result_data.parameters ->
+          Ok
+            (Some
+               {
+                 witness_value;
+                 witness_name = Ident.name witness;
+                 result_data;
+                 tag;
+                 instance =
+                   Btype.newgenty (Tconstr (Path.Pident id, arguments, ref Types.Mnil));
+               })
+      | _ ->
+          unsupported at
+            "Helping the calls of a function over a witness whose type parameters are \
+             not its structure's")
+
 (** The result [h] with which an action commits the calls it helps, for the contents
     [contents] of their key after it, with its OCaml type. With [stated], the contents are
-    that term in that environment, whose parts the result's pattern names. *)
-let helped_value ?stated env ~at ~key_type (h : S.helped_result) contents =
+    that term in that environment, whose parts the result's pattern names; with
+    [universal], the calls are of a universal procedure, whose results are universal. *)
+let helped_value ?stated ?universal env ~at ~key_type (h : S.helped_result) contents =
   let open State.Syntax in
   let* env =
     match h.contents with
@@ -800,20 +935,23 @@ let helped_value ?stated env ~at ~key_type (h : S.helped_result) contents =
         in
         { env with var_types = pattern_types env p contents_type @ env.var_types }
   in
-  let* typ =
-    let result = Option.value (specialized_body env.ctx h.result) ~default:h.result in
-    match term_type env result with
-    | Some typ -> State.return typ
-    | None ->
-        State.of_result
-          (Source.infer_logical_expression
-             ~type_variables:(source_type_variables env.ctx.given)
-             env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
-             ~variables:(Logical_context.variables env)
-             result)
-  in
-  let+ value = formula env h.result in
-  (value, typ)
+  match universal with
+  | Some universal -> universal_value env ~at universal h.result
+  | None ->
+      let* typ =
+        let result = h.result in
+        match term_type env result with
+        | Some typ -> State.return typ
+        | None ->
+            State.of_result
+              (Source.infer_logical_expression
+                 ~type_variables:(source_type_variables env.ctx.given)
+                 env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                 ~variables:(Logical_context.variables env)
+                 result)
+      in
+      let+ value = formula env h.result in
+      (value, typ)
 
 (** The lemma calls by which the action [p] that a step performs on [st], whose invariant
     has the arguments [args] and is open in [opened], helps the calls waiting in a pending
@@ -867,7 +1005,12 @@ let helping ctx st args (opened : opened) (p : performing) values ~la ~lemma =
               (pending_name st pending "help")
               (args @ [ c ] @ contents
               @ List.map views ~f:(fun (_, _, value) -> value)
-              @ [ List.nth_exn opened.values i; on; helped ]);
+              @ [ List.nth_exn opened.values i; on; helped ]
+              @ Option.value_map pending.pending_witness ~default:[] ~f:(fun _ ->
+                  [
+                    List.Assoc.find_exn opened.indices (witness_key pending)
+                      ~equal:String.equal;
+                  ]));
           ]
       | _ -> [])
 
@@ -948,16 +1091,23 @@ let use_invariants ?performs ?(no_action = false) ?contents ctx ~(at : Location.
               State.all st.fields ~f:(fun (_, raven, typ, _, _) -> local (raven, typ))
             in
             let* pending_locals =
-              State.all st.pendings ~f:(fun p ->
-                  let key =
-                    Option.value
-                      (Result.ok (Datatypes.typ ctx.given.types ~at p.key_type))
-                      ~default:(R.Type.ref ~loc:l)
+              State.map ~f:List.concat
+              @@ State.all st.pendings ~f:(fun p ->
+                  let typ t =
+                    R.Type.map ~loc:l (R.Type.ref ~loc:l)
+                      (Option.value
+                         (Result.ok (Datatypes.typ ctx.given.types ~at t))
+                         ~default:(R.Type.ref ~loc:l))
                   in
-                  let+ x =
-                    local (p.pending_on, R.Type.map ~loc:l (R.Type.ref ~loc:l) key)
+                  let* x = local (p.pending_on, typ p.key_type) in
+                  let+ witness =
+                    match (p.pending_witness, p.universal) with
+                    | Some w, Some (_, _, witness_type) ->
+                        let+ x = local (w, typ witness_type) in
+                        [ (witness_key p, x) ]
+                    | _ -> State.return []
                   in
-                  (p.pending_field, x))
+                  (p.pending_field, x) :: witness)
             in
             let* chain_locals =
               State.all st.chains ~f:(fun (field, raven) ->
@@ -1077,10 +1227,9 @@ let use_invariants ?performs ?(no_action = false) ?contents ctx ~(at : Location.
                   @ List.map st.chains ~f:(fun (field, raven) ->
                       ( ident ~loc:la raven,
                         List.Assoc.find_exn state.indices field ~equal:String.equal ))
-                  @ List.map st.pendings ~f:(fun p ->
-                      ( ident ~loc:la p.pending_on,
-                        List.Assoc.find_exn state.indices p.pending_field
-                          ~equal:String.equal ))
+                  @ List.map (pending_maps st) ~f:(fun (existential, key) ->
+                      ( ident ~loc:la existential,
+                        List.Assoc.find_exn state.indices key ~equal:String.equal ))
                 in
                 begin match performs with
                 | Some p when performing_on p inv ->
@@ -1711,15 +1860,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         Option.map (waits outcome) ~f:(fun (field : S.term) -> field.term_desc)
       with
       | Some (Tfield (_, Qid f)) ->
-          (* A copy for a witness's constructor waits in the field of its calls. *)
-          let field =
-            match ctx.given.specialized_witness with
-            | Some (_, ctor)
-              when List.exists st.pendings ~f:(fun q ->
-                       String.equal q.pending_field (f.pid_str ^ "$" ^ ctor)) ->
-                f.pid_str ^ "$" ^ ctor
-            | _ -> f.pid_str
-          in
+          let field = f.pid_str in
           begin match
             List.find st.pendings ~f:(fun q -> String.equal q.pending_field field)
           with
@@ -1749,7 +1890,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
   let rec arm (o : S.outcome) =
     match o with
     | Commits_with t ->
-        let* v = formula env t in
+        let* v = commit_value env ~at t in
         let* commit = au.commit_only ~at ~value:v in
         let* fold = use_invariants ctx ~at ~fold:true in
         let+ () = modify_path (fun path -> { path with snapshots }) in
@@ -1766,7 +1907,14 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
           | None -> State.return None
           | Some _ ->
               let* _, result_type =
-                helped_value env ~at ~key_type:pending.key_type helped_result key
+                let* witness = own_witness env ~at pending in
+                let* universal =
+                  State.of_result
+                    (pending_universal ctx.given.types ~at st pending
+                       (Option.value witness ~default:key))
+                in
+                helped_value ?universal env ~at ~key_type:pending.key_type helped_result
+                  key
               in
               let* typ = State.typ ctx ~at result_type in
               let+ x = State.fresh "result" in
@@ -1788,6 +1936,15 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         let inv = st.invariant in
         let after = { at with loc_start = at.loc_end } in
         let registered_on = R.Expr.update ~loc:l on (var hc) key in
+        (* A universal procedure's call registers its witness too. *)
+        let* witness = own_witness env ~at pending in
+        let registered_witness =
+          Option.map2 witness pending.pending_witness ~f:(fun w _ ->
+              R.Expr.update ~loc:l
+                (List.Assoc.find_exn opened.indices (witness_key pending)
+                   ~equal:String.equal)
+                (var hc) w)
+        in
         let* unfolds, folds =
           reconcile_parts st ~l ~la:(loc after) inv args opened
             {
@@ -1796,6 +1953,8 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
                 List.map opened.indices ~f:(fun (field, e) ->
                     ( field,
                       if String.equal field pending.pending_field then registered_on
+                      else if String.equal field (witness_key pending) then
+                        Option.value registered_witness ~default:e
                       else e ));
             }
             ~force:(fun _ -> false)
@@ -1824,7 +1983,9 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
                     (field "retired", Some (R.Expr.bool ~loc:l false));
                   ]
                  @ Option.value_map stored ~default:[] ~f:(fun (x, _) ->
-                     [ (field "result", Some (var x)) ])));
+                     [ (field "result", Some (var x)) ])
+                 @ Option.value_map witness ~default:[] ~f:(fun w ->
+                     [ (field "witness", Some w) ])));
             R.Stmt.fold ~loc:l
               ~witnesses:
                 ([
@@ -1835,7 +1996,7 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
                 @ Option.value_map stored ~default:[] ~f:(fun (x, _) ->
                     [ (ident ~loc:l "res", var x) ]))
               (qualified_name ~loc:l (pending_name st pending "registration"))
-              (var hc :: args);
+              ((var hc :: args) @ Option.to_list witness);
             lemma (member_name st "learn")
               [ List.hd_exn args; state opened.values; state next ];
             lemma (member_name st "snapshot") [ List.hd_exn args; state next ];
@@ -1844,10 +2005,13 @@ let decide ?value_type ctx (au : au) ~(at : Location.t) ~value (p : S.pat)
         @ [
             R.Stmt.fold ~loc:(loc after)
               ~witnesses:
-                [
-                  (ident ~loc:l raven_field, added);
-                  (ident ~loc:l pending.pending_on, registered_on);
-                ]
+                ([
+                   (ident ~loc:l raven_field, added);
+                   (ident ~loc:l pending.pending_on, registered_on);
+                 ]
+                @ Option.value_map
+                    (Option.both pending.pending_witness registered_witness) ~default:[]
+                    ~f:(fun (w, value) -> [ (ident ~loc:l w, value) ]))
               (qualified_name ~loc:l inv) args;
           ]
         @ ends added true
@@ -1898,7 +2062,7 @@ let collected_terms ctx (p : S.pat) value result =
   let open State.Syntax in
   let* env = scope_env ctx in
   let* matches, _ = State.of_result (spec_pattern env p value) in
-  let+ result = formula env result in
+  let+ result = commit_value env ~at:p.pat_loc result in
   (matches, result)
 
 (** The ghost statements retiring the registration of the function with the update [au],
@@ -1913,6 +2077,10 @@ let retire ctx (au : au) (r : registered) ~(at : Location.t) ~value commit =
       "A step that collects a result without a structure with pending calls"
   in
   let* linked = State.fresh "linked" in
+  let* own =
+    let* env = scope_env ctx in
+    own_witness env ~at r.pending
+  in
   (* A carried result, kept as the registration holds it. *)
   let _, _, helped_result = r.pending.helping in
   let+ stored =
@@ -1921,7 +2089,13 @@ let retire ctx (au : au) (r : registered) ~(at : Location.t) ~value commit =
     | Some _ ->
         let* env = scope_env ctx in
         let* _, result_type =
-          helped_value env ~at ~key_type:r.pending.key_type helped_result value
+          let* witness = own_witness env ~at r.pending in
+          let* universal =
+            State.of_result
+              (pending_universal ctx.given.types ~at st r.pending
+                 (Option.value witness ~default:value))
+          in
+          helped_value ?universal env ~at ~key_type:r.pending.key_type helped_result value
         in
         let* typ = State.typ ctx ~at result_type in
         let+ x = State.fresh "result" in
@@ -1939,7 +2113,8 @@ let retire ctx (au : au) (r : registered) ~(at : Location.t) ~value commit =
             ~witnesses:
               ((ident ~loc:l linked, var "l")
               :: carried (fun (x, _) -> [ (ident ~loc:l x, var "res") ]))
-            registration (r.registration :: args);
+            registration
+            ((r.registration :: args) @ Option.to_list own);
         ]
       @ commit
       @ [
@@ -1954,7 +2129,8 @@ let retire ctx (au : au) (r : registered) ~(at : Location.t) ~value commit =
                  (ident ~loc:l "r", R.Expr.bool ~loc:l true);
                ]
               @ carried (fun (x, _) -> [ (ident ~loc:l "res", var x) ]))
-            registration (r.registration :: args);
+            registration
+            ((r.registration :: args) @ Option.to_list own);
         ])
       [];
   ]

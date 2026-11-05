@@ -176,7 +176,8 @@ let transition_lemmas ctx (st : structure) (a : action) ~params ~existentials ~p
             values = opened_values;
             indices =
               List.map st.chains ~f:(fun (field, raven) -> (field, var raven))
-              @ List.map st.pendings ~f:(fun p -> (p.pending_field, var p.pending_on));
+              @ List.map (pending_maps st) ~f:(fun (existential, key) ->
+                  (key, var existential));
           }
         in
         let performing =
@@ -264,11 +265,11 @@ let transition_lemmas ctx (st : structure) (a : action) ~params ~existentials ~p
                   String.equal f p.pending_field)
             in
             let hc = var "hc" in
+            let registered = bin In hc (List.nth_exn values i) in
             let unwatched =
-              R.Expr.forall ~loc:l
+              R.Expr.forall ~loc:l ~triggers:[ [ registered ] ]
                 [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
-                (bin Impl
-                   (bin In hc (List.nth_exn values i))
+                (bin Impl registered
                    (bin Neq
                       (R.Expr.index ~loc:l
                          (List.Assoc.find_exn after.indices p.pending_field
@@ -619,9 +620,17 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
         (wf, owned)
       in
       let* on_types =
-        State.all st.pendings ~f:(fun p ->
-            let+ key = State.typ ctx ~at p.key_type in
-            (p.pending_on, R.Type.map ~loc:l (R.Type.ref ~loc:l) key))
+        State.map ~f:List.concat
+        @@ State.all st.pendings ~f:(fun p ->
+            let* key = State.typ ctx ~at p.key_type in
+            let+ witness =
+              match (p.pending_witness, p.universal) with
+              | Some w, Some (_, _, witness_type) ->
+                  let+ typ = State.typ ctx ~at witness_type in
+                  [ (w, R.Type.map ~loc:l (R.Type.ref ~loc:l) typ) ]
+              | _ -> State.return []
+            in
+            (p.pending_on, R.Type.map ~loc:l (R.Type.ref ~loc:l) key) :: witness)
       in
       let existential_types =
         List.map st.fields ~f:(fun (_, raven, typ, _, _) -> (raven, typ))
@@ -759,22 +768,16 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
                         }
                       in
                       let* contents = formula stated_env value in
-                      let env =
-                        {
-                          state_env with
-                          ctx =
-                            {
-                              state_env.ctx with
-                              given =
-                                {
-                                  state_env.ctx.given with
-                                  specialized_witness = p.specialized;
-                                };
-                            };
-                        }
+                      let env = state_env in
+                      let* universal =
+                        State.of_result
+                          (pending_universal types ~at st p
+                             (R.Expr.index ~loc:l
+                                (var (Option.value p.pending_witness ~default:""))
+                                hc))
                       in
                       let+ result, _ =
-                        helped_value ~stated:(stated_env, value) env ~at
+                        helped_value ~stated:(stated_env, value) ?universal env ~at
                           ~key_type:p.key_type helped_result contents
                       in
                       [
@@ -810,14 +813,19 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
             let registered =
               R.Expr.call ~loc:l
                 (qualified_name ~loc:l (pending_name st p "registration"))
-                (hc :: List.map params ~f:(fun (_, raven, _, _) -> var raven))
+                ((hc :: List.map params ~f:(fun (_, raven, _, _) -> var raven))
+                @ Option.value_map p.pending_witness ~default:[] ~f:(fun w ->
+                    [ R.Expr.index ~loc:l (var w) hc ]))
             in
             held (`Pending p.pending_field)
               (R.Expr.forall ~loc:l
                  [ R.Var.make ~loc:l (ident ~loc:l "hc") (R.Type.ref ~loc:l) ]
                  (bin Impl (bin In hc registrations)
                     (List.reduce_exn ~f:(bin And)
-                       ((half "watched" key :: membership)
+                       ((half "watched" key
+                         :: Option.value_map p.pending_witness ~default:[] ~f:(fun w ->
+                             [ half "witness" (R.Expr.index ~loc:l (var w) hc) ])
+                        @ membership)
                        @ [ half "linked" linked ]
                        @ carried @ [ registered ])))))
       in
@@ -1252,7 +1260,7 @@ let logical_contract = function
   | Some (c : S.contract) ->
       c.atomic || not (List.is_empty (c.atomic_requires @ c.atomic_ensures))
 
-let generic_modules ?(copies = []) (source : Source.t) ~types ~functions inventory =
+let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inventory =
   let types =
     List.concat_map source.proof_resources ~f:(fun resource ->
         List.concat_map (resource :: Option.to_list resource.Source.resource_public)
@@ -1271,12 +1279,12 @@ let generic_modules ?(copies = []) (source : Source.t) ~types ~functions invento
               in
               (name, Option.value_map body ~default:id ~f:(fun function_ -> function_.id)))
         in
-        (* A function copied per witness constructor is its copies. *)
+        (* A function over a witness whose calls wait is its universal procedure. *)
         let body_members =
-          List.concat_map specialization.body_members ~f:(fun (name, id) ->
-              match List.Assoc.find copies id ~equal:Ident.same with
-              | Some copied -> List.map copied ~f:(fun copy -> (Ident.name copy, copy))
-              | None -> [ (name, id) ])
+          List.map specialization.body_members ~f:(fun (name, id) ->
+              match List.Assoc.find universal id ~equal:Ident.same with
+              | Some procedure -> (name, procedure)
+              | None -> (name, id))
         in
         let same =
           List.equal (fun (left, left_id) (right, right_id) ->

@@ -266,23 +266,6 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
               target)
       in
       (R.Stmt.local ~loc:l ~const:false ~typ (ident ~loc:l x) @ stmts, value)
-  | Texp_match ({ exp_desc = Texp_ident (Pident id, _, _); _ }, cases, [], _)
-    when Option.is_some
-           (specialized_case ctx ~scrutinee:(Ident.name id) cases
-              ~constructors:(fun (c : Typedtree.computation Typedtree.case) ->
-                match Typedtree.split_pattern c.c_lhs with
-                | Some p, None -> Exceptions.matched_constructors p
-                | _ -> Some [])) ->
-      (* In a copy for a witness's constructor, a match on the witness is its case. *)
-      let case =
-        Option.value_exn
-          (specialized_case ctx ~scrutinee:(Ident.name id) cases
-             ~constructors:(fun (c : Typedtree.computation Typedtree.case) ->
-               match Typedtree.split_pattern c.c_lhs with
-               | Some p, None -> Exceptions.matched_constructors p
-               | _ -> Some []))
-      in
-      expr ~tail ctx case.c_rhs
   | Texp_match (scrutinee, cases, [], partial) ->
       let* read = is_read_value scrutinee in
       let* scrutinee_stmts, v = expr ctx scrutinee in
@@ -307,8 +290,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let total = match partial with Total -> true | Partial -> false in
       let* arm =
         State.of_result
-          (Witnesses.arms ctx.given.types ~at ~current:ctx.given.current_polymorphic
-             ~scrutinee:scrutinee.exp_type ~result:e.exp_type cases)
+          (Witnesses.arms ?universal:ctx.given.universal_result ctx.given.types ~at
+             ~current:ctx.given.current_polymorphic ~scrutinee:scrutinee.exp_type
+             ~result:e.exp_type cases)
       in
       (* A match on the value of a read that left the atomic update open closes it. *)
       let* state = au_state in
@@ -874,24 +858,41 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
             (stmts @ [ overflow ], v))
     | None, None, _ -> (
         let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
-        (* A function copied per witness constructor is called as the copy for the
-           constructor passed. *)
-        let* path, declaration =
+        (* A function over a witness whose calls wait to be helped is called as its
+           universal procedure, whose result has the case of the constructor passed. *)
+        let* path, declaration, universal =
           match
-            List.find ctx.given.specialized_calls ~f:(fun (paths, _, _) ->
+            List.find ctx.given.specialized_calls ~f:(fun (paths, _, _, _, _) ->
                 List.mem paths path ~equal:Path.same)
           with
-          | None -> State.return (path, declaration)
-          | Some (_, position, copies) -> (
-              let copy =
-                match Option.map (List.nth args position) ~f:(fun a -> a.exp_desc) with
-                | Some (Texp_construct (_, cstr, [])) ->
-                    List.find copies ~f:(fun (c, _, _) -> String.equal c cstr.cstr_name)
+          | None -> State.return (path, declaration, None)
+          | Some (_, position, id, scheme, (result : Datatypes.t)) -> (
+              let case =
+                match List.nth args position with
+                | Some ({ exp_desc = Texp_construct (_, cstr, []); _ } as witness) ->
+                    Option.both
+                      (List.find result.ctors ~f:(fun c ->
+                           String.equal c.ocaml cstr.cstr_name))
+                      (Witnesses.witness_type ctx.given.types witness.exp_type)
                 | _ -> None
               in
-              match copy with
-              | Some (_, id, scheme) ->
-                  State.return (Path.Pident id, { declaration with val_type = scheme })
+              match case with
+              | Some (ctor, (_, witness, arguments)) ->
+                  let ordinary =
+                    List.filter_map (List.zip_exn witness.indices arguments)
+                      ~f:(fun (index, t) -> Option.some_if (not index) t)
+                  in
+                  let instance =
+                    Btype.newgenty
+                      (Tconstr
+                         ( Path.Pident (Option.value_exn result.id),
+                           ordinary,
+                           ref Types.Mnil ))
+                  in
+                  State.return
+                    ( Path.Pident id,
+                      { declaration with val_type = scheme },
+                      Some (instance, List.hd_exn ctor.fields) )
               | None ->
                   State.of_result
                     (unsupported at
@@ -900,11 +901,42 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
         in
         match resolved_call ctx.given.functions ctx.given.libraries path with
         | Some f ->
+            (* A universal procedure's occurrence has the universal result for the
+               witness's index types, in the witness and as its result. *)
+            let occurrence =
+              match universal with
+              | None -> occurrence
+              | Some (instance, _) ->
+                  let rec universal_witness t =
+                    match
+                      (Types.get_desc t, Witnesses.witness_type ctx.given.types t)
+                    with
+                    | Tpoly (t, []), _ -> universal_witness t
+                    | Tconstr (path, arguments, abbrev), Some (_, witness, _) ->
+                        Btype.newgenty
+                          (Tconstr
+                             ( path,
+                               List.map2_exn witness.indices arguments
+                                 ~f:(fun index argument ->
+                                   if index then instance else argument),
+                               abbrev ))
+                    | _ -> t
+                  in
+                  let rec returning t =
+                    match Types.get_desc t with
+                    | Tarrow (label, a, r, c) ->
+                        Btype.newgenty
+                          (Tarrow (label, universal_witness a, returning r, c))
+                    | Tpoly (t, []) -> returning t
+                    | _ -> instance
+                  in
+                  returning occurrence
+            in
             let* actual_target, type_instance =
               State.polymorphic_application ~values:args ~environment:e.exp_env ctx ~at
                 ~path ~declaration:declaration.val_type ~occurrence ~target:f
             in
-            call ~actual_target ?type_instance ctx e f args
+            call ~actual_target ?type_instance ?universal ctx e f args
         | None -> (
             match path with
             | Pident _ -> State.of_result (unsupported at "A call of a local function")
@@ -913,7 +945,7 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
 
 (** The call of the top-level function [f] with [args], in [e]: a statement, whose result
     is kept in a variable unless it is unit. *)
-and call ?actual_target ?type_instance ctx (e : Typedtree.expression) f
+and call ?actual_target ?type_instance ?universal ctx (e : Typedtree.expression) f
     (ocaml_args : Typedtree.expression list) =
   let* arguments, args = operands ctx ocaml_args in
   let* signature =
@@ -946,8 +978,8 @@ and call ?actual_target ?type_instance ctx (e : Typedtree.expression) f
       ~f:(fun signature -> signature.procedure_returns_value)
   in
   let run explicit =
-    call_prepared ?actual_target ctx e f ocaml_args args ~explicit ~returns_value
-      ~signature_outputs:outputs
+    call_prepared ?actual_target ?universal ctx e f ocaml_args args ~explicit
+      ~returns_value ~signature_outputs:outputs
   in
   let annotation =
     List.Assoc.find ctx.given.access_proofs
@@ -966,8 +998,8 @@ and call ?actual_target ?type_instance ctx (e : Typedtree.expression) f
       in
       (arguments @ statements, value)
 
-and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args args
-    ~explicit ~returns_value ~signature_outputs =
+and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f ocaml_args
+    args ~explicit ~returns_value ~signature_outputs =
   let l = loc e.exp_loc in
   let stmts = [] in
   (* A lifted local function takes the parameters of the function it continues first. *)
@@ -1285,16 +1317,24 @@ and call_prepared ?actual_target ctx (e : Typedtree.expression) f ocaml_args arg
     in
     (stmts @ opening @ call @ closing @ propagation, unit_value ~loc:l, public_values)
   else
-    let* typ = State.typ ctx ~at:e.exp_loc e.exp_type in
+    (* A call of a universal procedure returns its universal result, of which the value
+       is the case of the call's witness. *)
+    let* typ =
+      State.typ ctx ~at:e.exp_loc (Option.value_map universal ~default:e.exp_type ~f:fst)
+    in
     let* x = State.fresh "tmp" in
-    let v = R.Expr.var ~loc:l (name ~loc:l x) in
+    let result = R.Expr.var ~loc:l (name ~loc:l x) in
+    let v =
+      Option.value_map universal ~default:result ~f:(fun (_, field) ->
+          R.Expr.field ~loc:l result (qualified_name ~loc:l field))
+    in
     let def =
       match ghosts with
       | [] -> R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs callee) (ident ~loc:l x)
       | _ ->
           R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
           @ ghost_decls
-          @ [ R.Stmt.assign ~loc:l (v :: ghosts) (R.Stmt.expr_rhs callee) ]
+          @ [ R.Stmt.assign ~loc:l (result :: ghosts) (R.Stmt.expr_rhs callee) ]
     in
     let* closing = closing v outcome_value in
     (* A retry that raised committed the update with its result, which the function

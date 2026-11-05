@@ -156,10 +156,10 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         Ok (allocation, { View_storage.field; value_type = typ }))
   in
   let resolve_function ~environment (id : S.id) =
-    (* A copy of a function for a witness's constructor, by its name. *)
+    (* The universal procedure of a function over a witness, by its name. *)
     match
       List.find funcs ~f:(fun f ->
-          Option.is_some f.copy_for && String.equal (Ident.name f.id) id.pid_str)
+          Option.is_some f.universal && String.equal (Ident.name f.id) id.pid_str)
     with
     | Some f -> Ok f.id
     | None -> (
@@ -321,33 +321,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                   { worker with variables; parameters }
                   worker.variables
         in
-        (* A field of the calls of a function copied per witness constructor is one field
-           per copy, which the actions helping it help each. *)
-        let copied (sf : S.state_field) =
-          Option.bind sf.sf_helps ~f:(fun helped ->
-              List.find scopes.specialized ~f:(fun s ->
-                  String.equal (Ident.name s.Specializations.original.id) helped))
-        in
-        let copy_field field (copy : Specializations.copy) =
-          field ^ "$" ^ copy.constructor
-        in
-        let typed_fields =
-          List.concat_map (List.zip_exn state_fields state_types) ~f:(fun (sf, t) ->
-              match copied sf with
-              | None -> [ (sf, t) ]
-              | Some s ->
-                  List.map s.copies ~f:(fun copy ->
-                      ( {
-                          sf with
-                          sf_name =
-                            {
-                              sf.sf_name with
-                              pid_str = copy_field sf.sf_name.pid_str copy;
-                            };
-                          sf_helps = Some (Ident.name copy.copy_id);
-                        },
-                        t )))
-        in
+        let typed_fields = List.zip_exn state_fields state_types in
         let actions =
           List.filter_map actions ~f:(fun (owner, action) ->
               Option.some_if
@@ -356,21 +330,7 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                 && List.for_all action.update ~f:(fun (field, _) ->
                     List.exists state_fields ~f:(fun sf ->
                         String.equal sf.S.sf_name.pid_str field)))
-                {
-                  action with
-                  helps =
-                    List.concat_map action.helps
-                      ~f:(fun ((field, key, result) as helps) ->
-                        match
-                          List.find_map state_fields ~f:(fun sf ->
-                              Option.some_if (String.equal sf.sf_name.pid_str field) sf)
-                          |> Option.bind ~f:copied
-                        with
-                        | None -> [ helps ]
-                        | Some s ->
-                            List.map s.copies ~f:(fun copy ->
-                                (copy_field field copy, key, result)));
-                })
+                action)
         in
         (* The key type of a field of pending calls. *)
         let pending_key t =
@@ -429,14 +389,32 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
                 {
                   pending_field = field;
                   pending_on = state ^ "_" ^ field ^ "_on";
+                  pending_witness =
+                    Option.some_if
+                      (List.exists scopes.specialized ~f:(fun s ->
+                           String.equal (Ident.name s.universal.id) (Ident.name helped)))
+                      (state ^ "_" ^ field ^ "_witness");
                   key_type = key;
                   helped;
-                  specialized =
+                  universal =
                     List.find_map scopes.specialized ~f:(fun s ->
-                        List.find_map s.copies ~f:(fun copy ->
-                            Option.some_if
-                              (String.equal (Ident.name copy.copy_id) (Ident.name helped))
-                              (s.witness, copy.constructor)));
+                        Option.bind
+                          (Option.some_if
+                             (String.equal (Ident.name s.universal.id) (Ident.name helped))
+                             ())
+                          ~f:(fun () ->
+                            Option.map
+                              (Specializations.witness_parameter types s.original)
+                              ~f:(fun (_, _, _, _) ->
+                                ( s.witness,
+                                  s.result,
+                                  List.find_map_exn s.original.params ~f:(fun param ->
+                                      match param.fp_kind with
+                                      | Tparam_pat
+                                          { pat_desc = Tpat_var (id, _, _); pat_type; _ }
+                                        when Ident.same id s.witness ->
+                                          Some pat_type
+                                      | _ -> None) ))));
                   helping;
                 })
         in
