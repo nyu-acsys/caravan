@@ -7,7 +7,7 @@ import * as path from 'node:path';
 import { toolchainEnvironment } from '../shared/toolchain';
 import { VerificationProcesses, UnsupportedServerError } from './verificationProcesses';
 import { parseReport, normalizeReport, normalizeContracts, normalizeProofSteps, normalizeMembers, type RavenReport, type NormalizedMember, type FileResult } from './report';
-import { contractLenses, contractHover } from './contracts';
+import { contractHover } from './contracts';
 import { renderProofView, type ProofMetadata } from './proofView';
 import { proofHints } from './proofHints';
 import { memberLenses } from './memberLenses';
@@ -16,7 +16,7 @@ import { verificationStateNotification, verifyNotification, type VerificationSta
 
 interface Settings {
 	executable: string; arguments: string[]; includePaths: string[];
-	smtTimeout: number; cache: boolean; verifyOnSave: boolean; showContractLenses: boolean; showProofHints: boolean; cwd: string;
+	smtTimeout: number; cache: boolean; verifyOnSave: boolean; showProofHints: boolean; cwd: string;
 }
 interface Owner {
 	generation: number; dependencies?: Set<string>; abort?: AbortController;
@@ -27,7 +27,7 @@ interface Owner {
 	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 	members?: NormalizedMember[];
 }
-const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, cache: true, verifyOnSave: true, showContractLenses: true, showProofHints: true, cwd: '' };
+const defaults: Settings = { executable: '', arguments: [], includePaths: [], smtTimeout: 10000, cache: true, verifyOnSave: true, showProofHints: true, cwd: '' };
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const processes = new VerificationProcesses(2);
@@ -180,7 +180,6 @@ function settingsFrom(value: unknown): Settings {
 		smtTimeout: typeof v.smtTimeout === 'number' && Number.isInteger(v.smtTimeout) && v.smtTimeout > 0 ? v.smtTimeout : defaults.smtTimeout,
 		cache: typeof v.cache === 'boolean' ? v.cache : defaults.cache,
 		verifyOnSave: typeof v.verifyOnSave === 'boolean' ? v.verifyOnSave : defaults.verifyOnSave,
-		showContractLenses: typeof v.showContractLenses === 'boolean' ? v.showContractLenses : defaults.showContractLenses,
 		showProofHints: typeof v.showProofHints === 'boolean' ? v.showProofHints : defaults.showProofHints,
 		cwd: typeof v.cwd === 'string' ? v.cwd : ''
 	};
@@ -401,14 +400,10 @@ connection.onCodeLens(async (params, token) => {
 	const file = fileOf(params.textDocument.uri);
 	if (!file || !relevant(file) || shuttingDown || token.isCancellationRequested) return [];
 	const root = rootOf(file);
-	const config = await settings(params.textDocument.uri);
-	const needsContracts = config.showContractLenses && file === root;
-	const metadata = needsContracts || !owners.get(root)?.members
-		? await metadataFor(URI.file(root).toString()) : undefined;
+	const metadata = !owners.get(root)?.members ? await metadataFor(URI.file(root).toString()) : undefined;
 	if (token.isCancellationRequested) return [];
 	const owner = owners.get(root);
-	return [...(config.showContractLenses && file === root ? contractLenses(metadata?.contracts ?? [], root) : []),
-		...memberLenses(owner?.members ?? metadata?.members ?? [], file, owner?.state ?? 'unchecked')];
+	return memberLenses(owner?.members ?? metadata?.members ?? [], file, owner?.state ?? 'unchecked');
 });
 connection.onHover(async (params, token) => {
 	const root = fileOf(params.textDocument.uri);

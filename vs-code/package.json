@@ -62,7 +62,6 @@
         "caravan.smtTimeout": {"type": "integer", "minimum": 1, "default": 10000, "scope": "resource", "description": "SMT solver timeout in milliseconds."},
         "caravan.cache": {"type": "boolean", "default": true, "scope": "resource", "description": "Reuse successfully verified proof obligations through Raven's dependency fingerprints. Stored in extension storage; disable to check every obligation again."},
         "caravan.verifyOnSave": {"type": "boolean", "default": true, "scope": "resource", "description": "Verify supported files after saving."},
-        "caravan.showContractLenses": {"type": "boolean", "default": true, "scope": "resource", "description": "Show external interface and proof-file contracts above implementation functions. Click a summary to open its original annotation."},
         "caravan.showProofHints": {"type": "boolean", "default": true, "scope": "resource", "description": "Show short labels for external proof steps in implementations, with full annotation hovers and navigation to their proof source."}
       }
     }

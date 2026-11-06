@@ -8,8 +8,8 @@
 VS Code integration for [Caravan](https://github.com/nyu-acsys/caravan), a verifier
 for multicore OCaml programs. The extension highlights specifications and proof
 files, reports verification errors in the editor, and tracks verification status.
-Contracts from companion interfaces and proof headers appear above their
-implementation functions, with streamed member statuses and module summaries.
+Contracts from companion interfaces and proof headers appear on hover, with
+streamed member statuses and module summaries above their declarations.
 
 New to Caravan? Start with the **[project introduction and examples](https://github.com/nyu-acsys/caravan#readme)**.
 The instructions below cover setup, day-to-day use, and building the extension.
@@ -83,25 +83,17 @@ such as `/path/to/caravan/_build/default/bin/caravan.exe`.
 
 ### Verifying a file
 
-Opening a saved `.ml` file shows contract summaries above functions whose contracts
-come from a `.mli` or `.proof` file. A lens such as
-`requires ... · ensures ...` shows the original clauses;
-click it to open and select the annotation in its source file. Inline contracts
-already visible in the `.ml` are not repeated.
-
 Hover over an implementation function's name to see its complete external
 contract, including the original header and line breaks but omitting the outer
 comment markers, with a link to its
 `.mli` or `.proof` source. Contracts use Caravan's proof syntax highlighting.
-These hovers complement OCaml Platform's type
-information and remain available when contract lenses are disabled.
+These hovers complement OCaml Platform's type information.
 
 Discovery runs independently of the solver and does not verify the file. It also
 finds source members for status lenses, initially marked `○ not checked`.
 Edits to the implementation or its dependencies hide outdated summaries until the
 saved inputs can be analyzed again. If discovery fails, run verification to see
-the diagnostics. Older Caravan builds without annotation discovery still support
-verification, but do not provide these lenses.
+the diagnostics.
 
 Short inline labels show external proof steps at their attachment points, such as
 `commit` and `fold stack t []`. Hover over a label for the full annotation with
@@ -136,7 +128,10 @@ marks stale lenses outdated; an unavailable verifier cannot leave a current
 verified display.
 
 Errors and warnings appear in the Problems panel and editor, with related source
-locations. The status bar tracks the active file and its current version: unchecked,
+locations. Gutter icons mark the starting lines of errors, warnings, and related
+locations, including locations in companion files. Hover over an icon for its
+messages; errors take precedence when several markers share a line.
+The status bar tracks the active file and its current version: unchecked,
 outdated, verifying, verified, verified with warnings, failed, or unavailable.
 Successful verification with warnings has a yellow indicator. Editing a file
 invalidates its result and stops obsolete verifier processes; older results cannot
@@ -190,8 +185,6 @@ to the VS Code window:
 * `caravan.cache`: Reuse successful proof fingerprints in extension storage.
   Defaults to `true`; disable to run every proof check again.
 * `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
-* `caravan.showContractLenses`: Show external contracts above implementation
-  functions. Defaults to `true`; member status lenses remain available independently.
 * `caravan.showProofHints`: Show inline proof-step labels with full annotation
   hovers and source navigation. Defaults to `true`.
 
@@ -282,7 +275,7 @@ Adding `--lsp-annotations-only` collects these attachments and an unchecked memb
 inventory using the same front-end resolution as verification, without generating
 Raven code or running SMT checks. Discovery never marks a member verified.
 The server shares this mode, worker queue, and dependency cache between contract
-lenses, hovers, and proof views, so ongoing verification does not delay discovery.
+hovers, status lenses, and proof views, so ongoing verification does not delay discovery.
 The client requests a combined view with `caravan/proofView` and refreshes its
 read-only virtual document on `caravan/proofViewChanged` notifications.
 

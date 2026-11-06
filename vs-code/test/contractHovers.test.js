@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { contractLenses, contractHover } = require('../out/server/contracts');
+const { contractHover } = require('../out/server/contracts');
 
 const root = path.resolve('module.ml');
 function contract(clauses) {
@@ -10,21 +10,6 @@ function contract(clauses) {
       start: { line: 3, character: 0 }, end: { line: 4, character: 9 } },
     clauses: clauses.map(text => ({ keyword: 'ensures', text })) };
 }
-
-test('contract summaries remain readable for header-only and long Unicode contracts', () => {
-  assert.equal(contractLenses([contract([])], root)[0].command.title, 'contract');
-  const title = contractLenses([contract(['🙂'.repeat(150) + '\nfalse'])], root)[0].command.title;
-  assert.ok(title.endsWith('…'));
-  assert.ok(title.isWellFormed());
-  assert.equal(title.includes('\n'), false);
-});
-
-test('duplicate generated workers produce one lens at the original implementation', () => {
-  const original = contract(['true']);
-  const result = contractLenses([original, original, { ...original,
-    location: { ...original.location, file: path.resolve('other.ml') } }], root);
-  assert.equal(result.length, 1);
-});
 
 test('contract hovers omit outer comment markers, preserve the contract, and link its location', () => {
   const original = contract(['fallback']);

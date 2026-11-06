@@ -12,7 +12,7 @@ local/
 /vendor/
 /vs-code/node_modules/
 /vs-code/out/
-/vs-code/images/
+/vs-code/images/icon.png
 /vs-code/*.vsix
 /vs-code/bundled/
 /vs-code/downloads/

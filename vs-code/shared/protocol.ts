@@ -13,7 +13,6 @@ export interface VerifyParams { uri: string }
 export const toolchainNotification = 'caravan/toolchain';
 export interface ToolchainSelection { executable: string; bundleRoot?: string }
 
-export const openContractCommand = 'caravan.openContract';
 export interface ContractLocation {
 	uri: string;
 	range: { start: { line: number; character: number }; end: { line: number; character: number } };

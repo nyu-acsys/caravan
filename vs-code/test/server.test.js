@@ -405,7 +405,6 @@ if(process.argv.at(-1)!=='--server') {
 
 async function streamingFixture(t, fails = false, early = false, useCache = false) {
 	const f = await fixture(t, 'module Work = struct\n  let first () = ()\n  let second () = ()\nend\n' + (fails ? '(* fail-run *)' : '') + (early ? '(* early-fail *)' : ''), undefined, true, useCache);
-	f.settings.showContractLenses = false;
 	f.settings.verifyOnSave = false;
 	await fs.writeFile(path.join(f.dir, 'fake verifier.cjs'), streamingVerifier);
 	await f.open();
@@ -527,12 +526,11 @@ test('proof hints share discovery with hovers and views and invalidate without a
 	f.notify('workspace/didChangeConfiguration', { settings: {} });
 	assert.deepEqual(await proofHints(f), []);
 	assert.equal((await runs(f)).length, 2);
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 });
 
 test('read-only proof views reuse discovery, preserve context, and reject dirty or invalid sources', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
-	f.settings.showContractLenses = false;
 	f.settings.verifyOnSave = false;
 	const proof = f.file.replace(/\.ml$/, '.proof');
 	await fs.writeFile(proof, 'commit');
@@ -557,7 +555,7 @@ test('read-only proof views reuse discovery, preserve context, and reject dirty 
 	await assert.rejects(f.request('caravan/proofView', {}), /Open an OCaml/);
 });
 
-test('contract lenses discover frontend metadata, cache it, and preserve unchecked state', { timeout: 15000 }, async t => {
+test('contract hovers discover frontend metadata, cache it, and preserve unchecked state', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract fail unicode');
 	const origin = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(origin, 'é😀contract');
@@ -570,13 +568,7 @@ test('contract lenses discover frontend metadata, cache it, and preserve uncheck
 	assert.match(contract.contents.value, /main\.mli:1/);
 	assert.match(contract.contents.value, /```caravan-proof\ncont\n```/);
 	assert.equal(await hover(f, { line: 0, character: 7 }), null);
-	const result = await lenses(f);
-	assert.equal(result.length, 1);
-	assert.equal(result[0].command.title, 'requires x > 0 && true · ensures result > x');
-	assert.deepEqual(result[0].range, { start: { line: 0, character: 3 }, end: { line: 0, character: 3 } });
-	assert.equal(result[0].command.command, 'caravan.openContract');
-	assert.deepEqual(result[0].command.arguments, [{ uri: uri(origin), range: { start: { line: 0, character: 3 }, end: { line: 0, character: 7 } } }]);
-	assert.deepEqual(await lenses(f), result);
+	assert.deepEqual(await lenses(f), []);
 	assert.deepEqual(await lenses(f, origin), []);
 	assert.equal(await hover(f, { line: 0, character: 3 }, origin), null);
 	assert.equal((await runs(f)).length, 1);
@@ -596,57 +588,53 @@ test('contract metadata has a separate worker from slow verification', { timeout
 	f.notify('caravan/verify', { uri: uri(other) });
 	await f.state('verifying');
 	await f.state('verifying', 0, other);
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	assert.equal(f.messages.some(message => message.params?.state === 'verified'), false);
 	await f.state('verified');
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	assert.equal((await runs(f)).filter(args => args.includes('--lsp-annotations-only')).length, 1);
 	const metadataDependency = path.join(f.dir, 'metadata-only.ml');
 	await fs.writeFile(metadataDependency, 'let dependency = 1');
 	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(metadataDependency), type: 1 }] });
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	assert.equal((await runs(f)).filter(args => args.includes('--lsp-annotations-only')).length, 2);
 });
 
-test('companion edits, dependencies, configuration and toolchains invalidate contract lenses', { timeout: 15000 }, async t => {
+test('companion edits, dependencies, configuration and toolchains invalidate contract hovers', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'proof-contract', undefined, true);
 	f.settings.verifyOnSave = false;
 	const proof = f.file.replace(/\.ml$/, '.proof');
 	await fs.writeFile(proof, 'contract');
 	await f.open();
 	await f.open(proof);
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'changed' }] });
 	assert.deepEqual(await lenses(f), []);
 	assert.equal(await hover(f), null);
 	assert.equal((await runs(f)).length, 1);
 	await fs.writeFile(proof, 'changed');
 	f.notify('textDocument/didSave', { textDocument: { uri: uri(proof) } });
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	const missingInterface = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(missingInterface, 'new interface');
 	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(missingInterface), type: 1 }] });
-	assert.equal((await lenses(f)).length, 1);
+	assert.deepEqual(await lenses(f), []);
 	const dependency = path.join(f.dir, 'dependency.ml');
 	await fs.writeFile(dependency, 'let dependency = 1');
 	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(dependency), type: 1 }] });
-	assert.equal((await lenses(f)).length, 1);
-	f.notify('workspace/didChangeConfiguration', { settings: {} });
-	assert.equal((await lenses(f)).length, 1);
-	f.notify('caravan/toolchain', { executable: process.execPath });
-	assert.equal((await lenses(f)).length, 1);
-	assert.equal((await runs(f)).length, 6);
-	assert.ok(f.requests.some(message => message.method === 'workspace/codeLens/refresh'));
-	f.settings.showContractLenses = false;
+	assert.deepEqual(await lenses(f), []);
 	f.notify('workspace/didChangeConfiguration', { settings: {} });
 	assert.deepEqual(await lenses(f), []);
-	assert.equal((await runs(f)).length, 7);
+	f.notify('caravan/toolchain', { executable: process.execPath });
+	assert.deepEqual(await lenses(f), []);
+	assert.equal((await runs(f)).length, 6);
+	assert.ok(f.requests.some(message => message.method === 'workspace/codeLens/refresh'));
 	const contract = await hover(f);
 	assert.match(contract.contents.value, /main\.proof:1/);
-	assert.equal((await runs(f)).length, 7);
+	assert.equal((await runs(f)).length, 6);
 });
 
-test('stale frontend metadata cannot reinstall lenses or proof hints after a companion edit', { timeout: 15000 }, async t => {
+test('stale frontend metadata cannot reinstall hovers or proof hints after a companion edit', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'contract proof-step metadata-slow');
 	const origin = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(origin, 'contract');
@@ -672,7 +660,7 @@ test('stale frontend metadata cannot reinstall lenses or proof hints after a com
 	assert.equal((await runs(f)).length, 1);
 });
 
-test('older tools and malformed metadata quietly cache empty lenses and verification still works', { timeout: 15000 }, async t => {
+test('older tools and malformed metadata quietly cache empty annotations and verification still works', { timeout: 15000 }, async t => {
 	for (const marker of ['metadata-unsupported', 'metadata-invalid']) {
 		const f = await fixture(t, `contract ${marker}`);
 		await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'contract');

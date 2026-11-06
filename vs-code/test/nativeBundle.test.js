@@ -11,7 +11,7 @@ const { systemPath } = require('../out/shared/toolchain');
 const { parseReport, normalizeContracts, normalizeProofSteps, normalizeMembers } = require('../out/server/report');
 const { VerificationProcesses } = require('../out/server/verificationProcesses');
 const { memberLenses } = require('../out/server/memberLenses');
-const { contractLenses, contractHover } = require('../out/server/contracts');
+const { contractHover } = require('../out/server/contracts');
 const { renderProofView } = require('../out/server/proofView');
 const { proofHints } = require('../out/server/proofHints');
 const { readFileSync } = require('node:fs');
@@ -62,11 +62,6 @@ test('native release installs and verifies Saturn with its relocated compiler an
         { env: environment, timeout: 30000 });
       const report = parseReport(metadata.stdout, 0);
       const contracts = normalizeContracts(report, repository, file => readFileSync(file, 'utf8'));
-      const lenses = contractLenses(contracts, source);
-      assert.ok(lenses.length >= 6);
-      assert.ok(lenses.every(lens => lens.command.command === 'caravan.openContract'));
-      assert.ok(lenses.some(lens => lens.command.arguments[0].uri.endsWith('/treiber_stack.mli')));
-      assert.ok(lenses.every(lens => /\/treiber_stack\.(mli|proof)$/.test(lens.command.arguments[0].uri)));
       const hover = contractHover(contracts, source, contracts[0].location.start,
         file => readFileSync(file, 'utf8'), repository);
       assert.ok(hover.contents.value.includes('Contract from [test/saturn/treiber\\_stack/treiber\\_stack.mli:'));
