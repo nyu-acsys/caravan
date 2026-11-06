@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -105,36 +106,52 @@ with tempfile.TemporaryDirectory(prefix="caravan dune project ") as temporary:
     assert root / "values/dune" in dependencies, dependencies
     dune = shutil.which("dune")
     assert dune
-    (root / "dune").write_text('''(rule
- (alias hold_lock)
- (action (run python3 -c "import time; time.sleep(30)")))
-''')
+    ready = root / "_build/discovery_lock_ready"
+    release = root / "_build/discovery_lock_release"
+    hold_lock = """from pathlib import Path
+import sys
+import time
+
+ready, release = map(Path, sys.argv[1:])
+ready.touch()
+deadline = time.monotonic() + 90
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit("Build lock fixture was not released")
+    time.sleep(0.02)
+"""
+    command = " ".join(
+        json.dumps(arg, ensure_ascii=False)
+        for arg in [sys.executable, "-c", hold_lock, str(ready), str(release)]
+    )
+    (root / "dune").write_text(f"(rule\n (alias hold_lock)\n (action (run {command})))\n")
     watcher = subprocess.Popen(
         [dune, "build", "-j1", "@hold_lock"],
         cwd=root, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     try:
         deadline = time.monotonic() + 10
-        while True:
+        while not ready.exists():
             assert watcher.poll() is None, watcher.stderr.read().decode()
-            try:
-                if (root / "_build/.lock").read_text().strip() == str(watcher.pid):
-                    break
-            except FileNotFoundError:
-                pass
-            assert time.monotonic() < deadline, "Dune build did not acquire its build lock"
+            assert time.monotonic() < deadline, "Dune build did not start its lock-holding action"
             time.sleep(0.02)
         assert "Verification successful." in run(main)
         report = json.loads(run(main, "--lsp-mode", "--lsp-annotations", "--lsp-annotations-only"))
         assert not report["errors"], report["errors"]
+        assert watcher.poll() is None, "Dune build released its lock during discovery"
     finally:
-        watcher.terminate()
+        release.touch()
         try:
             watcher.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            watcher.kill()
-            watcher.wait(timeout=5)
+            watcher.terminate()
+            try:
+                watcher.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.wait(timeout=5)
         watcher.stderr.close()
+    assert watcher.returncode == 0, "Dune lock-holding build failed"
 
 print("Dune discovery verifies transitive source contracts without an explicit include path.")
 print("Editor dependencies include project configuration; unrelated libraries stay excluded.")
