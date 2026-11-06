@@ -15,3 +15,5 @@ dune
 downloads/**
 dist/**
 CARAVAN_VERSION
+# vsce uses MARKETPLACE.md as readme.md; omit the developer README.
+README.md

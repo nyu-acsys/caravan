@@ -6,219 +6,23 @@
 # Caravan VS Code Extension
 
 VS Code integration for [Caravan](https://github.com/nyu-acsys/caravan), a verifier
-for multicore OCaml programs. The extension highlights specifications and proof
-files, reports verification errors in the editor, and tracks verification status.
-Contracts from companion interfaces and proof headers appear on hover, with
-streamed member statuses and module summaries above their declarations.
+for multicore OCaml programs. This directory contains the extension's source.
+For installation, configuration, and everyday use, see the
+[user guide](MARKETPLACE.md); the documentation below covers development and releases.
 
 New to Caravan? Start with the **[project introduction and examples](https://github.com/nyu-acsys/caravan#readme)**.
-The instructions below cover setup, day-to-day use, and building the extension.
 
 </td>
 </tr>
 </table>
 
-## Prerequisites
+## Development prerequisites
 
-Platform packages bundle Caravan, its linked Raven verifier, Z3, and matching
-OCaml standard-library interfaces. No separate tool installation is needed for
-self-contained programs. Bundles are built for Linux x64, macOS arm64, and Windows x64.
-For other platforms or an unbundled development package, install
-[Caravan and its dependencies](https://github.com/nyu-acsys/caravan#building).
-
-The extension requires [OCaml Platform](https://marketplace.visualstudio.com/items?itemName=ocamllabs.ocaml-platform)
-for normal OCaml editing and base syntax highlighting. Caravan adds highlighting
-inside `(*@ ... *)` annotations and for `.proof` files, alongside Platform's
-completion, navigation, and formatting.
-
-## First Usage
-
-Open your OCaml project in VS Code. A platform package uses its bundled toolchain
-on the first run, including offline. Raven is linked into Caravan; updating
-Caravan updates that verifier too, with no separate Raven executable to manage.
-
-### Which verifier gets used
-
-In order of precedence:
-
-1. `caravan.executable`, if set: your development-build or launcher override.
-2. A compatible toolchain installed by this extension, selected by the update channel.
-3. The toolchain bundled with the extension.
-4. `caravan` on your `PATH`, for unbundled development packages.
-
-The bundled toolchain is a floor rather than a pin. On the default `stable`
-channel, an older managed version cannot replace a newer bundled one. The `tag`
-channel selects the release named by `caravan.caravanVersion`; `bundled` disables
-managed versions and update checks.
-
-On startup, at most once a day, the extension checks for a compatible Caravan
-release and offers to install it. **Nothing is downloaded without asking**, apart
-from release metadata. Run **Caravan: Update Verifier** to check on demand,
-**Caravan: Show Verifier Version** to see the selected toolchain, or
-**Caravan: Use Bundled Verifier** to return to the shipped one. An explicit
-executable override always wins and disables update offers.
-
-Each update supplies Caravan, Z3, and matching OCaml interfaces together.
-Downloads are checked against `SHA256SUMS`; a temporary installation must answer
-`--manifest` and verify a small program before it becomes selectable. A failed or
-cancelled install leaves previous versions available. A release with an editor
-protocol the extension does not understand is declined.
-
-Caravan type-checks with its own OCaml compiler. Existing library artifacts must
-match that compiler version, shown by **Caravan: Show Verifier Version**. Rebuild
-libraries with that compiler, pin an appropriate Caravan release, or use a
-matching development build. For a particular opam switch, use settings such as:
-
-```json
-{
-  "caravan.executable": "opam",
-  "caravan.arguments": ["exec", "--switch=my-switch", "--", "caravan"]
-}
-```
-
-OCaml Platform's selected opam sandbox does not automatically configure Caravan.
-You can also set `caravan.executable` to the absolute path of a local Caravan build,
-such as `/path/to/caravan/_build/default/bin/caravan.exe`.
-
-### Project dependencies
-
-For a source file in a Dune project, Caravan automatically locates its library or
-executable and imports interfaces from its transitive local library dependencies.
-No `caravan.includePaths` setting is needed for those dependencies. The same
-discovery runs for command-line verification, contract hovers, and proof views.
-Dune must be available on the verifier's `PATH`; an opam launcher supplies the
-selected switch's environment.
-
-Discovery queries Dune's versioned workspace description. It reads `.mli` source
-contracts, including interfaces next to `.ml` implementations, without building or
-verifying those implementations. A library's private implementation proof is not
-imported into its clients. Dependencies need usable source interfaces; compiled
-`.cmi` directories alone do not supply Caravan contracts.
-
-Explicit `caravan.includePaths` entries provide additional interface stubs and
-win over discovered interfaces with the same module name. Outside a Dune project,
-for files without a matching Dune stanza, or when Dune is unavailable, the existing
-local/interface-stub lookup is used. Add `--no-dune` to `caravan.arguments` to
-bypass project discovery. Discovery applies to original source files, not copies
-in Dune build or test sandbox directories.
-
-This resolves interface dependencies, rather than reproducing Dune's compiler
-and preprocessing flags. Multi-module wrapped libraries are not yet supported;
-unsupported wrapped module mappings produce a diagnostic.
-
-### Verifying a file
-
-Hover over an implementation function's name to see its complete external
-contract, including the original header and line breaks but omitting the outer
-comment markers, with a link to its
-`.mli` or `.proof` source. Contracts use Caravan's proof syntax highlighting.
-These hovers complement OCaml Platform's type information.
-
-Discovery runs independently of the solver and does not verify the file. It also
-finds source members for status lenses, initially marked `○ not checked`.
-Edits to the implementation or its dependencies hide outdated summaries until the
-saved inputs can be analyzed again. If discovery fails, run verification to see
-the diagnostics.
-
-Short inline labels show external proof steps at their attachment points, such as
-`commit` and `fold stack t []`. Hover over a label for the full annotation with
-Caravan highlighting and a source link; follow the label's location to open the
-original proof. Longer scopes use a compact `proof` label. These hints share
-discovery and invalidation with contract displays and appear without verification.
-They require VS Code's `editor.inlayHints.enabled` setting to permit inlay hints.
-
-Open an annotated `.ml`, its `.mli`, or a `.proof` file. Save the file to verify it,
-or run **Caravan: Verify Saved File** from the Command Palette. Clicking the
-**Caravan:** status item also verifies the active file. For `.mli` and `.proof`
-files, Caravan checks the sibling `.ml` implementation with its interface and
-proof; a missing implementation is reported as unavailable.
-
-Status lenses appear above reported source members in `.ml`, `.mli`, and `.proof`
-files. `○ type-checked` records successful front-end checking; `✓ verified` records
-completed proof checks, while `– trusted` identifies assumed contracts. During
-verification, `⋯ checking` remains until all checks generated for a member finish.
-Reused results display `(cached)`. This label appears only when every proof check
-for the member came from the cache; mixed cached and newly checked members display
-ordinary verification success.
-Failures, solver timeouts, and skipped checks remain visible as `✗ failed`,
-`⏱ timed out`, and `– skipped`. A failure elsewhere leaves independently verified
-members verified. These lenses display information; verification still runs for
-the implementation and its companions.
-
-Module, functor, and proof-module summaries count each source member once, rather
-than counting generated procedures or adding nested module totals again. Module
-boundary checks and file prerequisites appear separately when they prevent a
-successful summary, even if every counted member is verified. Editing these inputs
-marks stale lenses outdated; an unavailable verifier cannot leave a current
-verified display.
-
-Errors and warnings appear in the Problems panel and editor, with related source
-locations. Gutter icons mark the starting lines of errors, warnings, and related
-locations, including locations in companion files. Hover over an icon for its
-messages; errors take precedence when several markers share a line.
-The status bar tracks the active file and its current version: unchecked,
-outdated, verifying, verified, verified with warnings, failed, or unavailable.
-Successful verification with warnings has a yellow indicator. Editing a file
-invalidates its result and stops obsolete verifier processes; older results cannot
-replace the current state. At most two verifier processes run concurrently.
-
-This version verifies saved files. Save edits before running verification;
-opening a file alone does not verify it. Changes to open dependencies or OCaml and
-proof files in the workspace invalidate results, as do changes to `dune`,
-`dune-project`, and `dune-workspace*` files. Closed dependencies outside the
-workspace are not watched yet.
-
-Caravan type-checks and verifies the saved source without running a separate Dune
-build. Discovery uses source interfaces already available in the project; generate
-any missing interfaces before verification. Verification requires a trusted
-workspace. If the tool is unavailable, inspect the **Caravan** output channel for
-details.
-
-### Read-only proof view
-
-Run **Caravan: Show Proof View** from an implementation, interface, or companion
-proof file. A read-only view opens beside it, showing the implementation with
-external contracts and outline steps at their resolved attachment points.
-The full companion files follow, so shared predicates, lemmas, and outline
-bindings remain available. Follow the source links to edit the originals.
-
-The view uses Caravan syntax highlighting and refreshes when its saved inputs or
-toolchain change. Save changes in the implementation and companion files before
-opening or refreshing it. Discovery does not run the solver or mark the file as
-verified. The assembled view is for reading, rather than a standalone proof file;
-verification and editing continue to use the original sources.
-
-## Configuration
-
-Verification settings can be set per workspace or folder. Update settings apply
-to the VS Code window:
-
-* `caravan.executable`: Override automatic selection with an executable or
-  launcher program. Empty by default.
-* `caravan.updateChannel`: `stable` (follow compatible releases, the default),
-  `tag` (select a release), or `bundled` (use the shipped toolchain).
-* `caravan.caravanVersion`: The release tag for the `tag` channel, e.g. `v0.1.0`.
-* `caravan.checkForUpdates`: Check on startup, at most once a day. Defaults to
-  `true`; installing still requires accepting the offer.
-* `caravan.arguments`: Arguments to the launcher, before Caravan's verification
-  flags and source path. Defaults to `[]`. For opam, use the example above.
-* `caravan.cwd`: The working directory. Empty by default, using the containing
-  workspace folder, or the file's directory outside a workspace. Relative paths
-  are resolved from that directory.
-* `caravan.includePaths`: Additional interface-stub directories passed with `-I`,
-  resolved from the working directory. These override discovered interfaces with
-  the same module name. Defaults to `[]`; Dune dependencies are found automatically.
-* `caravan.smtTimeout`: The time limit in milliseconds for each SMT query.
-  Defaults to `10000`.
-* `caravan.cache`: Reuse successful proof fingerprints in extension storage.
-  Defaults to `true`; disable to run every proof check again.
-* `caravan.verifyOnSave`: Verify supported files after saving. Defaults to `true`.
-* `caravan.showProofHints`: Show inline proof-step labels with full annotation
-  hovers and source navigation. Defaults to `true`.
-
-The executable is launched directly without a shell. Give the program and each
-argument separately; do not put shell quoting or a complete command line into a
-setting. Setting changes invalidate previous verification results.
+Install Node.js and npm, and build [Caravan](../README.md#building) with Z3 on
+its runtime path. The extension uses OCaml Platform for OCaml editing and base
+syntax highlighting; install it in the VS Code instance used for testing.
+Published platform packages bundle the verifier and its dependencies, while local
+extension builds use an installed or development toolchain.
 
 ## Building from Source
 
@@ -227,13 +31,13 @@ From the repository's `vs-code/` directory:
 ```bash
 $ npm ci
 $ npm test
-$ npx @vscode/vsce package
+$ npx @vscode/vsce package --readme-path MARKETPLACE.md
 $ code --install-extension caravan-0.1.0.vsix
 ```
 
 Use the filename produced by `vsce package` if the extension version has changed.
 This creates an unbundled development package. It includes the language server
-and its runtime dependencies; configure your installed Caravan and Z3 as above.
+and its runtime dependencies; configure your installed Caravan and Z3 as described below.
 
 `npm test` compiles the client and server and tests verification diagnostics,
 related locations, warnings, streamed member statuses, cancellation, and stale-result
@@ -259,6 +63,21 @@ $ code --extensionDevelopmentPath="$PWD" /path/to/ocaml/workspace
 Install OCaml Platform in the development host and configure Caravan there.
 Check `.ml` and `.mli` annotations, `.proof` highlighting, manual verification,
 verification after save, edits during verification, and a missing executable.
+
+### Selecting a development toolchain
+
+To test a local Caravan build in an opam switch, use settings such as:
+
+```json
+{
+  "caravan.executable": "opam",
+  "caravan.arguments": ["exec", "--switch=my-switch", "--", "caravan"]
+}
+```
+
+OCaml Platform's selected opam sandbox does not automatically configure Caravan.
+You can also set `caravan.executable` to the absolute path of a local Caravan build,
+such as `/path/to/caravan/_build/default/bin/caravan.exe`.
 
 ### Verifier interface
 
@@ -338,3 +157,12 @@ required by Caravan and Z3, with their accompanying notices. Both the archive
 smoke test and updater installation test remove compiler paths from the environment
 before verification, so the packaged tools must work independently of the build
 machine's opam and MinGW setup.
+
+## Extension documentation
+
+[`MARKETPLACE.md`](MARKETPLACE.md) is the user-facing listing shown inside VS Code.
+Packaging selects it with `--readme-path MARKETPLACE.md`; `.vscodeignore` excludes
+this developer README to avoid a collision with the packaged `readme.md`.
+Keep build, protocol, and release details here, and user setup and usage there.
+The [package workflow](../.github/workflows/package.yml) uses the same selection
+for every platform package.

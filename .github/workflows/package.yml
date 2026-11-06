@@ -63,7 +63,7 @@ jobs:
             test "$GITHUB_REF_NAME" = "vscode-v$version"
           fi
           mkdir -p dist
-          npx --yes @vscode/vsce@3.7.1 package --target '${{ matrix.platform }}' --out dist/
+          npx --yes @vscode/vsce@3.7.1 package --target '${{ matrix.platform }}' --out dist/ --readme-path MARKETPLACE.md
       - uses: actions/upload-artifact@v4
         with:
           name: caravan-vscode-${{ matrix.platform }}
