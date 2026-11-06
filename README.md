@@ -100,8 +100,13 @@ initialization expressions are not supported yet. Specification calls through
 constrained module signatures, nested implementation predicates, and shared-state
 declarations remain outside this module support.
 
-Interface-only dependencies found locally or through `-I` expose assumed contracts
-to clients, including logically atomic contracts. For example:
+Imported interfaces expose assumed contracts to clients, including logically atomic
+contracts. In Dune projects, Caravan discovers the source file's library or executable
+and its transitive local interface dependencies automatically. Selected interfaces
+can have implementations alongside them; clients use their exported contracts.
+Standalone interface stubs can also be supplied locally or through `-I`.
+Use `--no-dune` to disable automatic discovery. Multi-module wrapped libraries
+remain unsupported. For example:
 
 ```ocaml
 type t

@@ -88,6 +88,7 @@ let sibling_dependencies file =
 
 let source_dependencies (source : Source.t) =
   sibling_dependencies source.file
+  @ source.project_dependencies
   @ List.map source.libraries ~f:(fun library ->
       library.Source.library.scope.location.loc_start.pos_fname)
   @ List.map source.proof_scopes.declarations ~f:(fun entry ->
@@ -95,9 +96,12 @@ let source_dependencies (source : Source.t) =
   |> List.filter ~f:(fun file -> not (String.is_empty file))
   |> List.dedup_and_sort ~compare:String.compare
 
-let analyze ?(check_standard_library = false) ~include_dirs file =
+let analyze ?(check_standard_library = false) ?(discover_dependencies = true)
+    ~include_dirs file =
   let ( let* ) result f = Result.bind result ~f in
-  let* source = Source.load ~include_dirs ~check_standard_library file in
+  let* source =
+    Source.load ~include_dirs ~discover_dependencies ~check_standard_library file
+  in
   let* scopes = Program_scopes.run source in
   Ok (source, scopes, Editor_annotations.collect scopes, Editor_members.collect scopes)
 
@@ -127,8 +131,10 @@ let prepare_scopes ~history (source, scopes, annotations, members) =
       members;
     }
 
-let prepare ~include_dirs ~history file =
-  Result.bind (analyze ~include_dirs file) ~f:(prepare_scopes ~history)
+let prepare ?(discover_dependencies = true) ~include_dirs ~history file =
+  Result.bind
+    (analyze ~include_dirs ~discover_dependencies file)
+    ~f:(prepare_scopes ~history)
 
 let verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
   let explain diagnostic =
@@ -201,8 +207,8 @@ let analysis_error file error =
     members = [];
   }
 
-let annotations_only ~include_dirs file =
-  match analyze ~include_dirs file with
+let annotations_only ?(discover_dependencies = true) ~include_dirs file =
+  match analyze ~include_dirs ~discover_dependencies file with
   | Error error -> analysis_error file error
   | Ok (source, _, annotations, members) ->
       {
@@ -214,9 +220,9 @@ let annotations_only ~include_dirs file =
         members;
       }
 
-let run ?cache_dir ?on_progress ?(collect_members = true) ~include_dirs ~history
-    ~smt_timeout file =
-  match analyze ~include_dirs file with
+let run ?cache_dir ?on_progress ?(collect_members = true) ?(discover_dependencies = true)
+    ~include_dirs ~history ~smt_timeout file =
+  match analyze ~include_dirs ~discover_dependencies file with
   | Error error -> analysis_error file error
   | Ok ((source, _, annotations, members) as analysis) ->
       begin match prepare_scopes ~history analysis with
@@ -244,9 +250,10 @@ let run ?cache_dir ?on_progress ?(collect_members = true) ~include_dirs ~history
       end
 
 (** The human-readable command line, including the generated-program escape hatch. *)
-let file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout file =
+let file ?cache_dir ?(discover_dependencies = true) ~include_dirs ~history ~emit_rav
+    ~smt_timeout file =
   if emit_rav then (
-    match prepare ~include_dirs ~history file with
+    match prepare ~include_dirs ~discover_dependencies ~history file with
     | Error error ->
         Report.print error;
         false
@@ -256,7 +263,8 @@ let file ?cache_dir ~include_dirs ~history ~emit_rav ~smt_timeout file =
         true)
   else
     let result =
-      run ?cache_dir ~collect_members:false ~include_dirs ~history ~smt_timeout file
+      run ?cache_dir ~collect_members:false ~include_dirs ~discover_dependencies ~history
+        ~smt_timeout file
     in
     List.iter result.diagnostics ~f:Report.print_diagnostic;
     if result.verified then Logs.app (fun m -> m "Verification successful.");

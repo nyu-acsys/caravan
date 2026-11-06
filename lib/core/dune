@@ -16,6 +16,7 @@
   stdio
   logs
   fmt
+  unix
   compiler-libs.common
   raven-ivl.api
   caravan_spec))

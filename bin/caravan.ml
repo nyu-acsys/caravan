@@ -90,6 +90,10 @@ let include_dirs =
   in
   Arg.(value & opt_all dir [] & info [ "I" ] ~docv:"DIR" ~doc)
 
+let no_dune =
+  let doc = "Disable automatic discovery of interface dependencies in Dune projects." in
+  Arg.(value & flag & info [ "no-dune" ] ~doc)
+
 let files =
   let doc = "The OCaml files to verify." in
   Arg.(value & pos_all file [] & info [] ~docv:"FILE" ~doc)
@@ -102,7 +106,7 @@ let print text =
   Logs.Src.set_level protocol_source (Some Logs.App);
   Protocol.app (fun m -> m "%s" text)
 
-let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_rav
+let main ?on_progress ?(emit = print) () no_greeting include_dirs no_dune history emit_rav
     check_stdlib manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout
     cache_dir files =
   if manifest then begin
@@ -128,11 +132,14 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
   else if lsp_mode then (
     let results =
       if lsp_annotations_only then
-        List.map (Caravan_core.Check.annotations_only ~include_dirs) files
+        List.map
+          (Caravan_core.Check.annotations_only ~include_dirs
+             ~discover_dependencies:(not no_dune))
+          files
       else
         List.map
-          (Caravan_core.Check.run ?cache_dir ?on_progress ~include_dirs ~history
-             ~smt_timeout)
+          (Caravan_core.Check.run ?cache_dir ?on_progress ~include_dirs
+             ~discover_dependencies:(not no_dune) ~history ~smt_timeout)
           files
     in
     emit (Caravan_editor.Editor_report.to_string ~annotations:lsp_annotations results);
@@ -158,8 +165,8 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs history emit_r
       (* Every file is checked, also after one that fails. *)
       let results =
         List.map
-          (Caravan_core.Check.file ?cache_dir ~include_dirs ~history ~emit_rav
-             ~smt_timeout)
+          (Caravan_core.Check.file ?cache_dir ~include_dirs
+             ~discover_dependencies:(not no_dune) ~history ~emit_rav ~smt_timeout)
           files
       in
       let verified = List.for_all Fun.id results in
@@ -172,9 +179,9 @@ let cmd ?emit ?on_progress () =
   Cmd.v info
     Term.(
       const (main ?emit ?on_progress)
-      $ setup $ no_greeting $ include_dirs $ history $ emit_rav $ check_stdlib $ manifest
-      $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout $ cache_dir
-      $ files)
+      $ setup $ no_greeting $ include_dirs $ no_dune $ history $ emit_rav $ check_stdlib
+      $ manifest $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout
+      $ cache_dir $ files)
 
 let serve defaults =
   Logs.set_reporter (Logs_fmt.reporter ());

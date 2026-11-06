@@ -59,7 +59,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     run: { module: context.asAbsolutePath(path.join('out', 'server', 'server.js')), transport: TransportKind.ipc },
     debug: { module: context.asAbsolutePath(path.join('out', 'server', 'server.js')), transport: TransportKind.ipc }
   };
-  const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ml,mli,proof}');
+  const fileWatcher = vscode.workspace.createFileSystemWatcher('**/{*.ml,*.mli,*.proof,dune,dune-project,dune-workspace*}');
   context.subscriptions.push(fileWatcher);
   const clientOptions: LanguageClientOptions = {
     initializationOptions: () => {

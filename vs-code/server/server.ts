@@ -55,6 +55,10 @@ function fileOf(uri: string): string | undefined {
 }
 function rootOf(file: string): string { return file.replace(/\.(mli|proof)$/, '.ml'); }
 function relevant(file: string): boolean { return /\.(ml|mli|proof)$/.test(file); }
+function projectFile(file: string): boolean {
+	const name = path.basename(file);
+	return name === 'dune' || name === 'dune-project' || name === 'dune-workspace' || name.startsWith('dune-workspace.');
+}
 function siblings(file: string): string[] {
 	const stem = file.replace(/\.ml$/, '');
 	return [file, `${stem}.mli`, `${stem}.proof`];
@@ -133,12 +137,12 @@ function refreshAnnotations(): void {
 	if (inlayHintRefresh && !shuttingDown) void connection.languages.inlayHint.refresh().catch(() => undefined);
 	if (initialized && !shuttingDown) connection.sendNotification(proofViewChangedNotification);
 }
-function invalidate(file: string): void {
-	if (!relevant(file)) return;
+function invalidate(file: string, discoveryChanged = false): void {
+	if (!relevant(file) && !projectFile(file)) return;
 	revisions.set(file, (revisions.get(file) ?? 0) + 1);
 	for (const [root, owner] of owners) {
 		const dependencies = knownDependencies(root, owner);
-		if (!dependencies || dependencies.has(file)) {
+		if (discoveryChanged || projectFile(file) || !dependencies || dependencies.has(file)) {
 			clearAnnotations(owner);
 			owner.generation++;
 			owner.abort?.abort();
@@ -393,7 +397,8 @@ connection.onDidChangeWatchedFiles(event => {
 		const stamp = diskStamp(file);
 		if (diskStamps.get(file) === stamp) continue;
 		diskStamps.set(file, stamp);
-		invalidate(file);
+		// Failed discovery may not yet have reported the interface dependency graph.
+		invalidate(file, file.endsWith('.mli'));
 	}
 });
 connection.onCodeLens(async (params, token) => {

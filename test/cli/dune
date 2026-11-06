@@ -1,6 +1,7 @@
 (cram
  (deps
   %{bin:caravan}
+  %{bin:dune}
   (glob_files *.ml)
   (glob_files *.mli)
   (glob_files *.proof)
@@ -8,4 +9,5 @@
   check_member_status.py
   check_verification_cache.py
   check_contract_annotations.py
-  check_proof_annotations.py))
+  check_proof_annotations.py
+  check_dune_project.py))

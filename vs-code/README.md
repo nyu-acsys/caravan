@@ -72,14 +72,39 @@ matching development build. For a particular opam switch, use settings such as:
 ```json
 {
   "caravan.executable": "opam",
-  "caravan.arguments": ["exec", "--switch=my-switch", "--", "caravan"],
-  "caravan.includePaths": ["_build/default/lib"]
+  "caravan.arguments": ["exec", "--switch=my-switch", "--", "caravan"]
 }
 ```
 
 OCaml Platform's selected opam sandbox does not automatically configure Caravan.
 You can also set `caravan.executable` to the absolute path of a local Caravan build,
 such as `/path/to/caravan/_build/default/bin/caravan.exe`.
+
+### Project dependencies
+
+For a source file in a Dune project, Caravan automatically locates its library or
+executable and imports interfaces from its transitive local library dependencies.
+No `caravan.includePaths` setting is needed for those dependencies. The same
+discovery runs for command-line verification, contract hovers, and proof views.
+Dune must be available on the verifier's `PATH`; an opam launcher supplies the
+selected switch's environment.
+
+Discovery queries Dune's versioned workspace description. It reads `.mli` source
+contracts, including interfaces next to `.ml` implementations, without building or
+verifying those implementations. A library's private implementation proof is not
+imported into its clients. Dependencies need usable source interfaces; compiled
+`.cmi` directories alone do not supply Caravan contracts.
+
+Explicit `caravan.includePaths` entries provide additional interface stubs and
+win over discovered interfaces with the same module name. Outside a Dune project,
+for files without a matching Dune stanza, or when Dune is unavailable, the existing
+local/interface-stub lookup is used. Add `--no-dune` to `caravan.arguments` to
+bypass project discovery. Discovery applies to original source files, not copies
+in Dune build or test sandbox directories.
+
+This resolves interface dependencies, rather than reproducing Dune's compiler
+and preprocessing flags. Multi-module wrapped libraries are not yet supported;
+unsupported wrapped module mappings produce a diagnostic.
 
 ### Verifying a file
 
@@ -139,13 +164,15 @@ replace the current state. At most two verifier processes run concurrently.
 
 This version verifies saved files. Save edits before running verification;
 opening a file alone does not verify it. Changes to open dependencies or OCaml and
-proof files in the workspace invalidate results. Closed dependencies outside the
+proof files in the workspace invalidate results, as do changes to `dune`,
+`dune-project`, and `dune-workspace*` files. Closed dependencies outside the
 workspace are not watched yet.
 
-Caravan compiles and verifies the saved source without running a separate Dune
-build. Build included libraries first so that their interfaces and compilation
-artifacts are available. Verification requires a trusted workspace. If the tool
-is unavailable, inspect the **Caravan** output channel for details.
+Caravan type-checks and verifies the saved source without running a separate Dune
+build. Discovery uses source interfaces already available in the project; generate
+any missing interfaces before verification. Verification requires a trusted
+workspace. If the tool is unavailable, inspect the **Caravan** output channel for
+details.
 
 ### Read-only proof view
 
@@ -178,8 +205,9 @@ to the VS Code window:
 * `caravan.cwd`: The working directory. Empty by default, using the containing
   workspace folder, or the file's directory outside a workspace. Relative paths
   are resolved from that directory.
-* `caravan.includePaths`: Directories passed to Caravan with `-I`, resolved from
-  the working directory. Defaults to `[]`.
+* `caravan.includePaths`: Additional interface-stub directories passed with `-I`,
+  resolved from the working directory. These override discovered interfaces with
+  the same module name. Defaults to `[]`; Dune dependencies are found automatically.
 * `caravan.smtTimeout`: The time limit in milliseconds for each SMT query.
   Defaults to `10000`.
 * `caravan.cache`: Reuse successful proof fingerprints in extension storage.

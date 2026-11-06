@@ -26,6 +26,7 @@ const report = {errors:fail?[
  {...location,file:file.replace(/\\.ml$/,'.proof'),start_col:2,end_col:text.includes('unicode')?6:4,kind:'RelatedLoc',message:['Related specification']}
 ]:warning?[{...location,kind:'Warning',message:['Trusted specification']}]:[],
  dependencies:[file,path.join(path.dirname(file),'dependency.ml')],annotations:[],members:[],references:[],symbols:[]};
+if(text.includes('dune-dependency')) report.dependencies.push(path.join(path.dirname(file),'lib','dune'));
 if(text.includes('nodeps')) report.dependencies=[];
 if(process.argv.includes('--lsp-annotations-only')) {
  const origin = file.replace(/\\.ml$/, text.includes('proof-contract') ? '.proof' : '.mli');
@@ -157,6 +158,54 @@ test('legacy batch fallback omits the automatic verification cache option', { ti
 	await f.state('verified');
 	const args = JSON.parse((await fs.readFile(path.join(f.dir, 'runs'), 'utf8')).trim());
 	assert.equal(args.includes('--cache-dir'), false);
+});
+
+test('Dune configuration changes invalidate project results and discovered library dependencies', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'dune-dependency');
+	await f.open();
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified');
+	const project = path.join(f.dir, 'dune-project');
+	await fs.writeFile(project, '(lang dune 3.12)');
+	let from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(project), type: 1 }] });
+	await f.state('outdated', from);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	const library = path.join(f.dir, 'lib', 'dune');
+	await fs.mkdir(path.dirname(library));
+	await fs.writeFile(library, '(library (name dependency))');
+	from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(library), type: 1 }] });
+	await f.state('outdated', from);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	const unrelated = path.join(f.dir, 'unrelated', 'dune');
+	await fs.mkdir(path.dirname(unrelated));
+	await fs.writeFile(unrelated, '(library (name unrelated))');
+	from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(unrelated), type: 1 }] });
+	await f.state('outdated', from);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	const workspace = path.join(f.dir, 'dune-workspace.dev');
+	await fs.writeFile(workspace, '(lang dune 3.12)');
+	from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(workspace), type: 1 }] });
+	await f.state('outdated', from);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	const added = path.join(f.dir, 'lib', 'new_api.mli');
+	await fs.writeFile(added, 'val imported : unit -> unit');
+	from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(added), type: 1 }] });
+	await f.state('outdated', from);
+	f.notify('caravan/verify', { uri: uri(f.file) });
+	await f.state('verified', from);
+	await fs.writeFile(added, 'val replaced : unit -> unit');
+	from = f.messages.length;
+	f.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri(added), type: 2 }] });
+	await f.state('outdated', from);
 });
 
 test('dirty buffers and dependency edits invalidate results and cancel stale runs', { timeout: 15000 }, async t => {

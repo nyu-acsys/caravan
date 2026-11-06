@@ -136,6 +136,7 @@ type t = {
   proof : S.proof_decl list;  (** The declarations of the proof. *)
   proof_scopes : Proof_scopes.t;
   libraries : library list;
+  project_dependencies : string list;
   spec_bindings : Types.signature;
 }
 

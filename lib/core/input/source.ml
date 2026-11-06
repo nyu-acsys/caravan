@@ -645,9 +645,13 @@ let library_proof_scopes ~runtime_env env libraries =
 (** Parses and type-checks [file], in the environment of the standard library and the
     libraries in its directory and [include_dirs]. The front end reports errors by
     raising; they are returned here. *)
-let load ?(include_dirs = []) ?(check_standard_library = false) (file : string) :
-    (t, Report.error) Result.t =
+let load ?(include_dirs = []) ?(discover_dependencies = true)
+    ?(check_standard_library = false) (file : string) : (t, Report.error) Result.t =
   try
+    let* project =
+      if check_standard_library || not discover_dependencies then Ok Dune_project.empty
+      else Dune_project.resolve ~file
+    in
     let standard_library =
       let root = Stdlib.Filename.(dirname (dirname Stdlib.Sys.executable_name)) in
       let directory = Stdlib.Filename.concat root "lib/ocaml" in
@@ -665,7 +669,13 @@ let load ?(include_dirs = []) ?(check_standard_library = false) (file : string) 
     in
     let libraries =
       List.map
-        (if check_standard_library then [] else library_files ~include_dirs file)
+        (if check_standard_library then []
+         else
+           library_files ~include_dirs file @ project.interfaces
+           |> List.stable_dedup ~compare:(fun left right ->
+               String.compare
+                 (Stdlib.Filename.basename left)
+                 (Stdlib.Filename.basename right)))
         ~f:(fun file ->
           ( String.capitalize Stdlib.Filename.(remove_extension (basename file)),
             load_interface file ))
@@ -1075,6 +1085,7 @@ let load ?(include_dirs = []) ?(check_standard_library = false) (file : string) 
                 proof;
                 proof_scopes;
                 libraries;
+                project_dependencies = project.dependencies;
                 spec_bindings = specification_bindings runtime_env env;
               }))
   with exn -> (

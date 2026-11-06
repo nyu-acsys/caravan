@@ -72,6 +72,7 @@ let () =
       proof = user.declarations;
       proof_scopes =
         { root; scopes = scopes @ [ root ]; declarations = entries @ user_entries };
+      project_dependencies = [];
       spec_bindings = C.Source.specification_bindings runtime_env env;
     }
   in
