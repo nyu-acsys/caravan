@@ -1,0 +1,12 @@
+type 'a state = { value : 'a }
+
+invariant shared (cell : 'a t) (s : 'a state) = own cell s.value
+
+view contents (cell : 'a t) = s.value
+
+action replace value = compare_and_set cell _ value
+  ~> { s with value = value } linearizes set
+
+proof create = initially { value = value }
+proof read = at (Atomic.get cell) commit
+proof set = at (Atomic.compare_and_set cell before value) performs replace

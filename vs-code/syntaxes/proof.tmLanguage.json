@@ -11,5 +11,17 @@
     {
       "include": "source.ocaml"
     }
-  ]
+  ],
+  "injections": {
+    "L:source.caravan.proof - comment - string": {
+      "patterns": [
+        {
+          "include": "caravan.ocaml.injection"
+        },
+        {
+          "include": "source.caravan.spec"
+        }
+      ]
+    }
+  }
 }

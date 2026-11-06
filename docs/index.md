@@ -10,8 +10,8 @@ hero:
     alt: Caravan
   actions:
     - theme: brand
-      text: Get started
-      link: /getting-started/
+      text: Tutorial
+      link: /tutorial/
     - theme: alt
       text: Verified examples
       link: https://github.com/nyu-acsys/caravan/tree/main/test/saturn
@@ -53,7 +53,7 @@ contain predicates, invariants, lemmas, and proof steps attached to the code.
 The OCaml compiler continues to see ordinary OCaml source.
 
 Caravan supports both automatic invariant and history reasoning and explicit
-manual proof annotations. The [VS Code extension](https://github.com/nyu-acsys/caravan/tree/main/vs-code)
+manual proof annotations. The [VS Code extension](https://github.com/nyu-acsys/caravan/blob/main/vs-code/MARKETPLACE.md)
 shows external contracts and proof steps in the implementation, with links to
 their source files and a read-only combined proof view.
 
@@ -76,10 +76,11 @@ and clients. They also serve as verification regressions.
 Caravan is under active development. It supports a growing first-order subset of
 OCaml, including polymorphic functions, algebraic data types, records, modules and
 functors, mutable state, atomics, exceptions, and constant GADT witnesses. It does not yet
-cover the full OCaml language. The [repository documentation](https://github.com/nyu-acsys/caravan#readme)
+cover the full OCaml language. The [OCaml coverage guide](/tutorial/ocaml-subset)
 describes the supported constructs and current restrictions.
 
-Start with [a first verified file](/getting-started/). For the underlying logic,
+The [Caravan tutorial](/tutorial/) starts with a first verified file, then
+introduces contracts and both proof modes. For the underlying logic,
 the [Raven tutorial](https://nyu-acsys.github.io/raven/tutorial/) introduces
 ownership, invariants, and atomic contracts through worked examples.
 

@@ -1,0 +1,1 @@
+predicate contents (cell : int Atomic.t) (value : int) = own cell value

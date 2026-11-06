@@ -1,0 +1,15 @@
+predicate contents (cell : 'a Atomic.t) (value : 'a) = own cell value
+
+module Read = Ghost.AU (struct let operation = read end)
+
+proof create = on return fold contents cell value
+
+proof read =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    let value = Read.access token cell in
+    unfold contents cell value;
+    let result = step () in
+    fold contents cell value;
+    Read.commit token cell result;
+    result)
