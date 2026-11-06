@@ -1270,6 +1270,8 @@ let check_adapter_shape ~at (contract : S.contract option) =
       in
       if ghost then
         unsupported at "Explicit ghost inputs or outputs in a checked module binding"
+      else if Procedures.raising_contract c then
+        unsupported at "A raising operation in a checked module binding"
       else if c.pure || Option.is_some c.continues || not (List.is_empty c.variant) then
         unsupported at
           "A pure, continuation, or variant contract in a checked module binding"
@@ -1437,19 +1439,27 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
                     ~f:(fun (_, declaration) ->
                       Option.is_some declaration.Typedtree.typ_manifest
                       ||
-                      let t =
-                        Btype.newgenty
-                          (Tconstr (Path.Pident declaration.typ_id, [], ref Types.Mnil))
-                      in
-                      if parameterized_data then
+                      if Generic_type_families.arity declaration > 0 then
+                        let concrete, t =
+                          Generic_type_families.context ~owner:[] ~types:concrete
+                            declaration
+                        in
                         Result.is_ok (Datatypes.typ concrete ~at:declaration.typ_loc t)
                         && Option.is_some (Datatypes.dictionary_name concrete t)
                       else
-                        match Datatypes.desc concrete t with
-                        | Tconstr (path, [], _) ->
-                            Option.exists (Datatypes.find concrete path) ~f:(fun data ->
-                                Option.is_some data.library)
-                        | _ -> false)))
+                        let t =
+                          Btype.newgenty
+                            (Tconstr (Path.Pident declaration.typ_id, [], ref Types.Mnil))
+                        in
+                        if parameterized_data then
+                          Result.is_ok (Datatypes.typ concrete ~at:declaration.typ_loc t)
+                          && Option.is_some (Datatypes.dictionary_name concrete t)
+                        else
+                          match Datatypes.desc concrete t with
+                          | Tconstr (path, [], _) ->
+                              Option.exists (Datatypes.find concrete path) ~f:(fun data ->
+                                  Option.is_some data.library)
+                          | _ -> false)))
         in
         Ok
           (Option.some_if

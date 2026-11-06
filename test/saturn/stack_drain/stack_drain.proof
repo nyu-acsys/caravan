@@ -1,0 +1,53 @@
+module Test (Stack : S) = struct
+  proof result = drain st
+    requires (Stack.stack st xs)
+    ensures (Stack.stack st [] && result === xs) =
+    proof result = loop ()
+      requires (Stack.stack st xs)
+      ensures (Stack.stack st [] && result === xs) = begin () end
+end
+
+module Saturn_stack = struct
+  predicate stack (st : 'a t) (xs [@implicit] : 'a list) =
+    Treiber_stack.stack st xs
+
+  module Push = Ghost.AU (struct let operation = push end)
+  module Pop = Ghost.AU (struct let operation = pop end)
+
+  proof result = create ()
+    ensures (stack result []) =
+    on return fold stack result []
+
+  proof result = atomic push st value
+    atomic requires (stack st xs)
+    atomic ensures (stack st (value :: xs) && result === ()) =
+    at (Treiber_stack.push st value) (fun invoke ->
+      let token = Push.bind () in
+      let xs = Push.access token st value in
+      unfold stack st xs;
+      let result = invoke () in
+      fold stack st (value :: xs);
+      Push.commit token st value ();
+      result)
+
+  proof result = atomic pop st
+    atomic requires (stack st xs)
+    atomic ensures (match xs with
+      | [] -> result === None && stack st []
+      | value :: rest -> result === Some value && stack st rest) =
+    at (Treiber_stack.pop_opt st) (fun invoke ->
+      let token = Pop.bind () in
+      let xs = Pop.access token st in
+      unfold stack st xs;
+      let result = invoke () in
+      fold stack st (match xs with [] -> [] | _ :: rest -> rest);
+      Pop.commit token st result;
+      result)
+end
+
+proof drain =
+  at (Client.drain stack) (fun invoke ->
+    fold Saturn_stack.stack stack xs;
+    let result = invoke () in
+    unfold Saturn_stack.stack stack [];
+    result)

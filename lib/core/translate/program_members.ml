@@ -7,6 +7,7 @@ open Translate_context
 open Procedures
 open Program_items
 open Proof_declarations
+open Checked_workers
 
 type t = {
   library_modules : (Library_modules.t * R.Member.t list) list;
@@ -16,6 +17,7 @@ type t = {
           first. *)
   generic_interfaces : R.Member.t list list;
   checked_module_members : R.Member.t list list;
+  type_constructor_factories : (Module_inventory.checked_binding * R.Member.t list) list;
   action_check_lists : (structure * R.Member.t list) list;
   pending_member_lists : (structure * R.Member.t list) list;
   pred_members : (R.Callable.t * R.Callable.t list) list;
@@ -416,9 +418,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let library_worker_members =
     List.concat_map library_emissions ~f:(fun (_, _, workers) -> workers)
   in
+  let checked_predicates predicates =
+    List.filter predicates ~f:(fun (key, _) ->
+        List.exists checked_resource_entries ~f:(fun (_, checked, _, _) ->
+            String.equal key checked))
+  in
   (* The context of the requested [operation] of [view], with its arguments' and result's
      types. *)
-  let view_operation_context ?(primitive_namespace = []) (view : checked_view) operation =
+  let view_operation_context ?(abstract = false) ?(primitive_namespace = [])
+      (view : checked_view) operation =
     let signature = operation.operation_signature in
     let* () =
       check_adapter_shape ~at:signature.site.item_loc operation.operation_contract
@@ -470,6 +478,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         ~preds ~spec_funcs ~own_preds ~own_inputs:(List.filter_opt own_inputs)
         ~primitive_namespace ~generic_predicates ()
     in
+    let* ctx = enrich_predicates ctx own_preds in
+    let ctx = operation_context ~abstract ~primitive_namespace operation ctx in
     let predicates q =
       let env =
         {
@@ -506,10 +516,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   in
   (* The contract of [operation] as [view] requests it, with its context and that
      context's own state. *)
-  let prepare_view_operation ?(primitive_namespace = []) view operation =
+  let prepare_view_operation ?(abstract = false) ?(primitive_namespace = []) view
+      operation =
     let open State.Syntax in
     let* ctx, args, result =
-      State.of_result (view_operation_context ~primitive_namespace view operation)
+      State.of_result
+        (view_operation_context ~abstract ~primitive_namespace view operation)
     in
     let+ expected, local =
       State.within State.new_local
@@ -545,7 +557,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   publications,
                   publication_members ) =
              match List.Assoc.find checked_prepared actual_path ~equal:Path.same with
-             | Some info -> State.return (info, publications, publication_members)
+             | Some info ->
+                 let* () =
+                   if Option.is_some operation.operation_worker then
+                     State.of_result
+                       (unsupported at
+                          "A polymorphic operation forwarded through a previously \
+                           checked module view")
+                   else State.return ()
+                 in
+                 State.return (info, publications, publication_members)
              | None -> (
                  match
                    List.find funcs ~f:(fun f ->
@@ -573,7 +594,17 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      in
                      let actual_ctx =
                        spec_context types ~shared ~ocaml_env:f.environment ~proof_support
-                         ~preds ~spec_funcs ()
+                         ~preds ~spec_funcs ~generic_predicates ()
+                     in
+                     let worker =
+                       Program_declarations.applied_function_worker ~generics
+                         ~polymorphic_functions ~groups:[]
+                         ~canonical:(canonical_member shared) f
+                     in
+                     let* actual_ctx, actual_target, project =
+                       actual_operation_context ctx view operation ~native:f
+                         ~declaration:f.scheme_type ~worker ~target:(proc_name f)
+                         actual_ctx
                      in
                      let actual_args =
                        List.filter_map f.params ~f:(fun p ->
@@ -586,6 +617,15 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      let* prepared =
                        prepare_callable actual_ctx ~at:f.loc ~args:actual_args
                          ~result:f.body.exp_type f.contract
+                     in
+                     let prepared =
+                       {
+                         prepared with
+                         prepared_implicit =
+                           List.map prepared.prepared_implicit
+                             ~f:(fun (name, raven, typ, backend, loc) ->
+                               (name, raven, project typ, backend, loc));
+                       }
                      in
                      let* () =
                        if
@@ -607,8 +647,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                        else State.return ()
                      in
                      let+ target, publications, publication_members =
-                       if not (is_pure f) then
-                         State.return (proc_name f, publications, publication_members)
+                       if (not (is_pure f)) || Option.is_some operation.operation_worker
+                       then State.return (actual_target, publications, publication_members)
                        else
                          match List.Assoc.find publications f.id ~equal:Ident.same with
                          | Some publication ->
@@ -725,16 +765,32 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                              ~primitive_namespace:[ lib.library_name ] ~generic_predicates
                              ~proof_support ~preds ~spec_funcs ~own_preds ~own_inputs ()
                          in
+                         let* actual_ctx, actual_target, project =
+                           actual_operation_context ctx view operation
+                             ~declaration:value.val_type
+                             ~worker:(Path_bindings.find library_registry actual_path)
+                             ~target:(lib.library_name ^ "." ^ member)
+                             actual_ctx
+                         in
                          let+ prepared =
                            State.in_procedure
                              (prepare_callable actual_ctx ~at:value.val_loc
                                 ~args:actual_args ~result:actual_result contract)
                          in
+                         let prepared =
+                           {
+                             prepared with
+                             prepared_implicit =
+                               List.map prepared.prepared_implicit
+                                 ~f:(fun (name, raven, typ, backend, loc) ->
+                                   (name, raven, project typ, backend, loc));
+                           }
+                         in
                          ( ( prepared,
                              contract,
                              Subst.identity,
                              value.val_loc,
-                             lib.library_name ^ "." ^ member ),
+                             actual_target ),
                            publications,
                            publication_members )
                      end)
@@ -798,8 +854,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            in
            let* body, _ =
              State.within local
-               (forwarding_body ~at ~self:operation.operation_name ~target:actual_name
-                  ~result
+               (forwarding_body ~at
+                  ~self:
+                    (Option.value ctx.given.current_procedure
+                       ~default:operation.operation_name)
+                  ~target:actual_name ~result
                   ~atomic:(logical_contract operation.operation_contract)
                   expected)
            in
@@ -867,7 +926,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
              else
                prepared_member ~at ~name:operation.operation_member (Some body) expected
            in
-           ( (operation, expected, member) :: adapters,
+           ( (operation, ctx, expected, member) :: adapters,
              checked_prepared,
              publications,
              publication_members ))
@@ -903,69 +962,206 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     }
   in
   let resource_members group view ~aliases =
-    all view.view_resources ~f:(fun (formal, resource) ->
-        let p = formal.Module_inventory.declaration in
-        let l = loc p.pred_name.pid_loc in
-        let environment = Source.annotation_env source formal.site.environment in
-        let* parameter_types = Proof_bindings.parameter_types environment p.pred_params in
-        let parameter_types =
-          Compiler_types.map_group parameter_types
-            ~f:(Subst.type_expr formal.substitution)
-        in
-        let* vars =
-          all (List.zip_exn p.pred_params parameter_types) ~f:(fun ((id, _), t) ->
-              let* typ = Datatypes.typ view.view_types ~at:id.S.pid_loc t in
-              Ok (R.Var.make ~loc:l (ident ~loc:l id.pid_str) typ))
-        in
-        let* implicit = implicit_parameters p in
-        let formals, returns = List.split_n vars (List.length vars - implicit) in
-        let stem =
-          List.Assoc.find_exn group.Generic_modules.resources p.pred_name.pid_str
-            ~equal:String.equal
-        in
-        let member =
-          if aliases then
-            let kind =
-              if p.pred_persistent then R.Callable.Invariant else R.Callable.Predicate
-            in
-            R.Callable.resource_alias ~loc:l ~kind ~formals ~returns (ident ~loc:l stem)
-              (qualified_name ~loc:l resource.resource_backend)
+    let open State.Syntax in
+    let+ members =
+      State.all view.view_resources ~f:(fun (formal, resource) ->
+          let p = formal.Module_inventory.declaration in
+          let at = p.pred_name.pid_loc in
+          let l = loc at in
+          let environment = Source.annotation_env source formal.site.environment in
+          let* parameter_types =
+            State.of_result (Proof_bindings.parameter_types environment p.pred_params)
+          in
+          let parameter_types =
+            Compiler_types.map_group parameter_types
+              ~f:(Subst.type_expr formal.substitution)
+          in
+          let* implicit = State.of_result (implicit_parameters p) in
+          let stem =
+            List.Assoc.find_exn group.Generic_modules.resources p.pred_name.pid_str
+              ~equal:String.equal
+          in
+          let checked =
+            List.find_exn checked_modules ~f:(fun checked ->
+                phys_equal checked.Checked_modules.binding view.view_binding)
+          in
+          let owner = if aliases then checked.name else group.Generic_modules.interface in
+          let target = owner ^ "." ^ stem in
+          let* worker =
+            State.of_result
+              (Generic_predicates.discover
+                 ~expand:(Datatypes.expand view.view_types)
+                 ~key:target ~name:(resource_worker_name target) ~at
+                 ~explicit:(List.length parameter_types - implicit)
+                 parameter_types)
+          in
+          let worker = { worker with member = stem } in
+          let generic = not (List.is_empty worker.variables) in
+          let contract_stem = "Poly$" ^ stem ^ "$Contract" in
+          let namespace =
+            if not generic then String.split owner ~on:'.'
+            else if aliases then String.split worker.name ~on:'.'
+            else String.split (owner ^ "." ^ contract_stem) ~on:'.'
+          in
+          let types =
+            if not generic then view.view_types
+            else
+              Generic_predicates.types
+                { worker with name = String.concat ~sep:"." namespace }
+                view.view_types
+          in
+          let ctx =
+            scoped_contract_context types ~shared ~environment ~proof_support ~preds
+              ~spec_funcs ~own_preds:[] ~own_inputs:[] ~generic_predicates
+              ~primitive_namespace:namespace ()
+          in
+          let* vars =
+            State.all (List.zip_exn p.pred_params parameter_types) ~f:(fun ((id, _), t) ->
+                let+ typ = State.typ ctx ~at:id.S.pid_loc t in
+                R.Var.make ~loc:l (ident ~loc:l id.pid_str) typ)
+          in
+          let formals, returns = List.split_n vars (List.length vars - implicit) in
+          let* target =
+            if not aliases then State.return resource.resource_backend
+            else
+              match
+                Generic_predicates.find ~target:resource.resource_backend
+                  generic_predicates resource.resource_backend
+              with
+              | None -> State.return resource.resource_backend
+              | Some actual ->
+                  let* arguments =
+                    State.of_result
+                      (Generic_predicates.instantiate ~environment
+                         ~opaque:(Datatypes.is_opaque types)
+                         ~expand:(Datatypes.expand types) ~at actual
+                         (List.map parameter_types ~f:Option.some))
+                  in
+                  let+ instance =
+                    State.value_instance ctx ~at ~target:actual.name ~arguments
+                  in
+                  instance ^ "." ^ Generic_predicates.member actual
+          in
+          let member =
+            if aliases then
+              let kind =
+                if p.pred_persistent then R.Callable.Invariant else R.Callable.Predicate
+              in
+              R.Callable.resource_alias ~loc:l ~kind ~formals ~returns (ident ~loc:l stem)
+                (qualified_name ~loc:l target)
+            else
+              let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
+              R.Callable.func ~loc:l ~kind ~formals ~returns (ident ~loc:l stem) None
+          in
+          if not generic then State.return [ R.Member.callable member ]
           else
-            let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
-            R.Callable.func ~loc:l ~kind ~formals ~returns (ident ~loc:l stem) None
-        in
-        Ok (R.Member.callable member))
+            let params =
+              List.mapi worker.variables ~f:(fun index _ ->
+                  ( ident ~loc:l ("A" ^ Int.to_string index),
+                    qualified_name ~loc:l Prelude.value_interface ))
+            in
+            let+ support = worker_support ~namespace ~at () in
+            if aliases then
+              [
+                R.Member.module_ ~loc:l ~params
+                  ~implements:[ (qualified_name ~loc:l contract_stem, []) ]
+                  (ident ~loc:l ("Poly$" ^ stem))
+                  (support @ [ R.Member.callable member ]);
+              ]
+            else
+              [
+                R.Member.module_ ~loc:l ~interface:true ~params
+                  (ident ~loc:l contract_stem)
+                  (support @ [ R.Member.callable member ]);
+                R.Member.instance ~loc:l
+                  (ident ~loc:l ("Poly$" ^ stem))
+                  (qualified_name ~loc:l contract_stem);
+              ])
+    in
+    List.concat members
+  in
+  let make_type_constructor_factory ~owner ~types ~name declaration =
+    let open State.Syntax in
+    let at = declaration.Typedtree.typ_loc in
+    let namespace = owner @ [ name ] in
+    let given_types, applied =
+      Generic_type_families.context ~owner:namespace ~types declaration
+    in
+    let ctx =
+      spec_context given_types ~shared ~ocaml_env:source.env ~proof_support ~preds
+        ~spec_funcs ()
+    in
+    let* _ = State.dictionaries_given ctx.given ~at [ applied ] in
+    let* support = worker_support ~namespace ~at () in
+    State.of_result
+      (Generic_type_families.implementation ~loc:(loc at) ~owner ~types ~name declaration
+         ~support)
   in
   let type_members group view ~aliases =
+    let open State.Syntax in
     let* members =
-      all view.view_binding.expected.signature_types ~f:(fun (source, declaration) ->
-          if
+      State.all view.view_binding.expected.signature_types
+        ~f:(fun (member_name, declaration) ->
+          if Generic_type_families.transparent declaration then State.return None
+          else if
             aliases
             && (Option.is_some group.Generic_modules.world
                || Option.is_some declaration.Typedtree.typ_manifest)
-          then Ok None
+          then State.return None
           else
             let at = declaration.Typedtree.typ_loc in
             let l = loc at in
             let stem =
-              List.Assoc.find_exn group.Generic_modules.types source ~equal:String.equal
+              List.Assoc.find_exn group.Generic_modules.types member_name
+                ~equal:String.equal
             in
             match declaration.Typedtree.typ_manifest with
+            | None when Generic_type_families.arity declaration > 0 ->
+                if aliases then
+                  let checked =
+                    List.find_exn checked_modules ~f:(fun checked ->
+                        phys_equal checked.Checked_modules.binding view.view_binding)
+                  in
+                  let owner = String.split checked.name ~on:'.' in
+                  let+ member =
+                    make_type_constructor_factory ~owner ~types:view.view_types ~name:stem
+                      declaration
+                  in
+                  Some member
+                else
+                  let target =
+                    Option.value_map group.world
+                      ~default:
+                        (Generic_type_families.interface_name
+                           (Generic_type_families.arity declaration))
+                      ~f:(fun world -> world ^ "." ^ stem)
+                  in
+                  State.return
+                    (Some
+                       (match group.world with
+                       | None ->
+                           R.Member.instance ~loc:l (ident ~loc:l stem)
+                             (qualified_name ~loc:l target)
+                       | Some _ ->
+                           R.Member.alias ~loc:l (ident ~loc:l stem)
+                             (qualified_name ~loc:l target)))
             | None ->
                 let interface = qualified_name ~loc:l Prelude.value_interface in
                 if aliases then
                   let source_type = Ctype.newconstr (Path.Pident declaration.typ_id) [] in
                   begin match Datatypes.dictionary_name view.view_types source_type with
                   | Some dictionary ->
-                      Ok
+                      State.return
                         (Some
                            (R.Member.alias ~loc:l (ident ~loc:l stem)
                               (qualified_name ~loc:l dictionary)))
                   | None ->
-                      unsupported at "A canonical source-value dictionary for this type"
+                      State.of_result
+                        (unsupported at
+                           "A canonical source-value dictionary for this type")
                   end
                 else
-                  Ok
+                  State.return
                     (Some
                        (match group.Generic_modules.world with
                        | None -> R.Member.instance ~loc:l (ident ~loc:l stem) interface
@@ -973,16 +1169,19 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                            R.Member.alias ~loc:l (ident ~loc:l stem)
                              (qualified_name ~loc:l (world ^ "." ^ stem))))
             | Some manifest ->
-                let* definition =
-                  match group.Generic_modules.world with
-                  | Some world ->
-                      Ok
-                        (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ world ] stem) [])
-                  | None -> Datatypes.typ view.view_types ~at manifest.ctyp_type
+                let+ definition =
+                  State.of_result
+                    (match group.Generic_modules.world with
+                    | Some world ->
+                        Ok
+                          (R.Type.named ~loc:l
+                             (R.Name.make ~loc:l ~path:[ world ] stem)
+                             [])
+                    | None -> Datatypes.typ view.view_types ~at manifest.ctyp_type)
                 in
-                Ok (Some (R.Member.type_ ~loc:l (ident ~loc:l stem) (Some definition))))
+                Some (R.Member.type_ ~loc:l (ident ~loc:l stem) (Some definition)))
     in
-    Ok (List.filter_opt members)
+    State.return (List.filter_opt members)
   in
 
   let ghost_contract_members ?(carrier_interface = fun _ -> None) ~aliases ~implementation
@@ -1076,10 +1275,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         State.all (Generic_modules.parameter_groups owner) ~f:(fun group ->
             let open State.Syntax in
             let view = symbolic_view group (String.split group.interface ~on:'.') in
-            let* types = State.of_result (type_members group view ~aliases:false) in
-            let* resources =
-              State.of_result (resource_members group view ~aliases:false)
-            in
+            let* types = type_members group view ~aliases:false in
+            let* resources = resource_members group view ~aliases:false in
             let* ghost_modules =
               State.of_result
                 (ghost_module_members ~aliases:false group.representative.argument)
@@ -1090,17 +1287,16 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     not
                       (phys_equal operation.operation_binding
                          group.representative.argument)
-                  then State.return None
+                  then State.return []
                   else
-                    let+ _, _, _, _, prepared =
-                      prepare_view_operation
+                    let* ctx, _, _, _, prepared =
+                      prepare_view_operation ~abstract:true
                         ~primitive_namespace:(String.split group.interface ~on:'.')
                         view operation
                     in
-                    Some
-                      (R.Member.callable
-                         (prepared_member ~at:operation.operation_signature.site.item_loc
-                            ~name:operation.operation_member None prepared)))
+                    operation_module ~abstract:true ctx operation
+                      (prepared_member ~at:operation.operation_signature.site.item_loc
+                         ~name:operation.operation_member None prepared))
             in
             let* requests, dictionaries, instances =
               State.gets (fun (state : State.state) ->
@@ -1158,42 +1354,57 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   R.Member.module_ ~loc:l ~interface:true
                     (ident ~loc:l (Qualified_name.of_string group.interface).name)
                     (types @ domains @ resources @ ghost_modules @ instances
-                   @ List.filter_opt operations);
+                   @ List.concat operations);
                 ])))
   in
   let generic_interfaces = List.map generic_interfaces ~f:List.concat in
-  let* checked_module_members =
-    all checked_modules ~f:(fun view ->
+  let* checked_module_members, state =
+    State.run_from state
+    @@ State.all checked_modules ~f:(fun view ->
+        let open State.Syntax in
         let at = view.Checked_modules.binding.site.item_loc in
         let l = loc at in
         let members =
-          List.filter adapter_members ~f:(fun (operation, _, _) ->
+          List.filter adapter_members ~f:(fun (operation, _, _, _) ->
               phys_equal operation.operation_binding view.binding)
         in
         match (view.grouped, view.target) with
         | false, _ ->
-            Ok (List.map members ~f:(fun (_, _, member) -> R.Member.callable member))
+            let+ members =
+              State.all members ~f:(fun (operation, ctx, _, member) ->
+                  operation_module ~abstract:false ctx operation member)
+            in
+            List.concat members
         | true, Some target ->
-            Ok
+            State.return
               [
                 R.Member.checked_view ~loc:l
                   ~typ:(qualified_name ~loc:l view.interface)
                   (ident ~loc:l view.name) (name ~loc:l target);
               ]
         | true, None ->
-            let declarations =
-              List.map members ~f:(fun (operation, prepared, _) ->
-                  R.Member.callable
-                    (prepared_member ~at:operation.operation_signature.site.item_loc
-                       ~name:operation.operation_member None prepared))
-            in
             let* prefix, aliases =
               match Generic_modules.application_for_binding generics view.binding with
               | None ->
-                  Ok
+                  let concrete =
+                    List.find_exn checked_views ~f:(fun checked ->
+                        phys_equal checked.view_binding view.binding)
+                  in
+                  let* declarations =
+                    State.all members ~f:(fun (operation, _, _, _) ->
+                        let* ctx, _, _, _, prepared =
+                          prepare_view_operation ~abstract:true
+                            ~primitive_namespace:(String.split view.interface ~on:'.')
+                            concrete operation
+                        in
+                        operation_module ~abstract:true ctx operation
+                          (prepared_member ~at:operation.operation_signature.site.item_loc
+                             ~name:operation.operation_member None prepared))
+                  in
+                  State.return
                     ( [
                         R.Member.module_ ~loc:l ~interface:true
-                          (ident ~loc:l view.interface) declarations;
+                          (ident ~loc:l view.interface) (List.concat declarations);
                       ],
                       [] )
               | Some (group, _) ->
@@ -1203,22 +1414,134 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   in
                   let* types = type_members group concrete ~aliases:true in
                   let* resources = resource_members group concrete ~aliases:true in
-                  let* ghost_modules = ghost_module_members ~aliases:true view.binding in
-                  Ok ([], types @ resources @ ghost_modules)
+                  let* ghost_modules =
+                    State.of_result (ghost_module_members ~aliases:true view.binding)
+                  in
+                  let+ support =
+                    worker_support ~namespace:(String.split view.name ~on:'.') ~at ()
+                  in
+                  ([], types @ support @ resources @ ghost_modules)
             in
-            Ok
+            let* members =
+              State.all members ~f:(fun (operation, ctx, _, member) ->
+                  operation_module ~abstract:false ~inherited:view.interface ctx operation
+                    member)
+            in
+            State.return
               (prefix
               @ [
                   R.Member.module_ ~loc:l
                     ~implements:[ (qualified_name ~loc:l view.interface, []) ]
                     (ident ~loc:l view.name)
-                    (aliases
-                    @ List.map members ~f:(fun (_, _, member) -> R.Member.callable member)
-                    );
+                    (aliases @ List.concat members);
                 ]))
+  in
+  let* type_constructor_factories, state =
+    State.run_from state
+    @@
+    let open State.Syntax in
+    let+ groups =
+      State.all generics ~f:(fun group ->
+          match group.Generic_modules.world with
+          | None -> State.return []
+          | Some _ ->
+              let+ applications =
+                State.all group.applications ~f:(fun application ->
+                    let canonical =
+                      List.find_exn group.applications ~f:(fun other ->
+                          Path.same other.source.identity application.source.identity)
+                    in
+                    if not (phys_equal canonical application) then State.return []
+                    else
+                      let+ stages =
+                        State.all
+                          (List.zip_exn
+                             (Generic_modules.parameter_groups group)
+                             application.source.parameters)
+                          ~f:(fun (stage, parameter) ->
+                            let+ declarations =
+                              State.all
+                                parameter.Module_inventory.argument.expected
+                                  .signature_types ~f:(fun (member, declaration) ->
+                                  if
+                                    Option.is_some declaration.Typedtree.typ_manifest
+                                    || Generic_type_families.arity declaration = 0
+                                  then State.return []
+                                  else
+                                    let stem =
+                                      List.Assoc.find_exn stage.Generic_modules.types
+                                        member ~equal:String.equal
+                                    in
+                                    let name =
+                                      Generic_type_families.factory_name
+                                        ~world:canonical.world ~member:stem
+                                    in
+                                    let types =
+                                      checked_raw_types types parameter.argument
+                                    in
+                                    let+ factory =
+                                      make_type_constructor_factory ~owner:[] ~types ~name
+                                        declaration
+                                    in
+                                    [ (application.source.argument, [ factory ]) ])
+                            in
+                            List.concat declarations)
+                      in
+                      List.concat stages)
+              in
+              List.concat applications)
+    in
+    List.concat groups
   in
   let polymorphic_registry destination =
     let current_groups = Module_context.groups destination in
+    let namespace =
+      Module_context.namespace
+        (match destination with
+        | Module_context.Function_worker (_, parent)
+        | Module_context.Proof_worker (_, parent) ->
+            parent
+        | Flat | Worker _ -> destination)
+    in
+    let stages = List.concat_map current_groups ~f:Generic_modules.parameter_groups in
+    let checked =
+      List.concat_map checked_operations ~f:(fun operation ->
+          Option.value_map operation.operation_worker ~default:[] ~f:(fun worker ->
+              let name =
+                match
+                  List.find stages ~f:(fun stage ->
+                      phys_equal operation.operation_binding stage.representative.argument)
+                with
+                | None -> worker.name
+                | Some stage ->
+                    String.concat ~sep:"."
+                      (namespace
+                      @ [ stage.parameter; (Qualified_name.of_string worker.name).name ])
+              in
+              List.map operation.operation_paths ~f:(fun path ->
+                  let source =
+                    match path with
+                    | Path.Pdot (parent, _) ->
+                        checked_type_substitution operation.operation_binding parent
+                    | _ -> Subst.identity
+                  in
+                  let components =
+                    Compiler_types.map_group
+                      (worker.scheme.typ :: worker.scheme.variables) ~f:(fun typ ->
+                        Subst.type_expr source
+                          (Subst.type_expr operation.operation_signature.substitution typ))
+                  in
+                  ( path,
+                    {
+                      worker with
+                      name;
+                      scheme =
+                        {
+                          typ = List.hd_exn components;
+                          variables = List.tl_exn components;
+                        };
+                    } ))))
+    in
     Path_bindings.of_list
       (library_registry.entries
       @ List.concat_map funcs ~f:(fun candidate ->
@@ -1227,7 +1550,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               ~groups:current_groups ~canonical:(canonical_member shared) candidate
           in
           Option.value_map worker ~default:[] ~f:(fun worker ->
-              List.map candidate.paths ~f:(fun path -> (path, worker)))))
+              List.map candidate.paths ~f:(fun path -> (path, worker))))
+      @ checked)
   in
   (* The checks that the actions keep the histories' orders. *)
   let* action_check_lists, state =
@@ -1701,7 +2025,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             } ))
   in
   let polymorphic_registries =
-    if List.is_empty polymorphic_functions then []
+    if
+      List.is_empty polymorphic_functions
+      && List.for_all checked_operations ~f:(fun operation ->
+          Option.is_none operation.operation_worker)
+    then []
     else
       List.map runtime_destinations ~f:(fun destination ->
           (destination, polymorphic_registry destination))
@@ -1785,6 +2113,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             let f = { f with environment } in
             let data, predicates, _, pure_functions, spec_funcs, proof_support =
               body_context f
+            in
+            let* generic_predicates =
+              State.of_result
+                (resource_generics ~types:data ~inputs:proof_support.predicate_inputs
+                   ~workers:generic_predicates
+                   (checked_predicates predicates))
             in
             let declaration_name =
               Module_context.local_name (body_destination f) (body_pure_name f)
@@ -1957,6 +2291,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     let* environment = body_environment f in
     let f = { f with environment } in
     let data, predicates, functions, _, spec_funcs, proof_support = body_context f in
+    let* generic_predicates =
+      resource_generics ~types:data ~inputs:proof_support.predicate_inputs
+        ~workers:generic_predicates
+        (checked_predicates predicates)
+    in
     let declaration_name =
       Module_context.local_name (body_destination f) (body_proc_name f)
     in
@@ -2068,6 +2407,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         publication_members;
         generic_interfaces;
         checked_module_members;
+        type_constructor_factories;
         action_check_lists;
         pending_member_lists;
         pred_members;

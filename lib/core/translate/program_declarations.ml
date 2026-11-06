@@ -763,17 +763,49 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let operation_member =
               List.Assoc.find_exn view.members member ~equal:String.equal
             in
+            let operation_name =
+              if view.grouped then view.name ^ "." ^ operation_member
+              else operation_member
+            in
+            let operation_paths =
+              List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))
+            in
+            let* scheme =
+              Polymorphic_functions.discover ~at:signature.site.item_loc
+                signature.declaration.val_val.val_type
+            in
+            let* () =
+              if (not view.grouped) && not (List.is_empty scheme.variables) then
+                unsupported signature.site.item_loc
+                  "A polymorphic operation in a specialized checked module binding"
+              else Ok ()
+            in
+            let operation_worker =
+              Option.some_if
+                (not (List.is_empty scheme.variables))
+                Polymorphic_functions.
+                  {
+                    id = signature.declaration.val_id;
+                    paths = operation_paths;
+                    scheme;
+                    restriction = None;
+                    witness = None;
+                    name =
+                      String.concat ~sep:"."
+                        ((Qualified_name.of_string operation_name).path
+                        @ [ "Poly$" ^ operation_member ]);
+                    loc = signature.site.item_loc;
+                  }
+            in
             Ok
               {
                 operation_binding = binding;
                 operation_signature = signature;
                 operation_contract = contract;
-                operation_name =
-                  (if view.grouped then view.name ^ "." ^ operation_member
-                   else operation_member);
+                operation_name;
                 operation_member;
-                operation_paths =
-                  List.map binding.paths ~f:(fun path -> Path.Pdot (path, member));
+                operation_paths;
+                operation_worker;
               }))
   in
   let checked_operations = List.concat checked_operations in

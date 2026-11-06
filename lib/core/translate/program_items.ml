@@ -1566,6 +1566,7 @@ type checked_operation = {
   operation_name : string;
   operation_member : string;
   operation_paths : Path.t list;
+  operation_worker : Polymorphic_functions.t option;
 }
 
 type resource_signature = {

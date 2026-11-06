@@ -51,6 +51,33 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
              Option.map typ ~f:(fun typ -> (name, normalize typ))))
       term
   in
+  let instantiate_predicate ~at parameters actuals =
+    let expand = Datatypes.expand logical_types in
+    let* predicate =
+      Generic_parameters.discover ~expand ~key:"SignaturePredicate"
+        ~name:"SignaturePredicate" ~at ~explicit:(List.length parameters) parameters
+    in
+    if List.is_empty predicate.variables then Ok parameters
+    else
+      let* arguments =
+        Generic_parameters.instantiate ~environment
+          ~opaque:(Datatypes.is_opaque logical_types)
+          ~expand ~at predicate actuals
+      in
+      Ok (Generic_parameters.parameter_types predicate arguments)
+  in
+  let contextual_actuals variables actuals =
+    let bound =
+      List.filter_map variables ~f:snd
+      |> List.concat_map ~f:Polymorphic_functions.all_variables
+    in
+    List.map actuals ~f:(fun actual ->
+        Option.bind actual ~f:(fun typ ->
+            Option.some_if
+              (List.for_all (Polymorphic_functions.all_variables typ) ~f:(fun variable ->
+                   List.mem bound variable ~equal:Polymorphic_functions.same_variable))
+              typ))
+  in
   let compatible ~at expected actual =
     let expected = normalize expected in
     let actual = normalize actual in
@@ -330,6 +357,10 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
     let predicate = match callee.S.term_desc with Tvar q -> predicates q | _ -> None in
     match predicate with
     | Some expected ->
+        let* expected =
+          instantiate_predicate ~at:term.term_loc expected
+            (contextual_actuals variables types)
+        in
         let rec consume expected arguments types =
           match (expected, arguments, types) with
           | _, [], [] -> Ok ()
@@ -667,7 +698,22 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
     List.fold_result
       (Spec_arguments.predicate_parameters
          ~expand:(Datatypes.expand logical_types)
-         ~lookup:(fun q _ -> predicates q)
+         ~lookup:(fun q arguments ->
+           Option.bind (predicates q) ~f:(fun parameters ->
+               let variables =
+                 List.map variables ~f:(fun (name, typ) -> (name, Some typ))
+               in
+               let actuals =
+                 List.map arguments ~f:(fun argument ->
+                     match argument.S.term_desc with
+                     | Tvar (Qid id) ->
+                         Option.join
+                           (List.Assoc.find variables id.pid_str ~equal:String.equal)
+                     | _ -> Result.ok (infer variables argument))
+               in
+               Result.ok
+                 (instantiate_predicate ~at:(S.qualid_loc q) parameters
+                    (contextual_actuals variables actuals))))
          ~bound:(List.map variables ~f:fst) terms)
       ~init:variables
       ~f:(fun variables (id, typ) ->

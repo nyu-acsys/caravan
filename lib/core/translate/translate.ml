@@ -287,6 +287,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     publication_members;
     generic_interfaces;
     checked_module_members;
+    type_constructor_factories;
     action_check_lists;
     pending_member_lists;
     pred_members;
@@ -616,7 +617,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                   (List.filter_map parameter.argument.expected.signature_types
                      ~f:(fun (_, declaration) ->
                        Option.some_if
-                         (Option.is_none declaration.Typedtree.typ_manifest)
+                         (Option.is_none declaration.Typedtree.typ_manifest
+                         && Generic_type_families.arity declaration = 0)
                          {
                            domain_types = concrete;
                            domain_type =
@@ -1462,12 +1464,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                     (List.map (Generic_modules.type_slots group) ~f:(fun stem ->
                          ( ident ~loc:l stem,
                            qualified_name ~loc:l
-                             (if
-                                List.mem
-                                  (Generic_modules.value_type_slots group)
-                                  stem ~equal:String.equal
-                              then Prelude.value_interface
-                              else "Library.Type") )))
+                             (Generic_modules.type_slot_interface group stem) )))
                   (ident ~loc:l world)
                   (world_domains @ interface @ [ shape; factory; worker ]),
                 family_templates @ layout_templates,
@@ -1516,13 +1513,20 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               match group.world with
               | None -> Ok ([], group.name, view_names)
               | Some world ->
+                  let canonical =
+                    List.find_exn group.applications ~f:(fun other ->
+                        Path.same other.source.identity application.source.identity)
+                  in
                   let* arguments =
                     all application.source.parameters ~f:(fun parameter ->
                         let concrete =
                           checked_raw_types types parameter.Module_inventory.argument
                         in
-                        all parameter.argument.expected.signature_types
-                          ~f:(fun (_, declaration) ->
+                        all
+                          (List.filter parameter.argument.expected.signature_types
+                             ~f:(fun (_, declaration) ->
+                               not (Generic_type_families.transparent declaration)))
+                          ~f:(fun (member, declaration) ->
                             let t =
                               Btype.newgenty
                                 (Tconstr
@@ -1530,7 +1534,26 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                                      [],
                                      ref Types.Mnil ))
                             in
-                            if Option.is_none declaration.typ_manifest then
+                            if
+                              Option.is_none declaration.typ_manifest
+                              && Generic_type_families.arity declaration > 0
+                            then
+                              let stage =
+                                List.find_exn (Generic_modules.parameter_groups group)
+                                  ~f:(fun stage ->
+                                    Ident.same stage.representative.parameter
+                                      parameter.parameter)
+                              in
+                              let stem =
+                                List.Assoc.find_exn stage.types member ~equal:String.equal
+                              in
+                              Ok
+                                (R.Type.named ~loc:l
+                                   (q
+                                      (Generic_type_families.factory_name
+                                         ~world:canonical.world ~member:stem))
+                                   [])
+                            else if Option.is_none declaration.typ_manifest then
                               Result.map
                                 (dictionary_for ~at:declaration.typ_loc parameter.argument
                                    declaration.typ_id) ~f:(fun dictionary ->
@@ -1554,10 +1577,6 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                         (ident ~loc:l application.world)
                         (q world)
                   in
-                  let canonical =
-                    List.find_exn group.applications ~f:(fun other ->
-                        Path.same other.source.identity application.source.identity)
-                  in
                   let fresh =
                     if phys_equal canonical application then
                       [
@@ -1567,8 +1586,16 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       ]
                     else []
                   in
+                  let factories =
+                    if phys_equal canonical application then
+                      List.concat_map type_constructor_factories
+                        ~f:(fun (binding, members) ->
+                          if phys_equal binding application.source.argument then members
+                          else [])
+                    else []
+                  in
                   Ok
-                    ( selected :: fresh,
+                    ( factories @ (selected :: fresh),
                       application.world ^ "." ^ (Qualified_name.of_string group.name).name,
                       view_names @ [ canonical.layout ] )
             in
@@ -1727,6 +1754,18 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members
+        @ List.map
+            (List.concat_map generics ~f:(fun group ->
+                 List.concat_map (Generic_modules.parameter_groups group) ~f:(fun stage ->
+                     List.filter_map
+                       stage.representative.argument.expected.signature_types
+                       ~f:(fun (_, declaration) ->
+                         let count = Generic_type_families.arity declaration in
+                         Option.some_if
+                           (Option.is_none declaration.typ_manifest && count > 0)
+                           count)))
+            |> List.dedup_and_sort ~compare:Int.compare)
+            ~f:Generic_type_families.signature
         @ Prelude.value_functors
             ~integers:(needs_template Datatypes.Int_dictionary)
             ~lists:(needs_template Datatypes.List_dictionary)

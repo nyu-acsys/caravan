@@ -5,19 +5,24 @@
  (wrapped false)
  (modules
   stack_drain
+  stack_intf
+  clients
   wrong_contents
   wrong_result
   raising_call
   undeclared_raise
   wrong_raise)
+ (modules_without_implementation stack_intf)
  (libraries caravan_saturn_treiber_stack))
 
 (cram
  (deps
   %{bin:caravan}
+  %{bin:raven}
   treiber_stack.mli
   (glob_files *.ml)
   (glob_files *.mli)
+  (glob_files *.proof)
   ../treiber_stack/treiber_stack.ml
   ../treiber_stack/treiber_stack.mli
   ../treiber_stack/treiber_stack.proof

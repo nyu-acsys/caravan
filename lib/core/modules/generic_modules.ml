@@ -341,6 +341,28 @@ let types group ~owner =
         in
         match declaration.Typedtree.typ_manifest with
         | Some _ -> descriptor
+        | None when not (List.is_empty descriptor.parameters) ->
+            let scope =
+              if Option.equal String.equal (List.last owner) (Some group.parameter) then
+                String.split group.name ~on:'.'
+              else owner
+            in
+            {
+              descriptor with
+              family =
+                Some
+                  {
+                    Datatypes.worker =
+                      String.concat ~sep:"." (backend.path @ [ backend.name ]);
+                    member = "Carrier";
+                    dictionary = "Self";
+                    scope;
+                    argument_projection = None;
+                  };
+              backend_type = None;
+              value_constraint = None;
+              domain_scope = Some scope;
+            }
         | None ->
             let domain_scope =
               if Option.equal String.equal (List.last owner) (Some group.parameter) then
@@ -399,7 +421,11 @@ let world_types group ~owner =
 
 let type_slots group =
   List.concat_map (parameter_groups group) ~f:(fun stage ->
-      List.map stage.types ~f:snd
+      List.filter_map stage.representative.argument.expected.signature_types
+        ~f:(fun (source, declaration) ->
+          Option.some_if
+            (not (Generic_type_families.transparent declaration))
+            (List.Assoc.find_exn stage.types source ~equal:String.equal))
       @ List.map stage.representative.argument.expected.signature_ghost_modules
           ~f:(fun (member, _) -> carrier_name stage member))
 
@@ -411,3 +437,23 @@ let value_type_slots group =
           Option.some_if
             (Option.is_none declaration.Typedtree.typ_manifest)
             (List.Assoc.find_exn stage.types source ~equal:String.equal)))
+
+let type_slot_interface group stem =
+  Option.value
+    (List.find_map (parameter_groups group) ~f:(fun stage ->
+         List.find_map stage.representative.argument.expected.signature_types
+           ~f:(fun (source, declaration) ->
+             if
+               not
+                 (String.equal stem
+                    (List.Assoc.find_exn stage.types source ~equal:String.equal))
+             then None
+             else if Option.is_some declaration.Typedtree.typ_manifest then
+               Some "Library.Type"
+             else if Generic_type_families.arity declaration = 0 then
+               Some Prelude.value_interface
+             else
+               Some
+                 (Generic_type_families.interface_name
+                    (Generic_type_families.arity declaration)))))
+    ~default:"Library.Type"

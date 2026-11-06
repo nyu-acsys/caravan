@@ -191,13 +191,17 @@ Raven checks the forwarding proof, including restoration when an atomic call abo
 
 Checked bindings currently support first-order functions with matching operation
 kinds, resource parameter modes, and concrete and inferred-state argument shapes.
-Explicit ghost adaptations, public AU tokens, non-function values, nested module
-members, and resource definitions in signatures are unsupported. An already checked
-view cannot yet be constrained again by a callable signature in its enclosing
-`.mli`; use named checked bindings for successive views.
+Raising operations, explicit ghost adaptations, public AU tokens, non-function
+values, nested module members, and resource definitions in signatures are
+unsupported. An already checked view cannot yet be constrained again by a callable
+signature in its enclosing `.mli`; use named checked bindings for successive views.
 
-Monomorphic functors with named module parameters and a structure body support
+Functors with named module parameters and a structure body support
 concrete path applications such as `module Client = Drain (Treiber_stack)`.
+Parameter signatures can expose rank-one polymorphic operations and predicates,
+and abstract type constructors such as `type 'a t`. The
+[Saturn stack-drain client](test/saturn/stack_drain) uses the original polymorphic
+functor and its local recursive loop, with annotations in a companion proof file.
 Curried applications and partial applications such as `module With_A = Make (A)`
 and `module Client = With_A (B)` preserve the same result types as `Make (A) (B)`.
 Each application checks the complete argument against the parameter signature.
@@ -205,7 +209,9 @@ Eligible bodies share one generic proof across applications, including parameter
 with invariant resources, explicit proofs, captured static proof declarations,
 lifted local helpers and closed recursive heap layouts.
 Bodies outside the supported generic representation and runtime subset retain
-separate verified specializations. Parameter calls use the signature's
+separate verified specializations. Polymorphic checked operations currently require
+the shared generic translation; specialized checked bindings are unsupported.
+Polymorphic operations cannot yet be forwarded through an already checked module view. Parameter calls use the signature's
 contracts, including its abstract resources and logically atomic clauses. Captured
 names retain their definition-time scope. Unused functor bodies are not verified.
 Result variants and records share their types and mutable fields across repeated

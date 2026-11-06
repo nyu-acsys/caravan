@@ -11,6 +11,15 @@ Draining a nonempty stack cannot always return an empty list.
   Related Location: This assertion may not hold.
   [1]
 
+The instantiated generic loop must retain the value returned by each pop.
+
+  $ mkdir wrong_loop
+  $ cp stack_drain.mli stack_drain.proof stack_intf.mli treiber_stack.mli wrong_loop/
+  $ sed 's/Some v -> v :: loop ()/Some v -> (match v :: loop () with [] -> [] | _ :: rest -> rest)/' stack_drain.ml > wrong_loop/stack_drain.ml
+  $ ! caravan --shh wrong_loop/stack_drain.ml > wrong_loop.out 2>&1
+  $ grep -q 'Verification Error: A postcondition may not hold' wrong_loop.out
+  $ ! grep -Eq 'Unsupported Error:|Internal Error:|timed out' wrong_loop.out
+
 Draining consumes the original contents rather than preserving them in the stack.
 
   $ caravan --shh wrong_contents.ml
