@@ -12,6 +12,9 @@ end
 module Outer (X : Argument) = struct
   module Nested = Inner (X)
 
+  let identity (x : Nested.t) = Nested.identity x
+  (*@ result = identity x ensures result === x *)
+
   module Captured (Y : Argument) = struct
     type t = { value : int }
 
@@ -27,7 +30,7 @@ module First_captured = Left.Captured (Argument)
 module Second_captured = Right.Captured (Argument)
 
 let nested () =
-  match Right.Nested.identity (Left.Nested.identity (Direct.Value 7)) with
+  match Right.identity (Left.identity (Direct.Value 7)) with
   | Direct.Value x -> assert (x = 7)
 
 let captured () =

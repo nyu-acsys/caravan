@@ -51,11 +51,9 @@ constructors such as `type 'a t`. Proofs are shared through Raven functors where
 the generic representation supports the body; other supported bodies use separate
 verified specializations.
 
-There is currently a verification-coverage gap compared with Raven: Caravan
-discovers runtime functor bodies through applications in the input being checked.
-An unapplied functor's runtime bodies can therefore be skipped, even if their
-contracts are false. This is a limitation of the translation, not the intended
-modular verification behavior.
+Functor bodies and their companion proofs are verified at their declarations,
+using the parameter signatures as abstract contracts. This includes functors that
+are never applied; adding an application is not needed to check their bodies.
 
 Repeated applicative applications to the same module share result identity;
 aliases preserve that identity. Unit applications introduce fresh identities.

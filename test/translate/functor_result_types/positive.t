@@ -46,7 +46,7 @@
   2
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' sealed.rav
-  2
+  1
 
   $ caravan --shh nested.ml
   Verification successful.
@@ -69,6 +69,6 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' sealed_nested.rav
-  3
+  1
   $ caravan --shh polymorphic.ml
   Verification successful.

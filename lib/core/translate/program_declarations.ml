@@ -336,7 +336,15 @@ let body_module_context ~(module_contexts : Module_context.registry)
   let body_owner = body_owner ~generics in
   match body_owner f with
   | Some (group, _) -> context_for_group group
-  | None -> Module_context.for_location module_contexts f.loc
+  | None ->
+      let copied_definition =
+        List.exists generics ~f:(fun group ->
+            Option.exists group.Generic_modules.definition ~f:(fun definition ->
+                Declaration_scope.contains_in_input definition.source.template.mod_loc
+                  f.loc))
+      in
+      if copied_definition then module_contexts.root
+      else Module_context.for_location module_contexts f.loc
 
 (** Source-only contract analyses use the native type identities of this application. *)
 let source_function_projection ~generics (context : Module_context.t) f =
@@ -746,7 +754,27 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             members = group.operations;
           })
   in
-  let checked_modules = Checked_modules.plan ~schema inventory.bindings in
+  let checked_modules =
+    Checked_modules.plan ~schema inventory.bindings
+    |> List.map ~f:(fun view ->
+        if not (Module_inventory.symbolic_binding inventory view.Checked_modules.binding)
+        then view
+        else
+          let namespace =
+            List.find_map generics ~f:(fun group ->
+                List.find_map group.Generic_modules.applications ~f:(fun application ->
+                    Option.some_if
+                      (application.source.symbolic
+                      && List.exists application.source.parameters ~f:(fun parameter ->
+                          Module_inventory.same_binding
+                            parameter.Module_inventory.argument view.binding))
+                      (Qualified_name.of_string application.name).path))
+          in
+          match namespace with
+          | None -> view
+          | Some namespace ->
+              { view with name = String.concat ~sep:"." (namespace @ [ view.name ]) })
+  in
   let* checked_operations =
     all checked_modules ~f:(fun view ->
         let binding = view.Checked_modules.binding in

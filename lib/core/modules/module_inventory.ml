@@ -78,6 +78,7 @@ type parameter_instance = {
 }
 
 type specialization = {
+  symbolic : bool;
   origin : Path.t option;
   parameters : parameter_instance list;
   context : Functor_context.application option;
@@ -104,7 +105,12 @@ let function_members (body : Typedtree.structure) =
     | _ -> ());
     Tast_iterator.default_iterator.value_binding iterator binding
   in
-  let iterator = { Tast_iterator.default_iterator with value_binding } in
+  let module_expr iterator expression =
+    match expression.Typedtree.mod_desc with
+    | Tmod_functor _ -> ()
+    | _ -> Tast_iterator.default_iterator.module_expr iterator expression
+  in
+  let iterator = { Tast_iterator.default_iterator with value_binding; module_expr } in
   iterator.structure iterator body;
   List.rev !found
 
@@ -167,9 +173,27 @@ type t = {
   aliases : (Path.t * Path.t) list;
   bindings : checked_binding list;
   specializations : specialization list;
+  definitions : specialization list;
   constraints : resource_constraint list;
   library_signatures : (Source.library * signature_view) list;
 }
+
+let same_binding (left : checked_binding) right =
+  phys_equal left right
+  || Path.same left.actual_path right.actual_path
+     && phys_equal left.expected right.expected
+     && phys_equal left.parameter_substitution right.parameter_substitution
+
+let formal_binding inventory binding =
+  List.exists inventory.definitions ~f:(fun definition ->
+      List.exists definition.parameters ~f:(fun parameter ->
+          same_binding parameter.argument binding))
+
+let symbolic_binding inventory binding =
+  List.exists inventory.specializations ~f:(fun application ->
+      application.symbolic
+      && List.exists application.parameters ~f:(fun parameter ->
+          same_binding parameter.argument binding))
 
 type module_view = {
   functor_definition : functor_definition option;
@@ -191,6 +215,7 @@ and functor_definition = {
   template : Typedtree.module_expr;
   environment : Env.t;
   annotations : Annotation.t list;
+  verification : specialization option;
 }
 
 type signature_origin = {
@@ -1194,12 +1219,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     | Mty_functor _ -> unavailable at "A functor signature"
     | Mty_ident _ -> unavailable at "An abstract module signature"
   in
-  let rec module_expression annotations namespace ~identity
+  let rec module_expression ~definitions ~captures annotations namespace ~identity
       (expression : Typedtree.module_expr) =
     match expression.mod_desc with
     | Tmod_structure structure ->
-        collect_structure annotations namespace ~identity (scope expression.mod_loc)
-          structure
+        collect_structure ~definitions ~captures annotations namespace ~identity
+          (scope expression.mod_loc) structure
     | Tmod_ident (path, _) ->
         let* view = resolve_module expression.mod_loc expression.mod_env path in
         Ok
@@ -1215,7 +1240,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | _ -> false
         in
         if alias body then
-          let* actual = module_expression annotations namespace ~identity body in
+          let* actual =
+            module_expression ~definitions ~captures annotations namespace ~identity body
+          in
           begin match annotation with
           | Tmodtype_implicit -> Ok actual
           | Tmodtype_explicit mty ->
@@ -1269,7 +1296,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 }
           end
         else
-          let* view = module_expression annotations namespace ~identity body in
+          let* view =
+            module_expression ~definitions ~captures annotations namespace ~identity body
+          in
           begin match annotation with
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
@@ -1348,6 +1377,96 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           iterator.module_expr iterator body;
           !valid
         in
+        let* verification =
+          match (definitions, identity) with
+          | false, _ | _, None -> Ok None
+          | true, Some identity ->
+              let rec formal_parameters stages (template : Typedtree.module_expr) =
+                match template.mod_desc with
+                | Tmod_functor (parameter, body) ->
+                    let* parameter, parameter_name, expected =
+                      match parameter with
+                      | Unit -> Ok (Ident.create_local "Unit", "Unit", empty_signature)
+                      | Named (Some id, { txt = Some name; _ }, mty) ->
+                          let* expected =
+                            signature_type ~imported:false annotations mty
+                          in
+                          Ok (id, name, expected)
+                      | Named _ ->
+                          unavailable template.mod_loc "An anonymous functor parameter"
+                    in
+                    let path = Path.Pident parameter in
+                    let argument =
+                      {
+                        actual_path = path;
+                        parameter_substitution = Subst.identity;
+                        expected;
+                        site =
+                          {
+                            environment = body.mod_env;
+                            scope = scope template.mod_loc;
+                            annotations;
+                            item_loc = template.mod_loc;
+                            next = None;
+                          };
+                        namespace = namespace @ [ parameter_name ];
+                        paths = [ path ];
+                      }
+                    in
+                    let binding = ref argument in
+                    bindings := binding :: !bindings;
+                    publish path
+                      {
+                        empty_module with
+                        checked = Some binding;
+                        identity = Some path;
+                        application_identity = Some path;
+                      };
+                    let stages =
+                      stages @ [ { template; parameter; argument = !binding } ]
+                    in
+                    begin match body.mod_desc with
+                    | Tmod_functor _ -> formal_parameters stages body
+                    | _ ->
+                        let* view =
+                          module_expression ~definitions ~captures:stages annotations
+                            namespace ~identity:(Some identity) body
+                        in
+                        publish_type_paths identity view;
+                        let declarations, body_members =
+                          match direct_body body with
+                          | Some body ->
+                              ( List.concat_map body.str_items ~f:(fun item ->
+                                    match item.Typedtree.str_desc with
+                                    | Tstr_type (_, declarations) -> declarations
+                                    | _ -> []),
+                                function_members body )
+                          | None -> ([], [])
+                        in
+                        Ok
+                          (Some
+                             {
+                               symbolic = true;
+                               origin = Some identity;
+                               parameters = stages;
+                               context = None;
+                               template;
+                               parameter;
+                               argument = !binding;
+                               members =
+                                 List.filter_map view.values ~f:(fun (name, value) ->
+                                     match !value.binding.vb_pat.pat_desc with
+                                     | Tpat_var (id, _, _) -> Some (name, id)
+                                     | _ -> None);
+                               body_members;
+                               identity;
+                               declarations;
+                             })
+                    end
+                | _ -> unavailable template.mod_loc "A non-structural functor declaration"
+              in
+              formal_parameters captures expression
+        in
         Ok
           {
             empty_module with
@@ -1361,15 +1480,20 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   template = expression;
                   environment = expression.mod_env;
                   annotations;
+                  verification;
                 };
           }
     | Tmod_apply (callee, argument, _) ->
-        specialize annotations namespace ~identity expression callee (Some argument)
+        specialize
+          ~symbolic:(definitions && not (List.is_empty captures))
+          annotations namespace ~identity expression callee (Some argument)
     | Tmod_apply_unit callee ->
-        specialize annotations namespace ~identity expression callee None
+        specialize
+          ~symbolic:(definitions && not (List.is_empty captures))
+          annotations namespace ~identity expression callee None
     | Tmod_unpack _ -> unavailable expression.mod_loc "A first-class module"
-  and specialize annotations namespace ~identity (expression : Typedtree.module_expr)
-      callee argument =
+  and specialize ~symbolic annotations namespace ~identity
+      (expression : Typedtree.module_expr) callee argument =
     let rec application_head (value : Typedtree.module_expr) =
       match value.mod_desc with
       | Tmod_constraint (body, _, Tmodtype_implicit, _) -> application_head body
@@ -1406,7 +1530,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                     Ok identity
                 end
           in
-          module_expression annotations namespace ~identity:(Some stage_identity) callee
+          module_expression ~definitions:false ~captures:[] annotations namespace
+            ~identity:(Some stage_identity) callee
       | _ -> unavailable callee.mod_loc "A non-path functor application"
     in
     let* definition =
@@ -1542,7 +1667,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             "A functor specialization with the wrong parameter shape"
     in
     let* view =
-      module_expression definition.annotations namespace
+      module_expression ~definitions:false ~captures:[] definition.annotations namespace
         ~identity:(Some application_identity) body
     in
     let instances =
@@ -1574,7 +1699,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | None -> ([], [])
           in
           specializations :=
-            ( definition.template,
+            ( symbolic,
+              definition.template,
               parameter,
               binding,
               view.values,
@@ -1587,8 +1713,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             :: !specializations)
     end;
     Ok view
-  and collect_structure annotations namespace ~identity declaration_scope
-      (structure : Typedtree.structure) =
+  and collect_structure ~definitions ~captures annotations namespace ~identity
+      declaration_scope (structure : Typedtree.structure) =
     let all_annotations = annotations in
     let children =
       List.filter_map structure.str_items ~f:(fun (item : Typedtree.structure_item) ->
@@ -1710,8 +1836,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                           (Option.value_map identity ~default:(Path.Pident id)
                              ~f:(fun parent -> Path.Pdot (parent, name)))
                       in
-                      module_expression all_annotations (namespace @ [ name ]) ~identity
-                        declaration.mb_expr
+                      module_expression ~definitions ~captures all_annotations
+                        (namespace @ [ name ]) ~identity declaration.mb_expr
                     in
                     begin match declaration.mb_expr.mod_desc with
                     | Tmod_ident _ -> ()
@@ -1759,7 +1885,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     items { empty_module with application_identity = identity } structure.str_items
   in
   let* view =
-    collect_structure (Source.annotations source) [] ~identity:None source.scope structure
+    collect_structure ~definitions:true ~captures:[] (Source.annotations source) []
+      ~identity:None source.scope structure
   in
   let* () =
     match source.interface with
@@ -1780,8 +1907,29 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             Ok ()
         end
   in
+  let definitions =
+    let current_binding binding =
+      Option.value_map
+        (Option.bind (lookup modules binding.actual_path) ~f:(fun view -> view.checked))
+        ~default:binding
+        ~f:(fun current -> !current)
+    in
+    List.filter_map (List.rev !modules) ~f:(fun (_, view) ->
+        Option.bind view.functor_definition ~f:(fun definition -> definition.verification))
+    |> List.stable_dedup ~compare:(fun (left : specialization) right ->
+        Path.compare left.identity right.identity)
+    |> List.map ~f:(fun definition ->
+        {
+          definition with
+          argument = current_binding definition.argument;
+          parameters =
+            List.map definition.parameters ~f:(fun stage ->
+                { stage with argument = current_binding stage.argument });
+        })
+  in
   Ok
     {
+      definitions;
       structure =
         (let module_expr mapper expression =
            match List.Assoc.find !expansions expression ~equal:phys_equal with
@@ -1790,11 +1938,30 @@ let build (source : Source.t) (structure : Typedtree.structure) :
          in
          let map_structure mapper structure =
            let str_items =
-             List.filter structure.Typedtree.str_items ~f:(fun item ->
+             List.filter_map structure.Typedtree.str_items ~f:(fun item ->
                  match item.Typedtree.str_desc with
-                 | Tstr_module { mb_id = Some id; _ } ->
-                     not (List.mem !templates id ~equal:Ident.same)
-                 | _ -> true)
+                 | Tstr_module ({ mb_id = Some id; _ } as declaration)
+                   when List.mem !templates id ~equal:Ident.same ->
+                     let definition =
+                       Option.bind (lookup modules (Path.Pident id)) ~f:(fun view ->
+                           Option.bind view.functor_definition ~f:(fun d ->
+                               d.verification))
+                     in
+                     Option.map definition ~f:(fun definition ->
+                         let rec body (expression : Typedtree.module_expr) =
+                           match expression.mod_desc with
+                           | Tmod_functor (_, nested) | Tmod_constraint (nested, _, _, _)
+                             ->
+                               body nested
+                           | _ -> expression
+                         in
+                         {
+                           item with
+                           str_desc =
+                             Tstr_module
+                               { declaration with mb_expr = body definition.template };
+                         })
+                 | _ -> Some item)
            in
            Tast_mapper.default.structure mapper { structure with str_items }
          in
@@ -1811,7 +1978,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       specializations =
         List.rev_map !specializations
           ~f:(fun
-              ( template,
+              ( symbolic,
+                template,
                 parameter,
                 argument,
                 values,
@@ -1823,6 +1991,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 context )
             ->
             {
+              symbolic;
               origin;
               parameters =
                 List.map instances ~f:(fun (template, parameter, argument) ->

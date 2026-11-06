@@ -9,7 +9,7 @@ Proof predicates and lemmas from two applications are available through their me
 
 The generic worker has one body while both applications expose its proof members.
 
-  $ grep -c '^module Generic_First_Cell' exports.rav
+  $ grep -c '^module Generic_Make_Cell' exports.rav
   1
 
 A member of the first application rejects a cell from the second application.
@@ -45,7 +45,7 @@ Repeated applications retain one worker and interchangeable applicative types.
   $ caravan --shh --emit-rav exports_repeated.ml > repeated.rav
   $ raven --shh repeated.rav
   Verification successful.
-  $ grep -c '^module Generic_First_Cell' repeated.rav
+  $ grep -c '^module Generic_Make_Cell' repeated.rav
   1
 
 A checked argument retains its source type in exported proof members.

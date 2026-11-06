@@ -53,7 +53,7 @@
   Verification successful.
 
   $ grep -c '^[[:space:]]*field .*_contents[^:]*:' nested.rav
-  2
+  3
 
   $ caravan --shh --emit-rav named_argument.ml > named_argument.rav
   $ raven --shh --typeonly named_argument.rav

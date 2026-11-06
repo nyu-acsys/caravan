@@ -1,0 +1,5 @@
+module Make (X : Value) = struct
+  lemma incorrect (x : X.t)
+    ensures (false) =
+    ()
+end

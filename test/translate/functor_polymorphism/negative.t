@@ -12,11 +12,11 @@ Raising module arguments report the current forwarding limitation at the source.
   Unsupported Error: A raising operation in a checked module binding is not supported yet.
   $ ! grep -q 'Internal Error:' raising.out
 
-Specialized checked bindings reject polymorphic operations at the source.
+Forwarding through a previously checked module rejects unsupported polymorphic operations.
 
   $ ! caravan --shh nested_specialization.ml > nested.out 2>&1
   $ grep 'Unsupported Error:' nested.out
-  Unsupported Error: A polymorphic operation in a specialized checked module binding is not supported yet.
+  Unsupported Error: A polymorphic operation forwarded through a previously checked module view is not supported yet.
   $ ! grep -q 'Internal Error:' nested.out
 
 Polymorphic checked views cannot yet be forwarded through another checked view.

@@ -40,6 +40,7 @@ Shared leaf dictionaries contribute one contract check per abstract source type.
 
   $ caravan --shh --emit-rav generic_ref.ml > ref.rav
   $ sed -n '/^module Generic_.*\[/p' ref.rav
+  module Generic_Make_Cell[Parameter: Argument_Make_Cell]
   $ raven --shh --typeonly ref.rav
   Verification successful.
 
@@ -62,6 +63,7 @@ Shared leaf dictionaries contribute one contract check per abstract source type.
 
   $ caravan --shh --emit-rav generic_ref_alias.ml > ref_alias.rav
   $ sed -n '/^module Generic_.*\[/p' ref_alias.rav
+  module Generic_Make_Cell[Parameter: Argument_Make_Cell]
   $ raven --shh --typeonly ref_alias.rav
   Verification successful.
 

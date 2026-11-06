@@ -494,7 +494,13 @@ let run (source : Source.t) : (t, error) Result.t =
         expand (List.length inventory.aliases) declared)
   in
   let* types =
-    List.fold_result inventory.bindings ~init:types ~f:(fun types binding ->
+    List.fold_result
+      (List.filter inventory.bindings ~f:(fun binding ->
+           not
+             (Module_inventory.formal_binding inventory binding
+             || Module_inventory.symbolic_binding inventory binding)))
+      ~init:types
+      ~f:(fun types binding ->
         List.fold_result binding.Module_inventory.expected.signature_types ~init:types
           ~f:(fun types (member, declaration) ->
             let actual = Path.Pdot (binding.actual_path, member) in
@@ -539,7 +545,7 @@ let run (source : Source.t) : (t, error) Result.t =
         then Ok ()
         else
           unsupported binding.entry.name.pid_loc
-            "A functor proof without a supported generic runtime body and application")
+            "A functor proof without a supported generic runtime body")
   in
   let* _ =
     all source.proof_types ~f:(fun data ->
@@ -548,7 +554,7 @@ let run (source : Source.t) : (t, error) Result.t =
           when Option.is_some (Proof_bindings.functor_ancestor source.proof_scopes scope)
                && Option.is_none (Generic_proofs.owner generic_proofs (Some scope)) ->
             unsupported data.Datatypes.at
-              "A functor proof without a supported generic runtime body and application"
+              "A functor proof without a supported generic runtime body"
         | Some _ | None -> Ok ())
   in
   let* applications =

@@ -14,6 +14,7 @@ type t = {
   interface : string;
   parameter : string;
   representative : Module_inventory.specialization;
+  definition : application option;
   applications : application list;
   types : (string * string) list;
   resources : (string * string) list;
@@ -25,6 +26,11 @@ type t = {
 }
 
 let parameter_groups group = group.captures @ [ { group with captures = [] } ]
+let contexts group = Option.to_list group.definition @ group.applications
+
+let representative_context group =
+  Option.value_or_thunk group.definition ~default:(fun () ->
+      List.hd_exn group.applications)
 
 let stage_source (source : Module_inventory.specialization)
     (stage : Module_inventory.parameter_instance) =
@@ -53,7 +59,7 @@ let has_layout source =
       | Ttype_variant _ | Ttype_record _ -> true
       | _ -> false)
 
-let eligible (source : Module_inventory.specialization) =
+let eligible ?(definition = false) (source : Module_inventory.specialization) =
   let abstract_types =
     List.for_all source.parameters
       ~f:(fun (stage : Module_inventory.parameter_instance) ->
@@ -151,10 +157,12 @@ let eligible (source : Module_inventory.specialization) =
         in
         let iterator = { Tast_iterator.default_iterator with expr } in
         iterator.structure iterator body;
-        (not !heap_access)
+        (definition || not !heap_access)
         && List.for_all body.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
-            | Tstr_value _ | Tstr_attribute _ | Tstr_exception _ -> true
+            | Tstr_value _ | Tstr_attribute _ | Tstr_exception _ | Tstr_module _
+            | Tstr_modtype _ ->
+                true
             | Tstr_type (_, declarations) ->
                 List.for_all declarations ~f:(fun declaration ->
                     match declaration.Typedtree.typ_kind with
@@ -184,9 +192,9 @@ let eligible (source : Module_inventory.specialization) =
     List.for_all source.members ~f:(fun (_, id) ->
         List.exists source.body_members ~f:(fun (_, member) -> Ident.same id member))
   in
-  (not (List.is_empty source.members)) && functions && abstract_types && body
+  functions && abstract_types && body
 
-let plan ?(proof_layout = fun _ -> false) sources =
+let plan ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
   let make_application source =
     {
       source;
@@ -195,7 +203,7 @@ let plan ?(proof_layout = fun _ -> false) sources =
       layout = Fresh_names.fresh "Layout";
     }
   in
-  let add groups (source : Module_inventory.specialization) =
+  let add ~definition groups (source : Module_inventory.specialization) =
     let application = make_application source in
     match List.find groups ~f:(fun group -> same_stages group.representative source) with
     | Some group ->
@@ -203,15 +211,24 @@ let plan ?(proof_layout = fun _ -> false) sources =
             if phys_equal group other then
               {
                 other with
-                applications = other.applications @ [ application ];
+                definition = (if definition then Some application else other.definition);
+                applications =
+                  (if definition then other.applications
+                   else other.applications @ [ application ]);
                 captures =
                   List.map2_exn other.captures (List.drop_last_exn source.parameters)
                     ~f:(fun capture stage ->
                       {
                         capture with
+                        definition =
+                          (if definition then
+                             Some { application with source = stage_source source stage }
+                           else capture.definition);
                         applications =
-                          capture.applications
-                          @ [ { application with source = stage_source source stage } ];
+                          (if definition then capture.applications
+                           else
+                             capture.applications
+                             @ [ { application with source = stage_source source stage } ]);
                       });
               }
             else other)
@@ -224,6 +241,16 @@ let plan ?(proof_layout = fun _ -> false) sources =
                     if Char.is_alphanum c || Char.equal c '_' then c else '_')
               in
               (member, Fresh_names.fresh (label ^ "_" ^ stem)))
+        in
+        let slots argument select entries label =
+          Option.value_or_thunk
+            (List.find_map groups ~f:(fun group ->
+                 List.find_map (parameter_groups group) ~f:(fun stage ->
+                     Option.some_if
+                       (Module_inventory.same_binding stage.representative.argument
+                          argument)
+                       (select stage))))
+            ~default:(fun () -> members entries label)
         in
         let world =
           Option.some_if
@@ -265,10 +292,22 @@ let plan ?(proof_layout = fun _ -> false) sources =
             interface = qualify (Fresh_names.fresh ("Argument_" ^ prefix ^ "_stage"));
             parameter = "Parameter_" ^ Int.to_string index;
             representative = stage_source;
-            applications = [ { application with source = stage_source } ];
-            types = members stage.argument.expected.signature_types "Type";
-            resources = members stage.argument.expected.signature_resources "resource";
-            operations = members stage.argument.expected.signature_values "operation";
+            definition =
+              Option.some_if definition { application with source = stage_source };
+            applications =
+              (if definition then [] else [ { application with source = stage_source } ]);
+            types =
+              slots stage.argument
+                (fun stage -> stage.types)
+                stage.argument.expected.signature_types "Type";
+            resources =
+              slots stage.argument
+                (fun stage -> stage.resources)
+                stage.argument.expected.signature_resources "resource";
+            operations =
+              slots stage.argument
+                (fun stage -> stage.operations)
+                stage.argument.expected.signature_values "operation";
             members = member_names;
             body_members = body_member_names;
             world;
@@ -286,10 +325,27 @@ let plan ?(proof_layout = fun _ -> false) sources =
               interface = qualify (Fresh_names.fresh ("Argument_" ^ prefix));
               parameter = "Parameter";
               representative = source;
-              applications = [ application ];
-              types = members source.argument.expected.signature_types "Type";
-              resources = members source.argument.expected.signature_resources "resource";
-              operations = members source.argument.expected.signature_values "operation";
+              definition =
+                Option.some_if definition
+                  {
+                    application with
+                    name;
+                    layout = name ^ ".Layout";
+                    world = Option.value world ~default:application.world;
+                  };
+              applications = (if definition then [] else [ application ]);
+              types =
+                slots source.argument
+                  (fun stage -> stage.types)
+                  source.argument.expected.signature_types "Type";
+              resources =
+                slots source.argument
+                  (fun stage -> stage.resources)
+                  source.argument.expected.signature_resources "resource";
+              operations =
+                slots source.argument
+                  (fun stage -> stage.operations)
+                  source.argument.expected.signature_values "operation";
               members = member_names;
               body_members = body_member_names;
               world;
@@ -297,24 +353,82 @@ let plan ?(proof_layout = fun _ -> false) sources =
             };
           ]
   in
-  List.fold (List.filter sources ~f:eligible) ~init:[] ~f:add
+  let groups =
+    List.fold
+      (List.filter definitions ~f:(eligible ~definition:true))
+      ~init:[] ~f:(add ~definition:true)
+  in
+  let groups =
+    List.fold
+      (List.filter sources ~f:(eligible ~definition:false))
+      ~init:groups ~f:(add ~definition:false)
+  in
+  let owner source =
+    List.filter groups ~f:(fun group ->
+        Option.is_some group.definition
+        && List.is_prefix source.Module_inventory.argument.namespace
+             ~prefix:(List.drop_last_exn group.representative.argument.namespace)
+             ~equal:String.equal)
+    |> List.max_elt ~compare:(fun left right ->
+        Int.compare
+          (List.length left.representative.argument.namespace)
+          (List.length right.representative.argument.namespace))
+  in
+  let qualify_application application =
+    if not application.source.symbolic then application
+    else
+      match owner application.source with
+      | None -> application
+      | Some owner ->
+          let qualify name = owner.name ^ "." ^ name in
+          {
+            application with
+            name = qualify application.name;
+            world = qualify application.world;
+            layout = qualify application.layout;
+          }
+  in
+  (* Body-local result layouts stay internal to the declaration worker. Concrete
+     copies retain the compiler's application identities. *)
+  let nested_layout group =
+    List.exists sources ~f:(fun source ->
+        source.Module_inventory.symbolic
+        && (has_layout source || proof_layout source)
+        && Option.exists (owner source) ~f:(fun enclosing ->
+            String.equal enclosing.name group.name))
+  in
+  let rec qualify_group group =
+    let applications =
+      if nested_layout group then
+        List.filter group.applications ~f:(fun application -> application.source.symbolic)
+      else group.applications
+    in
+    {
+      group with
+      applications = List.map applications ~f:qualify_application;
+      captures = List.map group.captures ~f:qualify_group;
+    }
+  in
+  List.map groups ~f:qualify_group
 
 let interface (group : t) (application : application) =
-  match group.world with
-  | None -> group.interface
-  | Some _ -> application.world ^ "." ^ (Qualified_name.of_string group.interface).name
+  if Option.exists group.definition ~f:(phys_equal application) then group.interface
+  else
+    match group.world with
+    | None -> group.interface
+    | Some _ -> application.world ^ "." ^ (Qualified_name.of_string group.interface).name
 
 let application_for_binding groups binding =
   List.find_map groups ~f:(fun group ->
       List.find_map (parameter_groups group) ~f:(fun stage ->
           Option.map
-            (List.find stage.applications ~f:(fun application ->
-                 phys_equal application.source.argument binding))
+            (List.find (contexts stage) ~f:(fun application ->
+                 Module_inventory.same_binding application.source.argument binding))
             ~f:(fun application -> (stage, application))))
 
 let member groups id =
   List.find_map groups ~f:(fun group ->
-      List.find_map group.applications ~f:(fun application ->
+      List.find_map (contexts group) ~f:(fun application ->
           Option.map
             (List.find application.source.body_members ~f:(fun (_, candidate) ->
                  Ident.same candidate id))
@@ -338,6 +452,11 @@ let types group ~owner =
         let descriptor =
           Datatypes.parameter_type ~parameter:group.representative.parameter ~name:source
             ~declaration ~backend
+        in
+        let descriptor =
+          Datatypes.with_paths descriptor
+            (List.map group.representative.argument.paths ~f:(fun path ->
+                 Path.Pdot (path, source)))
         in
         match declaration.Typedtree.typ_manifest with
         | Some _ -> descriptor
@@ -394,7 +513,9 @@ let types group ~owner =
           backend_type = Some backend;
           paths =
             Path.Pdot (Path.Pdot (Path.Pident group.representative.parameter, name), "t")
-            :: descriptor.paths;
+            :: List.map group.representative.argument.paths ~f:(fun path ->
+                Path.Pdot (Path.Pdot (path, name), "t"))
+            @ descriptor.paths;
         })
   in
   formal_types @ ghost_types

@@ -190,8 +190,21 @@ let plan groups scopes =
             ~f:(fun group -> (group, scope)))
   in
   List.map candidates ~f:(fun (group, scope) ->
+      let* originals =
+        match group.Generic_modules.definition with
+        | None -> Ok scope.parameters
+        | Some _ ->
+            List.map group.representative.parameters
+              ~f:(fun (stage : Module_inventory.parameter_instance) ->
+                match stage.template.mod_desc with
+                | Tmod_functor (parameter, _) -> Ok parameter
+                | _ ->
+                    Report.unsupported stage.template.mod_loc
+                      "A generic proof parameter without a functor declaration")
+            |> Result.all
+      in
       let parameters =
-        List.map2_exn scope.parameters
+        List.map2_exn originals
           (List.zip_exn group.Generic_modules.representative.parameters
              (Generic_modules.parameter_groups group))
           ~f:(fun original (instance, generic) ->
@@ -367,9 +380,7 @@ let applications (source : Source.t) (inventory : Module_inventory.t)
       match members with
       | member :: _ -> Ok (Source.annotation_env source member.site.environment)
       | [] ->
-          Error
-            (Report.error Type application_source.argument.site.item_loc
-               "The application has no typed runtime member for its proof")
+          Ok (Source.annotation_env source application_source.argument.site.environment)
     in
     let private_projection =
       asset_projection source plan application_source.identity private_projection
@@ -532,7 +543,9 @@ let model_types ?(representation = fun _ _ -> None) source inventory plans =
                     in
                     let representation =
                       Option.value (representation plan data)
-                        ~default:(model_descriptor data ~owner:[ canonical.layout ])
+                        ~default:
+                          (model_descriptor data
+                             ~owner:(String.split canonical.layout ~on:'.'))
                     in
                     let paths =
                       Option.value_map data.id ~default:[] ~f:(fun id ->

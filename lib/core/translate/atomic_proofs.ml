@@ -701,6 +701,27 @@ let next_state ctx st ~inv_params args (opened : opened) (p : performing) =
     indices,
     List.map appended ~f:(fun (field, _, e, position) -> (field, e, position)) )
 
+(** Appending to an indexed field preserves its inverse map only for fresh entries. *)
+let appended_freshness ~loc:l st (opened : opened) appended =
+  let bin op a b = R.Expr.binary ~loc:l op a b in
+  List.map appended ~f:(fun (field, element, _) ->
+      let position, _ =
+        List.findi_exn st.fields ~f:(fun _ (name, _, _, _, _) -> String.equal name field)
+      in
+      let entries = List.nth_exn opened.values position in
+      let index = List.Assoc.find_exn opened.indices field ~equal:String.equal in
+      let position = R.Expr.index ~loc:l index element in
+      R.Expr.not_ ~loc:l
+        (List.reduce_exn ~f:(bin And)
+           [
+             bin Leq (R.Expr.int ~loc:l 0) position;
+             bin Lt position
+               (R.Expr.call ~loc:l
+                  (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
+                  [ entries ]);
+             bin Eq (R.Expr.index ~loc:l entries position) element;
+           ]))
+
 (** The views of [st], whose invariant has the arguments [args], in the state [values]:
     each view, its inputs and its value. *)
 let views_after ctx st args values =
@@ -1517,8 +1538,8 @@ let performing_updates_view ctx performing pred =
       && List.exists st.views ~f:(fun (view, _) ->
           String.equal (target pred) (target view.S.pred_name.pid_str)))
 
-(** The views of the open invariants, set to their values in the states after [p], and
-    folded: the views are functions of the state. *)
+(** Check indexed appends while the old state's ownership is available, then update and
+    fold the views of the open invariants to their values after [p]. *)
 let perform_views ctx ~(at : Location.t) (p : performing) =
   let open State.Syntax in
   let l = loc at in
@@ -1533,9 +1554,16 @@ let perform_views ctx ~(at : Location.t) (p : performing) =
         let args = List.Assoc.find invariants inv ~equal:String.equal in
         match (structure, args) with
         | Some st, Some args when performing_on p inv ->
-            let* next, _, _ = next_state ctx st ~inv_params:st.params args opened p in
+            let* next, _, appended =
+              next_state ctx st ~inv_params:st.params args opened p
+            in
+            let* freshness =
+              State.all (appended_freshness ~loc:l st opened appended) ~f:(fun fact ->
+                  State.check ~at "An indexed append may reuse an existing entry" fact)
+            in
             let+ views = views_after ctx st args (List.map next ~f:fst) in
-            List.concat_map views ~f:(fun (pred, inputs, value) ->
+            freshness
+            @ List.concat_map views ~f:(fun (pred, inputs, value) ->
                 let raven, _ =
                   List.Assoc.find_exn ctx.given.preds pred ~equal:String.equal
                 in

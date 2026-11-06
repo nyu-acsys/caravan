@@ -92,6 +92,7 @@ type t = {
   witness : witness option;
   extension_keys : (Shape.Uid.t * string) list;
       (** For [exn]: the key of each declared exception, its constructor's [ocaml]. *)
+  extension_aliases : (Path.t * string) list;
   at : Location.t;
 }
 
@@ -119,6 +120,7 @@ let list =
     atomic_procedure = None;
     witness = None;
     extension_keys = [];
+    extension_aliases = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -150,6 +152,7 @@ let option =
     atomic_procedure = None;
     witness = None;
     extension_keys = [];
+    extension_aliases = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -285,6 +288,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           witness;
           extension_keys = [];
+          extension_aliases = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -348,6 +352,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           witness = None;
           extension_keys = [];
+          extension_aliases = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -376,6 +381,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           atomic_procedure = None;
           witness = None;
           extension_keys = [];
+          extension_aliases = [];
           backend_type = None;
           module_path = None;
           cell_namespace = None;
@@ -440,6 +446,7 @@ let library_type ~library ~library_id ~at name =
     atomic_procedure = None;
     witness = None;
     extension_keys = [];
+    extension_aliases = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -525,6 +532,7 @@ let collection id kind =
     atomic_procedure = None;
     witness = None;
     extension_keys = [];
+    extension_aliases = [];
     backend_type = None;
     module_path = None;
     cell_namespace = None;
@@ -779,18 +787,20 @@ let find_variable (types : t list) variable =
 let constructor_key (d : t) (cstr : Data_types.constructor_description) =
   match cstr.cstr_tag with
   | Cstr_extension (path, _) ->
-      begin match
-        List.Assoc.find d.extension_keys cstr.cstr_uid ~equal:Shape.Uid.equal
-      with
-      | Some key -> key
-      | None ->
-          (* A functor application's exception, named through it, as [First.Empty]: the
-             application's copy is declared under that path. *)
-          let name = Path.name path in
-          if List.exists d.extension_keys ~f:(fun (_, key) -> String.equal key name) then
-            name
-          else cstr.cstr_name
-      end
+      let name = Path.name path in
+      let name =
+        Option.value
+          (List.Assoc.find d.extension_aliases path ~equal:Path.same)
+          ~default:name
+      in
+      if List.exists d.extension_keys ~f:(fun (_, key) -> String.equal key name) then name
+      else
+        begin match
+          List.Assoc.find d.extension_keys cstr.cstr_uid ~equal:Shape.Uid.equal
+        with
+        | Some key -> key
+        | None -> cstr.cstr_name
+        end
   | _ -> cstr.cstr_name
 
 (** The backend constructor of [cstr], retaining its source payload types. *)

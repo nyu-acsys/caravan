@@ -204,26 +204,7 @@ let transition_lemmas ctx (st : structure) (a : action) ~params ~existentials ~p
                       ~default:e ));
           }
         in
-        (* What the action appends to a field owned by index is not among its entries: not
-           at the position its index map gives it. *)
-        let fresh =
-          List.filter_map appended ~f:(fun (field, e, _) ->
-              Option.both
-                (List.find st.fields ~f:(fun (f, _, _, _, _) -> String.equal f field))
-                (List.Assoc.find st.chains field ~equal:String.equal)
-              |> Option.map ~f:(fun ((_, raven, _, _, _), index) ->
-                  let i = R.Expr.index ~loc:l (var index) e in
-                  R.Expr.not_ ~loc:l
-                    (List.reduce_exn ~f:(bin And)
-                       [
-                         bin Leq (R.Expr.int ~loc:l 0) i;
-                         bin Lt i
-                           (R.Expr.call ~loc:l
-                              (R.Name.make ~loc:l ~path:[ "Seq" ] "length")
-                              [ var raven ]);
-                         bin Eq (R.Expr.index ~loc:l (var raven) i) e;
-                       ])))
-        in
+        let fresh = appended_freshness ~loc:l st opened appended in
         let* views = views_after ctx st args values in
         let structure = List.hd_exn args in
         let structure =
@@ -1292,36 +1273,37 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
             resource.Source.resource_descriptor :: resource.resource_aliases))
     @ types
   in
-  let specializations =
-    List.map inventory.Module_inventory.specializations
-      ~f:(fun (specialization : Module_inventory.specialization) ->
-        let members =
-          List.map specialization.members ~f:(fun (name, id) ->
-              let body =
-                List.find functions ~f:(fun function_ ->
-                    List.mem function_.paths (Path.Pident id) ~equal:Path.same)
-              in
-              (name, Option.value_map body ~default:id ~f:(fun function_ -> function_.id)))
-        in
-        (* A function over a witness whose calls wait is its universal procedure. *)
-        let body_members =
-          List.map specialization.body_members ~f:(fun (name, id) ->
-              match List.Assoc.find universal id ~equal:Ident.same with
-              | Some procedure -> (name, procedure)
-              | None -> (name, id))
-        in
-        let same =
-          List.equal (fun (left, left_id) (right, right_id) ->
-              String.equal left right && Ident.same left_id right_id)
-        in
-        if
-          same members specialization.members
-          && same body_members specialization.body_members
-        then specialization
-        else { specialization with members; body_members })
+  let prepare (specialization : Module_inventory.specialization) =
+    let members =
+      List.map specialization.members ~f:(fun (name, id) ->
+          let body =
+            List.find functions ~f:(fun function_ ->
+                List.mem function_.paths (Path.Pident id) ~equal:Path.same)
+          in
+          (name, Option.value_map body ~default:id ~f:(fun function_ -> function_.id)))
+    in
+    (* A function over a witness whose calls wait is its universal procedure. *)
+    let body_members =
+      List.map specialization.body_members ~f:(fun (name, id) ->
+          match List.Assoc.find universal id ~equal:Ident.same with
+          | Some procedure -> (name, procedure)
+          | None -> (name, id))
+    in
+    let same =
+      List.equal (fun (left, left_id) (right, right_id) ->
+          String.equal left right && Ident.same left_id right_id)
+    in
+    if
+      same members specialization.members && same body_members specialization.body_members
+    then specialization
+    else { specialization with members; body_members }
   in
+  let specializations = List.map inventory.Module_inventory.specializations ~f:prepare in
+  let definitions = List.map inventory.definitions ~f:prepare in
   let groups =
-    Generic_modules.plan ~proof_layout:(Generic_proofs.has_models source) specializations
+    Generic_modules.plan ~definitions
+      ~proof_layout:(Generic_proofs.has_models source)
+      specializations
   in
   let annotations = Source.annotations source in
   let rec field_term (term : S.term) =
@@ -1389,7 +1371,7 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
                           function_.signature_sites representative.signature_sites))
         in
         let supported_functions =
-          List.for_all group.applications ~f:(fun application ->
+          List.for_all (Generic_modules.contexts group) ~f:(fun application ->
               List.for_all application.source.body_members ~f:(fun (_, id) ->
                   Option.exists
                     (List.find functions ~f:(fun f -> Ident.same f.id id))
@@ -1463,7 +1445,9 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
         in
         Ok
           (Option.some_if
-             (supported_functions && representation_stable && (not explicit_proofs)
+             (supported_functions
+             && (Option.is_some group.definition || representation_stable)
+             && (not explicit_proofs)
              && (not (List.exists parameter_contracts ~f:field_contract))
              && List.for_all (List.concat modes) ~f:Fn.id)
              group))

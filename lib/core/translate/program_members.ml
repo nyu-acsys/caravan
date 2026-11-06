@@ -531,13 +531,47 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     in
     (ctx, local, args, result, expected)
   in
+  let symbolic_view group owner =
+    let view =
+      List.find_exn checked_views ~f:(fun view ->
+          Module_inventory.same_binding view.view_binding
+            group.Generic_modules.representative.argument)
+    in
+    {
+      view with
+      view_types =
+        Generic_modules.types group ~owner
+        @ (let root =
+             List.find_exn generics ~f:(fun root ->
+                 String.equal root.Generic_modules.name group.name)
+           in
+           Option.value_map root.world ~default:[] ~f:(fun world ->
+               List.concat_map (Generic_modules.parameter_groups root) ~f:(fun stage ->
+                   Generic_modules.world_types stage ~owner:[ world ])))
+        @ types;
+      view_resources =
+        List.map view.view_resources ~f:(fun (formal, resource) ->
+            let stem =
+              List.Assoc.find_exn group.resources
+                formal.Module_inventory.declaration.pred_name.pid_str ~equal:String.equal
+            in
+            ( formal,
+              {
+                resource with
+                resource_backend = String.concat ~sep:"." (owner @ [ stem ]);
+              } ));
+    }
+  in
   (* The forwarding procedures of the checked operations, the pure functions they call
      published as procedures, and the contracts the operations' paths were prepared with. *)
   let* (adapter_members, publication_members), state =
     State.run_from state
     @@ State.map ~f:(fun (adapters, _, _, publication_members) ->
         (List.rev adapters, publication_members))
-    @@ State.fold checked_operations ~init:([], [], [], [])
+    @@ State.fold
+         (List.filter checked_operations ~f:(fun operation ->
+              not (Module_inventory.formal_binding inventory operation.operation_binding)))
+         ~init:([], [], [], [])
          ~f:(fun
              (adapters, checked_prepared, publications, publication_members) operation ->
            let open State.Syntax in
@@ -567,6 +601,59 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                    else State.return ()
                  in
                  State.return (info, publications, publication_members)
+             | None
+               when Module_inventory.symbolic_binding inventory binding
+                    && not
+                         (List.is_empty
+                            (Module_context.for_location scopes.module_contexts
+                               binding.site.item_loc)
+                              .parameters) ->
+                 let formal =
+                   List.find checked_operations ~f:(fun formal ->
+                       Module_inventory.formal_binding inventory formal.operation_binding
+                       && List.mem formal.operation_paths actual_path ~equal:Path.same)
+                 in
+                 let context =
+                   Module_context.for_location scopes.module_contexts
+                     binding.site.item_loc
+                 in
+                 let symbolic =
+                   Option.bind formal ~f:(fun formal ->
+                       Option.map
+                         (List.find context.parameters ~f:(fun parameter ->
+                              Module_inventory.same_binding formal.operation_binding
+                                parameter.Generic_proofs.instance.argument))
+                         ~f:(fun parameter -> (formal, parameter.generic)))
+                 in
+                 begin match symbolic with
+                 | None ->
+                     State.of_result
+                       (unsupported at
+                          "A symbolic module argument without an enclosing parameter \
+                           operation")
+                 | Some (formal, stage) ->
+                     let owner = context.namespace @ [ stage.parameter ] in
+                     let formal_view = symbolic_view stage owner in
+                     let* _, _, _, _, actual =
+                       prepare_view_operation ~abstract:true ~primitive_namespace:owner
+                         formal_view formal
+                     in
+                     let projection =
+                       checked_type_substitution formal.operation_binding
+                         formal.operation_binding.actual_path
+                     in
+                     let target =
+                       String.concat ~sep:"." (owner @ [ formal.operation_member ])
+                     in
+                     State.return
+                       ( ( actual,
+                           formal.operation_contract,
+                           projection,
+                           formal.operation_signature.site.item_loc,
+                           target ),
+                         publications,
+                         publication_members )
+                 end
              | None -> (
                  match
                    List.find funcs ~f:(fun f ->
@@ -931,36 +1018,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
              publications,
              publication_members ))
   in
-  let symbolic_view group owner =
-    let view =
-      List.find_exn checked_views ~f:(fun view ->
-          phys_equal view.view_binding group.Generic_modules.representative.argument)
-    in
-    {
-      view with
-      view_types =
-        Generic_modules.types group ~owner
-        @ (let root =
-             List.find_exn generics ~f:(fun root ->
-                 String.equal root.Generic_modules.name group.name)
-           in
-           Option.value_map root.world ~default:[] ~f:(fun world ->
-               List.concat_map (Generic_modules.parameter_groups root) ~f:(fun stage ->
-                   Generic_modules.world_types stage ~owner:[ world ])))
-        @ types;
-      view_resources =
-        List.map view.view_resources ~f:(fun (formal, resource) ->
-            let stem =
-              List.Assoc.find_exn group.resources
-                formal.Module_inventory.declaration.pred_name.pid_str ~equal:String.equal
-            in
-            ( formal,
-              {
-                resource with
-                resource_backend = String.concat ~sep:"." (owner @ [ stem ]);
-              } ));
-    }
-  in
   let resource_members group view ~aliases =
     let open State.Syntax in
     let+ members =
@@ -1267,7 +1324,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               ~at:constraint_.at constraint_.signature)
   in
   let* _ =
-    all inventory.bindings ~f:(fun binding -> ghost_module_members ~aliases:true binding)
+    all
+      (List.filter inventory.bindings ~f:(fun binding ->
+           not (Module_inventory.formal_binding inventory binding)))
+      ~f:(fun binding -> ghost_module_members ~aliases:true binding)
   in
   let* generic_interfaces, state =
     State.run_from state
@@ -1285,7 +1345,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               State.all checked_operations ~f:(fun operation ->
                   if
                     not
-                      (phys_equal operation.operation_binding
+                      (Module_inventory.same_binding operation.operation_binding
                          group.representative.argument)
                   then State.return []
                   else
@@ -1361,80 +1421,85 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* checked_module_members, state =
     State.run_from state
     @@ State.all checked_modules ~f:(fun view ->
-        let open State.Syntax in
-        let at = view.Checked_modules.binding.site.item_loc in
-        let l = loc at in
-        let members =
-          List.filter adapter_members ~f:(fun (operation, _, _, _) ->
-              phys_equal operation.operation_binding view.binding)
-        in
-        match (view.grouped, view.target) with
-        | false, _ ->
-            let+ members =
-              State.all members ~f:(fun (operation, ctx, _, member) ->
-                  operation_module ~abstract:false ctx operation member)
-            in
-            List.concat members
-        | true, Some target ->
-            State.return
-              [
-                R.Member.checked_view ~loc:l
-                  ~typ:(qualified_name ~loc:l view.interface)
-                  (ident ~loc:l view.name) (name ~loc:l target);
-              ]
-        | true, None ->
-            let* prefix, aliases =
-              match Generic_modules.application_for_binding generics view.binding with
-              | None ->
-                  let concrete =
-                    List.find_exn checked_views ~f:(fun checked ->
-                        phys_equal checked.view_binding view.binding)
-                  in
-                  let* declarations =
-                    State.all members ~f:(fun (operation, _, _, _) ->
-                        let* ctx, _, _, _, prepared =
-                          prepare_view_operation ~abstract:true
-                            ~primitive_namespace:(String.split view.interface ~on:'.')
-                            concrete operation
-                        in
-                        operation_module ~abstract:true ctx operation
-                          (prepared_member ~at:operation.operation_signature.site.item_loc
-                             ~name:operation.operation_member None prepared))
-                  in
-                  State.return
-                    ( [
-                        R.Member.module_ ~loc:l ~interface:true
-                          (ident ~loc:l view.interface) (List.concat declarations);
-                      ],
-                      [] )
-              | Some (group, _) ->
-                  let concrete =
-                    List.find_exn checked_views ~f:(fun checked ->
-                        phys_equal checked.view_binding view.binding)
-                  in
-                  let* types = type_members group concrete ~aliases:true in
-                  let* resources = resource_members group concrete ~aliases:true in
-                  let* ghost_modules =
-                    State.of_result (ghost_module_members ~aliases:true view.binding)
-                  in
-                  let+ support =
-                    worker_support ~namespace:(String.split view.name ~on:'.') ~at ()
-                  in
-                  ([], types @ support @ resources @ ghost_modules)
-            in
-            let* members =
-              State.all members ~f:(fun (operation, ctx, _, member) ->
-                  operation_module ~abstract:false ~inherited:view.interface ctx operation
-                    member)
-            in
-            State.return
-              (prefix
-              @ [
-                  R.Member.module_ ~loc:l
-                    ~implements:[ (qualified_name ~loc:l view.interface, []) ]
-                    (ident ~loc:l view.name)
-                    (aliases @ List.concat members);
-                ]))
+        if Module_inventory.formal_binding inventory view.Checked_modules.binding then
+          State.return []
+        else
+          let open State.Syntax in
+          let at = view.Checked_modules.binding.site.item_loc in
+          let l = loc at in
+          let members =
+            List.filter adapter_members ~f:(fun (operation, _, _, _) ->
+                phys_equal operation.operation_binding view.binding)
+          in
+          match (view.grouped, view.target) with
+          | false, _ ->
+              let+ members =
+                State.all members ~f:(fun (operation, ctx, _, member) ->
+                    operation_module ~abstract:false ctx operation member)
+              in
+              List.concat members
+          | true, Some target ->
+              State.return
+                [
+                  R.Member.checked_view ~loc:l
+                    ~typ:(qualified_name ~loc:l view.interface)
+                    (ident ~loc:l (Qualified_name.of_string view.name).name)
+                    (name ~loc:l target);
+                ]
+          | true, None ->
+              let* prefix, aliases =
+                match Generic_modules.application_for_binding generics view.binding with
+                | None ->
+                    let concrete =
+                      List.find_exn checked_views ~f:(fun checked ->
+                          phys_equal checked.view_binding view.binding)
+                    in
+                    let* declarations =
+                      State.all members ~f:(fun (operation, _, _, _) ->
+                          let* ctx, _, _, _, prepared =
+                            prepare_view_operation ~abstract:true
+                              ~primitive_namespace:(String.split view.interface ~on:'.')
+                              concrete operation
+                          in
+                          operation_module ~abstract:true ctx operation
+                            (prepared_member
+                               ~at:operation.operation_signature.site.item_loc
+                               ~name:operation.operation_member None prepared))
+                    in
+                    State.return
+                      ( [
+                          R.Member.module_ ~loc:l ~interface:true
+                            (ident ~loc:l view.interface) (List.concat declarations);
+                        ],
+                        [] )
+                | Some (group, _) ->
+                    let concrete =
+                      List.find_exn checked_views ~f:(fun checked ->
+                          phys_equal checked.view_binding view.binding)
+                    in
+                    let* types = type_members group concrete ~aliases:true in
+                    let* resources = resource_members group concrete ~aliases:true in
+                    let* ghost_modules =
+                      State.of_result (ghost_module_members ~aliases:true view.binding)
+                    in
+                    let+ support =
+                      worker_support ~namespace:(String.split view.name ~on:'.') ~at ()
+                    in
+                    ([], types @ support @ resources @ ghost_modules)
+              in
+              let* members =
+                State.all members ~f:(fun (operation, ctx, _, member) ->
+                    operation_module ~abstract:false ~inherited:view.interface ctx
+                      operation member)
+              in
+              State.return
+                (prefix
+                @ [
+                    R.Member.module_ ~loc:l
+                      ~implements:[ (qualified_name ~loc:l view.interface, []) ]
+                      (ident ~loc:l (Qualified_name.of_string view.name).name)
+                      (aliases @ List.concat members);
+                  ]))
   in
   let* type_constructor_factories, state =
     State.run_from state
@@ -1510,7 +1575,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               let name =
                 match
                   List.find stages ~f:(fun stage ->
-                      phys_equal operation.operation_binding stage.representative.argument)
+                      Module_inventory.same_binding operation.operation_binding
+                        stage.representative.argument)
                 with
                 | None -> worker.name
                 | Some stage ->
@@ -2001,7 +2067,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           List.fold checked_operations ~init:body_functions ~f:(fun mappings operation ->
               match
                 List.find stages ~f:(fun stage ->
-                    phys_equal operation.operation_binding stage.representative.argument)
+                    Module_inventory.same_binding operation.operation_binding
+                      stage.representative.argument)
               with
               | None -> mappings
               | Some stage ->
@@ -2227,10 +2294,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let for_applications sets ~rename =
     sets
     @ List.concat_map scopes.generics ~f:(fun (group : Generic_modules.t) ->
-        let representative =
-          List.find_exn group.applications ~f:(fun application ->
-              phys_equal application.source group.representative)
-        in
+        let representative = Generic_modules.representative_context group in
         let shared = Exceptions.shared decls.types group in
         List.concat_map group.applications ~f:(fun application ->
             if phys_equal application representative then []

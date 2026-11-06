@@ -14,7 +14,7 @@ The two applications retain distinct ghost model types.
   $ ! caravan --shh models_type_only_cross.ml > models_type_only_cross.out 2>&1
   $ grep -q 'Type Error:' models_type_only_cross.out
 
-An unapplied template must not emit its model as a global type.
+An unapplied template checks its model in its generic declaration.
 
   $ cat > unapplied_model.ml <<'ML'
   > module type ARG = sig type t end
@@ -27,6 +27,5 @@ An unapplied template must not emit its model as a global type.
   >   type model = Empty
   > end
   > PROOF
-  $ ! caravan --shh unapplied_model.ml > unapplied_model.out 2>&1
-  $ grep -F 'A functor proof without a supported generic runtime body and application is not supported yet.' unapplied_model.out
-  Unsupported Error: A functor proof without a supported generic runtime body and application is not supported yet.
+  $ caravan --shh unapplied_model.ml
+  Verification successful.

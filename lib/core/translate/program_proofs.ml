@@ -596,87 +596,129 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
           checked_type_substitution ~substitution:binding.parameter_substitution binding
             binding.actual_path
         in
-        let view_types = checked_raw_types types binding in
+        let context =
+          Module_context.for_location scopes.module_contexts binding.site.item_loc
+        in
+        let symbolic_types =
+          if Module_inventory.symbolic_binding inventory binding then
+            List.concat_map (Module_context.groups context.destination) ~f:(fun group ->
+                Generic_modules.worker_types group ~owner:context.namespace)
+          else []
+        in
+        let view_types = checked_raw_types (symbolic_types @ types) binding in
         let* view_resources =
           all binding.expected.signature_resources ~f:(fun (member, formal) ->
-              let wanted = Path.Pdot (binding.actual_path, member) in
-              match
-                List.find resources ~f:(fun resource ->
-                    List.mem resource.resource_paths wanted ~equal:Path.same)
-              with
-              | None ->
-                  error binding.site.item_loc
-                    ("The actual module does not declare resource " ^ member)
-              | Some actual ->
-                  let declaration = formal.Module_inventory.declaration in
-                  let* () =
-                    if Option.is_none declaration.pred_body then Ok ()
-                    else
-                      unsupported formal.site.item_loc
-                        "A resource definition in a checked module signature"
-                  in
-                  let* () =
-                    if
-                      Bool.equal declaration.pred_persistent
-                        actual.resource_declaration.pred_persistent
-                      && List.length declaration.pred_params
-                         = List.length actual.resource_types
-                    then Ok ()
-                    else
-                      error binding.site.item_loc
-                        ("The resource declaration " ^ member
-                       ^ " has a different kind or arity")
-                  in
-                  let environment =
-                    Source.annotation_env source formal.site.environment
-                  in
-                  let* raw =
-                    Proof_bindings.parameter_types environment declaration.pred_params
-                  in
-                  let raw =
-                    Compiler_types.map_group raw ~f:(Subst.type_expr formal.substitution)
-                  in
-                  let projected =
-                    Compiler_types.map_group raw ~f:(Subst.type_expr actual_substitution)
-                  in
-                  let implemented =
-                    Compiler_types.map_group actual.resource_types
-                      ~f:(Subst.type_expr binding.parameter_substitution)
-                  in
-                  let* equal =
-                    Signature_contract.compiler ~at:binding.site.item_loc (fun () ->
-                        Ctype.is_equal binding.site.environment true projected implemented)
-                  in
-                  let* () =
-                    if equal then Ok ()
-                    else
-                      error binding.site.item_loc
-                        ("The resource declaration " ^ member
-                       ^ " has different parameter types")
-                  in
-                  let* expected = implicit_parameters declaration in
-                  let* actual_implicit =
-                    implicit_parameters actual.resource_declaration
-                  in
-                  let* () =
-                    if expected = actual_implicit then Ok ()
-                    else
-                      error binding.site.item_loc
-                        ("The resource declaration " ^ member
-                       ^ " has different implicit parameters")
-                  in
-                  Ok
-                    ( formal,
-                      {
-                        resource_paths =
-                          List.map binding.paths ~f:(fun path -> Path.Pdot (path, member));
-                        resource_declaration = declaration;
-                        resource_backend = actual.resource_backend;
-                        resource_types =
-                          Compiler_types.map_group raw
-                            ~f:(Subst.type_expr source_substitution);
-                        resource_raw_types = raw;
-                      } ))
+              let declaration = formal.Module_inventory.declaration in
+              let* () =
+                if Option.is_none declaration.pred_body then Ok ()
+                else
+                  unsupported formal.site.item_loc
+                    "A resource definition in a checked module signature"
+              in
+              let environment = Source.annotation_env source formal.site.environment in
+              let* raw =
+                Proof_bindings.parameter_types environment declaration.pred_params
+              in
+              let raw =
+                Compiler_types.map_group raw ~f:(Subst.type_expr formal.substitution)
+              in
+              let resource ~backend =
+                {
+                  resource_paths =
+                    List.map binding.paths ~f:(fun path -> Path.Pdot (path, member));
+                  resource_declaration = declaration;
+                  resource_backend = backend;
+                  resource_types =
+                    Compiler_types.map_group raw ~f:(Subst.type_expr source_substitution);
+                  resource_raw_types = raw;
+                }
+              in
+              if Module_inventory.formal_binding inventory binding then
+                let* _ = implicit_parameters declaration in
+                let backend =
+                  Option.value_map
+                    (Generic_modules.application_for_binding scopes.generics binding)
+                    ~default:(String.concat ~sep:"." (binding.namespace @ [ member ]))
+                    ~f:(fun (group, _) ->
+                      group.interface ^ "."
+                      ^ List.Assoc.find_exn group.resources member ~equal:String.equal)
+                in
+                Ok (formal, resource ~backend)
+              else
+                let wanted = Path.Pdot (binding.actual_path, member) in
+                match
+                  List.find resources ~f:(fun resource ->
+                      List.mem resource.resource_paths wanted ~equal:Path.same)
+                with
+                | None ->
+                    error binding.site.item_loc
+                      ("The actual module does not declare resource " ^ member)
+                | Some actual ->
+                    let* () =
+                      if
+                        Bool.equal declaration.pred_persistent
+                          actual.resource_declaration.pred_persistent
+                        && List.length declaration.pred_params
+                           = List.length actual.resource_types
+                      then Ok ()
+                      else
+                        error binding.site.item_loc
+                          ("The resource declaration " ^ member
+                         ^ " has a different kind or arity")
+                    in
+                    let projected =
+                      Compiler_types.map_group raw
+                        ~f:(Subst.type_expr actual_substitution)
+                    in
+                    let implemented =
+                      Compiler_types.map_group actual.resource_types
+                        ~f:(Subst.type_expr binding.parameter_substitution)
+                    in
+                    let* equal =
+                      Signature_contract.compiler ~at:binding.site.item_loc (fun () ->
+                          Ctype.is_equal binding.site.environment true projected
+                            implemented)
+                    in
+                    let* () =
+                      if equal then Ok ()
+                      else
+                        error binding.site.item_loc
+                          ("The resource declaration " ^ member
+                         ^ " has different parameter types")
+                    in
+                    let* expected = implicit_parameters declaration in
+                    let* actual_implicit =
+                      implicit_parameters actual.resource_declaration
+                    in
+                    let* () =
+                      if expected = actual_implicit then Ok ()
+                      else
+                        error binding.site.item_loc
+                          ("The resource declaration " ^ member
+                         ^ " has different implicit parameters")
+                    in
+                    let backend =
+                      if not (Module_inventory.symbolic_binding inventory binding) then
+                        actual.resource_backend
+                      else
+                        Option.value_map
+                          (List.find_map (Module_context.groups context.destination)
+                             ~f:(fun group ->
+                               List.find_map (Generic_modules.parameter_groups group)
+                                 ~f:(fun stage ->
+                                   if
+                                     List.mem stage.representative.argument.paths
+                                       binding.actual_path ~equal:Path.same
+                                   then
+                                     Option.map
+                                       (List.Assoc.find stage.resources member
+                                          ~equal:String.equal) ~f:(fun stem ->
+                                         String.concat ~sep:"."
+                                           (context.namespace @ [ stage.parameter; stem ]))
+                                   else None)))
+                          ~default:actual.resource_backend ~f:Fn.id
+                    in
+                    Ok (formal, resource ~backend))
         in
         let view =
           {

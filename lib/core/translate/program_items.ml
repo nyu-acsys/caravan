@@ -94,7 +94,8 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                         let* () =
                           Signature_contract.lowerable source view
                             ~environment:
-                              (Source.annotation_env source entry.site.environment)
+                              (Source.annotation_env source ~at:entry.site.item_loc
+                                 entry.site.environment)
                             contract
                         in
                         Signature_contract.check
@@ -1604,6 +1605,22 @@ let checked_type_substitution ?(substitution = Subst.identity) binding path =
         substitution)
 
 let checked_raw_types types binding =
+  let rec referenced_paths (seen, paths) typ =
+    let id = Types.get_id typ in
+    if Set.mem seen id then (seen, paths)
+    else
+      let seen = Set.add seen id in
+      let paths =
+        match Types.get_desc typ with Tconstr (path, _, _) -> path :: paths | _ -> paths
+      in
+      Btype.fold_type_expr referenced_paths (seen, paths) typ
+  in
+  let _, dependencies =
+    List.fold binding.Module_inventory.expected.signature_values
+      ~init:(Set.empty (module Int), [])
+      ~f:(fun state (_, signature) ->
+        referenced_paths state signature.declaration.val_val.val_type)
+  in
   let aliases =
     List.map binding.Module_inventory.expected.signature_ghost_modules
       ~f:(fun (_, formal) ->
@@ -1623,7 +1640,11 @@ let checked_raw_types types binding =
               Some (Path.Pident declaration.Typedtree.typ_id)
             else None)
       in
-      Datatypes.with_paths data paths)
+      let dependencies =
+        List.filter dependencies ~f:(fun path ->
+            Datatypes.declares data (Subst.type_path binding.parameter_substitution path))
+      in
+      Datatypes.with_paths data (paths @ dependencies))
 
 let signature_contract (signature : Module_inventory.signature_value) =
   let site = signature.site in

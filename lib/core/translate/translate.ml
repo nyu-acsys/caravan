@@ -822,6 +822,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     @ List.filter_map checked_modules ~f:(fun view ->
         Option.some_if
           ((not (deferred_native_binding view.Checked_modules.binding))
+          && (not (Module_inventory.formal_binding inventory view.binding))
           && view.binding.site.item_loc.loc_start.pos_cnum <= position)
           view.name)
   in
@@ -1255,11 +1256,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                        resource.resource_scope)
                     member))
         in
-        let members =
-          emit_context_members destination ~at:l ~representations:ra_data
-            ~native_resources ~applications:[] ~late_members:[]
-        in
-        let worker =
+        let worker applications =
+          let members =
+            emit_context_members destination ~at:l ~representations:ra_data
+              ~native_resources ~applications ~late_members:[]
+          in
           R.Member.module_ ~loc:l
             ~params:
               (List.map (Generic_modules.parameter_groups group) ~f:(fun stage ->
@@ -1348,7 +1349,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                               substitution
                         | Some _ | None -> substitution)
                   in
-                  ([ application.layout ], substitution))
+                  (String.split application.layout ~on:'.', substitution))
             in
             let cell_environment =
               List.map layout_types ~f:(fun data ->
@@ -1458,15 +1459,31 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                 ~implements:[ (q (world ^ ".Shape"), []) ]
                 (ident ~loc:l "Fresh") []
             in
+            let applicative_factory =
+              R.Member.module_ ~loc:l
+                ~params:
+                  (List.map (Generic_modules.parameter_groups group) ~f:(fun stage ->
+                       (ident ~loc:l stage.parameter, q stage.interface)))
+                ~implements:[ (q (world ^ ".Shape"), []) ]
+                (ident ~loc:l "Applied_layout")
+                []
+            in
             Ok
-              ( R.Member.module_ ~loc:l
-                  ~params:
-                    (List.map (Generic_modules.type_slots group) ~f:(fun stem ->
-                         ( ident ~loc:l stem,
-                           qualified_name ~loc:l
-                             (Generic_modules.type_slot_interface group stem) )))
-                  (ident ~loc:l world)
-                  (world_domains @ interface @ [ shape; factory; worker ]),
+              ( (fun applications ->
+                  R.Member.module_ ~loc:l
+                    ~params:
+                      (List.map (Generic_modules.type_slots group) ~f:(fun stem ->
+                           ( ident ~loc:l stem,
+                             qualified_name ~loc:l
+                               (Generic_modules.type_slot_interface group stem) )))
+                    (ident ~loc:l world)
+                    (world_domains @ interface @ [ shape; factory ]
+                    @ (if
+                         List.exists group.applications ~f:(fun application ->
+                             application.source.symbolic)
+                       then [ applicative_factory ]
+                       else [])
+                    @ [ worker applications ])),
                 family_templates @ layout_templates,
                 List.filter family_members ~f:(fun (name, _) ->
                     List.is_empty (Qualified_name.of_string name).path) ))
@@ -1509,9 +1526,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             let view_names = List.map views ~f:(fun view -> view.Checked_modules.name) in
             let l = loc application.source.argument.site.item_loc in
             let q = qualified_name ~loc:l in
-            let* setup, worker, arguments =
+            let* setup, late_setup, worker, arguments =
               match group.world with
-              | None -> Ok ([], group.name, view_names)
+              | None -> Ok ([], [], group.name, view_names)
               | Some world ->
                   let canonical =
                     List.find_exn group.applications ~f:(fun other ->
@@ -1519,9 +1536,20 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                   in
                   let* arguments =
                     all application.source.parameters ~f:(fun parameter ->
-                        let concrete =
-                          checked_raw_types types parameter.Module_inventory.argument
+                        let binding = parameter.Module_inventory.argument in
+                        let context =
+                          Module_context.for_location module_contexts
+                            binding.site.item_loc
                         in
+                        let symbolic =
+                          if Module_inventory.symbolic_binding inventory binding then
+                            List.concat_map (Module_context.groups context.destination)
+                              ~f:(fun group ->
+                                Generic_modules.worker_types group
+                                  ~owner:context.namespace)
+                          else []
+                        in
+                        let concrete = checked_raw_types (symbolic @ types) binding in
                         all
                           (List.filter parameter.argument.expected.signature_types
                              ~f:(fun (_, declaration) ->
@@ -1541,8 +1569,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                               let stage =
                                 List.find_exn (Generic_modules.parameter_groups group)
                                   ~f:(fun stage ->
-                                    Ident.same stage.representative.parameter
-                                      parameter.parameter)
+                                    Generic_modules.same_template
+                                      stage.representative.template parameter.template)
                               in
                               let stem =
                                 List.Assoc.find_exn stage.types member ~equal:String.equal
@@ -1570,19 +1598,33 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                   in
                   let selected =
                     if List.is_empty (Generic_modules.type_slots group) then
-                      R.Member.alias ~loc:l (ident ~loc:l application.world) (q world)
+                      R.Member.alias ~loc:l
+                        (ident ~loc:l (Qualified_name.of_string application.world).name)
+                        (q world)
                     else
                       R.Member.instance ~loc:l
                         ~def:(q world, arguments)
-                        (ident ~loc:l application.world)
+                        (ident ~loc:l (Qualified_name.of_string application.world).name)
                         (q world)
                   in
                   let fresh =
                     if phys_equal canonical application then
                       [
-                        R.Member.unit_instance ~loc:l
-                          (ident ~loc:l canonical.layout)
-                          (q (application.world ^ ".Fresh"));
+                        (if application.source.symbolic then
+                           let factory = q (application.world ^ ".Applied_layout") in
+                           R.Member.instance ~loc:l
+                             ~def:
+                               ( factory,
+                                 List.map view_names ~f:(fun view ->
+                                     R.Type.named ~loc:l (q view) []) )
+                             (ident ~loc:l
+                                (Qualified_name.of_string canonical.layout).name)
+                             factory
+                         else
+                           R.Member.unit_instance ~loc:l
+                             (ident ~loc:l
+                                (Qualified_name.of_string canonical.layout).name)
+                             (q (application.world ^ ".Fresh")));
                       ]
                     else []
                   in
@@ -1595,7 +1637,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                     else []
                   in
                   Ok
-                    ( factories @ (selected :: fresh),
+                    ( factories
+                      @ (selected :: (if application.source.symbolic then [] else fresh)),
+                      (if application.source.symbolic then fresh else []),
                       application.world ^ "." ^ (Qualified_name.of_string group.name).name,
                       view_names @ [ canonical.layout ] )
             in
@@ -1609,11 +1653,12 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             Ok
               ( application.source.argument,
                 setup @ exception_module,
+                late_setup,
                 R.Member.instance ~loc:l
                   ~def:
                     ( q worker,
                       List.map arguments ~f:(fun n -> R.Type.named ~loc:l (q n) []) )
-                  (ident ~loc:l application.name)
+                  (ident ~loc:l (Qualified_name.of_string application.name).name)
                   (q worker) )))
   in
   let generic_instances = List.concat generic_instances in
@@ -1623,12 +1668,34 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     Report.zip ~at:Location.none "The checked modules and their members" checked_modules
       checked_module_members
   in
+  let checked_pairs =
+    let indexed = List.mapi checked_pairs ~f:(fun index pair -> (index, pair)) in
+    let position (index, (view, _)) =
+      if not (Module_inventory.formal_binding inventory view.Checked_modules.binding) then
+        (index, 0)
+      else
+        let last =
+          List.fold indexed ~init:index ~f:(fun last (candidate, (other, _)) ->
+              if
+                Module_inventory.symbolic_binding inventory other.Checked_modules.binding
+                && Declaration_scope.contains_in_input view.binding.site.item_loc
+                     other.binding.site.item_loc
+              then Int.max last candidate
+              else last)
+        in
+        (last, if last = index then 0 else 1)
+    in
+    List.stable_sort indexed ~compare:(fun left right ->
+        let a, phase_a = position left and b, phase_b = position right in
+        match Int.compare a b with 0 -> Int.compare phase_a phase_b | order -> order)
+    |> List.map ~f:snd
+  in
   let checked_module ~what binding =
     Report.expect ~at:Location.none what
       (List.find checked_pairs ~f:(fun (view, _) ->
            phys_equal view.Checked_modules.binding binding))
   in
-  let* _, native_blocks, pending, _ =
+  let* _, native_blocks, pending, _, scoped =
     List.fold_result checked_pairs
       ~init:
         ( [],
@@ -1637,10 +1704,12 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             deferred_domains,
             deferred_function_workers,
             pending_fields ),
+          [],
           [] )
-      ~f:(fun (emitted, blocks, pending, available) (view, members) ->
+      ~f:(fun (emitted, blocks, pending, available, scoped) (view, members) ->
         let binding = view.Checked_modules.binding in
-        if deferred_native_binding binding then Ok (emitted, blocks, pending, available)
+        if deferred_native_binding binding then
+          Ok (emitted, blocks, pending, available, scoped)
         else
           let attached =
             List.concat_map generics ~f:(fun group ->
@@ -1682,15 +1751,30 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           let prefix =
             List.concat_map (List.zip_exn paired_generics generic_implementations)
               ~f:(fun ((group, interface), implementation) ->
-                if phys_equal group.representative.argument binding then
+                if Module_inventory.same_binding group.representative.argument binding
+                then
+                  let applications =
+                    Option.value
+                      (List.Assoc.find scoped group.name ~equal:String.equal)
+                      ~default:[]
+                  in
+                  let implementation = implementation applications in
                   match group.Generic_modules.world with
                   | None -> interface @ [ implementation ]
                   | Some _ -> [ implementation ]
                 else [])
           in
+          let scoped =
+            List.filter scoped ~f:(fun (owner, _) ->
+                not
+                  (List.exists generics ~f:(fun group ->
+                       String.equal owner group.Generic_modules.name
+                       && Module_inventory.same_binding group.representative.argument
+                            binding)))
+          in
           let before_setup, pending = take_available ~available pending in
           let instances =
-            List.filter_map generic_instances ~f:(fun (argument, _, instance) ->
+            List.filter_map generic_instances ~f:(fun (argument, _, _, instance) ->
                 Option.some_if (phys_equal argument binding) instance)
           in
           let publications =
@@ -1700,7 +1784,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                   (R.Member.callable member))
           in
           let setup =
-            List.concat_map generic_instances ~f:(fun (argument, setup, _) ->
+            List.concat_map generic_instances ~f:(fun (argument, setup, _, _) ->
                 if phys_equal argument binding then setup else [])
           in
           let make_available available select =
@@ -1730,13 +1814,53 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                 view.Checked_modules.name :: available)
           in
           let after_instances, pending = take_available ~available pending in
-          Ok
-            ( (binding :: attached) @ emitted,
-              (before_setup @ prefix @ setup @ declarations @ publications
-             @ attached_members @ members @ instances @ after_instances)
-              :: blocks,
-              pending,
-              available ))
+          let late_setup =
+            List.concat_map generic_instances ~f:(fun (argument, _, late_setup, _) ->
+                if phys_equal argument binding then late_setup else [])
+          in
+          let contents =
+            if List.is_empty late_setup then
+              declarations @ publications @ attached_members @ members
+            else publications @ attached_members @ members @ late_setup @ declarations
+          in
+          let block =
+            before_setup @ prefix @ setup @ contents @ instances @ after_instances
+          in
+          let blocks, scoped =
+            let owner =
+              String.concat ~sep:"." (Qualified_name.of_string view.name).path
+            in
+            if
+              Module_inventory.symbolic_binding inventory binding
+              && not (String.is_empty owner)
+            then
+              ( blocks,
+                List.Assoc.add scoped owner
+                  (Option.value
+                     (List.Assoc.find scoped owner ~equal:String.equal)
+                     ~default:[]
+                  @ block)
+                  ~equal:String.equal )
+            else (block :: blocks, scoped)
+          in
+          Ok ((binding :: attached) @ emitted, blocks, pending, available, scoped))
+  in
+  let* () =
+    match scoped with
+    | [] -> Ok ()
+    | (owner, _) :: _ ->
+        let application =
+          List.find checked_modules ~f:(fun view ->
+              Module_inventory.symbolic_binding inventory view.Checked_modules.binding
+              && String.equal owner
+                   (String.concat ~sep:"." (Qualified_name.of_string view.name).path))
+        in
+        let at =
+          Option.value_map application ~default:Location.none ~f:(fun view ->
+              view.Checked_modules.binding.site.item_loc)
+        in
+        unsupported at
+          "A nested functor application without a supported enclosing generic body"
   in
   let native_modules = List.concat (List.rev native_blocks) in
   let pending_declarations, pending_domains, pending_workers, pending_fields = pending in

@@ -15,7 +15,7 @@ let plan types groups =
   List.concat_map groups ~f:(fun group ->
       if Option.is_none group.Generic_modules.world then []
       else
-        List.concat_map group.applications ~f:(fun application ->
+        List.concat_map (Generic_modules.contexts group) ~f:(fun application ->
             List.filter_map application.source.declarations ~f:(fun declaration ->
                 match declaration.Typedtree.typ_kind with
                 (* A witness's tags carry no data: the representative's serve all. *)
@@ -79,7 +79,8 @@ let concrete layouts types =
       match List.find layouts ~f:(fun entry -> same_type entry.concrete data) with
       | None -> Ok data
       | Some entry ->
-          Result.bind (descriptor entry ~owner:[ (owner layouts entry).layout ])
+          Result.bind
+            (descriptor entry ~owner:(String.split (owner layouts entry).layout ~on:'.'))
             ~f:(fun representation ->
               let rebind typ =
                 match

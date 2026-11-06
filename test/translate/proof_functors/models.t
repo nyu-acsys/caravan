@@ -5,7 +5,7 @@ Generic functor proof models retain their constructors and pure functions at eac
   $ caravan --shh --emit-rav models.ml > models.rav
   $ raven --shh models.rav
   Verification successful.
-  $ grep -c 'Generic_First_Cell\[Parameter:' models.rav
+  $ grep -c 'Generic_Make_Cell\[Parameter:' models.rav
   1
   $ grep -c 'func make_singleton(' models.rav
   1

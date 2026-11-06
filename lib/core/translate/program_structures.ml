@@ -517,12 +517,15 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
         Ok (group.name, identities))
   in
   let canonical_application group application =
-    let identities =
-      List.Assoc.find_exn application_identities group.Generic_modules.name
-        ~equal:String.equal
-    in
-    let identity = List.Assoc.find_exn identities application ~equal:phys_equal in
-    fst (List.find_exn identities ~f:(fun (_, other) -> Path.same other identity))
+    if Option.exists group.Generic_modules.definition ~f:(phys_equal application) then
+      application
+    else
+      let identities =
+        List.Assoc.find_exn application_identities group.Generic_modules.name
+          ~equal:String.equal
+      in
+      let identity = List.Assoc.find_exn identities application ~equal:phys_equal in
+      fst (List.find_exn identities ~f:(fun (_, other) -> Path.same other identity))
   in
   let application_aliases =
     List.concat_map generics ~f:(fun group ->
@@ -885,6 +888,12 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
   in
   let body_shared = body_shared ~body_module_context ~shared ~generic_shared in
   let past_structures ?(symbolic = false) (f : func) =
+    let symbolic =
+      symbolic
+      || Option.exists (Generic_modules.member generics f.id)
+           ~f:(fun (group, application, _) ->
+             Option.exists group.definition ~f:(phys_equal application))
+    in
     let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
     let context = proof_context scope preds spec_funcs proof_support in
     let owner = body_module_context f in

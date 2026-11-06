@@ -45,6 +45,6 @@ Manual proof scopes share a verified generic worker.
 
   $ caravan --shh --emit-rav manual.ml > manual.rav
   $ sed -n '/^module Generic_.*\[/p' manual.rav
-  module Generic_Left_Cell[Parameter: Argument_Left_Cell]
+  module Generic_Make_Cell[Parameter: Argument_Make_Cell]
   $ raven --shh manual.rav
   Verification successful.

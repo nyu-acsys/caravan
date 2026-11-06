@@ -11,6 +11,7 @@ let ( let* ) = Result.( >>= )
 type declared = {
   name : string;  (** Its key: its name, qualified by the modules declaring it. *)
   uid : Shape.Uid.t;
+  paths : Path.t list;
   args : Types.type_expr list;
   at : Location.t;
 }
@@ -18,12 +19,21 @@ type declared = {
 (** The predefined exceptions, without a payload, that programs may raise. *)
 let predefined = [ "Not_found"; "Exit" ]
 
-(** Whether [structure] mentions an exception: declares one, or constructs or matches one.
-*)
-let mentioned (structure : Typedtree.structure) =
+(** Whether [structure] mentions an exception, and its constructor module aliases. *)
+let mentions (structure : Typedtree.structure) =
   let found = ref false in
-  let extension (cstr : Data_types.constructor_description) =
-    match cstr.cstr_tag with Cstr_extension _ -> found := true | _ -> ()
+  let aliases = ref [] in
+  let extension env (cstr : Data_types.constructor_description) =
+    match cstr.cstr_tag with
+    | Cstr_extension (path, _) ->
+        found := true;
+        begin match path with
+        | Pdot (parent, name) ->
+            let parent = Env.normalize_module_path None env parent in
+            aliases := (path, Path.Pdot (parent, name)) :: !aliases
+        | Pident _ | Papply _ | Pextra_ty _ -> aliases := (path, path) :: !aliases
+        end
+    | _ -> ()
   in
   let iterator =
     {
@@ -35,25 +45,27 @@ let mentioned (structure : Typedtree.structure) =
       expr =
         (fun self e ->
           (match e.exp_desc with
-          | Texp_construct (_, cstr, _) -> extension cstr
+          | Texp_construct (_, cstr, _) -> extension e.exp_env cstr
           | _ -> ());
           Tast_iterator.default_iterator.expr self e);
       pat =
         (fun (type k) self (p : k Typedtree.general_pattern) ->
           (match p.pat_desc with
-          | Tpat_construct (_, cstr, _, _) -> extension cstr
+          | Tpat_construct (_, cstr, _, _) -> extension p.pat_env cstr
           | _ -> ());
           Tast_iterator.default_iterator.pat self p);
     }
   in
   iterator.structure iterator structure;
-  !found
+  ( !found,
+    List.dedup_and_sort !aliases ~compare:(fun (left, _) (right, _) ->
+        Path.compare left right) )
 
 (** The exceptions that [structure] declares outside functors, in order, each named by the
     modules declaring it. A functor's applications are expanded in [structure], each
     declaring its own. *)
 let declared (structure : Typedtree.structure) =
-  let rec items path (items : Typedtree.structure_item list) =
+  let rec items path module_paths env (items : Typedtree.structure_item list) =
     Result.all
       (List.map items ~f:(fun (item : Typedtree.structure_item) ->
            match item.str_desc with
@@ -65,6 +77,10 @@ let declared (structure : Typedtree.structure) =
                        {
                          name = String.concat ~sep:"." (path @ [ ext.ext_name.txt ]);
                          uid = ext.ext_type.ext_uid;
+                         paths =
+                           Path.Pident ext.ext_id
+                           :: List.map module_paths ~f:(fun parent ->
+                               Path.Pdot (parent, ext.ext_name.txt));
                          args =
                            List.map args ~f:(fun (ct : Typedtree.core_type) ->
                                ct.ctyp_type);
@@ -76,18 +92,29 @@ let declared (structure : Typedtree.structure) =
                      "An exception with a record or a GADT payload"
                | Text_rebind _ -> Report.unsupported ext.ext_loc "An exception alias"
                end
-           | Tstr_module { mb_expr; mb_name; _ } ->
-               module_expr (path @ Option.to_list mb_name.txt) mb_expr
+           | Tstr_module { mb_expr; mb_name; mb_id; _ } ->
+               let paths =
+                 Option.to_list (Option.map mb_id ~f:(fun id -> Path.Pident id))
+                 @ List.concat_map module_paths ~f:(fun parent ->
+                     List.map (Option.to_list mb_name.txt) ~f:(fun name ->
+                         Path.Pdot (parent, name)))
+               in
+               let paths =
+                 List.dedup_and_sort
+                   (paths @ List.map paths ~f:(Env.normalize_module_path None env))
+                   ~compare:Path.compare
+               in
+               module_expr (path @ Option.to_list mb_name.txt) paths mb_expr
            | _ -> Ok []))
     |> Result.map ~f:List.concat
-  and module_expr path (m : Typedtree.module_expr) =
+  and module_expr path paths (m : Typedtree.module_expr) =
     match m.mod_desc with
-    | Tmod_structure s -> items path s.str_items
-    | Tmod_constraint (body, _, _, _) -> module_expr path body
+    | Tmod_structure s -> items path paths s.str_final_env s.str_items
+    | Tmod_constraint (body, _, _, _) -> module_expr path paths body
     | Tmod_functor _ | Tmod_ident _ | Tmod_apply _ | Tmod_apply_unit _ | Tmod_unpack _ ->
         Ok []
   in
-  let* declared = items [] structure.str_items in
+  let* declared = items [] [] structure.str_final_env structure.str_items in
   match
     List.find_a_dup
       (List.map declared ~f:(fun d -> d.name) @ predefined)
@@ -123,6 +150,7 @@ let library_declared env (libraries : Library_modules.t list) =
                                {
                                  name = Path.name (Pdot (lib.library_path, Ident.name id));
                                  uid = ext.ext_uid;
+                                 paths = [ Path.Pdot (lib.library_path, Ident.name id) ];
                                  args;
                                  at = ext.ext_loc;
                                }
@@ -135,10 +163,19 @@ let library_declared env (libraries : Library_modules.t list) =
 (** The data type of [exn], with the exceptions of [structure] and [library], those the
     program's libraries declare, if it mentions any or they declare any. *)
 let datatype ?(library = []) (structure : Typedtree.structure) =
-  if not (mentioned structure || not (List.is_empty library)) then Ok None
+  let mentioned, extension_aliases = mentions structure in
+  if not (mentioned || not (List.is_empty library)) then Ok None
   else
     let* declared = declared structure in
     let declared = library @ declared in
+    let extension_aliases =
+      List.filter_map extension_aliases ~f:(fun (path, target) ->
+          Option.map
+            (List.find declared ~f:(fun declaration ->
+                 List.exists declaration.paths ~f:(fun declared ->
+                     Path.same declared target || Path.same declared path)))
+            ~f:(fun declaration -> (path, declaration.name)))
+    in
     let ctor name args =
       let raven = String.uncapitalize (String.tr ~target:'.' ~replacement:'$' name) in
       {
@@ -158,6 +195,7 @@ let datatype ?(library = []) (structure : Typedtree.structure) =
              List.map predefined ~f:(fun name -> ctor name [])
              @ List.map declared ~f:(fun d -> ctor d.name d.args);
            extension_keys = List.map declared ~f:(fun d -> (d.uid, d.name));
+           extension_aliases;
            at = Location.none;
          })
 
@@ -573,7 +611,7 @@ let shared types (group : Generic_modules.t) =
       List.filter_map exn.extension_keys ~f:(fun (_, key) ->
           Option.map (String.chop_prefix key ~prefix:representative) ~f:(fun suffix ->
               ( key,
-                List.map group.applications ~f:(fun application ->
+                List.map (Generic_modules.contexts group) ~f:(fun application ->
                     ( application,
                       Option.map
                         (Datatypes.find_ctor types (prefix application.source ^ suffix))

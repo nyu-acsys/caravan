@@ -842,11 +842,18 @@ let lowerable ?(value_paths = Path_bindings.empty) source
             -> Ident.same root id))
   in
   let signature_resource_path path =
-    Option.exists (root path) ~f:(fun id ->
-        List.exists source.Source.signature_resources ~f:(fun (_, resource) ->
-            Ident.same id resource.Source.resource_id
-            || Option.exists resource.resource_public ~f:(fun resource ->
-                Ident.same id resource.Source.resource_id)))
+    match path with
+    | Path.Pdot (owner, _) ->
+        let resources =
+          List.map source.Source.signature_resources ~f:snd @ source.proof_resources
+        in
+        List.exists resources ~f:(fun resource ->
+            let matches resource =
+              Path.same owner (Path.Pident resource.Source.resource_id)
+              || Source.resource_has_path resource owner
+            in
+            matches resource || Option.exists resource.resource_public ~f:matches)
+    | Pident _ | Papply _ | Pextra_ty _ -> false
   in
   let standard_library path =
     Option.exists (root path) ~f:(fun id ->
@@ -862,7 +869,7 @@ let lowerable ?(value_paths = Path_bindings.empty) source
         | None ->
             begin match Source.value_path environment q with
             | None -> Ok ()
-            | Some path when proof_path path -> Ok ()
+            | Some path when proof_path path || signature_resource_path path -> Ok ()
             | Some _ -> unavailable (S.qualid_loc q)
             end
         | Some path when Path_bindings.mem value_paths path ->

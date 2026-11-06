@@ -3,13 +3,13 @@ module Make (Cell : CELL) = struct
 
   let twice (cell : Cell.t) : Cell.t = same (same cell)
 
-  lemma identity (cell : Cell.t) ensures (twice cell === cell) = ()
+  lemma identity_fact (cell : Cell.t) ensures (twice cell === cell) = ()
 end
 
 lemma alias (cell : Actual.First.t)
   ensures (First.twice cell === Alias.same cell) =
-  First.identity cell
+  First.identity_fact cell
 
 lemma second (cell : Actual.Second.t)
   ensures (Second.twice cell === cell) =
-  Second.identity cell
+  Second.identity_fact cell

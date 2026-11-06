@@ -13,7 +13,7 @@ The generic proof predicate and lemma have one source definition each.
   1
   $ grep -c '^  lemma .*preserve' generic.rav
   1
-  $ grep -c '^module Generic_First_Cell' generic.rav
+  $ grep -c '^module Generic_Make_Cell' generic.rav
   1
   $ grep -c '^module Applied' generic.rav
   2
@@ -55,12 +55,12 @@ Private predicates also appear in contracts between generic methods.
 
 The worker body mentions only its formal parameter, without concrete argument resources.
 
-  $ ! sed -n '/^module Generic_First_Cell\[/,/^module Checked_first_Cell/p' generic.rav | grep -E 'Actual_(First|Second)\.'
+  $ ! sed -n '/^module Generic_Make_Cell\[/,/^module Checked_first_Cell/p' generic.rav | grep -E 'Actual_(First|Second)\.'
 
-An unapplied proof template is rejected until it has a generic runtime group.
+An unapplied proof template is checked through its generic runtime declaration.
 
-  $ caravan --shh unapplied.ml 2>&1 | grep -F 'Unsupported Error: A functor proof without a supported generic runtime body and application'
-  Unsupported Error: A functor proof without a supported generic runtime body and application is not supported yet.
+  $ caravan --shh unapplied.ml
+  Verification successful.
 
 Source aliases retain their types in generic proof signatures and unfold witnesses.
 
