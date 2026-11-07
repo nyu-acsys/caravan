@@ -1,0 +1,9 @@
+module World = struct
+  module Make () = struct
+    module Read = Ghost.AU (struct let operation = read end)
+  end
+
+  lemma wrong (token : One.Read.token) (value : int)
+    requires (One.Read.pending token value)
+    ensures (Two.Read.pending token value) = ()
+end

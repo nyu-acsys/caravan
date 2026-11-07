@@ -1,0 +1,9 @@
+type count = { n : int; c : integer }
+
+predicate pair (b : box) = exists s : count, m : int. own b.value m && s.n <= s.c
+
+lemma named (b : box)
+  requires (pair b)
+  ensures (pair b) =
+  let (s, m) = unfold pair b { s; m } in
+  fold pair b

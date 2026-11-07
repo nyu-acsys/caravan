@@ -1,0 +1,4 @@
+module A = struct module R = Nat end
+module B = struct module R = Nat end
+
+lemma incompatible ensures (A.R.valid B.R.id) = ()

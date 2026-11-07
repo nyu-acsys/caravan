@@ -1,0 +1,79 @@
+module A = struct
+  module R = Nat
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+  predicate token (cell : Ghost.t) (value : R.t) = own (Ghost.at slot cell) value
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (token cell R.id) =
+    let cell = Ghost.alloc [Ghost.init slot R.id] in
+    fold token cell R.id;
+    cell
+
+  lemma preserve (cell : Ghost.t)
+    requires (token cell R.id)
+    ensures (token cell R.id) = ()
+end
+
+module B = struct
+  module R = Excl (struct type t = int end)
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+  predicate token (cell : Ghost.t) (value : R.t) = own (Ghost.at slot cell) value
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (token cell R.id) =
+    let cell = Ghost.alloc [Ghost.init slot R.id] in
+    fold token cell R.id;
+    cell
+end
+
+module Make (X : INPUT) (Y : INPUT) = struct
+  type choice = Left of X.R.t | Right of Y.R.t
+
+  let valid (choice : choice) : bool =
+    match choice with
+    | Left value -> X.R.valid value
+    | Right value -> Y.R.valid value
+
+  lemma preserve (left : Ghost.t) (right : Ghost.t)
+    requires (X.token left X.R.id && Y.token right Y.R.id)
+    ensures (X.token left X.R.id && Y.token right Y.R.id) = ()
+
+  lemma both_valid ensures (valid (Left X.R.id) && valid (Right Y.R.id)) = ()
+
+  lemma captured (cell : Ghost.t)
+    requires (A.token cell A.R.id)
+    ensures (A.token cell A.R.id) = A.preserve cell
+end
+
+lemma direct (left : Ghost.t) (right : Ghost.t)
+  requires (A.token left A.R.id && B.token right B.R.id)
+  ensures (A.token left A.R.id && B.token right B.R.id) =
+  Direct.preserve left right
+
+lemma partial (left : Ghost.t) (right : Ghost.t)
+  requires (A.token left A.R.id && B.token right B.R.id)
+  ensures (A.token left A.R.id && B.token right B.R.id) =
+  Applied.preserve left right
+
+lemma aliases (left : Ghost.t) (right : Ghost.t)
+  requires (A.token left A.R.id && B.token right B.R.id)
+  ensures (A.token left A.R.id && B.token right B.R.id) =
+  Alias.preserve left right;
+  ViaAlias.preserve left right
+
+lemma constructors ensures
+  (Direct.valid (Direct.Left A.R.id)
+  && Applied.valid (Applied.Right B.R.id)
+  && Alias.valid (Alias.Left A.R.id)
+  && ViaAlias.valid (ViaAlias.Right B.R.id)) = ()
+
+lemma swapped (left : Ghost.t) (right : Ghost.t)
+  requires (B.token left B.R.id && A.token right A.R.id)
+  ensures (B.token left B.R.id && A.token right A.R.id) =
+  Swapped.preserve left right
+
+lemma swapped_models ensures
+  (Swapped.valid (Swapped.Left B.R.id)
+  && Swapped.valid (Swapped.Right A.R.id)) = ()
+
+lemma hidden (value : Hidden.choice) = ()

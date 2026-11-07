@@ -1,0 +1,1097 @@
+type 'a edge = Edge of 'a node Atomic.t * 'a * 'a node Atomic.t
+
+predicate segment (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items [@implicit] : 'a list) (cells [@implicit] : 'a node Atomic.t finset)
+    (edges [@implicit] : 'a edge finset) =
+  not (Finset.mem limit cells)
+  && (match items with
+      | [] -> first == limit && cells === Finset.empty && edges === Finset.empty
+      | value :: tail ->
+          exists next : 'a node Atomic.t, tail_cells : 'a node Atomic.t finset,
+            tail_edges : 'a edge finset.
+          first != limit && not (Finset.mem first tail_cells)
+          && cells === Finset.union (Finset.singleton first) tail_cells
+          && edges === Finset.union (Finset.singleton (Edge (first, value, next))) tail_edges
+          && own first (Next (value, next))
+          && segment next limit tail tail_cells tail_edges)
+
+lemma segment_info (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items [@implicit] : 'a list) (cells [@implicit] : 'a node Atomic.t finset)
+    (edges [@implicit] : 'a edge finset)
+  requires (segment first limit items cells edges)
+  ensures (segment first limit items cells edges)
+  ensures (not (Finset.mem limit cells))
+  ensures (items === [] -> first == limit && cells === Finset.empty && edges === Finset.empty)
+  ensures (items =/= [] -> Finset.mem first cells && first != limit) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
+    tail_edges = tail_edges}
+
+lemma segment_join (first : 'a node Atomic.t) (middle : 'a node Atomic.t)
+    (limit : 'a node Atomic.t) (left : 'a list) (right : 'a list)
+    (left_cells : 'a node Atomic.t finset) (right_cells : 'a node Atomic.t finset)
+    (left_edges : 'a edge finset) (right_edges : 'a edge finset)
+  requires (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  requires (Finset.inter left_cells right_cells === Finset.empty)
+  requires (not (Finset.mem limit left_cells))
+  ensures (segment first limit (left @ right)
+    (Finset.union left_cells right_cells) (Finset.union left_edges right_edges))
+  variant (left) =
+  segment_info middle limit;
+  let (next, tail_cells, tail_edges) =
+    unfold segment first middle left left_cells left_edges {next; tail_cells; tail_edges} in
+  match left with
+  | [] -> ()
+  | value :: tail ->
+      segment_join next middle limit tail right tail_cells right_cells tail_edges right_edges;
+      fold segment first limit (left @ right)
+        (Finset.union left_cells right_cells) (Finset.union left_edges right_edges)
+        {next = next; tail_cells = Finset.union tail_cells right_cells;
+          tail_edges = Finset.union tail_edges right_edges}
+
+lemma segment_append (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (successor : 'a node Atomic.t) (items : 'a list)
+    (cells : 'a node Atomic.t finset) (edges : 'a edge finset) (value : 'a)
+  requires (segment first limit items cells edges && own limit (Next (value, successor)))
+  requires (successor != limit && not (Finset.mem successor cells))
+  ensures (segment first successor (items @ [value])
+    (Finset.union cells (Finset.singleton limit))
+    (Finset.union edges (Finset.singleton (Edge (limit, value, successor))))) =
+  segment_info first limit;
+  fold segment successor successor [] Finset.empty Finset.empty;
+  fold segment limit successor [value] (Finset.singleton limit)
+    (Finset.singleton (Edge (limit, value, successor)))
+    {next = successor; tail_cells = Finset.empty; tail_edges = Finset.empty};
+  segment_join first limit successor items [value] cells (Finset.singleton limit)
+    edges (Finset.singleton (Edge (limit, value, successor)))
+
+(* A segment split at [target]: the parts before and after it. *)
+type 'a piece = {
+  before : 'a list; before_cells : 'a node Atomic.t finset; before_edges : 'a edge finset;
+  value : 'a; next : 'a node Atomic.t;
+  after : 'a list; after_cells : 'a node Atomic.t finset; after_edges : 'a edge finset;
+}
+
+(* The segment from a cell to [limit] with [items], [cells] and [edges] is [p] around
+   [target]. *)
+let splits (p : 'a piece) (target : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset) : bool =
+  items === p.before @ (p.value :: p.after)
+  && cells === Finset.union p.before_cells
+       (Finset.union (Finset.singleton target) p.after_cells)
+  && edges === Finset.union p.before_edges
+       (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
+  && Finset.inter p.before_cells p.after_cells === Finset.empty
+  && not (Finset.mem target p.before_cells) && not (Finset.mem target p.after_cells)
+  && target != limit && not (Finset.mem limit p.before_cells)
+
+lemma segment_split (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset)
+    (target : 'a node Atomic.t)
+  returns (p : 'a piece)
+  requires (segment first limit items cells edges && Finset.mem target cells)
+  ensures (segment first target p.before p.before_cells p.before_edges
+    && own target (Next (p.value, p.next))
+    && segment p.next limit p.after p.after_cells p.after_edges)
+  ensures (splits p target limit items cells edges)
+  variant (items) =
+  let w = unfold segment first limit items cells edges in
+  match items with
+  | [] -> assert false
+  | head :: tail ->
+      if first == target then begin
+        fold segment first target [] Finset.empty Finset.empty;
+        { before = []; before_cells = Finset.empty; before_edges = Finset.empty;
+          value = head; next = w.next;
+          after = tail; after_cells = w.tail_cells; after_edges = w.tail_edges }
+      end else begin
+        let p = segment_split w.next limit tail w.tail_cells w.tail_edges target in
+        let before_cells = Finset.union (Finset.singleton first) p.before_cells in
+        let before_edges =
+          Finset.union (Finset.singleton (Edge (first, head, w.next))) p.before_edges in
+        fold segment first target (head :: p.before) before_cells before_edges
+          {next = w.next; tail_cells = p.before_cells; tail_edges = p.before_edges};
+        { p with before = head :: p.before; before_cells = before_cells;
+          before_edges = before_edges }
+      end
+
+lemma segment_restore (first : 'a node Atomic.t) (target : 'a node Atomic.t)
+    (limit : 'a node Atomic.t) (items : 'a list) (cells : 'a node Atomic.t finset)
+    (edges : 'a edge finset) (p : 'a piece)
+  requires (segment first target p.before p.before_cells p.before_edges
+    && own target (Next (p.value, p.next))
+    && segment p.next limit p.after p.after_cells p.after_edges)
+  requires (splits p target limit items cells edges)
+  ensures (segment first limit items cells edges) =
+  segment_info p.next limit;
+  fold segment target limit (p.value :: p.after)
+    (Finset.union (Finset.singleton target) p.after_cells)
+    (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
+    {next = p.next; tail_cells = p.after_cells; tail_edges = p.after_edges};
+  segment_join first target limit p.before (p.value :: p.after) p.before_cells
+    (Finset.union (Finset.singleton target) p.after_cells) p.before_edges
+    (Finset.union (Finset.singleton (Edge (target, p.value, p.next))) p.after_edges)
+
+lemma segment_edge_endpoints (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset)
+  requires (segment first limit items cells edges)
+  ensures (segment first limit items cells edges)
+  ensures (forall edge : 'a edge. Finset.mem edge edges ->
+    match edge with Edge (source, _, destination) ->
+      Finset.mem source cells && (Finset.mem destination cells || destination == limit))
+  variant (items) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  match items with
+  | [] -> fold segment first limit items cells edges
+  | _ :: tail ->
+      segment_info next limit;
+      segment_edge_endpoints next limit tail tail_cells tail_edges;
+      fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
+        tail_edges = tail_edges}
+
+lemma segment_edges_functional (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset)
+  requires (segment first limit items cells edges)
+  ensures (segment first limit items cells edges)
+  ensures (forall a : 'a edge, b : 'a edge. Finset.mem a edges && Finset.mem b edges ->
+    match a with Edge (source_a, _, _) ->
+      match b with Edge (source_b, _, _) -> source_a == source_b -> a === b)
+  variant (items) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  match items with
+  | [] -> fold segment first limit items cells edges
+  | _ :: tail ->
+      segment_edge_endpoints next limit tail tail_cells tail_edges;
+      segment_edges_functional next limit tail tail_cells tail_edges;
+      fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
+        tail_edges = tail_edges}
+
+lemma consecutive_segment_edges (first : 'a node Atomic.t) (middle : 'a node Atomic.t)
+    (limit : 'a node Atomic.t) (left : 'a list) (right : 'a list)
+    (left_cells : 'a node Atomic.t finset) (right_cells : 'a node Atomic.t finset)
+    (left_edges : 'a edge finset) (right_edges : 'a edge finset)
+  requires (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  requires (Finset.inter left_cells right_cells === Finset.empty)
+  ensures (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  ensures (forall a : 'a edge, b : 'a edge.
+    Finset.mem a (Finset.union left_edges right_edges)
+    && Finset.mem b (Finset.union left_edges right_edges) ->
+      match a with Edge (source_a, _, _) ->
+        match b with Edge (source_b, _, _) -> source_a == source_b -> a === b)
+  ensures (forall edge : 'a edge. Finset.mem edge (Finset.union left_edges right_edges) ->
+    match edge with Edge (source, _, destination) ->
+      Finset.mem source (Finset.union left_cells right_cells)
+      && (Finset.mem destination (Finset.union left_cells right_cells)
+        || destination == middle || destination == limit)) =
+  segment_edge_endpoints first middle left left_cells left_edges;
+  segment_edge_endpoints middle limit right right_cells right_edges;
+  segment_edges_functional first middle left left_cells left_edges;
+  segment_edges_functional middle limit right right_cells right_edges
+
+(* Where a cell of the segments lies: the last cell, or a piece of a segment. *)
+type 'a exposure = At_last | Retired of 'a piece | Active of 'a piece
+
+type 'a empty_observation =
+  | Observed_link of 'a edge
+  | Waiting_on of Ghost.t
+
+type 'a fact =
+  | Published of 'a node Atomic.t
+  | Linked of 'a edge
+  | Head_seen of 'a node Atomic.t
+  | Registered of Ghost.t
+
+module Facts = SetRA (struct type 'a t = 'a fact end)
+module Fact_auth = Auth (Facts)
+
+let facts_auth : ('a node Atomic.t Atomic.t, 'a Fact_auth.t) Ghost.field = Ghost.field ()
+let view_queue : ('a node Atomic.t Atomic.t, 'a list) Ghost.field = Ghost.field ()
+
+module Empty = Ghost.AU (struct let operation = is_empty end)
+module Push = Ghost.AU (struct let operation = push end)
+module Pop = Ghost.AU (struct let operation = pop_as end)
+module Peek = Ghost.AU (struct let operation = peek_as end)
+
+type 'a request =
+  | Empty_request of 'a Empty.token
+  | Peek_option of ('a, 'a option) Peek.token
+  | Peek_value of ('a, 'a) Peek.token
+  | Peek_unit of ('a, unit) Peek.token
+
+let facts_of (published : 'a node Atomic.t finset) (links : 'a edge finset)
+    (seen : 'a node Atomic.t finset) (waiting : Ghost.t finset) : 'a fact set =
+  Set.of_predicate (fun (f : 'a fact) ->
+    match f with
+    | Published cell -> Finset.mem cell published
+    | Linked edge -> Finset.mem edge links
+    | Head_seen cell -> Finset.mem cell seen
+    | Registered reg -> Finset.mem reg waiting)
+
+lemma facts_grow (before_pub : 'a node Atomic.t finset)
+    (after_pub : 'a node Atomic.t finset) (before_links : 'a edge finset)
+    (after_links : 'a edge finset) (before_seen : 'a node Atomic.t finset)
+    (after_seen : 'a node Atomic.t finset) (before_waiting : Ghost.t finset)
+    (after_waiting : Ghost.t finset)
+  requires (Finset.subset before_pub after_pub
+    && Finset.subset before_links after_links
+    && Finset.subset before_seen after_seen
+    && Finset.subset before_waiting after_waiting)
+  ensures (Set.subset
+    (facts_of before_pub before_links before_seen before_waiting)
+    (facts_of after_pub after_links after_seen after_waiting)) = ()
+
+let waiting_watched : (Ghost.t, 'a node Atomic.t) Ghost.field = Ghost.field ()
+let waiting_linked : (Ghost.t, bool) Ghost.field = Ghost.field ()
+let waiting_token : (Ghost.t, 'a request) Ghost.field = Ghost.field ()
+let waiting_retired : (Ghost.t, bool) Ghost.field = Ghost.field ()
+let waiting_result : (Ghost.t, 'a node) Ghost.field = Ghost.field ()
+
+predicate waiting_registration (reg : Ghost.t) (q : 'a t)
+    (observed [@implicit] : 'a node) =
+  exists request : 'a request, linked : bool, retired : bool.
+    own ~fraction:Permission.half (Ghost.at waiting_token reg) request
+    && own ~fraction:Permission.half (Ghost.at waiting_linked reg) linked
+    && own ~fraction:Permission.half (Ghost.at waiting_retired reg) retired
+    && own ~fraction:Permission.half (Ghost.at waiting_result reg) observed
+    && (if retired then true else
+      match request with
+      | Empty_request token ->
+          if linked then Empty.committed token q false else Empty.pending token q
+      | Peek_option token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Option q
+          | Next (value, _) -> Peek.committed token q.head Option q (Some value))
+      | Peek_value token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Value q
+          | Next (value, _) -> Peek.committed token q.head Value q value)
+      | Peek_unit token ->
+          (match observed with
+          | Nil -> Peek.pending token q.head Unit q
+          | Next (_, _) -> Peek.committed token q.head Unit q ()))
+
+predicate [@inline] waiting_entry (reg : Ghost.t) (q : 'a t)
+    (watched : 'a node Atomic.t) (linked : bool) (edges : 'a edge finset) =
+  exists observed : 'a node.
+    own ~fraction:Permission.half (Ghost.at waiting_linked reg) linked
+    && own ~fraction:Permission.half (Ghost.at waiting_result reg) observed
+    && (if linked then match observed with
+          | Nil -> false
+          | Next (value, next) -> Finset.mem (Edge (watched, value, next)) edges
+        else observed === Nil)
+    && waiting_registration reg q observed
+
+predicate queue (q : 'a t) (xs [@implicit] : 'a list) =
+  own ~fraction:Permission.half (Ghost.at view_queue q.head) xs
+
+(* The invariant's witnesses: the cells of the queue's two segments, their values, links
+   and footprints, and the registered observations. *)
+type 'a state = {
+  root : 'a node Atomic.t; head : 'a node Atomic.t; last : 'a node Atomic.t; tail : 'a node Atomic.t;
+  retired_values : 'a list; values : 'a list;
+  retired_fp : 'a node Atomic.t finset; active_fp : 'a node Atomic.t finset;
+  retired_links : 'a edge finset; active_links : 'a edge finset;
+  waiting : Ghost.t finset; waiting_on : (Ghost.t, 'a node Atomic.t) map;
+}
+
+let footprint (s : 'a state) : 'a node Atomic.t finset =
+  Finset.union s.retired_fp (Finset.union s.active_fp (Finset.singleton s.last))
+
+let links (s : 'a state) : 'a edge finset = Finset.union s.retired_links s.active_links
+let seen (s : 'a state) : 'a node Atomic.t finset = Finset.union s.retired_fp (Finset.singleton s.head)
+
+let separated (s : 'a state) : bool =
+  Finset.inter s.retired_fp s.active_fp = Finset.empty
+  && not (Finset.mem s.last s.retired_fp) && not (Finset.mem s.last s.active_fp)
+
+predicate [@inline] segments (s : 'a state) =
+  segment s.root s.head s.retired_values s.retired_fp s.retired_links
+  && segment s.head s.last s.values s.active_fp s.active_links
+
+let facts (s : 'a state) : 'a fact set = facts_of (footprint s) (links s) (seen s) s.waiting
+
+let holds (s : 'a state) (f : 'a fact) : bool =
+  match f with
+  | Published cell -> Finset.mem cell (footprint s)
+  | Linked edge -> Finset.mem edge (links s)
+  | Head_seen cell -> Finset.mem cell (seen s)
+  | Registered reg -> Finset.mem reg s.waiting
+
+invariant is_queue (q : 'a t) =
+  exists s : 'a state.
+    q.head != q.tail
+    && own q.head s.head
+    && own q.tail s.tail
+    && segments s
+    && own s.last Nil
+    && separated s
+    && Finset.mem s.tail (footprint s)
+    && (forall reg : Ghost.t.
+          Finset.mem reg s.waiting ->
+            own ~fraction:Permission.half (Ghost.at waiting_watched reg)
+              (Map.get s.waiting_on reg)
+            && Finset.mem (Map.get s.waiting_on reg) (seen s)
+            && waiting_entry reg q (Map.get s.waiting_on reg)
+                 (Map.get s.waiting_on reg != s.last) (links s))
+    && own ~fraction:Permission.half (Ghost.at view_queue q.head) s.values
+    && own (Ghost.at facts_auth q.head)
+         (Fact_auth.auth (Facts.set (facts s)))
+
+(* A fact of the state, as a fragment of the authority over its facts. *)
+lemma issue_fact (q : 'a t) (s : 'a state) (f : 'a fact)
+  requires (own (Ghost.at facts_auth q.head) (Fact_auth.auth (Facts.set (facts s))))
+  requires (holds s f)
+  ensures (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f)))) =
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.auth (Facts.set (facts s)))
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f)))
+
+(* A fragment's fact holds of the current state. *)
+lemma observe_fact (q : 'a t) (s : 'a state) (f : 'a fact)
+  requires (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f))))
+  ensures (own (Ghost.at facts_auth q.head)
+    (Fact_auth.auth_frag (Facts.set (facts s)) (Facts.set (Set.singleton f))))
+  ensures (holds s f) = ()
+
+(* The facts of a state that extends another. *)
+lemma grow_facts (q : 'a t) (s : 'a state) (s' : 'a state)
+  requires (own (Ghost.at facts_auth q.head) (Fact_auth.auth (Facts.set (facts s))))
+  requires (Finset.subset (footprint s) (footprint s')
+    && Finset.subset (links s) (links s') && Finset.subset (seen s) (seen s')
+    && Finset.subset s.waiting s'.waiting)
+  ensures (own (Ghost.at facts_auth q.head) (Fact_auth.full (Facts.set (facts s')))) =
+  facts_grow (footprint s) (footprint s') (links s) (links s') (seen s) (seen s')
+    s.waiting s'.waiting;
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.auth (Facts.set (facts s))) (Fact_auth.full (Facts.set (facts s')))
+
+let cell_value (e : 'a exposure) : 'a node =
+  match e with
+  | At_last -> Nil
+  | Retired p -> Next (p.value, p.next)
+  | Active p -> Next (p.value, p.next)
+
+(* The segments and the last cell without the points-to of [cell]. *)
+predicate exposed (s : 'a state) (cell : 'a node Atomic.t) (e : 'a exposure) =
+  match e with
+  | At_last -> cell == s.last && segments s
+  | Retired p ->
+      own s.last Nil
+      && segment s.root cell p.before p.before_cells p.before_edges
+      && segment p.next s.head p.after p.after_cells p.after_edges
+      && segment s.head s.last s.values s.active_fp s.active_links
+      && splits p cell s.head s.retired_values s.retired_fp s.retired_links
+  | Active p ->
+      own s.last Nil
+      && segment s.root s.head s.retired_values s.retired_fp s.retired_links
+      && segment s.head cell p.before p.before_cells p.before_edges
+      && segment p.next s.last p.after p.after_cells p.after_edges
+      && splits p cell s.last s.values s.active_fp s.active_links
+
+(* Takes the points-to of a cell of the segments out of them. *)
+lemma expose (s : 'a state) (cell : 'a node Atomic.t)
+  returns (e : 'a exposure)
+  requires (segments s && own s.last Nil && separated s)
+  requires (Finset.mem cell (footprint s) || cell == s.head)
+  ensures (exposed s cell e && own cell (cell_value e)) =
+  segment_info s.root s.head;
+  segment_info s.head s.last;
+  let e =
+    if cell == s.last then At_last
+    else if Finset.mem cell s.retired_fp then begin
+      let p = segment_split s.root s.head s.retired_values s.retired_fp s.retired_links cell in
+      Retired p
+    end else begin
+      let p = segment_split s.head s.last s.values s.active_fp s.active_links cell in
+      Active p
+    end
+  in
+  fold exposed s cell e;
+  e
+
+(* Puts the points-to of an exposed cell back, with its edge if it has one. *)
+lemma restore (s : 'a state) (cell : 'a node Atomic.t) (e : 'a exposure)
+  requires (exposed s cell e && own cell (cell_value e))
+  ensures (segments s && own s.last Nil)
+  ensures (match e with
+    | At_last -> cell == s.last
+    | Retired p -> cell != s.last && Finset.mem (Edge (cell, p.value, p.next)) (links s)
+    | Active p -> cell != s.last && Finset.mem (Edge (cell, p.value, p.next)) (links s)) =
+  unfold exposed s cell e;
+  match e with
+  | At_last -> ()
+  | Retired p ->
+      segment_restore s.root cell s.head s.retired_values s.retired_fp s.retired_links p
+  | Active p -> segment_restore s.head cell s.last s.values s.active_fp s.active_links p
+
+lemma waiting_help (q : 'a t) (cell : 'a node Atomic.t) (value : 'a)
+    (next : 'a node Atomic.t) (xs : 'a list) (waiting : Ghost.t finset)
+    (waiting_on : (Ghost.t, 'a node Atomic.t) map)
+    (linkedflags : Ghost.t set) (edges : 'a edge finset)
+  requires (exists source_value : 'a. source_value === value)
+  requires (xs =/= [])
+  requires (own ~fraction:Permission.half (Ghost.at view_queue q.head) xs)
+  requires (forall reg : Ghost.t.
+    Finset.mem reg waiting ->
+      waiting_entry reg q (Map.get waiting_on reg) (Set.mem reg linkedflags) edges
+      && (Map.get waiting_on reg == cell ->
+        not (Set.mem reg linkedflags) && xs === [value]))
+  ensures (own ~fraction:Permission.half (Ghost.at view_queue q.head) xs)
+  ensures (forall reg : Ghost.t.
+    Finset.mem reg waiting ->
+      waiting_entry reg q (Map.get waiting_on reg)
+        (Set.mem reg linkedflags || Map.get waiting_on reg == cell)
+        (Finset.union edges (Finset.singleton (Edge (cell, value, next)))))
+  variant waiting =
+  if waiting <> Finset.empty then begin
+    let reg = Finset.choose waiting in
+    let rest = Finset.diff waiting (Finset.singleton reg) in
+    let observed : 'a node = Ghost.read (Ghost.at waiting_result reg) in
+    assert (waiting_entry reg q (Map.get waiting_on reg) (Set.mem reg linkedflags) edges);
+    waiting_help q cell value next xs rest waiting_on linkedflags edges;
+    if Map.get waiting_on reg == cell then begin
+      assert (observed === Nil);
+      let (request, linked, retired) =
+        unfold waiting_registration reg q Nil {request; linked; retired} in
+      if not retired then begin
+        match request with
+        | Empty_request token ->
+            let observed = Empty.access token q in
+            unfold queue q observed;
+            assert (observed === xs);
+            fold queue q observed;
+            Empty.commit token q false
+        | Peek_option token ->
+            let observed = Peek.access token q.head Option q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Option q (Some value)
+        | Peek_value token ->
+            let observed = Peek.access token q.head Value q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Value q value
+        | Peek_unit token ->
+            let observed = Peek.access token q.head Unit q in
+            unfold queue q observed;
+            assert (observed === [value]);
+            fold queue q observed;
+            Peek.commit token q.head Unit q ()
+      end else ();
+      Ghost.write (Ghost.at waiting_linked reg) true;
+      Ghost.write (Ghost.at waiting_result reg) (Next (value, next) : 'a node);
+      fold waiting_registration reg q (Next (value, next))
+        {request = request; linked = true; retired = retired}
+    end else ();
+    assert (waiting_entry reg q (Map.get waiting_on reg)
+      (Set.mem reg linkedflags || Map.get waiting_on reg == cell)
+      (Finset.union edges (Finset.singleton (Edge (cell, value, next)))))
+  end else ()
+
+lemma disjoint_member (left : 'a finset) (right : 'a finset) (item : 'a)
+  requires (Finset.inter left right === Finset.empty && Finset.mem item right)
+  ensures (not (Finset.mem item left)) = ()
+
+lemma segment_excludes_owned (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t finset) (edges : 'a edge finset)
+    (other : 'a node Atomic.t) (other_value : 'a node)
+  requires (segment first limit items cells edges && own other other_value)
+  ensures (segment first limit items cells edges && own other other_value)
+  ensures (not (Finset.mem other cells))
+  variant (items) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  match items with
+  | [] -> fold segment first limit items cells edges
+  | _ :: tail ->
+      assert (first != other);
+      segment_excludes_owned next limit tail tail_cells tail_edges other other_value;
+      fold segment first limit items cells edges
+        {next = next; tail_cells = tail_cells; tail_edges = tail_edges}
+
+lemma segment_prepend (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (value : 'a) (items : 'a list) (next [@implicit] : 'a node Atomic.t)
+    (cells [@implicit] : 'a node Atomic.t finset) (edges [@implicit] : 'a edge finset)
+  requires (own first (Next (value, next)) && own limit Nil
+    && segment next limit items cells edges)
+  ensures (own limit Nil && segment first limit (value :: items)
+    (Finset.union (Finset.singleton first) cells)
+    (Finset.union (Finset.singleton (Edge (first, value, next))) edges)) =
+  segment_info next limit items cells edges;
+  segment_excludes_owned next limit items cells edges first (Next (value, next));
+  assert (first != limit);
+  fold segment first limit (value :: items)
+    (Finset.union (Finset.singleton first) cells)
+    (Finset.union (Finset.singleton (Edge (first, value, next))) edges)
+    {next = next; tail_cells = cells; tail_edges = edges}
+
+lemma initialize_built_queue (q : 'a t) (last : 'a node Atomic.t) (values : 'a list)
+    (root [@implicit] : 'a node Atomic.t) (cells [@implicit] : 'a node Atomic.t finset)
+    (edges [@implicit] : 'a edge finset)
+  requires (own q.head root && own q.tail last && own last Nil
+    && segment root last values cells edges
+    && own (Ghost.at view_queue q.head) values
+    && own (Ghost.at facts_auth q.head) (Fact_auth.full (Facts.set Set.empty)))
+  ensures (is_queue q && queue q values) =
+  assert (q.head != q.tail);
+  segment_info root last values cells edges;
+  fold queue q values;
+  fold segment root root [] Finset.empty Finset.empty;
+  Ghost.fpu (Ghost.at facts_auth q.head)
+    (Fact_auth.full (Facts.set Set.empty))
+    (Fact_auth.full (Facts.set
+      (facts_of (Finset.union cells (Finset.singleton last)) edges
+        (Finset.singleton root) Finset.empty)));
+  fold is_queue q {root = root; head = root; last = last; tail = last;
+    retired_values = []; values = values; retired_fp = Finset.empty; active_fp = cells;
+    retired_links = Finset.empty; active_links = edges; waiting = Finset.empty;
+    waiting_on = (Map.const last : (Ghost.t, 'a node Atomic.t) map)}
+
+(* ---- Proof outlines ------------------------------------------------- *)
+
+proof create =
+  at (let head = Atomic.make_contended next)
+    initializes [Ghost.init view_queue [];
+      Ghost.init facts_auth (Fact_auth.full (Facts.set Set.empty))];
+  on return begin
+    fold queue q [];
+    fold segment next next [] Finset.empty Finset.empty;
+    fold segment next next [] Finset.empty Finset.empty;
+    Ghost.fpu (Ghost.at facts_auth head)
+      (Fact_auth.full (Facts.set Set.empty))
+      (Fact_auth.full (Facts.set
+        (facts_of (Finset.singleton next) Finset.empty (Finset.singleton next)
+          Finset.empty)));
+    fold is_queue q {root = next; head = next; last = next; tail = next;
+      retired_values = []; values = []; retired_fp = Finset.empty; active_fp =
+        Finset.empty;
+      retired_links = Finset.empty; active_links = Finset.empty; waiting = Finset.empty;
+      waiting_on = (Map.const next : (Ghost.t, 'a node Atomic.t) map)}
+  end
+
+proof fix_tail [q : 'a t] tail new_tail
+  requires (is_queue q && tail == q.tail)
+  requires (own (Ghost.at facts_auth q.head)
+    (Fact_auth.frag (Facts.set (Set.singleton (Published new_tail))))) =
+  at (Atomic.get tail) (fun step ->
+    unfold is_queue q;
+    let result = step () in
+    fold is_queue q;
+    result);
+  at (Atomic.get new_tail) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Published new_tail);
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s new_tail in
+    let result = step () in
+    restore s new_tail exposure;
+    fold is_queue q;
+    result);
+  at (Atomic.compare_and_set tail old_tail new_tail) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Published new_tail);
+    let result = step () in
+    fold is_queue q {tail = (if result then new_tail else s.tail)};
+    result);
+  at (fix_tail tail new_tail) (fun invoke ->
+    let result = invoke q in
+    result)
+
+proof push =
+  proof find_tail_and_enq [q : 'a t] [token : 'a Push.token] [value : 'a]
+      [fresh : 'a node Atomic.t] curr_end node
+    requires (is_queue q)
+    requires (node === Next (value, fresh) && own fresh Nil)
+    requires (own (Ghost.at facts_auth q.head)
+      (Fact_auth.frag (Facts.set (Set.singleton (Published curr_end)))))
+    requires (Push.pending token q value)
+    ensures (Push.committed token q value ())
+    ensures (own (Ghost.at facts_auth q.head)
+      (Fact_auth.frag (Facts.set (Set.singleton (Published fresh))))) = begin
+    at (Atomic.compare_and_set curr_end Nil node) (fun step ->
+      let s = unfold is_queue q in
+      observe_fact q s (Published curr_end);
+      segment_info s.root s.head;
+      segment_info s.head s.last;
+      let exposure = expose s curr_end in
+      let xs = Push.access token q value in
+      unfold queue q xs;
+      let result = step () in
+      if result then begin
+        assert (exposure === At_last);
+        unfold exposed s curr_end exposure;
+        assert (curr_end == s.last);
+        segment_excludes_owned s.root s.head s.retired_values s.retired_fp
+          s.retired_links fresh Nil;
+        segment_excludes_owned s.head s.last s.values s.active_fp s.active_links fresh
+          Nil;
+        assert (fresh != s.last);
+        Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
+        fold queue q (s.values @ [value]);
+        Push.commit token q value ();
+        waiting_help q s.last value fresh (s.values @ [value]) s.waiting s.waiting_on
+          (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last)) (links s);
+        segment_append s.head s.last fresh s.values s.active_fp s.active_links value;
+        let s' = { s with last = fresh; values = s.values @ [value];
+          active_fp = Finset.union s.active_fp (Finset.singleton s.last);
+          active_links = Finset.union s.active_links
+            (Finset.singleton (Edge (s.last, value, fresh))) } in
+        grow_facts q s s';
+        issue_fact q s' (Published fresh);
+        fold is_queue q s'
+      end else begin
+      restore s curr_end exposure;
+      fold queue q xs;
+      Push.abort token q value;
+      fold is_queue q
+      end;
+      result);
+    at (Atomic.get curr_end) (fun step ->
+      let s = unfold is_queue q in
+      observe_fact q s (Published curr_end);
+      segment_info s.root s.head;
+      segment_info s.head s.last;
+      let exposure = expose s curr_end in
+      let result = step () in
+      restore s curr_end exposure;
+      begin match result with
+      | Nil -> ()
+      | Next (_, next) ->
+        consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+          s.retired_fp
+          s.active_fp s.retired_links s.active_links;
+        issue_fact q s (Published next);
+        ()
+      end;
+      fold is_queue q;
+      result);
+    at (find_tail_and_enq curr_end node) (fun invoke ->
+      let result = invoke (q, token, value, fresh) in
+      result);
+    at (find_tail_and_enq n node) (fun invoke ->
+      let result = invoke (q, token, value, fresh) in
+      result)
+  end;
+  let token = Push.bind () in
+  at (Atomic.get tail) (fun step ->
+    let s = unfold is_queue q in
+    let result = step () in
+    issue_fact q s (Published result);
+    fold is_queue q;
+    result);
+  at (Atomic.compare_and_set old_tail Nil newnode) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Published old_tail);
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_tail in
+    let xs = Push.access token q value in
+    unfold queue q xs;
+    let result = step () in
+    if result then begin
+      assert (exposure === At_last);
+      unfold exposed s old_tail exposure;
+      assert (old_tail == s.last);
+      segment_excludes_owned s.root s.head s.retired_values s.retired_fp s.retired_links
+        new_tail Nil;
+      segment_excludes_owned s.head s.last s.values s.active_fp s.active_links new_tail
+        Nil;
+      assert (new_tail != s.last);
+      Ghost.write (Ghost.at view_queue q.head) (s.values @ [value]);
+      fold queue q (s.values @ [value]);
+      Push.commit token q value ();
+      waiting_help q s.last value new_tail (s.values @ [value]) s.waiting s.waiting_on
+        (Set.of_predicate (fun (reg : Ghost.t) -> Map.get s.waiting_on reg != s.last)) (links s);
+      segment_append s.head s.last new_tail s.values s.active_fp s.active_links value;
+      let s' = { s with last = new_tail; values = s.values @ [value];
+        active_fp = Finset.union s.active_fp (Finset.singleton s.last);
+        active_links = Finset.union s.active_links
+          (Finset.singleton (Edge (s.last, value, new_tail))) } in
+      grow_facts q s s';
+      issue_fact q s' (Published new_tail);
+      fold is_queue q s'
+    end else begin
+    restore s old_tail exposure;
+    fold queue q xs;
+    Push.abort token q value;
+    fold is_queue q
+    end;
+    result);
+  at (Atomic.get old_tail) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Published old_tail);
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_tail in
+    let result = step () in
+    restore s old_tail exposure;
+    begin match result with
+    | Nil -> ()
+    | Next (_, next) ->
+      consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+        s.retired_fp
+        s.active_fp s.retired_links s.active_links;
+      issue_fact q s (Published next);
+      ()
+    end;
+    fold is_queue q;
+    result);
+  at (find_tail_and_enq old_tail newnode) (fun invoke ->
+    let result = invoke (q, token, value, new_tail) in
+    result);
+  at (find_tail_and_enq n newnode) (fun invoke ->
+    let result = invoke (q, token, value, new_tail) in
+    result);
+  at (Atomic.compare_and_set tail old_tail new_tail) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Published new_tail);
+    let result = step () in
+    fold is_queue q {tail = (if result then new_tail else s.tail)};
+    result);
+  at (fix_tail tail new_tail) (fun invoke ->
+    let result = invoke q in
+    result)
+
+proof result = atomic pop_as [q : 'a t] head initial_backoff poly
+  requires (is_queue q && head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (match poly with
+    | Option -> (match xs with
+        | [] -> result === None && queue q []
+        | value :: rest -> result === Some value && queue q rest)
+    | Value -> (match xs with
+        | [] -> false | value :: rest -> result === value && queue q rest)
+    | Unit -> (match xs with [] -> false | _ :: rest -> queue q rest))
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+      && xs === [] && queue q xs) =
+  let token = Pop.bind () in
+  at (Atomic.get head) (fun step ->
+    let s = unfold is_queue q in
+    let result = step () in
+    issue_fact q s (Head_seen result);
+    fold is_queue q;
+    result);
+  at (Atomic.get old_head) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Head_seen old_head);
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_head in
+    let result = step () in
+    restore s old_head exposure;
+    begin match result with
+    | Nil ->
+        let xs = Pop.access token head initial_backoff poly q in
+        unfold queue q xs;
+        assert (xs === []);
+        fold queue q xs;
+        begin match poly with
+        | Option -> Pop.commit token head initial_backoff poly q None
+        | Value -> Pop.commit_raise token head initial_backoff poly q Empty
+        | Unit -> Pop.commit_raise token head initial_backoff poly q Empty
+        end
+    | Next (value, next) ->
+        issue_fact q s (Linked (Edge (old_head, value, next)))
+    end;
+    fold is_queue q;
+    result);
+  at (Atomic.compare_and_set head old_head next) (fun step ->
+    let s = unfold is_queue q in
+    let xs = Pop.access token head initial_backoff poly q in
+    unfold queue q xs;
+    assert (xs === s.values);
+    observe_fact q s (Head_seen old_head);
+    observe_fact q s (Linked (Edge (old_head, value, next)));
+    consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+      s.retired_fp s.active_fp s.retired_links s.active_links;
+    let result = step () in
+    if result then begin
+      assert (old_head == s.head);
+      segment_info s.root s.head;
+      segment_edge_endpoints s.root s.head s.retired_values s.retired_fp s.retired_links;
+      segment_info s.head s.last;
+      assert (s.values =/= []);
+      let (active_next, suffix_fp, suffix_links) =
+        unfold segment s.head s.last s.values s.active_fp s.active_links
+          {next; tail_cells; tail_edges} in
+      assert (active_next == next);
+      let (first, rest) =
+        match s.values with
+        | [] -> assert false
+        | first :: rest -> (first, rest)
+      in
+      assert (first === value);
+      segment_info next s.last;
+      assert (next == s.last || Finset.mem next suffix_fp);
+      if next != s.last then begin
+        assert (Finset.mem next s.active_fp);
+        disjoint_member s.retired_fp s.active_fp next
+      end else ();
+      Ghost.write (Ghost.at view_queue q.head) rest;
+      fold queue q rest;
+      begin match poly with
+      | Option -> Pop.commit token head initial_backoff poly q (Some value)
+      | Value -> Pop.commit token head initial_backoff poly q value
+      | Unit -> Pop.commit token head initial_backoff poly q ()
+      end;
+      segment_append s.root s.head next s.retired_values s.retired_fp
+        s.retired_links value;
+      let s' = { s with head = next; retired_values = s.retired_values @ [value];
+        values = rest; retired_fp = Finset.union s.retired_fp (Finset.singleton s.head);
+        active_fp = suffix_fp;
+        retired_links = Finset.union s.retired_links
+          (Finset.singleton (Edge (s.head, value, next)));
+        active_links = suffix_links } in
+      grow_facts q s s';
+      fold is_queue q s'
+    end else begin
+      fold queue q xs;
+      Pop.abort token head initial_backoff poly q;
+      fold is_queue q
+    end;
+    result);
+  at (pop_as head backoff poly) (fun invoke ->
+    let xs = Pop.access token head initial_backoff poly q in
+    let (result, raised) = invoke q in
+    begin match raised with
+    | None -> Pop.commit token head initial_backoff poly q result
+    | Some exception_ -> Pop.commit_raise token head initial_backoff poly q exception_
+    end;
+    result)
+
+
+proof is_empty =
+  let token = Empty.bind () in
+  let (old_head, observation) = at (Atomic.get head) (fun step ->
+    let s = unfold is_queue q in
+    let result = step () in
+    issue_fact q s (Head_seen result);
+    let observation =
+      if result != s.last then begin
+        segment_info s.head s.last;
+        let (next, rest_fp, rest_links) =
+          unfold segment s.head s.last s.values s.active_fp s.active_links
+            {next; tail_cells; tail_edges} in
+        let (value, rest) =
+          match s.values with
+          | [] -> assert false
+          | value :: rest -> (value, rest)
+        in
+        fold segment s.head s.last s.values s.active_fp s.active_links
+          {next = next; tail_cells = rest_fp; tail_edges = rest_links};
+        let link = Edge (result, value, next) in
+        issue_fact q s (Linked link);
+        let xs = Empty.access token q in
+        unfold queue q xs;
+        assert (xs =/= []);
+        fold queue q xs;
+        Empty.commit token q false;
+        fold is_queue q;
+        Observed_link link
+      end else begin
+        let registration = Ghost.alloc [
+          Ghost.init waiting_watched result;
+          Ghost.init waiting_linked false;
+          Ghost.init waiting_token (Empty_request token : 'a request);
+          Ghost.init waiting_result (Nil : 'a node);
+          Ghost.init waiting_retired false
+        ] in
+        fold waiting_registration registration q Nil
+          {request = Empty_request token; linked = false; retired = false};
+        let s' = { s with waiting = Finset.union s.waiting (Finset.singleton
+          registration);
+          waiting_on = Map.set s.waiting_on registration result } in
+        grow_facts q s s';
+        issue_fact q s' (Registered registration);
+        fold is_queue q s';
+        Waiting_on registration
+      end
+    in
+    (result, (result, observation))) in
+  at (Atomic.get (Atomic.get head)) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Head_seen old_head);
+    begin match observation with
+    | Observed_link link ->
+        observe_fact q s (Linked link)
+    | Waiting_on registration ->
+        observe_fact q s (Registered registration)
+    end;
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_head in
+    let result = step () in
+    restore s old_head exposure;
+    begin match observation with
+    | Observed_link link ->
+        consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+          s.retired_fp s.active_fp s.retired_links s.active_links;
+        begin match result with
+        | Nil -> assert false
+        | Next (_, _) -> ()
+        end
+    | Waiting_on registration ->
+        assert (Map.get s.waiting_on registration == old_head);
+        let observed : 'a node = Ghost.read (Ghost.at waiting_result registration) in
+        let (request, linked, retired) =
+          unfold waiting_registration registration q observed {request; linked; retired} in
+        let token = match request with
+          | Empty_request token -> token
+          | Peek_option _ -> assert false
+          | Peek_value _ -> assert false
+          | Peek_unit _ -> assert false in
+        begin match result with
+        | Nil ->
+            let xs = Empty.access token q in
+            unfold queue q xs;
+            assert (xs === []);
+            fold queue q xs;
+            Empty.commit token q true
+        | Next (_, _) -> assert linked
+        end;
+        Ghost.write (Ghost.at waiting_retired registration) true;
+        fold waiting_registration registration q observed
+          {request = request; linked = linked; retired = true}
+    end;
+    fold is_queue q;
+    result)
+
+proof r = atomic peek_as [q : 'a t] head poly
+  requires (is_queue q && head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (queue q xs && match poly with
+    | Option -> (match xs with [] -> r === None | value :: _ -> r === Some value)
+    | Value -> (match xs with [] -> false | value :: _ -> r === value)
+    | Unit -> xs =/= [])
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+      && xs === [] && queue q xs) =
+  let token = Peek.bind () in
+  let (old_head, observation) = at (Atomic.get head) (fun step ->
+    let s = unfold is_queue q in
+    let result = step () in
+    issue_fact q s (Head_seen result);
+    let observation =
+      if result != s.last then begin
+        segment_info s.head s.last;
+        let (next, rest_fp, rest_links) =
+          unfold segment s.head s.last s.values s.active_fp s.active_links
+            {next; tail_cells; tail_edges} in
+        let (value, rest) =
+          match s.values with
+          | [] -> assert false
+          | value :: rest -> (value, rest)
+        in
+        fold segment s.head s.last s.values s.active_fp s.active_links
+          {next = next; tail_cells = rest_fp; tail_edges = rest_links};
+        let link = Edge (result, value, next) in
+        issue_fact q s (Linked link);
+        let xs = Peek.access token head poly q in
+        unfold queue q xs;
+        assert (xs === value :: rest);
+        fold queue q xs;
+        begin match poly with
+        | Option -> Peek.commit token head poly q (Some value)
+        | Value -> Peek.commit token head poly q value
+        | Unit -> Peek.commit token head poly q ()
+        end;
+        fold is_queue q;
+        Observed_link link
+      end else begin
+        let request : 'a request = match poly with
+          | Option -> Peek_option token
+          | Value -> Peek_value token
+          | Unit -> Peek_unit token in
+        let registration = Ghost.alloc [
+          Ghost.init waiting_watched result;
+          Ghost.init waiting_linked false;
+          Ghost.init waiting_token request;
+          Ghost.init waiting_result (Nil : 'a node);
+          Ghost.init waiting_retired false
+        ] in
+        fold waiting_registration registration q Nil
+          {request = request; linked = false; retired = false};
+        let s' = { s with waiting = Finset.union s.waiting (Finset.singleton
+          registration);
+          waiting_on = Map.set s.waiting_on registration result } in
+        grow_facts q s s';
+        issue_fact q s' (Registered registration);
+        fold is_queue q s';
+        Waiting_on registration
+      end
+    in
+    (result, (result, observation))) in
+  at (Atomic.get old_head) (fun step ->
+    let s = unfold is_queue q in
+    observe_fact q s (Head_seen old_head);
+    begin match observation with
+    | Observed_link link -> observe_fact q s (Linked link)
+    | Waiting_on registration -> observe_fact q s (Registered registration)
+    end;
+    segment_info s.root s.head;
+    segment_info s.head s.last;
+    let exposure = expose s old_head in
+    let result = step () in
+    restore s old_head exposure;
+    consecutive_segment_edges s.root s.head s.last s.retired_values s.values
+      s.retired_fp s.active_fp s.retired_links s.active_links;
+    begin match observation with
+    | Observed_link link ->
+        begin match result with
+        | Nil -> assert false
+        | Next (_, _) -> ()
+        end
+    | Waiting_on registration ->
+        assert (Map.get s.waiting_on registration == old_head);
+        let observed : 'a node = Ghost.read (Ghost.at waiting_result registration) in
+        let (request, linked, retired) =
+          unfold waiting_registration registration q observed {request; linked; retired} in
+        begin match result with
+        | Nil ->
+            let xs = Peek.access token head poly q in
+            unfold queue q xs;
+            assert (xs === []);
+            fold queue q xs;
+            begin match poly with
+            | Option -> Peek.commit token head poly q None
+            | Value -> Peek.commit_raise token head poly q Empty
+            | Unit -> Peek.commit_raise token head poly q Empty
+            end
+        | Next (value, next) ->
+            assert linked;
+            assert (observed === Next (value, next))
+        end;
+        Ghost.write (Ghost.at waiting_retired registration) true;
+        fold waiting_registration registration q observed
+          {request = request; linked = linked; retired = true}
+    end;
+    fold is_queue q;
+    result)
+
+
+proof of_list =
+  proof result = build_next xs
+    requires (own tail_ Nil)
+    ensures (own tail_ Nil && segment result tail_ xs) = begin
+    on return
+      match xs with
+      | [] -> fold segment result tail_ [] Finset.empty Finset.empty
+      | hd :: tl -> segment_prepend result tail_ hd tl
+  end;
+  at (Atomic.make_contended @@ build_next list)
+    initializes [Ghost.init view_queue list;
+      Ghost.init facts_auth (Fact_auth.full (Facts.set Set.empty))];
+  on return initialize_built_queue q tail_ list
+

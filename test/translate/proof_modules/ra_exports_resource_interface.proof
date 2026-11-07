@@ -1,0 +1,11 @@
+module A = struct
+  module R = Nat
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+
+  predicate token (cell : Ghost.t) (value : R.t) =
+    own (Ghost.at slot cell) value
+end
+
+lemma public_carrier (cell : Ghost.t)
+  requires (A.token cell A.R.id)
+  ensures (A.token cell A.R.id) = ()

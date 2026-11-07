@@ -1,0 +1,4 @@
+let identity (cell : int Atomic.t) : int Atomic.t = cell
+
+lemma wrong_argument (cell : bool Atomic.t) =
+  let result = identity (if true then cell else cell) in ()

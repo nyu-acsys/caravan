@@ -1,0 +1,2 @@
+lemma claim (a : int ref finset) (b : int ref finset)
+  requires (a == b) = ()

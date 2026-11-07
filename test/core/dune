@@ -1,0 +1,107 @@
+(test
+ (name interface_dependencies)
+ (modules interface_dependencies)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name dune_project)
+ (modules dune_project)
+ (libraries base unix caravan_core)
+ (deps
+  source_paths.ml
+  source_paths_fixture.mli
+  ../saturn/backoff/backoff.mli
+  ../translate/libraries/include_dirs/backoff.mli
+  ../saturn/treiber_stack/treiber_stack.ml
+  ../saturn/treiber_stack/treiber_stack.mli))
+
+(test
+ (name diagnostics)
+ (modules diagnostics)
+ (libraries caravan_core compiler-libs.common raven-ivl.api))
+
+(test
+ (name function_types)
+ (modules function_types)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name module_paths)
+ (modules module_paths)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))
+
+(test
+ (name proof_scopes)
+ (modules proof_scopes)
+ (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
+ (name outline_annotations)
+ (modules outline_annotations)
+ (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
+ (name annotation_env)
+ (modules annotation_env)
+ (libraries base caravan_core compiler-libs.common)
+ (deps annotation_env_fixture.ml annotation_env_fixture.proof))
+
+(test
+ (name monotone_history)
+ (modules monotone_history)
+ (libraries caravan_core raven-ivl.api))
+
+(test
+ (name storage_identities)
+ (modules storage_identities)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name editor_members)
+ (modules editor_members)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))
+
+(test
+ (name source_parity)
+ (modules source_parity)
+ (libraries base stdio compiler-libs.common)
+ (deps
+  ../saturn/michael_scott_queue/michael_scott_queue.ml
+  ../saturn/michael_scott_queue/michael_scott_queue.mli
+  ../saturn/michael_scott_queue/michael_scott_queue_intf.mli
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
+  ../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli
+  ../saturn/treiber_stack/treiber_stack.ml
+  ../saturn/treiber_stack/treiber_stack.mli))
+
+(test
+ (name source_paths)
+ (modules source_paths)
+ (libraries base caravan_core compiler-libs.common)
+ (deps source_paths_fixture.mli))
+
+(test
+ (name stdlib_interfaces)
+ (modules stdlib_interfaces)
+ (libraries base caravan_core caravan_spec compiler-libs.common))
+
+(test
+ (name stdlib_zero_arity)
+ (modules stdlib_zero_arity)
+ (libraries
+  base
+  caravan_core
+  caravan_spec
+  compiler-libs.common
+  raven-ivl.api))

@@ -1,4 +1,4 @@
-name: Builds, tests & co
+name: ci
 
 on:
   pull_request:
@@ -15,6 +15,47 @@ env:
   Z3_VERSION: "5.1.0"
 
 jobs:
+  docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - run: node scripts/fetch-site-kit.mjs
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+        env:
+          GITHUB_PAGES: 'true'
+
+  editor:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: vs-code
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: vs-code/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Test native bundle packaging helpers
+        working-directory: .
+        run: python -m unittest discover -s scripts/release -v
+
   # The ocamlformat version must match the one in .ocamlformat.
   format:
     runs-on: ubuntu-latest
@@ -42,8 +83,13 @@ jobs:
           - os: ubuntu-latest
             z3_glob: "*x64-glibc*.zip"
             ocaml-compiler: "5.5"
+          - os: windows-latest
+            z3_glob: "*x64-win*.zip"
+            ocaml-compiler: "5.5"
 
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout tree
@@ -116,8 +162,10 @@ jobs:
           EOF
           opam pin add -y z3 "$pin_dir"
 
-      # Raven is not on opam yet: its library raven.api comes from its dev branch.
-      - run: opam pin add -y --no-action raven git+https://github.com/nyu-acsys/raven.git#dev
+      # Raven is not on opam yet: use the same pinned release as the native bundles.
+      - run: |
+          revision=$(tr -d '\r\n' < RAVEN_REVISION)
+          opam pin add -y --no-action raven-ivl "git+https://github.com/nyu-acsys/raven.git#$revision"
 
       - run: opam install . --deps-only --with-test
 

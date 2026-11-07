@@ -1,0 +1,5 @@
+predicate contents (cell : 'a Atomic.t) (value : 'a) = own cell value
+module Read = Ghost.AU (struct let operation = read end)
+
+lemma wrong_index (cell : int Atomic.t) (token : bool Read.token)
+  requires (Read.pending token cell) = ()

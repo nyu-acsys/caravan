@@ -1,0 +1,29 @@
+invariant is_zero (cell : int Atomic.t) = own cell 0
+
+invariant has_value (cell : int Atomic.t) (value : int) = own cell value
+
+invariant bounded (cell : int Atomic.t) (limit : int) =
+  exists value : int. own cell value && value <= limit
+
+lemma initialize (cell : int Atomic.t)
+  requires (own cell 0)
+  ensures (is_zero cell) =
+  fold is_zero cell
+
+lemma initialize_parameterized (cell : int Atomic.t) (value : int)
+  requires (own cell value)
+  ensures (has_value cell value) =
+  fold has_value cell value
+
+lemma initialize_bounded (cell : int Atomic.t) (value : int) (limit : int)
+  requires (own cell value)
+  requires (value <= limit)
+  ensures (bounded cell limit) =
+  fold bounded cell limit {value = value}
+
+lemma named_witness (cell : int Atomic.t) (limit : int)
+  requires (bounded cell limit)
+  ensures (bounded cell limit) =
+  let value = unfold bounded cell limit {value} in
+  assert (value <= limit);
+  fold bounded cell limit {value = value}

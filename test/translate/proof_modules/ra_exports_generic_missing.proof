@@ -1,0 +1,2 @@
+module A = struct module R = Nat end
+module Make (X : INPUT) = struct end

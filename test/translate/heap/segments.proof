@@ -1,0 +1,39 @@
+predicate segment (first : cell option) (last : cell option)
+    (path : cell list) (nodes : cell finset) =
+  (match last with None -> true | Some c -> not (Finset.mem c nodes))
+  && (match path with
+      | [] -> first === last && nodes = Finset.empty
+      | c :: tail ->
+          exists next : cell option, rest : cell finset.
+            first === Some c && not (first === last) && not (Finset.mem c rest)
+            && nodes = Finset.union rest (Finset.singleton c)
+            && own c.next next && segment next last tail rest)
+
+lemma segment_info (first : cell option) (last : cell option)
+    (path : cell list) (nodes : cell finset)
+  requires (segment first last path nodes)
+  ensures (segment first last path nodes)
+  ensures (path = [] -> first === last && nodes = Finset.empty)
+  ensures (path <> [] -> Finset.mem path.hd nodes)
+  ensures (match last with None -> true | Some c -> not (Finset.mem c nodes))
+  =
+    let (next_cell, remaining) =
+      unfold segment first last path nodes {next; rest} in
+    fold segment first last path nodes {next = next_cell; rest = remaining}
+
+lemma segment_join (first : cell option) (middle : cell option) (last : cell option)
+    (a : cell list) (b : cell list) (an : cell finset) (bn : cell finset)
+  requires (segment first middle a an && segment middle last b bn)
+  requires (Finset.inter an bn = Finset.empty)
+  requires (match last with None -> true | Some c -> not (Finset.mem c an))
+  ensures (segment first last (a @ b) (Finset.union an bn))
+  variant (a)
+  =
+    let () = segment_info middle last b bn in
+    let (next_cell, remaining) =
+      unfold segment first middle a an {next; rest} in
+    if a <> [] then begin
+      let () = segment_join next_cell middle last a.tl b remaining bn in
+      fold segment first last (a @ b) (Finset.union an bn)
+        {next = next_cell; rest = Finset.union remaining bn}
+    end else ()

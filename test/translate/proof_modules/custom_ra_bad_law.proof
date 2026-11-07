@@ -1,0 +1,9 @@
+module Bad : ResourceAlgebra = struct
+  type t = Zero | One
+
+  let id : t = Zero
+  let valid (value : t) : bool = true
+  let comp (left : t) (right : t) : t = left
+  let frame (whole : t) (part : t) : t = whole
+  let fpuAllowed (before : t) (after : t) : bool = before === after
+end

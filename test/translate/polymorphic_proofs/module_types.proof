@@ -1,0 +1,9 @@
+module Static = struct
+  type ('a, 'b) entry = { key : 'a; value : 'b }
+end
+
+module Make () = struct
+  type 'a wrapped = Wrapped of 'a * int
+
+  type 'a tree = Leaf of 'a | Branch of 'a tree list
+end

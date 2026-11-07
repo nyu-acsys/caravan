@@ -1,0 +1,173 @@
+(* The cells ever linked, their values, the indices of the head's and the tail's cells,
+   and the is_empty calls waiting for a cell to be linked. Cells are never unlinked:
+   popping moves the head. *)
+type 'a state = {
+  cells : 'a node Atomic.t sequence [@grows];
+  values : 'a sequence [@grows];
+  head : integer [@grows];
+  tail : integer;
+  waiting : 'a node Atomic.t pending [@helps is_empty];
+  peeking : 'a node Atomic.t pending [@helps peek_as];
+}
+
+invariant is_queue (q : 'a t) (s : 'a state) =
+  length s.cells = length s.values + 1
+  && 0 <= s.head && s.head < length s.cells
+  && 0 <= s.tail && s.tail < length s.cells
+  && own q.head s.cells.(s.head)
+  && own q.tail s.cells.(s.tail)
+  && (forall i : integer. 0 <= i && i < length s.values ->
+        own s.cells.(i) (Next (s.values.(i), s.cells.(i + 1))))
+  && own s.cells.(length s.values) Nil
+  && (forall c : 'a node Atomic.t. waiting s.peeking c ->
+        c == s.cells.(length s.values) -> s.head = length s.values)
+
+view queue (q : 'a t) = drop s.head s.values
+
+(* Popping moves the head on, by a compare_and_set from its cell to the next. *)
+action pop = compare_and_set q.head s.cells.(s.head) s.cells.(s.head + 1)
+  ~> { s with head = s.head + 1 } linearizes pop_as
+
+(* Linking a new cell, which the step gives the queue, after the last. *)
+action link v c = compare_and_set s.cells.(length s.values) Nil (Next (v, c))
+  consumes own c Nil
+  ~> { s with cells = s.cells ++ [ c ]; values = s.values ++ [ v ] } linearizes push
+  helps s.waiting on s.cells.(length s.values) with false
+  helps s.peeking on s.cells.(length s.values) as Next (v, _)
+    with (match poly with Option -> Some v | Value -> v | Unit -> ())
+
+(* Moving the tail on, to a cell linked before. *)
+action swing k = compare_and_set q.tail _ s.cells.(k) ~> { s with tail = k }
+
+
+predicate built_chain (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells [@implicit] : 'a node Atomic.t list) =
+  match items with
+  | [] -> first == limit && cells === [limit]
+  | value :: tail ->
+      exists next : 'a node Atomic.t, rest : 'a node Atomic.t list.
+      cells === first :: rest && own first (Next (value, next))
+      && built_chain next limit tail rest
+
+lemma built_excludes_owned (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items : 'a list) (cells : 'a node Atomic.t list) (other : 'a node Atomic.t)
+    (contents : 'a node)
+  requires (built_chain first limit items cells && own limit Nil && own other contents)
+  ensures (built_chain first limit items cells && own limit Nil && own other contents)
+  ensures (forall i : integer. 0 <= i && i < length (to_sequence cells) ->
+    other != (to_sequence cells).(i))
+  variant (items) =
+  let (next, rest) = unfold built_chain first limit items cells {next; rest} in
+  match items with
+  | [] ->
+      assert (other != limit);
+      fold built_chain first limit items cells
+  | value :: tail ->
+      assert (other != first);
+      built_excludes_owned next limit tail rest other contents;
+      fold built_chain first limit items cells {next = next; rest = rest}
+
+lemma expose_built_chain (head : 'a node Atomic.t Atomic.t option)
+    (limit : 'a node Atomic.t) (items : 'a list)
+    (first [@implicit] : 'a node Atomic.t) (cells [@implicit] : 'a node Atomic.t list)
+  returns (cell_list : 'a node Atomic.t list)
+  requires (match head with None -> true | Some head -> own head first)
+  requires (own limit Nil && built_chain first limit items cells)
+  ensures (match head with None -> true | Some head -> own head first)
+  ensures (own limit Nil)
+  ensures (cell_list === cells)
+  ensures (length (to_sequence cell_list) = List.length items + 1)
+  ensures ((to_sequence cell_list).(0) == first)
+  ensures ((to_sequence cell_list).(List.length items) == limit)
+  ensures (forall i : integer, j : integer.
+    0 <= i && i < length (to_sequence cell_list)
+    && 0 <= j && j < length (to_sequence cell_list)
+    && (to_sequence cell_list).(i) == (to_sequence cell_list).(j) -> i = j)
+  ensures (forall i : integer. 0 <= i && i < List.length items
+    && i < length (to_sequence cell_list) && (forall j : integer, k : integer.
+      0 <= j && j < length (to_sequence cell_list)
+      && 0 <= k && k < length (to_sequence cell_list)
+      && (to_sequence cell_list).(j) == (to_sequence cell_list).(k) -> j = k) ->
+    own (to_sequence cell_list).(i)
+      (Next ((to_sequence items).(i), (to_sequence cell_list).(i + 1))))
+  variant (items) =
+  let (next, rest) = unfold built_chain first limit items cells {next; rest} in
+  let _ = match items with
+    | [] -> ()
+    | value :: tail ->
+        built_excludes_owned next limit tail rest first (Next (value, next));
+        let _ = expose_built_chain None limit tail next rest in
+        ()
+  in
+  cells
+
+proof create =
+  initially { cells = [ next ]; values = []; head = 0; tail = 0 }
+
+(* Read observations that linearize immediately or wait for a linking action. *)
+proof is_empty =
+  at (Atomic.get head) returning c ->
+    if c != s.cells.(length s.values) then commit false
+    else wait in s.waiting on c;
+  at (Atomic.get (Atomic.get head)) returning Nil -> commit true
+
+proof of_list =
+  proof result = build_next xs
+    requires (own tail_ Nil)
+    ensures (own tail_ Nil && built_chain result tail_ xs) = begin
+    on return fold built_chain result tail_ xs
+  end;
+  initially
+    let cell_list = expose_built_chain (Some q.head) tail_ list in
+    { cells = to_sequence cell_list; values = to_sequence list;
+      head = 0; tail = List.length list }
+
+proof r = atomic pop_as [q : 'a t] head backoff poly
+  requires (is_queue q)
+  requires (head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (match poly with
+    | Option ->
+        if length xs = 0 then r = None && queue q xs
+        else r === Some xs.(0) && queue q (drop 1 xs)
+    | Value -> length xs > 0 && r === xs.(0) && queue q (drop 1 xs)
+    | Unit -> length xs > 0 && queue q (drop 1 xs))
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+    && length xs = 0 && queue q xs) =
+  at (Atomic.get old_head) returning Nil -> commit
+
+proof r = atomic peek_as [q : 'a t] head poly
+  requires (is_queue q)
+  requires (head == q.head)
+  atomic requires (queue q xs)
+  atomic ensures (queue q xs && match poly with
+    | Option -> if length xs = 0 then r === None else r === Some xs.(0)
+    | Value -> length xs > 0 && r === xs.(0)
+    | Unit -> length xs > 0)
+  atomic raises Empty ->
+    ((match poly with Option -> false | Value -> true | Unit -> true)
+    && length xs = 0 && queue q xs) =
+  at (Atomic.get head) returning c ->
+    if c != s.cells.(length s.values) then
+      commit
+        (match poly with
+        | Option -> Some s.values.(s.head)
+        | Value -> s.values.(s.head)
+        | Unit -> ())
+    else wait in s.peeking on c;
+  at (Atomic.get old_head) returning Nil -> commit
+
+proof fix_tail [q : 'a t] tail new_tail
+  requires (is_queue q)
+  requires (tail == q.tail)
+  requires (past (mem new_tail s.cells)) = ()
+
+proof push =
+  proof find_tail_and_enq curr_end node
+    continues push
+    requires (past (mem curr_end s.cells))
+    requires (node === Next (v, c) && own c Nil)
+    ensures (past (mem c s.cells)) = begin
+    ()
+  end

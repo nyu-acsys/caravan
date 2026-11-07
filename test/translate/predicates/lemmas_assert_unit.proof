@@ -1,0 +1,1 @@
+lemma not_a_result returns (result : int) = assert true

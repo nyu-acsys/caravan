@@ -1,0 +1,7 @@
+predicate held (b : box) = exists n : int, c : integer. own b.value n && n <= c
+
+lemma not_record (b : box) (v : int)
+  requires (held b)
+  ensures (held b) =
+  unfold held b;
+  fold held b { v with c = 0 }

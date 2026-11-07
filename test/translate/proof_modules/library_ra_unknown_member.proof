@@ -1,0 +1,3 @@
+module Exclusive = Excl (struct type t = int end)
+
+lemma unknown_member ensures (Exclusive.missing 0) = ()

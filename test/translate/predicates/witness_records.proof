@@ -1,0 +1,23 @@
+predicate held (b : box) = exists n : int, c : integer. own b.value n && n <= c
+
+lemma roundtrip (b : box)
+  requires (held b)
+  ensures (held b) =
+  let w = unfold held b in
+  assert (w.n <= w.c);
+  fold held b w
+
+lemma raise_count (b : box)
+  requires (held b)
+  ensures (held b) =
+  let w = unfold held b in
+  fold held b { w with c = w.c + 1 }
+
+predicate linked (c : cell) (present : bool) =
+  if present then exists next : cell. own c.next (Some next) else own c.next None
+
+lemma linked_roundtrip (c : cell) (present : bool)
+  requires (linked c present)
+  ensures (linked c present) =
+  let w = unfold linked c present in
+  fold linked c present w

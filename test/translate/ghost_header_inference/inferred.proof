@@ -1,0 +1,25 @@
+type 'a choice = Absent | Present of 'a
+
+lemma conditional_choice (flag : bool) (value : 'a)
+  returns (result : 'a choice)
+  ensures (result === (if flag then Absent else Present value)) =
+  let result = if flag then Absent else Present value in
+  result
+
+lemma matched_choice (flag : bool) (value : 'a)
+  returns (result : 'a choice)
+  ensures (result === (if flag then Absent else Present value)) =
+  let result = match flag with true -> Absent | false -> Present value in
+  result
+
+proof result = read_manual [owner : 'a owner] cell
+  requires (cell == owner.cell)
+  requires (own owner.cell value)
+  ensures (own owner.cell value && result === value) =
+  on return ()
+
+proof result = read_integer [owner : 'a owner] cell
+  requires (cell == owner.cell)
+  requires (own owner.cell value)
+  ensures (own owner.cell value && result === value) =
+  on return assert ((result : 'a) === value)

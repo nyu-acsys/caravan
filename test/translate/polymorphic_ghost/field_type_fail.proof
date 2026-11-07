@@ -1,0 +1,4 @@
+let saved : ('a Atomic.t, 'a) Ghost.field = Ghost.field ()
+
+lemma mismatch (cell : int Atomic.t)
+  requires (own (Ghost.at saved cell) true) = ()

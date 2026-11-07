@@ -1,0 +1,11 @@
+lemma same_set (a : int ref finset)
+  ensures (a = a) = ()
+
+lemma same_map (m : (int, int ref) map)
+  ensures (m = m) = ()
+
+lemma same_tuple (values : int ref finset * int)
+  ensures (values = values) = ()
+
+lemma same_list (values : int ref finset list)
+  ensures (values = values) = ()

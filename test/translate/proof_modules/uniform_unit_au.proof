@@ -1,0 +1,19 @@
+module World = struct
+  module Make () = struct
+    module Read = Ghost.AU (struct let operation = read end)
+
+    lemma preserve (token : Read.token) (value : int)
+      requires (Read.pending token value)
+      ensures (Read.pending token value) = ()
+  end
+
+  lemma alias (token : One.Read.token) (value : int)
+    requires (One.Read.pending token value)
+    ensures (Alias.Read.pending token value) =
+    One.preserve token value
+
+  lemma two (token : Two.Read.token) (value : int)
+    requires (Two.Read.pending token value)
+    ensures (Two.Read.pending token value) =
+    Two.preserve token value
+end

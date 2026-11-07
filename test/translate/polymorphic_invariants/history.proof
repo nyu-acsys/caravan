@@ -1,0 +1,7 @@
+type 'a state = { value : 'a; cells : 'a t sequence [@grows] }
+
+invariant live (root : 'a t) (s : 'a state) =
+  own root s.value
+  && (forall i : integer. 0 <= i && i < length s.cells -> own s.cells.(i) s.value)
+
+view contents (root : 'a t) = s.value

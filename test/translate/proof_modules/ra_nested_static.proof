@@ -1,0 +1,29 @@
+module A = struct
+  module Local : ResourceAlgebra = struct
+    type t = Unit
+    let id : t = Unit
+    let valid (value : t) : bool = true
+    let comp (left : t) (right : t) : t = Unit
+    let frame (whole : t) (part : t) : t = Unit
+    let fpuAllowed (before : t) (after : t) : bool = true
+  end
+
+  module Wrapped = Auth (Local)
+  lemma identity ensures (Local.valid Local.id && Wrapped.valid Wrapped.id) = ()
+end
+
+module B = struct
+  module Local : ResourceAlgebra = struct
+    type t = One
+    let id : t = One
+    let valid (value : t) : bool = true
+    let comp (left : t) (right : t) : t = One
+    let frame (whole : t) (part : t) : t = One
+    let fpuAllowed (before : t) (after : t) : bool = true
+  end
+
+  module Wrapped = Auth (Local)
+  lemma identity ensures (Local.valid Local.id && Wrapped.valid Wrapped.id) = ()
+end
+
+lemma client ensures (A.Local.valid A.Local.id && B.Local.valid B.Local.id) = ()

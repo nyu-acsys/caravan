@@ -1,0 +1,3 @@
+let watched : (Ghost.t, int Atomic.t) Ghost.field = Ghost.field ()
+
+type registration_state = Registered of Ghost.t | Linked of int

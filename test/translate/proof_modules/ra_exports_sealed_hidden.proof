@@ -1,0 +1,6 @@
+module A = struct
+  module R = Excl (struct type t = int end)
+  lemma private_helper ensures (R.valid (R.excl 1)) = ()
+end
+
+lemma hidden_constructor ensures (A.R.valid (A.R.excl 1)) = ()

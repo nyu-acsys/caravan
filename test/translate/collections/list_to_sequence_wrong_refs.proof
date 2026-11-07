@@ -1,0 +1,4 @@
+predicate int_refs (values : int ref sequence) = values === values
+
+lemma invalid (cell : bool ref) =
+  fold int_refs (to_sequence [cell])

@@ -1,0 +1,20 @@
+(library
+ (name caravan_saturn_treiber_stack)
+ (wrapped false)
+ (modules treiber_stack)
+ (libraries caravan_saturn_backoff))
+
+(library
+ (name caravan_saturn_stack_clients)
+ (modules clients)
+ (libraries caravan_saturn_treiber_stack)
+ (flags
+  (:standard -open Treiber_stack)))
+
+(cram
+ (deps
+  %{bin:caravan}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.proof)
+  (glob_files ../backoff/*.mli)))

@@ -1,0 +1,13 @@
+let saved : ('a t, 'a) Ghost.field = Ghost.field ()
+let registered : (Ghost.t, 'a) Ghost.field = Ghost.field ()
+
+lemma save (value : 'a) returns (registration : Ghost.t)
+  ensures (own (Ghost.at registered registration) value) =
+  Ghost.alloc [Ghost.init registered value]
+
+lemma roundtrip (registration : Ghost.t) (value : 'a)
+  requires (own (Ghost.at registered registration) value)
+  ensures (own (Ghost.at registered registration) value) =
+  let observed : 'a = Ghost.read (Ghost.at registered registration) in
+  assert (observed === value);
+  Ghost.write (Ghost.at registered registration) value

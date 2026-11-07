@@ -1,0 +1,46 @@
+type 'a fact = Seen of 'a
+
+module Make (Tag : TAG) = struct
+  module Read = Ghost.AU (struct let operation = read end)
+  let token_slot : (Ghost.t, 'a Read.token) Ghost.field = Ghost.field ()
+
+  module Facts = SetRA (struct type 'a t = 'a fact end)
+  module Authority = Auth (Facts)
+  let facts : (Ghost.t, 'a Authority.t) Ghost.field = Ghost.field ()
+
+  lemma keep (token : 'a Read.token) returns (registration : Ghost.t)
+    ensures (own (Ghost.at token_slot registration) token) =
+    Ghost.alloc [Ghost.init token_slot token]
+
+  lemma allocate (items : 'a fact set) returns (registration : Ghost.t)
+    ensures (own (Ghost.at facts registration) (Authority.full (Facts.set items))) =
+    Ghost.alloc [Ghost.init facts (Authority.full (Facts.set items))]
+
+  lemma preserve (token : 'a Read.token) (cell : 'a Atomic.t) (expected : 'a)
+    requires (Read.pending token cell expected)
+    ensures (Read.pending token cell expected) = ()
+end
+
+lemma repeated (token : 'a First.Read.token) (cell : 'a Atomic.t) (expected : 'a)
+  requires (First.Read.pending token cell expected)
+  ensures (Again.Read.pending token cell expected) =
+  Again.preserve token cell expected
+
+lemma alias (token : 'a First.Read.token) (cell : 'a Atomic.t) (expected : 'a)
+  requires (First.Read.pending token cell expected)
+  ensures (Alias.Read.pending token cell expected) =
+  Alias.preserve token cell expected
+
+lemma other (token : 'a Other.Read.token) (cell : 'a Atomic.t) (expected : 'a)
+  requires (Other.Read.pending token cell expected)
+  ensures (Other.Read.pending token cell expected) =
+  Other.preserve token cell expected
+
+lemma token_field (token : 'a First.Read.token) returns (registration : Ghost.t)
+  ensures (own (Ghost.at Alias.token_slot registration) token) =
+  First.keep token
+
+lemma resource_field (items : 'a fact set) returns (registration : Ghost.t)
+  ensures (own (Ghost.at Alias.facts registration)
+    (Again.Authority.full (First.Facts.set items))) =
+  First.allocate items

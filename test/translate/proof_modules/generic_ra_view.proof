@@ -1,0 +1,40 @@
+module Bit : ResourceAlgebra = struct
+  type t = Empty | Present | Invalid
+
+  let id : t = Empty
+
+  let valid (value : t) : bool = value != Invalid
+
+  let comp (left : t) (right : t) : t =
+    match (left, right) with
+    | Empty, value -> value
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+
+  let frame (whole : t) (part : t) : t =
+    match (whole, part) with
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+
+  let fpuAllowed (before : t) (after : t) : bool =
+    valid before && valid after && (before === Empty || after === Present)
+end
+
+module A = struct module R = Nat end
+module B = struct module R = Excl (struct type t = int end) end
+module C = struct module R = Bit end
+
+module Make (X : INPUT) = struct
+  module R = X.R
+  type state = { value : int [@grows]; model : X.R.t }
+
+  invariant is_counter (c : t) (s : state) =
+    0 <= s.value && s.value <= 1 && own c s.value && s.model === X.R.id
+
+  view counter (c : t) = s.value
+  view model (c : t) = s.model
+
+  action set_one = compare_and_set c 0 1 ~> { s with value = s.value + 1 } linearizes set_one
+end

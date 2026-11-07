@@ -1,0 +1,43 @@
+predicate stored (cell : int ref) (value : int) =
+  own cell.contents value
+
+proof make = on return fold stored cell value
+
+let rec logical_length (values : int list) : integer
+  variant values =
+  match values with
+  | [] -> 0
+  | _ :: tail -> 1 + logical_length tail
+
+lemma length_nonnegative (values : int list)
+  ensures (logical_length values >= 0)
+  variant values =
+  match values with
+  | [] -> ()
+  | _ :: tail -> length_nonnegative tail
+
+predicate remembered (cell : int ref) (value [@implicit] : int) =
+  own cell.contents value
+
+lemma retain (cell : int ref) (value [@implicit] : int)
+  requires (remembered cell value)
+  ensures (remembered cell value) =
+  ()
+
+lemma retain_seven (cell : int ref)
+  requires (remembered cell 7)
+  ensures (remembered cell 7) =
+  retain cell
+
+predicate some_value (cell : int ref) =
+  exists value : int. own cell.contents value
+
+lemma unpack_and_repack (cell : int ref)
+  requires (some_value cell)
+  ensures (some_value cell) =
+  let observed = unfold some_value cell {value} in
+  fold some_value cell {value = observed}
+
+let singleton (value : int) : int finset = Finset.singleton value
+
+let as_sequence (values : int list) : int sequence = to_sequence values

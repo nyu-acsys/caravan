@@ -1,0 +1,2 @@
+predicate held (cell : int Atomic.t Atomic.t)
+    (value : int Atomic.t) = own cell value

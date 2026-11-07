@@ -1,0 +1,32 @@
+> r = abs x requires x > min_int ensures r >= 0 ensures r = x || r = -x
+header r = abs x
+requires (infix x > min_int)
+ensures (infix r >= 0)
+ensures ((|| (infix r = x)) (infix r = (- x)))
+> q, r = div [k : int] x y requires 0 <= x < y ensures x = q * y + r
+header q, r = div [k] x y
+requires (infix 0 <= (infix x < y))
+ensures (infix x = ((+ ((* q) y)) r))
+> requires a -> b <-> not c ensures forall i: int. 0 <= i -> f i >= old (f i)
+requires ((-> a) ((<-> b) (not c)))
+ensures (forall i:ty. ((-> (infix 0 <= i)) (infix (f i) >= (old (f i)))))
+> n = length l ensures n = match l with [] -> 0 | _ :: t -> 1 + length t variant l
+header n = length l
+ensures (infix n = (match l [[] -> 0] [(:: (tuple _ t)) -> ((+ 1) (length t))]))
+variant l
+> v = f x ensures match x with
+         | Some (a, b) -> a = b
+         | None -> match y with A -> true | B -> false
+header v = f x
+ensures (match x [(Some (tuple a b)) -> (infix a = b)] [None -> (match y [A -> true] [B -> false])])
+> ensures let (a, b) = p in a + b = 3 && t.next = None pure
+ensures (let (tuple a b) p ((&& (infix ((+ a) b) = 3)) (infix (field t next) = None)))
+pure
+> ensures exists x y. x * y = 4
+ensures (exists x y. (infix ((* x) y) = 4))
+> ensures r = Some [x; y] && l = [] && f [1] = x :: l
+ensures ((&& (infix r = (Some ((:: x) ((:: y) []))))) ((&& (infix l = [])) (infix (f ((:: 1) [])) = ((:: x) l))))
+> ensures x = 1 +
+syntax error at 15
+> ensures x ` y
+lexing error: Illegal character '`'

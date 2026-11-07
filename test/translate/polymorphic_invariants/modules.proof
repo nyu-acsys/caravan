@@ -1,0 +1,10 @@
+module Cell = struct
+  type 'a state = { value : 'a }
+
+  invariant is_cell (q : 'a t) (s : 'a state) = own q s.value
+
+  view cell (q : 'a t) = s.value
+
+  action replace value = compare_and_set q _ value
+    ~> { s with value = value } linearizes set
+end

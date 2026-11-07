@@ -1,0 +1,14 @@
+(library
+ (name caravan_saturn_michael_scott_queue_lseg)
+ (wrapped false)
+ (modules_without_implementation michael_scott_queue_lseg_intf)
+ (libraries caravan_saturn_backoff))
+
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.proof)
+  (glob_files ../backoff/*.mli)))

@@ -1,0 +1,31 @@
+module A = struct
+  module R = Nat
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+
+  predicate token (cell : Ghost.t) (value : R.t) =
+    own (Ghost.at slot cell) value
+end
+
+module B = struct
+  module R = Excl (struct type t = int end)
+  let slot : (Ghost.t, R.t) Ghost.field = Ghost.field ()
+
+  predicate token (cell : Ghost.t) (value : R.t) =
+    own (Ghost.at slot cell) value
+end
+
+module Make (X : VIEW) = struct
+  lemma preserve (cell : Ghost.t)
+    requires (X.token cell X.R.id)
+    ensures (X.token cell X.R.id) = ()
+end
+
+lemma one_token (cell : Ghost.t)
+  requires (A.token cell A.R.id)
+  ensures (A.token cell A.R.id) =
+  One.preserve cell
+
+lemma two_token (cell : Ghost.t)
+  requires (B.token cell B.R.id)
+  ensures (B.token cell B.R.id) =
+  Two.preserve cell

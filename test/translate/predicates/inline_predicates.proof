@@ -1,0 +1,12 @@
+type count = { n : int; c : integer }
+
+predicate [@inline] bounded (s : count) = s.n <= s.c
+
+predicate held (b : box) = exists s : count. own b.value s.n && bounded s
+
+lemma raise_count (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  assert (bounded s);
+  fold held b { s with c = s.c + 1 }

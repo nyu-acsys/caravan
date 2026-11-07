@@ -1,0 +1,19 @@
+module A = struct module R = Nat end
+
+module Make (X : INPUT) = struct
+  module Authority = Auth (X.R)
+  lemma private_identity ensures (Authority.valid Authority.id) = ()
+end
+
+module Wrapped = Auth (One.Authority)
+let slot : (Ghost.t, One.Authority.t) Ghost.field = Ghost.field ()
+
+lemma exported
+  ensures (One.Authority.valid One.Authority.id)
+  ensures (One.Authority.comp One.Authority.id One.Authority.id
+           === One.Authority.id)
+  ensures (Wrapped.valid Wrapped.id) = ()
+
+lemma allocate returns (cell : Ghost.t)
+  ensures (own (Ghost.at slot cell) One.Authority.id) =
+  Ghost.alloc [Ghost.init slot One.Authority.id]

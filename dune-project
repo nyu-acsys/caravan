@@ -1,4 +1,7 @@
 (lang dune 3.12)
+(using menhir 2.1)
+
+(version 0.1.0)
 
 (generate_opam_files)
 
@@ -19,8 +22,12 @@
    (>= 5.5.0))
   (dune
    (>= 3.12))
-  (raven
-   (>= 1.5.0))
+  (raven-ivl
+   (= 1.6.1))
+  (menhir
+   (and
+    :build
+    (>= 20220210)))
   (ocamlformat
    (and
     :with-dev-setup
@@ -34,4 +41,6 @@
   (fmt
    (>= 0.9.0))
   (cmdliner
-   (>= 1.2.0))))
+   (>= 1.2.0))
+  (yojson
+   (>= 2.0.0))))

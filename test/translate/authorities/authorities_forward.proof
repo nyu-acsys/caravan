@@ -1,0 +1,2 @@
+module Facts_auth = Auth (Facts)
+module Facts = SetRA (struct type t = int end)

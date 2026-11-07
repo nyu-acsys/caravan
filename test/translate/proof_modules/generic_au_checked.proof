@@ -1,0 +1,3 @@
+module Make (X : INPUT) = struct
+  module Read = Ghost.AU (struct let operation = X.identity end)
+end

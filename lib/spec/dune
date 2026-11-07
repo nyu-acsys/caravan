@@ -1,0 +1,11 @@
+(library
+ (name caravan_spec)
+ (package caravan)
+ (libraries compiler-libs.common))
+
+(ocamllex
+ (modules spec_lexer))
+
+(menhir
+ (modules spec_parser)
+ (flags --explain))

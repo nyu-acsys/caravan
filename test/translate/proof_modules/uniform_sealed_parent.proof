@@ -1,0 +1,14 @@
+module World = struct
+  module Make () = struct
+    predicate stable (value : int) = value = value
+    module Read = Ghost.AU (struct let operation = read end)
+
+    lemma helper (value : int)
+      ensures (stable value) = fold stable value
+  end
+
+  lemma private_use (token : One.Read.token) (value : int)
+    requires (One.Read.pending token value)
+    ensures (Alias.Read.pending token value) =
+    One.helper value
+end

@@ -1,0 +1,9 @@
+type count = { n : int; c : integer }
+
+predicate held (b : box) = exists s : count. own b.value s.n && s.n <= s.c
+
+lemma lowered (b : box)
+  requires (held b)
+  ensures (held b) =
+  let s = unfold held b in
+  fold held b { s with c = s.n - 1 }

@@ -1,0 +1,38 @@
+module World = struct
+  module Make () = struct
+    type model = Empty | Item of int
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+
+    let slot : (Ghost.t, int) Ghost.field = Ghost.field ()
+    predicate held (cell : Ghost.t) (value : int) = own (Ghost.at slot cell) value
+
+    lemma allocate returns (cell : Ghost.t)
+      ensures (held cell 0) =
+      let cell = Ghost.alloc [Ghost.init slot 0] in
+      fold held cell 0;
+      cell
+
+    lemma preserve (cell : Ghost.t)
+      requires (held cell 0)
+      ensures (held cell 0) = ()
+
+    lemma item (value : int) ensures (payload (Item value) = value) = ()
+  end
+
+  lemma alias (cell : Ghost.t)
+    requires (One.held cell 0)
+    ensures (Alias.held cell 0) =
+    One.preserve cell
+
+  lemma separate =
+    let left = One.allocate in
+    let right = Two.allocate in
+    One.preserve left;
+    Two.preserve right
+
+  lemma models (value : int)
+    ensures (One.payload (One.Item value) = value
+      && Two.payload (Two.Item value) = value) = ()
+end

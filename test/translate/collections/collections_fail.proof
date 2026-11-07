@@ -1,0 +1,2 @@
+lemma removed (s : int finset) (x : int)
+  ensures (Finset.mem x (Finset.diff s (Finset.singleton x))) = ()

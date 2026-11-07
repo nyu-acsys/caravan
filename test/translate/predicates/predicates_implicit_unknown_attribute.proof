@@ -1,0 +1,1 @@
+predicate malformed (cell : int Atomic.t) (value [@surprise] : int) = own cell value

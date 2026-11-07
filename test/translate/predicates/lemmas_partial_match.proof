@@ -1,0 +1,2 @@
+lemma partial_match (x : int option) returns (result : int) =
+  match x with Some value -> value

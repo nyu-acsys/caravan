@@ -1,0 +1,4 @@
+predicate cell (c : t) (v [@implicit] : int) = own c v
+
+proof make =
+  on return fold cell c w

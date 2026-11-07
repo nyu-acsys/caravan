@@ -1,0 +1,6 @@
+(* The count only grows, which the action dec breaks. *)
+type state = { count : int [@grows] }
+
+invariant is_counter (c : t) (s : state) = own c s.count
+
+action dec = { s with count = s.count - 1 }

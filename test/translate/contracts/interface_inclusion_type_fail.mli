@@ -1,0 +1,1 @@
+val identity : bool -> bool

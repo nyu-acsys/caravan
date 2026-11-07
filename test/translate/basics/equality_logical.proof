@@ -1,0 +1,13 @@
+lemma constructors (cell : int ref)
+  ensures (Next cell === Next cell) = ()
+
+lemma different (left : int ref) (right : int ref)
+  requires (left != right)
+  ensures ([left] =/= [right])
+  ensures (Next left =/= Next right)
+  ensures (not ([left] === [right])) = ()
+
+let same_node (left : node) (right : node) : bool = left === right
+
+lemma use_same_node (cell : int ref)
+  ensures (same_node (Next cell) (Next cell)) = ()

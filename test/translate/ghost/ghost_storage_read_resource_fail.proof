@@ -1,0 +1,6 @@
+module Facts = SetRA (struct type t = int end)
+let facts : (Ghost.t, Facts.t) Ghost.field = Ghost.field ()
+
+lemma read (cell : Ghost.t) returns (result : Facts.t)
+  requires (own (Ghost.at facts cell) Facts.id) =
+  Ghost.read (Ghost.at facts cell)

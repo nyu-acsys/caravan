@@ -1,0 +1,28 @@
+module Bit : ResourceAlgebra = struct
+  type t = Empty | Present | Invalid
+
+  let id : t = Empty
+  let valid (value : t) : bool = value != Invalid
+  let comp (left : t) (right : t) : t =
+    match (left, right) with
+    | Empty, value -> value
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+  let frame (whole : t) (part : t) : t =
+    match (whole, part) with
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+  let fpuAllowed (before : t) (after : t) : bool =
+    valid before && valid after && (before === Empty || after === Present)
+end
+
+module Facts = SetRA (struct type 'a t = 'a end)
+module Product = Prod (Facts) (Bit)
+
+lemma valid_product (items : 'a set)
+  ensures (Product.valid (Product.prod (Facts.set items) Bit.id)) = ()
+
+lemma integer = valid_product (Set.singleton 17)
+lemma boolean = valid_product (Set.singleton true)

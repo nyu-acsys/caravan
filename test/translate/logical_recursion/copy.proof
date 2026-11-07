@@ -1,0 +1,42 @@
+let rec copy_list (values : 'a list) : 'a list
+  variant (values) =
+  match values with
+  | [] -> []
+  | head :: tail -> head :: copy_list tail
+
+lemma copy_identity (values : 'a list)
+  ensures (copy_list values === values)
+  variant (values) =
+  match values with
+  | [] -> ()
+  | _ :: tail -> copy_identity tail
+
+lemma copy_unbounded
+  ensures (copy_list [max_int + 1] === [max_int + 1]) =
+  copy_identity ([max_int + 1] : int list)
+
+let rec copy_with_suffix (values : 'a list) (suffix : 'a list) : 'a list
+  variant values, suffix =
+  match values with
+  | [] -> suffix
+  | head :: tail -> head :: copy_with_suffix tail suffix
+
+lemma copy_with_suffix_identity (values : 'a list) (suffix : 'a list)
+  ensures (copy_with_suffix values suffix === values @ suffix)
+  variant (values, suffix) =
+  match values with
+  | [] -> ()
+  | _ :: tail -> copy_with_suffix_identity tail suffix
+
+let rec copy_with_suffix_parenthesized (values : 'a list) (suffix : 'a list) : 'a list
+  variant (values, suffix) =
+  match values with
+  | [] -> suffix
+  | head :: tail -> head :: copy_with_suffix_parenthesized tail suffix
+
+lemma copy_with_suffix_parenthesized_identity (values : 'a list) (suffix : 'a list)
+  ensures (copy_with_suffix_parenthesized values suffix === values @ suffix)
+  variant values, suffix =
+  match values with
+  | [] -> ()
+  | _ :: tail -> copy_with_suffix_parenthesized_identity tail suffix

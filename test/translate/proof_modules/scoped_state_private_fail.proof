@@ -1,0 +1,7 @@
+module Counter = struct
+  type state = { value : int }
+end
+
+module Outside = struct
+  invariant leak (cell : int Atomic.t) (s : Counter.state) = own cell s.value
+end

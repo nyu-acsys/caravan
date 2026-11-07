@@ -1,0 +1,6 @@
+lemma identity (value [@implicit] : int) returns (result : int)
+  ensures (result = value) = value
+
+lemma too_many (value : int) =
+  let result = identity value value in
+  assert (result = value)

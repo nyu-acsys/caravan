@@ -1,0 +1,14 @@
+module R = Excl (struct type t = int end)
+let advance (value : int) : int = value + 1
+let identity (value : int) : int = value
+
+type state = { value : int [@grows] }
+
+invariant is_counter (c : t) (s : state) =
+  0 <= s.value && s.value <= 1 && own c s.value
+
+view model (c : t) = (if s.value = 0 then R.invalid else R.excl 1)
+view other (c : t) = R.excl (s.value + 2)
+
+action set_one after = compare_and_set c 0 after
+  ~> { s with value = advance s.value + identity after - after } linearizes set_one

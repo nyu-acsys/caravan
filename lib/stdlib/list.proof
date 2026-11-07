@@ -1,0 +1,37 @@
+let rec reverse (values : 'a list) : 'a list
+  variant values =
+  match values with
+  | [] -> []
+  | head :: tail -> reverse tail @ [head]
+
+lemma append_empty (values : 'a list)
+  ensures (values @ [] === values)
+  variant values =
+  match values with
+  | [] -> ()
+  | _ :: tail -> append_empty tail
+
+lemma append_assoc (first : 'a list) (second : 'a list) (third : 'a list)
+  ensures ((first @ second) @ third === first @ (second @ third))
+  variant first =
+  match first with
+  | [] -> ()
+  | _ :: tail -> append_assoc tail second third
+
+lemma reverse_append (first : 'a list) (second : 'a list)
+  ensures (reverse (first @ second) === reverse second @ reverse first)
+  variant first =
+  match first with
+  | [] -> append_empty (reverse second)
+  | head :: tail ->
+      reverse_append tail second;
+      append_assoc (reverse second) (reverse tail) [head]
+
+lemma [@auto] reverse_involution (values : 'a list)
+  ensures (reverse (reverse values) === values)
+  variant values =
+  match values with
+  | [] -> ()
+  | head :: tail ->
+      reverse_involution tail;
+      reverse_append (reverse tail) [head]

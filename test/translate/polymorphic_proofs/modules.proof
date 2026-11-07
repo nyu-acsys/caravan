@@ -1,0 +1,91 @@
+module Static = struct
+  predicate cell (cell : 'a Atomic.t) (value [@implicit] : 'a) = own cell value
+
+  lemma keep_cell (location : 'a Atomic.t) (value : 'a)
+    requires (cell location value)
+    ensures (cell location value) =
+    unfold cell location value;
+    fold cell location value
+
+  let identity (value : 'a) : 'a = value
+
+  lemma keep (value : 'a)
+    returns (result : 'a)
+    ensures (identity result === value) = value
+end
+
+module Make (P : VALUE) = struct
+  predicate cell (cell : 'a Atomic.t) (fixed : P.t) (value [@implicit] : 'a) =
+    own cell value && fixed === fixed
+
+  lemma keep_cell (location : 'a Atomic.t) (fixed : P.t) (value : 'a)
+    requires (cell location fixed value)
+    ensures (cell location fixed value) =
+    unfold cell location fixed value;
+    fold cell location fixed value
+
+  let pair (fixed : P.t) (value : 'a) : P.t * 'a = (fixed, value)
+
+  lemma preserve (fixed : P.t) (value : 'a)
+    ensures (pair fixed value === (fixed, value)) = ()
+
+  lemma keep (value : 'a)
+    returns (result : 'a)
+    ensures (result === value) = value
+end
+
+module Factory () = struct
+  predicate cell (cell : 'a Atomic.t) (value [@implicit] : 'a) = own cell value
+
+  lemma keep_cell (location : 'a Atomic.t) (value : 'a)
+    requires (cell location value)
+    ensures (cell location value) =
+    unfold cell location value;
+    fold cell location value
+end
+
+lemma integers
+  ensures (Static.identity 17 === 17)
+  ensures (Alias.pair 23 true === (23, true)) =
+  let result = Static.keep 17 in
+  assert (result === 17);
+  Alias.preserve 23 true;
+  let result = First.keep 42 in
+  assert (result === 42)
+
+lemma booleans
+  ensures (Static.identity true === true)
+  ensures (Second.pair 42 false === (42, false)) =
+  let result = Static.keep true in
+  assert result;
+  Second.preserve 42 false;
+  let result = Second.keep false in
+  assert (not result)
+
+lemma integer_cells (location : int Atomic.t)
+  requires (own location 17)
+  ensures (own location 17) =
+  fold Static.cell location 17;
+  Static.keep_cell location 17;
+  unfold Static.cell location 17;
+  fold Alias.cell location 23 17;
+  Alias.keep_cell location 23 17;
+  Second.keep_cell location 23 17;
+  unfold First.cell location 23 17;
+  fold Fresh_first.cell location 17;
+  Fresh_alias.keep_cell location 17;
+  unfold Fresh_first.cell location 17
+
+lemma boolean_cells (location : bool Atomic.t)
+  requires (own location true)
+  ensures (own location true) =
+  fold Static.cell location true;
+  Static.keep_cell location true;
+  unfold Static.cell location true;
+  fold Second.cell location 42 true;
+  First.keep_cell location 42 true;
+  Alias.keep_cell location 42 true;
+  unfold Alias.cell location 42 true;
+  fold Fresh_second.cell location true;
+  Fresh_second.keep_cell location true;
+  unfold Fresh_second.cell location true

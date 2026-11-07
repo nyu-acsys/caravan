@@ -1,0 +1,50 @@
+module Facts = SetRA (struct type t = int end)
+
+lemma root_identity ensures (Facts.valid Facts.id) = ()
+
+module Left = struct
+  type fact = Seen of int
+  module Facts = SetRA (struct type t = fact end)
+  module Authority = Auth (Facts)
+  let value : (Ghost.t, int) Ghost.field = Ghost.field ()
+  let facts : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (own (Ghost.at value cell) 0)
+    ensures (own (Ghost.at facts cell) (Authority.full (Facts.set Set.empty))) =
+    Ghost.alloc [Ghost.init value 0; Ghost.init facts (Authority.full (Facts.set Set.empty))]
+
+  lemma update (cell : Ghost.t)
+    requires (own (Ghost.at value cell) 0)
+    ensures (own (Ghost.at value cell) 1) =
+    Ghost.write (Ghost.at value cell) 1
+
+  lemma grow (cell : Ghost.t)
+    requires (own (Ghost.at facts cell) (Authority.full (Facts.set Set.empty)))
+    ensures (own (Ghost.at facts cell) (Authority.full (Facts.set (Set.singleton (Seen 1))))) =
+    Ghost.fpu (Ghost.at facts cell)
+      (Authority.full (Facts.set Set.empty))
+      (Authority.full (Facts.set (Set.singleton (Seen 1))))
+end
+
+module Right = struct
+  module Facts = SetRA (struct type t = int end)
+  module Authority = Auth (Facts)
+  let value : (Ghost.t, bool) Ghost.field = Ghost.field ()
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (own (Ghost.at value cell) false) =
+    Ghost.alloc [Ghost.init value false]
+end
+
+module Root_authority = Auth (Alias.Facts)
+
+lemma through_alias =
+  let cell = Alias.allocate in
+  Alias.update cell;
+  Alias.grow cell;
+  let value = Ghost.read (Ghost.at Alias.value cell) in
+  assert (value = 1)
+
+lemma root_authority_valid
+  ensures (Root_authority.valid (Root_authority.full (Alias.Facts.set Set.empty))) = ()

@@ -1,0 +1,9 @@
+module Facts = SetRA (struct type t = int end)
+module Facts_auth = Auth (Facts)
+module Other_facts = SetRA (struct type t = bool end)
+module Other_auth = Auth (Other_facts)
+
+let facts : (node Atomic.t, Facts_auth.t) Ghost.field = Ghost.field ()
+
+lemma incompatible (cell : node Atomic.t)
+  requires (own (Ghost.at facts cell) (Other_auth.auth (Other_facts.set Set.empty))) = ()

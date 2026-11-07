@@ -1,0 +1,1 @@
+lemma wrong = let (n : int) = true in ()

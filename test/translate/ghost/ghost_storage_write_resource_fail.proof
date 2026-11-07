@@ -1,0 +1,8 @@
+module Facts = SetRA (struct type t = int end)
+module Authority = Auth (Facts)
+
+let facts : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+lemma write_resource (owner : Ghost.t)
+  requires (own (Ghost.at facts owner) (Authority.full (Facts.set Set.empty))) =
+  Ghost.write (Ghost.at facts owner) (Authority.full (Facts.set Set.empty))

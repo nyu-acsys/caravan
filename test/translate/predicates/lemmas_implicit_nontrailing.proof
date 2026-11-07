@@ -1,0 +1,1 @@
+lemma malformed (value [@implicit] : int) (cell : int Atomic.t) = ()

@@ -1,0 +1,4 @@
+proof result = increase specified
+  requires (specified >= 0)
+  ensures (result = specified + 1) =
+  on return assert (result = specified + 1)

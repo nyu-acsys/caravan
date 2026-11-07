@@ -1,0 +1,2 @@
+let boolean_items (items : bool list) : bool =
+  match items with [] -> true | _ :: _ -> false

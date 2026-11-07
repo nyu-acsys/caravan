@@ -1,0 +1,10 @@
+module Make (X : INPUT) = struct
+  module Read = Ghost.AU (struct let operation = read end)
+
+  lemma preserve_private (token : Read.token) (value : int)
+    requires (Read.pending token value)
+    ensures (Read.pending token value) = ()
+end
+
+lemma hidden (token : One.Read.token) (value : int)
+  requires (One.Read.pending token value) = ()

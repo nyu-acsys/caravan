@@ -3,6 +3,9 @@
  (public_name caravan)
  (libraries
   base
+  stdio
+  unix
+  yojson
   cmdliner
   fmt
   fmt.cli
@@ -10,5 +13,7 @@
   logs
   logs.cli
   logs.fmt
-  raven.api
-  caravan_config))
+  raven-ivl.api
+  caravan_config
+  caravan_editor
+  caravan_core))

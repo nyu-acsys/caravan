@@ -1,0 +1,24 @@
+module Make (Cell : CELL) = struct
+  predicate wrapped (cell : t) (n [@implicit] : int) =
+    exists same : t. same === cell && Cell.counter same n
+
+  lemma preserve (cell : t) (n [@implicit] : int)
+    requires (wrapped cell n)
+    ensures (wrapped cell n) =
+    let same = unfold wrapped cell n { same } in
+    fold wrapped cell n { same = same }
+end
+
+lemma first_roundtrip (cell : First.t) (n [@implicit] : int)
+  requires (First.wrapped cell n)
+  ensures (Alias.wrapped cell n) =
+  Alias.preserve cell;
+  let same = unfold First.wrapped cell n { same } in
+  fold Alias.wrapped cell n { same = same }
+
+lemma second_roundtrip (cell : Second.t) (n [@implicit] : int)
+  requires (Second.wrapped cell n)
+  ensures (Second.wrapped cell n) =
+  Second.preserve cell;
+  let same = unfold Second.wrapped cell n { same } in
+  fold Second.wrapped cell n { same = same }

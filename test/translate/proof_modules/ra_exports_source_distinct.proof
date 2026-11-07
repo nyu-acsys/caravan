@@ -1,0 +1,7 @@
+module A = struct module R = Nat end
+module B = struct module R = Nat end
+
+predicate from_a (value : A.t) = true
+
+lemma incompatible (value : B.t)
+  requires (from_a value) = ()

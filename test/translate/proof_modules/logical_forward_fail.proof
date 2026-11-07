@@ -1,0 +1,4 @@
+module Model = struct
+  let first (x : int) : int = later x
+  let later (x : int) : int = x
+end

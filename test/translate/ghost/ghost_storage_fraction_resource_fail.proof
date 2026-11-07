@@ -1,0 +1,5 @@
+module Facts = SetRA (struct type t = int end)
+let facts : (Ghost.t, Facts.t) Ghost.field = Ghost.field ()
+
+lemma fraction (cell : Ghost.t)
+  requires (own ~fraction:Permission.half (Ghost.at facts cell) Facts.id) = ()

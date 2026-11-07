@@ -1,0 +1,10 @@
+type 'a fact = Seen of 'a
+
+module Facts = SetRA (struct type 'a t = 'a fact end)
+module Authority = Auth (Facts)
+
+let attached : ('a Atomic.t, 'a Authority.t) Ghost.field = Ghost.field ()
+
+lemma wrong_value (cell : int Atomic.t)
+  requires (own (Ghost.at attached cell)
+    (Authority.full (Facts.set (Set.singleton (Seen true))))) = ()

@@ -1,0 +1,3 @@
+type state = { items : int list }
+invariant is_stack (t : t) (s : state) = own t s.items
+view stack (t : t) = s.items

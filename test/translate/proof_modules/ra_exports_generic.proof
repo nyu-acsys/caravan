@@ -1,0 +1,33 @@
+module A = struct module R = Nat end
+module B = struct module R = Excl (struct type t = int end) end
+
+module Make (X : INPUT) = struct
+  module Authority = Auth (X.R)
+  lemma private_identity ensures (Authority.valid Authority.id) = ()
+end
+
+module Wrapped = Auth (One.Authority)
+let slot : (Ghost.t, One.Authority.t) Ghost.field = Ghost.field ()
+
+lemma exported
+  ensures (One.Authority.valid One.Authority.id)
+  ensures (One.Authority.comp One.Authority.id One.Authority.id
+           === One.Authority.id)
+  ensures (Wrapped.valid Wrapped.id)
+  ensures (Two.Authority.valid Two.Authority.id) = ()
+
+lemma allocate returns (cell : Ghost.t)
+  ensures (own (Ghost.at slot cell) One.Authority.id) =
+  Ghost.alloc [Ghost.init slot One.Authority.id]
+
+module Wrapped_again = Auth (Again.Authority)
+
+lemma same_application (value : One.Authority.t)
+  ensures (Again.Authority.comp value Again.Authority.id === value)
+  ensures (Alias.Authority.valid Alias.Authority.id) = ()
+
+lemma same_wrapper (value : Wrapped.t)
+  ensures (Wrapped_again.valid value === Wrapped.valid value) = ()
+
+lemma same_aliased_application (value : One.Authority.t)
+  ensures (Aliased.Authority.comp value Aliased.Authority.id === value) = ()

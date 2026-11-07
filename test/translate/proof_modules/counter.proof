@@ -1,0 +1,8 @@
+module Counter = struct
+  invariant zero (x : t) = own x 0
+
+  lemma initialize (x : t)
+    requires (own x 0)
+    ensures (zero x) =
+    fold zero x
+end

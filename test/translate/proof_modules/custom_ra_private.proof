@@ -1,0 +1,54 @@
+module Bit : ResourceAlgebra = struct
+  type t = Empty | Present | Invalid
+
+  let id : t = Empty
+
+  let valid (value : t) : bool = value != Invalid
+
+  let comp (left : t) (right : t) : t =
+    match (left, right) with
+    | Empty, value -> value
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+
+  let frame (whole : t) (part : t) : t =
+    match (whole, part) with
+    | value, Empty -> value
+    | Present, Present -> Present
+    | _ -> Invalid
+
+  let fpuAllowed (before : t) (after : t) : bool =
+    valid before && valid after && (before === Empty || after === Present)
+
+  let stored : (Ghost.t, t) Ghost.field = Ghost.field ()
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (own (Ghost.at stored cell) Empty) =
+    Ghost.alloc [Ghost.init stored Empty]
+
+  lemma publish (cell : Ghost.t)
+    requires (own (Ghost.at stored cell) Empty)
+    ensures (own (Ghost.at stored cell) Present) =
+    Ghost.fpu (Ghost.at stored cell) Empty Present
+
+  lemma exercise =
+    let cell = allocate in
+    publish cell
+end
+
+module Authority = Auth (Bit)
+module Alias = Bit
+
+lemma abstract_unit (value : Bit.t)
+  ensures (Bit.comp value Alias.id === value) = ()
+
+lemma authority_unit ensures (Authority.valid Authority.id) = ()
+
+let public_slot : (Ghost.t, Alias.t) Ghost.field = Ghost.field ()
+
+lemma public_allocate returns (cell : Ghost.t)
+  ensures (own (Ghost.at public_slot cell) Alias.id) =
+  Ghost.alloc [Ghost.init public_slot Alias.id]
+
+lemma leak ensures (Bit.Empty === Bit.id) = ()

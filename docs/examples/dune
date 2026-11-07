@@ -1,0 +1,16 @@
+(library
+ (name caravan_docs_examples)
+ (modules
+  negate
+  contracts
+  automatic_cell
+  manual_cell
+  proof_syntax
+  ghost_scopes))
+
+(cram
+ (deps
+  %{bin:caravan}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.proof)))

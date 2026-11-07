@@ -1,0 +1,13 @@
+module Cell = struct
+  module Facts = SetRA (struct type t = int end)
+  module Authority = Auth (Facts)
+  let value : (int Atomic.t, int) Ghost.field = Ghost.field ()
+  let facts : (int Atomic.t, Authority.t) Ghost.field = Ghost.field ()
+
+  lemma publish (cell : int Atomic.t)
+    requires (own (Ghost.at facts cell) (Authority.full (Facts.set Set.empty)))
+    ensures (own (Ghost.at facts cell) (Authority.full (Facts.set (Set.singleton 1)))) =
+    Ghost.fpu (Ghost.at facts cell)
+      (Authority.full (Facts.set Set.empty))
+      (Authority.full (Facts.set (Set.singleton 1)))
+end

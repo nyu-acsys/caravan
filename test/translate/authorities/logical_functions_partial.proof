@@ -1,0 +1,2 @@
+let partial (items : int list) : int =
+  match items with first :: _ :: _ -> first

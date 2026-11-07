@@ -1,0 +1,7 @@
+module A = struct
+  module R = Nat
+end
+
+module Make (X : Ra_view.VIEW) = struct
+  lemma identity ensures (X.R.valid X.R.id) = ()
+end

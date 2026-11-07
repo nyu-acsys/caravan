@@ -1,0 +1,50 @@
+module Facts = SetRA (struct type t = int end)
+module Alias = Facts
+module Authority = Auth (Alias)
+module Exclusive = Excl (struct type t = int end)
+module Product = Prod (Alias) (Exclusive)
+module Nested_exclusive = Excl (Facts)
+module Count = Nat
+module Values = Option (struct type t = int end)
+
+lemma identities
+  ensures (Alias.valid Alias.id && Authority.valid Authority.id)
+  ensures (Exclusive.valid Exclusive.id && Product.valid Product.id)
+  ensures (Count.valid Count.id)
+  ensures (Nested_exclusive.valid (Nested_exclusive.excl Facts.id)) = ()
+
+lemma constructors (value : int)
+  ensures (Exclusive.valid (Exclusive.excl value))
+  ensures (Product.valid (Product.prod (Alias.set Set.empty) (Exclusive.excl value)))
+  ensures (Authority.valid (Authority.frag (Alias.set Set.empty))) = ()
+
+lemma operations
+  ensures (Product.comp Product.id Product.id = Product.id)
+  ensures (Count.comp Count.id Count.id = Count.id) = ()
+
+module Store = struct
+  let plain : (Ghost.t, Values.t) Ghost.field = Ghost.field ()
+  let value : (Ghost.t, Product.t) Ghost.field = Ghost.field ()
+
+  lemma change_plain (cell : Ghost.t)
+    requires (own (Ghost.at plain cell) Values.none)
+    ensures (own (Ghost.at plain cell) (Values.some 1)) =
+    Ghost.write (Ghost.at plain cell) (Values.some 1)
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (own (Ghost.at value cell) Product.id) =
+    Ghost.alloc [Ghost.init value Product.id]
+
+  lemma exchange (cell : Ghost.t)
+    requires (own (Ghost.at value cell)
+      (Product.prod (Alias.set Set.empty) (Exclusive.excl 1)))
+    ensures (own (Ghost.at value cell)
+      (Product.prod (Alias.set Set.empty) (Exclusive.excl 2))) =
+    Ghost.fpu (Ghost.at value cell)
+      (Product.prod (Alias.set Set.empty) (Exclusive.excl 1))
+      (Product.prod (Alias.set Set.empty) (Exclusive.excl 2))
+end
+
+lemma use_store =
+  let cell = Store.allocate in
+  assert (Product.valid Product.id)

@@ -1,0 +1,1 @@
+predicate is_stack (t : t) = own t []

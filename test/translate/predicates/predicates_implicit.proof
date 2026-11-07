@@ -1,0 +1,69 @@
+predicate held (cell : int Atomic.t Atomic.t)
+    (value [@implicit] : int Atomic.t) = own cell value
+
+predicate numbers (cell : int list Atomic.t)
+    (items [@implicit] : int list) = own cell items
+
+lemma retain_abstract (cell : int Atomic.t Atomic.t)
+  requires (held cell)
+  ensures (held cell) =
+  ()
+
+lemma restore (cell : int Atomic.t Atomic.t) (value : int Atomic.t)
+  requires (held cell value)
+  ensures (held cell value) =
+  unfold held cell;
+  fold held cell
+
+lemma restore_explicit (cell : int Atomic.t Atomic.t) (value : int Atomic.t)
+  requires (held cell value)
+  ensures (held cell value) =
+  unfold held cell value;
+  fold held cell value
+
+lemma observe (cell : int Atomic.t Atomic.t)
+    (value [@implicit] : int Atomic.t)
+  requires (held cell value)
+  ensures (held cell value) =
+  ()
+
+lemma infer_from_predicate (cell : int Atomic.t Atomic.t) (value : int Atomic.t)
+  requires (held cell value)
+  ensures (held cell value) =
+  observe cell
+
+lemma restore_numbers (cell : int list Atomic.t) (items : int list)
+  requires (numbers cell items)
+  ensures (numbers cell items) =
+  unfold numbers cell;
+  fold numbers cell items
+
+lemma infer_numbers (cell : int list Atomic.t)
+    (items [@implicit] : int list)
+  requires (numbers cell items)
+  ensures (numbers cell items) =
+  ()
+
+lemma infer_list_from_predicate (cell : int list Atomic.t) (items : int list)
+  requires (numbers cell items)
+  ensures (numbers cell items) =
+  infer_numbers cell
+
+predicate paired (left : int Atomic.t Atomic.t) (right : int list Atomic.t)
+    (value [@implicit] : int Atomic.t) (items [@implicit] : int list) =
+  own left value && own right items
+
+lemma restore_pair (left : int Atomic.t Atomic.t) (right : int list Atomic.t)
+    (value : int Atomic.t) (items : int list)
+  requires (paired left right value items)
+  ensures (paired left right value items) =
+  unfold paired left right value;
+  fold paired left right value items
+
+predicate origin (value [@implicit] : int) = value = 0
+
+lemma origin_roundtrip
+  requires (origin)
+  ensures (origin) =
+  unfold origin;
+  fold origin 0

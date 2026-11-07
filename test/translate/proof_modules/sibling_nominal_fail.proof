@@ -1,0 +1,11 @@
+module Left = struct
+  predicate held (x : t) = own x 0
+end
+
+module Right = struct
+  predicate held (x : t) = own x 0
+end
+
+lemma mismatch (x : Right.t)
+  requires (Left.held x) =
+  ()

@@ -1,0 +1,5 @@
+module A = struct module R = Nat end
+module B = struct module R = Nat end
+module Make (X : INPUT) = struct module Authority = Auth (X.R) end
+
+lemma incompatible ensures (One.Authority.valid Two.Authority.id) = ()

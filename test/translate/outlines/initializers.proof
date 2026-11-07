@@ -1,0 +1,15 @@
+type state = { value : int }
+
+invariant shared (c : t) (s : state) = own c.cell s.value
+
+view cell (c : t) = s.value
+
+proof make =
+  let initial = value in
+  let copy = initial in
+  initially { value = copy }
+
+proof zero =
+  initially
+    let initial = 0 in
+    { value = initial }

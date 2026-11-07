@@ -1,0 +1,2 @@
+lemma unrestricted_runtime_witness (items : 'a list)
+  ensures (exists state : 'a snapshot. state.items === items) = ()

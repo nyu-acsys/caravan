@@ -1,0 +1,3 @@
+module Counter = struct
+  predicate zero (x : t) = own x 0
+end

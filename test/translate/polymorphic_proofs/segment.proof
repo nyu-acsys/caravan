@@ -1,0 +1,93 @@
+type 'a edge = Edge of 'a node Atomic.t * 'a * 'a node Atomic.t
+
+predicate segment (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items [@implicit] : 'a list) (cells [@implicit] : 'a node Atomic.t finset)
+    (edges [@implicit] : 'a edge finset) =
+  not (Finset.mem limit cells)
+  && (match items with
+      | [] -> first == limit && cells = Finset.empty && edges = Finset.empty
+      | value :: tail ->
+          exists next : 'a node Atomic.t, tail_cells : 'a node Atomic.t finset,
+            tail_edges : 'a edge finset.
+          first != limit && not (Finset.mem first tail_cells)
+          && cells = Finset.union (Finset.singleton first) tail_cells
+          && edges = Finset.union (Finset.singleton (Edge (first, value, next))) tail_edges
+          && own first (Next (value, next))
+          && segment next limit tail tail_cells tail_edges)
+
+lemma segment_info (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (items [@implicit] : 'a list) (cells [@implicit] : 'a node Atomic.t finset)
+    (edges [@implicit] : 'a edge finset)
+  requires (segment first limit items cells edges)
+  ensures (segment first limit items cells edges)
+  ensures (not (Finset.mem limit cells))
+  ensures (items = [] -> first == limit && cells = Finset.empty && edges = Finset.empty)
+  ensures (items <> [] -> Finset.mem first cells && first != limit) =
+  let (next, tail_cells, tail_edges) =
+    unfold segment first limit items cells edges {next; tail_cells; tail_edges} in
+  fold segment first limit items cells edges {next = next; tail_cells = tail_cells;
+    tail_edges = tail_edges}
+
+lemma segment_join (first : 'a node Atomic.t) (middle : 'a node Atomic.t)
+    (limit : 'a node Atomic.t) (left : 'a list) (right : 'a list)
+    (left_cells : 'a node Atomic.t finset) (right_cells : 'a node Atomic.t finset)
+    (left_edges : 'a edge finset) (right_edges : 'a edge finset)
+  requires (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  requires (Finset.inter left_cells right_cells = Finset.empty)
+  requires (not (Finset.mem limit left_cells))
+  ensures (segment first limit (left @ right)
+    (Finset.union left_cells right_cells) (Finset.union left_edges right_edges))
+  variant (left) =
+  segment_info middle limit;
+  let (next, tail_cells, tail_edges) =
+    unfold segment first middle left left_cells left_edges {next; tail_cells; tail_edges} in
+  match left with
+  | [] -> ()
+  | value :: tail ->
+      segment_join next middle limit tail right tail_cells right_cells tail_edges right_edges;
+      fold segment first limit (left @ right)
+        (Finset.union left_cells right_cells) (Finset.union left_edges right_edges)
+        {next = next; tail_cells = Finset.union tail_cells right_cells;
+          tail_edges = Finset.union tail_edges right_edges}
+
+lemma segment_append (first : 'a node Atomic.t) (limit : 'a node Atomic.t)
+    (successor : 'a node Atomic.t) (items : 'a list)
+    (cells : 'a node Atomic.t finset) (edges : 'a edge finset) (value : 'a)
+  requires (segment first limit items cells edges && own limit (Next (value, successor)))
+  requires (successor != limit && not (Finset.mem successor cells))
+  ensures (segment first successor (items @ [value])
+    (Finset.union cells (Finset.singleton limit))
+    (Finset.union edges (Finset.singleton (Edge (limit, value, successor))))) =
+  segment_info first limit;
+  fold segment successor successor [] Finset.empty Finset.empty;
+  fold segment limit successor [value] (Finset.singleton limit)
+    (Finset.singleton (Edge (limit, value, successor)))
+    {next = successor; tail_cells = Finset.empty; tail_edges = Finset.empty};
+  segment_join first limit successor items [value] cells (Finset.singleton limit)
+    edges (Finset.singleton (Edge (limit, value, successor)))
+
+
+lemma integer_client (first : int node Atomic.t) (middle : int node Atomic.t)
+    (limit : int node Atomic.t) (left : int list) (right : int list)
+    (left_cells : int node Atomic.t finset) (right_cells : int node Atomic.t finset)
+    (left_edges : int edge finset) (right_edges : int edge finset)
+  requires (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  requires (Finset.inter left_cells right_cells = Finset.empty)
+  requires (not (Finset.mem limit left_cells))
+  ensures (segment first limit (left @ right)
+    (Finset.union left_cells right_cells) (Finset.union left_edges right_edges)) =
+  segment_join first middle limit left right left_cells right_cells left_edges right_edges
+
+lemma boolean_client (first : bool node Atomic.t) (middle : bool node Atomic.t)
+    (limit : bool node Atomic.t) (left : bool list) (right : bool list)
+    (left_cells : bool node Atomic.t finset) (right_cells : bool node Atomic.t finset)
+    (left_edges : bool edge finset) (right_edges : bool edge finset)
+  requires (segment first middle left left_cells left_edges
+    && segment middle limit right right_cells right_edges)
+  requires (Finset.inter left_cells right_cells = Finset.empty)
+  requires (not (Finset.mem limit left_cells))
+  ensures (segment first limit (left @ right)
+    (Finset.union left_cells right_cells) (Finset.union left_edges right_edges)) =
+  segment_join first middle limit left right left_cells right_cells left_edges right_edges

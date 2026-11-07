@@ -1,0 +1,27 @@
+module A = struct
+  module R = Excl (struct type t = int end)
+
+  lemma private_constructor ensures (R.valid (R.excl 1)) = ()
+end
+
+module B = struct
+  module R = Nat
+end
+
+module A_auth = Auth (A.R)
+module Alias_auth = Auth (Alias.R)
+
+let slot : (Ghost.t, A.R.t) Ghost.field = Ghost.field ()
+
+lemma exported
+  ensures (A.R.valid A.R.id)
+  ensures (Alias.R.valid A.R.id)
+  ensures (A.R.comp A.R.id A.R.id === A.R.id)
+  ensures (A_auth.valid A_auth.id && Alias_auth.valid Alias_auth.id) = ()
+
+lemma allocate returns (cell : Ghost.t)
+  ensures (own (Ghost.at slot cell) A.R.id) =
+  Ghost.alloc [Ghost.init slot A.R.id]
+
+lemma distinct_identities
+  ensures (A.R.valid A.R.id && B.R.valid B.R.id) = ()

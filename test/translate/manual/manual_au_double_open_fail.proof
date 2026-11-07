@@ -1,0 +1,3 @@
+module Read = Ghost.AU (struct let operation = read end)
+
+predicate contents (cell : int Atomic.t) (value : int) = own cell value

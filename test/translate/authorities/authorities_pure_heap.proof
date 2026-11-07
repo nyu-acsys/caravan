@@ -1,0 +1,1 @@
+let heap_fact (cell : node Atomic.t) : bool = own cell End

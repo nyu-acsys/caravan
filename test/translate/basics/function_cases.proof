@@ -1,0 +1,9 @@
+predicate chain (first : node Atomic.t) (limit : node Atomic.t) (items : int list) =
+  match items with
+  | [] -> first == limit
+  | value :: tail ->
+      exists next : node Atomic.t.
+        first != limit && own first (Next (value, next)) && chain next limit tail
+
+let selected (fallback : int) (items : int list) (result : int) : bool =
+  match items with [] -> result = fallback | value :: _ -> result = value

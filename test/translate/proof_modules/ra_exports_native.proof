@@ -1,0 +1,4 @@
+module Native_ra = Excl (struct type t = Native.t end)
+
+lemma native_alias
+  ensures (Native_ra.valid (Native_ra.excl 1)) = ()

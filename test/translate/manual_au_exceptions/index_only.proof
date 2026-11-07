@@ -1,0 +1,24 @@
+module Read = Ghost.AU (struct let operation = read_as end)
+
+type saved = Saved_integer of int Read.token | Saved_boolean of bool Read.token
+
+let saved : (Ghost.t, saved) Ghost.field = Ghost.field ()
+
+proof result = atomic read_as kind
+  atomic ensures (match kind with Integer -> result === 17 | Boolean -> result === true) =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    Read.access token kind;
+    let result = step () in
+    let request = match kind with
+      | Integer -> Saved_integer token
+      | Boolean -> Saved_boolean token in
+    let registration = Ghost.alloc [Ghost.init saved request] in
+    begin match kind with
+    | Integer -> Read.commit token kind 17
+    | Boolean -> Read.commit token kind true
+    end;
+    result)
+
+proof result = atomic integer () atomic ensures (result === 17) = ()
+proof result = atomic boolean () atomic ensures (result === true) = ()

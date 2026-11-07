@@ -1,0 +1,2 @@
+invariant protected (cell : Atomic_cell.t) =
+  Atomic_cell.holds cell 0 && Atomic_cell.ticket cell 0

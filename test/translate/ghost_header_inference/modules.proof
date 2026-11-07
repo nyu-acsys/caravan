@@ -1,0 +1,12 @@
+module Make () = struct
+  proof read =
+    proof result = helper [context : 'a t] cell
+      requires (context === owner && cell == context.cell)
+      requires (own cell value)
+      ensures (own cell value && result === value) = begin
+      on return ()
+    end;
+    at (helper owner.cell) (fun invoke ->
+      let result = invoke owner in
+      result)
+end

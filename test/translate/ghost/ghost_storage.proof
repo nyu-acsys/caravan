@@ -1,0 +1,73 @@
+module Facts = SetRA (struct type t = int end)
+module Authority = Auth (Facts)
+
+let contents : (int Atomic.t, int list) Ghost.field = Ghost.field ()
+let facts : (int Atomic.t, Authority.t) Ghost.field = Ghost.field ()
+let reference_tag : (int ref, bool) Ghost.field = Ghost.field ()
+let record_tag : (counter, bool) Ghost.field = Ghost.field ()
+let watched : (Ghost.t, int Atomic.t) Ghost.field = Ghost.field ()
+let linked : (Ghost.t, bool) Ghost.field = Ghost.field ()
+let retired : (Ghost.t, bool) Ghost.field = Ghost.field ()
+
+lemma register (cell : int Atomic.t) returns (registration : Ghost.t)
+  ensures (own (Ghost.at watched registration) cell)
+  ensures (own (Ghost.at linked registration) false)
+  ensures (own (Ghost.at retired registration) false) =
+  let registration = Ghost.alloc [
+    Ghost.init watched cell;
+    Ghost.init linked false;
+    Ghost.init retired false
+  ] in
+  registration
+
+lemma split (registration : Ghost.t)
+  requires (own (Ghost.at linked registration) false)
+  ensures (own ~fraction:Permission.half (Ghost.at linked registration) false)
+  ensures (own ~fraction:Permission.half (Ghost.at linked registration) false) =
+  assert (own ~fraction:Permission.half (Ghost.at linked registration) false)
+
+lemma read_half (registration : Ghost.t) returns (result : bool)
+  requires (own ~fraction:Permission.half (Ghost.at linked registration) false)
+  ensures (own ~fraction:Permission.half (Ghost.at linked registration) false)
+  ensures (result = false) =
+  Ghost.read (Ghost.at linked registration)
+
+lemma update (registration : Ghost.t)
+  requires (own ~fraction:Permission.half (Ghost.at linked registration) false)
+  requires (own ~fraction:Permission.half (Ghost.at linked registration) false)
+  ensures (own (Ghost.at linked registration) true) =
+  Ghost.write (Ghost.at linked registration) true
+
+lemma registration_roundtrip (cell : int Atomic.t) =
+  let registration = register cell in
+  split registration;
+  let observed = read_half registration in
+  assert (observed = false);
+  update registration;
+  let value = Ghost.read (Ghost.at linked registration) in
+  assert (value = true)
+
+let nested_tag : (int ref ref, bool) Ghost.field = Ghost.field ()
+let outer_tag : (int ref Atomic.t, bool) Ghost.field = Ghost.field ()
+let counter_value : (Ghost.t, int) Ghost.field = Ghost.field ()
+
+lemma bounded_value returns (cell : Ghost.t)
+  ensures (own (Ghost.at counter_value cell) max_int) =
+  Ghost.alloc [Ghost.init counter_value max_int]
+
+lemma full_permission (registration : Ghost.t)
+  requires (own ~fraction:Permission.full (Ghost.at linked registration) false)
+  ensures (own (Ghost.at linked registration) true) =
+  Ghost.write (Ghost.at linked registration) true
+
+lemma publish (cell : int Atomic.t)
+  requires (own (Ghost.at facts cell) (Authority.full (Facts.set Set.empty)))
+  ensures (own (Ghost.at facts cell) (Authority.full (Facts.set (Set.singleton 0)))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Authority.full (Facts.set Set.empty))
+    (Authority.full (Facts.set (Set.singleton 0)))
+
+lemma fresh_registrations =
+  let first = Ghost.alloc [Ghost.init linked false] in
+  let second = Ghost.alloc [Ghost.init linked false] in
+  assert (first != second)

@@ -1,0 +1,5 @@
+module A = struct
+  module R = Nat
+end
+
+module Public = Auth(A.R)

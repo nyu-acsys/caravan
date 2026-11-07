@@ -10,3 +10,12 @@ CLAUDE.md
 AGENTS.md
 local/
 /vendor/
+/vs-code/node_modules/
+/vs-code/out/
+/vs-code/images/icon.png
+/vs-code/*.vsix
+/vs-code/bundled/
+/vs-code/downloads/
+/vs-code/dist/
+/dist/
+__pycache__/

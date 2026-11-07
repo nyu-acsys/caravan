@@ -1,0 +1,4 @@
+let model (value : 'a) : 'a = identity value
+
+lemma invalid_bound (value : int)
+  ensures (model value <= max_int) = ()

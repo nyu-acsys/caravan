@@ -1,0 +1,12 @@
+predicate contents (cell : int Atomic.t) (value : int) = own cell value
+
+module Read = Ghost.AU (struct let operation = read end)
+module ReadAlias = Ghost.AU (struct let operation = read_alias end)
+module ReadRetry = Ghost.AU (struct let operation = read_retry end)
+
+predicate tagged (value : int) = value = 7
+
+module Write = Ghost.AU (struct let operation = write end)
+module ReadPair = Ghost.AU (struct let operation = read_pair end)
+module Constant = Ghost.AU (struct let operation = constant end)
+module ReadTuple = Ghost.AU (struct let operation = read_tuple end)

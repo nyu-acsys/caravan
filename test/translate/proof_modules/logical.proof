@@ -1,0 +1,17 @@
+module Left = struct
+  let shift (x : t) : int = x
+  let twice (x : t) : int = shift (shift x)
+  let zero (ignored : int) : int = 0
+
+  lemma same (x : t) ensures (twice x = x && zero x = 0) = ()
+end
+
+module Right = struct
+  let shift (x : t) : int = x
+  let twice (x : t) : int = shift (shift x)
+
+  lemma same (x : t) ensures (twice x = x) = ()
+end
+
+lemma outside (x : int)
+  ensures (Alias.twice x = Right.twice x && Alias.zero x = 0) = ()

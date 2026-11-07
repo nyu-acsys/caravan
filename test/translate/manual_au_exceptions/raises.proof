@@ -1,0 +1,81 @@
+predicate contents (cell : 'a option Atomic.t) (value [@implicit] : 'a option) =
+  own cell value
+
+module Read = Ghost.AU (struct let operation = read end)
+module Consume = Ghost.AU (struct let operation = consume end)
+
+lemma preserve_raised (cell : 'a option Atomic.t) (token : 'a Read.token)
+  requires (Read.raised token cell Empty)
+  ensures (Read.raised token cell Empty) = ()
+
+proof result = atomic read cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && match value with
+    | None -> false
+    | Some expected -> result === expected)
+  atomic raises Empty -> (contents cell None) =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    let value = Read.access token cell in
+    unfold contents cell value;
+    let result = step () in
+    fold contents cell value;
+    begin match result with
+    | None ->
+        Read.commit_raise token cell Empty;
+        preserve_raised cell token;
+        assert (Read.raised token cell Empty)
+    | Some expected ->
+        Read.commit token cell expected;
+        assert (Read.committed token cell expected)
+    end;
+    result)
+
+proof result = atomic consume cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && value =/= None)
+  atomic raises Empty -> (contents cell None) =
+  at (Atomic.get cell) (fun step ->
+    let token = Consume.bind () in
+    let value = Consume.access token cell in
+    unfold contents cell value;
+    let result = step () in
+    fold contents cell value;
+    begin match result with
+    | None -> Consume.commit_raise token cell Empty
+    | Some _ -> Consume.commit token cell ()
+    end;
+    result)
+
+module Delegate = Ghost.AU (struct let operation = delegate end)
+module DelegateUnit = Ghost.AU (struct let operation = delegate_unit end)
+
+proof result = atomic delegate cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && match value with
+    | None -> false
+    | Some expected -> result === expected)
+  atomic raises Empty -> (contents cell None) =
+  at (read cell) (fun invoke ->
+    let token = Delegate.bind () in
+    let value = Delegate.access token cell in
+    let (result, outcome) = invoke () in
+    begin match outcome with
+    | None -> Delegate.commit token cell result
+    | Some exception_ -> Delegate.commit_raise token cell exception_
+    end;
+    result)
+
+proof result = atomic delegate_unit cell
+  atomic requires (contents cell value)
+  atomic ensures (contents cell value && value =/= None)
+  atomic raises Empty -> (contents cell None) =
+  at (consume cell) (fun invoke ->
+    let token = DelegateUnit.bind () in
+    let value = DelegateUnit.access token cell in
+    let (result, outcome) = invoke () in
+    begin match outcome with
+    | None -> DelegateUnit.commit token cell ()
+    | Some exception_ -> DelegateUnit.commit_raise token cell exception_
+    end;
+    result)

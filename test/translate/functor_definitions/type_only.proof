@@ -1,0 +1,8 @@
+module Make (X : Value) = struct
+  type model = Empty | Item of X.t
+
+  lemma reflexive (x : X.t)
+    ensures (Item x = Item x) =
+    let (value : model) = Item x in
+    match value with Empty -> () | Item _ -> ()
+end

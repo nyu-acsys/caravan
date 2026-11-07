@@ -2,4 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.0]
+
+- Verification of a first-order subset of multicore OCaml 5, including polymorphic functions, algebraic data types, records, exceptions, modules, functors, mutable state, and atomics.
+- Functional correctness and separation-logic contracts in `.ml` and `.mli` files, including arithmetic safety, loop invariants, and exceptional outcomes.
+- Modular linearizability proofs through logically atomic contracts, shared invariants, ghost-state actions, histories, and helping.
+- Automatic invariant reasoning and manual proofs in companion `.proof` files, with ghost state, logical definitions, reusable lemmas, and resource algebras.
+- Contracts for selected standard-library operations and imported library interfaces, with automatic discovery of local Dune dependencies.
+- Command-line verification with source-level diagnostics, verification caching, and generated Raven output for inspection and standalone verification.
+- VS Code integration with bundled toolchains, specification and proof highlighting, contract hovers, views of proofs and generated Raven, and streamed verification results.
+- Verified Saturn case studies covering the Treiber stack, Michael–Scott queue with history-based and segment-based proofs, and stack-drain clients.

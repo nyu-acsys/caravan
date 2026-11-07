@@ -1,0 +1,11 @@
+module Counter = struct
+  predicate contents (cell : t) (value [@implicit] : int) = own cell value
+  module Read = Ghost.AU (struct let operation = read end)
+end
+
+module Read = Ghost.AU (struct let operation = Alias.read end)
+let tokens : (Ghost.t, Read.token) Ghost.field = Ghost.field ()
+
+lemma preserve (token : Read.token) (cell : Alias.t)
+  requires (Read.pending token cell)
+  ensures (Read.pending token cell) = ()

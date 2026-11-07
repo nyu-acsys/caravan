@@ -1,0 +1,20 @@
+module Make (X : INPUT) = struct
+  module Read = Ghost.AU (struct let operation = read end)
+
+  lemma preserve_private (token : Read.token) (value : X.t)
+    requires (Read.pending token value)
+    ensures (Read.pending token value) = ()
+end
+
+let one_slot : (Ghost.t, One.Read.token) Ghost.field = Ghost.field ()
+let two_slot : (Ghost.t, Two.Read.token) Ghost.field = Ghost.field ()
+
+lemma one (token : One.Read.token) (value : A.t)
+  requires (One.Read.pending token value)
+  ensures (One.Read.pending token value) =
+  One.preserve_private token value
+
+lemma two (token : Two.Read.token) (value : B.t)
+  requires (Two.Read.pending token value)
+  ensures (Two.Read.pending token value) =
+  Two.preserve_private token value

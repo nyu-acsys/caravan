@@ -1,0 +1,22 @@
+type 'a fact = Seen of 'a | Published of 'a Atomic.t
+
+module Facts = SetRA (struct type 'a t = 'a fact end)
+module Authority = Auth (Facts)
+
+let attached : ('a Atomic.t, 'a Authority.t) Ghost.field = Ghost.field ()
+
+lemma keep_empty (cell : 'a Atomic.t)
+  requires (own (Ghost.at attached cell) (Authority.full (Facts.set Set.empty)))
+  ensures (own (Ghost.at attached cell) (Authority.full (Facts.set Set.empty))) = ()
+
+lemma keep_published (cell : 'a Atomic.t)
+  requires (own (Ghost.at attached cell)
+    (Authority.full (Facts.set (Set.singleton (Published cell)))))
+  ensures (own (Ghost.at attached cell)
+    (Authority.full (Facts.set (Set.singleton (Published cell))))) = ()
+
+let snapshot : ('a Atomic.t, (Ghost.t, 'a fact) map) Ghost.field = Ghost.field ()
+
+lemma keep_map (cell : 'a Atomic.t)
+  requires (own (Ghost.at snapshot cell) (Map.const (Published cell)))
+  ensures (own (Ghost.at snapshot cell) (Map.const (Published cell))) = ()

@@ -1,0 +1,1 @@
+lemma false_result returns (result : int) = assert false

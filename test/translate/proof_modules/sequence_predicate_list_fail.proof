@@ -1,0 +1,3 @@
+module Impl = struct
+  predicate contents (cell : int Atomic.t) (xs : int sequence) = true
+end

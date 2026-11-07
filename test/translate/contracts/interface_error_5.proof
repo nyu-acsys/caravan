@@ -1,0 +1,1 @@
+predicate is_lock (l : t) (b : bool) own l b

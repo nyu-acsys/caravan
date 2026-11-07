@@ -1,0 +1,37 @@
+predicate contents (cell : 'a Atomic.t) (value [@implicit] : 'a) = own cell value
+
+module Read = Ghost.AU (struct let operation = read end)
+module Retry = Ghost.AU (struct let operation = retry end)
+module Known = Ghost.AU (struct let operation = read_known end)
+
+let token_slot : (Ghost.t, 'a Read.token) Ghost.field = Ghost.field ()
+
+lemma keep_token (cell : 'a Atomic.t) (token : 'a Read.token)
+  returns (registration : Ghost.t)
+  requires (Read.pending token cell)
+  ensures (Read.pending token cell)
+  ensures (own (Ghost.at token_slot registration) token) =
+  Ghost.alloc [Ghost.init token_slot token]
+
+lemma roundtrip (registration : Ghost.t) (token : 'a Read.token)
+  requires (own (Ghost.at token_slot registration) token)
+  ensures (own (Ghost.at token_slot registration) token) =
+  let saved : 'a Read.token = Ghost.read (Ghost.at token_slot registration) in
+  assert (saved === token);
+  Ghost.write (Ghost.at token_slot registration) token
+
+type 'a saved_token = Empty | Saved of 'a Read.token
+
+lemma pack (token : 'a Read.token) returns (result : 'a saved_token)
+  ensures (result === Saved token) =
+  Saved token
+
+lemma unpack (saved : 'a saved_token) returns (result : 'a Read.token option)
+  ensures (result === (match saved with Empty -> None | Saved token -> Some token)) =
+  match saved with Empty -> None | Saved token -> Some token
+
+lemma help_unit (cell : unit Atomic.t) (token : unit Known.token)
+  requires (Known.pending token cell ())
+  ensures (Known.committed token cell () () ()) =
+  Known.access token cell ();
+  Known.commit token cell () () ()

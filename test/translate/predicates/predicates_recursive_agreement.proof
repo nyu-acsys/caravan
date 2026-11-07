@@ -1,0 +1,31 @@
+predicate footprint (nodes : int Atomic.t list)
+    (cells [@implicit] : int Atomic.t finset) =
+  match nodes with
+  | [] -> cells = Finset.empty
+  | cell :: tail ->
+      exists rest : int Atomic.t finset.
+        footprint tail rest
+        && cells = Finset.union (Finset.singleton cell) rest
+
+lemma duplicate (nodes : int Atomic.t list)
+    (cells [@implicit] : int Atomic.t finset)
+  requires (footprint nodes cells)
+  ensures (footprint nodes cells && footprint nodes cells)
+  variant (nodes) =
+  match nodes with
+  | [] ->
+      unfold footprint nodes cells;
+      fold footprint nodes cells;
+      fold footprint nodes cells
+  | _ :: tail ->
+      let rest = unfold footprint nodes cells {rest} in
+      duplicate tail rest;
+      fold footprint nodes cells {rest = rest};
+      fold footprint nodes cells {rest = rest}
+
+lemma duplicate_singleton (cell : int Atomic.t)
+  ensures (footprint [cell] (Finset.singleton cell)
+    && footprint [cell] (Finset.singleton cell)) =
+  fold footprint [] Finset.empty;
+  fold footprint [cell] (Finset.singleton cell) {rest = Finset.empty};
+  duplicate [cell] (Finset.singleton cell)

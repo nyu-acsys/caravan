@@ -1,0 +1,11 @@
+module World = struct
+  module Make () = struct
+    type model = Empty | Item of int
+
+    let payload (value : model) : int =
+      match value with Empty -> 0 | Item value -> value
+  end
+
+  lemma wrong (value : One.model)
+    ensures (Two.payload value = 0) = ()
+end

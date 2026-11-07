@@ -1,0 +1,87 @@
+module Static = struct
+  type model = Item of int
+
+  let payload (value : model) : int = match value with Item value -> value
+
+  let slot : (Ghost.t, int) Ghost.field = Ghost.field ()
+  predicate held (cell : Ghost.t) (value : int) =
+    own (Ghost.at slot cell) value
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (held cell 0) =
+    let cell = Ghost.alloc [Ghost.init slot 0] in
+    fold held cell 0;
+    cell
+
+  lemma preserve (cell : Ghost.t) (value : int)
+    requires (held cell value)
+    ensures (held cell value) = ()
+
+  lemma item (value : int)
+    ensures (payload (Item value) = value) = ()
+end
+
+module A = struct
+  predicate ready (value : int) = value >= 0
+end
+
+module Make (X : INPUT) = struct
+  lemma captured (cell : Ghost.t) (value : int)
+    requires (Static.held cell value && X.ready value)
+    ensures (Static_alias.held cell value && X.ready value) =
+    Static.preserve cell value
+end
+
+module Unit () = struct
+  type model = Item of int
+
+  let payload (value : model) : int = match value with Item value -> value
+
+  let slot : (Ghost.t, int) Ghost.field = Ghost.field ()
+  predicate held (cell : Ghost.t) (value : int) =
+    own (Ghost.at slot cell) value
+
+  lemma allocate returns (cell : Ghost.t)
+    ensures (held cell 0) =
+    let cell = Ghost.alloc [Ghost.init slot 0] in
+    fold held cell 0;
+    cell
+end
+
+module Curried (X : INPUT) () = struct
+  lemma captured (cell : Ghost.t) (value : int)
+    requires (Static.held cell value && X.ready value)
+    ensures (Static.held cell value && X.ready value) =
+    Static.preserve cell value
+end
+
+let same_model (value : Static.model) : Static_alias.model = value
+
+lemma same_predicate (cell : Ghost.t) (value : int)
+  requires (Static.held cell value)
+  ensures (Static_alias.held cell value) =
+  Static.preserve cell value
+
+lemma same_field =
+  let cell = Static.allocate in
+  unfold Static_alias.held cell 0;
+  fold Static.held cell 0
+
+lemma clients
+  requires (A.ready 0)
+  ensures (A.ready 0) =
+  let cell = Static.allocate in
+  Named.captured cell 0;
+  Applied.captured cell 0;
+  Static_alias.preserve cell 0
+
+lemma unit_resource =
+  let static_cell = Static.allocate in
+  let unit_cell = Fresh.allocate in
+  Static.preserve static_cell 0;
+  unfold Fresh.held unit_cell 0
+
+lemma models (value : int)
+  ensures (Static_alias.payload (Static.Item value) = value
+    && Static.payload (Static_alias.Item value) = value
+    && Fresh.payload (Fresh.Item value) = value) = ()

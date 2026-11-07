@@ -1,0 +1,8 @@
+module Facts = SetRA (struct type t = int end)
+module Facts_auth = Auth (Facts)
+
+let facts : (node Atomic.t, Facts_auth.t) Ghost.field = Ghost.field ()
+
+lemma wrong_owner (cell : int Atomic.t)
+  requires (own (Ghost.at facts (cell : node Atomic.t))
+    (Facts_auth.auth (Facts.set Set.empty))) = ()

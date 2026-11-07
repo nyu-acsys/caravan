@@ -1,0 +1,33 @@
+module Outer = struct
+  module Left = struct
+    predicate contents (cell : int Atomic.t) (value : int) = own cell value
+
+    module Read = Ghost.AU (struct let operation = read end)
+
+    lemma preserve_private (token : Read.token) (cell : t)
+      requires (Read.pending token cell)
+      ensures (Read.pending token cell) = ()
+  end
+
+  module Right = struct
+    predicate contents (cell : int Atomic.t) (value : int) = own cell value
+
+    module Read = Ghost.AU (struct let operation = read end)
+  end
+
+  module Helper = struct
+    let token_slot : (Ghost.t, Left.Read.token) Ghost.field = Ghost.field ()
+
+    lemma preserve (token : Left.Read.token) (cell : int Atomic.t)
+      requires (Left.Read.pending token cell)
+      ensures (Left.Read.pending token cell) =
+      ()
+
+    lemma preserve_alias (token : Alias.Read.token) (cell : int Atomic.t)
+      requires (Alias.Read.pending token cell)
+      ensures (Left.Read.pending token cell) =
+      ()
+  end
+end
+
+lemma hidden_token (token : Outer.Left.Read.token) = ()

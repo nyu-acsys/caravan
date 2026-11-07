@@ -1,0 +1,41 @@
+module Make (Cell : CELL) = struct
+  type model = Empty | Item of Cell.t
+
+  let singleton (cell : Cell.t) : model = Item cell
+
+  let is_empty (value : model) : bool =
+    match value with Empty -> true | Item _ -> false
+
+  predicate wrapped (cell : Cell.t) (n [@implicit] : int) =
+    Cell.counter cell n && is_empty (singleton cell) = false
+
+  lemma preserve (cell : Cell.t) (n [@implicit] : int)
+    requires (wrapped cell n)
+    ensures (wrapped cell n && is_empty (singleton cell) = false) =
+    unfold wrapped cell;
+    fold wrapped cell n
+
+  lemma singleton_item (cell : Cell.t)
+    ensures (singleton cell = Item cell && is_empty (singleton cell) = false) = ()
+end
+
+lemma first_model (cell : First.t)
+  ensures (First.singleton cell = Alias.singleton cell
+    && First.is_empty (First.singleton cell) = false) =
+  First.singleton_item cell;
+  Alias.singleton_item cell
+
+lemma match_item (cell : First.t)
+  ensures (First.is_empty (First.singleton cell) = false) =
+  let (value : First.model) = First.singleton cell in
+  match value with
+  | First.Empty -> ()
+  | First.Item item -> First.singleton_item item
+
+lemma repeated_model (cell : First.t)
+  ensures (Repeated.is_empty (First.singleton cell) = false) =
+  Repeated.singleton_item cell
+
+lemma second_model (cell : Second.t)
+  ensures (Second.is_empty (Second.singleton cell) = false) =
+  Second.singleton_item cell

@@ -1,0 +1,5 @@
+module First = Excl (struct type t = int end)
+module Third = Excl (struct type t = bool end)
+
+lemma distinct
+  ensures (Third.valid (First.excl 1)) = ()

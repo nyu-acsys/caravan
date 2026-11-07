@@ -1,0 +1,70 @@
+{
+  "name": "caravan",
+  "displayName": "Caravan",
+  "icon": "images/icon.png",
+  "description": "Verification for multicore OCaml programs.",
+  "version": "0.1.0",
+  "publisher": "nyu-acsys",
+  "repository": { "type": "git", "url": "https://github.com/nyu-acsys/caravan.git", "directory": "vs-code" },
+  "vsce": {
+    "baseContentUrl": "https://github.com/nyu-acsys/caravan/blob/HEAD/vs-code",
+    "baseImagesUrl": "https://github.com/nyu-acsys/caravan/raw/HEAD/vs-code"
+  },
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages", "Linters"],
+  "main": "./out/client/extension.js",
+  "activationEvents": ["onLanguage:ocaml", "onLanguage:ocaml.interface", "onLanguage:caravan-proof"],
+  "extensionDependencies": ["ocamllabs.ocaml-platform"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "scripts": {
+    "compile": "tsc -p . && node scripts/prepare-assets.cjs",
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test test/*.test.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12",
+    "vscode-uri": "^3.0.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.7.0",
+    "vscode-textmate": "^9.2.0",
+    "vscode-oniguruma": "^2.0.1"
+  },
+  "contributes": {
+    "commands": [
+      {"command": "caravan.verify", "title": "Caravan: Verify Saved File"},
+      {"command": "caravan.showProofView", "title": "Caravan: Show Proof View"},
+      {"command": "caravan.showRavenView", "title": "Caravan: Show Generated Raven"},
+      {"command": "caravan.updateVerifier", "title": "Caravan: Update Verifier"},
+      {"command": "caravan.showVerifierVersion", "title": "Caravan: Show Verifier Version"},
+      {"command": "caravan.useBundledVerifier", "title": "Caravan: Use Bundled Verifier"}
+    ],
+    "languages": [{"id": "caravan-proof", "aliases": ["Caravan Proof"], "extensions": [".proof"], "configuration": "./language-configuration.json"}],
+    "grammars": [
+      {"language": "caravan-proof", "scopeName": "source.caravan.proof", "path": "./syntaxes/proof.tmLanguage.json"},
+      {"scopeName": "source.caravan.spec", "path": "./syntaxes/spec.tmLanguage.json"},
+      {"scopeName": "caravan.ocaml.injection", "path": "./syntaxes/ocaml-injection.tmLanguage.json", "injectTo": ["source.ocaml", "source.ocaml.interface"]}
+    ],
+    "configuration": {
+      "title": "Caravan",
+      "properties": {
+        "caravan.executable": {"type": "string", "default": "", "scope": "resource", "description": "Override the managed or bundled Caravan with an executable or launcher program. Empty selects automatically. Runs without a shell."},
+        "caravan.updateChannel": {"type": "string", "enum": ["stable", "tag", "bundled"], "default": "stable", "scope": "window", "description": "Follow stable Caravan releases, select a release tag, or use only the bundled toolchain. Updates are offered before downloading."},
+        "caravan.caravanVersion": {"type": "string", "default": "", "scope": "window", "description": "Caravan release tag for the tag channel, for example v0.1.0."},
+        "caravan.checkForUpdates": {"type": "boolean", "default": true, "scope": "window", "description": "Check for a newer compatible toolchain on startup, at most once a day. Downloads require acceptance."},
+        "caravan.arguments": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Arguments before Caravan's verification flags and file path. For opam use executable opam and arguments [exec, --, caravan]."},
+        "caravan.cwd": {"type": "string", "default": "", "scope": "resource", "description": "Working directory, relative to the containing workspace folder or absolute. Empty uses the workspace folder, or the file directory outside a workspace."},
+        "caravan.includePaths": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Include directories passed with -I, resolved from the working directory."},
+        "caravan.smtTimeout": {"type": "integer", "minimum": 1, "default": 10000, "scope": "resource", "description": "SMT solver timeout in milliseconds."},
+        "caravan.cache": {"type": "boolean", "default": true, "scope": "resource", "description": "Reuse successfully verified proof obligations through Raven's dependency fingerprints. Stored in extension storage; disable to check every obligation again."},
+        "caravan.verifyOnSave": {"type": "boolean", "default": true, "scope": "resource", "description": "Verify supported files after saving."},
+        "caravan.showProofHints": {"type": "boolean", "default": true, "scope": "resource", "description": "Show short labels for external proof steps in implementations, with full annotation hovers and navigation to their proof source."}
+      }
+    }
+  }
+}

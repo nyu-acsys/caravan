@@ -1,0 +1,8 @@
+test/saturn/michael_scott_queue/michael_scott_queue.ml text eol=lf
+test/saturn/michael_scott_queue/michael_scott_queue.mli text eol=lf
+test/saturn/michael_scott_queue/michael_scott_queue_intf.mli text eol=lf
+test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml text eol=lf
+test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli text eol=lf
+test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli text eol=lf
+test/saturn/treiber_stack/treiber_stack.ml text eol=lf
+test/saturn/treiber_stack/treiber_stack.mli text eol=lf

@@ -1,0 +1,2 @@
+predicate unconstrained (cell : int Atomic.t)
+    (value [@implicit] : int Atomic.t) = true

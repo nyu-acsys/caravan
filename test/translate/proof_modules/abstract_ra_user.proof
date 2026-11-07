@@ -1,0 +1,21 @@
+module UnitRA : ResourceAlgebra = struct
+  type t = Unit
+  let id : t = Unit
+  let valid (value : t) : bool = true
+  let comp (left : t) (right : t) : t = Unit
+  let frame (whole : t) (part : t) : t = Unit
+  let fpuAllowed (before : t) (after : t) : bool = true
+end
+
+module A = struct
+  module R = UnitRA
+end
+
+module Make (X : VIEW) = struct
+  module Authority = Auth (X.R)
+
+  lemma identities
+    ensures (X.R.valid X.R.id && Authority.valid Authority.id) = ()
+end
+
+lemma use = One.identities

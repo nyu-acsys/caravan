@@ -1,0 +1,106 @@
+type fact = Published of node Atomic.t | Successor of node Atomic.t * node Atomic.t
+
+module Fact_set = SetRA (struct type t = fact end)
+module Fact_auth = Auth (Fact_set)
+
+let facts : (node Atomic.t, Fact_auth.t) Ghost.field = Ghost.field ()
+
+lemma valid_identities
+  ensures (Fact_set.valid Fact_set.id && Fact_auth.valid Fact_auth.id)
+  ensures (not (Fact_set.valid Fact_set.top)) = ()
+
+let facts_of (published : node Atomic.t finset)
+    (links : (node Atomic.t * node Atomic.t) finset) : fact set =
+  Set.of_predicate (fun (f : fact) ->
+    match f with
+    | Published cell -> Finset.mem cell published
+    | Successor (source, target) -> Finset.mem (source, target) links)
+
+let singleton_cell (cell : node Atomic.t) : node Atomic.t set =
+  let original = cell in
+  Set.of_predicate (fun (cell : node Atomic.t) -> cell == original)
+
+lemma singleton_membership (cell : node Atomic.t)
+  ensures (Set.mem cell (singleton_cell cell)) = ()
+
+lemma singleton_exclusion (left : node Atomic.t) (right : node Atomic.t)
+  requires (left != right)
+  ensures (not (Set.mem right (singleton_cell left))) = ()
+
+let first_of_two (items : int list) : int =
+  match items with first :: _ :: _ -> first | _ -> 0
+
+lemma short_list_default
+  ensures (first_of_two [] = 0 && first_of_two [1] = 0) = ()
+
+lemma published_fact (published : node Atomic.t finset)
+    (links : (node Atomic.t * node Atomic.t) finset) (cell : node Atomic.t)
+  requires (Finset.mem cell published)
+  ensures (Set.mem (Published cell) (facts_of published links)) = ()
+
+lemma successor_fact (published : node Atomic.t finset)
+    (links : (node Atomic.t * node Atomic.t) finset)
+    (source : node Atomic.t) (target : node Atomic.t)
+  requires (Finset.mem (source, target) links)
+  ensures (Set.mem (Successor (source, target)) (facts_of published links)) = ()
+
+lemma facts_grow (before : node Atomic.t finset) (after : node Atomic.t finset)
+    (old_links : (node Atomic.t * node Atomic.t) finset)
+    (new_links : (node Atomic.t * node Atomic.t) finset)
+  requires (Finset.subset before after && Finset.subset old_links new_links)
+  ensures (Set.subset (facts_of before old_links) (facts_of after new_links)) = ()
+
+lemma issue_snapshot (cell : node Atomic.t) (known : fact set) (f : fact)
+  requires (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set known)))
+  requires (Set.mem f known)
+  ensures (own (Ghost.at facts cell)
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f)))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set known))
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f)))
+
+lemma observe_snapshot (cell : node Atomic.t) (known : fact set) (f : fact)
+  requires (own (Ghost.at facts cell)
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f))))
+  ensures (own (Ghost.at facts cell)
+    (Fact_auth.auth_frag (Fact_set.set known) (Fact_set.set (Set.singleton f))))
+  ensures (Set.mem f known) = ()
+
+lemma duplicate_snapshot (cell : node Atomic.t) (remembered : fact set)
+  requires (own (Ghost.at facts cell) (Fact_auth.frag (Fact_set.set remembered)))
+  ensures (own (Ghost.at facts cell) (Fact_auth.frag (Fact_set.set remembered))
+    && own (Ghost.at facts cell) (Fact_auth.frag (Fact_set.set remembered))) = ()
+
+lemma authority_observes_fragment (cell : node Atomic.t) (known : fact set) (f : fact)
+  requires (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set known))
+    && own (Ghost.at facts cell) (Fact_auth.frag (Fact_set.set (Set.singleton f))))
+  ensures (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set known))
+    && own (Ghost.at facts cell) (Fact_auth.frag (Fact_set.set (Set.singleton f))))
+  ensures (Set.mem f known) = ()
+
+lemma grow_authority (cell : node Atomic.t) (before : fact set) (after : fact set)
+  requires (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set before)))
+  requires (Set.subset before after)
+  ensures (own (Ghost.at facts cell) (Fact_auth.full (Fact_set.set after))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set before)) (Fact_auth.full (Fact_set.set after))
+
+lemma publish_more (cell : node Atomic.t) (before : node Atomic.t finset)
+    (after : node Atomic.t finset) (links : (node Atomic.t * node Atomic.t) finset)
+  requires (own (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set (facts_of before links))))
+  requires (Finset.subset before after)
+  ensures (own (Ghost.at facts cell)
+    (Fact_auth.full (Fact_set.set (facts_of after links)))) =
+  facts_grow before after links links;
+  grow_authority cell (facts_of before links) (facts_of after links)
+
+lemma add_fact (cell : node Atomic.t) (known : fact set) (f : fact)
+  requires (own (Ghost.at facts cell) (Fact_auth.auth (Fact_set.set known)))
+  ensures (own (Ghost.at facts cell)
+    (Fact_auth.auth_frag (Fact_set.set (Set.union known (Set.singleton f)))
+      (Fact_set.set (Set.singleton f)))) =
+  Ghost.fpu (Ghost.at facts cell)
+    (Fact_auth.auth (Fact_set.set known))
+    (Fact_auth.auth_frag (Fact_set.set (Set.union known (Set.singleton f)))
+      (Fact_set.set (Set.singleton f)))

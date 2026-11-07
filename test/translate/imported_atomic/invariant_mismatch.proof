@@ -1,0 +1,1 @@
+invariant held (cell : t) = own cell.contents 0

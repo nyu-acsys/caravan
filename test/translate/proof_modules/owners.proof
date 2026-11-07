@@ -1,0 +1,3 @@
+module Counter = struct end
+
+module Make (Cell : VIEW) () = struct end

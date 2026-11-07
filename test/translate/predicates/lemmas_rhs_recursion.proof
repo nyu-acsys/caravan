@@ -1,0 +1,3 @@
+lemma loop (n : int) =
+  let () = loop n in
+  ()

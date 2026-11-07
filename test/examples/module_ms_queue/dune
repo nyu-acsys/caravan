@@ -1,0 +1,51 @@
+(copy_files ../../saturn/michael_scott_queue/michael_scott_queue_intf.mli)
+
+(rule
+ (target module_queue.ml)
+ (deps
+  ../../saturn/michael_scott_queue/michael_scott_queue.ml
+  ../../saturn/michael_scott_queue/michael_scott_queue.mli
+  client.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Queue : sig\n")
+    (cat ../../saturn/michael_scott_queue/michael_scott_queue.mli)
+    (echo "\nend = struct\n")
+    (cat ../../saturn/michael_scott_queue/michael_scott_queue.ml)
+    (echo "\nend\n\nmodule Alias = Queue\n\n")
+    (cat client.ml)))))
+
+(rule
+ (target module_queue.proof)
+ (deps ../../saturn/michael_scott_queue/michael_scott_queue.proof)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Queue = struct\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(rule
+ (target queue_api.mli)
+ (deps ../../saturn/michael_scott_queue/michael_scott_queue.mli)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "module Queue : sig\n")
+    (cat %{deps})
+    (echo "\nend\n")))))
+
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  michael_scott_queue_intf.mli
+  module_queue.ml
+  module_queue.proof
+  queue_api.mli
+  client.ml
+  ../../saturn/backoff/backoff.mli))

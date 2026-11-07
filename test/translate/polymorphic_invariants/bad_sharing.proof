@@ -1,0 +1,3 @@
+module Cell = struct
+  invariant related (q : 'a t) (value : 'b) = true
+end

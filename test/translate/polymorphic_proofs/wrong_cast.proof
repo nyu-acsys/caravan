@@ -1,0 +1,1 @@
+let wrong (left : 'a) (right : 'b) : 'a = (left : 'b)

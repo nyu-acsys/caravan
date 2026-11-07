@@ -1,0 +1,89 @@
+{
+  "name": "Caravan specification lexical rules",
+  "scopeName": "source.caravan.spec",
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#string"
+    },
+    {
+      "include": "#character"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "name": "storage.type.caravan",
+      "match": "'[a-z_][A-Za-z0-9_']*"
+    },
+    {
+      "name": "entity.name.function.caravan",
+      "match": "`[a-z_][A-Za-z0-9_']*`"
+    },
+    {
+      "name": "constant.numeric.caravan",
+      "match": "\\b(?:0[xX][\\da-fA-F_]+(?:\\.[\\da-fA-F_]*)?(?:[pP][+-]?[\\d_]+)?|0[oO][0-7_]+|0[bB][01_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?[\\d_]+)?)[i]?\\b"
+    },
+    {
+      "name": "support.function.caravan",
+      "match": "(?<![A-Za-z0-9_'])(?:~fraction|Set\\.of_predicate)(?![A-Za-z0-9_'])"
+    },
+    {
+      "name": "keyword.operator.caravan",
+      "match": "[=<>~+*/\\\\%!$&?@^.:|#-]+"
+    }
+  ],
+  "repository": {
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.caravan",
+          "match": "(?<![A-Za-z0-9_'])\\b(?:else|exists|forall|if|end|as|assert|at|begin|commit|fold|fun|in|let|rec|match|mod|not|of|old|then|unfold|with)(?![A-Za-z0-9_'])"
+        },
+        {
+          "name": "keyword.other.caravan",
+          "match": "(?<![A-Za-z0-9_'])\\b(?:ensures|requires|returns|returning|raises|atomic|invariant|variant|initially|consumes|continues|helps|on|wait|linearizes|performs)(?![A-Za-z0-9_'])"
+        },
+        {
+          "name": "storage.type.caravan",
+          "match": "(?<![A-Za-z0-9_'])\\b(?:action|lemma|module|type|predicate|proof|view|struct)(?![A-Za-z0-9_'])"
+        },
+        {
+          "name": "storage.modifier.caravan",
+          "match": "(?<![A-Za-z0-9_'])\\b(?:pure)(?![A-Za-z0-9_'])"
+        },
+        {
+          "name": "constant.language.caravan",
+          "match": "(?<![A-Za-z0-9_'])\\b(?:true|false)(?![A-Za-z0-9_'])"
+        }
+      ]
+    },
+    "string": {
+      "name": "string.quoted.double.caravan",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.caravan",
+          "match": "\\\\(?:.|$)"
+        }
+      ]
+    },
+    "character": {
+      "name": "string.quoted.single.caravan",
+      "match": "'(?:[^\\\\'\\n]|\\\\(?:[0-9]{3}|o[0-7]{3}|x[0-9a-fA-F]{2}|.))'"
+    },
+    "comment": {
+      "name": "comment.block.caravan",
+      "begin": "\\(\\*",
+      "end": "\\*\\)",
+      "patterns": [
+        {
+          "include": "#comment"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+proof result = increase specified
+  ensures (result = specified + 2) =
+  on return assert true

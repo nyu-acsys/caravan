@@ -1,0 +1,5 @@
+module Make (X : Value) = struct
+  lemma reflexive (x : X.t)
+    ensures (x === x) =
+    ()
+end

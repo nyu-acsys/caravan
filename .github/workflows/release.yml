@@ -1,0 +1,153 @@
+name: Release native bundles
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+            z3_glob: '*x64-glibc*.zip'
+          - os: macos-15
+            platform: darwin-arm64
+            z3_glob: '*arm64-osx*.zip'
+          - os: windows-latest
+            platform: win32-x64
+            z3_glob: '*x64-win*.zip'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.5.0'
+          windows-compiler: mingw
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch pinned Z3 and satisfy its opam dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+          Z3_GLOB: ${{ matrix.z3_glob }}
+          NATIVE_PYTHON: ${{ steps.python.outputs.python-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          z3_tag=$(tr -d '\r\n' < Z3_VERSION)
+          mkdir -p z3dl z3-pin
+          gh release download "$z3_tag" --repo Z3Prover/z3 --pattern "$Z3_GLOB" --dir z3dl
+          "$NATIVE_PYTHON" - <<'PY'
+          import os, pathlib, zipfile
+          archives = list(pathlib.Path('z3dl').glob('*.zip'))
+          assert len(archives) == 1, 'Expected exactly one Z3 distribution'
+          with zipfile.ZipFile(archives[0]) as archive:
+              archive.extractall('z3dl/extracted')
+          roots = list(pathlib.Path('z3dl/extracted').iterdir())
+          assert len(roots) == 1
+          executable = 'z3.exe' if os.name == 'nt' else 'z3'
+          (roots[0] / 'bin' / executable).chmod(0o755)
+          pathlib.Path('z3dl/root').write_text(str(roots[0].resolve()), encoding='utf-8')
+          with open(os.environ['GITHUB_PATH'], 'a', encoding='utf-8') as output:
+              output.write(str((roots[0] / 'bin').resolve()) + '\n')
+          PY
+          z3_version=${z3_tag#z3-}
+          printf 'opam-version: "2.0"\nname: "z3"\nversion: "%s"\nsynopsis: "External bundled Z3"\nbuild: []\ninstall: []\n' "$z3_version" > z3-pin/opam
+          opam pin add -y z3 ./z3-pin
+      - name: Install pinned Raven and build Caravan
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(tr -d '\r\n' < RAVEN_REVISION)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          opam pin add -y --no-action raven-ivl "git+https://github.com/nyu-acsys/raven.git#$revision"
+          opam install . --deps-only
+          opam exec -- dune build bin/caravan.exe
+      - name: Verify Caravan regressions with the pinned toolchain
+        run: opam exec -- dune runtest --force --cache=disabled
+      - name: Assemble and smoke test relocated archive
+        env:
+          NATIVE_PYTHON: ${{ steps.python.outputs.python-path }}
+          MSYS2_ARG_CONV_EXCL: '*'
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler_version=$(opam exec -- ocamlc -version | tr -d '\r')
+          curl --fail --location "https://raw.githubusercontent.com/ocaml/ocaml/${compiler_version}/LICENSE" --output OCaml-LICENSE
+          revision=$(tr -d '\r\n' < RAVEN_REVISION)
+          curl --fail --location "https://raw.githubusercontent.com/nyu-acsys/raven/${revision}/LICENSE" --output Raven-LICENSE
+          args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then args+=(--tag "$GITHUB_REF_NAME"); fi
+          compiler_bin=$(opam var bin | tr -d '\r')
+          stdlib=$(opam exec -- ocamlc -where | tr -d '\r')
+          documentation=$(opam var doc | tr -d '\r')
+          compiler="$compiler_bin/ocamlc"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            compiler_bin=$(opam exec -- cygpath -w "$compiler_bin" | tr -d '\r')
+            compiler="$compiler_bin/ocamlc.exe"
+            stdlib=$(opam exec -- cygpath -w "$stdlib" | tr -d '\r')
+            documentation=$(opam exec -- cygpath -w "$documentation" | tr -d '\r')
+            runtime_notices=$(opam exec -- cygpath -w /usr/share/doc | tr -d '\r')
+            args+=(--runtime-notices "$runtime_notices")
+          fi
+          opam exec -- "$NATIVE_PYTHON" scripts/release/bundle.py \
+            --platform '${{ matrix.platform }}' --binary _build/default/bin/caravan.exe \
+            --z3-root "$(cat z3dl/root)" --ocaml-license OCaml-LICENSE --raven-license Raven-LICENSE \
+            --ocamlc "$compiler" --stdlib "$stdlib" --opam-doc "$documentation" "${args[@]}"
+      - name: Test real release installation
+        working-directory: vs-code
+        env:
+          CARAVAN_TEST_RELEASE_DIRECTORY: ${{ github.workspace }}/dist
+        run: |
+          npm ci
+          npm run compile
+          node --test test/nativeBundle.test.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caravan-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble checksums and common manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release
+          manifests=(artifacts/*/manifest.json)
+          test -f "${manifests[0]}"
+          for manifest in "${manifests[@]}"; do cmp "${manifests[0]}" "$manifest"; done
+          cp "${manifests[0]}" release/
+          cp artifacts/*/*.tar.gz release/
+          cd release
+          sha256sum manifest.json *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caravan-release
+          path: release/*
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          draft: true
+          files: release/*
+          fail_on_unmatched_files: true
