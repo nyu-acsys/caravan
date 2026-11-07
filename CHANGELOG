@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.0]
 
 - Verification of a first-order subset of multicore OCaml 5, including polymorphic functions, algebraic data types, records, exceptions, modules, functors, mutable state, and atomics.
 - Functional correctness and separation-logic contracts in `.ml` and `.mli` files, including arithmetic safety, loop invariants, and exceptional outcomes.

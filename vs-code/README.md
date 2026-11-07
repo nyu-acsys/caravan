@@ -145,16 +145,16 @@ the same `manifest.json` alongside `bin/`, `lib/ocaml/`, and `licenses/`.
 
 The verifier and extension have separate release tags within this repository:
 
-1. Set the verifier version in `lib/config/caravan_config.ml`, choose the immutable
+1. Set the verifier version in `dune-project` and `lib/config/caravan_config.ml`, choose the immutable
    Raven commit in [`RAVEN_REVISION`](../RAVEN_REVISION), and the Z3 release in
    [`Z3_VERSION`](../Z3_VERSION). The Raven commit must be available on GitHub.
 2. Push a `vX.Y.Z` verifier tag. The [native release workflow](../.github/workflows/release.yml)
    builds and checks relocated Linux x64, macOS arm64, and Windows x64 bundles and creates a
    draft release with archives, `manifest.json`, and `SHA256SUMS`. Review and
    publish that release.
-3. Set [`CARAVAN_VERSION`](CARAVAN_VERSION) to the published verifier tag. It is
-   initially `unreleased`, which prevents accidental packaging against a
-   nonexistent release. Set the extension version in [`package.json`](package.json).
+3. Set [`CARAVAN_VERSION`](CARAVAN_VERSION) to the published verifier tag.
+   Publish the verifier release before packaging the extension. Set the extension
+   version in [`package.json`](package.json).
 4. Push `vscode-vX.Y.Z` for that extension version. The [package workflow](../.github/workflows/package.yml)
    verifies the pinned archives and creates a draft release containing the
    platform VSIXs. Review them before publishing or uploading to the Marketplace.

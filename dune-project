@@ -1,6 +1,8 @@
 (lang dune 3.12)
 (using menhir 2.1)
 
+(version 0.1.0)
+
 (generate_opam_files)
 
 (source (github nyu-acsys/caravan))
@@ -21,7 +23,7 @@
   (dune
    (>= 3.12))
   (raven-ivl
-   (>= 1.6.1))
+   (= 1.6.1))
   (menhir
    (and
     :build
