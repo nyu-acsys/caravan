@@ -73,7 +73,7 @@ jobs:
           set -euo pipefail
           revision=$(tr -d '\r\n' < RAVEN_REVISION)
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
-          opam pin add -y --no-action raven-ivl "git+https://github.com/nyu-acsys/raven.git#$revision"
+          opam pin add -y --no-action raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$revision"
           opam install . --deps-only
           opam exec -- dune build bin/caravan.exe
       - name: Verify Caravan regressions with the pinned toolchain
