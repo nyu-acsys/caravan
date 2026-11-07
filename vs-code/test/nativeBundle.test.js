@@ -34,9 +34,12 @@ test('native release installs and verifies Saturn with its relocated compiler an
     try {
       const base = `http://127.0.0.1:${server.address().port}`;
       const manifest = JSON.parse(contents.get('manifest.json'));
+      assert.equal(contents.get('manifest.json').toString('utf8'), JSON.stringify(manifest, null, 2) + '\n',
+        'Release manifests must use identical UTF-8 and LF formatting on every platform');
       const release = { tag: `v${manifest.version}`, manifest,
         assets: new Map(names.map(name => [name, `${base}/${name}`])) };
       const root = await core.installRelease(release, storage, { allowHttpForTests: true });
+      assert.deepEqual(await fs.readFile(path.join(root, 'manifest.json')), contents.get('manifest.json'));
       const selected = await core.resolveToolchain({ extensionPath: storage, storagePath: storage, channel: 'stable' });
       assert.equal(selected.source, 'managed');
       assert.equal(selected.bundleRoot, root);

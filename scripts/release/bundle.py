@@ -251,8 +251,8 @@ def main():
             raise ValueError('Z3 distribution has no license')
         for source in z3_licenses:
             shutil.copyfile(source, staging / 'licenses' / ('Z3-' + source.name))
-        manifest_text = json.dumps(manifest, sort_keys=True, indent=2) + '\n'
-        (staging / 'manifest.json').write_text(manifest_text)
+        manifest_bytes = (json.dumps(manifest, sort_keys=True, indent=2) + '\n').encode('utf-8')
+        (staging / 'manifest.json').write_bytes(manifest_bytes)
         with tarfile.open(archive, 'w:gz', format=tarfile.USTAR_FORMAT) as output:
             for entry in sorted(staging.iterdir()):
                 output.add(entry, arcname=entry.name)
@@ -275,13 +275,13 @@ def main():
         if relocated_manifest != manifest:
             raise ValueError('Relocated executable manifest differs from bundle manifest')
         run(str(relocated / 'bin' / ('caravan' + extension)), '--shh', str(smoke), env=environment, cwd=temporary)
-        (args.output / 'manifest.json').write_text(manifest_text)
+        (args.output / 'manifest.json').write_bytes(manifest_bytes)
     checksums = []
     for artifact in [archive, args.output / 'manifest.json']:
         with artifact.open('rb') as source:
             digest = hashlib.file_digest(source, 'sha256').hexdigest()
         checksums.append(f'{digest}  {artifact.name}\n')
-    (args.output / 'SHA256SUMS').write_text(''.join(checksums))
+    (args.output / 'SHA256SUMS').write_bytes(''.join(checksums).encode('utf-8'))
 
 
 if __name__ == '__main__':
