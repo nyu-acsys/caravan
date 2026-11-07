@@ -6,7 +6,8 @@ import { verificationStateNotification, verifyNotification, toolchainNotificatio
 import { VerifierUpdates } from './updates';
 import { registerGutterMarkers } from './gutter';
 import { registerProofViews } from './proofView';
-import { proofViewRequest, proofViewChangedNotification, type ProofViewResult } from '../shared/protocol';
+import { registerRavenViews } from './ravenView';
+import { proofViewRequest, proofViewChangedNotification, ravenViewRequest, type ProofViewResult, type RavenViewResult } from '../shared/protocol';
 
 let client: LanguageClient | undefined;
 
@@ -82,6 +83,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerProofViews(async (uri, token) => {
       if (!activeClient.isRunning()) throw new Error('The Caravan language server is unavailable. See the Caravan output channel.');
       return activeClient.sendRequest<ProofViewResult>(proofViewRequest, { uri }, token);
+    }, listener => vscode.Disposable.from(
+      activeClient.onNotification(proofViewChangedNotification, listener),
+      activeClient.onDidChangeState(() => listener()))),
+    registerRavenViews(async (uri, token) => {
+      if (!activeClient.isRunning()) throw new Error('The Caravan language server is unavailable. See the Caravan output channel.');
+      return activeClient.sendRequest<RavenViewResult>(ravenViewRequest, { uri }, token);
     }, listener => vscode.Disposable.from(
       activeClient.onNotification(proofViewChangedNotification, listener),
       activeClient.onDidChangeState(() => listener()))),

@@ -18,6 +18,7 @@ New to Caravan? Start with the **[project introduction and examples](https://git
 - **Proof hints** showing external proof steps beside the implementation, with
   full annotations on hover and navigation to their sources.
 - **Read-only proof views** combining an implementation with its external annotations.
+- **Generated Raven views** showing the translated program in a read-only editor.
 - **Verification status** above members, modules, and functors, updated as checks
   finish and indicating when successful results came from the cache.
 
@@ -59,6 +60,15 @@ Run **Caravan: Show Proof View** to open a read-only view beside the implementat
 It combines the code with external contracts and proof steps and includes the full
 companion files. Follow its source links to edit the originals. Contract hovers,
 proof hints, and proof views are available without running the solver.
+
+Run **Caravan: Show Generated Raven** to open the saved implementation's translated
+Raven program in a read-only tab beside the source. This command also works from
+its `.mli` or `.proof` file. It translates without running SMT verification and
+uses the same toolchain and project settings as verification. The view refreshes
+when sources, dependencies, or settings change; save dirty files to see their
+updated translation. Syntax highlighting is provided by the optional
+[Raven Verifier extension](https://marketplace.visualstudio.com/items?itemName=nyu-acsys.raven-verifier);
+without it, the view is plain text.
 
 ### Verification results
 

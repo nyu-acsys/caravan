@@ -47,6 +47,16 @@ if(process.argv.includes('--lsp-annotations-only')) {
  if(text.includes('metadata-slow')) setTimeout(answerMetadata,1200);else answerMetadata();
  return;
 }
+if(process.argv.includes('--emit-rav')) {
+ const emit=()=>{
+  if(text.includes('emit-error')) {console.error('Translation failed at source');process.exit(1);}
+  if(process.argv.includes('--lsp-mode')) {console.error('Incompatible output modes');process.exit(2);}
+  if(!text.includes('emit-empty')) process.stdout.write(['module Generated {', '  proc main() { assert false; }', '}', ''].join(String.fromCharCode(10)));
+  process.exit(0);
+ };
+ if(text.includes('emit-slow')) setTimeout(emit,1200);else emit();
+ return;
+}
 function answer() {
  if(text.includes('stderr')) {console.error('solver could not start');process.exit(2);}
  if(text.includes('malformed')) process.stdout.write('bad JSON');
@@ -125,7 +135,8 @@ async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = fal
 	});
 	await request('initialize', { processId: process.pid, rootUri: uri(dir), workspaceFolders: [{ uri: uri(dir), name: 'test' }], capabilities: { workspace: { configuration: true, codeLens: { refreshSupport }, inlayHint: { refreshSupport } } }, initializationOptions: { toolchain, ...(useCache ? { cacheDir: path.join(dir, 'verification cache') } : {}) } });
 	notify('initialized', {});
-	return { dir, file, settings, messages, requests, request, notify, wait, state, open };
+	return { dir, file, settings, messages, requests, request, notify, wait, state, open,
+		cancelLastRequest: () => notify('$/cancelRequest', { id: nextId - 1 }) };
 }
 
 test('save and manual verification resolve companions, flags and related diagnostics', { timeout: 15000 }, async t => {
@@ -746,4 +757,81 @@ test('proof-step reports validate and normalize implementation and original UTF-
 	assert.equal(normalized.text, 'commit');
 	step.source_loc.start_col = -1;
 	assert.throws(() => parseReport(JSON.stringify(report), 0), /invalid proof step/);
+});
+
+async function waitForEmission(f) {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		try {
+			if ((await runs(f)).some(args => args.includes('--emit-rav'))) return;
+		} catch (error) { if (error.code !== 'ENOENT') throw error; }
+		await delay(10);
+	}
+	throw new Error('Caravan translation did not start');
+}
+
+test('Raven views translate companions with configured paths without verifying or changing statuses', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'let x = fail', undefined, false, true);
+	const working = path.join(f.dir, 'working directory');
+	await fs.mkdir(working);
+	f.settings.cwd = working;
+	const proof = f.file.replace(/\.ml$/, '.proof');
+	const intf = f.file.replace(/\.ml$/, '.mli');
+	await fs.writeFile(proof, 'proof');
+	await fs.writeFile(intf, 'val x : int');
+	await f.open();
+	const first = await f.request('caravan/ravenView', { uri: uri(intf) });
+	assert.match(first.text, /^module Generated/);
+	assert.match(first.text, /assert false/);
+	let invocations = await runs(f);
+	assert.equal(invocations.length, 2);
+	assert.ok(invocations[0].includes('--lsp-annotations-only'));
+	assert.deepEqual(invocations[1], ['--shh', '--color', 'never', '--emit-rav', '-I',
+		path.join(working, 'include with spaces'), f.file]);
+	assert.deepEqual(await f.request('caravan/ravenView', { uri: uri(proof) }), first);
+	assert.deepEqual(await f.request('caravan/ravenView', { uri: uri(f.file) }), first);
+	invocations = await runs(f);
+	assert.equal(invocations.filter(args => args.includes('--lsp-annotations-only')).length, 1);
+	assert.equal(invocations.filter(args => args.includes('--emit-rav')).length, 3);
+	assert.equal(f.messages.some(message => message.method === 'textDocument/publishDiagnostics'
+		|| ['verified', 'verifying', 'failed'].includes(message.params?.state)), false);
+	await f.open(proof);
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(proof), version: 2 }, contentChanges: [{ text: 'dirty' }] });
+	await assert.rejects(f.request('caravan/ravenView', { uri: uri(f.file) }), /Save changed/);
+	assert.equal((await runs(f)).length, invocations.length);
+	await assert.rejects(f.request('caravan/ravenView', { uri: 'untitled:main.ml' }), /saved OCaml/);
+	await assert.rejects(f.request('caravan/ravenView', {}), /Open an OCaml/);
+});
+
+test('Raven view translation failures and empty output are reported instead of returned as code', { timeout: 15000 }, async t => {
+	for (const [source, message] of [['emit-error', /Translation failed at source/], ['emit-empty', /no Raven program/]]) {
+		const f = await fixture(t, source);
+		await f.open();
+		await assert.rejects(f.request('caravan/ravenView', { uri: uri(f.file) }), message);
+	}
+});
+
+test('cancelling a Raven view stops its translation', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'emit-slow');
+	await f.open();
+	const pending = f.request('caravan/ravenView', { uri: uri(f.file) });
+	const rejected = assert.rejects(pending, /cancelled/i);
+	await waitForEmission(f);
+	f.cancelLastRequest();
+	await rejected;
+	await fs.writeFile(f.file, 'fresh');
+	f.notify('textDocument/didChange', { textDocument: { uri: uri(f.file), version: 2 }, contentChanges: [{ text: 'fresh' }] });
+	assert.match((await f.request('caravan/ravenView', { uri: uri(f.file) })).text, /module Generated/);
+});
+
+test('Raven views reject dependencies changed on disk during translation', { timeout: 15000 }, async t => {
+	const f = await fixture(t, 'emit-slow');
+	const dependency = path.join(f.dir, 'metadata-only.ml');
+	await fs.writeFile(dependency, 'old dependency');
+	await f.open();
+	const pending = f.request('caravan/ravenView', { uri: uri(f.file) });
+	const rejected = assert.rejects(pending, /dependencies changed/);
+	await waitForEmission(f);
+	await fs.writeFile(dependency, 'changed dependency');
+	await rejected;
 });

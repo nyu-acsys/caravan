@@ -26,3 +26,8 @@ export interface ProofViewResult {
 	text: string;
 	links: { range: ContractLocation['range']; target: string }[];
 }
+
+export const showRavenViewCommand = 'caravan.showRavenView';
+export const ravenViewScheme = 'caravan-raven-view';
+export const ravenViewRequest = 'caravan/ravenView';
+export interface RavenViewResult { text: string }

@@ -4,47 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Exceptions can be declared, raised, handled, and specified with `raises` clauses, including in atomic contracts and loops.
-- Functions over constant GADT witnesses, as Saturn's `pop_as`, are verified once for all witnesses, with contracts matching on them.
-- The VS Code extension highlights proofs and annotations, shows contracts, streamed member statuses with cache indicators, module summaries and read-only proof views, verifies saved files, and manages bundled toolchains and compatible verifier updates.
-- `--cache-dir` reuses successful verification results whose dependency fingerprints are unchanged.
-- Source value domains preserve machine bounds through compound values and abstract module contracts, and support empty variants without assuming an inhabitant.
-- Static modules, nested signatures and signature includes, checked module aliases, and monomorphic curried named and unit functors preserve type identities and support qualified calls, ordinary and atomic contracts, and scoped logical types and functions, predicates, invariants and lemma proofs.
-- Proof files support resource algebra instances, ghost fields, AU facades, state records, views, and actions in module scopes, initialized ghost storage, fractional ownership, checked resource updates, and pure fact-set definitions.
-- Proof files can give a function's proof as an outline of steps at its code, leaving the `.ml` without annotations.
-- Generated invariant folds supply explicit witnesses for known state transitions and histories.
-- Source-level verification errors retain solver timeout explanations.
-- `--history=monotone` encodes histories of states by their current state and its lower bounds.
-- Qualified specification names retain their full paths, and contract attachment respects enclosing source scopes.
-- Proof files support terminating logical definitions, automatic lemmas, checked lemmas with inferable trailing arguments, implicit predicate parameters, inline predicates, general invariants, logical variant and record types, and sets and maps.
-- First-order OCaml functions on integers, booleans, and unit can be verified against annotated contracts.
-- Contracts support named arguments, quantifiers, chained comparisons, pattern matching, and logical equality with `===` and `=/=`.
-- Variants, tuples, lists, options, records, and type abbreviations are supported, with structural equality restricted to values without mutable components.
-- Contracts can use list concatenation, membership, and length, and call verified pure functions.
-- Bundled standard-library contracts support list reversal with checked algebra and reusable finite `Seq` snapshots, and pure imports are usable in specifications.
-- Mutable record fields, reference cells, and atomics support separation-logic ownership contracts, with ordinary accesses checked as non-atomic.
-- Integer arithmetic checks overflow and division by zero using OCaml's division and remainder semantics.
-- Specifications provide unbounded `integer` indices while OCaml `int` fields and quantifiers retain machine bounds.
-- While and for loops support annotated invariants.
-- Let bindings and function parameters support tuple and record patterns.
-- Local functions can capture surrounding variables and continue an enclosing function's atomic contract.
-- Functions written with `function` and applications using `@@` or `|>` are supported.
-- Shadowed function definitions and wrappers retain their contracts and atomic updates.
-- Atomic operations support physical comparison and wrapping integer read-modify-write operations.
-- Logically atomic contracts generate linearization proofs, including branches that return results.
-- Linearization points can be selected with `commit` and conditional `returning` annotations, including no-op unit branches.
-- Contracts can reside in `.mli` interfaces checked for OCaml implementation compatibility, with predicate definitions in companion `.proof` files.
-- Program annotations support `fold`, `unfold`, `assert`, checked ghost blocks, and manual proofs around atomic accesses, including stateful nested reads.
-- Shared structures support persistent invariants and exclusive views of their ghost state.
-- Growing ghost-state fields support histories, snapshots, and facts about past states.
-- Specifications support sequences, checked list conversion, and ownership by index with dynamic initialization and scoped ghost bindings.
-- Actions describe ghost-state transitions, infer matching atomic steps, and check that growing fields remain monotone.
-- Pending-call registrations and helping actions support proofs in which another operation completes a call.
-- Ghost parameters can be declared in contracts and inferred at call sites.
-- Trusted library interfaces support abstract types, resources, value contracts, local operations, empty invariant masks, and ordinary and logically atomic function contracts.
-- Functions marked `trusted` assume their contracts and emit a warning.
-- Verification errors identify OCaml source locations and distinguish generated-code errors from user proof failures.
-- Saturn case studies include the unchanged Treiber stack implementation, two Michael-Scott queue proofs with `of_list` and full helping, and an interface-verified stack-drain client.
-- `--emit-rav` prints the generated Raven program for standalone parsing and verification.
-- `--smt-timeout` controls the solver timeout for each query.
-- `-I` adds directories to the library interface search path.
+- Verification of a first-order subset of multicore OCaml 5, including polymorphic functions, algebraic data types, records, exceptions, modules, functors, mutable state, and atomics.
+- Functional correctness and separation-logic contracts in `.ml` and `.mli` files, including arithmetic safety, loop invariants, and exceptional outcomes.
+- Modular linearizability proofs through logically atomic contracts, shared invariants, ghost-state actions, histories, and helping.
+- Automatic invariant reasoning and manual proofs in companion `.proof` files, with ghost state, logical definitions, reusable lemmas, and resource algebras.
+- Contracts for selected standard-library operations and imported library interfaces, with automatic discovery of local Dune dependencies.
+- Command-line verification with source-level diagnostics, verification caching, and generated Raven output for inspection and standalone verification.
+- VS Code integration with bundled toolchains, specification and proof highlighting, contract hovers, views of proofs and generated Raven, and streamed verification results.
+- Verified Saturn case studies covering the Treiber stack, Michael–Scott queue with history-based and segment-based proofs, and stack-drain clients.

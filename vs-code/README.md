@@ -126,6 +126,17 @@ hovers, status lenses, and proof views, so ongoing verification does not delay d
 The client requests a combined view with `caravan/proofView` and refreshes its
 read-only virtual document on `caravan/proofViewChanged` notifications.
 
+`caravan/ravenView` uses the same metadata dependency graph to reject unsaved or
+changed inputs, then runs `--emit-rav` with the configured launcher, environment,
+working directory, and include paths. Translation shares the bounded discovery
+queue and supports cancellation; it does not run the solver or update verification
+results. The client shares the proof view's read-only document lifecycle and
+refresh notifications. The virtual document has a `.rav` filename, letting VS Code
+use the Raven extension's language association and highlighting when installed,
+or plain text otherwise. Caravan does not register a Raven grammar. The Raven
+extension selects file URIs for verification, so the generated view is not sent
+to its verifier.
+
 `caravan --manifest` reports its version, editor protocol, minimum Z3 version,
 OCaml compiler version, and linked Raven API version. A native archive carries
 the same `manifest.json` alongside `bin/`, `lib/ocaml/`, and `licenses/`.

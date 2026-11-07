@@ -11,7 +11,7 @@ import { contractHover } from './contracts';
 import { renderProofView, type ProofMetadata } from './proofView';
 import { proofHints } from './proofHints';
 import { memberLenses } from './memberLenses';
-import { proofViewRequest, proofViewChangedNotification } from '../shared/protocol';
+import { proofViewRequest, proofViewChangedNotification, ravenViewRequest } from '../shared/protocol';
 import { verificationStateNotification, verifyNotification, type VerificationState, type VerifyParams, toolchainNotification, type ToolchainSelection } from '../shared/protocol';
 
 interface Settings {
@@ -23,6 +23,7 @@ interface Owner {
 	diagnostics: Map<string, Diagnostic[]>;
 	state: VerificationState; message?: string;
 	annotationGeneration: number; annotationAbort?: AbortController;
+	ravenAbort?: AbortController;
 	annotations?: Promise<ProofMetadata | undefined>; annotationError?: string;
 	annotationStamps?: Map<string, string>; annotationDependencies?: Set<string>;
 	members?: NormalizedMember[];
@@ -119,6 +120,8 @@ function clearAnnotations(owner: Owner): void {
 	owner.annotationGeneration++;
 	owner.annotationAbort?.abort();
 	owner.annotationAbort = undefined;
+	owner.ravenAbort?.abort();
+	owner.ravenAbort = undefined;
 	owner.annotations = undefined;
 	owner.annotationError = undefined;
 	owner.annotationStamps = undefined;
@@ -204,16 +207,18 @@ function hasDirty(dependencies?: Set<string>): boolean {
 function diskStamp(file: string): string {
 	try { const stat = fs.statSync(file); return `${stat.mtimeMs}:${stat.size}`; } catch { return 'missing'; }
 }
-function launch(root: string, config: Settings, annotationsOnly = false): { executable: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv } {
+function launch(root: string, config: Settings, mode: 'verify' | 'annotations' | 'raven' = 'verify'): { executable: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv } {
 	const workspace = workspaceFor(root);
 	const cwd = config.cwd ? path.resolve(workspace, config.cwd) : workspace;
 	const selected = config.executable || toolchain?.executable || 'caravan';
 	const executable = selected.includes('/') || selected.includes('\\') ? path.resolve(cwd, selected) : selected;
 	const bundleRoot = !config.executable ? toolchain?.bundleRoot : undefined;
 	const env = bundleRoot ? toolchainEnvironment(bundleRoot) : undefined;
-	const args = [...config.arguments, '--lsp-mode', '--lsp-annotations',
-		...(annotationsOnly ? ['--lsp-annotations-only'] : ['--smt-timeout', String(config.smtTimeout)]),
-		...(!annotationsOnly && config.cache && cacheDir ? ['--cache-dir', cacheDir] : []),
+	const flags = mode === 'raven' ? ['--shh', '--color', 'never', '--emit-rav'] :
+		['--lsp-mode', '--lsp-annotations', ...(mode === 'annotations' ?
+			['--lsp-annotations-only'] : ['--smt-timeout', String(config.smtTimeout)])];
+	const args = [...config.arguments, ...flags,
+		...(mode === 'verify' && config.cache && cacheDir ? ['--cache-dir', cacheDir] : []),
 		...config.includePaths.flatMap(directory => ['-I', path.resolve(cwd, directory)]), root];
 	return { executable, args, cwd, env };
 }
@@ -256,7 +261,7 @@ async function annotations(root: string, uri: string, owner: Owner): Promise<Pro
 		const known = knownDependencies(root, owner);
 		if (hasDirty(known) || !fs.existsSync(root)) return undefined;
 		const snapshot = new Map(revisions);
-		const { executable, args, cwd, env } = launch(root, config, true);
+		const { executable, args, cwd, env } = launch(root, config, 'annotations');
 		const abort = new AbortController();
 		owner.annotationAbort = abort;
 		const output = await annotationProcesses.run(executable, args, cwd, abort.signal, env);
@@ -423,23 +428,61 @@ connection.languages.inlayHint.on(async (params, token) => {
 	const metadata = await metadataFor(params.textDocument.uri);
 	return token.isCancellationRequested ? [] : proofHints(metadata?.steps ?? [], root, params.range, workspaceFor(root));
 });
-connection.onRequest(proofViewRequest, async (params: unknown, token) => {
+function viewSource(params: unknown, view: string): { root: string; uri: string; owner: Owner } {
 	if (typeof params !== 'object' || params === null || !('uri' in params) || typeof params.uri !== 'string') {
-		throw new Error('Open an OCaml implementation, interface, or proof file to show its proof view.');
+		throw new Error(`Open an OCaml implementation, interface, or proof file to show its ${view} view.`);
 	}
 	const file = fileOf(params.uri);
-	if (!file || !relevant(file)) throw new Error('Proof views require a saved OCaml source file.');
+	if (!file || !relevant(file)) throw new Error(`${view} views require a saved OCaml source file.`);
 	const root = rootOf(file);
 	const uri = URI.file(root).toString();
 	if (!fs.existsSync(root)) throw new Error(`No implementation found: ${root}`);
 	const owner = ownerOf(root);
-	if (hasDirty(knownDependencies(root, owner))) throw new Error('Save changed OCaml and proof files before opening the proof view.');
+	if (hasDirty(knownDependencies(root, owner))) throw new Error(`Save changed OCaml and proof files before opening the ${view} view.`);
+	return { root, uri, owner };
+}
+connection.onRequest(proofViewRequest, async (params: unknown, token) => {
+	const { root, uri, owner } = viewSource(params, 'proof');
 	const metadata = await metadataFor(uri);
 	if (token.isCancellationRequested) throw new Error('Proof view request cancelled.');
 	if (!metadata) throw new Error(owner.annotationError ?? 'Save changed files and retry the proof view; run verification for analysis diagnostics.');
 	const source = sourceText(root);
 	if (source === undefined) throw new Error(`No implementation found: ${root}`);
 	return renderProofView(root, source, metadata, sourceText, workspaceFor(root));
+});
+connection.onRequest(ravenViewRequest, async (params: unknown, token) => {
+	const { root, uri, owner } = viewSource(params, 'Raven');
+	owner.ravenAbort?.abort();
+	const abort = new AbortController();
+	owner.ravenAbort = abort;
+	const cancellation = token.onCancellationRequested(() => abort.abort());
+	const generation = owner.annotationGeneration;
+	const current = (): boolean => !shuttingDown && !abort.signal.aborted
+		&& !token.isCancellationRequested && generation === owner.annotationGeneration;
+	try {
+		const metadata = await metadataFor(uri);
+		if (!current()) throw new Error('Raven view request cancelled.');
+		if (!metadata) throw new Error(owner.annotationError ?? 'Save changed files and retry the Raven view; run verification for analysis diagnostics.');
+		const dependencies = knownDependencies(root, owner);
+		if (!dependencies) throw new Error('Caravan did not report source dependencies for the Raven view.');
+		const stamps = new Map([...dependencies].map(file => [file, diskStamp(file)]));
+		const config = await settings(uri);
+		if (!current() || hasDirty(dependencies)) throw new Error('Save changed files and retry the Raven view.');
+		const { executable, args, cwd, env } = launch(root, config, 'raven');
+		const output = await annotationProcesses.run(executable, args, cwd, abort.signal, env);
+		if (!current()) throw new Error('Raven view request cancelled.');
+		const changed = [...stamps].find(([file, stamp]) => diskStamp(file) !== stamp);
+		if (changed) invalidate(changed[0]);
+		if (changed || hasDirty(dependencies)) throw new Error('Source dependencies changed while generating Raven; save changed files and retry.');
+		if (output.code !== 0) throw new Error(output.stderr.trim() || output.stdout.trim()
+			|| `Caravan translation exited ${output.code ?? 'without an exit code'}.`);
+		if (!output.stdout.trim()) throw new Error('Caravan produced no Raven program.');
+		if (output.stderr.trim()) connection.console.warn(output.stderr.trim());
+		return { text: output.stdout };
+	} finally {
+		cancellation.dispose();
+		if (owner.ravenAbort === abort) owner.ravenAbort = undefined;
+	}
 });
 connection.onNotification(toolchainNotification, selectToolchain);
 connection.onNotification(verifyNotification, (params: VerifyParams) => {
