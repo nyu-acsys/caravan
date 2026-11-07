@@ -91,7 +91,7 @@ git clone https://github.com/nyu-acsys/caravan.git
 cd caravan
 opam switch create caravan 5.5.0
 eval $(opam env --switch=caravan)
-opam pin add raven-ivl "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
+opam pin add raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
 opam install . --deps-only --with-test
 dune build
 ```

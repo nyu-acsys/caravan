@@ -163,9 +163,10 @@ jobs:
           opam pin add -y z3 "$pin_dir"
 
       # Raven is not on opam yet: use the same pinned release as the native bundles.
-      - run: |
+      - shell: bash
+        run: |
           revision=$(tr -d '\r\n' < RAVEN_REVISION)
-          opam pin add -y --no-action raven-ivl "git+https://github.com/nyu-acsys/raven.git#$revision"
+          opam pin add -y --no-action raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$revision"
 
       - run: opam install . --deps-only --with-test
 
