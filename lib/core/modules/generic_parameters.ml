@@ -104,10 +104,14 @@ let parameter_types predicate arguments =
   in
   List.map predicate.parameters ~f:substitute
 
-let types predicate types =
+let types ?environment predicate types =
   List.mapi predicate.variables ~f:(fun index variable ->
-      Datatypes.variable_type ~variable
-        ~owner:(String.split predicate.name ~on:'.')
-        ~parameter:("A" ^ Int.to_string index)
-        ~at:predicate.loc)
+      let data =
+        Datatypes.variable_type ~variable
+          ~owner:(String.split predicate.name ~on:'.')
+          ~parameter:("A" ^ Int.to_string index)
+          ~at:predicate.loc
+      in
+      Option.value_map environment ~default:data ~f:(fun environment ->
+          Datatypes.bind_local_variable environment data))
   @ types

@@ -16,7 +16,7 @@ compiler does not make an arbitrary library call verifiable.
 | Mutable state | References, monomorphic mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses. | Not arbitrary GADTs or dependent payloads. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
-| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources and helping proofs. | No `Domain.spawn`/`Domain.join` harness or general `Mutex`/`Condition` library support yet. |
+| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, and statically known polymorphic `Domain.spawn`/`Domain.join` tasks. | General `Mutex`/`Condition` library support remains unsupported. |
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve
@@ -34,6 +34,49 @@ contract, use `raises Exception -> proposition` (or `atomic raises` for an atomi
 outcome). A logical `pure` function can be used in specifications when it meets
 Caravan's purity and termination requirements; arbitrary OCaml calls cannot be
 embedded in a proposition.
+
+## Domain tasks {#sec:domain-tasks}
+
+Declare a facade in the companion `.proof` file for each operation to run in a
+domain:
+
+```proof
+module Job = Ghost.Task (struct let operation = work end)
+```
+
+The operation needs an ordinary, explicit contract. A call such as
+`Domain.spawn (fun () -> work cell)` transfers that contract's precondition to
+the task. `Domain.join domain` recovers its normal postcondition or propagates a
+declared exception with its exceptional postcondition. A named unit operation
+can also be passed directly: `Domain.spawn work`.
+
+Tasks and their callers may be polymorphic. Type arguments are inferred from the
+call and carried by the handle resource, including type parameters that occur only
+in captured arguments. For example, a task `work value` with contract
+`ensures result === value` can be spawned at both `int` and `bool` in the same
+client. Generic callers and functor bodies can use an existing task facade without
+adding type arguments to the proof syntax.
+
+Functors can also declare task facades in the matching `.proof` module. Repeat the
+source functor's parameters in that module header, as for other proof declarations.
+The task contract is checked with the generic body, including when the functor is
+never applied. Repeated applicative applications share task identity; generative
+applications keep their completion resources distinct. Facades respect the functor
+result's signature boundary. This uses the shared generic translation; applications
+that require an unsupported specialized proof body are rejected explicitly.
+
+The spatial predicate `Job.handle domain cell` records the right to join this
+task with captured argument `cell`. Use it in contracts when passing handles
+between functions. Handles may be aliased, but the resource can be consumed only
+once. OCaml itself allows repeated joins; the current verification contract
+supports one resource-recovering join.
+
+Inline thunks must call a known task with captured values or constants. Put
+computed arguments and more elaborate child code in a separately verified task;
+Caravan does not move their effects into the parent. Logically atomic task
+contracts and ghost task parameters are
+not yet supported. Joins need enough information to select a unique task facade,
+from the handle's origin or its contract.
 
 ## Modules and functors {#sec:modules-and-functors}
 

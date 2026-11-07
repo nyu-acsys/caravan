@@ -126,6 +126,7 @@ let declaration_shape declaration =
   | Proof_type _ -> ("type", false, [])
   | Proof_resource _ -> ("resource", false, [])
   | Proof_au _ -> ("atomic_update", false, [])
+  | Proof_task _ -> ("domain_task", false, [])
   | Proof_field _ -> ("field", false, [])
   | Proof_state _ -> ("state", false, [])
 

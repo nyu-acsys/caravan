@@ -80,10 +80,15 @@ let proof_constructor_collision ?(allow_shadowing = false) env interface proof =
 (** Type-checks the algebraic types of [proof] in [env], after the implementation, and
     returns their descriptors and the environment for the rest of the proof. *)
 let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
-    ?(allow_shadowing = false) ?(previous = ([], [], [], [])) ?complete_proof
+    ?(allow_shadowing = false) ?(previous = ([], [], [], [], [])) ?complete_proof
     ?(canonical_owner = Fn.id) (env : Env.t) (interface : interface option)
     (proof : S.proof_decl list) :
-    ( Env.t * Datatypes.t list * proof_resource list * proof_field list * proof_au list,
+    ( Env.t
+      * Datatypes.t list
+      * proof_resource list
+      * proof_field list
+      * proof_au list
+      * proof_task list,
       Report.error )
     Result.t =
   let complete_proof = Option.value complete_proof ~default:proof in
@@ -177,7 +182,9 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
               (Lexing.from_string
                  "module Permission : sig type t val half : t val full : t end")))
   in
-  let previous_types, previous_resources, previous_fields, previous_aus = previous in
+  let previous_types, previous_resources, previous_fields, previous_aus, previous_tasks =
+    previous
+  in
   let resource_at_path env resources path =
     let private_id =
       List.find resources ~f:(fun resource ->
@@ -201,7 +208,47 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
     in
     Option.first_some private_id (Option.first_some public_view private_path)
   in
+  let resolve_operation env ~at ~kind operation =
+    let* operation_path, operation_type =
+      try
+        let path, value = Env.find_value_by_name (longident operation) env in
+        Ok
+          ( Env.normalize_value_path (Some at) env path |> canonical_owner,
+            value.Types.val_type )
+      with Stdlib.Not_found ->
+        Error
+          (Report.error Type (S.qualid_loc operation)
+             ("The " ^ kind ^ " operation is not an OCaml function"))
+    in
+    let args, result = function_arguments operation_type in
+    if List.is_empty args then
+      Error (Report.error Type at ("The " ^ kind ^ " operation must be a function"))
+    else Ok (operation_path, operation_type, args, result)
+  in
+  let arrow args result =
+    List.fold_right args ~init:result ~f:(fun arg result ->
+        let arg =
+          match Types.get_desc arg with
+          | Tpoly _ -> arg
+          | _ -> Btype.newgenty (Tpoly (arg, []))
+        in
+        Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
+  in
+  let facade_value ~at (name, args, result) =
+    let id = Ident.create_local name in
+    Types.Sig_value
+      ( id,
+        {
+          val_type = Compiler_types.scheme_structure (arrow args result);
+          val_kind = Val_reg;
+          val_loc = at;
+          val_attributes = [];
+          val_uid = Shape.Uid.internal_not_actually_unique;
+        },
+        Exported )
+  in
   let aus = ref (List.rev previous_aus) in
+  let tasks = ref (List.rev previous_tasks) in
   let* env, reversed, resources, fields =
     List.fold_result proof
       ~init:
@@ -262,22 +309,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         name.pid_str))
               else Ok ()
             in
-            let* operation_path, operation_type =
-              try
-                let path, value = Env.find_value_by_name (longident operation) env in
-                Ok
-                  ( Env.normalize_value_path (Some at) env path |> canonical_owner,
-                    value.Types.val_type )
-              with Stdlib.Not_found ->
-                Error
-                  (Report.error Type (S.qualid_loc operation)
-                     "The AU operation is not an OCaml function")
-            in
-            let args, result = function_arguments operation_type in
-            let* () =
-              if List.is_empty args then
-                Error (Report.error Type at "The AU operation must be a function")
-              else Ok ()
+            let* operation_path, operation_type, args, result =
+              resolve_operation env ~at ~kind:"AU" operation
             in
             let* scheme = Polymorphic_functions.discover ~at operation_type in
             let parameters = scheme.variables in
@@ -317,28 +350,6 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             let token =
               Btype.newgenty (Types.get_desc (Ctype.newconstr token_path parameters))
             in
-            let arrow args result =
-              List.fold_right args ~init:result ~f:(fun arg result ->
-                  let arg =
-                    match Types.get_desc arg with
-                    | Tpoly _ -> arg
-                    | _ -> Btype.newgenty (Tpoly (arg, []))
-                  in
-                  Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
-            in
-            let value (name, args, result) =
-              let id = Ident.create_local name in
-              Types.Sig_value
-                ( id,
-                  {
-                    val_type = Compiler_types.scheme_structure (arrow args result);
-                    val_kind = Val_reg;
-                    val_loc = at;
-                    val_attributes = [];
-                    val_uid = Shape.Uid.internal_not_actually_unique;
-                  },
-                  Exported )
-            in
             let values =
               [
                 ("bind", [ Predef.type_unit ], token);
@@ -352,7 +363,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             in
             let env =
               Env.add_module module_id Mp_present
-                (Mty_signature (module_signature @ List.map values ~f:value))
+                (Mty_signature (module_signature @ List.map values ~f:(facade_value ~at)))
                 env
             in
             aus :=
@@ -373,6 +384,67 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 au_application = None;
               }
               :: !aus;
+            Ok (env, descriptors, resources, fields)
+        | Proof_task { task_name = name; task_operation = operation } ->
+            let at = name.pid_loc in
+            let* () =
+              if module_exists env name.pid_str then
+                Error
+                  (Report.error Type at
+                     (Printf.sprintf "The proof module %s is already declared"
+                        name.pid_str))
+              else Ok ()
+            in
+            let* operation_path, operation_type, args, result =
+              resolve_operation env ~at ~kind:"Task" operation
+            in
+            let* scheme = Polymorphic_functions.discover ~at operation_type in
+            let* domain_path =
+              try
+                let domain =
+                  Longident.Ldot
+                    ({ txt = Lident "Stdlib"; loc = at }, { txt = "Domain"; loc = at })
+                in
+                let path, _ =
+                  Env.find_type_by_name
+                    (Ldot ({ txt = domain; loc = at }, { txt = "t"; loc = at }))
+                    env
+                in
+                Ok (Env.normalize_type_path None env path)
+              with Stdlib.Not_found ->
+                Error (Report.error Type at "Cannot resolve the OCaml Domain.t type")
+            in
+            let* () =
+              if Datatypes.is_domain domain_path then Ok ()
+              else
+                Error
+                  (Report.error Type at
+                     "A task facade requires the standard-library Domain.t type")
+            in
+            let handle = Ctype.newconstr domain_path [ result ] in
+            let module_id = Ident.create_local name.pid_str in
+            let module_path = Path.Pident module_id in
+            let env =
+              Env.add_module module_id Mp_present
+                (Mty_signature
+                   [ facade_value ~at ("handle", handle :: args, Predef.type_bool) ])
+                env
+            in
+            tasks :=
+              {
+                task_name = name.pid_str;
+                task_scope = None;
+                task_id = module_id;
+                task_path = module_path;
+                task_environment = env;
+                task_operation = operation;
+                task_operation_path = operation_path;
+                task_operation_type = operation_type;
+                task_parameters = scheme.variables;
+                task_at = at;
+                task_application = None;
+              }
+              :: !tasks;
             Ok (env, descriptors, resources, fields)
         | Proof_resource { resource_name = name; resource_functor; resource_arguments } ->
             let at = name.pid_loc in
@@ -1124,7 +1196,13 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             Ok (env, descriptors, resources, fields)
         | _ -> Ok (env, descriptors, resources, fields))
   in
-  Ok (env, List.rev reversed, List.rev resources, List.rev fields, List.rev !aus)
+  Ok
+    ( env,
+      List.rev reversed,
+      List.rev resources,
+      List.rev fields,
+      List.rev !aus,
+      List.rev !tasks )
 
 let signature_ghost_modules ~comments (scope : Proof_scopes.scope) =
   let within = Declaration_scope.contains in
@@ -1453,7 +1531,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   ])
             in
             let temporary = S.mk_id ~loc:at backend in
-            let* generated_env, _, generated, _, _ =
+            let* generated_env, _, generated, _, _, _ =
               elaborate_proof_types ~add_standard:false ~allow_interfaces:true base None
                 [
                   S.Proof_resource
@@ -1587,7 +1665,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
           List.filter_map declarations ~f:(fun entry ->
               match entry.declaration with
               | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
-              | Proof_au _ ->
+              | Proof_au _ | Proof_task _ ->
                   Some entry.declaration
               | _ -> None)
         in
@@ -1606,7 +1684,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               | _ :: _ ->
                   List.for_all proof ~f:(function
                     | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
-                    | Proof_au _ ->
+                    | Proof_au _ | Proof_task _ ->
                         true
                     | _ -> false)
               | [] -> false
@@ -1622,7 +1700,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
           else
             Report.unsupported
               (Option.value scope.proof_location ~default:scope.source_location)
-              "A type, function, resource, field, or AU inside a functor proof"
+              "A type, function, resource, field, AU, or Task inside a functor proof"
         in
         let inherited =
           List.filter previous ~f:(fun (ancestor, _, _) ->
@@ -1630,7 +1708,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         in
         let known_resources =
           previous_resources
-          @ List.concat_map previous ~f:(fun (_, (_, _, resources, _, _), _) -> resources)
+          @ List.concat_map previous ~f:(fun (_, (_, _, resources, _, _, _), _) ->
+              resources)
         in
         let own_names =
           List.filter_map proof ~f:(function
@@ -1639,6 +1718,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             | Proof_resource { resource_name; _ } -> Some resource_name.pid_str
             | Proof_field { field_name; _ } -> Some field_name.pid_str
             | Proof_au { au_name; _ } -> Some au_name.pid_str
+            | Proof_task { task_name; _ } -> Some task_name.pid_str
             | _ -> None)
         in
         let without_shadowed bindings =
@@ -1657,7 +1737,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         in
         let base =
           List.fold inherited ~init:base
-            ~f:(fun env (ancestor, (ancestor_env, _, _, _, _), bindings) ->
+            ~f:(fun env (ancestor, (ancestor_env, _, _, _, _, _), bindings) ->
               let inherited_bindings =
                 if List.is_empty ancestor.Proof_scopes.parameters then bindings
                 else specification_bindings ancestor.environment ancestor_env
@@ -1674,10 +1754,10 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               else env)
         in
         let* base, abstract_resources = abstract_resources scope base in
-        let* env, types, resources, fields, aus =
+        let* env, types, resources, fields, aus, tasks =
           elaborate_proof_types ~add_standard:false
             ~allow_shadowing:(Option.is_some scope.definition)
-            ~previous:([], known_resources @ abstract_resources, [], [])
+            ~previous:([], known_resources @ abstract_resources, [], [], [])
             ~canonical_owner:(Proof_scopes.canonical_owner scopes)
             base None proof
         in
@@ -1887,7 +1967,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 S.mk_id ~loc:at
                   (Compiler_types.internal_name ~at (name.pid_str ^ "_public"))
               in
-              let* generated_env, _, generated, _, _ =
+              let* generated_env, _, generated, _, _, _ =
                 elaborate_proof_types ~add_standard:false ~allow_interfaces:true base None
                   [
                     S.Proof_resource
@@ -2039,6 +2119,17 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 au_token_paths = List.dedup_and_sort token_paths ~compare:Path.compare;
               })
         in
+        let tasks =
+          List.map tasks ~f:(fun task ->
+              {
+                task with
+                task_scope = scope.owner;
+                task_path =
+                  Option.value_map scope.owner ~default:task.task_path ~f:(fun owner ->
+                      Path.Pdot (owner, task.task_name));
+                task_environment = env;
+              })
+        in
         let namespaced =
           List.map types ~f:(fun data ->
               let name =
@@ -2072,7 +2163,9 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               Types.Sig_module
                 (resource.resource_id, Mp_present, declaration, Trec_not, Exported))
         in
-        Ok (previous @ [ (scope, (env, namespaced, resources, fields, aus), bindings) ]))
+        Ok
+          (previous
+          @ [ (scope, (env, namespaced, resources, fields, aus, tasks), bindings) ]))
   in
   let module_chain scope =
     List.mapi scope.Proof_scopes.namespace ~f:(fun index name ->
@@ -2156,7 +2249,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         | _ -> env)
   in
   let qualified_env =
-    List.fold typed ~init:qualified_env ~f:(fun env (scope, (_, _, resources, _, _), _) ->
+    List.fold typed ~init:qualified_env
+      ~f:(fun env (scope, (_, _, resources, _, _, _), _) ->
         match module_chain scope with
         | Some ((root_name, Some root_id, _) :: rest)
           when not (public_functor_result scope) ->
@@ -2203,7 +2297,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         in
         begin match template with
         | None -> (env, projected)
-        | Some (scope, (_, _, resources, _, _), bindings) ->
+        | Some (scope, (_, _, resources, _, _, _), bindings) ->
             let identity = application.applicative_identity in
             let carrier_identity = Env.normalize_module_path None env identity in
             let env =
@@ -2298,7 +2392,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               Functor_context.same_scope scope application.scope)
         in
         match template with
-        | Some (scope, (_, _, resources, _, _), _) ->
+        | Some (scope, (_, _, resources, _, _, _), _) ->
             let view_owner = application.result in
             let carrier_identity =
               Env.normalize_module_path None qualified_env
@@ -2421,7 +2515,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         | None -> env
         | Some (identity, template_id) ->
             let template =
-              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _), _) ->
+              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _, _), _) ->
                   Option.map
                     (List.find resources ~f:(fun original ->
                          Ident.same original.resource_id template_id))
@@ -2479,7 +2573,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
         with
         | Path.Pdot (Pident result_id, name), Some public, Some (identity, template_id) ->
             let template =
-              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _), _) ->
+              List.find_map typed ~f:(fun (scope, (_, _, resources, _, _, _), _) ->
                   Option.bind
                     (List.find resources ~f:(fun original ->
                          Ident.same original.resource_id template_id))
@@ -2597,25 +2691,27 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             end
         | Pdot _ | Papply _ | Pextra_ty _ -> env)
   in
+  let facade_application (application : Functor_context.application) =
+    let template =
+      List.find typed ~f:(fun (scope, _, _) ->
+          Functor_context.same_scope scope application.scope)
+    in
+    Option.map template ~f:(fun (scope, (_, _, _, _, aus, tasks), _) ->
+        let identity = application.applicative_identity in
+        let carrier_identity = Env.normalize_module_path None qualified_env identity in
+        let substitution = Functor_context.substitution application in
+        let substitution =
+          List.fold (source_type_ids scope.structure) ~init:substitution
+            ~f:(fun substitution (id, name) ->
+              Subst.add_type id (Path.Pdot (identity, name)) substitution)
+        in
+        (scope, aus, tasks, carrier_identity, substitution))
+  in
   let application_aus =
     List.concat_map applications ~f:(fun (application : Functor_context.application) ->
-        let template =
-          List.find typed ~f:(fun (scope, _, _) ->
-              Functor_context.same_scope scope application.scope)
-        in
-        match template with
-        | Some (scope, (_, _, _, _, aus), _) ->
+        match facade_application application with
+        | Some (scope, aus, _, carrier_identity, substitution) ->
             let view_owner = application.result in
-            let identity = application.applicative_identity in
-            let carrier_identity =
-              Env.normalize_module_path None qualified_env identity
-            in
-            let substitution = Functor_context.substitution application in
-            let substitution =
-              List.fold (source_type_ids scope.structure) ~init:substitution
-                ~f:(fun substitution (id, name) ->
-                  Subst.add_type id (Path.Pdot (identity, name)) substitution)
-            in
             List.filter aus ~f:(fun au -> Option.equal Path.same au.au_scope scope.owner)
             |> List.map ~f:(fun au ->
                 let path = Path.Pdot (view_owner, au.au_name) in
@@ -2670,6 +2766,46 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   au_application = Some (carrier_identity, au.au_id);
                 })
         | _ -> [])
+  in
+  let application_tasks =
+    List.concat_map applications ~f:(fun (application : Functor_context.application) ->
+        match facade_application application with
+        | Some (scope, _, tasks, carrier_identity, substitution) ->
+            List.filter tasks ~f:(fun task ->
+                Option.equal Path.same task.task_scope scope.owner
+                &&
+                  try
+                    let _ =
+                      Env.find_value
+                        (Path.Pdot
+                           (Path.Pdot (application.result, task.task_name), "handle"))
+                        qualified_env
+                    in
+                    true
+                  with Stdlib.Not_found -> false)
+            |> List.map ~f:(fun task ->
+                let operation_path =
+                  Option.value_map (scoped_value_name scope task.task_operation_path)
+                    ~default:(Subst.module_path substitution task.task_operation_path)
+                    ~f:(fun name -> Path.Pdot (application.result, name))
+                in
+                let related =
+                  Compiler_types.map_group
+                    (task.task_operation_type :: task.task_parameters)
+                    ~f:(Subst.type_expr substitution)
+                in
+                {
+                  task with
+                  task_scope = None;
+                  task_id = Ident.create_local task.task_name;
+                  task_path = Path.Pdot (application.result, task.task_name);
+                  task_environment = qualified_env;
+                  task_operation_path = operation_path;
+                  task_operation_type = List.hd_exn related;
+                  task_parameters = List.tl_exn related;
+                  task_application = Some (carrier_identity, task.task_id);
+                })
+        | None -> [])
   in
   let private_root env caller root_id =
     let root = Env.find_module (Pident root_id) qualified_env in
@@ -2737,7 +2873,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             List.find typed ~f:(fun (candidate, _, _) ->
                 Option.equal Ident.same candidate.declaration_id scope.declaration_id)
           with
-          | Some (_, (env, _, _, _, _), _) -> env
+          | Some (_, (env, _, _, _, _, _), _) -> env
           | None ->
               if Option.is_none scope.owner then qualified_env else scope.environment
         in
@@ -2793,9 +2929,9 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 else env
             | [] -> env))
   in
-  let types = List.concat_map typed ~f:(fun (_, (_, types, _, _, _), _) -> types) in
+  let types = List.concat_map typed ~f:(fun (_, (_, types, _, _, _, _), _) -> types) in
   let resources =
-    List.concat_map typed ~f:(fun (_, (_, _, resources, _, _), _) -> resources)
+    List.concat_map typed ~f:(fun (_, (_, _, resources, _, _, _), _) -> resources)
     @ List.map application_resources ~f:(fun resource ->
         {
           resource with
@@ -2853,12 +2989,17 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   end
               | Some _, [] | None, _ -> Ok ()))
   in
-  let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields, _), _) -> fields) in
+  let fields = List.concat_map typed ~f:(fun (_, (_, _, _, fields, _, _), _) -> fields) in
   let aus =
-    List.concat_map typed ~f:(fun (_, (_, _, _, _, aus), _) -> aus)
+    List.concat_map typed ~f:(fun (_, (_, _, _, _, aus, _), _) -> aus)
     @ List.map application_aus ~f:(fun au -> { au with au_environment = qualified_env })
   in
-  Ok (qualified_env, scopes, types, resources, fields, aus)
+  let tasks =
+    List.concat_map typed ~f:(fun (_, (_, _, _, _, _, tasks), _) -> tasks)
+    @ List.map application_tasks ~f:(fun task ->
+        { task with task_environment = qualified_env })
+  in
+  Ok (qualified_env, scopes, types, resources, fields, aus, tasks)
 
 let signature_ghost_resources env comments =
   Annotation.of_comments comments
@@ -2887,7 +3028,7 @@ let signature_ghost_resources env comments =
       let temporary =
         S.mk_id ~loc:at (Compiler_types.internal_name ~at (name.pid_str ^ "_signature"))
       in
-      let* generated_env, _, generated, _, _ =
+      let* generated_env, _, generated, _, _, _ =
         elaborate_proof_types ~add_standard:false ~allow_interfaces:true env None
           [
             S.Proof_resource
@@ -3161,7 +3302,7 @@ let imported_proof_resources env libraries =
           let temporary =
             S.mk_id ~loc:at (Compiler_types.internal_name ~at name.pid_str)
           in
-          let* generated_env, _, generated, _, _ =
+          let* generated_env, _, generated, _, _, _ =
             elaborate_proof_types ~add_standard:false ~allow_interfaces:true env None
               [
                 S.Proof_resource

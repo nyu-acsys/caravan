@@ -1,0 +1,4 @@
+module Worker (A : Element) = struct
+  module Job = Ghost.Task (struct let operation = work end)
+  module Echo = Ghost.Task (struct let operation = echo end)
+end

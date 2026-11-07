@@ -167,11 +167,19 @@ let asset_projection source plan path substitution =
         Option.value_map resource.resource_public ~default:substitution
           ~f:(add_resource substitution))
   in
-  List.fold source.Source.proof_aus ~init:substitution ~f:(fun substitution au ->
+  let substitution =
+    List.fold source.Source.proof_aus ~init:substitution ~f:(fun substitution au ->
+        if
+          Option.is_none au.Source.au_application
+          && Option.equal Path.same au.au_scope plan.scope.owner
+        then Subst.add_module au.au_id (Path.Pdot (path, au.au_name)) substitution
+        else substitution)
+  in
+  List.fold source.Source.proof_tasks ~init:substitution ~f:(fun substitution task ->
       if
-        Option.is_none au.Source.au_application
-        && Option.equal Path.same au.au_scope plan.scope.owner
-      then Subst.add_module au.au_id (Path.Pdot (path, au.au_name)) substitution
+        Option.is_none task.Source.task_application
+        && Option.equal Path.same task.task_scope plan.scope.owner
+      then Subst.add_module task.task_id (Path.Pdot (path, task.task_name)) substitution
       else substitution)
 
 let manifest_alias (declaration : Typedtree.type_declaration) =

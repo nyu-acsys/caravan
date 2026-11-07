@@ -311,8 +311,27 @@ let () =
     | exception Spec_parser.Error -> ()
     | exception Spec_ast.Syntax_error _ -> ()
   in
+  begin match
+    parse_proof
+      {|module Job = Ghost.Task (struct let operation = Worker.run end)
+        module Update = Ghost.AU (struct let operation = update end)|}
+  with
+  | [
+   Proof_task { task_name; task_operation = Qdot (Qid worker, operation) };
+   Proof_au { au_name; au_operation = Qid update };
+  ] ->
+      assert (task_name.pid_str = "Job");
+      assert (worker.pid_str = "Worker");
+      assert (operation.pid_str = "run");
+      assert (au_name.pid_str = "Update");
+      assert (update.pid_str = "update")
+  | _ -> failwith "operation facades were not parsed"
+  end;
   List.iter rejected
     [
+      "module Job = Ghost.Task (struct let worker = run end)";
+      "module Job = Other.Task (struct let operation = run end)";
+      "module Update = Ghost.AU (struct let worker = update end)";
       "module Facts = SetRA (struct type element = int end)";
       "let facts : (int, Authority.t) Ghost.field = Other.field ()";
       "let facts : int = Ghost.field ()";

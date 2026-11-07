@@ -166,7 +166,8 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
     List.filter_map local_exports ~f:(fun binding ->
         match binding.kind with
         | Predicate _ -> Some (binding.public_key, (binding.backend, binding.public_types))
-        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _
+        | Action _ ->
             None)
     @ preds
   in
@@ -297,7 +298,8 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
               ( binding.backend,
                 ( Option.value (definition_target binding) ~default:binding.backend,
                   binding.private_types ) )
-        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+        | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _
+        | Action _ ->
             None)
   in
   let inputs =
@@ -325,7 +327,8 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
             Some
               ( binding.entry.name.pid_str,
                 Option.value (definition_target binding) ~default:binding.backend )
-        | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+        | Predicate _ | Lemma _ | Resource _ | Field _ | Atomic _ | Task _ | State _
+        | Action _ ->
             None)
     @ List.map private_functions ~f:(fun (key, signature) -> (key, signature.lemma_raven))
     @ List.map private_preds ~f:(fun (key, (backend, _)) -> (key, backend))
@@ -781,7 +784,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
         let* count = implicit_parameter_count ~kind:"predicate" p.pred_params in
         Ok (Option.map count ~f:(fun count -> (key, List.length ts - count))))
   in
-  let predicate_inputs = List.filter_opt predicate_inputs in
+  let predicate_inputs =
+    List.map decls.tasks ~f:(fun task ->
+        (task.Task_facades.key, List.length task.handle_types))
+    @ List.filter_opt predicate_inputs
+  in
   let predicate_inputs =
     predicate_inputs
     @ List.filter_map library_preds ~f:(fun (lib, p, _) ->
@@ -819,7 +826,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
         if List.Assoc.mem preds target ~equal:String.equal then None
         else Some (target, (target, types)))
   in
-  let preds = checked_preds @ preds in
+  let preds = List.map decls.tasks ~f:Task_facades.predicate @ checked_preds @ preds in
   let scoped_keys = List.map scoped_proofs.bindings ~f:(fun binding -> binding.backend) in
   let private_scoped_inputs = scoped_inputs in
   let predicate_inputs =
@@ -923,7 +930,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                   | _ -> Some (path, pure_reference f))));
       predicate_views =
         Path_bindings.of_list
-          (List.map checked_resource_entries ~f:(fun (path, key, _, _) -> (path, key)));
+          (List.concat_map decls.tasks ~f:Task_facades.views
+          @ List.map checked_resource_entries ~f:(fun (path, key, _, _) -> (path, key)));
       public_types;
       strict_source_types = false;
       library_paths = library_paths libraries;
@@ -945,7 +953,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
             ~scope:(Proof_bindings.scope_for_location scoped_proofs id.S.pid_loc)
             id);
       opaque_predicates =
-        Proof_bindings.opaque_keys scoped_proofs
+        List.map decls.tasks ~f:(fun task -> task.Task_facades.key)
+        @ Proof_bindings.opaque_keys scoped_proofs
         @ List.map checked_resource_entries ~f:(fun (_, key, _, _) -> key)
         @ List.concat_map library_preds ~f:(fun (library, p, _) ->
             [

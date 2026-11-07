@@ -446,7 +446,7 @@ let spec_case_env env ?scrutinee ?scrutinee_type (p : S.pat) =
 let generic_operands env operands =
   let rec generic typ =
     match Datatypes.desc env.data typ with
-    | Tvar _ -> Option.is_some (Datatypes.find_variable env.data typ)
+    | Tvar _ | Tunivar _ -> Option.is_some (Datatypes.find_variable env.data typ)
     | Tconstr (_, arguments, _) -> List.exists arguments ~f:generic
     | Ttuple components -> List.exists components ~f:(fun (_, typ) -> generic typ)
     | Tpoly (body, []) -> generic body

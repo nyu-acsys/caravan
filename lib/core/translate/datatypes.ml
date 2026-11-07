@@ -484,6 +484,17 @@ let variable_type ~variable ~owner ~parameter ~at =
     at;
   }
 
+(** A locally abstract type stands for the generalized variable of its name. *)
+let bind_local_variable environment (data : t) =
+  match Option.map data.variable ~f:Types.get_desc with
+  | Some (Tunivar (Some name)) ->
+      begin match Env.find_type_by_name (Longident.Lident name) environment with
+      | Pident id, _ -> { data with id = Some id }
+      | _ -> data
+      | exception Stdlib.Not_found -> data
+      end
+  | _ -> data
+
 let parameter_type ~parameter ~name ~declaration ~backend =
   {
     (library_type ~library:"Parameter" ~library_id:parameter
@@ -737,6 +748,21 @@ let rec expand_parameterized types t =
 
 let desc types t = Types.get_desc (expand types t)
 
+(** Express native locally abstract types through their quantified variables. *)
+let quantified_type types typ =
+  let rec project typ =
+    let copy desc = Ctype.newty (Btype.copy_type_desc project desc) in
+    match Types.get_desc typ with
+    | Tvar _ | Tunivar _ -> typ
+    | Tconstr (path, [], _) as desc ->
+        begin match Option.bind (find types path) ~f:(fun data -> data.variable) with
+        | Some variable -> variable
+        | None -> copy desc
+        end
+    | desc -> copy desc
+  in
+  project typ
+
 (** Trusted abstract views retain their carriers across compiler alias expansion. *)
 let is_opaque types typ =
   match desc types typ with
@@ -776,7 +802,7 @@ let value_family types typ =
 let find_variable (types : t list) variable =
   let variable = expand types variable in
   match Types.get_desc variable with
-  | Tvar _ ->
+  | Tvar _ | Tunivar _ ->
       List.find types ~f:(fun data ->
           Option.exists data.variable ~f:(fun bound ->
               Int.equal (Types.get_id (expand types bound)) (Types.get_id variable)))
@@ -826,6 +852,17 @@ let is_ref (p : Path.t) =
 let is_atomic (p : Path.t) =
   match Path.name p with "Stdlib.Atomic.t" | "Stdlib__Atomic.t" -> true | _ -> false
 
+(** The standard library's opaque domain handles. *)
+let is_domain (p : Path.t) =
+  match p with
+  | Pdot (Pdot (Pident root, "Domain"), "t") ->
+      Ident.persistent root && String.equal (Ident.name root) "Stdlib"
+  | Pdot (Pident root, "t") ->
+      Ident.persistent root && String.equal (Ident.name root) "Stdlib__Domain"
+  | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false
+
+let is_reference p = is_ref p || is_atomic p || is_domain p
+
 (** The opaque reference type used for proof-only storage. *)
 let is_ghost (p : Path.t) = String.equal (Path.name p) "Ghost.t"
 
@@ -835,7 +872,7 @@ let is_permission (p : Path.t) = String.equal (Path.name p) "Permission.t"
 (** Whether [t] itself is a heap reference, rather than a value containing one. *)
 let is_heap_ref (types : t list) (t : Types.type_expr) =
   match desc types t with
-  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+  | Tconstr (p, [ _ ], _) when is_reference p -> true
   | Tconstr (p, [], _) when is_ghost p -> true
   | Tconstr (p, [], _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
   | _ -> false
@@ -844,7 +881,7 @@ let is_heap_ref (types : t list) (t : Types.type_expr) =
 let cell_namespaces (data : t list) (typ : Types.type_expr) =
   let rec collect typ =
     match desc data typ with
-    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
+    | Tconstr (path, [ _ ], _) when is_reference path -> []
     | Tconstr (path, [ element ], _)
       when Path.same path Predef.path_list || Path.same path Predef.path_option ->
         collect element
@@ -901,7 +938,8 @@ let rec abstract_value_constraint types t =
             && List.equal Types.eq_type data.parameters arguments
           then data.value_constraint
           else None)
-  | Tvar _ -> Option.bind (find_variable types t) ~f:(fun data -> data.value_constraint)
+  | Tvar _ | Tunivar _ ->
+      Option.bind (find_variable types t) ~f:(fun data -> data.value_constraint)
   | Tconstr (path, [], _) ->
       begin match find types path with
       | Some { mathematical = true; _ } -> None
@@ -996,7 +1034,7 @@ let rec type_key types t =
   else if Option.is_some alias then type_key types (Option.value_exn alias)
   else
     match desc types t with
-    | Tvar _ ->
+    | Tvar _ | Tunivar _ ->
         Option.map
           (Option.bind (find_variable types t) ~f:(fun data -> data.backend_type))
           ~f:(fun backend -> Named_key (backend.Qualified_name.path @ [ backend.name ]))
@@ -1005,7 +1043,7 @@ let rec type_key types t =
     | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Some Unit_key
     | Tconstr (p, [], _) when is_permission p -> Some Permission_key
     | Tconstr (p, [], _) when is_ghost p -> Some Ref_key
-    | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Some Ref_key
+    | Tconstr (p, [ _ ], _) when is_reference p -> Some Ref_key
     | Tconstr (p, [ element ], _) when Path.same p Predef.path_list ->
         unary (fun key -> List_key key) element
     | Tconstr (p, [ element ], _) when Path.same p Predef.path_option ->
@@ -1220,10 +1258,10 @@ let domain_identity types t =
   let rec scopes seen t =
     let t = expand_parameterized types t in
     match Types.get_desc t with
-    | Tvar _ ->
+    | Tvar _ | Tunivar _ ->
         Option.value_map (find_variable types t) ~default:[] ~f:(fun data ->
             Option.to_list data.domain_scope)
-    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> []
+    | Tconstr (path, [ _ ], _) when is_reference path -> []
     | Tconstr (path, arguments, _)
       when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
         let family = Option.value_exn (Option.value_exn (find types path)).family in
@@ -1452,7 +1490,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   let l = loc at in
   let types = Option.value_map self ~default:types ~f:(fun self -> self :: types) in
   match desc types t with
-  | Tvar _ ->
+  | Tvar _ | Tunivar _ ->
       begin match
         Option.bind (find_variable types t) ~f:(fun data -> data.backend_type)
       with
@@ -1469,7 +1507,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let* elt = typ types ?self ~at elt in
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
-  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [ _ ], _) when is_reference p -> Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
       let* elt = typ types ?self ~at elt in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
@@ -1572,7 +1610,7 @@ let instantiated types occurrence =
 let fold_families types requested ~init ~f =
   let rec visit seen state typ =
     match desc types typ with
-    | Tconstr (path, [ _ ], _) when is_ref path || is_atomic path -> state
+    | Tconstr (path, [ _ ], _) when is_reference path -> state
     | Tconstr (path, arguments, _) ->
         let state = List.fold arguments ~init:state ~f:(visit seen) in
         let data = find types path in
@@ -1881,7 +1919,7 @@ let rec immediate (types : t list) (t : Types.type_expr) =
     when Path.same p Predef.path_int || Path.same p Predef.path_bool
          || Path.same p Predef.path_unit ->
       true
-  | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+  | Tconstr (p, [ _ ], _) when is_reference p -> true
   | Tconstr (p, [], _) when is_ghost p -> true
   | Tconstr (p, [], _) ->
       begin match find types p with
@@ -1897,8 +1935,8 @@ let rec immediate (types : t list) (t : Types.type_expr) =
 let has_refs (types : t list) (t : Types.type_expr) =
   let rec go seen t =
     match desc types t with
-    | Tvar _ -> true
-    | Tconstr (p, [ _ ], _) when is_ref p || is_atomic p -> true
+    | Tvar _ | Tunivar _ -> true
+    | Tconstr (p, [ _ ], _) when is_reference p -> true
     | Tconstr (p, [], _) when is_ghost p -> true
     | Tconstr (p, args, _) -> begin
         List.exists args ~f:(go seen)

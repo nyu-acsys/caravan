@@ -105,3 +105,8 @@
   caravan_spec
   compiler-libs.common
   raven-ivl.api))
+
+(test
+ (name domain_contract)
+ (modules domain_contract)
+ (libraries caravan_core raven-ivl.api))

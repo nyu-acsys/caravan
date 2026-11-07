@@ -80,7 +80,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             (not (List.is_empty field.Source.field_parameters))
             (Generic_fields.worker field))
     in
-    let proofs = decls.generic_predicates @ proofs.generic_callables in
+    let proofs =
+      decls.generic_predicates @ proofs.generic_callables
+      @ List.filter_map decls.tasks ~f:(fun task ->
+          Option.some_if task.Task_facades.emit task.worker)
+    in
     let workers =
       List.map decls.polymorphic_functions ~f:(fun worker ->
           {
@@ -227,6 +231,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     polymorphic_functions;
     generic_predicates;
     generic_predicate_workers;
+    tasks = _;
   } =
     decls
   in
@@ -295,6 +300,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     logical_members;
     pure_funcs;
     procs;
+    task_members;
   } =
     translated
   in
@@ -970,16 +976,54 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   let namespaces =
     List.map support_domains ~f:(fun (name, _) -> (Qualified_name.of_string name).path)
     @ List.map support_instances ~f:(fun instance -> instance.instance_namespace)
+    @ List.map callable_workers ~f:(fun worker ->
+        (Qualified_name.of_string (callable_name worker)).path)
     |> List.dedup_and_sort ~compare:(List.compare String.compare)
   in
   let domain_dependencies = Generic_support.domain_dependencies domain_requests in
-  let* support_members =
+  let module_worker_namespaces =
+    List.filter_map scopes.module_contexts.contexts ~f:(fun context ->
+        match context.Module_context.destination with
+        | Worker _ -> Some context.namespace
+        | Flat | Function_worker _ | Proof_worker _ -> None)
+  in
+  let* support_plans =
     all namespaces ~f:(fun namespace ->
-        let* members =
-          Generic_support.order ~namespace ~at:Location.none ~domains:support_domains
+        let nodes =
+          Generic_support.nodes ~namespace ~at:Location.none ~domains:support_domains
             ~domain_dependencies ~instances:support_instances
         in
-        Ok (namespace, members))
+        let* ordered = Generic_support.order_nodes ~at:Location.none nodes in
+        let workers =
+          List.filter_map callable_workers ~f:(fun worker ->
+              Option.some_if
+                (List.mem module_worker_namespaces namespace
+                   ~equal:(List.equal String.equal)
+                && List.equal String.equal namespace
+                     (Qualified_name.of_string (callable_name worker)).path)
+                Generic_support.
+                  {
+                    name = callable_name worker;
+                    member = `Worker worker;
+                    dependencies =
+                      targets worker
+                      @ List.concat_map task_members ~f:(fun (owner, _, dependencies) ->
+                          if String.equal owner (callable_name worker) then dependencies
+                          else []);
+                  })
+        in
+        let* combined =
+          Generic_support.order_nodes ~at:Location.none
+            (workers
+            @ List.map nodes ~f:(fun node -> { node with member = `Value node.member }))
+        in
+        Ok
+          ( namespace,
+            List.map ordered ~f:(fun node -> node.member),
+            List.map combined ~f:(fun node -> node.member) ))
+  in
+  let support_members =
+    List.map support_plans ~f:(fun (namespace, members, _) -> (namespace, members))
   in
   let rec emit_context_members ?namespace ?(library = false) destination ~at
       ~representations ~native_resources ~applications ~late_members =
@@ -1066,6 +1110,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Definitions;
               `Native_resources;
               `Public_resources;
+              `Task_support;
               `Function_workers;
               `Applications;
               `Value_domains;
@@ -1088,8 +1133,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Native_resources;
               `Public_resources;
               `Applications;
-              `Function_workers;
-              `Value_domains;
+              `Workers_and_values;
               `Primitives;
               `Pure_functions;
               `Fields;
@@ -1112,6 +1156,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Fields;
               `View_fields;
               `State;
+              `Task_contracts;
               `Predicates;
               `Logical_functions;
               `Lemmas;
@@ -1128,6 +1173,15 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
       | `Public_resources -> emitted_assets destination public_resource_members
       | `Applications -> applications
       | `Function_workers -> function_workers
+      | `Workers_and_values ->
+          Option.value
+            (List.find_map support_plans ~f:(fun (owner, _, members) ->
+                 Option.some_if (List.equal String.equal namespace owner) members))
+            ~default:[]
+          |> List.concat_map ~f:(function
+            | `Value member -> [ member ]
+            | `Worker worker -> [ emit_callable_worker destination worker ])
+          |> fun members -> members @ defaults
       | `Value_domains -> support @ defaults
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
@@ -1149,6 +1203,13 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               R.Member.callable member)
       | `Lemmas -> emitted_proofs destination proof_lemma_members
       | `Logical_functions -> emitted_proofs destination logical_members
+      | `Task_support ->
+          if List.is_empty decls.tasks then []
+          else Domain_contract.support ~loc:at Task_facades.model
+      | `Task_contracts ->
+          List.concat_map task_members ~f:(fun (owner, members, _) ->
+              if String.equal owner (String.concat ~sep:"." namespace) then members
+              else [])
       | `Procedures -> (
           List.map (owned destination procs) ~f:procedure_member
           @

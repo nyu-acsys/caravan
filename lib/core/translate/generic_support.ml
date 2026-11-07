@@ -3,9 +3,7 @@
 open Base
 open Translate_context
 
-type node = { name : string; member : R.Member.t; dependencies : string list }
-
-let ( let* ) result f = Result.bind result ~f
+type 'a node = { name : string; member : 'a; dependencies : string list }
 
 let domain_dependencies requests =
   List.fold requests
@@ -19,7 +17,7 @@ let domain_dependencies requests =
               List.map families ~f:(fun family -> family.Datatypes.family_name)
               @ Option.value existing ~default:[])))
 
-let order ~namespace ~at ~domains ~domain_dependencies
+let nodes ~namespace ~at ~domains ~domain_dependencies
     ~(instances : function_instance list) =
   let local name =
     List.equal String.equal (Qualified_name.of_string name).path namespace
@@ -43,10 +41,12 @@ let order ~namespace ~at ~domains ~domain_dependencies
           {
             name = String.concat ~sep:"." (namespace @ [ instance.instance_name ]);
             member = Value_instances.member ~loc:(loc at) instance;
-            dependencies = instance.instance_arguments;
+            dependencies = instance.instance_worker :: instance.instance_arguments;
           })
   in
-  let nodes = domains @ instances in
+  domains @ instances
+
+let order_nodes ~at nodes =
   let prefixes =
     List.map nodes ~f:(fun node -> node.name)
     |> List.dedup_and_sort ~compare:(fun left right ->
@@ -63,10 +63,12 @@ let order ~namespace ~at ~domains ~domain_dependencies
     |> List.filter ~f:(fun name -> not (String.equal name node.name))
     |> List.dedup_and_sort ~compare:String.compare
   in
-  let* ordered =
-    Polymorphic_functions.order_by nodes
-      ~name:(fun node -> node.name)
-      ~location:(fun _ -> at)
-      ~dependencies
-  in
-  Ok (List.map ordered ~f:(fun node -> node.member))
+  Polymorphic_functions.order_by nodes
+    ~name:(fun node -> node.name)
+    ~location:(fun _ -> at)
+    ~dependencies
+
+let order ~namespace ~at ~domains ~domain_dependencies ~instances =
+  Result.map
+    (order_nodes ~at (nodes ~namespace ~at ~domains ~domain_dependencies ~instances))
+    ~f:(List.map ~f:(fun node -> node.member))

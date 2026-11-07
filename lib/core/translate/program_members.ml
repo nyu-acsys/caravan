@@ -26,6 +26,7 @@ type t = {
   logical_members : R.Member.t list;
   pure_funcs : (Procedures.func * R.Callable.t) list;
   procs : (Procedures.func * R.Callable.t) list;
+  task_members : (string * R.Member.t list * string list) list;
 }
 
 let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
@@ -2259,8 +2260,89 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      contract ))))
     |> Result.map ~f:List.concat
   in
+  let* domain_plans =
+    if List.is_empty decls.tasks then Ok []
+    else
+      let tasks = List.map decls.tasks ~f:(Task_facades.signature ~types:decls.types) in
+      let* functions =
+        all funcs ~f:(fun f ->
+            let* environment = body_environment f in
+            let* result, names =
+              contract_names f
+                (Option.bind f.contract ~f:(fun contract -> contract.header))
+                (List.length f.params)
+            in
+            let parameters =
+              List.concat_map (List.zip_exn f.params names) ~f:(fun (parameter, name) ->
+                  match parameter.Typedtree.fp_kind with
+                  | Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } ->
+                      [ (Option.value name ~default:(Ident.name id), id) ]
+                  | Tparam_pat _ ->
+                      List.map (params_bound [ parameter ]) ~f:(fun id ->
+                          (Ident.name id, id))
+                  | Tparam_optional_default _ -> [])
+            in
+            let data, predicates, _, _, spec_funcs, proof_support = body_context f in
+            let ctx =
+              spec_context data ~shared:(body_shared f) ~ocaml_env:environment
+                ~preds:predicates ~spec_funcs ~proof_support ~generic_predicates ()
+            in
+            let var_types =
+              List.concat_map (List.zip_exn f.params names) ~f:(fun (parameter, name) ->
+                  match parameter.Typedtree.fp_kind with
+                  | Tparam_pat pattern ->
+                      Option.value_map name ~default:[] ~f:(fun name ->
+                          [ (name, pattern.pat_type) ])
+                      @ List.map (Typedtree.pat_bound_idents_full pattern)
+                          ~f:(fun (id, _, typ, _) -> (Ident.name id, typ))
+                  | Tparam_optional_default _ -> [])
+            in
+            let logical =
+              {
+                ctx;
+                data;
+                funcs = spec_funcs;
+                vars = [];
+                var_types = (result, f.body.exp_type) :: var_types;
+                logical_definition = false;
+              }
+            in
+            let* scheme = Polymorphic_functions.discover ~at:f.loc f.scheme_type in
+            Ok
+              ( f.id,
+                Domain_calls.
+                  {
+                    paths = f.paths;
+                    parameters;
+                    result;
+                    contract = f.contract;
+                    environment;
+                    body = f.body;
+                    logical;
+                    scheme;
+                  } ))
+      in
+      all translated ~f:(fun (name, f, _) ->
+          let* function_ =
+            Report.expect ~at:f.loc "The domain caller's source function"
+              (List.Assoc.find functions f.id ~equal:Ident.same)
+          in
+          let* plan =
+            Domain_calls.analyze ~canonical:proofs.proof_support.canonical_path
+              ~types:decls.types ~tasks ~functions:(List.map functions ~f:snd) function_
+          in
+          Ok (name, plan))
+  in
+  let domain_effect procedure expression =
+    Domain_calls.application_raises
+      (Option.value
+         (List.Assoc.find domain_plans procedure ~equal:String.equal)
+         ~default:[])
+      expression
+  in
   let raising, by_constructor =
-    Exceptions.raise_sets ~library:library_raising ~key:(Exceptions.key decls.types)
+    Exceptions.raise_sets ~library:library_raising ~application_raises:domain_effect
+      ~key:(Exceptions.key decls.types)
       (List.map translated ~f:(fun (name, f, _) ->
            ( name,
              f.contract,
@@ -2386,6 +2468,10 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         pasts;
         past_returns;
         ghost_args;
+        domain_calls =
+          Option.value
+            (List.Assoc.find domain_plans (proc_name f) ~equal:String.equal)
+            ~default:[];
         procedure_signatures;
         raising;
         witness_raising;
@@ -2463,6 +2549,32 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         in
         Some (f, member))
   in
+  let* task_members, state =
+    State.run_from state
+    @@ let open State.Syntax in
+       State.all
+         (List.filter decls.tasks ~f:(fun task -> task.Task_facades.emit))
+         ~f:(fun task ->
+           let* operation, given, _ =
+             State.of_result (procedure_context task.Task_facades.operation)
+           in
+           let given =
+             {
+               given with
+               types =
+                 Generic_parameters.types ~environment:operation.body.exp_env task.worker
+                   given.types;
+               primitive_namespace = String.split task.worker.name ~on:'.';
+               current_polymorphic = None;
+             }
+           in
+           let+ members, dependencies =
+             Task_facades.member ~given
+               ~past_structures:(past_structures ~symbolic:true task.operation)
+               ~proc_name:(body_proc_name operation) { task with operation }
+           in
+           (task.worker.name, members, dependencies))
+  in
   let pure_funcs = List.filter_opt pure_funcs and procs = List.filter_opt procs in
   Ok
     ( {
@@ -2479,5 +2591,6 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         logical_members;
         pure_funcs;
         procs;
+        task_members;
       },
       state )

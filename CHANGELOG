@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
+
 ## [0.1.0]
 
 - Verification of a first-order subset of multicore OCaml 5, including polymorphic functions, algebraic data types, records, exceptions, modules, functors, mutable state, and atomics.

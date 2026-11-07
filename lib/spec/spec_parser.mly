@@ -424,13 +424,17 @@ proof_decl:
         module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
 | MODULE n = uident EQUAL f = uqualid LEFTPAR STRUCT
     LET operation = lident EQUAL target = lqualid END RIGHTPAR
-    { begin match f with
-      | Qdot (Qid ghost, au) when ghost.pid_str = "Ghost" && au.pid_str = "AU" -> ()
-      | _ -> raise (Syntax_error (qualid_loc f, "Expected Ghost.AU"))
-      end;
+    { let kind = match f with
+      | Qdot (Qid ghost, facade)
+        when ghost.pid_str = "Ghost" &&
+          (facade.pid_str = "AU" || facade.pid_str = "Task") -> facade.pid_str
+      | _ -> raise (Syntax_error (qualid_loc f, "Expected Ghost.AU or Ghost.Task"))
+      in
       if operation.pid_str <> "operation" then
-        raise (Syntax_error (operation.pid_loc, "An AU argument must define operation"));
-      Proof_au { au_name = n; au_operation = target } }
+        raise (Syntax_error (operation.pid_loc,
+          "A Ghost." ^ kind ^ " argument must define operation"));
+      if kind = "AU" then Proof_au { au_name = n; au_operation = target }
+      else Proof_task { task_name = n; task_operation = target } }
 | MODULE n = uident EQUAL f = uqualid args = proof_module_argument*
     { Proof_resource { resource_name = n; resource_functor = f; resource_arguments = args } }
 | LET recursive = boption(REC) n = lident ps = pred_param* COLON ty = typ

@@ -594,6 +594,122 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
 (** The application of the function at [path] to [args], in [e]. *)
 and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
     (args : Typedtree.expression list) =
+  match List.Assoc.find ctx.given.domain_calls (Domain_calls.key e) ~equal:Poly.equal with
+  | Some domain -> domain_call ctx e domain
+  | None -> apply_ordinary ctx e path declaration occurrence args
+
+and domain_call ctx (e : Typedtree.expression) domain =
+  let at = e.exp_loc in
+  let l = loc at in
+  let* () =
+    if List.Assoc.mem ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal then
+      State.of_result (unsupported at "Ghost.scope attached to a Domain operation")
+    else State.return ()
+  in
+  let instantiate task =
+    let* instance =
+      if List.is_empty task.domain_worker.variables then
+        State.return task.domain_worker.name
+      else
+        State.value_instance ctx ~at ~target:task.domain_worker.name
+          ~arguments:task.domain_arguments
+    in
+    let* () = State.note_call ctx.given instance in
+    State.return
+      {
+        task with
+        domain_runtime =
+          Qualified_name.of_string (instance ^ "." ^ task.domain_runtime.name);
+        domain_contract =
+          Qualified_name.of_string (instance ^ "." ^ task.domain_contract.name);
+      }
+  in
+  let member task method_ =
+    Qualified_name.raven ~loc:l (Domain_contract.member_name task.domain_contract method_)
+  in
+  match domain with
+  | Domain_fork (task, arguments) ->
+      let* task = instantiate task in
+      let* arguments =
+        State.all arguments ~f:(function
+          | Unit_argument -> State.return ([], unit_value ~loc:l)
+          | Value_argument expression -> expr ctx expression)
+      in
+      let* types = State.all task.domain_inputs ~f:(State.typ ctx ~at) in
+      let captures_type =
+        match types with
+        | [] -> R.Type.tuple ~loc:l []
+        | [ one ] -> one
+        | types -> R.Type.tuple ~loc:l types
+      in
+      let values = List.map arguments ~f:snd in
+      let captures_value =
+        match values with [ one ] -> one | values -> R.Expr.tuple ~loc:l values
+      in
+      let* capture_name = State.fresh "domain_captures" in
+      let captures = R.Expr.var ~loc:l (name ~loc:l capture_name) in
+      let* handle_name = State.fresh "domain" in
+      State.return
+        ( List.concat_map arguments ~f:fst
+          @ R.Stmt.local ~loc:l ~const:true ~typ:captures_type
+              ~init:(R.Stmt.expr_rhs captures_value)
+              (ident ~loc:l capture_name)
+          @ [ R.Stmt.fold ~loc:l (member task "precondition") [ captures ] ]
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
+              ~init:
+                (R.Stmt.expr_rhs
+                   (Domain_contract.fork ~loc:l ~runtime:task.domain_runtime captures))
+              (ident ~loc:l handle_name),
+          R.Expr.var ~loc:l (name ~loc:l handle_name) )
+  | Domain_join (task, expression) ->
+      let* task = instantiate task in
+      let* statements, handle = expr ctx expression in
+      let captures =
+        Domain_contract.captures ~loc:l ~runtime:task.domain_runtime handle
+      in
+      let* result_type = State.typ ctx ~at task.domain_result in
+      let* result_name = State.fresh "domain_result" in
+      let result = R.Expr.var ~loc:l (name ~loc:l result_name) in
+      let raises = match task.domain_raises with State.Raises [] -> false | _ -> true in
+      let* outcome_type =
+        if raises then State.typ ctx ~at Translate_context.outcome_type
+        else State.return (R.Type.tuple ~loc:l [])
+      in
+      let* outcome_name = State.fresh "domain_outcome" in
+      let outcome = R.Expr.var ~loc:l (name ~loc:l outcome_name) in
+      let* propagation =
+        if not raises then State.return []
+        else
+          let* handlers =
+            State.gets (fun (state : State.state) -> state.carried.handlers)
+          in
+          let* () =
+            match (ctx.au, handlers) with
+            | Some _, [] ->
+                State.of_result
+                  (unsupported at
+                     "A Domain.join that may raise in a function with an atomic contract")
+            | _ -> State.return ()
+          in
+          propagate ~at ~certain:false ~typ:outcome_type outcome task.domain_raises
+      in
+      State.return
+        ( statements
+          @ R.Stmt.local ~loc:l ~typ:result_type (ident ~loc:l result_name)
+          @ R.Stmt.local ~loc:l ~typ:outcome_type (ident ~loc:l outcome_name)
+          @ [
+              R.Stmt.assign ~loc:l [ result; outcome ]
+                (R.Stmt.expr_rhs
+                   (Domain_contract.join ~loc:l ~runtime:task.domain_runtime handle
+                      captures));
+              R.Stmt.unfold ~loc:l (member task "postcondition")
+                [ captures; result; outcome ];
+            ]
+          @ propagation,
+          if is_unit e.exp_type then unit_value ~loc:l else result )
+
+and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
+    (args : Typedtree.expression list) =
   let at = e.exp_loc in
   let l = loc at in
   let contents (r : Typedtree.expression) =
@@ -1824,7 +1940,10 @@ and loop_raising ctx ~at ~(spec : S.loop_spec) (cond : Typedtree.expression opti
             Option.value
               (List.Assoc.find ctx.given.raising f ~equal:String.equal)
               ~default:(State.Raises [])))
-      (Exceptions.uses ~key:(Exceptions.key ctx.given.types) e)
+      (Exceptions.uses
+         ~key:(Exceptions.key ctx.given.types)
+         ~application_raises:(Domain_calls.application_raises ctx.given.domain_calls)
+         e)
   in
   let raising e = match raises e with State.Raises [] -> false | _ -> true in
   match cond with

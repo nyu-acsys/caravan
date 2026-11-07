@@ -1,0 +1,11 @@
+module Job = Ghost.Task (struct let operation = work end)
+module Capture = Ghost.Task (struct let operation = ignore_value end)
+module Choose = Ghost.Task (struct let operation = choose end)
+module Empty = Ghost.Task (struct let operation = unit_work end)
+module Monomorphic = Ghost.Task (struct let operation = monomorphic end)
+module Transfer = Ghost.Task (struct let operation = transfer end)
+module Pick = Ghost.Task (struct let operation = pick end)
+
+module Worker = struct
+  module Job = Ghost.Task (struct let operation = echo end)
+end

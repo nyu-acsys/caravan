@@ -558,7 +558,7 @@ let library_proof_scopes ~runtime_env env libraries =
                     (Report.error Type library.library.scope.location
                        "Cannot resolve the library proof's module")
             in
-            let* proof_env, _, _, _, _ =
+            let* proof_env, _, _, _, _, _ =
               Proof_types.elaborate_proof_types ~add_standard:false lexical None
                 proof.proof_declarations
             in
@@ -807,7 +807,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 ~annotations:(Annotation.of_comments comments)
                 proof_file_contents
         in
-        let* env, _, _, _, _ = Proof_types.elaborate_proof_types env interface [] in
+        let* env, _, _, _, _, _ = Proof_types.elaborate_proof_types env interface [] in
         let* signature_resources =
           Proof_types.signature_ghost_resources env signature_comments
         in
@@ -826,9 +826,9 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 resource_arguments = [];
               }
           in
-          let* local_env, _, all_resources, _, _ =
+          let* local_env, _, all_resources, _, _, _ =
             Proof_types.elaborate_proof_types ~add_standard:false ~allow_interfaces:true
-              ~previous:([], resources, [], []) parent.Proof_scopes.environment None
+              ~previous:([], resources, [], [], []) parent.Proof_scopes.environment None
               [ declaration ]
           in
           let* signatures = Proof_library.signatures module_name.pid_loc in
@@ -910,11 +910,18 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                     else resource)
               else existing @ [ added ])
         in
-        let initial = (env, [], [], definitions, [], [], proof_scopes) in
+        let initial = (env, [], [], definitions, [], [], [], proof_scopes) in
         Result.bind
           (List.fold_result proof ~init:initial
              ~f:(fun
-                 (env, root_types, scoped_types, resources, fields, aus, proof_scopes)
+                 ( env,
+                   root_types,
+                   scoped_types,
+                   resources,
+                   fields,
+                   aus,
+                   tasks,
+                   proof_scopes )
                  declaration
                ->
                match declaration with
@@ -924,7 +931,8 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                           types,
                           module_resources,
                           module_fields,
-                          module_aus ) =
+                          module_aus,
+                          module_tasks ) =
                      Proof_types.scoped_proof_types ~applications
                        ~only:[ module_name.pid_str ] ?public_interface:interface
                        ~comments:signature_comments ~previous_resources:resources
@@ -937,6 +945,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                        merge_resources resources module_resources,
                        fields @ module_fields,
                        aus @ module_aus,
+                       tasks @ module_tasks,
                        proof_scopes )
                | S.Proof_definition { module_name; _ } ->
                    let* ( env,
@@ -944,7 +953,8 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                           types,
                           module_resources,
                           module_fields,
-                          module_aus ) =
+                          module_aus,
+                          module_tasks ) =
                      Proof_types.scoped_proof_types ~applications
                        ~only:[ module_name.pid_str ] ?public_interface:interface
                        ~comments:signature_comments ~previous_resources:resources
@@ -957,14 +967,23 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                        merge_resources resources module_resources,
                        fields @ module_fields,
                        aus @ module_aus,
+                       tasks @ module_tasks,
                        proof_scopes )
                | declaration ->
-                   let* env, root_types, resources, fields, aus =
+                   let* env, root_types, resources, fields, aus, tasks =
                      Proof_types.elaborate_proof_types ~add_standard:false
-                       ~previous:(root_types, resources, fields, aus)
+                       ~previous:(root_types, resources, fields, aus, tasks)
                        ~complete_proof:proof env interface [ declaration ]
                    in
-                   Ok (env, root_types, scoped_types, resources, fields, aus, proof_scopes)))
+                   Ok
+                     ( env,
+                       root_types,
+                       scoped_types,
+                       resources,
+                       fields,
+                       aus,
+                       tasks,
+                       proof_scopes )))
           ~f:(fun
               ( env,
                 root_types,
@@ -972,6 +991,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 proof_resources,
                 proof_fields,
                 proof_aus,
+                proof_tasks,
                 proof_scopes )
             ->
             let* proof_scopes, implicit =
@@ -982,9 +1002,10 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                    implicit_types,
                    implicit_resources,
                    implicit_fields,
-                   implicit_aus ) =
+                   implicit_aus,
+                   implicit_tasks ) =
               match implicit with
-              | [] -> Ok (env, proof_scopes, [], [], [], [])
+              | [] -> Ok (env, proof_scopes, [], [], [], [], [])
               | _ ->
                   Proof_types.scoped_proof_types ~applications
                     ~only_ids:
@@ -1079,6 +1100,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 signature_resources;
                 proof_fields = proof_fields @ implicit_fields;
                 proof_aus = proof_aus @ implicit_aus;
+                proof_tasks = proof_tasks @ implicit_tasks;
                 proof_applications;
                 pending;
                 interface;

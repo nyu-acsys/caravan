@@ -945,7 +945,7 @@ let predicates (source : Source.t) inventory =
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
       | Proof_module _ | Proof_definition _ | Proof_state _ | Proof_action _
       | Proof_lemma _ | Proof_type _ | Proof_resource _ | Proof_field _ | Proof_function _
-      | Proof_au _ ->
+      | Proof_au _ | Proof_task _ ->
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
@@ -1492,11 +1492,14 @@ let scoped_predicate (binding : Proof_bindings.binding) =
         | View value -> View { value }
       in
       Some (p.pred_name.pid_loc, p, definition, binding.private_types)
-  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ -> None
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _
+    ->
+      None
 
 let scoped_lemma (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _
+  | Action _ ->
       None
   | Lemma (S.Proof_lemma lemma) ->
       Some
@@ -1513,8 +1516,8 @@ let scoped_function (binding : Proof_bindings.binding) =
              declaration with
              function_name = { declaration.function_name with pid_str = binding.backend };
            })
-  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
-  | Action _ ->
+  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _
+  | State _ | Action _ ->
       None
 
 let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
@@ -1562,8 +1565,8 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let* actual =
                       match binding.kind with
                       | Predicate (p, _) -> Ok p
-                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
-                      | Action _ ->
+                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _
+                      | State _ | Action _ ->
                           error binding.entry.name.pid_loc
                             "A module resource must be defined as a predicate or \
                              invariant"

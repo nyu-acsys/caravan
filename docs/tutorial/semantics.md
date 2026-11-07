@@ -102,8 +102,9 @@ and lemmas separately require decreasing variants.
 
 Exceptions named by normal and atomic exceptional contracts are part of the proof.
 Do not read successful verification as a claim about all environmental failures,
-including allocation failure or asynchronous runtime behavior. The verifier also
-does not check an unmodeled domain-spawning harness.
+including allocation failure or asynchronous runtime behavior. The domain model
+assumes successful creation; it does not model `Domain.spawn` resource-exhaustion
+failures, domain-local storage, or domain-exit hooks.
 
 Manual ghost proofs are checked, not trusted shortcuts. Their operations erase
 from execution, and access scopes must preserve the attached runtime operation.
@@ -124,6 +125,9 @@ that establishes types, not imported behavioral contracts.
 - Bundled standard-library behavioral contracts are trusted. Their mathematical
   models and auxiliary lemmas are checked by `caravan --check-stdlib` and by the
   regression suite.
+- Domain fork/join ownership transfer uses a trusted parameterized Raven interface.
+  The task implementation is still verified against the operation contract;
+  declaring a task facade does not make that implementation trusted.
 - An imported `pure` operation promises purity, determinism, and termination when
   its precondition holds, as well as its contract. A specification call denotes a
   total mathematical extension; outside the precondition or source domain its

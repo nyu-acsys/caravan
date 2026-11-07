@@ -109,6 +109,20 @@ let au_has_path au path =
     | Path.Pdot (owner, "token") -> Path.same path owner
     | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false)
 
+type proof_task = {
+  task_name : string;
+  task_scope : Path.t option;
+  task_id : Ident.t;
+  task_path : Path.t;
+  task_environment : Env.t;
+  task_operation : S.qualid;
+  task_operation_path : Path.t;
+  task_operation_type : Types.type_expr;
+  task_parameters : Types.type_expr list;
+  task_at : Location.t;
+  task_application : (Path.t * Ident.t) option;
+}
+
 type t = {
   file : string;
   text : string;
@@ -128,6 +142,7 @@ type t = {
   signature_resources : (Location.t * proof_resource) list;
   proof_fields : proof_field list;
   proof_aus : proof_au list;
+  proof_tasks : proof_task list;
   proof_applications : Functor_context.application list;
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be

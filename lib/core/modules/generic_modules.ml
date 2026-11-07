@@ -134,6 +134,21 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
           | _ -> false
         in
         let expr (iterator : Tast_iterator.iterator) (expression : Typedtree.expression) =
+          (match expression.exp_desc with
+          | Texp_apply
+              ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Typedtree.Arg callback) ])
+            -> (
+              let operation =
+                Signature_contract.compiler ~at:expression.exp_loc (fun () ->
+                    Env.normalize_value_path (Some expression.exp_loc) expression.exp_env
+                      path
+                    |> Domain_primitives.operation)
+              in
+              match (operation, callback.exp_desc) with
+              | Ok (Some Spawn), Texp_function _ ->
+                  function_roots := callback :: !function_roots
+              | _ -> ())
+          | _ -> ());
           if heap_type ~env:expression.exp_env expression.exp_type then
             heap_access := true;
           begin match expression.exp_desc with

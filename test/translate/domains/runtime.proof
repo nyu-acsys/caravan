@@ -1,0 +1,7 @@
+module Job = Ghost.Task (struct let operation = work end)
+
+module UnitJob = Ghost.Task (struct let operation = unit_work end)
+
+module OtherJob = Ghost.Task (struct let operation = other end)
+
+module VoidJob = Ghost.Task (struct let operation = unit_result end)

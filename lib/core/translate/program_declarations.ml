@@ -24,6 +24,7 @@ type t = {
   runtime_destinations : Module_context.destination list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
   atomic_operations : (Source.proof_au * Procedures.func) list;
+  tasks : Task_facades.t list;
   token_types : Datatypes.t list;
   generic_models : Datatypes.t list;
   resource_types : Datatypes.t list;
@@ -264,17 +265,7 @@ let function_types polymorphic_functions f types =
               ~parameter:("A" ^ Int.to_string index)
               ~at:worker.loc
           in
-          (* A locally abstract type stands for the variable of its name. *)
-          match Types.get_desc variable with
-          | Tunivar (Some name) ->
-              begin match
-                Env.find_type_by_name (Longident.Lident name) f.body.exp_env
-              with
-              | Pident id, _ -> { data with id = Some id }
-              | _ -> data
-              | exception Stdlib.Not_found -> data
-              end
-          | _ -> data)
+          Datatypes.bind_local_variable f.body.exp_env data)
       @ types
 
 let predicate_destination ~generic_predicates ~declaration_context key =
@@ -1079,27 +1070,28 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
     au_procedure ~polymorphic_functions ~procedures ~generics ~generic_procedures
       ~asset_context
   in
-  let applied_atomic_operation (au : Source.proof_au) =
+  let applied_facade_operation application ~matches ~operation =
     let ( let* ) value f = Option.bind value ~f in
-    let* identity, template = au.au_application in
+    let* identity, template = application in
     let* binding =
       List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
-          match binding.Proof_bindings.kind with
-          | Atomic original -> Ident.same original.au_id template
-          | _ -> false)
+          matches template binding.Proof_bindings.kind)
     in
     let* plan = Generic_proofs.owner generic_proofs (Some binding.entry.scope) in
-    let* operation =
-      match binding.kind with
-      | Atomic original -> Some original.au_operation_path
-      | _ -> None
-    in
+    let* operation = operation binding.kind in
     let* application =
       List.find plan.group.applications ~f:(fun application ->
           Path.same application.source.identity identity)
     in
     let* id = Generic_proofs.function_id plan ~instance:application.source operation in
     List.find funcs ~f:(fun f -> Ident.same f.id id)
+  in
+  let applied_atomic_operation (au : Source.proof_au) =
+    applied_facade_operation au.au_application
+      ~matches:(fun template -> function
+        | Atomic original -> Ident.same original.au_id template | _ -> false)
+      ~operation:(function
+        | Atomic original -> Some original.au_operation_path | _ -> None)
   in
   let* atomic_operations =
     all source.proof_aus ~f:(fun (au : Source.proof_au) ->
@@ -1126,6 +1118,45 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         | Some f when not (Option.exists f.contract ~f:(fun c -> c.atomic)) ->
             error au.au_at "An AU facade requires a logically atomic contract"
         | Some f -> Ok (au, f))
+  in
+  let* tasks =
+    let application_view (task : Source.proof_task) =
+      Option.bind task.task_application ~f:(fun (_, template) ->
+          List.find untyped_scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Task original ->
+                  Ident.same original.task_id template
+                  && Path.same task.task_path (Path.Pdot (view.path, task.task_name))
+              | _ -> false))
+    in
+    let context task =
+      match application_view task with
+      | Some view -> asset_context view.source.entry.scope.owner
+      | None -> asset_context task.Source.task_scope
+    in
+    let resolve (task : Source.proof_task) =
+      match task.task_application with
+      | Some _ ->
+          Option.first_some
+            (List.find funcs ~f:(fun f ->
+                 List.mem f.paths task.task_operation_path ~equal:Path.same))
+            (applied_facade_operation task.task_application
+               ~matches:(fun template -> function
+                 | Task original -> Ident.same original.task_id template | _ -> false)
+               ~operation:(function
+                 | Task original -> Some original.task_operation_path | _ -> None))
+      | None -> (
+          match (context task).worker with
+          | Some plan ->
+              Option.bind (Generic_proofs.function_id plan task.task_operation_path)
+                ~f:(fun id -> List.find funcs ~f:(fun f -> Ident.same f.id id))
+          | None ->
+              List.find funcs ~f:(fun f ->
+                  List.mem f.paths task.task_operation_path ~equal:Path.same))
+    in
+    Task_facades.collect ~family_plan
+      ~operation_types:(fun f -> function_types polymorphic_functions f types)
+      ~resolve ~context ~application_view source untyped_scoped_proofs
   in
   let* token_types =
     all atomic_operations ~f:(fun (au, f) ->
@@ -1824,7 +1855,18 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                }))
   in
   let generic_predicates = generic_predicates @ List.filter_opt imported_predicates in
-  let generic_predicate_workers = generic_predicates in
+  let task_workers =
+    List.filter_map tasks ~f:(fun task ->
+        Option.some_if task.Task_facades.emit task.worker)
+  in
+  let generic_predicate_workers = generic_predicates @ task_workers in
+  let generic_predicates =
+    generic_predicates
+    @ List.filter_map tasks ~f:(fun task ->
+        Option.some_if
+          (not (List.is_empty task.Task_facades.worker.variables))
+          task.worker)
+  in
   let* application_predicates =
     all scoped_proofs.applications ~f:(fun view ->
         match
@@ -1894,6 +1936,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
       runtime_destinations;
       procedure_signatures;
       atomic_operations;
+      tasks;
       token_types;
       generic_models;
       resource_types;

@@ -240,7 +240,7 @@ let run (source : Source.t) : (t, error) Result.t =
         let backend =
           match binding.kind with
           | Predicate _ | Lemma _ -> proof_implementation resource
-          | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+          | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _ ->
               implementation resource
         in
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))

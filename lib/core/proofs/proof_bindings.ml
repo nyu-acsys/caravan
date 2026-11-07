@@ -27,6 +27,7 @@ type kind =
   | Resource of Source.proof_resource
   | Field of Source.proof_field
   | Atomic of Source.proof_au
+  | Task of Source.proof_task
 
 type binding = {
   entry : Proof_scopes.entry;
@@ -151,7 +152,7 @@ let exported inventory source scope name kind =
   if Option.is_some template || Option.is_some scope.Proof_scopes.definition then false
   else
     match kind with
-    | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
+    | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ ->
         List.is_empty relevant
     | Predicate _ ->
         List.for_all relevant ~f:(fun (ancestor, constraint_) ->
@@ -185,7 +186,7 @@ let visible t ~scope binding =
   inside_template
   &&
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ ->
       List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
@@ -198,7 +199,7 @@ let visible t ~scope binding =
 
 let opaque_at t ~scope binding =
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ -> false
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ -> false
   | Resource _ -> not (List.is_empty (remaining_constraints t ~scope binding))
   | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
 
@@ -212,7 +213,8 @@ let opaque_keys t =
   List.filter_map t.bindings ~f:(fun binding ->
       match binding.kind with
       | Predicate _ -> Option.some_if (opaque t binding) binding.public_key
-      | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+      | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _
+      | Task _ ->
           None)
 
 let rec signature_type_projection substitution owner signature =
@@ -617,6 +619,16 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
             (Report.error Type entry.name.pid_loc
                "Missing elaborated ghost field declaration")
       end
+  | Proof_task _ ->
+      begin match
+        List.find source.proof_tasks ~f:(fun task ->
+            Option.is_none task.task_application
+            && Poly.equal task.task_at entry.name.pid_loc)
+      with
+      | Some task -> Ok (Task task, [])
+      | None ->
+          Error (Report.error Type entry.name.pid_loc "Missing elaborated task facade")
+      end
   | Proof_au _ ->
       begin match
         List.find source.proof_aus ~f:(fun au ->
@@ -634,6 +646,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
            | Proof_definition _ -> "definition"
            | Proof_resource _ -> "resource"
            | Proof_au _ -> "atomic update"
+           | Proof_task _ -> "domain task"
            | Proof_field _ -> "field"
            | Proof_function _ -> "function"
            | Proof_state _ -> "state"
@@ -670,6 +683,10 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
     List.fold source.proof_aus ~init:projection ~f:(fun projection au ->
         Subst.add_module au.Source.au_id au.au_path projection)
   in
+  let projection =
+    List.fold source.proof_tasks ~init:projection ~f:(fun projection task ->
+        Subst.add_module task.Source.task_id task.task_path projection)
+  in
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
         Option.is_some entry.Proof_scopes.scope.owner
@@ -705,8 +722,8 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
               | ( _,
                   ( S.Proof_predicate _ | Proof_invariant _ | Proof_lemma _
                   | Proof_function _ | Proof_resource _ | Proof_definition _
-                  | Proof_field _ | Proof_au _ | Proof_state _ | Proof_view _
-                  | Proof_action _ ) )
+                  | Proof_field _ | Proof_au _ | Proof_task _ | Proof_state _
+                  | Proof_view _ | Proof_action _ ) )
                 when same_owner ancestor.owner scope.owner
                      || Option.is_some scope.definition
                         && same_owner ancestor.owner scope.parent ->
@@ -783,7 +800,7 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
           let declared =
             match kind with
             | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _
-              ->
+            | Task _ ->
                 None
             | Predicate _ ->
                 relevant_constraints inventory.constraints source.proof_scopes scope

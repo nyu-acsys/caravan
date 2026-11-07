@@ -277,6 +277,7 @@ type proof_decl =
       resource_arguments : proof_module_argument list;
     }
   | Proof_au of { au_name : id; au_operation : qualid }
+  | Proof_task of { task_name : id; task_operation : qualid }
   | Proof_field of { field_name : id; field_type : pty }
   | Proof_function of {
       function_name : id;

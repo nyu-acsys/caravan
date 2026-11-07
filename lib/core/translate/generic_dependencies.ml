@@ -71,7 +71,7 @@ let declaration_references = function
             (Option.value_map contents ~default:[] ~f:Translate_context.pat_names)
             result)
   | Proof_module _ | Proof_definition _ | Proof_type _ | Proof_resource _ | Proof_au _
-  | Proof_field _ | Proof_state _ ->
+  | Proof_task _ | Proof_field _ | Proof_state _ ->
       []
 
 let annotation_references (annotation : Annotation.t) =
@@ -312,7 +312,17 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
               if Source.resource_has_path resource path then resource_worker resource
               else None))
     in
-    runtime @ fields @ proof @ atomic @ resources
+    let tasks =
+      List.concat_map value ~f:(fun path ->
+          List.filter_map decls.tasks ~f:(fun task ->
+              Option.some_if
+                (Path.same
+                   (proofs.proof_support.canonical_path path)
+                   (proofs.proof_support.canonical_path
+                      (Path.Pdot (task.Task_facades.source.task_path, "handle"))))
+                task.worker.name))
+    in
+    runtime @ fields @ proof @ atomic @ resources @ tasks
   in
   let references ~environment ~scope refs =
     List.concat_map refs ~f:(reference ~environment ~scope)
@@ -325,8 +335,16 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let worker_node ?context (worker : Generic_parameters.t) =
     let context =
       Option.value_or_thunk context ~default:(fun () ->
-          Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
-            ~unapplied_proofs:scopes.unapplied_proofs worker.key)
+          match
+            List.find decls.tasks ~f:(fun task ->
+                task.Task_facades.emit && String.equal task.worker.key worker.key)
+          with
+          | Some task ->
+              Program_scopes.asset_context ~module_contexts:scopes.module_contexts
+                task.source.task_scope
+          | None ->
+              Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+                ~unapplied_proofs:scopes.unapplied_proofs worker.key)
     in
     let dependencies = types_dependencies worker.parameters in
     let dependencies =
@@ -366,13 +384,27 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
                         ~f:runtime_path))
           | Invariant _ | Body _ | Direct_invariant _ | View _ -> [])
     in
+    let tasks =
+      List.concat_map decls.tasks ~f:(fun task ->
+          if not (String.equal task.Task_facades.worker.key worker.key) then []
+          else
+            let operation = task.operation in
+            references ~environment:operation.environment
+              ~scope:
+                (Proof_bindings.scope_for_location scopes.scoped_proofs operation.loc)
+              (List.concat_map
+                 (Option.value_map operation.contract ~default:[] ~f:contract_terms)
+                 ~f:
+                   (Translate_context.term_references
+                      (Procedures.contract_bound_names operation))))
+    in
     Generic_families.
       {
         name = worker.name;
         scope = context.namespace;
         variables = worker.variables;
         at = worker.loc;
-        dependencies = helping @ dependencies;
+        dependencies = tasks @ helping @ dependencies;
       }
   in
   let runtime_nodes =

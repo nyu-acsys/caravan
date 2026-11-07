@@ -30,6 +30,7 @@ let name = function
   | Proof_type { type_name; _ } -> type_name
   | Proof_resource { resource_name; _ } -> resource_name
   | Proof_au { au_name; _ } -> au_name
+  | Proof_task { task_name; _ } -> task_name
   | Proof_field { field_name; _ } -> field_name
   | Proof_function { function_name; _ } -> function_name
   | Proof_lemma { lemma_name; _ } -> lemma_name

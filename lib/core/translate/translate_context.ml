@@ -1080,6 +1080,27 @@ type predicate_body = {
   project_type : Types.type_expr -> Types.type_expr;
 }
 
+type domain_task = {
+  domain_key : string;
+  domain_template : string;
+  domain_owner : Path.t option;
+  domain_paths : Path.t list;
+  domain_handle_paths : Path.t list;
+  domain_worker : Generic_parameters.t;
+  domain_arguments : Types.type_expr list;
+  domain_runtime : Qualified_name.t;
+  domain_contract : Qualified_name.t;
+  domain_inputs : Types.type_expr list;
+  domain_result : Types.type_expr;
+  domain_raises : State_monad.raise_set;
+}
+
+type domain_argument = Unit_argument | Value_argument of Typedtree.expression
+
+type domain_call =
+  | Domain_fork of domain_task * domain_argument list
+  | Domain_join of domain_task * Typedtree.expression
+
 type inputs = {
   types : Datatypes.t list;
   primitive_namespace : string list;
@@ -1129,6 +1150,7 @@ type inputs = {
       (** Imported constants whose persistent facts are acquired by an accessor. *)
   local_calls : string list;
       (** Trusted imports without shared-memory steps, expanded by their contracts. *)
+  domain_calls : ((int * int) * domain_call) list;
   annotations : Annotation.t list;  (** Those of the file, as loops' invariants. *)
   proof_lemmas : (string * lemma_signature) list;
   proof_support : proof_support;
@@ -1198,6 +1220,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     libraries = Path_bindings.empty;
     contracted_values = Path_bindings.empty;
     local_calls = [];
+    domain_calls = [];
   }
 
 let value_spec ctx ~loc typ variable =
