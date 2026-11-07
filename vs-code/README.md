@@ -163,6 +163,9 @@ Later compatible verifier releases are offered to installed extensions without
 rebuilding them. Release a new extension when its code or editor protocol support
 changes, or to refresh the toolchain available on the first offline run.
 
+Linux bundles are built on Ubuntu 24.04 to match the pinned Z3 distribution
+and require a compatible system with glibc 2.39 or later.
+
 Windows builds use native Python for packaging and include the runtime DLLs
 required by Caravan and Z3, with their accompanying notices. Both the archive
 smoke test and updater installation test remove compiler paths from the environment

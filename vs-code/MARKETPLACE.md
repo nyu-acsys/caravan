@@ -28,7 +28,8 @@ Install **Caravan** from VS Code's Extensions view, or install a downloaded VSIX
 with **Extensions: Install from VSIX**. Platform packages bundle Caravan, its
 linked Raven verifier, Z3, and matching OCaml standard-library interfaces for
 Linux x64, macOS arm64, and Windows x64. No separate verifier installation is
-needed for self-contained programs.
+needed for self-contained programs. Linux bundles target Ubuntu 24.04 or a
+compatible system with glibc 2.39 or later.
 
 The extension requires [OCaml Platform](https://marketplace.visualstudio.com/items?itemName=ocamllabs.ocaml-platform)
 for OCaml editing, completion, navigation, formatting, and base syntax highlighting.
