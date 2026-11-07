@@ -13,7 +13,7 @@ local/
 /vs-code/node_modules/
 /vs-code/out/
 /vs-code/images/icon.png
-/vs-code/*.vsix
+/vs-code/**/*.vsix
 /vs-code/bundled/
 /vs-code/downloads/
 /vs-code/dist/
