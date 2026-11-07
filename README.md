@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://raw.githubusercontent.com/nyu-acsys/caravan/main/LICENSE"><img alt="MIT licensed" src="https://img.shields.io/badge/license-MIT-blue.svg"/></a>
   <a href="https://nyu-acsys.github.io/caravan/"><img alt="Project documentation" src="https://img.shields.io/badge/docs-nyu--acsys.github.io%2Fcaravan-blue.svg"/></a>
-  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg"/></a>
+  <a href="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush"><img alt="ci" src="https://github.com/nyu-acsys/caravan/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push"/></a>
 </p>
 
 Caravan is an SMT-based verifier for multicore OCaml programs. It uses concurrent
