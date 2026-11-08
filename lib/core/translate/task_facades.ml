@@ -14,10 +14,15 @@ type t = {
   result_type : Types.type_expr;
   emit : bool;
   paths : Path.t list;
+  procedure : string;
+  native_count : int;
+  ghost_inputs : (string * Types.type_expr) list;
+  implicit_inputs : (string * Types.type_expr) list;
+  ghost_outputs : (string * Types.type_expr) list;
 }
 
-let collect ~family_plan ~operation_types ~resolve ~context ~application_view source
-    bindings =
+let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~context
+    ~application_view source bindings =
   all source.Source.proof_tasks ~f:(fun task ->
       let at = task.Source.task_at in
       let view = application_view task in
@@ -80,6 +85,60 @@ let collect ~family_plan ~operation_types ~resolve ~context ~application_view so
             end
       in
       let handle_types, _ = Proof_types.function_arguments handle in
+      let native_count = List.length operation.params in
+      let procedure = procedure_name operation in
+      let given = given operation in
+      let project = Datatypes.quantified_type (operation_types operation) in
+      let native_types =
+        List.filter_map operation.params ~f:(fun parameter ->
+            match parameter.Typedtree.fp_kind with
+            | Tparam_pat pattern -> Some (project pattern.pat_type)
+            | Tparam_optional_default _ -> None)
+      in
+      let* probe =
+        Generic_parameters.discover ~key:backend ~name:backend ~at
+          ~explicit:(List.length native_types)
+          (project operation.body.exp_type :: native_types)
+      in
+      let given = { given with types = Generic_predicates.types probe given.types } in
+      let operation_for_signature =
+        {
+          operation with
+          contract =
+            Option.map operation.contract ~f:(fun contract ->
+                {
+                  contract with
+                  requires =
+                    List.filter contract.requires ~f:(fun term ->
+                        Option.is_none (S.past_membership term));
+                  ensures =
+                    List.filter contract.ensures ~f:(fun term ->
+                        Option.is_none (S.past_membership term));
+                });
+        }
+      in
+      let snapshot = Fresh_names.save () in
+      let prepared =
+        State.run_from State.initial
+          (State.in_procedure
+             (prepare_proc ~given ~past_structures:[] ~proc_name:procedure
+                operation_for_signature))
+      in
+      Fresh_names.restore snapshot;
+      let* prepared, _ = prepared in
+      let ghost_inputs =
+        List.map prepared.ghosts ~f:(fun (name, _, typ) -> (name, typ))
+      in
+      let implicit_inputs =
+        List.map prepared.implicit ~f:(fun (name, _, typ, _) -> (name, typ))
+      in
+      let signature =
+        List.Assoc.find_exn given.procedure_signatures procedure ~equal:String.equal
+      in
+      let ghost_outputs = signature.procedure_outputs in
+      let handle_types =
+        handle_types @ List.map (ghost_inputs @ implicit_inputs) ~f:snd
+      in
       let backend = "task$" ^ backend ^ "$handle" in
       let key =
         Option.value_map view ~default:backend ~f:(fun view ->
@@ -106,8 +165,10 @@ let collect ~family_plan ~operation_types ~resolve ~context ~application_view so
           ~name:
             (String.concat ~sep:"."
                (context.Module_context.namespace @ [ "DomainTask$" ^ backend ^ "$Worker" ]))
-          ~at ~explicit:(List.length handle_types)
-          (Ctype.newconstr domain [ result_type ] :: inputs)
+          ~at
+          ~explicit:(1 + native_count + List.length ghost_inputs)
+          ((Ctype.newconstr domain [ result_type ] :: inputs)
+          @ List.map (ghost_inputs @ implicit_inputs) ~f:(fun (_, typ) -> project typ))
       in
       let worker =
         {
@@ -115,6 +176,25 @@ let collect ~family_plan ~operation_types ~resolve ~context ~application_view so
           member = backend;
           name = Generic_family_plan.proof family_plan backend worker.name;
         }
+      in
+      let native_arity = 1 + native_count in
+      let* native_worker =
+        Generic_parameters.discover ~key:backend ~name:worker.name ~at
+          ~explicit:native_arity
+          (List.take worker.parameters native_arity)
+      in
+      let* handle_worker =
+        Generic_parameters.discover ~key:backend ~name:worker.name ~at
+          ~explicit:native_arity
+          (List.take handle_types native_arity)
+      in
+      let* to_handle =
+        Report.expect ~at "The task handle's native type parameters"
+          (Datatypes.substitution native_worker.variables handle_worker.variables)
+      in
+      let handle_types =
+        List.take handle_types native_arity
+        @ List.map (List.drop worker.parameters native_arity) ~f:to_handle
       in
       let* worker =
         match view with
@@ -144,8 +224,17 @@ let collect ~family_plan ~operation_types ~resolve ~context ~application_view so
       let worker =
         match view with
         | None -> worker
-        | Some _ ->
-            { worker with parameters = Ctype.newconstr domain [ result_type ] :: inputs }
+        | Some _ -> { worker with parameters = handle_types }
+      in
+      let ghost_type = match view with None -> project | Some _ -> to_handle in
+      let ghost_inputs =
+        List.map ghost_inputs ~f:(fun (name, typ) -> (name, ghost_type typ))
+      in
+      let implicit_inputs =
+        List.map implicit_inputs ~f:(fun (name, typ) -> (name, ghost_type typ))
+      in
+      let ghost_outputs =
+        List.map ghost_outputs ~f:(fun (name, typ) -> (name, ghost_type typ))
       in
       let paths =
         match (view, context.worker) with
@@ -164,6 +253,11 @@ let collect ~family_plan ~operation_types ~resolve ~context ~application_view so
           result_type;
           emit = Option.is_none view;
           paths;
+          procedure;
+          native_count;
+          ghost_inputs;
+          implicit_inputs;
+          ghost_outputs;
         })
 
 let predicate task = (task.key, (task.worker.name ^ "." ^ task.backend, task.handle_types))
@@ -192,8 +286,18 @@ let signature ~types task =
     domain_arguments = [];
     domain_runtime = Qualified_name.of_string (runtime_name task);
     domain_contract = Qualified_name.of_string (contract_name task);
-    domain_inputs = List.tl_exn task.worker.parameters;
+    domain_inputs = List.take (List.tl_exn task.worker.parameters) task.native_count;
     domain_result = task.result_type;
+    domain_procedure = task.procedure;
+    domain_ghost_inputs = task.ghost_inputs;
+    domain_implicit_inputs = task.implicit_inputs;
+    domain_ghost_outputs = task.ghost_outputs;
+    domain_history_inputs =
+      List.count contract.requires ~f:(fun term ->
+          Option.is_some (S.past_membership term));
+    domain_history_outputs =
+      List.count contract.ensures ~f:(fun term -> Option.is_some (S.past_membership term));
+    domain_capture_hints = [];
     domain_raises =
       Exceptions.declared_raises
         ~resolve:(Exceptions.resolver types task.operation.environment)
@@ -214,24 +318,12 @@ let member ~given ~past_structures ~proc_name task =
   State.in_procedure
   @@
   let open State.Syntax in
-  let f = task.operation in
   let at = task.source.task_at in
   let l = loc at in
-  let* prepared = prepare_proc ~given ~past_structures ~proc_name f in
+  let* prepared = prepare_proc ~given ~past_structures ~proc_name task.operation in
+  let f = prepared.func in
   let ctx = prepared.context in
-  let* () =
-    if
-      List.is_empty prepared.implicit
-      && List.is_empty prepared.ghosts
-      && List.is_empty (ghost_results f)
-      && List.is_empty prepared.past_pres
-      && List.is_empty prepared.past_posts
-    then State.return ()
-    else
-      State.of_result
-        (unsupported at
-           "A task facade with ghost inputs, ghost results, or history witnesses")
-  in
+  let contract = Option.value_exn f.contract in
   let* parameter_types =
     State.all f.params ~f:(fun parameter ->
         match parameter.Typedtree.fp_kind with
@@ -247,36 +339,108 @@ let member ~given ~past_structures ~proc_name task =
               (unsupported parameter.fp_loc "A destructuring task parameter"))
   in
   let* types = State.all parameter_types ~f:(State.typ ctx ~at) in
+  let ghosts = prepared.ghosts in
+  let implicits =
+    List.map prepared.implicit ~f:(fun (source, raven, typ, _) -> (source, raven, typ))
+  in
+  let* ghost_types =
+    State.all (ghosts @ implicits) ~f:(fun (_, _, typ) -> State.typ ctx ~at typ)
+  in
+  let* output_types =
+    State.all task.ghost_outputs ~f:(fun (_, typ) -> State.typ ctx ~at typ)
+  in
   let* () =
     State.iter (f.body.exp_type :: parameter_types) ~f:(State.note_domain given.types)
   in
-  let captures_type = tuple_type ~loc:l types in
   let captures = R.Expr.var ~loc:l (name ~loc:l "captures") in
-  let arguments =
-    List.mapi types ~f:(fun index _ ->
-        if List.length types = 1 then captures else R.Expr.tuple_get ~loc:l captures index)
+  let output = R.Expr.var ~loc:l (name ~loc:l "ghosts") in
+  let capture_count =
+    List.length types + List.length ghost_types + (2 * List.length prepared.past_pres)
   in
-  let parameters = List.zip_exn prepared.arg_names arguments in
+  let output_count = List.length output_types + (2 * List.length prepared.past_posts) in
+  let projection value count index =
+    if count = 1 then value else R.Expr.tuple_get ~loc:l value index
+  in
+  let arguments =
+    List.mapi types ~f:(fun index _ -> projection captures capture_count index)
+  in
+  let ghost_arguments =
+    List.mapi ghost_types ~f:(fun index _ ->
+        projection captures capture_count (List.length types + index))
+  in
   let environment =
-    List.fold parameters
+    List.fold (List.zip_exn prepared.arg_names arguments)
       ~init:{ prepared.environment with vars = []; logical_definition = false }
-      ~f:(fun env (parameter, value) ->
-        Option.value_map parameter ~default:env ~f:(fun parameter ->
-            bind env parameter (Value value)))
+      ~f:(fun env (source, value) ->
+        Option.value_map source ~default:env ~f:(fun source ->
+            bind env source (Value value)))
+  in
+  let environment =
+    List.fold
+      (List.zip_exn (ghosts @ implicits) ghost_arguments)
+      ~init:environment
+      ~f:(fun env ((source, _, _), value) -> bind env source (Value value))
   in
   let environment =
     bind environment prepared.result_name
       (Value
-         (if is_unit f.body.exp_type then R.Expr.tuple ~loc:l []
+         (if is_unit f.body.exp_type then unit_value ~loc:l
           else R.Expr.var ~loc:l (name ~loc:l "result")))
   in
+  let environment =
+    List.foldi task.ghost_outputs ~init:environment ~f:(fun index env (source, _) ->
+        bind env source (Value (projection output output_count index)))
+  in
   let* environment = pattern_definitions environment f in
-  let contract = Option.value_exn f.contract in
+  let* pre_history =
+    history_witness_facts ~ghost:false ctx environment ~at ~requires:contract.requires
+      prepared.past_pres
+  in
+  let* post_history =
+    history_witness_facts ~ghost:false ctx environment ~at ~requires:contract.requires
+      prepared.past_posts
+  in
+  let witness_types facts =
+    List.concat_map facts ~f:(fun ((_, st, _, _, _), _) ->
+        [
+          R.Type.named ~loc:l
+            (generated_module_member ~loc:l (module_name st "state") "T")
+            [];
+          R.Type.int ~loc:l;
+        ])
+  in
+  let conjunction = function
+    | [] -> R.Expr.bool ~loc:l true
+    | terms -> List.reduce_exn terms ~f:(R.Expr.binary ~loc:l And)
+  in
+  let history_formula facts values =
+    let variables = List.concat_map facts ~f:(fun ((_, _, _, decls, _), _) -> decls) in
+    let expressions =
+      List.concat_map facts ~f:(fun ((_, _, _, _, (snapshot, index)), _) ->
+          [ snapshot; index ])
+    in
+    let equalities = List.map2_exn expressions values ~f:(R.Expr.binary ~loc:l Eq) in
+    let body = conjunction (equalities @ List.map facts ~f:snd) in
+    if List.is_empty variables then body else R.Expr.exists ~loc:l variables body
+  in
+  let pre_values =
+    List.init
+      (2 * List.length pre_history)
+      ~f:(fun index ->
+        projection captures capture_count
+          (List.length types + List.length ghost_types + index))
+  in
+  let post_values =
+    List.init
+      (2 * List.length post_history)
+      ~f:(fun index -> projection output output_count (List.length output_types + index))
+  in
   let* pre = State.all contract.requires ~f:(Spec_terms.formula environment) in
   let pre =
     List.filter_map (List.zip_exn parameter_types arguments) ~f:(fun (typ, value) ->
         Datatypes.admissible ~loc:l given.types typ value)
     @ pre
+    @ [ history_formula pre_history pre_values ]
   in
   let* normal = contract_postcondition_formulas environment ~at contract.ensures in
   let normal =
@@ -284,10 +448,7 @@ let member ~given ~past_structures ~proc_name task =
       (Datatypes.admissible ~loc:l given.types f.body.exp_type
          (R.Expr.var ~loc:l (name ~loc:l "result")))
     @ normal
-  in
-  let conjunction = function
-    | [] -> R.Expr.bool ~loc:l true
-    | expressions -> List.reduce_exn expressions ~f:(R.Expr.binary ~loc:l And)
+    @ [ history_formula post_history post_values ]
   in
   let* result_type = State.typ ctx ~at f.body.exp_type in
   let* outcome_type, post =
@@ -319,38 +480,129 @@ let member ~given ~past_structures ~proc_name task =
       in
       State.return (outcome_typ, conjunction (normal :: exceptional))
   in
+  let captures_type =
+    tuple_type ~loc:l (types @ ghost_types @ witness_types pre_history)
+  in
+  let outputs_type = tuple_type ~loc:l (output_types @ witness_types post_history) in
   let contract_name = contract_name task in
   let runtime_name = runtime_name task in
   let runtime = Qualified_name.of_string runtime_name in
-  let formals =
-    List.mapi types ~f:(fun index typ ->
-        R.Var.make ~loc:l (ident ~loc:l ("arg" ^ Int.to_string index)) typ)
-  in
-  let actuals =
-    List.mapi types ~f:(fun index _ ->
+  let alias_types = types @ ghost_types in
+  let alias_values =
+    List.mapi alias_types ~f:(fun index _ ->
         R.Expr.var ~loc:l (name ~loc:l ("arg" ^ Int.to_string index)))
   in
+  let alias_formals =
+    List.mapi alias_types ~f:(fun index typ ->
+        R.Var.make ~loc:l ~ghost:(index >= task.native_count)
+          (ident ~loc:l ("arg" ^ Int.to_string index))
+          typ)
+  in
+  let alias_formals, alias_implicit =
+    List.split_n alias_formals (task.native_count + List.length ghosts)
+  in
   let handle = R.Expr.var ~loc:l (name ~loc:l "domain") in
+  let stored = Domain_contract.captures ~loc:l ~runtime handle in
   let alias =
     R.Member.callable
       (R.Callable.func ~loc:l ~kind:Pred ~inline:true
          ~formals:
-           (R.Var.make ~loc:l (ident ~loc:l "domain") (R.Type.ref ~loc:l) :: formals)
-         (ident ~loc:l task.backend)
-         (Some (Domain_contract.handle ~loc:l ~runtime [ handle; tuple ~loc:l actuals ])))
+           (R.Var.make ~loc:l (ident ~loc:l "domain") (R.Type.ref ~loc:l) :: alias_formals)
+         ~returns:alias_implicit (ident ~loc:l task.backend)
+         (Some
+            (conjunction
+               (Domain_contract.handle ~loc:l ~runtime [ handle; stored ]
+               :: List.mapi alias_values ~f:(fun index value ->
+                   R.Expr.binary ~loc:l Eq (projection stored capture_count index) value)
+               ))))
+  in
+  let native_values =
+    List.map prepared.formals ~f:(fun (source, _, _) ->
+        Option.value_map source ~default:(unit_value ~loc:l) ~f:(fun (_, raven) ->
+            R.Expr.var ~loc:l (name ~loc:l raven)))
+  in
+  let proof_values =
+    List.map (ghosts @ implicits) ~f:(fun (_, raven, _) ->
+        R.Expr.var ~loc:l (name ~loc:l raven))
+  in
+  let* adapter_history =
+    history_witness_facts ctx prepared.environment ~at ~requires:contract.requires
+      prepared.past_pres
+  in
+  let history_values =
+    List.concat_map adapter_history ~f:(fun ((_, _, _, _, (snapshot, index)), _) ->
+        [ snapshot; index ])
+  in
+  let capture_value = tuple ~loc:l (native_values @ proof_values @ history_values) in
+  let* adapter_pre =
+    State.all contract.requires ~f:(Spec_terms.formula prepared.environment)
+  in
+  let adapter_pre =
+    List.filter_map prepared.formals ~f:(fun (_, spec, _) -> spec)
+    @ List.map (adapter_pre @ List.map adapter_history ~f:snd) ~f:R.Spec.make
+  in
+  let* proof_formals =
+    State.all ghosts ~f:(fun (_, raven, typ) ->
+        let+ typ = State.typ ctx ~at typ in
+        R.Var.make ~loc:l ~ghost:true (ident ~loc:l raven) typ)
+  in
+  let history_formals =
+    List.concat_map adapter_history ~f:(fun ((_, _, _, decls, _), _) -> decls)
+  in
+  let* capture_name = State.fresh "domain_captures" in
+  let capture = R.Expr.var ~loc:l (name ~loc:l capture_name) in
+  let* handle_name = State.fresh "domain_handle" in
+  let result = R.Expr.var ~loc:l (name ~loc:l handle_name) in
+  let adapter =
+    R.Member.callable
+      (R.Callable.proc ~loc:l
+         ~formals:
+           (List.map prepared.formals ~f:(fun (_, _, v) -> v)
+           @ proof_formals @ history_formals
+           @ List.map prepared.implicit ~f:(fun (_, _, _, v) -> v))
+         ~returns:[ R.Var.make ~loc:l (ident ~loc:l handle_name) (R.Type.ref ~loc:l) ]
+         ~requires:adapter_pre
+         ~ensures:
+           [
+             R.Spec.make
+               (R.Expr.call ~loc:l (name ~loc:l task.backend)
+                  ((result :: native_values) @ proof_values));
+             R.Spec.make
+               (R.Expr.binary ~loc:l Eq
+                  (Domain_contract.captures ~loc:l ~runtime result)
+                  capture_value);
+           ]
+         (ident ~loc:l ("fork$" ^ task.backend))
+         (Some
+            (R.Stmt.local ~loc:l ~ghost:true ~const:true ~typ:captures_type
+               ~init:(R.Stmt.expr_rhs capture_value)
+               (ident ~loc:l capture_name)
+            @ [
+                R.Stmt.fold ~loc:l
+                  (qualified_name ~loc:l (contract_name ^ ".precondition"))
+                  [ capture ];
+              ]
+            @ [
+                R.Stmt.assign ~loc:l [ result ]
+                  (R.Stmt.expr_rhs (Domain_contract.fork ~loc:l ~runtime capture));
+                R.Stmt.return ~loc:l [ result ];
+              ])))
   in
   let dependencies =
     List.filter_map
-      (f.body.exp_type :: parameter_types)
+      ((f.body.exp_type :: parameter_types)
+      @ List.map (ghosts @ implicits) ~f:(fun (_, _, typ) -> typ)
+      @ List.map task.ghost_outputs ~f:snd)
       ~f:(Datatypes.dictionary_name given.types)
   in
   State.return
     ( [
-        Domain_contract.task_instance ~loc:l model ~name:contract_name
-          ~captures:captures_type ~result:result_type ~outcome:outcome_type
-          ~requires:(conjunction pre) ~ensures:post;
+        Domain_contract.task_instance ~loc:l ~ghost_results:outputs_type model
+          ~name:contract_name ~captures:captures_type ~result:result_type
+          ~outcome:outcome_type ~requires:(conjunction pre) ~ensures:post;
         Domain_contract.runtime_instance ~loc:l model ~name:runtime_name
           ~task:(Qualified_name.of_string contract_name);
         alias;
+        adapter;
       ],
       dependencies )

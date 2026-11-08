@@ -472,6 +472,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
   State.in_procedure
   @@
   let open State.Syntax in
+  let* ctx = State.of_result (Checked_workers.enrich_predicates ctx preds) in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
@@ -1398,7 +1399,7 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
               && at.loc_end.pos_cnum <= body.loc_end.pos_cnum
               &&
               match Annotation.kind annotation with
-              | Contract | Manual | Scope | Ghost | Returns | Proof | Initially
+              | Contract | Loop | Manual | Scope | Ghost | Returns | Proof | Initially
               | Initializes | Linearization ->
                   false
               | _ -> true)

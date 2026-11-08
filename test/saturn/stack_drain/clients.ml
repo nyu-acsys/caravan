@@ -24,3 +24,8 @@ let mutable_payload () =
   | _ -> assert false
   end;
   assert (Treiber_stack.is_empty stack)
+
+let parallel () =
+  let count, content = Stack_drain.test () in
+  assert (count = 20);
+  assert (List.length content = 20)

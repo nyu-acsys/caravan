@@ -1,0 +1,3 @@
+proof loop cell =
+  at (incr cell) invariant true;
+  at (incr cell) invariant true

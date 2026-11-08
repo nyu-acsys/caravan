@@ -1119,45 +1119,6 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             error au.au_at "An AU facade requires a logically atomic contract"
         | Some f -> Ok (au, f))
   in
-  let* tasks =
-    let application_view (task : Source.proof_task) =
-      Option.bind task.task_application ~f:(fun (_, template) ->
-          List.find untyped_scoped_proofs.applications ~f:(fun view ->
-              match view.source.kind with
-              | Task original ->
-                  Ident.same original.task_id template
-                  && Path.same task.task_path (Path.Pdot (view.path, task.task_name))
-              | _ -> false))
-    in
-    let context task =
-      match application_view task with
-      | Some view -> asset_context view.source.entry.scope.owner
-      | None -> asset_context task.Source.task_scope
-    in
-    let resolve (task : Source.proof_task) =
-      match task.task_application with
-      | Some _ ->
-          Option.first_some
-            (List.find funcs ~f:(fun f ->
-                 List.mem f.paths task.task_operation_path ~equal:Path.same))
-            (applied_facade_operation task.task_application
-               ~matches:(fun template -> function
-                 | Task original -> Ident.same original.task_id template | _ -> false)
-               ~operation:(function
-                 | Task original -> Some original.task_operation_path | _ -> None))
-      | None -> (
-          match (context task).worker with
-          | Some plan ->
-              Option.bind (Generic_proofs.function_id plan task.task_operation_path)
-                ~f:(fun id -> List.find funcs ~f:(fun f -> Ident.same f.id id))
-          | None ->
-              List.find funcs ~f:(fun f ->
-                  List.mem f.paths task.task_operation_path ~equal:Path.same))
-    in
-    Task_facades.collect ~family_plan
-      ~operation_types:(fun f -> function_types polymorphic_functions f types)
-      ~resolve ~context ~application_view source untyped_scoped_proofs
-  in
   let* token_types =
     all atomic_operations ~f:(fun (au, f) ->
         let data =
@@ -1855,20 +1816,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                }))
   in
   let generic_predicates = generic_predicates @ List.filter_opt imported_predicates in
-  let task_workers =
-    List.filter_map tasks ~f:(fun task ->
-        Option.some_if task.Task_facades.emit task.worker)
-  in
-  let generic_predicate_workers = generic_predicates @ task_workers in
-  let generic_predicates =
-    generic_predicates
-    @ List.filter_map tasks ~f:(fun task ->
-        Option.some_if
-          (not (List.is_empty task.Task_facades.worker.variables))
-          task.worker)
-  in
-  let* application_predicates =
-    all scoped_proofs.applications ~f:(fun view ->
+  let project_predicate_applications generic_predicates applications =
+    all applications ~f:(fun view ->
         match
           Generic_parameters.find generic_predicates view.Proof_bindings.source.backend
         with
@@ -1887,6 +1836,171 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 @ [ (Qualified_name.of_string worker.name).name ])
             in
             Ok (Some { worker with key = view.key; name }))
+  in
+  let needs_task_context = not (List.is_empty source.proof_tasks) in
+  let* task_application_predicates =
+    if not needs_task_context then Ok []
+    else
+      project_predicate_applications generic_predicates
+        (List.filter scoped_proofs.applications ~f:(fun view ->
+             match view.Proof_bindings.source.kind with Predicate _ -> true | _ -> false))
+  in
+  let task_generic_predicates =
+    generic_predicates @ List.filter_opt task_application_predicates
+  in
+  let* task_imported_pure =
+    if not needs_task_context then Ok []
+    else
+      all libraries ~f:(fun library ->
+          let* contracts = library_contracts library in
+          Ok
+            (List.filter_map contracts ~f:(fun (name, (contract, _)) ->
+                 Option.some_if contract.S.pure
+                   ( Path.Pdot (library.library_path, name),
+                     Qualified_name.of_string
+                       (library.library_name ^ "." ^ library_pure_name name) ))))
+      |> Result.map ~f:List.concat
+  in
+  let task_runtime_functions =
+    Path_bindings.of_list
+      (task_imported_pure
+      @ List.concat_map pure ~f:(fun f ->
+          List.filter_map f.paths ~f:(fun path ->
+              match path with
+              | Path.Pdot _ when not (List.is_empty f.signature_sites) -> None
+              | _ -> Some (path, pure_reference ~generics f))))
+  in
+  let* tasks =
+    let application_view (task : Source.proof_task) =
+      Option.bind task.task_application ~f:(fun (_, template) ->
+          List.find untyped_scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Task original ->
+                  Ident.same original.task_id template
+                  && Path.same task.task_path (Path.Pdot (view.path, task.task_name))
+              | _ -> false))
+    in
+    let context task =
+      match application_view task with
+      | Some view -> asset_context view.source.entry.scope.owner
+      | None -> asset_context task.Source.task_scope
+    in
+    let resolve (task : Source.proof_task) =
+      match task.task_application with
+      | Some _ ->
+          Option.first_some
+            (List.find funcs ~f:(fun f ->
+                 List.mem f.paths task.task_operation_path ~equal:Path.same))
+            (applied_facade_operation task.task_application
+               ~matches:(fun template -> function
+                 | Task original -> Ident.same original.task_id template | _ -> false)
+               ~operation:(function
+                 | Task original -> Some original.task_operation_path | _ -> None))
+      | None -> (
+          match (context task).worker with
+          | Some plan ->
+              Option.bind (Generic_proofs.function_id plan task.task_operation_path)
+                ~f:(fun id -> List.find funcs ~f:(fun f -> Ident.same f.id id))
+          | None ->
+              List.find funcs ~f:(fun f ->
+                  List.mem f.paths task.task_operation_path ~equal:Path.same))
+    in
+    Task_facades.collect ~family_plan
+      ~operation_types:(fun f -> function_types polymorphic_functions f types)
+      ~procedure_name:proc_name
+      ~given:(fun f ->
+        let env = Source.annotation_env ~at:f.loc source f.environment in
+        let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+        let visible = Proof_bindings.visible scoped_proofs ~scope in
+        let preds =
+          List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Predicate _ when binding.exported || visible binding ->
+                  Some (binding.public_key, (binding.backend, binding.public_types))
+              | _ -> None)
+          @ List.filter_map scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Predicate _ -> Some (view.key, (view.backend, view.types))
+              | _ -> None)
+          @ List.map predicates ~f:(fun (_, p, _, ts) ->
+              (p.S.pred_name.pid_str, (p.pred_name.pid_str, ts)))
+          @ List.map library_preds ~f:(fun (lib, p, ts) ->
+              ( lib.Library_modules.source_name ^ "." ^ p.S.pred_name.pid_str,
+                (lib.library_name ^ "." ^ p.pred_name.pid_str, ts) ))
+        in
+        let spec_funcs =
+          List.filter_map source.proof ~f:(function
+            | S.Proof_function declaration ->
+                Some (declaration.function_name.pid_str, declaration.function_name.pid_str)
+            | _ -> None)
+          @ List.concat_map scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Function _ when binding.exported || visible binding ->
+                  let local = binding.entry.name in
+                  let local_name =
+                    Option.to_list
+                      (Option.bind
+                         (Proof_bindings.resolve scoped_proofs ~scope ~environment:env
+                            (S.Qid local)) ~f:(fun key ->
+                           Option.some_if
+                             (String.equal key binding.backend
+                             || String.equal key binding.public_key)
+                             (local.pid_str, binding.backend)))
+                  in
+                  (binding.backend, binding.backend)
+                  :: (binding.public_key, binding.backend)
+                  :: local_name
+              | _ -> [])
+          @ List.filter_map scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Function _ -> Some (view.key, view.backend)
+              | _ -> None)
+        in
+        let proof_support =
+          {
+            empty_proof_support with
+            runtime_functions = task_runtime_functions;
+            predicate_views =
+              Path_bindings.of_list
+                (List.filter_map scoped_proofs.applications ~f:(fun view ->
+                     match view.source.kind with
+                     | Predicate _ ->
+                         Some
+                           ( Path.Pdot (view.path, view.source.entry.name.pid_str),
+                             view.key )
+                     | _ -> None));
+            resources = all_resources;
+            ghost_fields = source.proof_fields;
+            proof_key =
+              (fun environment q ->
+                Proof_bindings.resolve scoped_proofs ~scope ~environment q);
+            canonical_path = Proof_bindings.canonical_owner scoped_proofs;
+          }
+        in
+        {
+          (declaration_inputs
+             (function_types polymorphic_functions f types)
+             ~shared:no_shared ~env ~preds ~spec_funcs ~proof_support
+             ~generic_predicates:task_generic_predicates ())
+          with
+          procedure_signatures;
+        })
+      ~resolve ~context ~application_view source untyped_scoped_proofs
+  in
+  let task_workers =
+    List.filter_map tasks ~f:(fun task ->
+        Option.some_if task.Task_facades.emit task.worker)
+  in
+  let generic_predicate_workers = generic_predicates @ task_workers in
+  let generic_predicates =
+    generic_predicates
+    @ List.filter_map tasks ~f:(fun task ->
+        Option.some_if
+          (not (List.is_empty task.Task_facades.worker.variables))
+          task.worker)
+  in
+  let* application_predicates =
+    project_predicate_applications generic_predicates scoped_proofs.applications
   in
   let generic_predicates = generic_predicates @ List.filter_opt application_predicates in
   let* imported_functions =

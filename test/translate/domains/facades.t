@@ -44,12 +44,12 @@ Task handles retain their source result type despite sharing Raven's Ref carrier
   $ grep 'Type Error:' wrong_result.out
   Type Error: The value domain has type bool Domain.t
 
-Unsupported task shapes fail at their facade declaration.
+Inferred precondition witnesses are captured at spawn.
 
-  $ caravan --shh ghost.ml > ghost.out 2>&1
-  [1]
-  $ grep 'Unsupported Error:' ghost.out
-  Unsupported Error: A task facade with ghost inputs, ghost results, or history witnesses is not supported yet.
+  $ caravan --shh ghost.ml
+  Verification successful.
+
+Unsupported task shapes fail at their facade declaration.
   $ caravan --shh missing_contract.ml > missing_contract.out 2>&1
   [1]
   $ grep 'Type Error:' missing_contract.out

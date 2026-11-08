@@ -1,5 +1,10 @@
 (** Trusted contracts for the supported subset of [Stdlib.List]. *)
 
+val length : 'a list -> int
+(*@ result = length values pure
+    requires List.length values <= max_int
+    ensures result === List.length values *)
+
 val rev : 'a list -> 'a list
 (*@ result = rev xs pure
     ensures result === reverse xs *)

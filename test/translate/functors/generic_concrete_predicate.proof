@@ -1,0 +1,4 @@
+module Make (Stack : STACK) = struct
+  invariant running (st : int Stack.t) =
+    exists items : int list. Stack.stack st items
+end

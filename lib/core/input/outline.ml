@@ -122,6 +122,22 @@ let rec matches (a : Parsetree.expression) (e : Parsetree.expression) =
         List.length a = List.length e
         && List.for_all2_exn a e ~f:(fun (la, a) (le, e) ->
             Poly.equal la le && matches a e)
+    | ( Pexp_function (left, _, Pfunction_body left_body),
+        Pexp_function (right, _, Pfunction_body right_body) ) ->
+        let same_parameter (left : Parsetree.function_param)
+            (right : Parsetree.function_param) =
+          match (left.pparam_desc, right.pparam_desc) with
+          | ( Pparam_val (left_label, left_default, left_pattern),
+              Pparam_val (right_label, right_default, right_pattern) ) ->
+              Poly.equal left_label right_label
+              && Option.equal matches left_default right_default
+              && String.equal
+                   (Stdlib.Format.asprintf "%a" Pprintast.pattern left_pattern)
+                   (Stdlib.Format.asprintf "%a" Pprintast.pattern right_pattern)
+          | Pparam_newtype left, Pparam_newtype right -> String.equal left.txt right.txt
+          | _ -> false
+        in
+        List.equal same_parameter left right && matches left_body right_body
     | Pexp_field (a, fa), Pexp_field (e, fe) ->
         Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt) && matches a e
     | Pexp_constraint (a, _), _ -> matches a e
@@ -404,6 +420,27 @@ let synthesized ?(prefix = "") ?outline ~proof_text ~(origin : Location.t) posit
     outline;
   }
 
+(** The loop whose first executed expression is [code]. *)
+let loop_body definition (code : Parsetree.expression) ~at =
+  let rec first (expression : Parsetree.expression) =
+    match expression.pexp_desc with
+    | Pexp_sequence (before, _) | Pexp_constraint (before, _) -> first before
+    | Pexp_let (_, [ binding ], _) -> first binding.pvb_expr
+    | _ -> expression
+  in
+  let bodies =
+    List.filter_map (subexpressions definition.body) ~f:(fun expression ->
+        match expression.pexp_desc with
+        | (Pexp_while (_, body) | Pexp_for (_, _, _, _, body))
+          when Poly.equal (first body).pexp_loc code.pexp_loc ->
+            Some body
+        | _ -> None)
+  in
+  match bodies with
+  | [ body ] -> Ok body
+  | [] -> error at "A loop invariant anchors the first expression of its loop body"
+  | _ -> error at "This loop invariant anchor selects more than one loop"
+
 (** The annotations that [outline]'s steps stand for: each step's at its place, and its
     contract and whether its proof is manual after the function. Steps other than
     linearizations make it manual. *)
@@ -434,9 +471,17 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let* code =
               anchor_place ~proof_text definition ~excluded ~previous anchor_loc
             in
-            let place = step_end code in
+            let* place =
+              match action with
+              | Loop ->
+                  let* body = loop_body definition code ~at:anchor_loc in
+                  Ok body.pexp_loc.loc_start
+              | Linearize | Initializes | Scope -> Ok (step_end code)
+            in
             let prefix =
-              match action with Linearize | Initializes -> "" | Scope -> "Ghost.scope "
+              match action with
+              | Linearize | Initializes | Loop -> ""
+              | Scope -> "Ghost.scope "
             in
             let* context =
               uses ~visible ~step_loc:action_loc ~regions:(regions_of regions code)
@@ -461,7 +506,12 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
                   Export { key; pattern; code; code_regions = regions_of regions code }
                   :: shadow visible (S.pat_names pattern)
             in
-            Ok (place.pos_cnum, visible, annotation :: annotations)
+            let previous =
+              match action with
+              | Loop -> previous
+              | Linearize | Initializes | Scope -> place.pos_cnum
+            in
+            Ok (previous, visible, annotation :: annotations)
         | On_return { return_loc } ->
             let place = definition.body.pexp_loc.loc_end in
             let* outline =
@@ -497,7 +547,7 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
   let manual =
     if
       List.exists outline.outline_steps ~f:(function
-        | S.At { action = Linearize; _ } | Let _ | Nested _ | Initially _ -> false
+        | S.At { action = Linearize | Loop; _ } | Let _ | Nested _ | Initially _ -> false
         | At _ | On_return _ -> true)
     then
       [

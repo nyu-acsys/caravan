@@ -1,0 +1,2 @@
+proof loop cell =
+  at (decr cell) invariant true

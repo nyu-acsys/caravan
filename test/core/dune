@@ -13,7 +13,8 @@
   ../saturn/backoff/backoff.mli
   ../translate/libraries/include_dirs/backoff.mli
   ../saturn/treiber_stack/treiber_stack.ml
-  ../saturn/treiber_stack/treiber_stack.mli))
+  ../saturn/treiber_stack/treiber_stack.mli
+  ../saturn/stack_drain/stack_drain.ml))
 
 (test
  (name diagnostics)
@@ -23,6 +24,11 @@
 (test
  (name function_types)
  (modules function_types)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name worker_groups)
+ (modules worker_groups)
  (libraries base caravan_core compiler-libs.common))
 
 (test

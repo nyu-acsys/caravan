@@ -18,9 +18,52 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
         between a && Poly.equal (Annotation.kind a) Annotation.Loop)
   with
   | [] ->
-      Ok { S.invariants = []; state_invariants = []; loop_variant = []; loop_raises = [] }
-  | [ a ] -> Annotation.loop_spec a
+      Ok
+        ( { S.invariants = []; state_invariants = []; loop_variant = []; loop_raises = [] },
+          None )
+  | [ a ] -> Result.map (Annotation.loop_spec a) ~f:(fun spec -> (spec, Some a))
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
+
+(** Outline bindings used by an invariant must be logical expressions. *)
+let loop_outline_terms annotation terms =
+  let ( let* ) = Result.( >>= ) in
+  let rec logical (expression : S.proof_expr) =
+    let term desc = S.mk_term desc expression.proof_loc in
+    match expression.proof_desc with
+    | Proof_value value -> Ok value
+    | Proof_let (pattern, value, body) ->
+        let* value = logical value in
+        let* body = logical body in
+        Ok (term (Tlet (pattern, value, body)))
+    | Proof_if (condition, yes, no) ->
+        let* yes = logical yes in
+        let* no = logical no in
+        Ok (term (Tif (condition, yes, no)))
+    | Proof_match (value, cases) ->
+        let* cases =
+          Result.all
+            (List.map cases ~f:(fun (pattern, body) ->
+                 Result.map (logical body) ~f:(fun body -> (pattern, body))))
+        in
+        Ok (term (Tmatch (value, cases)))
+    | Proof_assert _ | Proof_fold _ | Proof_unfold _ | Proof_seq _ ->
+        error expression.proof_loc
+          "An outline binding used by a loop invariant must be a logical expression"
+  in
+  let bindings =
+    Option.value_map annotation ~default:[] ~f:(fun annotation ->
+        Option.value_map annotation.Annotation.outline ~default:[] ~f:(fun outline ->
+            outline.lets))
+  in
+  let* bindings =
+    Result.all
+      (List.map bindings ~f:(fun (pattern, expression) ->
+           Result.map (logical expression) ~f:(fun value -> (pattern, value))))
+  in
+  Ok
+    (List.map terms ~f:(fun term ->
+         List.fold_right bindings ~init:term ~f:(fun (pattern, value) body ->
+             S.mk_term (Tlet (pattern, value, body)) body.term_loc)))
 
 (** The invariants of a loop at [at]: those of [spec], with the variables in scope there,
     the facts that hold throughout the function, and the value domains of variables in
@@ -29,7 +72,7 @@ let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
     as the value of the loop's condition. The invariants of [spec] hold under [guard] if
     given, as for a loop that may raise, when it has not. *)
-let rec loop_invariants ?(counter = "") ?guard ctx ~at (spec : S.loop_spec)
+let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loop_spec)
     ~(relation : ((string * string) * R.Expr.t) list -> R.Expr.t option State.t) =
   let open State.Syntax in
   let l = loc at in
@@ -46,6 +89,10 @@ let rec loop_invariants ?(counter = "") ?guard ctx ~at (spec : S.loop_spec)
   in
   let runtime name = List.mem runtime_names name ~equal:String.equal in
   let* env = scope_env ctx in
+  let* env =
+    outline_env env
+      (Option.bind annotation ~f:(fun annotation -> annotation.Annotation.outline))
+  in
   let* env, state_invariants =
     State.fold spec.state_invariants ~init:(env, [])
       ~f:(fun (env, terms) (pattern, body) ->
@@ -63,7 +110,9 @@ let rec loop_invariants ?(counter = "") ?guard ctx ~at (spec : S.loop_spec)
         in
         (env, terms @ [ term ]))
   in
-  let terms = spec.invariants @ state_invariants in
+  let* terms =
+    State.of_result (loop_outline_terms annotation (spec.invariants @ state_invariants))
+  in
   let* free = free_typed env terms ~at in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->

@@ -1567,6 +1567,63 @@ let procedure_implicit_names ~given ~past_structures ~proc_name f state =
   Fresh_names.restore saved;
   (result, state)
 
+(** A snapshot and a position witnessing each fact about an earlier state. *)
+let history_witness_facts ?(ghost = true) ctx env ~at ~requires pasts =
+  let open State.Syntax in
+  let l = loc at in
+  let* history_invariants = invariant_apps ~include_opaque:true ctx env requires in
+  let witnesses (p : past) =
+    let* st =
+      resolve_shared_structure
+        ?element_type:(Spec_terms.term_type env p.element)
+        env ~at:p.element.term_loc ~invariant:p.inv ~field:p.field
+    in
+    let p = { p with inv = st.invariant } in
+    let* structure =
+      match List.Assoc.find history_invariants p.inv ~equal:String.equal with
+      | Some (x :: _) ->
+          let anchored =
+            match anchor_location ctx.given.types st.structure_type with
+            | Some at -> at ~loc:l x
+            | None -> x
+          in
+          State.return
+            (R.Expr.field ~loc:l anchored
+               (qualified_name ~loc:l (member_name st "history")))
+      | _ ->
+          State.of_result
+            (error p.element.term_loc
+               (Printf.sprintf
+                  "A fact about an earlier state of %s, which the precondition does not \
+                   hold"
+                  p.inv))
+    in
+    let* snapshot = State.fresh "snapshot" in
+    let* k = State.fresh "position" in
+    let var x = R.Expr.var ~loc:l (name ~loc:l x) in
+    let+ e = Spec_terms.formula env p.element in
+    let decl x typ = R.Var.make ~loc:l ~ghost (ident ~loc:l x) typ in
+    ( ( p,
+        st,
+        e,
+        [
+          decl snapshot
+            (R.Type.named ~loc:l
+               (generated_module_member ~loc:l (module_name st "state") "T")
+               []);
+          decl k (R.Type.int ~loc:l);
+        ],
+        (var snapshot, var k) ),
+      past_fact ~loc:l ~history:ctx.given.shared.history st ~structure ~field:p.field
+        ~snapshot:(var snapshot) ~k:(var k) e )
+  in
+  State.all pasts ~f:witnesses
+
+let history_witnesses ctx env ~at ~requires pasts =
+  State.map
+    (history_witness_facts ctx env ~at ~requires pasts)
+    ~f:(List.map ~f:(fun (witness, fact) -> (witness, R.Spec.make fact)))
+
 (** The procedure of [f], with its verified contract and atomic update. *)
 let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (f : func)
     : R.Callable.t State.t =
@@ -1723,56 +1780,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
     State.modify_carried (fun c ->
         { c with invariants = (if f.manual then [] else invariants) })
   in
-  (* A snapshot and a position witnessing each fact about an earlier state. *)
-  let* history_invariants = invariant_apps ~include_opaque:true ctx env pres in
-  let witnesses (p : past) =
-    let* st =
-      resolve_shared_structure
-        ?element_type:(Spec_terms.term_type env p.element)
-        env ~at:p.element.term_loc ~invariant:p.inv ~field:p.field
-    in
-    let p = { p with inv = st.invariant } in
-    let* structure =
-      match List.Assoc.find history_invariants p.inv ~equal:String.equal with
-      | Some (x :: _) ->
-          let anchored =
-            match anchor_location ctx.given.types st.structure_type with
-            | Some at -> at ~loc:l x
-            | None -> x
-          in
-          State.return
-            (R.Expr.field ~loc:l anchored
-               (qualified_name ~loc:l (member_name st "history")))
-      | _ ->
-          State.of_result
-            (error p.element.term_loc
-               (Printf.sprintf
-                  "A fact about an earlier state of %s, which the precondition does not \
-                   hold"
-                  p.inv))
-    in
-    let* snapshot = State.fresh "snapshot" in
-    let* k = State.fresh "position" in
-    let var x = R.Expr.var ~loc:l (name ~loc:l x) in
-    let+ e = Spec_terms.formula env p.element in
-    let decl x typ = R.Var.make ~loc:l ~ghost:true (ident ~loc:l x) typ in
-    ( ( p,
-        st,
-        e,
-        [
-          decl snapshot
-            (R.Type.named ~loc:l
-               (generated_module_member ~loc:l (module_name st "state") "T")
-               []);
-          decl k (R.Type.int ~loc:l);
-        ],
-        (var snapshot, var k) ),
-      R.Spec.make
-        (past_fact ~loc:l ~history:ctx.given.shared.history st ~structure ~field:p.field
-           ~snapshot:(var snapshot) ~k:(var k) e) )
-  in
-  let* past_params = State.all past_pres ~f:witnesses in
-  let* past_results = State.all past_posts ~f:witnesses in
+  let* past_params = history_witnesses ctx env ~at:f.loc ~requires:pres past_pres in
+  let* past_results = history_witnesses ctx env ~at:f.loc ~requires:pres past_posts in
   let* () =
     match (raising, past_results) with
     | Some _, _ :: _ ->
@@ -1814,13 +1823,21 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
     State.all atomic_pres ~f:(fun t ->
         State.map (Spec_terms.formula env t) ~f:(fun e -> R.Spec.make ~atomic:true e))
   in
-  (* Preconditions without [own] only mention immutable variables, so they hold
-     throughout, as in loops. *)
-  let* facts =
-    specs
-      (List.filter pres ~f:(fun t ->
-           not (List.mem (term_names t) "own" ~equal:String.equal)))
+  (* Pure facts and persistent invariants survive changes to spatial resources. *)
+  let stable term =
+    List.for_all (term_references [] term) ~f:(fun q ->
+        if String.equal (qualid_key q) "own" then false
+        else
+          match
+            List.Assoc.find ctx.given.preds (logical_key env q) ~equal:String.equal
+          with
+          | None -> true
+          | Some (raven, _) ->
+              List.Assoc.mem ctx.given.shared.persistent
+                (canonical_member ctx.given.shared raven)
+                ~equal:String.equal)
   in
+  let* facts = specs (List.filter (List.concat_map pres ~f:conjuncts) ~f:stable) in
   let* () = State.modify_carried (fun c -> { c with facts }) in
   (* Names free in the postconditions are existentially quantified, as [j] in
      [ensures own c.count j]. *)

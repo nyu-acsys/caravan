@@ -1093,6 +1093,14 @@ type domain_task = {
   domain_inputs : Types.type_expr list;
   domain_result : Types.type_expr;
   domain_raises : State_monad.raise_set;
+  domain_procedure : string;
+  domain_ghost_inputs : (string * Types.type_expr) list;
+  domain_implicit_inputs : (string * Types.type_expr) list;
+  domain_ghost_outputs : (string * Types.type_expr) list;
+  domain_history_inputs : int;
+  domain_history_outputs : int;
+  domain_capture_hints : Ident.t option list;
+      (** Lexical identities used to register returned history positions. *)
 }
 
 type domain_argument = Unit_argument | Value_argument of Typedtree.expression

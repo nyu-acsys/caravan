@@ -78,6 +78,36 @@ let normalize_module_name name source =
     | None -> source
   else source
 
+let check_digest name expected source =
+  let actual = Stdlib.Digest.(to_hex (string source)) in
+  if not (String.equal expected actual) then
+    failwith
+      ("Upstream source parity failed for " ^ name ^ ": expected " ^ expected ^ ", got "
+     ^ actual)
+
+(* The barrier-free tutorial functor, with integer IDs and a named loop counter. *)
+let stack_drain_body source =
+  let after marker source =
+    match String.substr_index source ~pattern:marker with
+    | Some index -> String.drop_prefix source (index + String.length marker)
+    | None -> failwith ("Missing stack-drain source marker " ^ marker)
+  in
+  let body = after "module Test (Stack : S) = struct\n" source in
+  let body =
+    match String.substr_index body ~pattern:"\nend\n" with
+    | Some index -> String.prefix body index
+    | None -> failwith "Missing stack-drain functor end"
+  in
+  List.fold
+    [
+      ("(id : int)", "(id : string)");
+      ("for i = 0 to 9 do", "for _ = 0 to 9 do");
+      ("work 1 st", "work \"A\" st");
+      ("work 2 st", "work \"B\" st");
+    ]
+    ~init:body
+    ~f:(fun body (pattern, with_) -> String.substr_replace_all body ~pattern ~with_)
+
 let () =
   List.iter sources ~f:(fun (name, expected) ->
       let path = "../saturn/" ^ name in
@@ -86,8 +116,7 @@ let () =
         if String.is_suffix name ~suffix:".ml" then source else strip_annotations source
       in
       let source = normalize_module_name name source in
-      let actual = Stdlib.Digest.(to_hex (string source)) in
-      if not (String.equal expected actual) then
-        failwith
-          ("Upstream source parity failed for " ^ name ^ ": expected " ^ expected
-         ^ ", got " ^ actual))
+      check_digest name expected source);
+  check_digest "stack_drain/stack_drain.ml (tutorial functor)"
+    "eb5cb2cf56e88545ebc55dc986cf436a"
+    (stack_drain_body (Stdio.In_channel.read_all "../saturn/stack_drain/stack_drain.ml"))

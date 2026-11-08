@@ -64,7 +64,9 @@ The repository includes case studies adapted from
 data structures:
 
 - A [Treiber stack](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/treiber_stack)
-  and [stack-drain clients](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/stack_drain).
+  and [parallel stack-drain clients](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/stack_drain)
+  using `Domain.spawn` and `Domain.join`, with a proof that two workers leave twenty
+  elements for the final drain.
 - A [Michael–Scott queue with a history-based proof](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue).
 - The same queue with an [explicit segment-based proof](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue_lseg).
 
@@ -75,8 +77,9 @@ and clients. They also serve as verification regressions.
 
 Caravan is under active development. It supports a growing first-order subset of
 OCaml, including polymorphic functions, algebraic data types, records, modules and
-functors, mutable state, atomics, exceptions, and constant GADT witnesses. It does not yet
-cover the full OCaml language. The [OCaml coverage guide](/tutorial/ocaml-subset)
+functors, mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
+tasks, exceptions, and constant GADT witnesses. It does not yet cover the full
+OCaml language. The [OCaml coverage guide](/tutorial/ocaml-subset)
 describes the supported constructs and current restrictions.
 
 The [Caravan tutorial](/tutorial/) starts with a first verified file, then

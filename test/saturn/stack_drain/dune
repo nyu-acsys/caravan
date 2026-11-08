@@ -3,6 +3,9 @@
 (library
  (name caravan_saturn_stack_drain)
  (wrapped false)
+ ; The loop index is used by the proof outline.
+ (flags
+  (:standard -w -35))
  (modules
   stack_drain
   stack_intf

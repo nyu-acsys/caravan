@@ -340,3 +340,12 @@ let () =
       "let facts_of (x : int) : int set = Set.of_predicate (fun f -> f = x)";
       "lemma arbitrary_lambda = fun (x : int) -> x";
     ]
+
+let () =
+  let loop source = Spec_parser.loop_spec Spec_lexer.token (Lexing.from_string source) in
+  let state = loop "invariant (fun saved -> saved = 0)" in
+  assert (List.length state.state_invariants = 1);
+  assert (state.invariants = []);
+  let ordinary = loop "invariant true" in
+  assert (ordinary.state_invariants = []);
+  assert (List.length ordinary.invariants = 1)

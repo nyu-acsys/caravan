@@ -344,10 +344,10 @@ outline_steps:
 | LEFTPAR RIGHTPAR { [] }
 | s = outline_step { [s] }
 | s = outline_step SEMICOLON ss = outline_steps { s :: ss }
-| LET p = pat EQUAL AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
+| LET p = pat EQUAL AT LEFTPAR anchor_loc = anchor RIGHTPAR action = step_action
     IN ss = outline_steps
     { let action, action_loc = action in
-      At { anchor; anchor_loc = mk_loc $loc(anchor); action; action_loc; export = Some p }
+      At { anchor_loc; action; action_loc; export = Some p }
       :: ss }
 | LET p = pat EQUAL e = proof_expr IN ss = outline_steps
     { Let { pattern = p; value = e } :: ss }
@@ -360,9 +360,9 @@ nested_steps:
 outline_step:
 | INITIALLY initial_expression
     { Initially { initialization_loc = mk_loc $loc } }
-| AT LEFTPAR anchor = anchor RIGHTPAR action = step_action
+| AT LEFTPAR anchor_loc = anchor RIGHTPAR action = step_action
     { let action, action_loc = action in
-      At { anchor; anchor_loc = mk_loc $loc(anchor); action; action_loc; export = None } }
+      At { anchor_loc; action; action_loc; export = None } }
 | a = lident LEFTPAR anchor RIGHTPAR step_action
     { raise (Syntax_error (a.pid_loc,
         "A step is at (code) followed by its step, or on return followed by ghost code")) }
@@ -377,11 +377,35 @@ outline_step:
 
 (* The code a step follows, or the code bound to a name, as [let head = Atomic.make x]. *)
 anchor:
-| t = term { t }
-| LET pat EQUAL t = term { t }
+| anchor_token+ { mk_loc $loc }
+;
+
+(* Anchors are parsed as OCaml by Outline; this grammar preserves their balanced range. *)
+anchor_token:
+| LEFTPAR anchor_token* RIGHTPAR { () }
+| LEFTSQ anchor_token* RIGHTSQ { () }
+| LEFTBRC anchor_token* RIGHTBRC { () }
+| LIDENT | UIDENT | OP1 | OP2 | OP3 | OP4
+| OPPREF | QUOTE_LIDENT | BACKQUOTE_LIDENT | ATTRIBUTE | INTEGER | FLOAT | CHAR
+| STRING | REQUIRES | ENSURES | VARIANT | PURE | INVARIANT | PREDICATE
+| FOLD | UNFOLD | ASSERT | ATOMIC | ATOMIC_REQUIRES | ATOMIC_ENSURES | ATOMIC_RAISES
+| RAISES | COMMIT | RETURNING | TYPE | VIEW | ACTION | INITIALLY
+| PERFORMS | CONSUMES | LINEARIZES | LEADSTO | CONTINUES | WAIT | ON
+| HELPS | AS | PROOF | AT | LEMMA | RETURNS | OF
+| BEGIN | END | MODULE | STRUCT | FUN | SET_OF_PREDICATE | FRACTION
+| ELSE | EXISTS | FALSE | FORALL | IF | IN | LET
+| REC | MATCH | NOT | OLD | THEN | TRUE | WITH
+| CONJ | AMPAMP | ARROW | BAR | BARBAR | COLON | COLONCOLON
+| COMMA | DOT | DOTDOT | EQUAL | LRARROW | LTGT | DISJ
+| SEMICOLON | STAR | UNDERSCORE
+| LEFTSQRIGHTSQ
+    { () }
 ;
 
 step_action:
+| INVARIANT term { (Loop, mk_loc $loc) }
+| INVARIANT LEFTPAR FUN pat_arg ARROW term RIGHTPAR
+    { (Loop, mk_loc $loc) }
 | COMMIT { (Linearize, mk_loc $loc) }
 | COMMIT term_arg { (Linearize, mk_loc $loc) }
 | RETURNING mpat ARROW outcome { (Linearize, mk_loc $loc) }

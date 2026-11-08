@@ -2303,7 +2303,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 data;
                 funcs = spec_funcs;
                 vars = [];
-                var_types = (result, f.body.exp_type) :: var_types;
+                var_types =
+                  ((result, f.body.exp_type) :: var_types)
+                  @ Option.value_map
+                      (List.Assoc.find procedure_signatures (proc_name f)
+                         ~equal:String.equal)
+                      ~default:[]
+                      ~f:(fun signature ->
+                        signature.procedure_inputs @ signature.procedure_outputs);
                 logical_definition = false;
               }
             in
@@ -2320,6 +2327,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     body = f.body;
                     logical;
                     scheme;
+                    arguments =
+                      List.map f.params ~f:(fun parameter ->
+                          match parameter.Typedtree.fp_kind with
+                          | Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } -> Some id
+                          | _ -> None);
                   } ))
       in
       all translated ~f:(fun (name, f, _) ->

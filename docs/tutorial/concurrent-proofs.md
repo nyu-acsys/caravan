@@ -234,6 +234,20 @@ do not escape those regions. A loop also does not carry a changed ghost state
 from one iteration to the next. Use a loop invariant for iteration reasoning;
 `invariant (fun saved -> proposition)` can refer to the inherited ghost state.
 
+A loop invariant can stay in the `.proof` outline. Anchor its first body
+expression and refer to the counter named in the OCaml source. For a loop
+`for i = 0 to 9 do increment cell done`, its outline can contain:
+
+```proof
+at (increment cell) invariant (own cell.contents i);
+at (increment cell) (fun step -> let result = step () in result)
+```
+
+This form also works for `while` loops. The invariant holds at loop entry and
+after each iteration, including the final counter value beyond a `for` loop's
+bound. It can use exports from earlier outline steps and logical `let` bindings.
+Its anchor remains available for a proof scope on the same body expression.
+
 Contracts can also declare ghost inputs and results. Calls pass these through
 access scopes; `Ghost.returns` supplies ghost results at runtime return points.
 Ghost values, allocations, and updates have no runtime effects. Manual and

@@ -1110,6 +1110,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Definitions;
               `Native_resources;
               `Public_resources;
+              `State_support;
               `Task_support;
               `Function_workers;
               `Applications;
@@ -1132,6 +1133,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Definitions;
               `Native_resources;
               `Public_resources;
+              `State_support;
               `Applications;
               `Workers_and_values;
               `Primitives;
@@ -1149,6 +1151,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         | Module_context.Function_worker _ | Module_context.Proof_worker _ ->
             [
               `Token_types;
+              `State_support;
               `Function_workers;
               `Value_domains;
               `Family_assets;
@@ -1186,9 +1189,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
       | `Proof_definitions -> emitted_assets destination definition_proof_modules
+      (* Task contracts in nested workers can mention these history types. *)
+      | `State_support -> state_members destination structure_member_lists
       | `State ->
-          state_members destination structure_member_lists
-          @ state_members destination pending_member_lists
+          state_members destination pending_member_lists
           @ state_members destination action_check_lists
       | `Late_members -> late_members
       | `Primitives -> primitive_members

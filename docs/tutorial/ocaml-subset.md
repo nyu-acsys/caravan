@@ -71,12 +71,30 @@ between functions. Handles may be aliased, but the resource can be consumed only
 once. OCaml itself allows repeated joins; the current verification contract
 supports one resource-recovering join.
 
+Task operations may also declare ghost inputs and results. A `Ghost.scope` attached
+to `Domain.spawn` supplies the ghost inputs, using the same syntax as a checked
+procedure call. The handle stores these inputs together with inferred precondition
+witnesses. A scope attached to `Domain.join` receives the ghost results; they are
+unavailable before joining. `Ghost.returns` supplies those results in the worker's
+proof. When a handle crosses a function boundary, pass the declared ghost inputs
+after the captured runtime arguments in its `Job.handle` predicate; inferred
+precondition witnesses remain implicit. Past-fact witnesses follow the same transfer:
+precondition snapshots are captured at spawn, and returned facts are recovered at
+join.
+
 Inline thunks must call a known task with captured values or constants. Put
 computed arguments and more elaborate child code in a separately verified task;
 Caravan does not move their effects into the parent. Logically atomic task
-contracts and ghost task parameters are
-not yet supported. Joins need enough information to select a unique task facade,
-from the handle's origin or its contract.
+contracts are not yet supported. Joins need enough information to select a unique
+task facade, from the handle's origin or its contract.
+
+The [parallel stack-drain client](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/stack_drain)
+demonstrates shared access: a shared invariant holds the stack's exclusive
+ownership, and each worker receives its own ghost counter resource. Both joins
+return the completed worker resources, allowing the parent to recover the stack
+and drain twenty elements. Its runtime code follows Saturn's tutorial with integer
+worker IDs and a named loop counter; all implementation annotations are in the
+companion `.proof` file.
 
 ## Modules and functors {#sec:modules-and-functors}
 
@@ -141,8 +159,21 @@ Bundled annotated subsets of the standard library currently include:
 
 | Operations | Model |
 | --- | --- |
+| `List.length` | Runtime calls return an OCaml `int`; specifications use total mathematical length. |
 | `List.rev`, `List.rev_append` | List reversal, usable in implementations and specifications. |
 | `Seq.empty`, `List.to_seq`, `List.of_seq` | Finite, reusable snapshots, described by `Seq.persistent sequence values`. |
+
+The runtime `List.length` contract requires the length to fit in an OCaml `int`:
+
+```caravan
+let size values = List.length values
+(*@ result = size values
+    requires List.length values <= max_int
+    ensures result = List.length values *)
+```
+
+The same expression in a specification denotes mathematical length even when
+that bound does not hold.
 
 Snapshots remain usable after the originating data structure changes. User-defined
 sequence producers, direct sequence-thunk calls, stateful/one-shot sequences, and

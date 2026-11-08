@@ -14,6 +14,7 @@ type function_ = {
   body : Typedtree.expression;
   logical : Translate_context.env;
   scheme : Polymorphic_functions.scheme;
+  arguments : Ident.t option list;
 }
 
 type provenance = Unknown | Task of domain_task | Tuple of provenance list
@@ -50,6 +51,18 @@ let resource_task ~canonical ~tasks environment head =
                     (canonical handle_path))))
   | _ -> None
 
+let map_task_types task ~arguments ~f =
+  let named = List.map ~f:(fun (name, typ) -> (name, f typ)) in
+  {
+    task with
+    domain_arguments = arguments;
+    domain_inputs = List.map task.domain_inputs ~f;
+    domain_result = f task.domain_result;
+    domain_ghost_inputs = named task.domain_ghost_inputs;
+    domain_implicit_inputs = named task.domain_implicit_inputs;
+    domain_ghost_outputs = named task.domain_ghost_outputs;
+  }
+
 let specialize ~types ~environment ~at task actuals =
   let actuals = List.map actuals ~f:(Option.map ~f:(Datatypes.quantified_type types)) in
   if List.is_empty task.domain_worker.variables then Ok task
@@ -66,13 +79,7 @@ let specialize ~types ~environment ~at task actuals =
       Report.expect ~at "The task's type arguments"
         (Datatypes.substitution task.domain_worker.variables arguments)
     in
-    Ok
-      {
-        task with
-        domain_arguments = arguments;
-        domain_inputs = List.map task.domain_inputs ~f:substitute;
-        domain_result = substitute task.domain_result;
-      }
+    Ok (map_task_types task ~arguments ~f:substitute)
 
 let resource_names ~canonical ~types ~tasks function_ terms =
   all (List.concat_map terms ~f:conjuncts) ~f:(fun term ->
@@ -85,7 +92,16 @@ let resource_names ~canonical ~types ~tasks function_ terms =
               ~environment:function_.environment ~at:term.term_loc task
               (List.map arguments ~f:(Spec_terms.term_type function_.logical))
           in
-          Some (name.pid_str, task)
+          let hints =
+            List.map
+              (List.take (List.tl_exn arguments) (List.length task.domain_inputs))
+              ~f:(fun term ->
+                match term.S.term_desc with
+                | Tvar (Qid name) ->
+                    List.Assoc.find function_.parameters name.pid_str ~equal:String.equal
+                | _ -> None)
+          in
+          Some (name.pid_str, { task with domain_capture_hints = hints })
       | _ -> Ok None)
   |> Result.map ~f:List.filter_opt
 
@@ -136,6 +152,11 @@ let task_for_path ~tasks expression path =
       error expression.exp_loc
         "Domain.spawn has more than one task facade for this operation"
 
+let capture_hints values =
+  List.map values ~f:(function
+    | Value_argument { Typedtree.exp_desc = Texp_ident (Pident id, _, _); _ } -> Some id
+    | Unit_argument | Value_argument _ -> None)
+
 let spawn ~types ~tasks (callback : Typedtree.expression) =
   let instantiate task result arguments =
     let* handle =
@@ -158,7 +179,7 @@ let spawn ~types ~tasks (callback : Typedtree.expression) =
       if
         List.length task.domain_inputs = 1
         && Ctype.is_equal callback.exp_env true task.domain_inputs [ Predef.type_unit ]
-      then Ok (task, [ Unit_argument ])
+      then Ok ({ task with domain_capture_hints = [ None ] }, [ Unit_argument ])
       else
         unsupported callback.exp_loc "A domain task value with parameters other than unit"
   | Texp_function ([ parameter ], Tfunction_body body) ->
@@ -184,7 +205,8 @@ let spawn ~types ~tasks (callback : Typedtree.expression) =
                       "A domain task argument computed inside its closure; move the \
                        computation into the verified task")
           in
-          if List.length values = List.length task.domain_inputs then Ok (task, values)
+          if List.length values = List.length task.domain_inputs then
+            Ok ({ task with domain_capture_hints = capture_hints values }, values)
           else unsupported body.exp_loc "A partially applied domain task"
       | _ -> unsupported body.exp_loc "A domain closure other than a call of a known task"
       end
@@ -268,6 +290,7 @@ let analyze ~canonical ~types ~tasks ~functions function_ =
             Ok (calls @ [ (key expression, Domain_join (task, handle)) ], Unknown)
         | Some _, _ -> unsupported expression.exp_loc "This Domain operation's arguments"
         | None, _ ->
+            let ocaml_arguments = arguments in
             let* arguments = all arguments ~f:(inspect bindings) in
             let* value =
               match
@@ -296,6 +319,24 @@ let analyze ~canonical ~types ~tasks ~functions function_ =
                           Tuple values
                       | Task task ->
                           let arguments = List.map task.domain_arguments ~f:substitute in
+                          let hints =
+                            List.map task.domain_capture_hints ~f:(fun hint ->
+                                Option.bind hint ~f:(fun id ->
+                                    Option.bind
+                                      (List.findi function_.arguments
+                                         ~f:(fun _ candidate ->
+                                           Option.exists candidate ~f:(Ident.same id)))
+                                      ~f:(fun (index, _) ->
+                                        match List.nth ocaml_arguments index with
+                                        | Some
+                                            {
+                                              Typedtree.exp_desc =
+                                                Texp_ident (Pident id, _, _);
+                                              _;
+                                            } ->
+                                            Some id
+                                        | _ -> None)))
+                          in
                           let target =
                             match path with
                             | Path.Pdot (owner, _) ->
@@ -317,23 +358,15 @@ let analyze ~canonical ~types ~tasks ~functions function_ =
                                      arguments)
                               in
                               Task
-                                {
-                                  target with
-                                  domain_arguments = arguments;
-                                  domain_inputs = List.map target.domain_inputs ~f:project;
-                                  domain_result = project target.domain_result;
-                                }
+                                (map_task_types
+                                   { target with domain_capture_hints = hints }
+                                   ~arguments ~f:project)
                           | None ->
                               Ok
                                 (Task
-                                   {
-                                     task with
-                                     domain_arguments =
-                                       List.map task.domain_arguments ~f:substitute;
-                                     domain_inputs =
-                                       List.map task.domain_inputs ~f:substitute;
-                                     domain_result = substitute task.domain_result;
-                                   })
+                                   (map_task_types
+                                      { task with domain_capture_hints = hints }
+                                      ~arguments ~f:substitute))
                           end
                     in
                     map value

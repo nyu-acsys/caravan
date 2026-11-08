@@ -18,11 +18,14 @@ let reference ~loc qualified = Qualified_name.raven ~loc qualified
 let ident ~loc text = R.Ident.make ~loc text
 let name ~loc text = R.Name.make ~loc text
 let variable ~loc text = R.Expr.var ~loc (name ~loc text)
-let parameter ~loc text typ = R.Var.make ~loc (ident ~loc text) typ
+
+let parameter ~loc ?(ghost = false) text typ =
+  R.Var.make ~loc ~ghost (ident ~loc text) typ
 
 let resource_signature ~loc model =
   let captures = R.Type.named ~loc (name ~loc "Captures") [] in
   let result = R.Type.named ~loc (name ~loc "Result") [] in
+  let ghost_results = R.Type.named ~loc (name ~loc "GhostResults") [] in
   let outcome = R.Type.named ~loc (name ~loc "Outcome") [] in
   let predicate text parameters =
     R.Member.callable
@@ -33,21 +36,24 @@ let resource_signature ~loc model =
     [
       R.Member.type_ ~loc (ident ~loc "Captures") None;
       R.Member.type_ ~loc (ident ~loc "Result") None;
+      R.Member.type_ ~loc (ident ~loc "GhostResults") None;
       R.Member.type_ ~loc (ident ~loc "Outcome") None;
-      predicate "precondition" [ parameter ~loc "captures" captures ];
+      predicate "precondition" [ parameter ~loc ~ghost:true "captures" captures ];
       predicate "postcondition"
         [
-          parameter ~loc "captures" captures;
+          parameter ~loc ~ghost:true "captures" captures;
           parameter ~loc "result" result;
+          parameter ~loc ~ghost:true "ghosts" ghost_results;
           parameter ~loc "outcome" outcome;
         ];
     ]
 
 let runtime_support ~loc model =
   let task_type text = R.Type.named ~loc (R.Name.make ~loc ~path:[ "Task" ] text) [] in
-  let captures = parameter ~loc "captures" (task_type "Captures") in
+  let captures = parameter ~loc ~ghost:true "captures" (task_type "Captures") in
   let handle = parameter ~loc "h" (R.Type.ref ~loc) in
   let result = parameter ~loc "result" (task_type "Result") in
+  let ghosts = parameter ~loc ~ghost:true "ghosts" (task_type "GhostResults") in
   let outcome = parameter ~loc "outcome" (task_type "Outcome") in
   let context = variable ~loc "captures" in
   let ownership = R.Expr.call ~loc (name ~loc "handle") [ variable ~loc "h"; context ] in
@@ -83,17 +89,23 @@ let runtime_support ~loc model =
          procedure "fork" [ captures ] [ handle ]
            (task_resource "precondition" [ context ])
            ownership;
-         procedure "join" [ handle; captures ] [ result; outcome ] ownership
+         procedure "join" [ handle; captures ] [ result; ghosts; outcome ] ownership
            (task_resource "postcondition"
-              [ context; variable ~loc "result"; variable ~loc "outcome" ]);
+              [
+                context;
+                variable ~loc "result";
+                variable ~loc "ghosts";
+                variable ~loc "outcome";
+              ]);
        ])
 
 let support ~loc model = [ resource_signature ~loc model; runtime_support ~loc model ]
 
-(** Predicate bodies bind [captures], [result], and [outcome]. Unit results use the
-    explicit scalar [()] carrier; exceptional outcomes can use [exn option]. *)
-let task_instance ~loc model ~name:instance ~captures ~result ~outcome ~requires ~ensures
-    =
+(** Predicate bodies bind [captures], [result], [ghosts], and [outcome]. Unit results use
+    the explicit scalar [()] carrier; exceptional outcomes can use [exn option]. *)
+let task_instance ~loc ?ghost_results model ~name:instance ~captures ~result ~outcome
+    ~requires ~ensures =
+  let ghost_results = Option.value ghost_results ~default:(R.Type.tuple ~loc []) in
   let predicate text formals body =
     R.Member.callable
       (R.Callable.func ~loc ~kind:Pred ~formals (ident ~loc text) (Some body))
@@ -104,12 +116,14 @@ let task_instance ~loc model ~name:instance ~captures ~result ~outcome ~requires
     [
       R.Member.type_ ~loc (ident ~loc "Captures") (Some captures);
       R.Member.type_ ~loc (ident ~loc "Result") (Some result);
+      R.Member.type_ ~loc (ident ~loc "GhostResults") (Some ghost_results);
       R.Member.type_ ~loc (ident ~loc "Outcome") (Some outcome);
-      predicate "precondition" [ parameter ~loc "captures" captures ] requires;
+      predicate "precondition" [ parameter ~loc ~ghost:true "captures" captures ] requires;
       predicate "postcondition"
         [
-          parameter ~loc "captures" captures;
+          parameter ~loc ~ghost:true "captures" captures;
           parameter ~loc "result" result;
+          parameter ~loc ~ghost:true "ghosts" ghost_results;
           parameter ~loc "outcome" outcome;
         ]
         ensures;

@@ -786,7 +786,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
   in
   let predicate_inputs =
     List.map decls.tasks ~f:(fun task ->
-        (task.Task_facades.key, List.length task.handle_types))
+        ( task.Task_facades.key,
+          List.length task.handle_types - List.length task.implicit_inputs ))
     @ List.filter_opt predicate_inputs
   in
   let predicate_inputs =

@@ -212,7 +212,6 @@ let rec pat_names (p : pat) =
     [.proof] file as [at (anchor) step] or [on return e]. *)
 type outline_step =
   | At of {
-      anchor : term;  (** The code it follows, by its own names. *)
       anchor_loc : Location.t;
       action : step_action;
       action_loc : Location.t;
@@ -233,6 +232,7 @@ and step_action =
   | Linearize  (** [commit], [returning p -> commit] or [performs a]. *)
   | Scope  (** A proof around the access or call, [(fun step -> e)]. *)
   | Initializes  (** The ghost fields of an allocation, [initializes [...]]. *)
+  | Loop  (** An invariant at the first expression of a loop body. *)
 
 and outline = {
   outline_name : id;

@@ -462,7 +462,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       (stmts1 @ ghost @ stmts2, v)
   | Texp_while (cond, body) ->
       let* () = no_loop_before_linearizing ~at in
-      let* spec = State.of_result (loop_spec ctx ~after:cond.exp_loc body) in
+      let* spec, annotation = State.of_result (loop_spec ctx ~after:cond.exp_loc body) in
       let* c_stmts, c = expr ctx cond in
       let* x = State.fresh "continue" in
       (* A condition that needs statements, as reads, is evaluated before the loop and at the
@@ -485,7 +485,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let unraised c =
         Option.value_map guard ~default:c ~f:(fun g -> R.Expr.binary ~loc:l And c g)
       in
-      let* invariants = loop_invariants ?guard ctx ~at spec ~relation in
+      let* invariants = loop_invariants ?guard ?annotation ctx ~at spec ~relation in
       let invariants = invariants @ exceptional in
       let target = (x, l) in
       let* body_stmts, reaching =
@@ -518,7 +518,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           unit_value ~loc:l )
   | Texp_for (id, _, lo, hi, direction, body) ->
       let* () = no_loop_before_linearizing ~at in
-      let* spec = State.of_result (loop_spec ctx ~after:hi.exp_loc body) in
+      let* spec, annotation = State.of_result (loop_spec ctx ~after:hi.exp_loc body) in
       let* lo_stmts, lo = expr ctx lo in
       let* hi_stmts, hi = expr ctx hi in
       let int = R.Type.int ~loc:l in
@@ -541,7 +541,7 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
         Option.value_map raising ~default:([], []) ~f:(fun (d, _, _, _, x) -> (d, x))
       in
       let* invariants =
-        loop_invariants ~counter:i ?guard ctx ~at spec ~relation:(fun _ ->
+        loop_invariants ~counter:i ?guard ?annotation ctx ~at spec ~relation:(fun _ ->
             State.return None)
       in
       let invariants = invariants @ exceptional in
@@ -601,10 +601,17 @@ and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
 and domain_call ctx (e : Typedtree.expression) domain =
   let at = e.exp_loc in
   let l = loc at in
-  let* () =
-    if List.Assoc.mem ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal then
-      State.of_result (unsupported at "Ghost.scope attached to a Domain operation")
-    else State.return ()
+  let annotation =
+    List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
+  in
+  let scoped ~inputs ~outputs run =
+    match annotation with
+    | None ->
+        let+ statements, value, _, after_call = run None in
+        (statements @ after_call, value)
+    | Some annotation ->
+        access_proof ctx annotation ~result_type:e.exp_type ~input_types:inputs
+          ~output_types:outputs (fun values -> run (Some values))
   in
   let instantiate task =
     let* instance =
@@ -630,83 +637,163 @@ and domain_call ctx (e : Typedtree.expression) domain =
   match domain with
   | Domain_fork (task, arguments) ->
       let* task = instantiate task in
-      let* arguments =
+      let ocaml_args =
+        List.map arguments ~f:(function
+          | Unit_argument -> None
+          | Value_argument e -> Some e)
+      in
+      let* evaluated =
         State.all arguments ~f:(function
           | Unit_argument -> State.return ([], unit_value ~loc:l)
           | Value_argument expression -> expr ctx expression)
       in
-      let* types = State.all task.domain_inputs ~f:(State.typ ctx ~at) in
-      let captures_type =
-        match types with
-        | [] -> R.Type.tuple ~loc:l []
-        | [ one ] -> one
-        | types -> R.Type.tuple ~loc:l types
-      in
-      let values = List.map arguments ~f:snd in
-      let captures_value =
-        match values with [ one ] -> one | values -> R.Expr.tuple ~loc:l values
-      in
-      let* capture_name = State.fresh "domain_captures" in
-      let captures = R.Expr.var ~loc:l (name ~loc:l capture_name) in
-      let* handle_name = State.fresh "domain" in
-      State.return
-        ( List.concat_map arguments ~f:fst
-          @ R.Stmt.local ~loc:l ~const:true ~typ:captures_type
-              ~init:(R.Stmt.expr_rhs captures_value)
-              (ident ~loc:l capture_name)
-          @ [ R.Stmt.fold ~loc:l (member task "precondition") [ captures ] ]
-          @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
+      let values = List.map evaluated ~f:snd in
+      let run explicit =
+        let* ghosts =
+          Call_witnesses.infer_ghost_inputs ctx ~at ~callee:task.domain_procedure
+            ~ocaml_args ~prefix_count:0 ~explicit
+        in
+        let* history =
+          Call_witnesses.history_inputs ctx ~at ~callee:task.domain_procedure
+            ~argument_types:task.domain_inputs ~prefix_count:0 ~args:(values @ ghosts)
+        in
+        let* handle_name = State.fresh "domain" in
+        let adapter =
+          { task.domain_runtime with name = "fork$" ^ task.domain_template }
+        in
+        State.return
+          ( R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
               ~init:
                 (R.Stmt.expr_rhs
-                   (Domain_contract.fork ~loc:l ~runtime:task.domain_runtime captures))
+                   (R.Expr.call ~loc:l
+                      (Qualified_name.raven ~loc:l adapter)
+                      (values @ ghosts @ history)))
               (ident ~loc:l handle_name),
-          R.Expr.var ~loc:l (name ~loc:l handle_name) )
+            R.Expr.var ~loc:l (name ~loc:l handle_name),
+            [],
+            [] )
+      in
+      let+ statements, value =
+        scoped ~inputs:(List.map task.domain_ghost_inputs ~f:snd) ~outputs:[] run
+      in
+      (List.concat_map evaluated ~f:fst @ statements, value)
   | Domain_join (task, expression) ->
       let* task = instantiate task in
       let* statements, handle = expr ctx expression in
       let captures =
         Domain_contract.captures ~loc:l ~runtime:task.domain_runtime handle
       in
-      let* result_type = State.typ ctx ~at task.domain_result in
-      let* result_name = State.fresh "domain_result" in
-      let result = R.Expr.var ~loc:l (name ~loc:l result_name) in
+      let capture_count =
+        List.length task.domain_inputs
+        + List.length task.domain_ghost_inputs
+        + List.length task.domain_implicit_inputs
+        + (2 * task.domain_history_inputs)
+      in
+      let output_count =
+        List.length task.domain_ghost_outputs + (2 * task.domain_history_outputs)
+      in
+      let projection value count index =
+        if count = 1 then value else R.Expr.tuple_get ~loc:l value index
+      in
       let raises = match task.domain_raises with State.Raises [] -> false | _ -> true in
-      let* outcome_type =
-        if raises then State.typ ctx ~at Translate_context.outcome_type
-        else State.return (R.Type.tuple ~loc:l [])
+      let* capture_outcome =
+        match annotation with
+        | Some annotation when raises ->
+            State.of_result
+              (access_captures_outcome annotation
+                 ~outputs:(List.length task.domain_ghost_outputs))
+        | _ -> State.return false
       in
-      let* outcome_name = State.fresh "domain_outcome" in
-      let outcome = R.Expr.var ~loc:l (name ~loc:l outcome_name) in
-      let* propagation =
-        if not raises then State.return []
-        else
-          let* handlers =
-            State.gets (fun (state : State.state) -> state.carried.handlers)
-          in
-          let* () =
-            match (ctx.au, handlers) with
-            | Some _, [] ->
-                State.of_result
-                  (unsupported at
-                     "A Domain.join that may raise in a function with an atomic contract")
-            | _ -> State.return ()
-          in
-          propagate ~at ~certain:false ~typ:outcome_type outcome task.domain_raises
-      in
-      State.return
-        ( statements
-          @ R.Stmt.local ~loc:l ~typ:result_type (ident ~loc:l result_name)
-          @ R.Stmt.local ~loc:l ~typ:outcome_type (ident ~loc:l outcome_name)
-          @ [
-              R.Stmt.assign ~loc:l [ result; outcome ]
+      let run _ =
+        let* result_type = State.typ ctx ~at task.domain_result in
+        let* result_name = State.fresh "domain_result" in
+        let result = R.Expr.var ~loc:l (name ~loc:l result_name) in
+        let* ghosts_name = State.fresh "domain_ghosts" in
+        let ghosts = R.Expr.var ~loc:l (name ~loc:l ghosts_name) in
+        let ghosts_type = R.Type.named ~loc:l (member task "GhostResults") [] in
+        let* outcome_type =
+          if raises then State.typ ctx ~at Translate_context.outcome_type
+          else State.return (R.Type.tuple ~loc:l [])
+        in
+        let* outcome_name = State.fresh "domain_outcome" in
+        let outcome = R.Expr.var ~loc:l (name ~loc:l outcome_name) in
+        let* (state : State.state) = State.get in
+        let arguments =
+          List.mapi task.domain_inputs ~f:(fun index _ ->
+              let hint =
+                Option.bind
+                  (Option.join (List.nth task.domain_capture_hints index))
+                  ~f:(State.name_in state.names)
+              in
+              Option.value_map hint ~default:(projection captures capture_count index)
+                ~f:(fun hint -> R.Expr.var ~loc:l (name ~loc:l hint)))
+        in
+        let arguments =
+          arguments
+          @ List.mapi task.domain_ghost_inputs ~f:(fun index _ ->
+              projection captures capture_count (List.length task.domain_inputs + index))
+        in
+        let* history_decls, history =
+          Call_witnesses.history_outputs ctx ~at ~callee:task.domain_procedure
+            ~argument_types:task.domain_inputs ~prefix_count:0
+            ~result_type:task.domain_result ~args:arguments
+        in
+        let* propagation =
+          if not raises then State.return []
+          else
+            let* handlers =
+              State.gets (fun (state : State.state) -> state.carried.handlers)
+            in
+            let* () =
+              match (ctx.au, handlers) with
+              | Some _, [] ->
+                  State.of_result
+                    (unsupported at
+                       "A Domain.join that may raise in a function with an atomic \
+                        contract")
+              | _ -> State.return ()
+            in
+            propagate ~at ~certain:false ~typ:outcome_type outcome task.domain_raises
+        in
+        let public =
+          List.mapi task.domain_ghost_outputs ~f:(fun index _ ->
+              projection ghosts output_count index)
+        in
+        let history_assign =
+          List.mapi history ~f:(fun index target ->
+              R.Stmt.assign ~loc:l [ target ]
                 (R.Stmt.expr_rhs
-                   (Domain_contract.join ~loc:l ~runtime:task.domain_runtime handle
-                      captures));
-              R.Stmt.unfold ~loc:l (member task "postcondition")
-                [ captures; result; outcome ];
-            ]
-          @ propagation,
-          if is_unit e.exp_type then unit_value ~loc:l else result )
+                   (projection ghosts output_count (List.length public + index))))
+        in
+        let propagation, after_call =
+          if capture_outcome then ([], propagation) else (propagation, [])
+        in
+        State.return
+          ( R.Stmt.local ~loc:l ~typ:result_type (ident ~loc:l result_name)
+            @ R.Stmt.local ~loc:l ~ghost:true ~typ:ghosts_type (ident ~loc:l ghosts_name)
+            @ R.Stmt.local ~loc:l ~typ:outcome_type (ident ~loc:l outcome_name)
+            @ history_decls
+            @ [
+                R.Stmt.assign ~loc:l [ result; ghosts; outcome ]
+                  (R.Stmt.expr_rhs
+                     (Domain_contract.join ~loc:l ~runtime:task.domain_runtime handle
+                        captures));
+                R.Stmt.unfold ~loc:l (member task "postcondition")
+                  [ captures; result; ghosts; outcome ];
+              ]
+            @ history_assign @ propagation,
+            (if is_unit e.exp_type then unit_value ~loc:l else result),
+            (public @ if capture_outcome then [ outcome ] else []),
+            after_call )
+      in
+      let+ body, value =
+        scoped ~inputs:[]
+          ~outputs:
+            (List.map task.domain_ghost_outputs ~f:snd
+            @ if capture_outcome then [ outcome_type ] else [])
+          run
+      in
+      (statements @ body, value)
 
 and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
     (args : Typedtree.expression list) =
@@ -1209,54 +1296,10 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
     State.of_result (captured_arguments ~at:e.exp_loc ~values:[] s.names captured)
   in
   let prefix = prefix @ captured in
-  (* A ghost argument is the value of which the argument a precondition relates it to is a
-     field, as [q] for [tail] in [fix_tail tail new_tail] after [push { tail; _ }]. *)
   let* ghosts =
-    match explicit with
-    | Some values -> State.return values
-    | None ->
-        State.of_result
-          (all
-             (Option.value
-                (List.Assoc.find ctx.given.ghost_args f ~equal:String.equal)
-                ~default:[])
-             ~f:(fun equation ->
-               let known =
-                 Option.bind equation ~f:(fun (i, field) ->
-                     match List.nth ocaml_args (i - List.length prefix) with
-                     | Some { exp_desc = Texp_ident (Pident id, _, _); _ } ->
-                         Option.bind (State.name_in s.names id) ~f:(fun x ->
-                             List.find_map s.carried.fields_of ~f:(fun (y, (g, value)) ->
-                                 Option.some_if
-                                   (String.equal x y && String.equal g field)
-                                   value))
-                     (* The field itself of a variable, as [t.head]. *)
-                     | Some
-                         {
-                           exp_desc =
-                             Texp_field
-                               ({ exp_desc = Texp_ident (Pident y, _, _); _ }, _, label);
-                           _;
-                         }
-                       when String.equal label.lbl_name field ->
-                         Option.map (State.name_in s.names y) ~f:(fun y ->
-                             R.Expr.var ~loc:l (name ~loc:l y))
-                     | _ -> None)
-               in
-               match (known, equation) with
-               | Some value, _ -> Ok value
-               | None, None ->
-                   error e.exp_loc
-                     "Caravan cannot tell the ghost argument of this call: give the \
-                      callee a precondition that makes a parameter a field of it, as \
-                      tail = q.tail"
-               | None, Some (_, field) ->
-                   error e.exp_loc
-                     (Printf.sprintf
-                        "Caravan cannot tell the ghost argument of this call: the \
-                         argument is not a variable known to be the field %s of a value, \
-                         as one a record pattern binds"
-                        field)))
+    Call_witnesses.infer_ghost_inputs ctx ~at:e.exp_loc ~callee:f
+      ~ocaml_args:(List.map ocaml_args ~f:Option.some)
+      ~prefix_count:(List.length prefix) ~explicit
   in
   let args = prefix @ args @ ghosts in
   (* A recursive call before the function linearizes is a retry, which linearizes it in
@@ -1297,151 +1340,21 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
         au.close Commit_call ~value
           ~outcome:(Option.value_map outcome ~default:Returned ~f:(fun o -> Outcome o)))
   in
-  (* The latest snapshot witnesses the facts about earlier states that the callee
-     requires, with the arguments' positions in it. *)
-  let* path = get_path in
-  let* env = scope_env ctx in
-  let argument_type index =
-    Option.map
-      (List.nth ocaml_args (index - List.length prefix))
-      ~f:(fun (argument : Typedtree.expression) -> argument.exp_type)
-  in
   let* witnesses =
-    State.all
-      (Option.value (List.Assoc.find ctx.given.pasts f ~equal:String.equal) ~default:[])
-      ~f:(fun (inv, field, i) ->
-        let* st =
-          resolve_shared_structure ?element_type:(argument_type i) env ~at:e.exp_loc
-            ~invariant:inv ~field
-        in
-        let inv = st.invariant in
-        let* argument =
-          State.of_result
-            (Report.expect ~at:e.exp_loc "The argument a past fact is about"
-               (List.nth args i))
-        in
-        match
-          ( List.Assoc.find path.snapshots inv ~equal:String.equal,
-            known_position path.positions inv field argument )
-        with
-        | _, Some p -> State.return [ p.pos_snapshot; p.pos_k ]
-        | Some (latest :: _), None ->
-            let+ index =
-              State.of_result
-                (Report.expect ~at:e.exp_loc
-                   ("The snapshot index of field " ^ field)
-                   (List.Assoc.find latest.indices field ~equal:String.equal))
-            in
-            [
-              state_of ~loc:l st (grown st latest.values);
-              R.Expr.index ~loc:l index argument;
-            ]
-        | _ ->
-            State.of_result
-              (error e.exp_loc
-                 "This call needs a fact about an earlier state, of which no snapshot \
-                  was taken"))
+    Call_witnesses.history_inputs ctx ~at:e.exp_loc ~callee:f
+      ~argument_types:
+        (List.map ocaml_args ~f:(fun (e : Typedtree.expression) -> e.exp_type))
+      ~prefix_count:(List.length prefix) ~args
   in
   (* A library's procedure is qualified by its module, as [Backoff.once]. *)
   let callee_name = qualified_name ~loc:l (Option.value actual_target ~default:f) in
-  let callee = R.Expr.call ~loc:l callee_name (args @ List.concat witnesses @ implicit) in
-  (* The ghost results witnessing facts about the state after the call: the caller's own,
-     if the callee continues its update with the same ones. *)
-  let* ghost_facts =
-    let metadata =
-      Option.value
-        (List.Assoc.find ctx.given.past_returns f ~equal:String.equal)
-        ~default:[]
-    in
-    State.all metadata ~f:(fun past ->
-        let parameters = past.past_inputs @ [ past.past_result; past.past_element ] in
-        let* worker =
-          State.of_result
-            (Generic_parameters.discover ~expand:(Datatypes.expand env.data)
-               ~key:past.past_invariant ~name:past.past_invariant ~at:e.exp_loc
-               ~explicit:(List.length past.past_inputs)
-               parameters)
-        in
-        let* element_type =
-          if List.is_empty worker.variables then State.return past.past_element
-          else
-            let* () =
-              if
-                List.length past.past_inputs = List.length prefix + List.length ocaml_args
-              then State.return ()
-              else
-                State.of_result
-                  (unsupported e.exp_loc "This lifted history call's type arguments")
-            in
-            let* arguments =
-              State.of_result
-                (Generic_parameters.instantiate ~environment:env.ctx.given.env
-                   ~opaque:(Datatypes.is_opaque env.data)
-                   ~expand:(Datatypes.expand env.data) ~at:e.exp_loc worker
-                   (List.init (List.length prefix) ~f:(fun _ -> None)
-                   @ List.map ocaml_args ~f:(fun (argument : Typedtree.expression) ->
-                       Some argument.exp_type)
-                   @ [ Some e.exp_type; None ]))
-            in
-            State.return
-              (List.last_exn (Generic_parameters.parameter_types worker arguments))
-        in
-        let+ st =
-          resolve_shared_structure ~element_type env ~at:e.exp_loc
-            ~invariant:past.past_invariant ~field:past.past_field
-        in
-        { past with past_invariant = st.invariant; past_element = element_type })
-  in
-  let ghost_count = 2 * List.length ghost_facts in
+  let callee = R.Expr.call ~loc:l callee_name (args @ witnesses @ implicit) in
+  let reuse = Option.map retry ~f:(fun (au, _, _) -> au.ghost_results) in
   let* ghost_decls, ghosts =
-    match retry with
-    | Some (au, _, _) when ghost_count > 0 && List.length au.ghost_results = ghost_count
-      ->
-        State.return ([], au.ghost_results)
-    | _ ->
-        let+ fresh =
-          State.all ghost_facts ~f:(fun past ->
-              let st =
-                List.find_exn ctx.given.shared.structures ~f:(fun st ->
-                    String.equal st.invariant past.past_invariant)
-              in
-              let* position = State.fresh "position" in
-              let+ snapshot = State.fresh "snapshot" in
-              [
-                ( snapshot,
-                  R.Type.named ~loc:l
-                    (generated_module_member ~loc:l (module_name st "state") "T")
-                    [] );
-                (position, R.Type.int ~loc:l);
-              ])
-        in
-        let fresh = List.concat fresh in
-        ( List.concat_map fresh ~f:(fun (x, typ) ->
-              R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l x)),
-          List.map fresh ~f:(fun (x, _) -> R.Expr.var ~loc:l (name ~loc:l x)) )
-  in
-  (* The ghost results witness the positions of the entries the callee ensures. *)
-  let rec witnessed facts ghosts =
-    match (facts, ghosts) with
-    | past :: facts, snapshot :: k :: ghosts ->
-        let rest = witnessed facts ghosts in
-        begin match past.past_entry args with
-        | Some e ->
-            {
-              pos_inv = past.past_invariant;
-              pos_field = past.past_field;
-              pos_element = e;
-              pos_snapshot = snapshot;
-              pos_k = k;
-            }
-            :: rest
-        | None -> rest
-        end
-    | _ -> []
-  in
-  let* () =
-    modify_path (fun path ->
-        { path with positions = witnessed ghost_facts ghosts @ path.positions })
+    Call_witnesses.history_outputs ?reuse ctx ~at:e.exp_loc ~callee:f
+      ~argument_types:
+        (List.map ocaml_args ~f:(fun (e : Typedtree.expression) -> e.exp_type))
+      ~prefix_count:(List.length prefix) ~result_type:e.exp_type ~args
   in
   let* public =
     State.all signature_outputs ~f:(fun (_, ty) ->

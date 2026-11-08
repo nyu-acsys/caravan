@@ -11,6 +11,20 @@ let integer_literal ~at text =
         "This integer literal is outside the supported OCaml int range; use a \
          mathematical expression with smaller literals"
 
+let mathematical_list_length env ~at q =
+  let standard = function
+    | Path.Pdot (Pident module_, "length") ->
+        Ident.persistent module_ && String.equal (Ident.name module_) "Stdlib__List"
+    | Pdot (Pdot (Pident module_, "List"), "length") ->
+        Ident.persistent module_ && String.equal (Ident.name module_) "Stdlib"
+    | _ -> false
+  in
+  Option.exists (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+      standard path
+      || Option.exists
+           (Result.ok (Source.normalize_value_path env.ctx.given.env ~at path))
+           ~f:standard)
+
 let expected_outputs env outputs = function
   | Some result when List.length outputs = 1 -> [ Some result ]
   | Some result ->
@@ -1433,6 +1447,9 @@ and application env (t : S.term) =
       logical_application ~term:t env ~at
         (Option.value_exn (logical_signature env q))
         args
+  | Tvar q, args when mathematical_list_length env ~at q ->
+      let+ args = State.all args ~f:(formula env) in
+      R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] "len") args
   | Tvar q, args when Option.is_some (runtime_spec env q) ->
       let target = Qualified_name.to_string (Option.value_exn (runtime_spec env q)) in
       let* target =

@@ -584,7 +584,11 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
             not (String.is_prefix op ~prefix:"make"))
         ||
         match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
-        | Ok path -> Path_bindings.mem functions path || Path_bindings.mem libraries path
+        | Ok path ->
+            Path_bindings.mem functions path
+            || Path_bindings.mem libraries path
+            || Option.exists (Domain_primitives.operation path) ~f:(function
+                | Spawn | Join -> true)
         | Error _ -> false)
     | _ -> false
   in
