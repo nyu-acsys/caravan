@@ -32,7 +32,13 @@ type ctor = {
   args : Types.type_expr list;
 }
 
-type field = { label : string; raven_field : string; typ : Types.type_expr }
+type field = {
+  label : string;
+  raven_field : string;
+  typ : Types.type_expr;
+  generic : bool;  (** The declaration's payload depends on record parameters. *)
+}
+
 type collection_kind = Sequence | FinSet | Set | Map
 
 type family = {
@@ -313,16 +319,16 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
       let is_mutable (ld : Typedtree.label_declaration) =
         match ld.ld_mutable with Mutable -> true | Immutable -> false
       in
-      let* () =
-        if (not (List.is_empty decl.typ_params)) && List.exists lds ~f:is_mutable then
-          Report.unsupported at "A mutable record with type parameters"
-        else Ok ()
-      in
       let heap, ctors =
         if List.exists lds ~f:is_mutable then
           ( Some
               (List.map2_exn labels types ~f:(fun label typ ->
-                   { label; raven_field = record_field_name name label; typ })),
+                   {
+                     label;
+                     raven_field = record_field_name name label;
+                     typ;
+                     generic = not (List.is_empty (type_variables [] typ));
+                   })),
             [] )
         else
           ( None,
@@ -797,14 +803,16 @@ let is_opaque types typ =
   | _ -> false
 
 let instantiate (data : t) arguments =
-  let substitute = instantiate_alias data.parameters arguments in
-  Option.map
-    (Option.all
-       (List.map data.ctors ~f:(fun ctor ->
-            Option.map
-              (Option.all (List.map ctor.args ~f:substitute))
-              ~f:(fun args -> { ctor with args }))))
-    ~f:(fun ctors -> { data with ctors })
+  Option.map (substitution data.parameters arguments) ~f:(fun substitute ->
+      {
+        data with
+        ctors =
+          List.map data.ctors ~f:(fun ctor ->
+              { ctor with args = List.map ctor.args ~f:substitute });
+        heap =
+          Option.map data.heap
+            ~f:(List.map ~f:(fun field -> { field with typ = substitute field.typ }));
+      })
 
 let is_value_family (data : t) =
   (not (List.is_empty data.parameters))
@@ -910,7 +918,7 @@ let is_heap_ref (types : t list) (t : Types.type_expr) =
   match desc types t with
   | Tconstr (p, arguments, _) when is_reference_type p arguments -> true
   | Tconstr (p, [], _) when is_ghost p -> true
-  | Tconstr (p, [], _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
+  | Tconstr (p, _, _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
   | _ -> false
 
 (** Owners of generic data layouts retained in a value's Raven type. *)
@@ -1095,6 +1103,9 @@ let rec type_key types t =
               ~f:(fun (key, value) -> Map_key (key, value))
         | _ -> None
         end
+    | Tconstr (path, _, _)
+      when Option.exists (find types path) ~f:(fun data -> Option.is_some data.heap) ->
+        Some Ref_key
     | Tconstr (path, arguments, _)
       when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
         let data = Option.value_exn (find types path) in
@@ -1557,6 +1568,9 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let* key = typ types ?self ~at key in
       let* value = typ types ?self ~at value in
       Ok (R.Type.map ~loc:l key value)
+  | Tconstr (path, _, _)
+    when Option.exists (find types path) ~f:(fun data -> Option.is_some data.heap) ->
+      Ok (R.Type.ref ~loc:l)
   | Tconstr (path, arguments, _)
     when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
       let data = Option.value_exn (find types path) in
@@ -1588,9 +1602,6 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
           in
           Ok (R.Type.named ~loc:l (Qualified_name.raven ~loc:l name) arguments)
       end
-  | Tconstr (p, [], _)
-    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
-      Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [], _) when Option.exists self ~f:(fun d -> declares d p) ->
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
   | Tconstr (p, [], _)
@@ -1956,6 +1967,9 @@ let rec immediate (types : t list) (t : Types.type_expr) =
       true
   | Tconstr (p, arguments, _) when is_reference_type p arguments -> true
   | Tconstr (p, [], _) when is_ghost p -> true
+  | Tconstr (p, _, _)
+    when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
+      true
   | Tconstr (p, [], _) ->
       begin match find types p with
       | Some { heap = Some _; _ } -> true
@@ -1995,16 +2009,36 @@ let find_label (types : t list) (label : Data_types.label_description) =
   | Tconstr (p, _, _) -> Option.map (find types p) ~f:(fun d -> d)
   | _ -> None
 
-(** The fields declaring the fields of the record types of [types] that are references. *)
+(** A field family is nominal in its declaration and indexed by its stored domain. *)
+let record_field_family (field : field) =
+  let name = Qualified_name.of_string field.raven_field in
+  Qualified_name.to_string { name with name = "Field$" ^ name.name }
+
+let record_field_member types ~at (field : field) =
+  let l = loc at in
+  if field.generic then
+    let family = Qualified_name.of_string (record_field_family field) in
+    let value text = R.Name.make ~loc:l ~path:[ "V" ] text in
+    Ok
+      (R.Member.module_ ~loc:l
+         ~params:[ (R.Ident.make ~loc:l "V", R.Name.make ~loc:l Prelude.value_interface) ]
+         (R.Ident.make ~loc:l family.name)
+         [
+           R.Member.field ~loc:l ~where:(value "holds") (R.Ident.make ~loc:l "value")
+             (R.Type.named ~loc:l (value "Carrier") []);
+         ])
+  else
+    let* typ = typ types ~at field.typ in
+    let name = (Qualified_name.of_string field.raven_field).name in
+    Ok (field_member types ~loc:l name typ field.typ)
+
+(** The fields declaring heap record layouts, including their generic families. *)
 let fields ?declarations (types : t list) : (R.Member.t list, Report.error) Result.t =
-  let field (d : t) (f : field) =
-    let* typ = typ types ~at:d.at f.typ in
-    let l = loc d.at in
-    Ok (field_member types ~loc:l f.raven_field typ f.typ)
-  in
   Result.all
-    (List.concat_map (Option.value declarations ~default:types) ~f:(fun d ->
-         List.map (Option.value d.heap ~default:[]) ~f:(field d)))
+    (List.concat_map (Option.value declarations ~default:types) ~f:(fun data ->
+         List.map
+           (Option.value data.heap ~default:[])
+           ~f:(record_field_member types ~at:data.at)))
 
 let family_parameters ~loc ~interface (data : t) =
   List.mapi data.parameters ~f:(fun index _ ->

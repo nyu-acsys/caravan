@@ -1677,6 +1677,7 @@ type prepared_callable = {
 
 let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~result
     (contract : S.contract option) =
+  let ctx = { ctx with given = { ctx.given with execution_types = result :: args } } in
   let l = loc at in
   let header = Option.bind contract ~f:(fun c -> c.header) in
   let header_names =

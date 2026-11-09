@@ -6,10 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Native mutex and condition proofs support protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.
-- Proof-defined modules support type aliases, including nonrecursive aliases, and explicit manifest carrier constraints.
+- Polymorphic mutable records support allocation, ownership contracts, reads, and writes through generic functions, modules, and functors.
+- Native mutex and condition proofs support polymorphic protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.
+- Proof-defined modules support type aliases, including nonrecursive aliases, and parameterized manifest carrier constraints.
 - Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
-- Proof outlines support loop invariants and OCaml closure and record anchors.
+- Proof outlines support loop invariants, OCaml closure and record anchors, and ghost return adapters.
+- The OCaml 5 tutorial blocking stack verifies with polymorphic LIFO contracts and Domain handoff clients.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.
 
 ### Changed
@@ -18,6 +20,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Companion interface predicates remain available through annotation-free source module signatures while preserving opacity.
 - Loops no longer retain changing spatial preconditions as invariant facts.
 - Nested generic workers can reference enclosing module parameters without spurious dependency cycles.
 

@@ -158,3 +158,68 @@ let interface_name resource =
     let name = Qualified_name.of_string resource.resource_backend in
     Qualified_name.to_string { name with name = name.name ^ "$Interface" }
   else String.concat ~sep:"." resource.resource_functor
+
+(** The protected carrier fixes an instance even for operations taking only handles. *)
+let protected_carrier resources resource =
+  let rec follow seen resource arguments =
+    if List.mem seen resource.resource_id ~equal:Ident.same then None
+    else
+      let seen = resource.resource_id :: seen in
+      let actual path =
+        Option.bind (find_resource resources path) ~f:(fun target ->
+            follow seen target arguments)
+      in
+      if
+        List.equal String.equal resource.resource_functor
+          [ Mutex_contract.resource_interface ]
+      then
+        Option.bind resource.resource_descriptor.alias
+          ~f:(Datatypes.instantiate_alias resource.resource_parameters arguments)
+      else
+        match resource.resource_alias_of with
+        | Some path -> actual path
+        | None
+          when List.equal String.equal resource.resource_functor
+                 [ Mutex_contract.protocol_name ] ->
+            List.find_map resource.resource_arguments ~f:(function
+              | Module_argument path -> actual path
+              | Type_argument _ -> None)
+        | None -> None
+  in
+  follow [] resource resource.resource_parameters
+
+let infer_protected_arguments ?(fallback = []) ~types ~environment ~at resources resource
+    candidates =
+  let ( let* ) result f = Result.bind result ~f in
+  match resource_worker resource with
+  | None -> Ok []
+  | Some worker -> (
+      let* carrier =
+        Report.expect ~at "The protected resource family's carrier"
+          (protected_carrier resources resource)
+      in
+      let probe = { worker with parameters = [ carrier ]; explicit = 1 } in
+      let expand = Datatypes.expand types in
+      let equal = List.equal (Polymorphic_functions.same_type ~expand) in
+      let infer candidates =
+        List.filter_map candidates ~f:(fun candidate ->
+            Result.ok
+              (Generic_parameters.instantiate ~environment
+                 ~opaque:(Datatypes.is_opaque types) ~expand ~at probe [ Some candidate ]))
+        |> List.fold ~init:[] ~f:(fun choices arguments ->
+            if List.mem choices arguments ~equal then choices else arguments :: choices)
+      in
+      let choices =
+        match infer candidates with [] -> infer fallback | choices -> choices
+      in
+      match choices with
+      | [ arguments ] -> Ok arguments
+      | [] ->
+          Error
+            (Report.error Type at
+               "Cannot infer the protected resource family from this operation's carrier \
+                types")
+      | _ ->
+          Error
+            (Report.error Type at
+               "The protected resource family instance is ambiguous in this operation"))

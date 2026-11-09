@@ -100,6 +100,19 @@ Outlines can also select an access with `at (expression)`, as in the next chapte
 Matching ignores formatting and parentheses; ambiguous matches are rejected.
 Outlines for local helpers nest inside the enclosing function's outline, and
 source modules have corresponding `module ... = struct ... end` proof blocks.
+An outline can also supply ghost results through a return adapter. For example,
+if `let identity (value : int) = value` has this companion contract and proof:
+
+```proof
+proof result, [copy : int] = identity value
+  ensures (result === value && copy === value) =
+  on return Ghost.returns (fun result () -> result)
+```
+
+`result` is the runtime result; the adapter returns the ghost result `copy`.
+Multiple ghost results use a tuple. The adapter's second argument is the current
+proof state (`()` when there is none).
+
 Alternatively, proof annotations can follow their expressions in the `.ml`.
 Both forms use the same verifier; a companion proof is not an unchecked assumption.
 

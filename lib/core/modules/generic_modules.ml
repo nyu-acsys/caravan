@@ -192,12 +192,7 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
                             match constructor.cd_args with
                             | Cstr_tuple _ -> true
                             | Cstr_record _ -> false)
-                    | Ttype_record fields ->
-                        List.is_empty declaration.typ_params
-                        || List.for_all fields ~f:(fun field ->
-                            match field.Typedtree.ld_mutable with
-                            | Immutable -> true
-                            | Mutable -> false)
+                    | Ttype_record _ -> true
                     | _ -> false)
             | _ -> false)
     | None -> false

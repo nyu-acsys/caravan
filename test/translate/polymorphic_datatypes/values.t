@@ -30,6 +30,8 @@ Unsupported datatype forms are rejected before verification.
   $ caravan --shh nonregular.ml > nonregular.out 2>&1
   [1]
   $ grep -q 'A nonregular recursive datatype' nonregular.out
-  $ caravan --shh mutable.ml > mutable.out 2>&1
-  [1]
-  $ grep -q 'A mutable record with type parameters' mutable.out
+
+Parameterized mutable record declarations are accepted.
+
+  $ caravan --shh mutable.ml
+  Verification successful.

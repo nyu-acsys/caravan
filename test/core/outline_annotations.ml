@@ -83,3 +83,32 @@ let () =
       | Contract | Loop | Predicate | Ghost_module | Ghost | Returns | Manual | Initially
       | Initializes | Trusted ->
           failwith "Expected an outline proof step")
+
+let () =
+  let source = "let identity (value : int) = value\n" in
+  let proof =
+    "proof result, [copy : int] = identity value\n\
+     ensures (result === value && copy === value) =\n\
+     on return Ghost.returns (fun result () -> result)\n"
+  in
+  let structure = Parse.implementation (lexbuf "adapter.ml" source) in
+  let parsed =
+    Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
+      (lexbuf "adapter.proof" proof)
+  in
+  let annotations =
+    get (C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed)
+  in
+  let adapter =
+    List.find_exn annotations ~f:(fun annotation ->
+        match C.Annotation.kind annotation with Returns -> true | _ -> false)
+  in
+  ignore (get (C.Annotation.returns adapter));
+  let origin = Option.value_exn adapter.origin in
+  assert (String.equal adapter.text (slice proof origin.loc));
+  assert (String.equal origin.loc.loc_start.pos_fname "adapter.proof");
+  let contract =
+    List.find_exn annotations ~f:(fun annotation ->
+        match C.Annotation.kind annotation with Contract -> true | _ -> false)
+  in
+  ignore (get (C.Annotation.contract contract))

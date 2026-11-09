@@ -64,7 +64,8 @@ The [Saturn case studies](test/saturn) include:
 - The same queue with an [explicit segment proof](test/saturn/michael_scott_queue_lseg).
 
 The [Moonpool Parker](test/moonpool/parker) uses a mutex and condition variable to
-implement a coalescing permit.
+implement a coalescing permit. The [OCaml 5 tutorial blocking stack](test/ocaml5_tutorial/blocking_stack)
+adds polymorphic LIFO contracts over mutex-protected mutable state.
 
 Smaller [verification examples](test/examples) illustrate individual proof patterns.
 See [test organization](test/README.md) for the full collection.

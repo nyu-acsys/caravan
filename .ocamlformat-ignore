@@ -9,3 +9,4 @@ test/saturn/treiber_stack/treiber_stack.ml
 test/saturn/stack_drain/stack_drain.ml
 test/saturn/treiber_stack/treiber_stack.mli
 test/moonpool/parker/parker_.ml
+test/ocaml5_tutorial/blocking_stack/blocking_stack.ml

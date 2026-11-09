@@ -53,6 +53,7 @@ type signature_module = {
 }
 
 and signature_view = {
+  signature_annotated : bool;
   signature_resources : (string * signature_resource) list;
   signature_ghost_modules : (string * signature_ghost_module) list;
   signature_values : (string * signature_value) list;
@@ -231,6 +232,7 @@ let rec direct_body (expression : Typedtree.module_expr) =
 
 let empty_signature =
   {
+    signature_annotated = false;
     signature_resources = [];
     signature_ghost_modules = [];
     signature_values = [];
@@ -393,6 +395,7 @@ let merge_signature view included =
     List.fold right ~init:left ~f:(fun bindings (name, value) -> bind bindings name value)
   in
   {
+    signature_annotated = view.signature_annotated || included.signature_annotated;
     signature_values = merge view.signature_values (List.rev included.signature_values);
     signature_types = merge view.signature_types (List.rev included.signature_types);
     signature_resources = merge view.signature_resources included.signature_resources;
@@ -911,7 +914,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       |> Result.all
     in
     items ghost_declarations
-      { empty_signature with signature_resources; signature_ghost_modules }
+      {
+        empty_signature with
+        signature_annotated = not (List.is_empty annotations);
+        signature_resources;
+        signature_ghost_modules;
+      }
       signature.sig_items
   in
   let signature_module_substitution substitution path signature =
@@ -1911,6 +1919,51 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             Ok ()
         end
   in
+  (* Companion predicates complete signatures without proof annotations. *)
+  let constraints =
+    let constraints = List.rev !constraints in
+    let companion =
+      List.filter constraints ~f:(fun constraint_ -> not constraint_.restricts_visibility)
+    in
+    let rec unannotated signature =
+      (not signature.signature_annotated)
+      && List.for_all signature.signature_modules ~f:(fun (_, nested) ->
+          unannotated nested.signature_body)
+      && List.for_all signature.signature_modtypes ~f:(fun (_, nested) ->
+          unannotated nested)
+    in
+    let rec overlay owner signature =
+      if not (unannotated signature) then signature
+      else
+        let resources =
+          List.find_map companion ~f:(fun constraint_ ->
+              Option.some_if (Option.equal Path.same owner constraint_.owner) constraint_)
+          |> Option.value_map ~default:signature.signature_resources
+               ~f:(fun constraint_ ->
+                 List.map constraint_.signature.signature_resources
+                   ~f:(fun (name, resource) ->
+                     ( name,
+                       {
+                         resource with
+                         substitution =
+                           Subst.compose resource.substitution constraint_.substitution;
+                       } )))
+        in
+        let modules =
+          List.map signature.signature_modules ~f:(fun (name, nested) ->
+              let owner =
+                Option.value_map owner ~default:(root_module_path name) ~f:(fun owner ->
+                    Some (Path.Pdot (owner, name)))
+              in
+              (name, { nested with signature_body = overlay owner nested.signature_body }))
+        in
+        { signature with signature_resources = resources; signature_modules = modules }
+    in
+    List.map constraints ~f:(fun constraint_ ->
+        if constraint_.restricts_visibility then
+          { constraint_ with signature = overlay constraint_.owner constraint_.signature }
+        else constraint_)
+  in
   let definitions =
     let current_binding binding =
       Option.value_map
@@ -1977,7 +2030,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
       bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
-      constraints = List.rev !constraints;
+      constraints;
       library_signatures;
       specializations =
         List.rev_map !specializations

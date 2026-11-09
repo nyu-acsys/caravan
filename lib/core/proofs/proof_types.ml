@@ -77,12 +77,30 @@ let proof_constructor_collision ?(allow_shadowing = false) env interface proof =
   in
   find [] constructors
 
+let checked_constructor env ~at ~name parameters body =
+  let declaration =
+    Ast_helper.Type.mk ~loc:at
+      ~params:
+        (List.map parameters ~f:(fun parameter ->
+             ( Ast_helper.Typ.var ~loc:parameter.S.pid_loc parameter.pid_str,
+               (Asttypes.NoVariance, Asttypes.NoInjectivity) )))
+      ~manifest:(core_type ~at body)
+      { txt = Compiler_types.internal_name ~at ("argument_" ^ name); loc = at }
+  in
+  let typed =
+    Typemod.type_interface env [ Ast_helper.Sig.type_ Nonrecursive [ declaration ] ]
+  in
+  match typed.sig_type with
+  | [ Types.Sig_type (_, declaration, _, _) ] ->
+      (declaration.type_params, Option.value_exn declaration.type_manifest)
+  | _ -> failwith "A type argument must elaborate to one type declaration"
+
 (** Type-checks the algebraic types of [proof] in [env], after the implementation, and
     returns their descriptors and the environment for the rest of the proof. *)
 let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
     ?(allow_shadowing = false) ?(previous = ([], [], [], [], [])) ?complete_proof
-    ?(canonical_owner = Fn.id) (env : Env.t) (interface : interface option)
-    (proof : S.proof_decl list) :
+    ?(canonical_owner = Fn.id) ?(family_parameters = []) (env : Env.t)
+    (interface : interface option) (proof : S.proof_decl list) :
     ( Env.t
       * Datatypes.t list
       * proof_resource list
@@ -107,24 +125,6 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
         Error
           (Report.error Type name.pid_loc
              (Printf.sprintf "The proof constructor %s is already declared" name.pid_str))
-  in
-  let checked_constructor env ~at ~name parameters body =
-    let declaration =
-      Ast_helper.Type.mk ~loc:at
-        ~params:
-          (List.map parameters ~f:(fun parameter ->
-               ( Ast_helper.Typ.var ~loc:parameter.S.pid_loc parameter.pid_str,
-                 (Asttypes.NoVariance, Asttypes.NoInjectivity) )))
-        ~manifest:(core_type ~at body)
-        { txt = Compiler_types.internal_name ~at ("argument_" ^ name); loc = at }
-    in
-    let typed =
-      Typemod.type_interface env [ Ast_helper.Sig.type_ Nonrecursive [ declaration ] ]
-    in
-    match typed.sig_type with
-    | [ Types.Sig_type (_, declaration, _, _) ] ->
-        (declaration.type_params, Option.value_exn declaration.type_manifest)
-    | _ -> failwith "A type argument must elaborate to one type declaration"
   in
   let apply_parameters parameters arguments typ =
     Option.value_exn (Datatypes.instantiate_alias parameters arguments typ)
@@ -726,7 +726,21 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                         (not (List.is_empty parameters))
                         (List.length parameters))
                 in
-                let arity = Option.value (List.hd arities) ~default:0 in
+                let* () =
+                  if
+                    List.is_empty family_parameters
+                    || Proof_library.is_protected_resource signatures library
+                       && List.is_empty resource_arguments
+                  then Ok ()
+                  else
+                    Error
+                      (Report.error Type at
+                         "A proof-defined module does not support a parameterized type \
+                          constraint")
+                in
+                let arity =
+                  Option.value (List.hd arities) ~default:(List.length family_parameters)
+                in
                 let* () =
                   if List.for_all arities ~f:(Int.equal arity) then Ok ()
                   else
@@ -1074,7 +1088,10 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                       (Datatypes.with_paths resource_descriptor
                          [ Path.Pdot (Path.Pident resource_id, "t") ])
                       with
-                      alias = Some (Ctype.expand_head env resource_type);
+                      alias =
+                        Some
+                          (Ctype.expand_head env
+                             (Compiler_types.scheme_structure resource_type));
                     }
                   else resource_descriptor
                 in
@@ -1848,6 +1865,20 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 | None -> Error (Report.error Type at "Unknown Raven library interface")
               in
               let local = specification_bindings base env in
+              let resource =
+                List.find known_resources ~f:(fun resource ->
+                    resource.resource_definition
+                    && Option.exists scope.owner ~f:(fun owner ->
+                        Path.same owner resource.resource_path))
+              in
+              let family_parameters =
+                Option.value_map resource ~default:[] ~f:(fun resource ->
+                    resource.resource_parameters)
+              in
+              let family_arguments =
+                List.mapi family_parameters ~f:(fun index _ ->
+                    Ast_helper.Typ.var ~loc:at ("a" ^ Int.to_string index))
+              in
               let* () =
                 if
                   List.exists local ~f:(function
@@ -1860,13 +1891,8 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               in
               let* () =
                 let representation =
-                  List.find_map known_resources ~f:(fun resource ->
-                      if
-                        resource.resource_definition
-                        && Option.exists scope.owner ~f:(fun owner ->
-                            Path.same owner resource.resource_path)
-                      then resource.resource_descriptor.alias
-                      else None)
+                  Option.bind resource ~f:(fun resource ->
+                      resource.resource_descriptor.alias)
                 in
                 match representation with
                 | None -> Ok ()
@@ -1876,11 +1902,18 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                         | Types.Sig_type (id, declaration, _, _)
                           when String.equal (Ident.name id) "t" ->
                             Some
-                              (Ctype.newconstr (Path.Pident id) declaration.type_params)
+                              ( declaration.type_params,
+                                Ctype.newconstr (Path.Pident id) declaration.type_params
+                              )
                         | _ -> None)
                     in
                     begin match actual with
-                    | Some actual when Ctype.is_equal env false [ actual ] [ expected ] ->
+                    | Some (parameters, actual)
+                      when List.length parameters = List.length family_parameters
+                           && Ctype.is_equal env
+                                (not (List.is_empty family_parameters))
+                                (parameters @ [ actual ])
+                                (family_parameters @ [ expected ]) ->
                         Ok ()
                     | Some _ | None ->
                         Error
@@ -1946,7 +1979,9 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 let* expected =
                   match expected with
                   | Ok typ ->
-                      Ok (Typetexp.transl_simple_type env ~closed:true typ).ctyp_type
+                      if List.is_empty family_parameters then
+                        Ok (Typetexp.transl_simple_type env ~closed:true typ).ctyp_type
+                      else Ok (Typetexp.transl_type_scheme env typ).ctyp_type
                   | Error error -> Error error
                 in
                 let actual_declaration = declaration name in
@@ -2002,7 +2037,11 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                       (Report.error Type at
                          (Printf.sprintf "The proof-defined module is missing %s" name))
                 | Some actual ->
-                    if Ctype.is_equal env false [ actual ] [ expected ] then Ok ()
+                    if
+                      Ctype.is_equal env
+                        (not (List.is_empty family_parameters))
+                        [ actual ] [ expected ]
+                    then Ok ()
                     else
                       Error
                         (Report.error Type at
@@ -2016,14 +2055,14 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                       ~kind:
                         (Proof_library.operation_kind signatures selected operation.name)
                       operation.name
-                      (Proof_library.operation_type ~at ~signature:selected
-                         ~substitutions:[] operation))
+                      (Proof_library.operation_type ~family_arguments ~at
+                         ~signature:selected ~substitutions:[] operation))
               in
               List.fold_result (Proof_library.member_constants signatures selected)
                 ~init:() ~f:(fun () (name, typ) ->
                   member name
-                    (Proof_library.ocaml_type ~at ~signature:selected ~substitutions:[]
-                       typ))
+                    (Proof_library.ocaml_type ~family_arguments ~at ~signature:selected
+                       ~substitutions:[] typ))
         in
         let* exported_ghosts =
           public_ghost_modules ?public_interface ~comments scopes scope

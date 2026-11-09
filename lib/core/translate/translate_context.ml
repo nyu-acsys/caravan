@@ -1179,6 +1179,7 @@ type inputs = {
       (** The predicates, by their OCaml names, with their Raven names and parameter
           types. *)
   current_procedure : string option;
+  execution_types : Types.type_expr list;
   execution_contract : bool;
       (** Entry-context bindings in preconditions, rather than spatial context ownership.
       *)
@@ -1224,6 +1225,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     env;
     preds;
     current_procedure = None;
+    execution_types = [];
     execution_contract = false;
     mutex_execution = false;
     execution_owner = None;
@@ -1685,8 +1687,17 @@ module State = struct
       (Printf.sprintf "This %s may overflow" what)
       (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
 
-  (** The Raven field named [label] of the values of type [t] that are references; an
-      atomic's contents have the empty label, as in [own a v]. *)
+  let record_field given ~at (field : Datatypes.field) =
+    if field.generic then
+      let+ instance =
+        value_instance_given given ~at
+          ~target:(Datatypes.record_field_family field)
+          ~arguments:[ field.typ ]
+      in
+      instance ^ ".value"
+    else return field.raven_field
+
+  (** Resolve storage from an occurrence, retaining its declaration's field identity. *)
   let field_of_type (given : inputs) ~at (t : Types.type_expr) label =
     match Datatypes.desc given.types t with
     | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
@@ -1695,33 +1706,28 @@ module State = struct
     | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
         let+ field = atomic_field given ~at elt in
         Some field
-    | Tconstr (p, [], _) ->
-        begin match Datatypes.find given.types p with
-        | Some { heap = Some fields; _ } ->
-            return
-              (Option.map
-                 (List.find fields ~f:(fun f -> String.equal f.label label))
-                 ~f:(fun f -> f.raven_field))
-        | _ -> return None
-        end
-    | _ -> return None
-
-  (** The Raven field of the record field [label], and whether its record is a reference;
-      [None] if it is unknown. *)
-  let field_of_label (given : inputs) ~at (label : Data_types.label_description) =
-    match Types.get_desc label.lbl_res with
-    | Tconstr (p, [ elt ], _) when Datatypes.is_ref p ->
-        let+ field = ref_field given ~at elt in
-        Some (field, true)
     | _ ->
-        begin match Datatypes.find_label given.types label with
+        begin match Datatypes.instantiated given.types t with
         | Some { heap = Some fields; _ } ->
-            let field =
-              List.find_exn fields ~f:(fun f -> String.equal f.label label.lbl_name)
-            in
-            return (Some (field.raven_field, true))
-        | Some _ -> return (Some (label.lbl_name, false))
-        | None -> return None
+            begin match List.find fields ~f:(fun f -> String.equal f.label label) with
+            | None -> return None
+            | Some field ->
+                let+ field = record_field given ~at field in
+                Some field
+            end
+        | Some _ | None -> return None
+        end
+
+  (** The field of this record occurrence, and whether access reads the heap. *)
+  let field_of_label (given : inputs) ~at ~record_type
+      (label : Data_types.label_description) =
+    let+ field = field_of_type given ~at record_type label.lbl_name in
+    match field with
+    | Some field -> Some (field, true)
+    | None ->
+        begin match Datatypes.find_label given.types label with
+        | Some { heap = None; _ } -> Some (label.lbl_name, false)
+        | Some _ | None -> None
         end
 
   let ordinary_read ?guard (given : inputs) ~at ~field ~elt r =

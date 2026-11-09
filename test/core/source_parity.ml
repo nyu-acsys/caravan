@@ -108,7 +108,16 @@ let stack_drain_body source =
     ~init:body
     ~f:(fun body (pattern, with_) -> String.substr_replace_all body ~pattern ~with_)
 
+let tutorial_stack_body source =
+  match String.substr_index source ~pattern:"\nlet integer_lifo () =" with
+  | Some index -> String.rstrip (String.prefix source index) ^ "\n"
+  | None -> failwith "Missing tutorial blocking-stack client marker"
+
 let () =
+  check_digest "ocaml5_tutorial/blocking_stack/blocking_stack.ml (upstream module)"
+    "070ac004a55414d787bb243d24ca243f"
+    (tutorial_stack_body
+       (Stdio.In_channel.read_all "../ocaml5_tutorial/blocking_stack/blocking_stack.ml"));
   check_digest "moonpool/parker/parker_.ml" "0fe9b8df83e4820de11a2d4ba25176d0"
     (Stdio.In_channel.read_all "../moonpool/parker/parker_.ml");
   List.iter sources ~f:(fun (name, expected) ->

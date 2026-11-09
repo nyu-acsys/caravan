@@ -231,10 +231,14 @@ scope:
 ;
 
 return_adapter:
-| ghost = uident DOT RETURNS LEFTPAR FUN result = pat_arg state = pat_arg
-    ARROW body = proof_expr RIGHTPAR EOF
-    { if ghost.pid_str <> "Ghost" then
-        raise (Syntax_error (ghost.pid_loc, "Expected Ghost.returns"));
+| adapter = return_adapter_expr EOF { adapter }
+;
+
+return_adapter_expr:
+| ghost = uqualid DOT RETURNS LEFTPAR FUN result = pat_arg state = pat_arg
+    ARROW body = proof_expr RIGHTPAR
+    { if not (match ghost with Qid id -> id.pid_str = "Ghost" | Qdot _ -> false) then
+        raise (Syntax_error (qualid_loc ghost, "Expected Ghost.returns"));
       { returns_result = result; returns_state = state; returns_body = body } }
 ;
 
@@ -293,6 +297,17 @@ proof_item:
 ;
 
 outline(steps):
+| PROOF n = lident COMMA rs = separated_nonempty_list(COMMA, ret_value)
+    EQUAL b = outline_body(steps)
+    { ignore rs;
+      match b with
+      | `Steps _ -> raise (Syntax_error (n.pid_loc, "Ghost results are followed by = and the call"))
+      | `Contract (f, fs, contract_end, ss) ->
+          let params = List.filter_map (function Lvar x -> Some x | _ -> None) fs in
+          { outline_name = f; outline_params = (if params = [] then None else Some params);
+            outline_contract = Option.map (fun e ->
+              { (mk_loc $loc) with loc_start = $startpos(n); loc_end = e }) contract_end;
+            outline_steps = ss; outline_loc = mk_loc $loc } }
 | PROOF n = lident ps = fun_arg* cs = outline_clause* EQUAL b = outline_body(steps)
     { let params ps =
         match List.filter_map (function Lvar x -> Some x | _ -> None) ps with
@@ -366,12 +381,17 @@ outline_step:
 | a = lident LEFTPAR anchor RIGHTPAR step_action
     { raise (Syntax_error (a.pid_loc,
         "A step is at (code) followed by its step, or on return followed by ghost code")) }
+| ON r = lident adapter = return_adapter_expr
+    { if r.pid_str <> "return" then
+        raise (Syntax_error (r.pid_loc, "Expected on return"));
+      ignore adapter;
+      On_return { return_loc = mk_loc $loc(adapter); return_adapter = true } }
 | ON r = lident e = proof_nonseq
     { if r.pid_str <> "return" then
         raise (Syntax_error (r.pid_loc,
           "A step is at (code) followed by its step, or on return followed by ghost code"));
       ignore e;
-      On_return { return_loc = mk_loc $loc(e) } }
+      On_return { return_loc = mk_loc $loc(e); return_adapter = false } }
 | o = outline(nested_steps) { Nested o }
 ;
 
@@ -542,10 +562,7 @@ proof_definition_constraints:
     { if n.pid_str <> "t" then
         raise (Syntax_error (n.pid_loc,
           "A proof-defined module supports a constraint on type t only"));
-      if ps <> [] then
-        raise (Syntax_error (n.pid_loc,
-          "A proof-defined module does not support a parameterized type constraint"));
-      [n, ty] }
+      [ps, n, ty] }
 ;
 
 proof_module_parameter:

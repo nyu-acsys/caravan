@@ -1,0 +1,43 @@
+module Resource : Ghost.MutexResource with type ('a, 'b) t = ('b, 'a) t = struct
+  type nonrec ('a, 'b) t = ('b, 'a) t
+  predicate resource (cell : ('a, 'b) t) = exists value : 'b, other : 'a. own cell.value value && own cell.other other
+end
+module Guard = Ghost.Mutex(Resource)
+
+lemma fields (cell : ('a, 'b) t) (mutex [@implicit] : Mutex.t)
+    (condition [@implicit] : Condition.t)
+  returns (saved_mutex : Mutex.t) (saved_condition : Condition.t)
+  requires (own cell.mutex mutex && own cell.condition condition)
+  ensures (own cell.mutex mutex && own cell.condition condition &&
+    saved_mutex === mutex && saved_condition === condition) = (mutex, condition)
+
+predicate [@inline] handle (cell : ('a, 'b) t) (mutex : Mutex.t) (condition : Condition.t) =
+  own cell.mutex mutex && own cell.condition condition &&
+  Guard.is_mutex mutex cell && Guard.is_condition condition mutex
+
+proof result, [mutex : Mutex.t], [condition : Condition.t] = create value other
+  requires (Ghost.Mutex.context owner held)
+  ensures (handle result mutex condition && not (Finset.mem mutex held)) =
+  on return Ghost.returns (fun result () ->
+    let (mutex, condition) = fields result in
+    fold Resource.resource result;
+    Guard.initialize mutex result;
+    Guard.initialize_condition condition mutex;
+    (mutex, condition))
+
+proof await [mutex : Mutex.t] [condition : Condition.t] cell
+  requires (handle cell mutex condition && Ghost.Mutex.context owner held &&
+    not (Finset.mem mutex held))
+  ensures (handle cell mutex condition) = ()
+
+proof client () ensures (true) =
+  let first_handles = at (let first = create 17 false) (fun invoke ->
+    let (result, handles) = invoke () in (result, handles)) in
+  let second_handles = at (let second = create true 42) (fun invoke ->
+    let (result, handles) = invoke () in (result, handles)) in
+  at (await first) (fun invoke ->
+    let (mutex, condition) = first_handles in
+    let result = invoke (mutex, condition) in result);
+  at (await second) (fun invoke ->
+    let (mutex, condition) = second_handles in
+    let result = invoke (mutex, condition) in result)

@@ -223,7 +223,8 @@ type outline_step =
   | Let of { pattern : pat; value : proof_expr }
       (** [let p = e in ...]: pure ghost code for the later steps, which run it where they
           use it. *)
-  | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
+  | On_return of { return_loc : Location.t; return_adapter : bool }
+      (** Ghost code when the function returns. *)
   | Initially of { initialization_loc : Location.t }
       (** The constructor's initial shared state. *)
   | Nested of outline  (** The outline of a local function. *)
@@ -266,7 +267,7 @@ type proof_decl =
   | Proof_definition of {
       module_name : id;
       module_interface : qualid;
-      module_constraints : (id * pty) list;
+      module_constraints : (id list * id * pty) list;
       module_declarations : proof_decl list;
       module_outlines : outline list;
       module_loc : Location.t;

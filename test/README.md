@@ -9,6 +9,7 @@
 | `examples` | Verified clients, proof patterns, and small algorithm fragments. |
 | `saturn` | Saturn implementations and clients, aiming for upstream fidelity modulo annotations. |
 | `moonpool` | Moonpool implementations with companion proofs and unchanged upstream source. |
+| `ocaml5_tutorial` | OCaml 5 tutorial implementations with companion proofs and checked clients. |
 | `case_studies` | Substantial independent data structure implementations and their proofs. |
 
 Keep positive and negative checks alongside the sources they exercise. Examples

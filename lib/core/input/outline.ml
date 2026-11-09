@@ -521,14 +521,15 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
               | Linearize | Initializes | Scope -> place.pos_cnum
             in
             Ok (previous, visible, annotation :: annotations)
-        | On_return { return_loc } ->
+        | On_return { return_loc; return_adapter } ->
             let place = definition.body.pexp_loc.loc_end in
             let* outline =
               uses ~visible ~step_loc:return_loc ~regions:[] ~place:place.pos_cnum
                 (slice proof_text return_loc)
             in
+            let prefix = if return_adapter then "" else "proof " in
             let annotation =
-              synthesized ~prefix:"proof " ~outline ~proof_text ~origin:return_loc place
+              synthesized ~prefix ~outline ~proof_text ~origin:return_loc place
             in
             Ok (previous, visible, annotation :: annotations)
         | Initially { initialization_loc } ->

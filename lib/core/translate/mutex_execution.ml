@@ -241,7 +241,23 @@ let protocol ~at ~environment resources =
         String.compare a.Source.resource_backend b.resource_backend)
   in
   match protocols with
-  | [ protocol ] when List.is_empty protocol.resource_parameters -> Ok protocol
-  | [ _ ] -> unsupported at "A polymorphic native Mutex facade"
+  | [ protocol ] -> Ok protocol
   | [] -> error at "Native Mutex access requires a Ghost.Mutex facade"
   | _ -> error at "The native Mutex facade is ambiguous"
+
+let native_protocol ctx ~at ~receivers =
+  let open Translate_context in
+  let open State.Syntax in
+  let resources = ctx.given.proof_support.resources in
+  let* protocol = State.of_result (protocol ~at ~environment:ctx.given.env resources) in
+  match Generic_assets.resource_worker protocol with
+  | None -> State.return (Qualified_name.of_string protocol.resource_backend)
+  | Some worker ->
+      let* arguments =
+        State.of_result
+          (Generic_assets.infer_protected_arguments ~fallback:ctx.given.execution_types
+             ~types:ctx.given.types ~environment:ctx.given.env ~at resources protocol
+             receivers)
+      in
+      let+ instance = State.value_instance ctx ~at ~target:worker.name ~arguments in
+      Qualified_name.of_string (instance ^ "." ^ worker.member)

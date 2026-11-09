@@ -35,11 +35,11 @@ The implementation must satisfy its declared manifest equality and spatial membe
   [1]
   $ grep -q 'member resource must be a predicate' kind.out
 
-Unsupported constraint shapes are diagnosed at the header.
+Unsupported constraint members and incompatible carrier definitions are diagnosed.
 
   $ caravan --shh --emit-rav wrong_member.ml > member.out 2>&1
   [1]
   $ grep -q 'supports a constraint on type t only' member.out
   $ caravan --shh --emit-rav parameterized_constraint.ml > parameterized.out 2>&1
   [1]
-  $ grep -q 'does not support a parameterized type constraint' parameterized.out
+  $ grep -q 'does not satisfy its manifest constraint' parameterized.out

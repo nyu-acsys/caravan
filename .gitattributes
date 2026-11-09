@@ -8,3 +8,4 @@ test/saturn/treiber_stack/treiber_stack.ml text eol=lf
 test/saturn/treiber_stack/treiber_stack.mli text eol=lf
 test/saturn/stack_drain/stack_drain.ml text eol=lf
 test/moonpool/parker/parker_.ml text eol=lf
+test/ocaml5_tutorial/blocking_stack/blocking_stack.ml text eol=lf

@@ -1352,10 +1352,6 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let* member =
           match (resource.resource_definition, resource.resource_alias_of) with
           | true, _ ->
-              let* () =
-                if Option.is_none worker then Ok ()
-                else unsupported at "A parameterized proof-defined resource algebra"
-              in
               let* backend =
                 match implementation resource with
                 | Some backend -> Ok backend
@@ -1718,6 +1714,43 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           | View _ -> Ok None)
   in
   let generic_predicates = List.filter_opt generic_predicates in
+  let* generic_predicates =
+    all generic_predicates ~f:(fun worker ->
+        let resource =
+          Option.bind
+            (List.find scoped_proofs.bindings ~f:(fun binding ->
+                 String.equal binding.Proof_bindings.backend worker.Generic_parameters.key))
+            ~f:(fun binding ->
+              Option.bind (Program_scopes.definition_resource ~source binding.entry.scope)
+                ~f:(fun resource ->
+                  Option.map
+                    (List.find resource.Source.resource_operations
+                       ~f:(fun (name, _, _, _) ->
+                         String.equal name binding.entry.name.pid_str))
+                    ~f:(fun operation -> (resource, operation))))
+        in
+        match resource with
+        | Some (resource, (_, _, inputs, _))
+          when Generic_assets.transparent_protected_resource resource
+               && not (List.is_empty resource.resource_parameters) ->
+            let* arguments =
+              Generic_parameters.instantiate ~environment:resource.resource_environment
+                ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                ~at:resource.resource_at worker
+                (List.map inputs ~f:Option.some)
+            in
+            let correspondence = List.zip_exn worker.variables arguments in
+            let* variables =
+              all resource.resource_parameters ~f:(fun parameter ->
+                  Report.expect ~at:resource.resource_at
+                    "A predicate type parameter for each protected resource family \
+                     parameter"
+                    (List.find_map correspondence ~f:(fun (variable, argument) ->
+                         Option.some_if (Types.eq_type argument parameter) variable)))
+            in
+            Ok { worker with variables }
+        | _ -> Ok worker)
+  in
   let scope_of =
     Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs
   in
@@ -1995,6 +2028,24 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         Option.some_if task.Task_facades.emit task.worker)
   in
   let generic_predicate_workers = generic_predicates @ task_workers in
+  let* public_predicate_instances =
+    all scoped_proofs.bindings ~f:(fun binding ->
+        match
+          ( binding.Proof_bindings.kind,
+            Generic_parameters.find generic_predicates binding.backend,
+            Program_scopes.definition_resource ~source binding.entry.scope )
+        with
+        | Predicate _, Some worker, Some _ ->
+            let* worker =
+              Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~at:binding.entry.name.pid_loc worker binding.public_types
+            in
+            Ok (Some { worker with key = binding.public_key })
+        | _ -> Ok None)
+  in
+  let generic_predicates =
+    generic_predicates @ List.filter_opt public_predicate_instances
+  in
   let generic_predicates =
     generic_predicates
     @ List.filter_map tasks ~f:(fun task ->

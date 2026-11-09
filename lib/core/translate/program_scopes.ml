@@ -248,7 +248,11 @@ let run (source : Source.t) : (t, error) Result.t =
                      | _ -> false) ->
               implementation resource
           | Predicate _ | Lemma _ -> proof_implementation resource
-          | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _ ->
+          | Function _ ->
+              Option.map (implementation resource) ~f:(fun name ->
+                  if List.is_empty resource.resource_parameters then name
+                  else name ^ "$Helpers")
+          | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _ ->
               implementation resource
         in
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))

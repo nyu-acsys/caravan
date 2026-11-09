@@ -819,6 +819,9 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
         in
         let prepare_definition (root_env, resources) parent module_name module_interface
             constraints =
+          let family_parameters =
+            List.concat_map constraints ~f:(fun (parameters, _, _) -> parameters)
+          in
           let declaration =
             S.Proof_resource
               {
@@ -829,8 +832,8 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
           in
           let* local_env, _, all_resources, _, _, _ =
             Proof_types.elaborate_proof_types ~add_standard:false ~allow_interfaces:true
-              ~previous:([], resources, [], [], []) parent.Proof_scopes.environment None
-              [ declaration ]
+              ~family_parameters ~previous:([], resources, [], [], [])
+              parent.Proof_scopes.environment None [ declaration ]
           in
           let* signatures = Proof_library.signatures module_name.pid_loc in
           let* selected =
@@ -877,7 +880,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
           in
           let* local_env, new_resource =
             List.fold_result constraints ~init:(local_env, new_resource)
-              ~f:(fun (environment, resource) ((name : S.id), typ) ->
+              ~f:(fun (environment, resource) (parameters, (name : S.id), typ) ->
                 let* () =
                   if String.equal name.pid_str "t" then Ok ()
                   else
@@ -886,18 +889,38 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                          "A proof-defined module supports a constraint on type t only")
                 in
                 let manifest =
-                  (Typetexp.transl_simple_type parent.environment ~closed:true
-                     (core_type ~at:name.pid_loc typ))
-                    .ctyp_type
+                  if List.is_empty parameters then
+                    (Typetexp.transl_simple_type parent.environment ~closed:true
+                       (core_type ~at:name.pid_loc typ))
+                      .ctyp_type
+                  else
+                    let parameters, manifest =
+                      Proof_types.checked_constructor parent.environment ~at:name.pid_loc
+                        ~name:name.pid_str parameters typ
+                    in
+                    Option.value_exn
+                      (Datatypes.instantiate_alias parameters resource.resource_parameters
+                         manifest)
+                in
+                let carrier_manifest parameters =
+                  Option.value_exn
+                    (Datatypes.instantiate_alias resource.resource_parameters parameters
+                       manifest)
                 in
                 let* carrier =
                   match
                     List.find resource.resource_type_members ~f:(fun (member, _, _) ->
                         String.equal member "T")
                   with
-                  | Some (_, id, declaration) when List.is_empty declaration.type_params
-                    ->
-                      Ok (id, { declaration with type_manifest = Some manifest })
+                  | Some (_, id, declaration)
+                    when List.length declaration.type_params = List.length parameters ->
+                      Ok
+                        ( id,
+                          {
+                            declaration with
+                            type_manifest =
+                              Some (carrier_manifest declaration.type_params);
+                          } )
                   | Some _ ->
                       Error
                         (Report.error Type name.pid_loc
@@ -934,8 +957,9 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 in
                 let rec refine typ =
                   match Types.get_desc typ with
-                  | Tconstr (path, [], _) when List.mem carriers path ~equal:Path.same ->
-                      manifest
+                  | Tconstr (path, arguments, _)
+                    when List.mem carriers path ~equal:Path.same ->
+                      carrier_manifest arguments
                   | Tvar _ | Tunivar _ -> typ
                   | description ->
                       Btype.newgenty (Btype.copy_type_desc refine description)
@@ -946,7 +970,11 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                       when String.equal (Ident.name id) "t" ->
                         Types.Sig_type
                           ( id,
-                            { declaration with type_manifest = Some manifest },
+                            {
+                              declaration with
+                              type_manifest =
+                                Some (carrier_manifest declaration.type_params);
+                            },
                             recursive,
                             visibility )
                     | Sig_value (id, declaration, visibility) ->
@@ -989,13 +1017,14 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
               ~f:(fun owner -> Path.Pdot (owner, module_name.pid_str))
           in
           let resource =
-            {
-              new_resource with
-              resource_scope = parent.owner;
-              resource_path = path;
-              resource_environment = local_env;
-              resource_definition = true;
-            }
+            Generic_assets.decorate_resource
+              {
+                new_resource with
+                resource_scope = parent.owner;
+                resource_path = path;
+                resource_environment = local_env;
+                resource_definition = true;
+              }
           in
           let root_env = if Option.is_none parent.owner then local_env else root_env in
           Ok
@@ -1192,7 +1221,9 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                          {
                            resource with
                            resource_representation =
-                             Some (Ctype.newconstr (Path.Pident type_id) []);
+                             Some
+                               (Ctype.newconstr (Path.Pident type_id)
+                                  resource.resource_parameters);
                          }))
             in
             Ok

@@ -40,3 +40,6 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 The upstream Moonpool implementation files under test/moonpool are distributed
 under the MIT license; see test/moonpool/LICENSE for their attribution and license.
+
+The upstream OCaml 5 tutorial module under test/ocaml5_tutorial is distributed
+under the MIT license; see test/ocaml5_tutorial/LICENSE for its attribution and license.

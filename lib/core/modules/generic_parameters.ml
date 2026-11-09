@@ -49,7 +49,14 @@ let rebind ~expand ~at declaration parameters =
       ~explicit:declaration.explicit parameters
   in
   if List.length rebound.variables = List.length declaration.variables then
-    Ok { rebound with member = declaration.member }
+    let variables =
+      if
+        List.for_all declaration.variables ~f:(fun variable ->
+            List.mem rebound.variables variable ~equal:Types.eq_type)
+      then declaration.variables
+      else rebound.variables
+    in
+    Ok { rebound with member = declaration.member; variables }
   else Report.unsupported at "A generic proof signature with different type parameters"
 
 let instantiate ?environment ?(opaque = fun _ -> false) ~expand ~at predicate actuals =

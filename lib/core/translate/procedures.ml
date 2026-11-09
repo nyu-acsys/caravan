@@ -1475,7 +1475,21 @@ type proc_preparation = {
 let prepare_proc ~given ~past_structures ~proc_name (f : func) =
   let ctx =
     {
-      given = { given with current_procedure = Some proc_name; manual = f.manual };
+      given =
+        {
+          given with
+          current_procedure = Some proc_name;
+          manual = f.manual;
+          execution_types =
+            f.body.exp_type
+            :: (List.filter_map f.params ~f:(fun parameter ->
+                    match parameter.Typedtree.fp_kind with
+                    | Tparam_pat pattern -> Some pattern.pat_type
+                    | Tparam_optional_default (pattern, _) -> Some pattern.pat_type)
+               @ List.filter_map f.captured ~f:(fun id ->
+                   try Some (Env.find_value (Path.Pident id) f.environment).val_type
+                   with Stdlib.Not_found -> None));
+        };
       au = None;
     }
   in

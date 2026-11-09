@@ -1,0 +1,117 @@
+module Atomic_stack = struct
+  let saved : ('a t, 'a list) Ghost.field = Ghost.field ()
+
+  predicate contents (self : 'a t) (values [@implicit] : 'a list) =
+    own ~fraction:Permission.half (Ghost.at saved self) values
+
+  module Resource : Ghost.MutexResource with type 'a t = 'a t = struct
+    type nonrec 'a t = 'a t
+    predicate resource (self : 'a t) = exists values : 'a list.
+      own self.contents values &&
+      own ~fraction:Permission.half (Ghost.at saved self) values
+  end
+  module Guard = Ghost.Mutex(Resource)
+
+  predicate [@inline] is_stack (self : 'a t) (share : Permission.t)
+      (mutex [@implicit] : Mutex.t) (condition [@implicit] : Condition.t) =
+    own ~fraction:share self.mutex mutex && own ~fraction:share self.condition condition &&
+    Guard.is_mutex mutex self && Guard.is_condition condition mutex
+
+  lemma fields (self : 'a t) (mutex [@implicit] : Mutex.t)
+      (condition [@implicit] : Condition.t)
+    returns (saved_mutex : Mutex.t) (saved_condition : Condition.t)
+    requires (own self.mutex mutex && own self.condition condition)
+    ensures (own self.mutex mutex && own self.condition condition &&
+      saved_mutex === mutex && saved_condition === condition) = (mutex, condition)
+
+  module Push = Ghost.AU(struct let operation = push end)
+  module Pop = Ghost.AU(struct let operation = pop end)
+
+  proof result = make () =
+    at ({contents = []; mutex = Mutex.create (); condition = Condition.create ()})
+      initializes [Ghost.init saved []];
+    on return Ghost.returns (fun result () ->
+      let (mutex, condition) = fields result in
+      fold contents result [];
+      fold Resource.resource result;
+      Guard.initialize mutex result;
+      Guard.initialize_condition condition mutex;
+      (mutex, condition))
+
+  proof result = push r v =
+    at (Mutex.lock r.mutex) (fun invoke ->
+      let result = invoke () in unfold Resource.resource r; result);
+    at (Mutex.unlock r.mutex) (fun invoke ->
+      let token = Push.bind () in
+      let (_, _, _, values) = Push.access token r v mutex condition in
+      unfold contents r values;
+      Ghost.write (Ghost.at saved r) (v :: values);
+      fold contents r (v :: values);
+      Push.commit token r v mutex condition ();
+      fold Resource.resource r;
+      let result = invoke () in result)
+
+  proof result = pop r =
+    at (Mutex.lock r.mutex) (fun invoke ->
+      let result = invoke () in unfold Resource.resource r; result);
+    proof result = loop [mutex : Mutex.t] [condition : Condition.t] ()
+      requires (is_stack r share mutex condition && Guard.held mutex owner &&
+        Ghost.Mutex.context owner held && Finset.mem mutex held &&
+        own r.contents values &&
+        own ~fraction:Permission.half (Ghost.at saved r) values)
+      ensures (is_stack r share mutex condition && Guard.held mutex owner &&
+        exists tail : 'a list.
+          own r.contents tail &&
+          own ~fraction:Permission.half (Ghost.at saved r) (result :: tail)) = begin
+      at (Condition.wait r.condition r.mutex) (fun invoke ->
+        fold Resource.resource r;
+        let result = invoke () in unfold Resource.resource r; result);
+      at (loop ()) (fun invoke -> let result = invoke (mutex, condition) in result)
+    end;
+    at (let res = loop ()) (fun invoke -> let result = invoke (mutex, condition) in result);
+    at (Mutex.unlock r.mutex) (fun invoke ->
+      let token = Pop.bind () in
+      let (_, _, _, values) = Pop.access token r mutex condition in
+      unfold contents r values;
+      let tail = match values with
+        | [] -> assert (false); []
+        | head :: tail -> tail
+      in
+      Ghost.write (Ghost.at saved r) tail;
+      fold contents r tail;
+      Pop.commit token r mutex condition res;
+      fold Resource.resource r;
+      let result = invoke () in result)
+end
+
+proof result = integer_lifo () ensures (result === (42, 17)) =
+  let handles = at (let stack = Atomic_stack.make ()) (fun invoke ->
+    let (result, handles) = invoke () in (result, handles)) in
+  at (Atomic_stack.push stack 17) (fun invoke -> let result = invoke handles in result);
+  at (Atomic_stack.push stack 42) (fun invoke -> let result = invoke handles in result);
+  at (let top = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result);
+  at (let next = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result)
+
+proof result = boolean_lifo () ensures (result === (false, true)) =
+  let handles = at (let stack = Atomic_stack.make ()) (fun invoke ->
+    let (result, handles) = invoke () in (result, handles)) in
+  at (Atomic_stack.push stack true) (fun invoke -> let result = invoke handles in result);
+  at (Atomic_stack.push stack false) (fun invoke -> let result = invoke handles in result);
+  at (let top = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result);
+  at (let next = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result)
+
+proof produce [mutex : Mutex.t] [condition : Condition.t] stack
+  requires (Atomic_stack.is_stack stack Permission.full mutex condition &&
+    Atomic_stack.contents stack [] && Ghost.Mutex.context owner held && not (Finset.mem mutex held))
+  ensures (Atomic_stack.is_stack stack Permission.full mutex condition &&
+    Atomic_stack.contents stack [42; 17]) =
+  at (Atomic_stack.push stack 17) (fun invoke -> let result = invoke (mutex, condition) in result);
+  at (Atomic_stack.push stack 42) (fun invoke -> let result = invoke (mutex, condition) in result)
+module Producer = Ghost.Task(struct let operation = produce end)
+
+proof result = handoff () ensures (result === (42, 17)) =
+  let handles = at (let stack = Atomic_stack.make ()) (fun invoke ->
+    let (result, handles) = invoke () in (result, handles)) in
+  at (Domain.spawn (fun () -> produce stack)) (fun invoke -> let result = invoke handles in result);
+  at (let top = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result);
+  at (let next = Atomic_stack.pop stack) (fun invoke -> let result = invoke handles in result)

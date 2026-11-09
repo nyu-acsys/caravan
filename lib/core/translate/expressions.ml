@@ -195,7 +195,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
           let* typ = State.typ ctx ~at e.exp_type in
           let* fields =
             State.all values ~f:(fun (label, _) ->
-                let+ field = State.field_of_label ctx.given ~at label in
+                let+ field =
+                  State.field_of_label ctx.given ~at ~record_type:e.exp_type label
+                in
                 fst (Option.value_exn field))
           in
           let* x = State.fresh "tmp" in
@@ -216,7 +218,9 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
   | Texp_record _ -> State.of_result (unsupported at "A record copied with changes")
   | Texp_field (record, _, label) -> begin
       let* stmts, v = expr ctx record in
-      let* field = State.field_of_label ctx.given ~at label in
+      let* field =
+        State.field_of_label ctx.given ~at ~record_type:record.exp_type label
+      in
       match field with
       | Some (field, true) ->
           let+ reading, value =
@@ -239,13 +243,15 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       | None -> State.of_result (unsupported at "This field")
     end
   | Texp_setfield (record, _, label, value) -> begin
+      let value_type = value.exp_type in
       let* value_stmts, value = expr ctx value in
+      let record_type = record.exp_type in
       let* record_stmts, record = expr ctx record in
-      let* field = State.field_of_label ctx.given ~at label in
+      let* field = State.field_of_label ctx.given ~at ~record_type label in
       match field with
       | Some (field, true) ->
           let+ writing =
-            State.ordinary_write ctx.given ~at ~field ~elt:label.lbl_arg record value
+            State.ordinary_write ctx.given ~at ~field ~elt:value_type record value
           in
           (value_stmts @ record_stmts @ [ writing ], unit_value ~loc:l)
       | _ -> State.of_result (unsupported at "This field")
@@ -647,17 +653,18 @@ and mutex_call ctx (e : Typedtree.expression) operation args =
       State.return (statements @ creation, value)
   | Create, _ -> State.of_result (unsupported at "This Mutex.create application")
   | (Lock | Unlock | Try_lock), [ mutex ] when ctx.given.mutex_execution ->
-      let* protocol =
-        State.of_result
-          (Mutex_execution.protocol ~at ~environment:ctx.given.env
-             ctx.given.proof_support.resources)
+      let receivers =
+        List.filter_map args ~f:(fun argument ->
+            match argument.Typedtree.exp_desc with
+            | Texp_field (record, _, _) -> Some record.exp_type
+            | _ -> None)
       in
+      let* facade = Mutex_execution.native_protocol ctx ~at ~receivers in
       let* owner =
         State.of_result
           (Report.expect ~at "The native execution owner" ctx.given.execution_owner)
       in
       let* statements, mutex = expr ctx mutex in
-      let facade = Qualified_name.of_string protocol.resource_backend in
       let run _ =
         match operation with
         | Lock ->
@@ -715,17 +722,18 @@ and condition_call ctx (e : Typedtree.expression) operation args =
           | Wait, [ _; _ ] | (Signal | Broadcast), [ _ ] -> Ok ()
           | _ -> unsupported at "This Condition application")
       in
-      let* protocol =
-        State.of_result
-          (Mutex_execution.protocol ~at ~environment:ctx.given.env
-             ctx.given.proof_support.resources)
+      let receivers =
+        List.filter_map args ~f:(fun argument ->
+            match argument.Typedtree.exp_desc with
+            | Texp_field (record, _, _) -> Some record.exp_type
+            | _ -> None)
       in
+      let* facade = Mutex_execution.native_protocol ctx ~at ~receivers in
       let* owner =
         State.of_result
           (Report.expect ~at "The native execution owner" ctx.given.execution_owner)
       in
       let* statements, arguments = operands ctx args in
-      let facade = Qualified_name.of_string protocol.resource_backend in
       let method_ =
         match operation with
         | Wait -> "wait"
@@ -1688,15 +1696,16 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
       let values = List.mapi ps ~f:(fun i _ -> ([], R.Expr.tuple_get ~loc:l v i)) in
       components guard (List.map ps ~f:snd) values
   | Tpat_record (fields, _) ->
+      let record_type = p.pat_type in
       let* parts =
         State.all fields ~f:(fun (_, label, p) ->
-            let* field = State.field_of_label ctx.given ~at label in
+            let* field = State.field_of_label ctx.given ~at ~record_type label in
             match field with
             | Some (field, false) ->
                 State.return (p, ([], R.Expr.field ~loc:l v (qualified_name ~loc:l field)))
             | Some (field, true) ->
                 let+ access, value =
-                  State.ordinary_read ?guard ctx.given ~at ~field ~elt:label.lbl_arg v
+                  State.ordinary_read ?guard ctx.given ~at ~field ~elt:p.pat_type v
                 in
                 (p, (access, value))
             | None -> State.of_result (unsupported at "This field"))
@@ -2276,9 +2285,11 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
         end
       | _ -> not_pure "A read of a reference"
       end
-  | Texp_field ({ exp_desc = Texp_ident (Pident r, _, _); _ }, _, label)
+  | Texp_field (({ exp_desc = Texp_ident (Pident r, _, _); _ } as record), _, label)
     when Option.is_some (State.name_in names r) -> begin
-      let* field = State.field_of_label ctx.given ~at label in
+      let* field =
+        State.field_of_label ctx.given ~at ~record_type:record.exp_type label
+      in
       let x = Option.value_exn (State.name_in names r) in
       match field with
       | Some (field, true) ->
@@ -2294,7 +2305,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       | None -> not_pure "This field"
     end
   | Texp_field (record, _, label) ->
-      let* field = State.field_of_label ctx.given ~at label in
+      let* field =
+        State.field_of_label ctx.given ~at ~record_type:record.exp_type label
+      in
       begin match field with
       | Some (field, false) ->
           let+ record = pure_in values record in

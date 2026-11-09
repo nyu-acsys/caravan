@@ -12,8 +12,8 @@ compiler does not make an arbitrary library call verifiable.
 | Values | `int`, `bool`, `unit`, tuples, lists, options, variants, immutable records. | No general support for strings, floats, arrays, or objects. |
 | Control flow | `let`, `if`, pattern matching, sequencing, recursive functions, `while` and `for` loops. | Supply loop invariants when the inferred facts are insufficient; `variant` annotations on executable functions and loops are not yet supported. |
 | Functions | Named first-order functions, local helpers and captures, recursion, and rank-one polymorphism. | No general function-valued parameters, returned closures, or callbacks; no independently generalized helper that also depends on enclosing type parameters. |
-| Data types | Parameterized variants and immutable records, including regular recursive types and aliases. | Parameterized mutable records, inline constructor records, and nonregular recursive data types are unsupported. |
-| Mutable state | References, monomorphic mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
+| Data types | Parameterized variants and records, including mutable records, regular recursive types, and aliases. | Inline constructor records and nonregular recursive data types are unsupported. |
+| Mutable state | References, mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses. | Not arbitrary GADTs or dependent payloads. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
 | Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, native mutexes with ownership effects and task cleanup, and native conditions. | `Mutex.protect` is unsupported; blocking and deadlock freedom are not proved. |
@@ -24,6 +24,22 @@ source-value admissibility, including integer bounds and domains of nested
 containers. Local helpers can capture enclosing values and type parameters.
 Ordering on unconstrained generic values and explicitly quantified source type
 annotations remain outside the supported subset.
+
+Mutable records may have type parameters. Their fields use the usual ownership
+contracts; the same generic operation can store integers or Booleans:
+
+```ocaml
+type 'a cell = { mutable contents : 'a }
+
+let replace cell value = cell.contents <- value
+(*@ replace cell value
+    requires own cell.contents before
+    ensures own cell.contents value *)
+```
+
+Every field of a heap record requires ownership to read, including fields declared
+immutable in OCaml. Parameterized record fields retain their source-value bounds
+when generic operations are instantiated at concrete types.
 
 Checked `variant` annotations currently apply to logical functions and lemmas in
 `.proof` files. Executable functions and loops are verified for partial correctness,
@@ -213,8 +229,30 @@ originating call's context, including when tokens are aliased, stored in ghost
 fields, or used in a helping proof. This metadata does not grant ownership of that
 execution context to the helper.
 
-Native accesses currently require one unambiguous facade in the proof environment;
-standalone polymorphic facade families are deferred.
+Protected resources can also be polymorphic. For a source record `type 'a cell =
+{ mutable value : 'a; mutex : Mutex.t }`, its companion proof can declare:
+
+```proof
+module Cell : Ghost.MutexResource with type 'a t = 'a cell = struct
+  type 'a t = 'a cell
+  predicate resource (cell : 'a t) =
+    exists value : 'a. own cell.value value
+end
+module Guard = Ghost.Mutex (Cell)
+```
+
+Each value-type instance has its own checked resource implementation. Native
+accesses require one unambiguous facade in their lexical proof environment.
+Caravan infers its type arguments from the protected record receiver or a unique
+matching carrier among the function's parameters and result. Ghost operations
+can also use carrier types in the proof environment. Caravan rejects ambiguous
+cases rather than guessing a type instance.
+
+The [tutorial blocking stack](https://github.com/nyu-acsys/caravan/tree/main/test/ocaml5_tutorial/blocking_stack)
+uses this mechanism with a polymorphic list. Its constructor returns ghost mutex
+and condition handles, and its operation contracts take them as explicit ghost
+arguments. This keeps invariant masks precise across calls. An access scope passes
+the handles together as `invoke (mutex, condition)`; runtime calls stay unchanged.
 `Mutex.protect` is not supported yet. The
 [focused mutex examples](https://github.com/nyu-acsys/caravan/tree/main/test/translate/mutex)
 show complete critical sections and exceptional cleanup.

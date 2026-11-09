@@ -597,10 +597,27 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
       let+ () = State.note_call env.ctx.given signature.lemma_raven in
       signature
   | Some original ->
+      let protected =
+        List.find env.ctx.given.proof_support.resources ~f:(fun resource ->
+            Option.exists (Generic_assets.resource_worker resource) ~f:(fun worker ->
+                String.equal worker.key original.key
+                && String.equal worker.name original.name)
+            && Option.is_some
+                 (Generic_assets.protected_carrier env.ctx.given.proof_support.resources
+                    resource))
+      in
       let* worker =
-        State.of_result
-          (Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at original
-             (signature.lemma_inputs @ signature.lemma_outputs))
+        match protected with
+        | Some _ ->
+            State.return
+              {
+                original with
+                parameters = signature.lemma_inputs @ signature.lemma_outputs;
+              }
+        | None ->
+            State.of_result
+              (Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at original
+                 (signature.lemma_inputs @ signature.lemma_outputs))
       in
       let target = Qualified_name.of_string signature.lemma_raven in
       let worker =
@@ -629,9 +646,18 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
       let infer result =
         let outputs = expected_outputs env signature.lemma_outputs result in
         let instantiate supplied =
-          Generic_parameters.instantiate ~environment:env.ctx.given.env
-            ~opaque:(Datatypes.is_opaque env.data)
-            ~expand:(Datatypes.expand env.data) ~at worker (supplied @ outputs)
+          let inferred =
+            Generic_parameters.instantiate ~environment:env.ctx.given.env
+              ~opaque:(Datatypes.is_opaque env.data)
+              ~expand:(Datatypes.expand env.data) ~at worker (supplied @ outputs)
+          in
+          match (inferred, protected) with
+          | Ok _, _ | Error _, None -> inferred
+          | Error _, Some resource ->
+              Generic_assets.infer_protected_arguments ~types:env.data
+                ~environment:env.ctx.given.env ~at env.ctx.given.proof_support.resources
+                resource
+                (env.ctx.given.execution_types @ List.map env.var_types ~f:snd)
         in
         let supplied = supplied @ omitted in
         match result with
