@@ -122,6 +122,15 @@ let rec matches (a : Parsetree.expression) (e : Parsetree.expression) =
         List.length a = List.length e
         && List.for_all2_exn a e ~f:(fun (la, a) (le, e) ->
             Poly.equal la le && matches a e)
+    | Pexp_record (a, abase), Pexp_record (e, ebase) ->
+        Option.equal matches abase ebase
+        && List.equal
+             (fun (la, a) (le, e) ->
+               Poly.equal
+                 (Longident.flatten la.Location.txt)
+                 (Longident.flatten le.Location.txt)
+               && matches a e)
+             a e
     | ( Pexp_function (left, _, Pfunction_body left_body),
         Pexp_function (right, _, Pfunction_body right_body) ) ->
         let same_parameter (left : Parsetree.function_param)

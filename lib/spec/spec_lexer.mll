@@ -75,6 +75,7 @@
         "struct", STRUCT;
         "then", THEN;
         "type", TYPE;
+        "nonrec", NONREC;
         "true", TRUE;
         "unfold", UNFOLD;
         "variant", VARIANT;

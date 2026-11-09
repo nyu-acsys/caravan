@@ -1,0 +1,99 @@
+let permit_value : (t, bool) Ghost.field = Ghost.field ()
+
+predicate permit_state (self : t) (permit [@implicit] : bool) =
+  own ~fraction:Permission.half (Ghost.at permit_value self) permit
+
+lemma fields (self : t) (mutex [@implicit] : Mutex.t)
+    (condition [@implicit] : Condition.t)
+  returns (saved_mutex : Mutex.t) (saved_condition : Condition.t)
+  requires (own self.m mutex && own self.c condition)
+  ensures (own self.m mutex && own self.c condition &&
+    saved_mutex === mutex && saved_condition === condition) =
+  (mutex, condition)
+
+module Resource : Ghost.MutexResource with type t = t = struct
+  type nonrec t = t
+  predicate resource (self : t) =
+    exists permit : bool.
+      own self.permit permit &&
+      own ~fraction:Permission.half (Ghost.at permit_value self) permit
+end
+
+module Guard = Ghost.Mutex (Resource)
+
+predicate [@inline] is_parker (self : t) (mutex : Mutex.t) (condition : Condition.t)
+    (share : Permission.t) =
+  own ~fraction:share self.m mutex && own ~fraction:share self.c condition &&
+  Guard.is_mutex mutex self && Guard.is_condition condition mutex
+
+module Park = Ghost.AU (struct let operation = park end)
+module Unpark = Ghost.AU (struct let operation = unpark end)
+
+proof result = create ()
+  requires (Ghost.Mutex.context owner held)
+  ensures (is_parker result mutex condition Permission.full &&
+    not (Finset.mem mutex held) && permit_state result false) =
+  at ({ m = Mutex.create (); c = Condition.create (); permit = false })
+    initializes [Ghost.init permit_value false];
+  on return begin
+    let (mutex, condition) = fields result in
+    fold permit_state result false;
+    fold Resource.resource result;
+    Guard.initialize mutex result;
+    Guard.initialize_condition condition mutex
+  end
+
+proof result = atomic park self
+  requires (is_parker self mutex condition share && Ghost.Mutex.context owner held &&
+    not (Finset.mem mutex held))
+  ensures (is_parker self mutex condition share)
+  atomic requires (permit_state self previous)
+  atomic ensures (permit_state self false && previous) =
+  at (Mutex.lock self.m) (fun lock ->
+    let result = lock () in
+    unfold Resource.resource self;
+    result);
+  at (Condition.wait self.c self.m) invariant
+    (own ~fraction:share self.m mutex && own ~fraction:share self.c condition &&
+      own self.permit permit &&
+      own ~fraction:Permission.half (Ghost.at permit_value self) permit &&
+      Guard.is_mutex mutex self && Guard.is_condition condition mutex &&
+      Guard.held mutex owner &&
+      Ghost.Mutex.context owner (Finset.union held (Finset.singleton mutex)));
+  at (Condition.wait self.c self.m) (fun invoke ->
+    fold Resource.resource self;
+    let result = invoke () in
+    unfold Resource.resource self;
+    result);
+  at (Mutex.unlock self.m) (fun unlock ->
+    let token = Park.bind () in
+    let (_, _, _, _, previous, _) = Park.access token self in
+    unfold permit_state self previous;
+    assert (previous);
+    Ghost.write (Ghost.at permit_value self) false;
+    fold permit_state self false;
+    Park.commit token self ();
+    fold Resource.resource self;
+    let result = unlock () in
+    result)
+
+proof result = atomic unpark self
+  requires (is_parker self mutex condition share && Ghost.Mutex.context owner held &&
+    not (Finset.mem mutex held))
+  ensures (is_parker self mutex condition share)
+  atomic requires (permit_state self previous)
+  atomic ensures (permit_state self true) =
+  at (Mutex.lock self.m) (fun lock ->
+    let result = lock () in
+    unfold Resource.resource self;
+    result);
+  at (Mutex.unlock self.m) (fun unlock ->
+    let token = Unpark.bind () in
+    let (_, _, _, _, previous, _) = Unpark.access token self in
+    unfold permit_state self previous;
+    Ghost.write (Ghost.at permit_value self) true;
+    fold permit_state self true;
+    Unpark.commit token self ();
+    fold Resource.resource self;
+    let result = unlock () in
+    result)

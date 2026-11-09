@@ -600,12 +600,27 @@ and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
   match Mutex_primitives.operation normalized with
   | Some operation -> mutex_call ctx e operation args
   | None ->
-      begin match
-        List.Assoc.find ctx.given.domain_calls (Domain_calls.key e) ~equal:Poly.equal
-      with
-      | Some domain -> domain_call ctx e domain
-      | None -> apply_ordinary ctx e path declaration occurrence args
+      begin match Condition_primitives.operation normalized with
+      | Some operation -> condition_call ctx e operation args
+      | None ->
+          begin match
+            List.Assoc.find ctx.given.domain_calls (Domain_calls.key e) ~equal:Poly.equal
+          with
+          | Some domain -> domain_call ctx e domain
+          | None -> apply_ordinary ctx e path declaration occurrence args
+          end
       end
+
+and native_access ctx (e : Typedtree.expression) run =
+  match
+    List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
+  with
+  | None ->
+      let+ statements, value, _, _ = run None in
+      (statements, value)
+  | Some annotation ->
+      access_proof ctx annotation ~result_type:e.exp_type ~input_types:[] ~output_types:[]
+        (fun values -> run (Some values))
 
 and mutex_call ctx (e : Typedtree.expression) operation args =
   let at = e.exp_loc in
@@ -628,17 +643,7 @@ and mutex_call ctx (e : Typedtree.expression) operation args =
           [],
           [] )
       in
-      let* creation, value =
-        match
-          List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
-        with
-        | None ->
-            let+ creation, value, _, _ = run None in
-            (creation, value)
-        | Some annotation ->
-            access_proof ctx annotation ~result_type:e.exp_type ~input_types:[]
-              ~output_types:[] (fun values -> run (Some values))
-      in
+      let* creation, value = native_access ctx e run in
       State.return (statements @ creation, value)
   | Create, _ -> State.of_result (unsupported at "This Mutex.create application")
   | (Lock | Unlock | Try_lock), [ mutex ] when ctx.given.mutex_execution ->
@@ -678,21 +683,72 @@ and mutex_call ctx (e : Typedtree.expression) operation args =
               [] )
         | Create | Protect -> State.of_result (error at "Invalid native Mutex access")
       in
-      let* access, value =
-        match
-          List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
-        with
-        | None ->
-            let+ access, value, _, _ = run None in
-            (access, value)
-        | Some annotation ->
-            access_proof ctx annotation ~result_type:e.exp_type ~input_types:[]
-              ~output_types:[] (fun values -> run (Some values))
-      in
+      let* access, value = native_access ctx e run in
       State.return (statements @ access, value)
   | (Lock | Unlock | Try_lock), _ ->
       State.of_result (error at "Native Mutex access requires a Ghost.Mutex facade")
   | Protect, _ -> State.of_result (unsupported at "Mutex.protect")
+
+and condition_call ctx (e : Typedtree.expression) operation args =
+  let at = e.exp_loc in
+  let l = loc at in
+  match (operation, args) with
+  | Condition_primitives.Create, [ argument ] ->
+      let* statements, _ = expr ctx argument in
+      let* () = State.note_condition_support in
+      let run _ =
+        let+ result = State.fresh "condition" in
+        ( R.Stmt.local ~loc:l
+            ~typ:(Condition_contract.typ ~loc:l)
+            ~init:(R.Stmt.expr_rhs (Condition_contract.create ~loc:l))
+            (ident ~loc:l result),
+          R.Expr.var ~loc:l (name ~loc:l result),
+          [],
+          [] )
+      in
+      let+ creation, value = native_access ctx e run in
+      (statements @ creation, value)
+  | (Wait | Signal | Broadcast), _ when ctx.given.mutex_execution ->
+      let* () =
+        State.of_result
+          (match (operation, args) with
+          | Wait, [ _; _ ] | (Signal | Broadcast), [ _ ] -> Ok ()
+          | _ -> unsupported at "This Condition application")
+      in
+      let* protocol =
+        State.of_result
+          (Mutex_execution.protocol ~at ~environment:ctx.given.env
+             ctx.given.proof_support.resources)
+      in
+      let* owner =
+        State.of_result
+          (Report.expect ~at "The native execution owner" ctx.given.execution_owner)
+      in
+      let* statements, arguments = operands ctx args in
+      let facade = Qualified_name.of_string protocol.resource_backend in
+      let method_ =
+        match operation with
+        | Wait -> "wait"
+        | Signal -> "signal"
+        | Broadcast -> "broadcast"
+        | Create -> "create"
+      in
+      let run _ =
+        State.return
+          ( [
+              R.Stmt.call ~loc:l
+                (Mutex_contract.protocol_call ~loc:l ~facade method_
+                   (arguments @ [ owner ]));
+            ],
+            unit_value ~loc:l,
+            [],
+            [] )
+      in
+      let+ access, value = native_access ctx e run in
+      (statements @ access, value)
+  | Create, _ -> State.of_result (unsupported at "This Condition.create application")
+  | (Wait | Signal | Broadcast), _ ->
+      State.of_result (error at "Native Condition access requires a Ghost.Mutex facade")
 
 and domain_call ctx (e : Typedtree.expression) domain =
   let at = e.exp_loc in

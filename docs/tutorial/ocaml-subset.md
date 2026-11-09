@@ -16,7 +16,7 @@ compiler does not make an arbitrary library call verifiable.
 | Mutable state | References, monomorphic mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses. | Not arbitrary GADTs or dependent payloads. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
-| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, and native mutexes with ownership effects and task cleanup. | `Mutex.protect` and `Condition` remain unsupported; blocking and deadlock freedom are not proved. |
+| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, native mutexes with ownership effects and task cleanup, and native conditions. | `Mutex.protect` is unsupported; blocking and deadlock freedom are not proved. |
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve
@@ -215,9 +215,27 @@ execution context to the helper.
 
 Native accesses currently require one unambiguous facade in the proof environment;
 standalone polymorphic facade families are deferred.
-`Mutex.protect` and `Condition` operations are not supported yet. The
+`Mutex.protect` is not supported yet. The
 [focused mutex examples](https://github.com/nyu-acsys/caravan/tree/main/test/translate/mutex)
 show complete critical sections and exceptional cleanup.
+
+### Native condition variables
+
+`Condition.create`, `Condition.wait`, `Condition.signal`, and
+`Condition.broadcast` are supported with a `Ghost.Mutex` facade. Associate a
+condition with its mutex using `Guard.initialize_condition condition mutex`;
+`Guard.is_condition condition mutex` records that persistent association.
+`wait` requires the current owner to hold the associated mutex and its folded
+resource. It releases the mutex while waiting, reacquires it on return, and
+returns the refreshed resource. Since wakeups may be spurious, callers must
+recheck their predicate in a loop. `signal` and `broadcast` require the
+association, but do not require the mutex to be held and establish no guard or
+protected-data guarantee.
+
+The [condition regressions](https://github.com/nyu-acsys/caravan/tree/main/test/translate/condition)
+show the basic contract and spurious-wakeup behavior. The
+[Moonpool parker](https://github.com/nyu-acsys/caravan/tree/main/test/moonpool/parker)
+is a larger example using waits and notifications together.
 
 ## Modules and functors {#sec:modules-and-functors}
 

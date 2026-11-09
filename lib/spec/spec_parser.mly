@@ -75,7 +75,7 @@
     let rec convert = function
       | Proof_state { state_name = n; state_params = ps; state_fields = fs }
         when not (List.mem n.pid_str states) ->
-          Proof_type { type_name = n; type_params = ps; type_kind = Record (List.map field fs) }
+          Proof_type { type_name = n; type_params = ps; type_kind = Record (List.map field fs); type_recursive = true }
       | Proof_module m ->
           Proof_module { m with module_declarations = List.map convert m.module_declarations }
       | Proof_definition m ->
@@ -147,7 +147,7 @@
 
 (* Keywords *)
 
-%token ELSE EXISTS FALSE FORALL IF IN LET REC MATCH NOT OLD THEN TRUE WITH
+%token ELSE EXISTS FALSE FORALL IF IN LET REC NONREC MATCH NOT OLD THEN TRUE WITH
 
 (* Symbols *)
 
@@ -394,7 +394,7 @@ anchor_token:
 | HELPS | AS | PROOF | AT | LEMMA | RETURNS | OF
 | BEGIN | END | MODULE | STRUCT | FUN | SET_OF_PREDICATE | FRACTION
 | ELSE | EXISTS | FALSE | FORALL | IF | IN | LET
-| REC | MATCH | NOT | OLD | THEN | TRUE | WITH
+| REC | NONREC | MATCH | NOT | OLD | THEN | TRUE | WITH
 | CONJ | AMPAMP | ARROW | BAR | BARBAR | COLON | COLONCOLON
 | COMMA | DOT | DOTDOT | EQUAL | LRARROW | LTGT | DISJ
 | SEMICOLON | STAR | UNDERSCORE
@@ -510,9 +510,11 @@ proof_decl:
 | TYPE ps = loption(type_parameters) n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
     { Proof_state { state_name = n; state_params = ps; state_fields = fs } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL cs = bar_list1(type_ctor)
-    { Proof_type { type_name = n; type_params = ps; type_kind = Variant cs } }
+    { Proof_type { type_name = n; type_params = ps; type_kind = Variant cs; type_recursive = true } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL ty = typ
-    { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty } }
+    { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty; type_recursive = true } }
+| TYPE NONREC ps = loption(type_parameters) n = lident EQUAL ty = typ
+    { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty; type_recursive = false } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);

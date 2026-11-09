@@ -31,7 +31,7 @@ let increment value = value + 1
 Caravan is under active development. It supports a first-order subset of OCaml 5,
 including polymorphic functions, algebraic data types, records, modules and
 functors, mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
-tasks, native mutex critical sections, exceptions, and constant GADT witnesses.
+tasks, native mutexes and condition variables, exceptions, and constant GADT witnesses.
 See the [tutorial](https://nyu-acsys.github.io/caravan/tutorial/) for examples,
 [language coverage](https://nyu-acsys.github.io/caravan/tutorial/ocaml-subset), and
 [semantic conventions](https://nyu-acsys.github.io/caravan/tutorial/semantics).
@@ -62,6 +62,9 @@ The [Saturn case studies](test/saturn) include:
   [parallel stack-drain clients](test/saturn/stack_drain) using domains.
 - A [Michael–Scott queue with automatic history reasoning](test/saturn/michael_scott_queue).
 - The same queue with an [explicit segment proof](test/saturn/michael_scott_queue_lseg).
+
+The [Moonpool Parker](test/moonpool/parker) uses a mutex and condition variable to
+implement a coalescing permit.
 
 Smaller [verification examples](test/examples) illustrate individual proof patterns.
 See [test organization](test/README.md) for the full collection.

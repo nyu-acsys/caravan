@@ -8,6 +8,7 @@
 | `translate` | Focused translation and diagnostic regressions. |
 | `examples` | Verified clients, proof patterns, and small algorithm fragments. |
 | `saturn` | Saturn implementations and clients, aiming for upstream fidelity modulo annotations. |
+| `moonpool` | Moonpool implementations with companion proofs and unchanged upstream source. |
 | `case_studies` | Substantial independent data structure implementations and their proofs. |
 
 Keep positive and negative checks alongside the sources they exercise. Examples
@@ -31,3 +32,7 @@ The history queue implementation is the unchanged file from Saturn commit
 proof and interfaces. The source-parity regression checks its exact bytes and
 the original interface bytes after removing inserted annotations. Formatting
 excludes this implementation too, and its source files use LF line endings.
+
+Moonpool examples follow the same per-data-structure layout under `moonpool/`.
+The Parker implementation retains its upstream bytes, checked by the source-parity
+regression, and its annotations live in a companion `.proof` file.

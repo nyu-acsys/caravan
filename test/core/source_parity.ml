@@ -109,6 +109,8 @@ let stack_drain_body source =
     ~f:(fun body (pattern, with_) -> String.substr_replace_all body ~pattern ~with_)
 
 let () =
+  check_digest "moonpool/parker/parker_.ml" "0fe9b8df83e4820de11a2d4ba25176d0"
+    (Stdio.In_channel.read_all "../moonpool/parker/parker_.ml");
   List.iter sources ~f:(fun (name, expected) ->
       let path = "../saturn/" ^ name in
       let source = Stdio.In_channel.read_all path in

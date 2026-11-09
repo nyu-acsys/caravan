@@ -1,0 +1,51 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = exists value : int. own cell.contents value && 0 <= value
+end
+module Guard = Ghost.Mutex (Cell)
+
+proof result = make cell
+  requires (Ghost.Mutex.context owner held && own cell.contents value && 0 <= value)
+  ensures (match result with mutex, condition ->
+    Guard.is_mutex mutex cell && Guard.is_condition condition mutex && not (Finset.mem mutex held)) =
+  at (Mutex.create ()) (fun create ->
+    fold Cell.resource cell;
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex);
+  at (Condition.create ()) (fun create ->
+    let condition = create () in
+    Guard.initialize_condition condition mutex;
+    condition)
+
+proof await mutex condition
+  requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held) &&
+    Guard.is_mutex mutex cell && Guard.is_condition condition mutex)
+  ensures (Guard.is_mutex mutex cell && Guard.is_condition condition mutex) = ()
+
+proof signal condition
+  requires (Guard.is_condition condition mutex)
+  ensures (Guard.is_condition condition mutex) = ()
+
+proof broadcast condition
+  requires (Guard.is_condition condition mutex)
+  ensures (Guard.is_condition condition mutex) = ()
+
+proof result = refresh mutex condition cell
+  requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held) &&
+    Guard.is_mutex mutex cell && Guard.is_condition condition mutex)
+  ensures (Guard.is_mutex mutex cell && Guard.is_condition condition mutex && 0 <= result) =
+  at (Mutex.lock mutex) (fun lock ->
+    let result = lock () in
+    unfold Cell.resource cell;
+    result);
+  at (Condition.wait condition mutex) (fun invoke ->
+    fold Cell.resource cell;
+    let result = invoke () in
+    unfold Cell.resource cell;
+    result);
+  at (Mutex.unlock mutex) (fun unlock ->
+    fold Cell.resource cell;
+    let result = unlock () in result)
+
+proof result = client () ensures (0 <= result) = ()

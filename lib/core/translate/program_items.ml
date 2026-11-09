@@ -592,6 +592,7 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
             || Option.exists (Mutex_primitives.operation path) ~f:(function
               | Create | Lock | Unlock | Try_lock -> true
               | Protect -> false)
+            || Option.is_some (Condition_primitives.operation path)
         | Error _ -> false)
     | _ -> false
   in

@@ -122,7 +122,7 @@ let snapshot ~loc self = execution_call ~loc "snapshot" [ self ]
 
 module C = Checked_signatures
 
-type public_type = Carrier | Native_mutex | Owner | Resource
+type public_type = Carrier | Native_mutex | Native_condition | Owner | Resource
 
 type public_parameter = {
   parameter_name : string;
@@ -180,12 +180,33 @@ let initialization_declaration =
     declaration_results = [];
   }
 
+let condition_declaration =
+  {
+    declaration_name = "is_condition";
+    declaration_kind = R.Ast.Callable.Invariant;
+    declaration_parameters = [ public_parameter "c" Native_condition ];
+    declaration_results = [ public_parameter ~ghost:true ~implicit:true "m" Native_mutex ];
+  }
+
+let condition_initialization_declaration =
+  {
+    declaration_name = "initialize_condition";
+    declaration_kind = R.Ast.Callable.Lemma;
+    declaration_parameters =
+      [
+        public_parameter "c" Native_condition;
+        public_parameter ~ghost:true "m" Native_mutex;
+      ];
+    declaration_results = [];
+  }
+
 let public_variables ~loc parameters =
   List.map
     (fun parameter ->
       let typ =
         match parameter.parameter_type with
         | Carrier | Native_mutex -> R.Type.named ~loc (local ~loc "T") []
+        | Native_condition -> Condition_contract.typ ~loc
         | Resource -> R.Type.named ~loc (local ~loc "R") []
         | Owner -> R.Type.ref ~loc
       in
@@ -204,6 +225,7 @@ let public_returns ~loc declaration =
 let source_callable declaration : C.callable =
   let typ = function
     | Carrier | Native_mutex -> C.Named ([ "T" ], [])
+    | Native_condition -> C.Named ([ Condition_contract.type_name ], [])
     | Resource -> C.Named ([ "R" ], [])
     | Owner -> C.Ref
   in
@@ -270,7 +292,13 @@ let source_signatures () : C.module_signature list =
       operations = [];
       callables =
         List.map source_callable
-          [ association_declaration; held_declaration; initialization_declaration ];
+          [
+            association_declaration;
+            held_declaration;
+            initialization_declaration;
+            condition_declaration;
+            condition_initialization_declaration;
+          ];
       constants = [];
     };
   ]
@@ -437,6 +465,10 @@ let protocol ~loc () =
   let r = variable ~loc "r" in
   let held_values = variable ~loc "held_set" in
   let association = R.Expr.call ~loc (local ~loc "is_mutex") [ mutex; r ] in
+  let condition = variable ~loc "c" in
+  let condition_association =
+    R.Expr.call ~loc (local ~loc "is_condition") [ condition; mutex ]
+  in
   let protected = R.Expr.call ~loc (R.Name.make ~loc ~path:[ "R" ] "resource") [ r ] in
   let current = execution_context ~loc self held_values in
   let contains = R.Expr.binary ~loc In mutex held_values in
@@ -451,6 +483,18 @@ let protocol ~loc () =
             ~requires:[ R.Spec.make (conjunction requires) ]
             ~ensures:[ R.Spec.make (conjunction ensures) ]
             (ident ~loc text) None))
+  in
+  let notification text =
+    kernel text
+      [
+        R.Var.make ~loc (ident ~loc "c") (Condition_contract.typ ~loc);
+        reference "self";
+        R.Var.make ~loc ~ghost:true ~implicit:true (ident ~loc "m") (R.Type.ref ~loc);
+        held_set;
+      ]
+      []
+      [ current; condition_association ]
+      [ current; condition_association ]
   in
   let acquire =
     conjunction
@@ -476,6 +520,18 @@ let protocol ~loc () =
               ~returns:(public_returns ~loc association_declaration)
               (ident ~loc association_declaration.declaration_name)
               None));
+      R.Member.free
+        (R.Member.callable
+           (R.Callable.func ~loc ~kind:Inv
+              ~formals:(public_formals ~loc condition_declaration)
+              ~returns:(public_returns ~loc condition_declaration)
+              (ident ~loc condition_declaration.declaration_name)
+              None));
+      kernel ~kind:Lemma condition_initialization_declaration.declaration_name
+        (public_formals ~loc condition_initialization_declaration)
+        []
+        [ Condition_contract.fresh ~loc condition ]
+        [ condition_association ];
       R.Member.callable
         (R.Callable.func ~loc ~kind:Pred ~inline:true
            ~formals:(public_formals ~loc held_declaration)
@@ -511,6 +567,21 @@ let protocol ~loc () =
       kernel "unlock" operation_formals []
         [ current; contains; association; held ~loc mutex self; protected ]
         [ association; execution_context ~loc self (released_set ~loc held_values mutex) ];
+      kernel "wait"
+        (R.Var.make ~loc (ident ~loc "c") (Condition_contract.typ ~loc)
+        :: operation_formals)
+        []
+        [
+          current;
+          contains;
+          association;
+          condition_association;
+          held ~loc mutex self;
+          protected;
+        ]
+        [ current; association; condition_association; held ~loc mutex self; protected ];
+      notification "signal";
+      notification "broadcast";
       kernel "try_lock" operation_formals
         [ R.Var.make ~loc (ident ~loc "success") (R.Type.bool ~loc) ]
         [ current; association ]
@@ -551,7 +622,8 @@ let protocol_support ~loc () =
   (resource_signature ~loc () :: execution_support ~loc ())
   @ [ native_support ~loc (); protocol ~loc () ]
 
-let complete_support ~loc () = support ~loc () @ protocol_support ~loc ()
+let complete_support ~loc () =
+  support ~loc () @ Condition_contract.support ~loc () @ protocol_support ~loc ()
 
 let instance ~loc ~name ~resource =
   let target = local ~loc protocol_name in

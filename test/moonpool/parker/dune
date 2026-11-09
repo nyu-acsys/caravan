@@ -1,0 +1,12 @@
+(library
+ (name caravan_moonpool_parker)
+ (wrapped false)
+ (modules parker_))
+
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.proof)))

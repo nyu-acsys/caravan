@@ -307,6 +307,7 @@ module State_monad = struct
     procedure_implicits : (string * string list) list;
         (** The actual implicit parameters of procedures already translated. *)
     defaults : default_request list;
+    condition_support : bool;
     mutex_support : bool;  (** Whether native mutex allocation is used. *)
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
@@ -505,6 +506,7 @@ module State_monad = struct
           call_targets = [];
           procedure_implicits = [];
           defaults = [];
+          condition_support = false;
           mutex_support = false;
           dynamic_indices = false;
         };
@@ -1347,6 +1349,10 @@ module State = struct
               { state.tables with call_targets = request :: state.tables.call_targets };
           })
 
+  let note_condition_support =
+    modify (fun state ->
+        { state with tables = { state.tables with condition_support = true } })
+
   let note_mutex_support =
     modify (fun state ->
         { state with tables = { state.tables with mutex_support = true } })
@@ -1900,7 +1906,9 @@ let spec_contains_runtime_refs ctx ty =
       match Datatypes.desc ctx.given.types ty with
       | Tvar _ | Tunivar _ -> true
       | Tconstr (p, [ _ ], _) when Datatypes.is_ref p || Datatypes.is_atomic p -> true
-      | Tconstr (p, [], _) when Datatypes.is_ghost p || Datatypes.is_mutex p -> true
+      | Tconstr (p, [], _)
+        when Datatypes.is_ghost p || Datatypes.is_mutex p || Datatypes.is_condition p ->
+          true
       | Tconstr (p, args, _) ->
           List.exists args ~f:(go seen)
           || begin match Datatypes.find ctx.given.types p with

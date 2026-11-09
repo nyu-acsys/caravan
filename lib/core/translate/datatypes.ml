@@ -610,7 +610,9 @@ let compiler_aliases ?(modules = []) ?(values = []) types
               let normalized = Env.try_normalize_type_path None environment path in
               let native_alias =
                 Option.filter normalized ~f:(fun normalized ->
-                    Mutex_primitives.is_type normalized && not (Path.same path normalized))
+                    (Mutex_primitives.is_type normalized
+                    || Condition_primitives.is_type normalized)
+                    && not (Path.same path normalized))
               in
               let represented = Option.bind normalized ~f:(find types) in
               let declaration =
@@ -888,10 +890,13 @@ let is_domain (p : Path.t) =
 (** Native mutex handles have no payload type parameter. *)
 let is_mutex = Mutex_primitives.is_type
 
-let is_reference p = is_ref p || is_atomic p || is_domain p || is_mutex p
+let is_condition = Condition_primitives.is_type
+
+let is_reference p =
+  is_ref p || is_atomic p || is_domain p || is_mutex p || is_condition p
 
 let is_reference_type path arguments =
-  if is_mutex path then List.is_empty arguments
+  if is_mutex path || is_condition path then List.is_empty arguments
   else is_reference path && List.length arguments = 1
 
 (** The opaque reference type used for proof-only storage. *)

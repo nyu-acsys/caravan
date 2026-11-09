@@ -1984,6 +1984,13 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
            (pending_declarations @ pending_domains @ pending_workers @ pending_fields)
            ~f:snd)
   in
+  let mutex_protocol_support =
+    List.exists source.proof_resources ~f:(fun resource ->
+        List.equal String.equal resource.Source.resource_functor
+          [ Mutex_contract.protocol_name ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_contract.resource_interface ])
+  in
   Ok
     ( R.Program.make ~loc:start
         (Prelude.members
@@ -2013,14 +2020,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         @ (if List.exists structure_member_lists ~f:(fun (st, _) -> has_history st) then
              History.program_members history
            else [])
-        @ (if
-             List.exists source.proof_resources ~f:(fun resource ->
-                 List.equal String.equal resource.Source.resource_functor
-                   [ Mutex_contract.protocol_name ]
-                 || List.equal String.equal resource.resource_functor
-                      [ Mutex_contract.resource_interface ])
-           then Mutex_contract.complete_support ~loc:start ()
+        @ (if mutex_protocol_support then Mutex_contract.complete_support ~loc:start ()
            else if state.tables.mutex_support then Mutex_contract.support ~loc:start ()
+           else [])
+        @ (if state.tables.condition_support && not mutex_protocol_support then
+             Condition_contract.support ~loc:start ()
            else [])
         @ imported_resource_members @ modules @ value_factories
         @ List.filter_map shared_exception_members ~f:(fun (_, members) ->

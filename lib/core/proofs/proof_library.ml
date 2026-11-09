@@ -148,7 +148,7 @@ let accepts_type_argument signatures path =
       | _ -> false)
   | None -> false
 
-let mutex_type ~at =
+let native_type ~at module_name =
   Ast_helper.Typ.constr ~loc:at
     {
       txt =
@@ -157,13 +157,16 @@ let mutex_type ~at =
               txt =
                 Longident.Ldot
                   ( { txt = Longident.Lident "Stdlib"; loc = at },
-                    { txt = "Mutex"; loc = at } );
+                    { txt = module_name; loc = at } );
               loc = at;
             },
             { txt = "t"; loc = at } );
       loc = at;
     }
     []
+
+let mutex_type ~at = native_type ~at "Mutex"
+let condition_type ~at = native_type ~at "Condition"
 
 let owner_type ~at =
   Ast_helper.Typ.constr ~loc:at
@@ -214,6 +217,8 @@ let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
              { txt = Longident.Lident "map"; loc = at }
              [ key; value ])
     | Other name -> unsupported ("Unsupported Raven library type " ^ name)
+    | Named ([ path ], []) when String.equal path Condition_contract.type_name ->
+        Ok (condition_type ~at)
     | Named (path, args) ->
         let owner =
           signature.path :: signature.implements
