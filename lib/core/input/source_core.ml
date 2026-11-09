@@ -53,7 +53,9 @@ type proof_resource = {
   resource_type_members : (string * Ident.t * Types.type_declaration) list;
   resource_type : Types.type_expr;
   resource_id : Ident.t;
-  resource_operations : (string * Types.type_expr list * Types.type_expr) list;
+  resource_operations :
+    (string * Raven_api.Ast.Callable.call_kind * Types.type_expr list * Types.type_expr)
+    list;
   resource_constants : string list;
   resource_descriptor : Datatypes.t;
   resource_aliases : Datatypes.t list;

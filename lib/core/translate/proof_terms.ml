@@ -39,7 +39,10 @@ let lemma_call ?expected env (t : S.term) =
   | Tvar q ->
       let display = qualid_key q in
       begin match
-        List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q) ~equal:String.equal
+        Option.first_some
+          (resource_operation ~lemma:true env q)
+          (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
+             ~equal:String.equal)
       with
       | None ->
           State.of_result
@@ -476,8 +479,29 @@ let proof_call ?expected env t =
         | "commit" | "commit_raise" -> "commitAU"
         | _ -> method_
       in
-      State.return (R.Expr.call ~loc:l (name ~loc:l method_) values, outputs)
-  | _ -> lemma_call ?expected env t
+      let call = R.Expr.call ~loc:l (name ~loc:l method_) values in
+      if signature.au_context && String.equal method_ "bindAU" then
+        let* owner =
+          State.of_result
+            (Report.expect ~at:t.term_loc "The atomic call's execution owner"
+               env.ctx.given.execution_owner)
+        in
+        let* held =
+          State.of_result
+            (Report.expect ~at:t.term_loc "The atomic call's entry holdings"
+               env.ctx.given.execution_entry_held)
+        in
+        let+ raw = State.fresh "au_raw_token" in
+        ( R.Stmt.local ~loc:l ~ghost:true
+            ~typ:
+              (R.Type.atomic_token ~loc:l (qualified_name ~loc:l signature.au_procedure))
+            ~init:(R.Stmt.expr_rhs call) (ident ~loc:l raw),
+          R.Expr.tuple ~loc:l [ R.Expr.var ~loc:l (name ~loc:l raw); owner; held ],
+          outputs )
+      else State.return ([], call, outputs)
+  | _ ->
+      State.map (lemma_call ?expected env t) ~f:(fun (call, outputs) ->
+          ([], call, outputs))
 
 let proof_signature env (t : S.term) =
   let head, _ = spine t [] in
@@ -487,8 +511,10 @@ let proof_signature env (t : S.term) =
       begin match head.term_desc with
       | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
       | Tvar q ->
-          List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
-            ~equal:String.equal
+          Option.first_some
+            (resource_operation ~lemma:true env q)
+            (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
+               ~equal:String.equal)
       | _ -> None
       end
 
@@ -1141,64 +1167,68 @@ let rec proof_expression env targets (body : S.proof_expr) =
                 (error t.term_loc
                    "The proof expression has a different result type from its binding")
           in
-          let* call, outputs = proof_call ~expected env t in
-          if List.length outputs = List.length targets then
-            if List.is_empty targets then State.return [ R.Stmt.call ~loc:l call ]
+          let* before, call, outputs = proof_call ~expected env t in
+          let+ statements =
+            if List.length outputs = List.length targets then
+              if List.is_empty targets then State.return [ R.Stmt.call ~loc:l call ]
+              else
+                State.return
+                  [
+                    R.Stmt.assign ~loc:l
+                      (List.map targets ~f:target_expr)
+                      (R.Stmt.expr_rhs call);
+                  ]
             else
-              State.return
-                [
-                  R.Stmt.assign ~loc:l
-                    (List.map targets ~f:target_expr)
-                    (R.Stmt.expr_rhs call);
-                ]
-          else
-            begin match targets with
-            | [ target ] ->
-                let+ temporaries =
-                  State.all outputs ~f:(fun ty ->
+              begin match targets with
+              | [ target ] ->
+                  let+ temporaries =
+                    State.all outputs ~f:(fun ty ->
+                        let* raven = State.fresh "result" in
+                        let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
+                        let target = { target_name = raven; target_type = ty } in
+                        ( target,
+                          R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
+                            (ident ~loc:l raven) ))
+                  in
+                  let values =
+                    List.map temporaries ~f:(fun (target, _) -> target_expr target)
+                  in
+                  let call =
+                    if List.is_empty values then R.Stmt.call ~loc:l call
+                    else R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs call)
+                  in
+                  let result = R.Expr.tuple ~loc:l values in
+                  List.concat_map temporaries ~f:snd
+                  @ [
+                      call;
+                      R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs result);
+                    ]
+              | _ ->
+                  begin match outputs with
+                  | [ ty ] when not (List.is_empty targets) ->
                       let* raven = State.fresh "result" in
                       let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
-                      let target = { target_name = raven; target_type = ty } in
-                      ( target,
+                      let result = R.Expr.var ~loc:l (name ~loc:l raven) in
+                      let declaration =
                         R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
-                          (ident ~loc:l raven) ))
-                in
-                let values =
-                  List.map temporaries ~f:(fun (target, _) -> target_expr target)
-                in
-                let call =
-                  if List.is_empty values then R.Stmt.call ~loc:l call
-                  else R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs call)
-                in
-                let result = R.Expr.tuple ~loc:l values in
-                List.concat_map temporaries ~f:snd
-                @ [
-                    call;
-                    R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs result);
-                  ]
-            | _ ->
-                begin match outputs with
-                | [ ty ] when not (List.is_empty targets) ->
-                    let* raven = State.fresh "result" in
-                    let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
-                    let result = R.Expr.var ~loc:l (name ~loc:l raven) in
-                    let declaration =
-                      R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
-                    in
-                    let assignments =
-                      List.mapi targets ~f:(fun i target ->
-                          R.Stmt.assign ~loc:l
-                            [ target_expr target ]
-                            (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l result i)))
-                    in
-                    declaration
-                    @ [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs call) ]
-                    @ assignments
-                | _ ->
-                    State.of_result
-                      (error t.term_loc "Bind all the results of this lemma")
-                end
-            end
+                          (ident ~loc:l raven)
+                      in
+                      let assignments =
+                        List.mapi targets ~f:(fun i target ->
+                            R.Stmt.assign ~loc:l
+                              [ target_expr target ]
+                              (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l result i)))
+                      in
+                      declaration
+                      @ [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs call) ]
+                      @ assignments
+                  | _ ->
+                      State.of_result
+                        (error t.term_loc "Bind all the results of this lemma")
+                  end
+              end
+          in
+          before @ statements
       | None ->
           let values =
             match (targets, t.term_desc) with

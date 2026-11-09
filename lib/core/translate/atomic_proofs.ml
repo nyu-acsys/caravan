@@ -113,7 +113,34 @@ let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loo
   let* terms =
     State.of_result (loop_outline_terms annotation (spec.invariants @ state_invariants))
   in
+  let context_terms, terms =
+    List.partition_tf (List.concat_map terms ~f:conjuncts) ~f:(fun term ->
+        List.exists (term_references [] term)
+          ~f:
+            (Source.is_mutex_context
+               ?trusted:ctx.given.proof_support.execution_context_path ctx.given.env))
+  in
   let* free = free_typed env terms ~at in
+  let* () =
+    State.of_result
+      (Result.all_unit
+         (List.map context_terms ~f:(fun term ->
+              if
+                List.exists (term_names term) ~f:(fun name ->
+                    List.exists free ~f:(fun (source, _, _, _, _) ->
+                        String.equal source name))
+              then
+                error term.term_loc "A mutex loop context must use previously bound names"
+              else Ok ())))
+  in
+  let* execution_invariants =
+    if not (List.is_empty context_terms) then State.all context_terms ~f:(formula env)
+    else
+      match (ctx.given.execution_owner, ctx.given.execution_entry_held) with
+      | Some owner, Some held ->
+          State.return [ Mutex_contract.execution_context ~loc:l owner held ]
+      | _ -> State.return []
+  in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
@@ -169,7 +196,7 @@ let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loo
               if runtime raven then value_spec ctx ~loc:l t raven
               else range_spec ~loc:l t raven))
   in
-  ranges @ facts @ user
+  ranges @ facts @ user @ List.map execution_invariants ~f:R.Spec.make
 
 (** The names that [t] owns the values of fields of variables as, as [k] for [i.contents]
     in [own i.contents k]: the variable, the field and the name. *)

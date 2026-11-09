@@ -307,6 +307,7 @@ module State_monad = struct
     procedure_implicits : (string * string list) list;
         (** The actual implicit parameters of procedures already translated. *)
     defaults : default_request list;
+    mutex_support : bool;  (** Whether native mutex allocation is used. *)
     dynamic_indices : bool;
         (** Whether an invariant is established with index maps that are computed. *)
   }
@@ -504,6 +505,7 @@ module State_monad = struct
           call_targets = [];
           procedure_implicits = [];
           defaults = [];
+          mutex_support = false;
           dynamic_indices = false;
         };
       origins = [];
@@ -683,6 +685,7 @@ type atomic_universal = {
 
 type atomic_signature = {
   au_key : string;
+  au_context : bool;
   au_generic : Generic_parameters.t option;
   au_owner : Path.t option;
   au_private : atomic_shape;
@@ -753,6 +756,7 @@ let map_atomic_types signature ~f =
   run schema ~f
 
 type proof_support = {
+  execution_context_path : Path.t option;
   runtime_functions : Qualified_name.t Path_bindings.t;
   predicate_views : string Path_bindings.t;
   public_types : Path.t list;
@@ -773,6 +777,7 @@ type proof_support = {
 
 let empty_proof_support =
   {
+    execution_context_path = None;
     runtime_functions = Path_bindings.empty;
     predicate_views = Path_bindings.empty;
     public_types = [];
@@ -1172,6 +1177,12 @@ type inputs = {
       (** The predicates, by their OCaml names, with their Raven names and parameter
           types. *)
   current_procedure : string option;
+  execution_contract : bool;
+      (** Entry-context bindings in preconditions, rather than spatial context ownership.
+      *)
+  mutex_execution : bool;
+  execution_owner : R.Expr.t option;
+  execution_entry_held : R.Expr.t option;
   manual : bool;
   access_proofs : ((int * int) * Annotation.t) list;
   return_proofs : ((int * int) * Annotation.t) list;
@@ -1211,6 +1222,10 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     env;
     preds;
     current_procedure = None;
+    execution_contract = false;
+    mutex_execution = false;
+    execution_owner = None;
+    execution_entry_held = None;
     manual = false;
     access_proofs = [];
     return_proofs = [];
@@ -1331,6 +1346,26 @@ module State = struct
             tables =
               { state.tables with call_targets = request :: state.tables.call_targets };
           })
+
+  let note_mutex_support =
+    modify (fun state ->
+        { state with tables = { state.tables with mutex_support = true } })
+
+  let execution_arguments_for ~at owner =
+    let l = loc at in
+    let* held = fresh "caravan$call_held" in
+    let value = R.Expr.var ~loc:l (name ~loc:l held) in
+    return
+      ( R.Stmt.local ~loc:l ~ghost:true
+          ~typ:(Mutex_contract.held_set_type ~loc:l)
+          ~init:(R.Stmt.expr_rhs (Mutex_contract.snapshot ~loc:l owner))
+          (ident ~loc:l held),
+        [ owner; value ] )
+
+  let execution_arguments ctx ~at =
+    match ctx.given.execution_owner with
+    | None -> of_result (error at "This operation needs a native execution context")
+    | Some owner -> execution_arguments_for ~at owner
 
   (** The value dictionaries of the types [arguments], requested for declaration. *)
   let dictionaries_given (given : inputs) ~at arguments =
@@ -1865,7 +1900,7 @@ let spec_contains_runtime_refs ctx ty =
       match Datatypes.desc ctx.given.types ty with
       | Tvar _ | Tunivar _ -> true
       | Tconstr (p, [ _ ], _) when Datatypes.is_ref p || Datatypes.is_atomic p -> true
-      | Tconstr (p, [], _) when Datatypes.is_ghost p -> true
+      | Tconstr (p, [], _) when Datatypes.is_ghost p || Datatypes.is_mutex p -> true
       | Tconstr (p, args, _) ->
           List.exists args ~f:(go seen)
           || begin match Datatypes.find ctx.given.types p with
@@ -2109,7 +2144,13 @@ let atomic_arguments ~loc:l ?raising ?raised_result signature method_ values =
   | [] -> []
   | token :: rest ->
       let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
-      let inputs = R.Expr.tuple ~loc:l inputs in
+      let token, context =
+        if signature.au_context then
+          ( R.Expr.tuple_get ~loc:l token 0,
+            [ R.Expr.tuple_get ~loc:l token 1; R.Expr.tuple_get ~loc:l token 2 ] )
+        else (token, [])
+      in
+      let inputs = R.Expr.tuple ~loc:l (inputs @ context) in
       if
         List.mem
           [ "commit"; "committed"; "commit_raise"; "raised" ]
@@ -2151,10 +2192,24 @@ let resource_module env parent =
       List.find env.ctx.given.proof_support.resources ~f:(fun resource ->
           Source.resource_has_path resource path))
 
-let resource_operation env = function
+let resource_operation_kind env = function
   | S.Qdot (parent, operation) ->
       Option.bind (resource_module env parent) ~f:(fun resource ->
-          List.find_map resource.resource_operations ~f:(fun (name, inputs, result) ->
+          List.find_map resource.resource_operations ~f:(fun (name, kind, _, _) ->
+              Option.some_if (String.equal name operation.pid_str) kind))
+  | Qid _ -> None
+
+let resource_operation ?(lemma = false) env = function
+  | S.Qdot (parent, operation) ->
+      Option.bind (resource_module env parent) ~f:(fun resource ->
+          List.find_map resource.resource_operations
+            ~f:(fun (name, kind, inputs, result) ->
+              let selected =
+                match kind with
+                | R.Ast.Callable.Lemma -> lemma
+                | Func | Pred | Invariant -> not lemma
+                | Proc -> false
+              in
               let generic =
                 Generic_assets.operation_worker resource ~name ~inputs ~result
               in
@@ -2166,7 +2221,7 @@ let resource_operation env = function
                     ^ Generic_parameters.member worker)
               in
               Option.some_if
-                (String.equal name operation.pid_str)
+                (selected && String.equal name operation.pid_str)
                 {
                   lemma_raven = target;
                   lemma_constant =
@@ -2174,20 +2229,43 @@ let resource_operation env = function
                   lemma_generic = generic;
                   lemma_inputs = inputs;
                   lemma_implicit_count = 0;
-                  lemma_outputs = [ result ];
+                  lemma_outputs = (if lemma && is_unit result then [] else [ result ]);
                 }))
   | Qid _ -> None
 
 let logical_signature env q =
-  match q with
-  | S.Qid id when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
-  | _ ->
-      begin match resource_operation env q with
-      | Some _ as signature -> signature
-      | None ->
-          List.Assoc.find env.ctx.given.proof_support.logical_functions
-            (logical_key env q) ~equal:String.equal
-      end
+  let context_signature () =
+    Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+        try
+          let declaration = Env.find_value path env.ctx.given.env in
+          let inputs, result =
+            Proof_types.function_arguments declaration.Types.val_type
+          in
+          Some
+            {
+              lemma_raven = Mutex_contract.execution_name ^ ".context";
+              lemma_constant = false;
+              lemma_generic = None;
+              lemma_inputs = inputs;
+              lemma_implicit_count = 0;
+              lemma_outputs = [ result ];
+            }
+        with Stdlib.Not_found -> None)
+  in
+  if
+    Source.is_mutex_context ?trusted:env.ctx.given.proof_support.execution_context_path
+      env.ctx.given.env q
+  then context_signature ()
+  else
+    match q with
+    | S.Qid id when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
+    | _ ->
+        begin match resource_operation env q with
+        | Some _ as signature -> signature
+        | None ->
+            List.Assoc.find env.ctx.given.proof_support.logical_functions
+              (logical_key env q) ~equal:String.equal
+        end
 
 let ghost_descriptor env q =
   Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
@@ -2419,7 +2497,10 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
         let key = logical_key env q in
         let original = List.Assoc.find env.ctx.given.preds key ~equal:String.equal in
         match original with
-        | None -> None
+        | None ->
+            Option.bind (logical_signature env q) ~f:(fun signature ->
+                if Option.is_none signature.lemma_generic then Some signature.lemma_inputs
+                else None)
         | Some (target, parameters) -> (
             match
               Generic_predicates.find ~target env.ctx.given.generic_predicates key

@@ -817,7 +817,8 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
         let* env, imported_scopes, imported_entries, libraries =
           library_proof_scopes ~runtime_env env libraries
         in
-        let prepare_definition (root_env, resources) parent module_name module_interface =
+        let prepare_definition (root_env, resources) parent module_name module_interface
+            constraints =
           let declaration =
             S.Proof_resource
               {
@@ -850,12 +851,16 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                      "Unknown Raven library interface")
           in
           let* () =
-            if Proof_library.is_resource_algebra signatures selected then Ok ()
+            if
+              Proof_library.is_resource_algebra signatures selected
+              || Proof_library.is_protected_resource signatures selected
+            then Ok ()
             else
               Error
                 (Report.error Type
                    (S.qualid_loc module_interface)
-                   "A proof-defined module must implement ResourceAlgebra")
+                   "A proof-defined module must implement ResourceAlgebra or \
+                    Ghost.MutexResource")
           in
           let* new_resource =
             match
@@ -869,6 +874,115 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 Error
                   (Report.error Type module_name.pid_loc
                      "A proof-defined module could not be registered")
+          in
+          let* local_env, new_resource =
+            List.fold_result constraints ~init:(local_env, new_resource)
+              ~f:(fun (environment, resource) ((name : S.id), typ) ->
+                let* () =
+                  if String.equal name.pid_str "t" then Ok ()
+                  else
+                    Error
+                      (Report.error Type name.pid_loc
+                         "A proof-defined module supports a constraint on type t only")
+                in
+                let manifest =
+                  (Typetexp.transl_simple_type parent.environment ~closed:true
+                     (core_type ~at:name.pid_loc typ))
+                    .ctyp_type
+                in
+                let* carrier =
+                  match
+                    List.find resource.resource_type_members ~f:(fun (member, _, _) ->
+                        String.equal member "T")
+                  with
+                  | Some (_, id, declaration) when List.is_empty declaration.type_params
+                    ->
+                      Ok (id, { declaration with type_manifest = Some manifest })
+                  | Some _ ->
+                      Error
+                        (Report.error Type name.pid_loc
+                           "A proof-defined module does not support a parameterized type \
+                            constraint")
+                  | None ->
+                      Error
+                        (Report.error Type name.pid_loc
+                           "The proof-defined module interface has no abstract type t")
+                in
+                let carrier_id, carrier_declaration = carrier in
+                let environment =
+                  Env.add_type ~check:false carrier_id carrier_declaration environment
+                in
+                let declaration =
+                  Env.find_module (Path.Pident resource.resource_id) environment
+                in
+                let* signature =
+                  match Mtype.scrape environment declaration.md_type with
+                  | Mty_signature signature -> Ok signature
+                  | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+                      Error
+                        (Report.error Type name.pid_loc
+                           "A constrained proof-defined module must have a signature")
+                in
+                let carriers =
+                  Path.Pident carrier_id
+                  :: Path.Pdot (Path.Pident resource.resource_id, "t")
+                  :: List.filter_map signature ~f:(function
+                    | Types.Sig_type (id, _, _, _) when String.equal (Ident.name id) "t"
+                      ->
+                        Some (Path.Pident id)
+                    | _ -> None)
+                in
+                let rec refine typ =
+                  match Types.get_desc typ with
+                  | Tconstr (path, [], _) when List.mem carriers path ~equal:Path.same ->
+                      manifest
+                  | Tvar _ | Tunivar _ -> typ
+                  | description ->
+                      Btype.newgenty (Btype.copy_type_desc refine description)
+                in
+                let signature =
+                  List.map signature ~f:(function
+                    | Types.Sig_type (id, declaration, recursive, visibility)
+                      when String.equal (Ident.name id) "t" ->
+                        Types.Sig_type
+                          ( id,
+                            { declaration with type_manifest = Some manifest },
+                            recursive,
+                            visibility )
+                    | Sig_value (id, declaration, visibility) ->
+                        Sig_value
+                          ( id,
+                            { declaration with val_type = refine declaration.val_type },
+                            visibility )
+                    | item -> item)
+                in
+                let environment =
+                  Env.add_module_declaration ~check:false resource.resource_id Mp_present
+                    { declaration with md_type = Mty_signature signature }
+                    environment
+                in
+                let resource =
+                  {
+                    resource with
+                    resource_type_members =
+                      List.map resource.resource_type_members
+                        ~f:(fun (member, id, declaration) ->
+                          ( member,
+                            id,
+                            if Ident.same id carrier_id then carrier_declaration
+                            else declaration ));
+                    resource_descriptor =
+                      { resource.resource_descriptor with alias = Some manifest };
+                    resource_operations =
+                      List.map resource.resource_operations
+                        ~f:(fun (operation, kind, inputs, output) ->
+                          let related =
+                            Compiler_types.map_group (output :: inputs) ~f:refine
+                          in
+                          (operation, kind, List.tl_exn related, List.hd_exn related));
+                  }
+                in
+                Ok (environment, resource))
           in
           let path =
             Option.value_map parent.owner ~default:(Path.Pident new_resource.resource_id)
@@ -2022,6 +2136,14 @@ let value_path env q =
     let path, _ = Env.find_value_by_name (longident q) env in
     Some (Env.normalize_value_path None env path)
   with Stdlib.Not_found -> None
+
+let mutex_context_path env =
+  let id name = S.mk_id ~loc:Location.none name in
+  value_path env (S.Qdot (Qdot (Qid (id "Ghost"), id "Mutex"), id "context"))
+
+let is_mutex_context ?trusted env q =
+  Option.exists trusted ~f:(fun expected ->
+      Option.exists (value_path env q) ~f:(Path.same expected))
 
 let module_path env q =
   try

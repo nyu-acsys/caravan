@@ -1400,6 +1400,48 @@ and application env (t : S.term) =
   | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result
         (error head.term_loc "A local proof value cannot be called as a logical function")
+  | Tvar q, [ source_owner; held ]
+    when Source.is_mutex_context
+           ?trusted:env.ctx.given.proof_support.execution_context_path env.ctx.given.env q
+    ->
+      begin match env.ctx.given.execution_owner with
+      | None ->
+          State.of_result
+            (error at "Mutex context is available only in executable function proofs")
+      | Some owner ->
+          let* signature =
+            State.of_result
+              (Report.expect ~at "The Mutex context signature" (logical_signature env q))
+          in
+          let* values =
+            typed_arguments env ~at signature.lemma_inputs [ source_owner; held ]
+          in
+          let* source_owner, held =
+            match values with
+            | [ owner; held ] -> State.return (owner, held)
+            | _ ->
+                State.of_result
+                  (error at "The Mutex context signature needs two arguments")
+          in
+          let actual = owner in
+          let* resource =
+            if env.ctx.given.execution_contract then
+              match env.ctx.given.execution_entry_held with
+              | None -> State.of_result (error at "Missing native entry context")
+              | Some entry -> State.return (R.Expr.binary ~loc:l Eq held entry)
+            else State.return (Mutex_contract.execution_context ~loc:l actual held)
+          in
+          State.return
+            (R.Expr.binary ~loc:l And
+               (R.Expr.binary ~loc:l Eq source_owner actual)
+               resource)
+      end
+  | Tvar q, _
+    when Source.is_mutex_context
+           ?trusted:env.ctx.given.proof_support.execution_context_path env.ctx.given.env q
+    ->
+      State.of_result
+        (error at "Ghost.Mutex.context expects an owner and a held-lock set")
   | Tvar q, args when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
       begin match (method_, atomic_inputs signature method_) with

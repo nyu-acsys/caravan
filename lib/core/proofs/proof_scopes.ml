@@ -286,9 +286,17 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
                 Ok (state, scope, scopes, entries)
             end
         | S.Proof_definition
-            { module_name; module_interface; module_declarations; module_loc; _ } ->
+            {
+              module_name;
+              module_interface;
+              module_constraints;
+              module_declarations;
+              module_loc;
+              _;
+            } ->
             let* state, scope =
               prepare_definition state scope module_name module_interface
+                module_constraints
             in
             let scopes = replace_scope scope scopes in
             let* nested =
@@ -327,7 +335,7 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
 let resolve ?location ~environment structure declarations =
   Result.map
     (resolve_prepared ?location ~environment ~state:()
-       ~prepare_definition:(fun () scope _ _ -> Ok ((), scope))
+       ~prepare_definition:(fun () scope _ _ _ -> Ok ((), scope))
        structure declarations)
     ~f:snd
 

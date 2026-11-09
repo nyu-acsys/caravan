@@ -48,6 +48,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   } =
     scopes
   in
+  let mutex_execution = Mutex_execution.enabled scopes.source.proof_resources in
   let declaration_context =
     Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
       ~unapplied_proofs:scopes.unapplied_proofs
@@ -480,6 +481,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         ~primitive_namespace ~generic_predicates ()
     in
     let* ctx = enrich_predicates ctx own_preds in
+    let ctx = { ctx with given = { ctx.given with mutex_execution } } in
     let ctx = operation_context ~abstract ~primitive_namespace operation ctx in
     let predicates q =
       let env =
@@ -683,6 +685,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      let actual_ctx =
                        spec_context types ~shared ~ocaml_env:f.environment ~proof_support
                          ~preds ~spec_funcs ~generic_predicates ()
+                     in
+                     let actual_ctx =
+                       {
+                         actual_ctx with
+                         given = { actual_ctx.given with mutex_execution };
+                       }
                      in
                      let worker =
                        Program_declarations.applied_function_worker ~generics
@@ -896,14 +904,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                  "The module operation has a different ordinary or logically atomic \
                   contract kind"
            in
-           let expected_implicit = expected.prepared_implicit
-           and actual_implicit = actual.prepared_implicit in
+           let signature_implicit prepared =
+             List.filter (List.zip_exn prepared.prepared_implicit prepared.prepared_roles)
+               ~f:(fun ((source, _, _, _, _), _) ->
+                 not
+                   (List.Assoc.mem prepared.prepared_execution_aliases source
+                      ~equal:String.equal))
+             |> List.unzip
+           in
+           let expected_implicit, expected_roles = signature_implicit expected
+           and actual_implicit, actual_roles = signature_implicit actual in
            let* () =
              State.of_result
              @@
              if
                List.length expected_implicit = List.length actual_implicit
-               && Poly.equal expected.prepared_roles actual.prepared_roles
+               && Poly.equal expected_roles actual_roles
              then Ok ()
              else
                unsupported at
@@ -942,7 +958,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            in
            let* body, _ =
              State.within local
-               (forwarding_body ~at
+               (forwarding_body ~actual ~at
                   ~self:
                     (Option.value ctx.given.current_procedure
                        ~default:operation.operation_name)
@@ -2476,6 +2492,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            ())
         with
         functions;
+        mutex_execution;
         lifted;
         pasts;
         past_returns;

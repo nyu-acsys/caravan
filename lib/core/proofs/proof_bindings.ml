@@ -175,6 +175,26 @@ let remaining_constraints t ~scope binding =
                (drop_prefix boundary.Proof_scopes.namespace caller.Proof_scopes.namespace))))
 
 let visible t ~scope binding =
+  let definition_visible =
+    match binding.entry.scope.definition with
+    | None -> true
+    | Some _ ->
+        Option.exists scope ~f:(fun caller ->
+            Option.is_some
+              (drop_prefix binding.entry.scope.namespace caller.Proof_scopes.namespace))
+        || begin match binding.entry.scope.public_type with
+        | Some (Types.Mty_signature members) ->
+            List.exists members ~f:(fun member ->
+                match (binding.kind, member) with
+                | ( (Function _ | Predicate _ | Lemma _ | Field _ | Action _),
+                    Types.Sig_value (id, _, _) )
+                | (Resource _ | Atomic _ | Task _), Sig_module (id, _, _, _, _)
+                | State _, Sig_type (id, _, _, _) ->
+                    String.equal (Ident.name id) binding.entry.name.pid_str
+                | _ -> false)
+        | Some (Mty_ident _ | Mty_functor _ | Mty_alias _) | None -> false
+        end
+  in
   let inside_template =
     match functor_ancestor t.scopes binding.entry.scope with
     | None -> true
@@ -183,7 +203,7 @@ let visible t ~scope binding =
             Option.is_some (drop_prefix owner.namespace scope.Proof_scopes.namespace))
   in
   let relevant = remaining_constraints t ~scope binding in
-  inside_template
+  inside_template && definition_visible
   &&
   match binding.kind with
   | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ ->

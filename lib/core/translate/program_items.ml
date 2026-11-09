@@ -589,6 +589,9 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
             || Path_bindings.mem libraries path
             || Option.exists (Domain_primitives.operation path) ~f:(function
                 | Spawn | Join -> true)
+            || Option.exists (Mutex_primitives.operation path) ~f:(function
+              | Create | Lock | Unlock | Try_lock -> true
+              | Protect -> false)
         | Error _ -> false)
     | _ -> false
   in
@@ -1658,6 +1661,8 @@ let signature_contract (signature : Module_inventory.signature_value) =
 type prepared_callable = {
   prepared_formals : R.Var.t list;
   prepared_args : R.Expr.t list;
+  prepared_execution : Mutex_execution.boundary;
+  prepared_execution_aliases : (string * Mutex_execution.witness) list;
   prepared_implicit : (string * string * Types.type_expr * R.Type.t * R.Loc.t) list;
   prepared_roles : (bool * bool) list;
   prepared_returns : R.Var.t list;
@@ -1701,6 +1706,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
     State.modify (fun (s : State.state) ->
         { s with names = { s.names with used = Set.add s.names.used "r" } })
   in
+  let* ctx, execution = Mutex_execution.prepare_boundary ctx ~at contract in
   let* result_typ = State.typ ctx ~at result in
   let* () = State.note_domain ctx.given.types result in
   let* result_name, names = State.of_result header_names in
@@ -1790,7 +1796,9 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
       Signature_contract.terms ~expected:Predef.type_bool ~logical_types:ctx.given.types
         ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
-  let* logical_requires = State.all requires ~f:(formula env) in
+  let* logical_requires =
+    State.all requires ~f:(formula (Mutex_execution.entry_environment env))
+  in
   let clauses ?atomic terms =
     State.all terms ~f:(fun t ->
         State.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
@@ -1802,6 +1810,10 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
       (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.ensures))
       @ Option.value_map outcome ~default:[] ~f:(fun (set, _, _) ->
           Exceptions.raises_postconditions ctx.given.types ~at raises set))
+  in
+  let* execution_ensures =
+    Mutex_execution.exit_resources env execution ~at ~raising:(Option.is_some outcome)
+      contract
   in
   let+ atomic_ensures =
     contract_postconditions env ~at ~atomic:true
@@ -1849,22 +1861,34 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   {
     prepared_formals =
       List.map params ~f:(fun (_, _, _, v) -> v)
+      @ execution.formals
       @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
           R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ);
     prepared_args =
       List.map params ~f:(fun (_, raven, _, _) -> R.Expr.var ~loc:l (name ~loc:l raven));
+    prepared_execution = execution;
+    prepared_execution_aliases =
+      (if List.is_empty execution.formals then []
+       else
+         Mutex_execution.entry_bindings
+           ?trusted:ctx.given.proof_support.execution_context_path ctx.given.env
+           ~implicit:(List.map implicit ~f:(fun (source, _, _, _, _) -> source))
+           contract);
     prepared_implicit = implicit;
     prepared_roles = roles;
     prepared_returns = returns;
-    prepared_requires = in_range @ requires @ atomic_requires;
-    prepared_ensures = result_in_range @ ensures @ atomic_ensures;
+    prepared_requires =
+      in_range @ requires @ atomic_requires @ List.map execution.resources ~f:R.Spec.make;
+    prepared_ensures =
+      result_in_range @ ensures @ atomic_ensures
+      @ List.map execution_ensures ~f:R.Spec.make;
     prepared_logical_ensures;
-    prepared_pre_formulas = input_domains @ logical_requires;
+    prepared_pre_formulas = input_domains @ logical_requires @ execution.resources;
     prepared_post_formulas =
       Option.to_list
         (Datatypes.admissible ~loc:l ctx.given.types result
            (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r")))
-      @ logical_ensures;
+      @ logical_ensures @ execution_ensures;
   }
 
 let prepared_member ?opens ~at ~name body prepared =
@@ -1875,7 +1899,7 @@ let prepared_member ?opens ~at ~name body prepared =
     body
 
 (** A checked call with direct argument and result forwarding. *)
-let forwarding_body ~at ~self ~target ~result ~atomic prepared =
+let forwarding_body ?actual ~at ~self ~target ~result ~atomic prepared =
   let open State.Syntax in
   let l = loc at in
   let var x = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -1890,16 +1914,47 @@ let forwarding_body ~at ~self ~target ~result ~atomic prepared =
     if atomic then List.map opened ~f:snd
     else List.map prepared.prepared_implicit ~f:(fun (_, x, _, _, _) -> var x)
   in
+  let actual = Option.value actual ~default:prepared in
+  let* execution_stmts, execution_args =
+    if List.is_empty actual.prepared_execution.formals then State.return ([], [])
+    else Mutex_execution.call_arguments ~at prepared.prepared_execution
+  in
+  let available =
+    List.filter_map (List.zip_exn prepared.prepared_implicit implicit_args)
+      ~f:(fun ((source, _, _, _, _), value) ->
+        Option.some_if
+          (not
+             (List.Assoc.mem prepared.prepared_execution_aliases source
+                ~equal:String.equal))
+          value)
+  in
+  let* implicit_args, _ =
+    State.fold actual.prepared_implicit ~init:([], available)
+      ~f:(fun (values, available) (source, _, _, _, _) ->
+        match
+          ( List.Assoc.find actual.prepared_execution_aliases source ~equal:String.equal,
+            execution_args,
+            available )
+        with
+        | Some Mutex_execution.Owner, owner :: _, _ ->
+            State.return (owner :: values, available)
+        | Some Held, [ _; held ], _ -> State.return (held :: values, available)
+        | None, _, value :: rest -> State.return (value :: values, rest)
+        | _ ->
+            State.of_result
+              (error at "The forwarded operation has incompatible context arguments"))
+  in
+  let implicit_args = List.rev implicit_args in
   let call =
     R.Expr.call ~loc:l
       (qualified_name ~loc:l target)
-      (prepared.prepared_args @ implicit_args)
+      (prepared.prepared_args @ execution_args @ implicit_args)
   in
   let call_statement =
     if is_unit result then R.Stmt.call ~loc:l call
     else R.Stmt.assign ~loc:l [ var "r" ] (R.Stmt.expr_rhs call)
   in
-  if not atomic then State.return [ call_statement ]
+  if not atomic then State.return (execution_stmts @ [ call_statement ])
   else
     let+ token = State.fresh "token" in
     let bind =
@@ -1919,7 +1974,8 @@ let forwarding_body ~at ~self ~target ~result ~atomic prepared =
         (R.Expr.call ~loc:l (name ~loc:l "commitAU")
            [ var token; (if is_unit result then unit_value ~loc:l else var "r") ])
     in
-    bind @ List.concat_map opened ~f:fst @ [ opening; call_statement; commit ]
+    execution_stmts @ bind @ List.concat_map opened ~f:fst
+    @ [ opening; call_statement; commit ]
 
 let contains_atomic_token types typ =
   let rec contains seen typ =

@@ -62,8 +62,8 @@ Unused declarations still require a known resource algebra interface.
   $ grep -F 'Unknown Raven library interface' unused_unknown.out
   Type Error: Unknown Raven library interface.
   $ ! caravan --shh abstract_ra_unused_non_ra.ml > unused_non_ra.out 2>&1
-  $ grep -F 'An abstract proof module must name a ResourceAlgebra interface' unused_non_ra.out
-  Type Error: An abstract proof module must name a ResourceAlgebra interface.
+  $ grep -F 'An abstract proof module must name a ResourceAlgebra or Ghost.MutexResource interface' unused_non_ra.out
+  Type Error: An abstract proof module must name a ResourceAlgebra or Ghost.MutexResource interface.
 
 Sealed source modules export their declared abstract algebras.
 

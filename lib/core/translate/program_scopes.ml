@@ -239,6 +239,14 @@ let run (source : Source.t) : (t, error) Result.t =
     Option.bind (definition_resource binding.entry.scope) ~f:(fun resource ->
         let backend =
           match binding.kind with
+          | Predicate _
+            when List.exists resource.resource_operations ~f:(fun (name, kind, _, _) ->
+                     String.equal name binding.entry.name.pid_str
+                     &&
+                     match kind with
+                     | R.Ast.Callable.Pred | Invariant -> true
+                     | _ -> false) ->
+              implementation resource
           | Predicate _ | Lemma _ -> proof_implementation resource
           | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _ ->
               implementation resource

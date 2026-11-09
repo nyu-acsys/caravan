@@ -16,7 +16,7 @@ compiler does not make an arbitrary library call verifiable.
 | Mutable state | References, monomorphic mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses. | Not arbitrary GADTs or dependent payloads. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
-| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, and statically known polymorphic `Domain.spawn`/`Domain.join` tasks. | General `Mutex`/`Condition` library support remains unsupported. |
+| Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, and native mutexes with ownership effects and task cleanup. | `Mutex.protect` and `Condition` remain unsupported; blocking and deadlock freedom are not proved. |
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve
@@ -88,6 +88,24 @@ Caravan does not move their effects into the parent. Logically atomic task
 contracts are not yet supported. Joins need enough information to select a unique
 task facade, from the handle's origin or its contract.
 
+With a Mutex facade present, each spawned task receives a fresh execution owner
+and an empty held-lock set. Implicit owner and held-set names in the worker's
+context clause denote that child context; they are not captured from the parent.
+Explicit ghost inputs retain their supplied values and must satisfy the worker's
+precondition in the child's context. For example, a parent's held token cannot
+authorize a child to unlock its mutex.
+
+Caravan generates a checked completion adapter that calls the actual worker and
+requires empty holdings before completion, on both normal and exceptional exits.
+This obligation is checked even for a task facade that is never spawned. The
+native fork/join implementation is trusted to execute the designated operation;
+the adapter checks that its contract justifies the resources returned by join.
+Spawn and join preserve the parent's execution context. Join returns the worker's
+promised resources without exposing a live child context or changing lock owners.
+The same mechanism supports polymorphic tasks, ghost results and history facts.
+These are partial-correctness guarantees; blocking and deadlock freedom are not
+proved.
+
 The [parallel stack-drain client](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/stack_drain)
 demonstrates shared access: a shared invariant holds the stack's exclusive
 ownership, and each worker receives its own ghost counter resource. Both joins
@@ -95,6 +113,111 @@ return the completed worker resources, allowing the parent to recover the stack
 and drain twenty elements. Its runtime code follows Saturn's tutorial with integer
 worker IDs and a named loop counter; all implementation annotations are in the
 companion `.proof` file.
+
+## Mutex critical sections {#sec:mutex-critical-sections}
+
+Runtime code uses ordinary `Mutex.create`, `Mutex.lock`, `Mutex.unlock`, and
+`Mutex.try_lock`. A companion proof chooses the resource protected by a mutex:
+
+```proof
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) =
+    exists value : int. own cell.contents value && 0 <= value
+end
+module Guard = Ghost.Mutex (Cell)
+```
+
+The explicit `with type` exposes the context's carrier equality; an ordinary colon
+ascription keeps it abstract. The local concrete predicate definition remains
+available for folding and unfolding. The resource is a spatial predicate, not a
+resource algebra, and need not be exclusive itself.
+
+A `Ghost.scope` around creation installs the resource:
+
+```proof
+at (Mutex.create ()) (fun create ->
+  fold Cell.resource cell;
+  let mutex = create () in
+  Guard.initialize mutex cell;
+  mutex)
+```
+
+`Guard.is_mutex mutex cell` is a persistent association. Successful acquisition
+returns `Cell.resource cell` and an exclusive `Guard.held mutex self` token;
+unlocking consumes both. Open the cell predicate after locking and fold it before
+unlocking, using the usual proof scopes.
+
+Each executable function has a hidden execution owner and held-lock set. By
+default, an ordinary function preserves that set on both normal and exceptional
+exits. This is checked against its body; Caravan does not insert cleanup. Trusted
+imports implicitly promise the same preservation. In a contract, name the entry
+context and require availability when acquiring an existing mutex:
+
+```proof
+requires (Ghost.Mutex.context self held &&
+  not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+```
+
+These names are inferred contract witnesses, without explicit ghost-call adapters.
+The context clause describes the existing hidden context; it does not introduce
+another copy or let the proof choose a different execution owner. There can be
+one direct context conjunct per contract channel. A fresh mutex is absent from
+the current held set. Recursive locking and wrong-owner unlocking fail their
+preconditions, accounting for OCaml's programmer-error exceptions.
+
+Helpers that acquire or release a lock can state the resulting held set in an
+ordinary postcondition. For example, this contract allows `acquire` to return
+with the mutex held:
+
+```proof
+proof acquire mutex cell
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell) = ()
+```
+
+A release helper requires the held token and protected resource and states
+`Ghost.Mutex.context self (Finset.diff held (Finset.singleton mutex))` on return.
+The caller receives the updated context automatically through the ordinary call;
+no extra ghost arguments are needed. The execution owner stays the same.
+
+A `raises` clause can similarly specify the held set on that exceptional outcome.
+Omitting a context clause requires preservation of the entry set independently
+for the normal exit and each declared exceptional outcome, even if another exit
+explicitly changes it. A bare `raises Exception` clause also preserves holdings.
+Overlapping exception patterns impose all matching clauses, including their
+preservation defaults.
+
+Loops preserve the procedure's entry context by default. If the function acquires
+a lock before entering a loop, give the loop an explicit context invariant, such
+as `Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex))`, along
+with the protected data invariant. Context invariants remain required on an
+exceptional exit from the loop too.
+
+A failed `try_lock` grants no protected resource. If the current execution already
+holds the mutex, it returns false and preserves the existing resources.
+
+The same execution-context rules apply through checked module signatures and
+functor parameters. Unit, curried and named-parameter functors can use Mutex and
+Domain operations, and can declare their protected resource and facades in the
+matching proof module. A functor's native accesses use its lexically bound facade;
+other applications of that functor do not make that choice ambiguous. Compatible
+contracts can name their context witnesses differently, or omit the names when
+they are unused, without adding ghost arguments to calls. Imported operations
+retain their existing contracts and implicitly promise context preservation.
+
+Manual `Ghost.AU` proofs keep the same syntax. Their tokens internally retain the
+originating call's context, including when tokens are aliased, stored in ghost
+fields, or used in a helping proof. This metadata does not grant ownership of that
+execution context to the helper.
+
+Native accesses currently require one unambiguous facade in the proof environment;
+standalone polymorphic facade families are deferred.
+`Mutex.protect` and `Condition` operations are not supported yet. The
+[focused mutex examples](https://github.com/nyu-acsys/caravan/tree/main/test/translate/mutex)
+show complete critical sections and exceptional cleanup.
 
 ## Modules and functors {#sec:modules-and-functors}
 

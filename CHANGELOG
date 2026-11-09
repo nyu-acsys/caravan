@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Native mutex proofs support protected-resource facades, owner-aware locking, helper effects, and Domain workers with checked lock cleanup in modules and functors.
+- Proof-defined modules support type aliases and explicit manifest carrier constraints.
 - Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
 - Proof outlines support loop invariants and OCaml closure anchors.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.

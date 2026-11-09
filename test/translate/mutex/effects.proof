@@ -1,0 +1,80 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = exists n : int. own cell.contents n && 0 <= n
+end
+module Guard = Ghost.Mutex (Cell)
+
+proof acquire mutex cell
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell) = ()
+
+proof release mutex cell
+  requires (Ghost.Mutex.context self held && Finset.mem mutex held &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell)
+  ensures (Ghost.Mutex.context self (Finset.diff held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell) = ()
+
+proof acquire_or_raise mutex cell choice
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell)
+  raises Acquired n ->
+    (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+      Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell && n === 1)
+  raises Unchanged n -> (Guard.is_mutex mutex cell && n === 0) = ()
+
+proof release_or_raise mutex cell choice
+  requires (Ghost.Mutex.context self held && Finset.mem mutex held &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell)
+  ensures (Ghost.Mutex.context self (Finset.diff held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell)
+  raises Released ->
+    (Ghost.Mutex.context self (Finset.diff held (Finset.singleton mutex)) &&
+      Guard.is_mutex mutex cell)
+  raises Retained ->
+    (Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell) = ()
+
+proof exceptional_acquire mutex cell fail
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell)
+  raises Acquired n ->
+    (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+      Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell) = ()
+
+proof repeat mutex cell
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) = ()
+
+proof acquire_with_defaults mutex cell fail
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell)
+  raises Unchanged n -> (Guard.is_mutex mutex cell && n === 0)
+  raises _ = ()
+
+proof client choice ensures (true) =
+  at (Mutex.create ()) (fun create ->
+    fold Cell.resource cell;
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex)
+
+proof releasing_client choice ensures (true) =
+  at (Mutex.create ()) (fun create ->
+    fold Cell.resource cell;
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex)
+
+proof exceptional_client fail ensures (true) =
+  at (Mutex.create ()) (fun create ->
+    fold Cell.resource cell;
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex)

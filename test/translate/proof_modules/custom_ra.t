@@ -26,4 +26,4 @@ Required interface operations cannot be omitted.
   $ cp custom_ra.ml custom_ra_missing.ml
   $ ! caravan --shh custom_ra_missing.ml > missing.out 2>&1
   $ grep -F 'Type Error:' missing.out
-  Type Error: The proof-defined resource algebra is missing comp.
+  Type Error: The proof-defined module is missing comp.

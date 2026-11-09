@@ -85,6 +85,7 @@ type t = {
       (** The lexical scope containing parameters used by this value representation. *)
   family : family option;
   atomic_procedure : string option;
+  atomic_context : bool;
   backend_type : Qualified_name.t option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
@@ -118,6 +119,7 @@ let list =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    atomic_context = false;
     witness = None;
     extension_keys = [];
     extension_aliases = [];
@@ -150,6 +152,7 @@ let option =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    atomic_context = false;
     witness = None;
     extension_keys = [];
     extension_aliases = [];
@@ -286,6 +289,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          atomic_context = false;
           witness;
           extension_keys = [];
           extension_aliases = [];
@@ -350,6 +354,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          atomic_context = false;
           witness = None;
           extension_keys = [];
           extension_aliases = [];
@@ -379,6 +384,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
+          atomic_context = false;
           witness = None;
           extension_keys = [];
           extension_aliases = [];
@@ -444,6 +450,7 @@ let library_type ~library ~library_id ~at name =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    atomic_context = false;
     witness = None;
     extension_keys = [];
     extension_aliases = [];
@@ -507,8 +514,17 @@ let parameter_type ~parameter ~name ~declaration ~backend =
     alias = Option.map declaration.typ_manifest ~f:(fun t -> t.Typedtree.ctyp_type);
   }
 
+let atomic_carrier ~loc ~context procedure =
+  let raw =
+    R.Type.atomic_token ~loc
+      (Qualified_name.raven ~loc (Qualified_name.of_string procedure))
+  in
+  if context then
+    R.Type.tuple ~loc [ raw; R.Type.ref ~loc; R.Type.fin_set ~loc (R.Type.ref ~loc) ]
+  else raw
+
 (** A nominal proof token for an existing atomic procedure. *)
-let atomic_token ~path ~procedure ~at =
+let atomic_token ?(context = false) ~path ~procedure ~at () =
   {
     list with
     id = None;
@@ -516,6 +532,7 @@ let atomic_token ~path ~procedure ~at =
     ctors = [];
     library = Some path;
     atomic_procedure = Some procedure;
+    atomic_context = context;
     at;
   }
 
@@ -541,6 +558,7 @@ let collection id kind =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
+    atomic_context = false;
     witness = None;
     extension_keys = [];
     extension_aliases = [];
@@ -588,28 +606,34 @@ let compiler_aliases ?(modules = []) ?(values = []) types
         let seen = Set.add seen id in
         let state =
           match Types.get_desc typ with
-          | Tconstr (path, _, _) when persistent path && Option.is_none (find types path)
-            ->
-              let represented =
-                Option.bind
-                  (Env.try_normalize_type_path None environment path)
-                  ~f:(find types)
+          | Tconstr (path, _, _) when Option.is_none (find types path) ->
+              let normalized = Env.try_normalize_type_path None environment path in
+              let native_alias =
+                Option.filter normalized ~f:(fun normalized ->
+                    Mutex_primitives.is_type normalized && not (Path.same path normalized))
               in
+              let represented = Option.bind normalized ~f:(find types) in
               let declaration =
                 try Some (Env.find_type path environment) with Stdlib.Not_found -> None
               in
               begin match (represented, declaration) with
-              | Some represented, _ ->
+              | Some represented, _ when persistent path || Option.is_some native_alias ->
                   let types =
                     List.map types ~f:(fun data ->
                         if phys_equal data represented then with_paths data [ path ]
                         else data)
                   in
                   (seen, types)
-              | ( None,
-                  Some
-                    ({ type_private = Public; type_manifest = Some body; _ } as
-                     declaration) ) ->
+              | None, Some declaration
+                when persistent path
+                     && Poly.equal declaration.type_private Public
+                     && Option.is_some declaration.type_manifest
+                     || Option.is_some native_alias ->
+                  let body =
+                    match native_alias with
+                    | Some path -> Ctype.newconstr path []
+                    | None -> Option.value_exn declaration.type_manifest
+                  in
                   let alias =
                     {
                       list with
@@ -622,7 +646,7 @@ let compiler_aliases ?(modules = []) ?(values = []) types
                     }
                   in
                   visit (seen, alias :: types) body
-              | None, (Some _ | None) -> (seen, types)
+              | Some _, _ | None, (Some _ | None) -> (seen, types)
               end
           | _ -> (seen, types)
         in
@@ -861,7 +885,14 @@ let is_domain (p : Path.t) =
       Ident.persistent root && String.equal (Ident.name root) "Stdlib__Domain"
   | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false
 
-let is_reference p = is_ref p || is_atomic p || is_domain p
+(** Native mutex handles have no payload type parameter. *)
+let is_mutex = Mutex_primitives.is_type
+
+let is_reference p = is_ref p || is_atomic p || is_domain p || is_mutex p
+
+let is_reference_type path arguments =
+  if is_mutex path then List.is_empty arguments
+  else is_reference path && List.length arguments = 1
 
 (** The opaque reference type used for proof-only storage. *)
 let is_ghost (p : Path.t) = String.equal (Path.name p) "Ghost.t"
@@ -872,7 +903,7 @@ let is_permission (p : Path.t) = String.equal (Path.name p) "Permission.t"
 (** Whether [t] itself is a heap reference, rather than a value containing one. *)
 let is_heap_ref (types : t list) (t : Types.type_expr) =
   match desc types t with
-  | Tconstr (p, [ _ ], _) when is_reference p -> true
+  | Tconstr (p, arguments, _) when is_reference_type p arguments -> true
   | Tconstr (p, [], _) when is_ghost p -> true
   | Tconstr (p, [], _) -> Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap)
   | _ -> false
@@ -881,7 +912,7 @@ let is_heap_ref (types : t list) (t : Types.type_expr) =
 let cell_namespaces (data : t list) (typ : Types.type_expr) =
   let rec collect typ =
     match desc data typ with
-    | Tconstr (path, [ _ ], _) when is_reference path -> []
+    | Tconstr (path, arguments, _) when is_reference_type path arguments -> []
     | Tconstr (path, [ element ], _)
       when Path.same path Predef.path_list || Path.same path Predef.path_option ->
         collect element
@@ -1043,7 +1074,7 @@ let rec type_key types t =
     | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Some Unit_key
     | Tconstr (p, [], _) when is_permission p -> Some Permission_key
     | Tconstr (p, [], _) when is_ghost p -> Some Ref_key
-    | Tconstr (p, [ _ ], _) when is_reference p -> Some Ref_key
+    | Tconstr (p, arguments, _) when is_reference_type p arguments -> Some Ref_key
     | Tconstr (p, [ element ], _) when Path.same p Predef.path_list ->
         unary (fun key -> List_key key) element
     | Tconstr (p, [ element ], _) when Path.same p Predef.path_option ->
@@ -1261,7 +1292,7 @@ let domain_identity types t =
     | Tvar _ | Tunivar _ ->
         Option.value_map (find_variable types t) ~default:[] ~f:(fun data ->
             Option.to_list data.domain_scope)
-    | Tconstr (path, [ _ ], _) when is_reference path -> []
+    | Tconstr (path, arguments, _) when is_reference_type path arguments -> []
     | Tconstr (path, arguments, _)
       when Option.exists (find types path) ~f:(fun data -> Option.is_some data.family) ->
         let family = Option.value_exn (Option.value_exn (find types path)).family in
@@ -1507,7 +1538,7 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       let* elt = typ types ?self ~at elt in
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l d.module_name) [ elt ])
-  | Tconstr (p, [ _ ], _) when is_reference p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, arguments, _) when is_reference_type p arguments -> Ok (R.Type.ref ~loc:l)
   | Tconstr (p, [ elt ], _) when Option.exists (find types p) ~f:is_sequence ->
       let* elt = typ types ?self ~at elt in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "Seq") [ elt ])
@@ -1568,9 +1599,8 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.atomic_procedure) ->
       let d = Option.value_exn (find types p) in
       Ok
-        (R.Type.atomic_token ~loc:l
-           (Qualified_name.raven ~loc:l
-              (Qualified_name.of_string (Option.value_exn d.atomic_procedure))))
+        (atomic_carrier ~loc:l ~context:d.atomic_context
+           (Option.value_exn d.atomic_procedure))
   | Tconstr (p, [], _) when List.exists types ~f:(fun d -> declares d p) ->
       let d = Option.value_exn (find types p) in
       Ok (R.Type.named ~loc:l (R.Name.make ~loc:l ~path:[ d.module_name ] "T") [])
@@ -1610,7 +1640,7 @@ let instantiated types occurrence =
 let fold_families types requested ~init ~f =
   let rec visit seen state typ =
     match desc types typ with
-    | Tconstr (path, [ _ ], _) when is_reference path -> state
+    | Tconstr (path, arguments, _) when is_reference_type path arguments -> state
     | Tconstr (path, arguments, _) ->
         let state = List.fold arguments ~init:state ~f:(visit seen) in
         let data = find types path in
@@ -1919,7 +1949,7 @@ let rec immediate (types : t list) (t : Types.type_expr) =
     when Path.same p Predef.path_int || Path.same p Predef.path_bool
          || Path.same p Predef.path_unit ->
       true
-  | Tconstr (p, [ _ ], _) when is_reference p -> true
+  | Tconstr (p, arguments, _) when is_reference_type p arguments -> true
   | Tconstr (p, [], _) when is_ghost p -> true
   | Tconstr (p, [], _) ->
       begin match find types p with
@@ -1936,7 +1966,7 @@ let has_refs (types : t list) (t : Types.type_expr) =
   let rec go seen t =
     match desc types t with
     | Tvar _ | Tunivar _ -> true
-    | Tconstr (p, [ _ ], _) when is_reference p -> true
+    | Tconstr (p, arguments, _) when is_reference_type p arguments -> true
     | Tconstr (p, [], _) when is_ghost p -> true
     | Tconstr (p, args, _) -> begin
         List.exists args ~f:(go seen)
@@ -2119,6 +2149,8 @@ let value_family_members types (data : t) =
       Ok
         ( external_ @ [ (qualified, factory) ],
           value_templates ~dictionaries:true types payloads )
+
+let needs_module (d : t) = Option.is_none d.heap && Option.is_none d.alias
 
 (** The module declaring [d], given the data types declared before it. *)
 let member ?(parameters = true) (types : t list) (d : t) :

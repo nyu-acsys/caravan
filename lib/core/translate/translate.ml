@@ -319,8 +319,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   in
   let emitted_predicates destination =
     List.concat_map predicate_members ~f:(fun (key, (member, parts)) ->
-        if Module_context.same_destination destination (predicate_destination key) then
-          member :: parts
+        if
+          Module_context.same_destination destination (predicate_destination key)
+          && Option.is_none (Option.bind (scoped_binding key) ~f:definition_target)
+        then member :: parts
         else [])
   in
   let proof_member key member =
@@ -373,21 +375,51 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               Option.value_map ~default:[]
                 (List.find scoped_proofs.bindings ~f:(fun binding ->
                      Ident.same binding.entry.id entry.id
-                     && (match binding.kind with Function _ -> true | _ -> false)
+                     && (match binding.kind with
+                       | Function _ -> true
+                       | Predicate _ ->
+                           List.exists resource.resource_operations
+                             ~f:(fun (name, kind, _, _) ->
+                               String.equal name binding.entry.name.pid_str
+                               &&
+                               match kind with
+                               | R.Ast.Callable.Pred | Invariant -> true
+                               | _ -> false)
+                       | _ -> false)
                      && Option.exists (definition_resource binding.entry.scope)
                           ~f:(fun owner ->
                             Ident.same owner.resource_id resource.resource_id)))
                 ~f:(fun binding -> members_named binding.backend))
         in
-        let interface =
-          qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+        let interface_name = Generic_assets.interface_name resource in
+        let interface = qualified_name ~loc:l interface_name in
+        let refined =
+          if Option.is_none resource.resource_descriptor.alias then []
+          else
+            [
+              ( resource,
+                R.Member.module_ ~loc:l ~interface:true
+                  ~implements:
+                    [
+                      ( qualified_name ~loc:l
+                          (String.concat ~sep:"." resource.resource_functor),
+                        [] );
+                    ]
+                  (ident ~loc:l (Qualified_name.of_string interface_name).name)
+                  [ carrier ] );
+            ]
         in
         Ok
-          ( resource,
-            R.Member.module_ ~loc:l
-              ~implements:[ (interface, []) ]
-              (ident ~loc:l backend) (carrier :: members) ))
+          (refined
+          @ [
+              ( resource,
+                R.Member.module_ ~loc:l
+                  ~implements:[ (interface, []) ]
+                  (ident ~loc:l backend)
+                  ((if List.is_empty refined then [ carrier ] else []) @ members) );
+            ]))
   in
+  let definition_modules = List.concat definition_modules in
   let definition_proof_modules =
     List.filter_map source.proof_resources ~f:(fun resource ->
         if
@@ -402,7 +434,16 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       (List.find scoped_proofs.bindings ~f:(fun binding ->
                            Ident.same binding.entry.id entry.id
                            && (match binding.kind with
-                             | Predicate _ | Lemma _ -> true
+                             | Predicate _ ->
+                                 not
+                                   (List.exists resource.resource_operations
+                                      ~f:(fun (name, kind, _, _) ->
+                                        String.equal name binding.entry.name.pid_str
+                                        &&
+                                        match kind with
+                                        | R.Ast.Callable.Pred | Invariant -> true
+                                        | _ -> false))
+                             | Lemma _ -> true
                              | _ -> false)
                            && Option.exists (definition_resource binding.entry.scope)
                                 ~f:(fun owner ->
@@ -1081,7 +1122,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           | Some family, Some procedure
             when List.equal String.equal namespace (String.split family.worker ~on:'.') ->
               let carrier =
-                R.Type.atomic_token ~loc:at (qualified_name ~loc:at procedure)
+                Datatypes.atomic_carrier ~loc:at ~context:data.atomic_context procedure
               in
               [
                 R.Member.type_ ~loc:at (ident ~loc:at family.member) (Some carrier);
@@ -1306,7 +1347,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         let* ra_data =
           all
             (List.filter_map private_ra_types ~f:(fun (plan, data) ->
-                 Option.some_if (phys_equal plan.Generic_proofs.group group) data))
+                 Option.some_if
+                   (phys_equal plan.Generic_proofs.group group
+                   && Datatypes.needs_module data)
+                   data))
             ~f:(Datatypes.member types)
         in
         let destination = Module_context.Worker group in
@@ -1372,7 +1416,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             in
             let* data_members =
               all
-                (List.filter layout_types ~f:(fun d -> Option.is_none d.Datatypes.heap))
+                (List.filter layout_types ~f:Datatypes.needs_module)
                 ~f:(Datatypes.member environment)
             in
             let* family_parts =
@@ -1968,6 +2012,15 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         @ (if state.tables.dynamic_indices then Indexed_initialization.members else [])
         @ (if List.exists structure_member_lists ~f:(fun (st, _) -> has_history st) then
              History.program_members history
+           else [])
+        @ (if
+             List.exists source.proof_resources ~f:(fun resource ->
+                 List.equal String.equal resource.Source.resource_functor
+                   [ Mutex_contract.protocol_name ]
+                 || List.equal String.equal resource.resource_functor
+                      [ Mutex_contract.resource_interface ])
+           then Mutex_contract.complete_support ~loc:start ()
+           else if state.tables.mutex_support then Mutex_contract.support ~loc:start ()
            else [])
         @ imported_resource_members @ modules @ value_factories
         @ List.filter_map shared_exception_members ~f:(fun (_, members) ->

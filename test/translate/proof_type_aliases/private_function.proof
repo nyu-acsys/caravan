@@ -1,0 +1,9 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = own cell.contents 0
+  let private_identity (value : int) : int = value
+end
+
+module Alias = Cell
+
+proof unused () requires (Alias.private_identity 0 = 0) = ()

@@ -1,0 +1,13 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+
+  let is_zero (value : int) : bool = value = 0
+  predicate resource (cell : t) = own cell.contents 0 && is_zero 0
+  predicate secret (value : int) = value = 0
+
+  lemma prove_zero ensures (is_zero 0) = ()
+  lemma prove_secret ensures (secret 0) = fold secret 0
+  lemma use_helpers ensures (secret 0 && is_zero 0) =
+    prove_zero;
+    prove_secret
+end

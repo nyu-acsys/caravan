@@ -1,0 +1,15 @@
+type number = int
+type cell = int ref
+type 'a bag = 'a list
+type 'a maybe_bag = 'a bag option
+
+predicate contents (cell : cell) (value : number) = own cell.contents value
+
+let copy (values : 'a bag) : 'a bag = values
+let wrap (values : 'a bag) : 'a maybe_bag = Some values
+
+proof result = keep_cell cell
+  requires (contents cell value)
+  ensures (contents result value) = ()
+
+proof result = echo values ensures (result === copy values) = ()

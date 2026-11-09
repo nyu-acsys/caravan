@@ -21,6 +21,15 @@ type operation = {
   outputs : (string * typ) list;
 }
 
+type callable = {
+  operation : operation;
+  kind : Ast.Callable.call_kind;
+  ghost_inputs : string list;
+  implicit_inputs : string list;
+  ghost_outputs : string list;
+  implicit_outputs : string list;
+}
+
 type type_member = {
   name : string;
   rep : bool;
@@ -37,6 +46,7 @@ type module_signature = {
   required_members : (string * string) list;
   types : type_member list;
   operations : operation list;
+  callables : callable list;
   constants : (string * typ) list;
 }
 
@@ -98,6 +108,23 @@ let operation (call : Ast.Callable.t) =
     outputs = vars decl.call_decl_returns;
   }
 
+let callable (call : Ast.Callable.t) =
+  let selected declarations predicate =
+    List.filter_map declarations ~f:(fun (declaration : Ast.Type.var_decl) ->
+        Option.some_if (predicate declaration) (name declaration.var_name))
+  in
+  let decl = call.call_decl in
+  {
+    operation = operation call;
+    kind = decl.call_decl_kind;
+    ghost_inputs = selected decl.call_decl_formals (fun variable -> variable.var_ghost);
+    implicit_inputs =
+      selected decl.call_decl_formals (fun variable -> variable.var_implicit);
+    ghost_outputs = selected decl.call_decl_returns (fun variable -> variable.var_ghost);
+    implicit_outputs =
+      selected decl.call_decl_returns (fun variable -> variable.var_implicit);
+  }
+
 let required_members (md : Ast.Module.t) =
   List.filter_map md.mod_def ~f:(function
     | Ast.Module.SymbolDef symbol ->
@@ -109,24 +136,29 @@ let required_members (md : Ast.Module.t) =
 let rec modules path (md : Ast.Module.t) =
   let path = path @ [ name md.mod_decl.mod_decl_name ] in
   let open Ast.Module in
-  let types, operations, constants, nested =
-    List.fold md.mod_def ~init:([], [], [], [])
-      ~f:(fun (types, operations, constants, nested) -> function
+  let types, operations, callables, constants, nested =
+    List.fold md.mod_def ~init:([], [], [], [], [])
+      ~f:(fun (types, operations, callables, constants, nested) -> function
       | Ast.Module.SymbolDef (TypeDef def) ->
-          (type_member path def :: types, operations, constants, nested)
-      | SymbolDef (CallDef call)
-        when Poly.equal call.call_decl.call_decl_kind Ast.Callable.Func ->
-          (types, operation call :: operations, constants, nested)
+          (type_member path def :: types, operations, callables, constants, nested)
+      | SymbolDef (CallDef call) ->
+          let operations =
+            if Poly.equal call.call_decl.call_decl_kind Ast.Callable.Func then
+              operation call :: operations
+            else operations
+          in
+          (types, operations, callable call :: callables, constants, nested)
       | SymbolDef (VarDef def) when def.var_decl.var_const ->
           ( types,
             operations,
+            callables,
             (name def.var_decl.var_name, typ def.var_decl.var_type) :: constants,
             nested )
-      | SymbolDef (ModDef child) -> (types, operations, constants, child :: nested)
-      | SymbolDef
-          (ModInst _ | ConstrDef _ | DestrDef _ | FieldDef _ | VarDef _ | CallDef _)
+      | SymbolDef (ModDef child) ->
+          (types, operations, callables, constants, child :: nested)
+      | SymbolDef (ModInst _ | ConstrDef _ | DestrDef _ | FieldDef _ | VarDef _)
       | Import _ ->
-          (types, operations, constants, nested))
+          (types, operations, callables, constants, nested))
   in
   let parameters =
     List.map (Ast.Module.formals md.mod_decl) ~f:(fun formal ->
@@ -141,6 +173,7 @@ let rec modules path (md : Ast.Module.t) =
       required_members = required_members md;
       types = List.rev types;
       operations = List.rev operations;
+      callables = List.rev callables;
       constants = List.rev constants;
     }
   in

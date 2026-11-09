@@ -442,9 +442,11 @@ proof_decl:
     { let ds, os = ds in
       Proof_module { module_name = n; module_parameters = ps;
         module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
-| MODULE n = uident COLON interface = uqualid EQUAL ds = proof_module_body
+| MODULE n = uident COLON interface = uqualid constraints = proof_definition_constraints
+    EQUAL ds = proof_module_body
     { let ds, os = ds in
       Proof_definition { module_name = n; module_interface = interface;
+        module_constraints = constraints;
         module_declarations = ds; module_outlines = os; module_loc = mk_loc $loc } }
 | MODULE n = uident EQUAL f = uqualid LEFTPAR STRUCT
     LET operation = lident EQUAL target = lqualid END RIGHTPAR
@@ -509,6 +511,8 @@ proof_decl:
     { Proof_state { state_name = n; state_params = ps; state_fields = fs } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL cs = bar_list1(type_ctor)
     { Proof_type { type_name = n; type_params = ps; type_kind = Variant cs } }
+| TYPE ps = loption(type_parameters) n = lident EQUAL ty = typ
+    { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty } }
 | INVARIANT n = lident ps = pred_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
@@ -528,6 +532,18 @@ proof_decl:
 
 proof_module_body:
 | STRUCT items = proof_item* END { split_items items }
+;
+
+proof_definition_constraints:
+| { [] }
+| WITH TYPE ps = loption(type_parameters) n = lident EQUAL ty = typ
+    { if n.pid_str <> "t" then
+        raise (Syntax_error (n.pid_loc,
+          "A proof-defined module supports a constraint on type t only"));
+      if ps <> [] then
+        raise (Syntax_error (n.pid_loc,
+          "A proof-defined module does not support a parameterized type constraint"));
+      [n, ty] }
 ;
 
 proof_module_parameter:

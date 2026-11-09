@@ -1124,7 +1124,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let data =
           Datatypes.with_paths
             (Datatypes.atomic_token ~path:au.Source.au_token_path
-               ~procedure:(au_procedure au f) ~at:au.au_at)
+               ~procedure:(au_procedure au f) ~at:au.au_at
+               ~context:(Mutex_execution.enabled source.proof_resources)
+               ())
             au.au_token_paths
         in
         let groups =
@@ -1277,8 +1279,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
     all
       (List.filter_mapi data_types ~f:(fun i (d : Datatypes.t) ->
            Option.some_if
-             (Option.is_none d.heap && Option.is_none d.alias
-             && not (Result_layouts.contains layouts d))
+             (Datatypes.needs_module d && not (Result_layouts.contains layouts d))
              (List.take data_types i, d)))
       ~f:(fun (before, d) ->
         let* member =
@@ -1361,10 +1362,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 | None -> error at "Missing resource algebra implementation"
               in
               let interface =
-                qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+                qualified_name ~loc:l (Generic_assets.interface_name resource)
               in
               Ok
-                (R.Member.alias ~loc:l ~typ:interface ~sealed:true
+                (R.Member.alias ~loc:l ~typ:interface
+                   ~sealed:(not (Generic_assets.transparent_protected_resource resource))
                    (ident ~loc:l (Qualified_name.of_string resource.resource_backend).name)
                    (qualified_name ~loc:l backend))
           | false, Some path ->
@@ -1959,6 +1961,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let proof_support =
           {
             empty_proof_support with
+            execution_context_path = Source.mutex_context_path source.env;
             runtime_functions = task_runtime_functions;
             predicate_views =
               Path_bindings.of_list

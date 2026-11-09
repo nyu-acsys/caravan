@@ -1,0 +1,26 @@
+module Resource : Ghost.MutexResource with type t = unit = struct
+  type t = unit
+  predicate resource (value : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+
+proof result = work mutex value
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex ())
+  ensures (Guard.is_mutex mutex () && result === value) = ()
+module Job = Ghost.Task (struct let operation = work end)
+
+proof domain = launch mutex value
+  requires (Guard.is_mutex mutex ())
+  ensures (Job.handle domain mutex value) = ()
+
+proof result = finish domain mutex value
+  requires (Job.handle domain mutex value)
+  ensures (Guard.is_mutex mutex () && result === value) = ()
+
+proof result = client () ensures (result === 8) =
+  at (Mutex.create ()) (fun create ->
+    fold Resource.resource ();
+    let mutex = create () in
+    Guard.initialize mutex ();
+    mutex)

@@ -199,6 +199,7 @@ type type_kind =
   | Variant of (id * pty list) list
   | Record of (id * pty) list
       (** A logical record, [type piece = { before : int list; next : node }]. *)
+  | Alias of pty
 
 (** The names that [p] binds. *)
 let rec pat_names (p : pat) =
@@ -265,6 +266,7 @@ type proof_decl =
   | Proof_definition of {
       module_name : id;
       module_interface : qualid;
+      module_constraints : (id * pty) list;
       module_declarations : proof_decl list;
       module_outlines : outline list;
       module_loc : Location.t;

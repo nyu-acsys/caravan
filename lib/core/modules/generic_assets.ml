@@ -143,3 +143,18 @@ let types resources data =
         resource.resource_descriptor :: resource.resource_aliases
       else [])
   @ data
+
+(** A protected-resource carrier made public by an explicit type equality. *)
+let transparent_protected_resource resource =
+  resource.resource_definition
+  && Option.is_some resource.resource_descriptor.alias
+  && List.equal String.equal resource.resource_functor
+       [ Mutex_contract.resource_interface ]
+
+(** Manifest carrier constraints use a refined interface at the public boundary. *)
+let interface_name resource =
+  if resource.resource_definition && Option.is_some resource.resource_descriptor.alias
+  then
+    let name = Qualified_name.of_string resource.resource_backend in
+    Qualified_name.to_string { name with name = name.name ^ "$Interface" }
+  else String.concat ~sep:"." resource.resource_functor

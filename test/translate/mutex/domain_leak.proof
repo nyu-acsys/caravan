@@ -1,0 +1,12 @@
+module Resource : Ghost.MutexResource with type t = unit = struct
+  type t = unit
+  predicate resource (value : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+
+proof work mutex
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex ())
+  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex () && Guard.held mutex self && Resource.resource ()) = ()
+module Job = Ghost.Task (struct let operation = work end)

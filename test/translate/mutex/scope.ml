@@ -1,0 +1,1 @@
+let scoped () = Mutex.create ()

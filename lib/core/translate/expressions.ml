@@ -594,9 +594,105 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
 (** The application of the function at [path] to [args], in [e]. *)
 and apply ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
     (args : Typedtree.expression list) =
-  match List.Assoc.find ctx.given.domain_calls (Domain_calls.key e) ~equal:Poly.equal with
-  | Some domain -> domain_call ctx e domain
-  | None -> apply_ordinary ctx e path declaration occurrence args
+  let* normalized =
+    State.of_result (Source.normalize_value_path e.exp_env ~at:e.exp_loc path)
+  in
+  match Mutex_primitives.operation normalized with
+  | Some operation -> mutex_call ctx e operation args
+  | None ->
+      begin match
+        List.Assoc.find ctx.given.domain_calls (Domain_calls.key e) ~equal:Poly.equal
+      with
+      | Some domain -> domain_call ctx e domain
+      | None -> apply_ordinary ctx e path declaration occurrence args
+      end
+
+and mutex_call ctx (e : Typedtree.expression) operation args =
+  let at = e.exp_loc in
+  let l = loc at in
+  match (operation, args) with
+  | Mutex_primitives.Create, [ argument ] ->
+      let* statements, _ = expr ctx argument in
+      let* () = State.note_mutex_support in
+      let run _ =
+        let+ result = State.fresh "mutex" in
+        let value = R.Expr.var ~loc:l (name ~loc:l result) in
+        ( R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
+            ~init:
+              (R.Stmt.expr_rhs
+                 (match ctx.given.execution_owner with
+                 | None -> Mutex_contract.create ~loc:l
+                 | Some owner -> Mutex_contract.create_in_execution ~loc:l owner))
+            (ident ~loc:l result),
+          value,
+          [],
+          [] )
+      in
+      let* creation, value =
+        match
+          List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
+        with
+        | None ->
+            let+ creation, value, _, _ = run None in
+            (creation, value)
+        | Some annotation ->
+            access_proof ctx annotation ~result_type:e.exp_type ~input_types:[]
+              ~output_types:[] (fun values -> run (Some values))
+      in
+      State.return (statements @ creation, value)
+  | Create, _ -> State.of_result (unsupported at "This Mutex.create application")
+  | (Lock | Unlock | Try_lock), [ mutex ] when ctx.given.mutex_execution ->
+      let* protocol =
+        State.of_result
+          (Mutex_execution.protocol ~at ~environment:ctx.given.env
+             ctx.given.proof_support.resources)
+      in
+      let* owner =
+        State.of_result
+          (Report.expect ~at "The native execution owner" ctx.given.execution_owner)
+      in
+      let* statements, mutex = expr ctx mutex in
+      let facade = Qualified_name.of_string protocol.resource_backend in
+      let run _ =
+        match operation with
+        | Lock ->
+            State.return
+              ( [ R.Stmt.call ~loc:l (Mutex_contract.lock ~loc:l ~facade mutex owner) ],
+                unit_value ~loc:l,
+                [],
+                [] )
+        | Unlock ->
+            State.return
+              ( [ R.Stmt.call ~loc:l (Mutex_contract.unlock ~loc:l ~facade mutex owner) ],
+                unit_value ~loc:l,
+                [],
+                [] )
+        | Try_lock ->
+            let+ result = State.fresh "locked" in
+            ( R.Stmt.local ~loc:l ~typ:(R.Type.bool ~loc:l)
+                ~init:
+                  (R.Stmt.expr_rhs (Mutex_contract.try_lock ~loc:l ~facade mutex owner))
+                (ident ~loc:l result),
+              R.Expr.var ~loc:l (name ~loc:l result),
+              [],
+              [] )
+        | Create | Protect -> State.of_result (error at "Invalid native Mutex access")
+      in
+      let* access, value =
+        match
+          List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
+        with
+        | None ->
+            let+ access, value, _, _ = run None in
+            (access, value)
+        | Some annotation ->
+            access_proof ctx annotation ~result_type:e.exp_type ~input_types:[]
+              ~output_types:[] (fun values -> run (Some values))
+      in
+      State.return (statements @ access, value)
+  | (Lock | Unlock | Try_lock), _ ->
+      State.of_result (error at "Native Mutex access requires a Ghost.Mutex facade")
+  | Protect, _ -> State.of_result (unsupported at "Mutex.protect")
 
 and domain_call ctx (e : Typedtree.expression) domain =
   let at = e.exp_loc in
@@ -658,17 +754,27 @@ and domain_call ctx (e : Typedtree.expression) domain =
             ~argument_types:task.domain_inputs ~prefix_count:0 ~args:(values @ ghosts)
         in
         let* handle_name = State.fresh "domain" in
+        let* child_statements, child_arguments =
+          if not ctx.given.mutex_execution then State.return ([], [])
+          else
+            let+ child = State.fresh "domain_child" in
+            ( R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.ref ~loc:l)
+                ~init:(R.Stmt.expr_rhs (Mutex_contract.start ~loc:l))
+                (ident ~loc:l child),
+              [ R.Expr.var ~loc:l (name ~loc:l child) ] )
+        in
         let adapter =
           { task.domain_runtime with name = "fork$" ^ task.domain_template }
         in
         State.return
-          ( R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
-              ~init:
-                (R.Stmt.expr_rhs
-                   (R.Expr.call ~loc:l
-                      (Qualified_name.raven ~loc:l adapter)
-                      (values @ ghosts @ history)))
-              (ident ~loc:l handle_name),
+          ( child_statements
+            @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
+                ~init:
+                  (R.Stmt.expr_rhs
+                     (R.Expr.call ~loc:l
+                        (Qualified_name.raven ~loc:l adapter)
+                        (values @ ghosts @ history @ child_arguments)))
+                (ident ~loc:l handle_name),
             R.Expr.var ~loc:l (name ~loc:l handle_name),
             [],
             [] )
@@ -688,6 +794,7 @@ and domain_call ctx (e : Typedtree.expression) domain =
         + List.length task.domain_ghost_inputs
         + List.length task.domain_implicit_inputs
         + (2 * task.domain_history_inputs)
+        + if ctx.given.mutex_execution then 1 else 0
       in
       let output_count =
         List.length task.domain_ghost_outputs + (2 * task.domain_history_outputs)
@@ -1348,7 +1455,18 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
   in
   (* A library's procedure is qualified by its module, as [Backoff.once]. *)
   let callee_name = qualified_name ~loc:l (Option.value actual_target ~default:f) in
-  let callee = R.Expr.call ~loc:l callee_name (args @ witnesses @ implicit) in
+  let* execution_statements, execution_arguments =
+    if
+      ctx.given.mutex_execution
+      && List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
+          String.equal target f)
+    then State.execution_arguments ctx ~at:e.exp_loc
+    else State.return ([], [])
+  in
+  let stmts = stmts @ execution_statements in
+  let callee =
+    R.Expr.call ~loc:l callee_name (args @ witnesses @ execution_arguments @ implicit)
+  in
   let reuse = Option.map retry ~f:(fun (au, _, _) -> au.ghost_results) in
   let* ghost_decls, ghosts =
     Call_witnesses.history_outputs ?reuse ctx ~at:e.exp_loc ~callee:f

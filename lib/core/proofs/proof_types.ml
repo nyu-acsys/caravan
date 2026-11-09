@@ -165,6 +165,15 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
            (Printf.sprintf "The module %s is reserved for specifications" name))
     with Stdlib.Not_found -> Ok ()
   in
+  let arrow args result =
+    List.fold_right args ~init:result ~f:(fun arg result ->
+        let arg =
+          match Types.get_desc arg with
+          | Tpoly _ -> arg
+          | _ -> Btype.newgenty (Tpoly (arg, []))
+        in
+        Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
+  in
   let* env =
     if not add_standard then Ok env
     else
@@ -174,7 +183,60 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
         signature env
           (Parse.interface
              (Lexing.from_string
-                "module Ghost : sig type t type ('owner, 'value) field end"))
+                "module Ghost : sig\n\
+                 type t\n\
+                 type ('owner, 'value) field\n\
+                 module Mutex : sig\n\
+                 end\n\
+                 end"))
+      in
+      let ghost_id, ghost_module = Env.find_module_by_name (Lident "Ghost") env in
+      let owner = Ctype.newconstr (Path.Pdot (ghost_id, "t")) [] in
+      let mutex =
+        Ctype.newconstr
+          (Path.Pdot (Pident (Ident.create_persistent "Stdlib__Mutex"), "t"))
+          []
+      in
+      let finset, _ = Env.find_type_by_name (Lident "finset") env in
+      let held = Ctype.newconstr finset [ mutex ] in
+      let context =
+        Types.Sig_value
+          ( Ident.create_local "context",
+            {
+              val_type =
+                Compiler_types.scheme_structure (arrow [ owner; held ] Predef.type_bool);
+              val_kind = Val_reg;
+              val_loc = Location.none;
+              val_attributes = [];
+              val_uid = Shape.Uid.internal_not_actually_unique;
+            },
+            Exported )
+      in
+      let module_type : Types.module_type =
+        match ghost_module.md_type with
+        | Mty_signature members ->
+            Types.Mty_signature
+              (List.map members ~f:(function
+                | Sig_module (id, presence, declaration, recursive, visibility)
+                  when String.equal (Ident.name id) "Mutex" ->
+                    Types.Sig_module
+                      ( id,
+                        presence,
+                        { declaration with md_type = Mty_signature [ context ] },
+                        recursive,
+                        visibility )
+                | member -> member))
+        | Mty_ident _ | Mty_functor _ | Mty_alias _ ->
+            failwith "The standard Ghost signature must be structural"
+      in
+      let env =
+        match ghost_id with
+        | Pident id ->
+            Env.add_module_declaration ~check:false id Mp_present
+              { ghost_module with md_type = module_type }
+              env
+        | Pdot _ | Papply _ | Pextra_ty _ ->
+            failwith "The standard Ghost module must be local"
       in
       Ok
         (signature env
@@ -225,15 +287,6 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
       Error (Report.error Type at ("The " ^ kind ^ " operation must be a function"))
     else Ok (operation_path, operation_type, args, result)
   in
-  let arrow args result =
-    List.fold_right args ~init:result ~f:(fun arg result ->
-        let arg =
-          match Types.get_desc arg with
-          | Tpoly _ -> arg
-          | _ -> Btype.newgenty (Tpoly (arg, []))
-        in
-        Btype.newgenty (Tarrow (Nolabel, arg, result, Types.commu_ok)))
-  in
   let facade_value ~at (name, args, result) =
     let id = Ident.create_local name in
     Types.Sig_value
@@ -269,10 +322,12 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 { txt = name.pid_str; loc = name.pid_loc }
                 (core_type ~at:name.pid_loc ty)
             in
-            let kind =
+            let kind, manifest =
               match type_kind with
-              | Variant ctors -> Parsetree.Ptype_variant (List.map ctors ~f:constructor)
-              | Record fields -> Ptype_record (List.map fields ~f:label)
+              | Variant ctors ->
+                  (Parsetree.Ptype_variant (List.map ctors ~f:constructor), None)
+              | Record fields -> (Ptype_record (List.map fields ~f:label), None)
+              | Alias typ -> (Ptype_abstract, Some (core_type ~at:type_name.pid_loc typ))
             in
             let declaration =
               let params =
@@ -280,7 +335,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                     ( Ast_helper.Typ.var ~loc:parameter.pid_loc parameter.pid_str,
                       (Asttypes.NoVariance, Asttypes.NoInjectivity) ))
               in
-              Ast_helper.Type.mk ~loc:type_name.pid_loc ~kind ~params
+              Ast_helper.Type.mk ~loc:type_name.pid_loc ~kind ?manifest ~params
                 { txt = type_name.pid_str; loc = type_name.pid_loc }
             in
             let typed, _, _, _, env =
@@ -294,9 +349,10 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             let* added =
               Result.all
                 (List.map typed_declarations ~f:(fun declaration ->
-                     Result.map
-                       (Datatypes.of_declaration declaration)
-                       ~f:Datatypes.with_mathematical_domain))
+                     Result.map (Datatypes.of_declaration declaration) ~f:(fun data ->
+                         match type_kind with
+                         | Alias _ -> data
+                         | Variant _ | Record _ -> Datatypes.with_mathematical_domain data)))
             in
             Ok (env, List.rev_append added descriptors, resources, fields)
         | Proof_au { au_name = name; au_operation = operation } ->
@@ -1008,6 +1064,16 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                                resource_parameters previous.resource_type);
                       })
                 in
+                let resource_descriptor =
+                  if Proof_library.is_mutex_protocol library then
+                    {
+                      (Datatypes.with_paths resource_descriptor
+                         [ Path.Pdot (Path.Pident resource_id, "t") ])
+                      with
+                      alias = Some (Ctype.expand_head env resource_type);
+                    }
+                  else resource_descriptor
+                in
                 let resource_aliases =
                   List.filter_map (List.zip_exn pairs arguments)
                     ~f:(fun ((formal, argument), typed_argument) ->
@@ -1027,7 +1093,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                       | Proof_module_argument _, Type_argument _ ->
                           failwith "A resource argument must retain its kind")
                 in
-                let value_type operation =
+                let value_type kind operation =
                   let qualified =
                     Longident.Ldot
                       ( { txt = Longident.Lident name.pid_str; loc = at },
@@ -1050,16 +1116,19 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                   let parameters, arguments = List.unzip variables in
                   let typ = apply_parameters parameters arguments value.Types.val_type in
                   let inputs, output = function_arguments typ in
-                  (operation, inputs, output)
+                  (operation, kind, inputs, output)
                 in
                 let resource_operations =
-                  List.map operations ~f:(fun operation -> value_type operation.name)
+                  List.map operations ~f:(fun operation ->
+                      value_type
+                        (Proof_library.operation_kind signatures library operation.name)
+                        operation.name)
                   @ List.filter_map library_constants ~f:(fun (constant, _) ->
                       Option.some_if
                         (not
                            (List.exists operations ~f:(fun operation ->
                                 String.equal operation.name constant)))
-                        (value_type constant))
+                        (value_type Raven_api.Ast.Callable.Func constant))
                 in
                 let resource =
                   {
@@ -1508,14 +1577,14 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               match
                 Proof_library.find signatures (Proof_library.path_of_qualid interface)
               with
-              | Some selected
-                when selected.interface
-                     && Proof_library.is_resource_algebra signatures selected ->
+              | Some selected when Proof_library.is_resource_interface signatures selected
+                ->
                   Ok ()
               | Some _ ->
                   Error
                     (Report.error Type (S.qualid_loc interface)
-                       "An abstract proof module must name a ResourceAlgebra interface")
+                       "An abstract proof module must name a ResourceAlgebra or \
+                        Ghost.MutexResource interface")
               | None ->
                   Error
                     (Report.error Type (S.qualid_loc interface)
@@ -1609,10 +1678,10 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             in
             let typ = Ctype.newconstr type_path [] in
             let operations =
-              List.map generated.resource_operations ~f:(fun (operation, _, _) ->
+              List.map generated.resource_operations ~f:(fun (operation, kind, _, _) ->
                   let value = Env.find_value (Path.Pdot (path, operation)) env in
                   let inputs, output = function_arguments value.val_type in
-                  (operation, inputs, output))
+                  (operation, kind, inputs, output))
             in
             let descriptor =
               Datatypes.resource_type ~name:backend ~module_id:id ~at |> fun descriptor ->
@@ -1783,23 +1852,142 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 then Ok ()
                 else
                   Error
-                    (Report.error Type at
-                       "A proof-defined resource algebra must declare type t")
+                    (Report.error Type at "A proof-defined module must declare type t")
               in
-              let member name expected =
+              let* () =
+                let representation =
+                  List.find_map known_resources ~f:(fun resource ->
+                      if
+                        resource.resource_definition
+                        && Option.exists scope.owner ~f:(fun owner ->
+                            Path.same owner resource.resource_path)
+                      then resource.resource_descriptor.alias
+                      else None)
+                in
+                match representation with
+                | None -> Ok ()
+                | Some expected ->
+                    let actual =
+                      List.find_map local ~f:(function
+                        | Types.Sig_type (id, declaration, _, _)
+                          when String.equal (Ident.name id) "t" ->
+                            Some
+                              (Ctype.newconstr (Path.Pident id) declaration.type_params)
+                        | _ -> None)
+                    in
+                    begin match actual with
+                    | Some actual when Ctype.is_equal env false [ actual ] [ expected ] ->
+                        Ok ()
+                    | Some _ | None ->
+                        Error
+                          (Report.error Type at
+                             "The proof-defined module type t does not satisfy its \
+                              manifest constraint")
+                    end
+              in
+              let declaration name =
+                List.find_map declarations ~f:(fun entry ->
+                    Option.some_if
+                      (String.equal entry.Proof_scopes.name.pid_str name)
+                      entry.declaration)
+              in
+              let declared_kind = function
+                | S.Proof_predicate predicate ->
+                    Some
+                      (if predicate.pred_persistent then Raven_api.Ast.Callable.Invariant
+                       else Pred)
+                | Proof_invariant _ -> Some Raven_api.Ast.Callable.Invariant
+                | Proof_function _ -> Some Raven_api.Ast.Callable.Func
+                | Proof_lemma _ -> Some Raven_api.Ast.Callable.Lemma
+                | _ -> None
+              in
+              let kind_name = function
+                | Raven_api.Ast.Callable.Func -> "a logical function"
+                | Pred -> "a predicate"
+                | Invariant -> "an invariant"
+                | Lemma -> "a lemma"
+                | Proc -> "a procedure"
+              in
+              let declared_type parameters result =
+                let core =
+                  List.fold_right parameters ~init:result ~f:(fun (_, typ) result ->
+                      Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at typ) result)
+                in
+                Typetexp.TyVarEnv.with_local_scope (fun () ->
+                    (Typetexp.transl_type_scheme env core).ctyp_type)
+              in
+              let boolean =
+                Ast_helper.Typ.constr ~loc:at
+                  { txt = Longident.Lident "bool"; loc = at }
+                  []
+              in
+              let predicate_parameters = function
+                | S.Proof_predicate predicate -> Some predicate.pred_params
+                | Proof_invariant { inv_params; inv_state; _ } ->
+                    Some (inv_params @ [ inv_state ])
+                | _ -> None
+              in
+              let error at message = Error (Report.error Type at message) in
+              let implicit_count parameters =
+                List.fold_result parameters ~init:(false, 0)
+                  ~f:(fun (seen, count) ((id : S.id), _) ->
+                    let implicit = List.mem id.pid_attrs "implicit" ~equal:String.equal in
+                    if seen && not implicit then
+                      error id.pid_loc
+                        "Implicit predicate parameters must follow explicit parameters"
+                    else Ok (seen || implicit, count + if implicit then 1 else 0))
+                |> Result.map ~f:snd
+              in
+              let member ?kind name expected =
                 let* expected =
                   match expected with
                   | Ok typ ->
                       Ok (Typetexp.transl_simple_type env ~closed:true typ).ctyp_type
                   | Error error -> Error error
                 in
-                match
-                  List.find_map local ~f:(function
-                    | Types.Sig_value (id, value, _)
-                      when String.equal (Ident.name id) name ->
-                        Some value.val_type
-                    | _ -> None)
-                with
+                let actual_declaration = declaration name in
+                let* () =
+                  match (kind, Option.bind actual_declaration ~f:declared_kind) with
+                  | Some expected, Some actual when not (Poly.equal expected actual) ->
+                      error at
+                        (Printf.sprintf "The proof-defined module member %s must be %s"
+                           name (kind_name expected))
+                  | _ -> Ok ()
+                in
+                let parameters = Option.bind actual_declaration ~f:predicate_parameters in
+                let* () =
+                  match parameters with
+                  | None -> Ok ()
+                  | Some parameters ->
+                      let* count = implicit_count parameters in
+                      let returns =
+                        Option.value_map
+                          (List.find (Proof_library.member_callables signatures selected)
+                             ~f:(fun callable ->
+                               String.equal callable.Checked_signatures.operation.name
+                                 name))
+                          ~default:0
+                          ~f:(fun callable -> List.length callable.operation.outputs)
+                      in
+                      if count = returns then Ok ()
+                      else
+                        error at
+                          (Printf.sprintf
+                             "The proof-defined module member %s has the wrong number of \
+                              implicit parameters"
+                             name)
+                in
+                let actual =
+                  match parameters with
+                  | Some parameters -> Some (declared_type parameters boolean)
+                  | None ->
+                      List.find_map local ~f:(function
+                        | Types.Sig_value (id, value, _)
+                          when String.equal (Ident.name id) name ->
+                            Some value.val_type
+                        | _ -> None)
+                in
+                match actual with
                 | None
                   when not
                          (List.exists selected.required_members ~f:(fun (_, required) ->
@@ -1808,22 +1996,22 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                 | None ->
                     Error
                       (Report.error Type at
-                         (Printf.sprintf
-                            "The proof-defined resource algebra is missing %s" name))
+                         (Printf.sprintf "The proof-defined module is missing %s" name))
                 | Some actual ->
                     if Ctype.is_equal env false [ actual ] [ expected ] then Ok ()
                     else
                       Error
                         (Report.error Type at
                            (Printf.sprintf
-                              "The proof-defined resource algebra member %s has the \
-                               wrong type"
-                              name))
+                              "The proof-defined module member %s has the wrong type" name))
               in
               let* () =
                 List.fold_result (Proof_library.member_operations signatures selected)
                   ~init:() ~f:(fun () operation ->
-                    member operation.name
+                    member
+                      ~kind:
+                        (Proof_library.operation_kind signatures selected operation.name)
+                      operation.name
                       (Proof_library.operation_type ~at ~signature:selected
                          ~substitutions:[] operation))
               in
@@ -1934,18 +2122,19 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               let* selected =
                 match Proof_library.find signatures interface with
                 | Some selected
-                  when selected.interface
-                       && Proof_library.is_resource_algebra signatures selected ->
+                  when Proof_library.is_resource_interface signatures selected ->
                     Ok selected
                 | Some _ ->
                     Error
                       (Report.error Type at
-                         "An exported proof module must name a ResourceAlgebra interface")
+                         "An exported proof module must name a ResourceAlgebra or \
+                          Ghost.MutexResource interface")
                 | None -> Error (Report.error Type at "Unknown Raven library interface")
               in
               let* () =
                 if
-                  private_resource.resource_is_ra
+                  (private_resource.resource_is_ra
+                  || Proof_library.is_protected_resource signatures selected)
                   && (List.equal String.equal private_resource.resource_functor
                         selected.path
                      || List.exists private_resource.resource_interfaces
@@ -2045,8 +2234,9 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   resource_id = public_id;
                   resource_operations =
                     List.map generated.resource_operations
-                      ~f:(fun (operation, inputs, output) ->
+                      ~f:(fun (operation, kind, inputs, output) ->
                         ( operation,
+                          kind,
                           List.map inputs ~f:(Subst.type_expr substitution),
                           Subst.type_expr substitution output ));
                   resource_descriptor = descriptor;
@@ -2139,8 +2329,15 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               let data = Datatypes.with_name data name in
               match (scope.owner, data.id) with
               | Some owner, Some id ->
+                  let public_carrier =
+                    String.equal (Ident.name id) "t"
+                    && List.exists known_resources ~f:(fun resource ->
+                        resource.resource_definition
+                        && Path.same owner resource.resource_path
+                        && Option.is_some resource.resource_descriptor.alias)
+                  in
                   let paths =
-                    if Option.is_some scope.definition then []
+                    if Option.is_some scope.definition && not public_carrier then []
                     else
                       [ Path.Pdot (owner, Ident.name id) ]
                       @ Option.to_list
@@ -3015,14 +3212,13 @@ let signature_ghost_resources env comments =
           Proof_library.find signatures
             (Proof_library.path_of_qualid declaration.ghost_module_interface)
         with
-        | Some selected
-          when selected.interface && Proof_library.is_resource_algebra signatures selected
-          ->
+        | Some selected when Proof_library.is_resource_interface signatures selected ->
             Ok selected
         | Some _ ->
             Error
               (Report.error Type at
-                 "An abstract proof module must name a ResourceAlgebra interface")
+                 "An abstract proof module must name a ResourceAlgebra or \
+                  Ghost.MutexResource interface")
         | None -> Error (Report.error Type at "Unknown Raven library interface")
       in
       let temporary =
@@ -3090,8 +3286,10 @@ let signature_ghost_resources env comments =
           resource_type = Ctype.newconstr (Path.Pdot (path, "t")) [];
           resource_id = id;
           resource_operations =
-            List.map generated.resource_operations ~f:(fun (operation, args, result) ->
+            List.map generated.resource_operations
+              ~f:(fun (operation, kind, args, result) ->
                 ( operation,
+                  kind,
                   List.map args ~f:(Subst.type_expr substitution),
                   Subst.type_expr substitution result ));
           resource_descriptor =
@@ -3279,14 +3477,14 @@ let imported_proof_resources env libraries =
               Proof_library.find signatures
                 (Proof_library.path_of_qualid declaration.ghost_module_interface)
             with
-            | Some selected
-              when selected.interface
-                   && Proof_library.is_resource_algebra signatures selected ->
+            | Some selected when Proof_library.is_resource_interface signatures selected
+              ->
                 Ok selected
             | Some _ ->
                 Error
                   (Report.error Type at
-                     "An imported proof module must name a ResourceAlgebra interface")
+                     "An imported proof module must name a ResourceAlgebra or \
+                      Ghost.MutexResource interface")
             | None -> Error (Report.error Type at "Unknown Raven library interface")
           in
           let* () =
@@ -3392,8 +3590,9 @@ let imported_proof_resources env libraries =
               resource_id = id;
               resource_operations =
                 List.map generated.resource_operations
-                  ~f:(fun (operation, args, result) ->
+                  ~f:(fun (operation, kind, args, result) ->
                     ( operation,
+                      kind,
                       List.map args ~f:(Subst.type_expr substitution),
                       Subst.type_expr substitution result ));
               resource_descriptor = descriptor;

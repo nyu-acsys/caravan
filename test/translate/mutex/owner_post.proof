@@ -1,0 +1,9 @@
+module Resource : Ghost.MutexResource with type t = unit = struct
+  type t = unit
+  predicate resource (value : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+
+proof untouched [other : Ghost.t] ()
+  requires (Ghost.Mutex.context self held && self =/= other)
+  ensures (Ghost.Mutex.context other held) = ()

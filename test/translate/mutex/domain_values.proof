@@ -1,0 +1,11 @@
+module Resource : Ghost.MutexResource with type t = unit = struct
+  type t = unit
+  predicate resource (value : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+
+proof result = empty () ensures (result === []) = ()
+module Empty = Ghost.Task (struct let operation = empty end)
+
+proof result = integers () ensures (result === []) = ()
+proof result = booleans () ensures (result === []) = ()

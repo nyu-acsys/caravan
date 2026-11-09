@@ -165,7 +165,11 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
   let preds =
     List.filter_map local_exports ~f:(fun binding ->
         match binding.kind with
-        | Predicate _ -> Some (binding.public_key, (binding.backend, binding.public_types))
+        | Predicate _ ->
+            Some
+              ( binding.public_key,
+                ( Option.value (definition_target binding) ~default:binding.backend,
+                  binding.public_types ) )
         | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _
         | Action _ ->
             None)
@@ -921,6 +925,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
   let resources, ghost_fields = proof_assets None in
   let proof_support =
     {
+      execution_context_path = Source.mutex_context_path source.env;
       runtime_functions =
         Path_bindings.of_list
           (imported_pure
@@ -1259,6 +1264,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                  map_atomic_types
                    {
                      au_key = key;
+                     au_context = Mutex_execution.enabled source.proof_resources;
                      au_generic;
                      au_owner = owner;
                      au_private = shape;

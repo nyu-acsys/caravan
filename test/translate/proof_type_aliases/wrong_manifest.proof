@@ -1,0 +1,4 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = bool ref
+  predicate resource (cell : t) = true
+end

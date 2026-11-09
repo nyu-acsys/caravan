@@ -1,0 +1,6 @@
+module Cell : Ghost.MutexResource = struct
+  type t = int ref
+  predicate resource (cell : t) = own cell.contents 0
+end
+
+proof mutex = make cell requires (Cell.resource cell) = ()

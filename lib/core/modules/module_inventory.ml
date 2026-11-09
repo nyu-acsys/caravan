@@ -494,7 +494,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | Pdot (parent, _) -> imported parent
               | Papply _ | Pextra_ty _ -> false
             in
-            if imported normalized then
+            if imported normalized || Mutex_primitives.is_module normalized then
               begin try
                 let declaration = Env.find_module normalized env in
                 match Mtype.scrape env declaration.md_type with

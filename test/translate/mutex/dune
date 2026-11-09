@@ -1,0 +1,33 @@
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.proof)
+  ../domains/ghost_explicit.ml
+  ../domains/ghost_explicit.proof
+  ../domains/ghost_explicit_raises.ml
+  ../domains/ghost_explicit_raises.proof
+  ../domains/history.ml
+  ../domains/history.proof
+  ../domains/functor.ml
+  ../domains/functor.proof
+  ../domains/functor_parameters.ml
+  ../domains/functor_parameters.proof
+  ../domains/functor_curried.ml
+  ../domains/functor_curried.proof
+  ../domains/functor_raises.ml
+  ../domains/functor_raises.proof
+  ../domains/ghost_explicit_functor.ml
+  ../domains/ghost_explicit_functor.proof
+  ../module_contracts/ordinary.ml
+  ../module_contracts/atomic.ml
+  ../module_contracts/actual.mli
+  ../functor_polymorphism/operations.ml
+  ../functor_polymorphism/argument.mli
+  ../functor_polymorphism/atomic.ml
+  ../functor_polymorphism/atomic_argument.mli
+  ../proof_modules/scoped_au.ml
+  ../proof_modules/scoped_au.proof
+  ../polymorphic_ghost/au_functor.ml
+  ../polymorphic_ghost/au_functor.proof))

@@ -1,0 +1,3 @@
+type cell = int ref
+
+let equal (left : cell) (right : cell) : bool = left = right

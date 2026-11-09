@@ -1630,6 +1630,10 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   State.in_procedure
   @@
   let open State.Syntax in
+  let* execution_ctx, execution =
+    Mutex_execution.prepare_boundary { given; au = None } ~at:f.loc f.contract
+  in
+  let given = execution_ctx.given in
   let* {
          context = ctx;
          func = f;
@@ -1751,8 +1755,10 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* () = State.set_scope scope in
   let implicit_decls = implicit in
   let implicit = List.map implicit ~f:(fun (_, _, _, var) -> var) in
+  let contract_env = Mutex_execution.entry_environment env in
   let specs fs =
-    State.all fs ~f:(fun f -> State.map (Spec_terms.formula env f) ~f:R.Spec.make)
+    State.all fs ~f:(fun f ->
+        State.map (Spec_terms.formula contract_env f) ~f:R.Spec.make)
   in
   (* Values of type [int] are in its range. *)
   let in_range = List.filter_map formals ~f:(fun (_, range, _) -> range) in
@@ -1827,6 +1833,11 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let stable term =
     List.for_all (term_references [] term) ~f:(fun q ->
         if String.equal (qualid_key q) "own" then false
+        else if
+          Option.exists (resource_operation_kind env q) ~f:(function
+            | R.Ast.Callable.Pred | Lemma | Proc -> true
+            | Func | Invariant -> false)
+        then false
         else
           match
             List.Assoc.find ctx.given.preds (logical_key env q) ~equal:String.equal
@@ -1901,6 +1912,12 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
         let* normal = postconditions (List.map posts ~f:Exceptions.on_return) in
         let+ exceptional = postconditions (raises_terms set @ witness_raises_terms) in
         normal @ exceptional
+  in
+  let* execution_ensures =
+    State.map
+      (Mutex_execution.exit_resources env execution ~at:f.loc
+         ~raising:(Option.is_some raising) f.contract)
+      ~f:(List.map ~f:R.Spec.make)
   in
   let atomic_posts =
     Option.value_map f.contract ~default:[] ~f:(fun c -> c.atomic_ensures)
@@ -2011,15 +2028,20 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                             (R.Expr.var ~loc:l (name ~loc:l result))
                             (ident ~loc:l u.raven))))))
   in
-  let requires = in_range @ requires @ List.map past_params ~f:snd @ atomic_requires in
+  let requires =
+    in_range @ requires @ List.map past_params ~f:snd @ atomic_requires
+    @ List.map execution.resources ~f:R.Spec.make
+  in
   let ensures =
     Option.to_list result_in_range
     @ defined @ ensures @ List.map past_results ~f:snd @ atomic_ensures
     @ List.map cases ~f:R.Spec.make
-    @ if atomic then List.map cases ~f:(R.Spec.make ~atomic:true) else []
+    @ (if atomic then List.map cases ~f:(R.Spec.make ~atomic:true) else [])
+    @ execution_ensures
   in
   let all_formals =
-    List.map formals ~f:(fun (_, _, v) -> v) @ ghost_formals @ past_formals @ implicit
+    List.map formals ~f:(fun (_, _, v) -> v)
+    @ ghost_formals @ past_formals @ execution.formals @ implicit
   in
   let* () =
     State.of_result
