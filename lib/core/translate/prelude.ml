@@ -10,6 +10,7 @@ let div = "ocaml_div"
 let mod_ = "ocaml_mod"
 let in_range = "ocaml_int"
 let wrap = "ocaml_wrap"
+let wrap_full = "ocaml_wrap_full"
 let value_interface = "Ocaml$Value"
 let cell_family = "Ocaml$Cells"
 let value_int = "Ocaml$IntValue"
@@ -17,7 +18,7 @@ let value_list = "Ocaml$ListValue"
 let value_option = "Ocaml$OptionValue"
 let value_tuple arity = "Ocaml$TupleValue$" ^ Int.to_string arity
 
-(** The bounds of OCaml's 63-bit [int]. *)
+(** The bounds of OCaml's machine [int]. *)
 let min_int = Stdlib.min_int
 
 let max_int = Stdlib.max_int
@@ -29,6 +30,20 @@ let func name ret body =
     ~formals:[ int_var "a"; int_var "b" ]
     ~returns:[ int_var ret ]
     (R.Ident.make ~loc name) (Some body)
+
+(** Source arithmetic normalizes every intermediate result; specifications stay
+    mathematical. *)
+let runtime_binary ~loc op a b =
+  let call name args = R.Expr.call ~loc (R.Name.make ~loc name) args in
+  match op with
+  | R.Expr.Plus | Minus -> call wrap [ R.Expr.binary ~loc op a b ]
+  | Mult -> call wrap_full [ R.Expr.binary ~loc op a b ]
+  | Div -> call wrap [ call div [ a; b ] ]
+  | Mod -> call mod_ [ a; b ]
+  | _ -> R.Expr.binary ~loc op a b
+
+let runtime_neg ~loc value =
+  R.Expr.call ~loc (R.Name.make ~loc wrap) [ R.Expr.neg ~loc value ]
 
 let cell_members =
   let value name = R.Name.make ~loc ~path:[ "V" ] name in
@@ -216,6 +231,11 @@ let members : R.Member.t list =
   let ocaml_div x y = R.Expr.call ~loc (R.Name.make ~loc div) [ x; y ] in
   let x = var "x" in
   let bound op n = R.Expr.binary ~loc op x (R.Expr.int ~loc n) in
+  let modulus =
+    R.Expr.binary ~loc Plus
+      (R.Expr.binary ~loc Minus (R.Expr.int ~loc max_int) (R.Expr.int ~loc min_int))
+      (R.Expr.int ~loc 1)
+  in
   [
     value_signature;
     unspecified_member;
@@ -225,8 +245,7 @@ let members : R.Member.t list =
          ~returns:[ R.Var.make ~loc (R.Ident.make ~loc "b") (R.Type.bool ~loc) ]
          (R.Ident.make ~loc in_range)
          (Some (R.Expr.binary ~loc And (bound Geq min_int) (bound Leq max_int))));
-    (* The value congruent to [x] modulo 2^63 in the range, for [x] a sum of two values in
-       it. *)
+    (* One correction suffices for sums, differences, negations and machine quotients. *)
     R.Member.callable
       (R.Callable.func ~loc ~inline:true
          ~formals:[ int_var "x" ]
@@ -234,18 +253,28 @@ let members : R.Member.t list =
          (R.Ident.make ~loc wrap)
          (Some
             (let n i = R.Expr.int ~loc i in
-             let size =
-               R.Expr.binary ~loc Plus
-                 (R.Expr.binary ~loc Minus (n max_int) (n min_int))
-                 (n 1)
-             in
              R.Expr.ite ~loc
                (R.Expr.binary ~loc Gt x (n max_int))
-               (R.Expr.binary ~loc Minus x size)
+               (R.Expr.binary ~loc Minus x modulus)
                (R.Expr.ite ~loc
                   (R.Expr.binary ~loc Lt x (n min_int))
-                  (R.Expr.binary ~loc Plus x size)
+                  (R.Expr.binary ~loc Plus x modulus)
                   x))));
+    R.Member.callable
+      (R.Callable.func ~loc ~inline:true
+         ~formals:[ int_var "x" ]
+         ~returns:[ int_var "w" ]
+         (R.Ident.make ~loc wrap_full)
+         (Some
+            (let n i = R.Expr.int ~loc i in
+             let normalized =
+               R.Expr.binary ~loc Plus
+                 (R.Expr.binary ~loc Mod (R.Expr.binary ~loc Minus x (n min_int)) modulus)
+                 (n min_int)
+             in
+             R.Expr.ite ~loc
+               (R.Expr.binary ~loc And (bound Geq min_int) (bound Leq max_int))
+               x normalized)));
     (* For a dividend that is not negative, Euclidean division truncates. *)
     R.Member.callable
       (func div "q"

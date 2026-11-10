@@ -1679,14 +1679,6 @@ module State = struct
     let+ () = record_origin { at; code = Assertion; message; related = [] } in
     R.Stmt.assert_ ~loc:(loc at) (R.Spec.make c)
 
-  (** The check that the value [v] of an [int] operation, at [at], does not overflow. *)
-  let no_overflow ~at what v =
-    let l = loc at in
-    let bound op n = R.Expr.binary ~loc:l op v (R.Expr.int ~loc:l n) in
-    check ~at
-      (Printf.sprintf "This %s may overflow" what)
-      (R.Expr.binary ~loc:l And (bound Geq Prelude.min_int) (bound Leq Prelude.max_int))
-
   let record_field given ~at (field : Datatypes.field) =
     if field.generic then
       let+ instance =

@@ -22,6 +22,9 @@ Emitted functors and their task contracts also verify independently.
   $ caravan --shh --emit-rav functor_curried.ml > functor_curried.rav
   $ raven --shh functor_curried.rav
   Verification successful.
+  $ caravan --shh --emit-rav functor_hidden.ml > functor_hidden.rav
+  $ raven --shh functor_hidden.rav
+  Verification successful.
   $ caravan --shh --emit-rav functor_raises.ml > functor_raises.rav
   $ raven --shh functor_raises.rav
   Verification successful.

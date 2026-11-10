@@ -1,0 +1,14 @@
+let rec node_count (value : tree) : integer
+  variant value =
+  match value with
+  | Leaf -> 0
+  | Node (left, _, right) -> node_count left + 1 + node_count right
+
+lemma [@auto] node_count_nonnegative (value : tree)
+  ensures (node_count value >= 0)
+  variant value =
+  match value with
+  | Leaf -> ()
+  | Node (left, _, right) ->
+      node_count_nonnegative left;
+      node_count_nonnegative right

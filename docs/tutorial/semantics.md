@@ -6,22 +6,25 @@ reading those properties as claims about OCaml programs.
 
 ## Integers {#sec:integers}
 
-Runtime `int` values have OCaml machine bounds. Ordinary executable arithmetic
-must not overflow: Caravan generates obligations for operations such as `+`, `-`,
-`*`, division, and unary negation. Division also requires a nonzero divisor.
-OCaml itself can wrap on overflow; Caravan currently rejects such ordinary
-arithmetic rather than using wraparound to prove its contract.
+Runtime `int` values have OCaml machine bounds. Executable addition, subtraction,
+multiplication, division, and negation use OCaml's signed wraparound semantics.
+Every intermediate arithmetic result wraps, including in executable pure
+functions, reference increments/decrements, and atomic arithmetic. Division and
+remainder still require a nonzero divisor.
 
 Specification arithmetic is mathematical. In `ensures result === value + 1`, the
 addition does not wrap. Quantifiers over `int` range over bounded source integers;
 the specification-only type `integer` ranges over all mathematical integers.
 Logical datatypes and mathematical collections are not automatically restricted
 to runtime-representable values just because a field has type `int`. At boundaries
-back to executable code, source-value constraints must hold.
+back to executable code, source-value constraints must hold. Define unbounded
+measures as logical functions returning `integer`; a pure OCaml implementation
+used in a contract retains its executable arithmetic semantics.
 
-The atomic arithmetic operations `Atomic.fetch_and_add`, `Atomic.incr`, and
-`Atomic.decr` are modeled with wrapping behavior. Do not transfer a no-overflow
-fact from ordinary addition to these operations.
+For example, executable `max_int + 1` evaluates to `min_int`, whereas the same
+expression in a specification denotes the mathematical integer above `max_int`.
+A postcondition such as `result === value + 1` therefore needs a precondition
+excluding overflow, or separate cases describing its wrapped result.
 
 ## Equality and physical identity {#sec:equality-and-physical-identity}
 

@@ -116,6 +116,7 @@ let run (source : Source.t) : (t, error) Result.t =
       Prelude.value_interface;
       Prelude.in_range;
       Prelude.wrap;
+      Prelude.wrap_full;
     ];
   let reserved =
     List.map source.libraries ~f:(fun lib -> lib.Source.library_name)

@@ -1013,11 +1013,9 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
       let int_type = Predef.type_int in
       let* reading, v = read r field int_type in
       let binop : R.Expr.binop = if String.equal op "incr" then Plus else Minus in
-      let v' = R.Expr.binary ~loc:l binop v (R.Expr.int ~loc:l 1) in
-      let what = if String.equal op "incr" then "increment" else "decrement" in
-      let* writing = State.ordinary_write ctx.given ~at ~field ~elt:int_type r v' in
-      let+ overflow = State.no_overflow ~at what v' in
-      (stmts @ reading @ [ overflow; writing ], unit_value ~loc:l)
+      let v' = Prelude.runtime_binary ~loc:l binop v (R.Expr.int ~loc:l 1) in
+      let+ writing = State.ordinary_write ctx.given ~at ~field ~elt:int_type r v' in
+      (stmts @ reading @ [ writing ], unit_value ~loc:l)
   | _ -> apply_operator ctx e path declaration occurrence args
 
 (** The application of [Atomic.op] to [args], in [e]. *)
@@ -1220,32 +1218,17 @@ and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration oc
           State.check ~at:divisor "This divisor may be zero"
             (R.Expr.binary ~loc:(loc divisor) Neq b (R.Expr.int ~loc:(loc divisor) 0))
         in
-        let checked what v =
-          let+ overflow = State.no_overflow ~at what v in
-          (stmts @ [ overflow ], v)
-        in
         begin match op with
-        | Plus -> checked "addition" (R.Expr.binary ~loc:l op a b)
-        | Minus -> checked "subtraction" (R.Expr.binary ~loc:l op a b)
-        | Mult -> checked "multiplication" (R.Expr.binary ~loc:l op a b)
-        | Div ->
-            let v = prelude_call ~loc:l Prelude.div [ a; b ] in
-            let* nonzero = nonzero () in
-            let+ overflow = State.no_overflow ~at "division" v in
-            (stmts @ [ nonzero; overflow ], v)
-        | Mod ->
+        | Div | Mod ->
             let+ nonzero = nonzero () in
-            (stmts @ [ nonzero ], prelude_call ~loc:l Prelude.mod_ [ a; b ])
-        | _ -> State.return (stmts, R.Expr.binary ~loc:l op a b)
+            (stmts @ [ nonzero ], Prelude.runtime_binary ~loc:l op a b)
+        | _ -> State.return (stmts, Prelude.runtime_binary ~loc:l op a b)
         end
     | _, Some op, [ a ] -> (
-        let* stmts, a = expr ctx a in
+        let+ stmts, a = expr ctx a in
         match op with
-        | `Not -> State.return (stmts, R.Expr.not_ ~loc:l a)
-        | `Neg ->
-            let v = R.Expr.neg ~loc:l a in
-            let+ overflow = State.no_overflow ~at "negation" v in
-            (stmts @ [ overflow ], v))
+        | `Not -> (stmts, R.Expr.not_ ~loc:l a)
+        | `Neg -> (stmts, Prelude.runtime_neg ~loc:l a))
     | None, None, _ -> (
         let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
         (* A function over a witness whose calls wait to be helped is called as its
@@ -2332,13 +2315,9 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       in
       let* args = State.all args ~f:(pure_in values) in
       match (binop_of_path path, unop_of_path path, path, args) with
-      | Some Div, _, _, [ a; b ] ->
-          State.return (prelude_call ~loc:l Prelude.div [ a; b ])
-      | Some Mod, _, _, [ a; b ] ->
-          State.return (prelude_call ~loc:l Prelude.mod_ [ a; b ])
-      | Some op, _, _, [ a; b ] -> State.return (R.Expr.binary ~loc:l op a b)
+      | Some op, _, _, [ a; b ] -> State.return (Prelude.runtime_binary ~loc:l op a b)
       | _, Some `Not, _, [ a ] -> State.return (R.Expr.not_ ~loc:l a)
-      | _, Some `Neg, _, [ a ] -> State.return (R.Expr.neg ~loc:l a)
+      | _, Some `Neg, _, [ a ] -> State.return (Prelude.runtime_neg ~loc:l a)
       | None, None, path, _ ->
           let* path = State.of_result (Source.normalize_value_path e.exp_env ~at path) in
           begin match Path_bindings.find funcs path with

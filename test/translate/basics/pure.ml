@@ -3,11 +3,11 @@
 
 type tree = Leaf | Node of tree * int * tree
 
-(* The postcondition holds of the function too, which gives the bound on the subtrees. *)
+(* Mathematical node counts bound the executable size and height computations. *)
 let rec size t = match t with Leaf -> 0 | Node (l, _, r) -> size l + 1 + size r
 (*@ n = size t
-    requires size t < 1000
-    ensures n >= 0 *)
+    requires node_count t < 1000
+    ensures n = node_count t && n >= 0 *)
 
 let rec all_small l =
   match l with [] -> true | x :: t -> 0 <= x && x <= 1000 && all_small t
@@ -24,13 +24,14 @@ let max (a : int) b = if a >= b then a else b
 let rec height t =
   match t with Leaf -> 0 | Node (l, _, r) -> 1 + max (height l) (height r)
 (*@ h = height t
-    requires size t < 1000
-    ensures 0 <= h <= size t *)
+    requires node_count t < 1000
+    ensures 0 <= h <= node_count t
+    ensures h <= size t *)
 
 (* Contracts using pure functions, of functions that are not pure. *)
 let grow t x = Node (t, x, Leaf)
 (*@ r = grow t x
-    requires size t < 999
+    requires node_count t < 999
     ensures size r = size t + 1
     ensures height r = 1 + height t *)
 

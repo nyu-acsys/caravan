@@ -18,9 +18,9 @@ arguments and its result. `requires` states what callers must establish; `ensure
 states what the implementation must return. `===` is pure logical equality: it
 compares immutable structure recursively and heap references by identity, without
 reading their mutable contents. `=/=` is its negation.
-The upper bound ensures the executable addition cannot overflow, while the
-postcondition uses mathematical arithmetic. Removing the precondition makes the
-proof fail at the addition; see [integer semantics](./semantics#sec:integers).
+The upper bound ensures the wrapped executable addition agrees with mathematical
+addition, while the postcondition uses mathematical arithmetic. Removing the
+precondition makes the postcondition fail; see [integer semantics](./semantics#sec:integers).
 
 The next function in the same file updates an ordinary OCaml reference:
 
