@@ -1,0 +1,26 @@
+module Left = Ghost.Frozen (struct let field (cell : record) = cell.left end)
+
+predicate contents (cell : record) (value : int) = own cell.left value
+
+lemma pack_left (cell : record) (value : int)
+  requires (own cell.left value)
+  ensures (contents cell value) =
+  fold contents cell value
+
+lemma unpack_left (cell : record) (value : int)
+  requires (contents cell value)
+  ensures (own cell.left value) =
+  unfold contents cell value
+
+proof result = split_left cell
+  requires (own cell.left value)
+  ensures (own ~fraction:Permission.half cell.left value &&
+    own ~fraction:Permission.half cell.left value && result === cell) =
+  on return Left.split cell
+
+proof result = packed left right
+  ensures (contents result left && own result.right right) =
+  at (create left right) (fun allocate ->
+    let cell = allocate () in
+    pack_left cell left;
+    cell)

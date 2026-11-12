@@ -59,13 +59,29 @@ let has_layout source =
       | Ttype_variant _ | Ttype_record _ -> true
       | _ -> false)
 
-let eligible ?(definition = false) (source : Module_inventory.specialization) =
-  let abstract_types =
+let eligible ~inventory ?(definition = false) (source : Module_inventory.specialization) =
+  let parameter_types =
     List.for_all source.parameters
       ~f:(fun (stage : Module_inventory.parameter_instance) ->
         List.for_all stage.argument.expected.signature_types ~f:(fun (_, declaration) ->
             match declaration.Typedtree.typ_kind with
             | Ttype_abstract -> true
+            | Ttype_record _ ->
+                Option.exists
+                  (Result.ok
+                     (Field_disciplines.of_declaration (Path.Pident declaration.typ_id)
+                        declaration.typ_type))
+                  ~f:
+                    (List.exists ~f:(fun field ->
+                         let origin =
+                           Module_inventory.field_origin inventory
+                             ~record_path:field.Field_disciplines.record_path
+                             ~position:field.position
+                         in
+                         Poly.equal
+                           (Option.value_map origin ~default:field.kind ~f:(fun origin ->
+                                origin.Field_disciplines.kind))
+                           Field_disciplines.Frozen))
             | _ -> false))
   in
   let body =
@@ -182,16 +198,8 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
                 List.for_all declarations ~f:(fun declaration ->
                     match declaration.Typedtree.typ_kind with
                     | Ttype_abstract -> Option.is_some declaration.typ_manifest
-                    | Ttype_variant _ when Datatypes.is_witness_declaration declaration ->
-                        true
-                    | Ttype_variant constructors ->
-                        List.is_empty declaration.typ_params
-                        || List.for_all constructors ~f:(fun constructor ->
-                            Option.is_none constructor.Typedtree.cd_res
-                            &&
-                            match constructor.cd_args with
-                            | Cstr_tuple _ -> true
-                            | Cstr_record _ -> false)
+                    | Ttype_variant _ ->
+                        Result.is_ok (Datatypes.of_declaration declaration)
                     | Ttype_record _ -> true
                     | _ -> false)
             | _ -> false)
@@ -202,9 +210,9 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
     List.for_all source.members ~f:(fun (_, id) ->
         List.exists source.body_members ~f:(fun (_, member) -> Ident.same id member))
   in
-  functions && abstract_types && body
+  functions && parameter_types && body
 
-let plan ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
+let plan ~inventory ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
   let make_application source =
     {
       source;
@@ -365,12 +373,12 @@ let plan ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
   in
   let groups =
     List.fold
-      (List.filter definitions ~f:(eligible ~definition:true))
+      (List.filter definitions ~f:(eligible ~inventory ~definition:true))
       ~init:[] ~f:(add ~definition:true)
   in
   let groups =
     List.fold
-      (List.filter sources ~f:(eligible ~definition:false))
+      (List.filter sources ~f:(eligible ~inventory ~definition:false))
       ~init:groups ~f:(add ~definition:false)
   in
   let owner source =
@@ -468,9 +476,16 @@ let types group ~owner =
             (List.map group.representative.argument.paths ~f:(fun path ->
                  Path.Pdot (path, source)))
         in
-        match declaration.Typedtree.typ_manifest with
-        | Some _ -> descriptor
-        | None when not (List.is_empty descriptor.parameters) ->
+        match (declaration.Typedtree.typ_kind, declaration.typ_manifest) with
+        | Ttype_record _, _ ->
+            {
+              descriptor with
+              heap = Some [];
+              backend_type = None;
+              value_constraint = None;
+            }
+        | _, Some _ -> descriptor
+        | _, None when not (List.is_empty descriptor.parameters) ->
             let scope =
               if Option.equal String.equal (List.last owner) (Some group.parameter) then
                 String.split group.name ~on:'.'
@@ -492,7 +507,7 @@ let types group ~owner =
               value_constraint = None;
               domain_scope = Some scope;
             }
-        | None ->
+        | _, None ->
             let domain_scope =
               if Option.equal String.equal (List.last owner) (Some group.parameter) then
                 String.split group.name ~on:'.'

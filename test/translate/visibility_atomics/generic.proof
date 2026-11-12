@@ -1,0 +1,3 @@
+module Frozen = Ghost.Frozen (struct
+  let field (record : unused) = record.data
+end)

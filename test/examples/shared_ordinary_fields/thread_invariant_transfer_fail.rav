@@ -1,0 +1,14 @@
+proc unrelated_read_does_not_transfer(executing: Ref, writer: Ref,
+    mail: Ref, cell: Ref, channel: Ref)
+  requires executing != writer && ThreadContext.context(executing, {})
+    && ThreadCounters.published(channel, cell, 42, {})
+    && view_mailbox(mail, writer, channel)
+  opens view_mailbox(mail, writer, channel), ThreadCounters.published
+{
+  unfold view_mailbox(mail, writer, channel);
+  ThreadContext.duplicate_seen(writer, {channel});
+  val signal := mail.view_signal;
+  fold view_mailbox(mail, writer, channel);
+  // Claiming the writer's view does not supply authority for the executing thread.
+  val result := ThreadCounters.read_frozen(executing, cell, channel, {channel}, 42, {});
+}

@@ -1,0 +1,37 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+invariant live (cell : int Atomic.t) = exists value : int. own cell value
+
+lemma closed (cell : int Atomic.t)
+  requires (live cell) ensures (live cell) opens {} = ()
+
+lemma refresh (cell : int Atomic.t)
+  requires (live cell) ensures (live cell) opens { live cell } =
+  unfold live cell;
+  closed cell;
+  fold live cell
+
+lemma whole_namespace (cell : int Atomic.t)
+  requires (live cell) ensures (live cell) opens { live _ } =
+  unfold live cell;
+  fold live cell
+
+lemma frozen_mask (cell : cell)
+  requires (Value.frozen cell 0) ensures (Value.frozen cell 0)
+  opens { Value.frozen cell } = ()
+
+predicate wrapped (cell : int Atomic.t) = live cell
+lemma refresh_wrapped (cell : int Atomic.t)
+  requires (wrapped cell) ensures (wrapped cell) opens { wrapped cell } =
+  unfold wrapped cell;
+  unfold live cell;
+  fold live cell;
+  fold wrapped cell
+
+invariant paired (left : int Atomic.t) (right : int Atomic.t) = live left && live right
+lemma refresh_pair (left : int Atomic.t) (right : int Atomic.t)
+  requires (paired left right) ensures (paired left right)
+  opens { paired left _; live left } =
+  unfold paired left right;
+  unfold live left;
+  fold live left;
+  fold paired left right

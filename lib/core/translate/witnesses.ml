@@ -313,7 +313,7 @@ let rec refined_type aliases typ =
   let typ = Datatypes.expand aliases typ in
   match Types.get_desc typ with
   | Tvar _ | Tunivar _ -> typ
-  | desc -> Ctype.newty (Btype.copy_type_desc (refined_type aliases) desc)
+  | desc -> Ctype.newty (Compiler_types.map_desc (refined_type aliases) desc)
 
 (** For a contract's case for the constructor [ctor] of a match on a value of the witness
     type [scrutinee], in the worker [current]: the abbreviations there, and the variables

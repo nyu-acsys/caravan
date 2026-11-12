@@ -330,6 +330,7 @@ let check_state_parameters ~at ~parameters ~arguments fields =
                  (Printf.sprintf "The state type parameter '%s is not declared" id.pid_str))
       | PTtyapp (_, arguments) -> Result.all_unit (List.map arguments ~f:check)
       | PTtuple elements -> Result.all_unit (List.map elements ~f:check)
+      | PTtyany | PTvariant _ -> Ok ()
       | PTarrow (argument, result) ->
           let* () = check argument in
           check result
@@ -658,7 +659,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       | None ->
           Error (Report.error Type entry.name.pid_loc "Missing elaborated AU facade")
       end
-  | Proof_module _ | Proof_type _ ->
+  | Proof_module _ | Proof_type _ | Proof_access_field _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -668,6 +669,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
            | Proof_au _ -> "atomic update"
            | Proof_task _ -> "domain task"
            | Proof_field _ -> "field"
+           | Proof_access_field _ -> "shared field"
            | Proof_function _ -> "function"
            | Proof_state _ -> "state"
            | Proof_view _ -> "view"
@@ -710,7 +712,10 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
         Option.is_some entry.Proof_scopes.scope.owner
-        && match entry.declaration with S.Proof_type _ -> false | _ -> true)
+        &&
+        match entry.declaration with
+        | S.Proof_type _ | Proof_access_field _ -> false
+        | _ -> true)
   in
   let* () =
     List.fold_result entries ~init:[] ~f:(fun previous entry ->

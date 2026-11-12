@@ -91,14 +91,35 @@
     | Tvar (Qid x) when x.pid_str = field.pid_str -> field
     | _ -> raise (Syntax_error (at, "An unfold names the existentials it binds"))
 
-  let fractional_own f fraction location value loc =
+  let own_application f labels location value loc =
     begin match f.term_desc with
     | Tvar (Qid id) when id.pid_str = "own" -> ()
     | _ -> raise (Syntax_error (f.term_loc,
-        "Only own accepts the fraction argument"))
+        "Only own accepts labeled arguments"))
     end;
+    let add (fraction, writer, release) = function
+      | `Fraction term when Option.is_none fraction -> (Some term, writer, release)
+      | `Writer term when Option.is_none writer -> (fraction, Some term, release)
+      | `Release term when Option.is_none release -> (fraction, writer, Some term)
+      | `Fraction term | `Writer term | `Release term ->
+          raise (Syntax_error (term.term_loc, "Duplicate labels on own"))
+    in
+    let fraction, writer, release = List.fold_left add (None, None, None) labels in
+    begin match writer, release with
+    | Some writer, Some release ->
+        raise (Syntax_error (release.term_loc,
+          "The ~writer and ~release labels cannot be used together on own"))
+    | _ -> ()
+    end;
+    let full = mk_term (Tvar (Qdot (Qid (mk_pid "Permission" loc),
+      mk_pid "full" loc))) loc in
+    let args = match release with
+      | Some release ->
+          [location; value; Option.value fraction ~default:full; mk_term (Ttuple []) loc; release]
+      | None -> [location; value; Option.value fraction ~default:full] @ Option.to_list writer
+    in
     let apply f arg = mk_term (Tapply (f, arg)) loc in
-    (List.fold_left apply f [location; value; fraction]).term_desc
+    (List.fold_left apply f args).term_desc
 
   let add_clause c (keyword, t) =
     match keyword with
@@ -131,6 +152,7 @@
 %token <string> OP1 OP2 OP3 OP4 OPPREF
 %token <string> QUOTE_LIDENT
 %token <string> BACKQUOTE_LIDENT
+%token <string> POLY_TAG
 %token <string> ATTRIBUTE
 
 %token <string * char option> INTEGER
@@ -140,10 +162,10 @@
 
 (* Contract tokens *)
 
-%token REQUIRES ENSURES VARIANT PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
+%token REQUIRES ENSURES VARIANT OPENS PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES ATOMIC_RAISES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS AS PROOF AT
-%token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION
+%token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION WRITER RELEASE
 
 (* Keywords *)
 
@@ -216,18 +238,32 @@ proof_expr_eof:
 ;
 
 scope:
-| f = lqualid LEFTPAR FUN operation = lident state = pat_arg?
-    ARROW body = proof_expr RIGHTPAR EOF
-    { begin match f, state with
+| value = scope_expression EOF { value }
+;
+
+scope_expression:
+| parent = uqualid DOT method_ = lident LEFTPAR FUN operation = lident state = pat_arg?
+    ARROW body = proof_expr RIGHTPAR
+    { let f = Qdot (parent, method_) in
+      begin match f, state with
       | Qdot (Qid ghost, scope), None
-        when ghost.pid_str = "Ghost" && scope.pid_str = "scope" -> ()
+        when ghost.pid_str = "Ghost" &&
+          List.mem scope.pid_str ["scope"; "frozen_scope"; "published_scope"; "release_scope"; "acquire_scope"] -> ()
       | Qdot (Qdot (Qid ghost, state), scope), Some _
         when ghost.pid_str = "Ghost" && state.pid_str = "State"
-          && scope.pid_str = "scope" -> ()
-      | _ -> raise (Syntax_error (mk_loc $loc(f),
-          "Expected Ghost.scope with one binder or Ghost.State.scope with two binders"))
+          && List.mem scope.pid_str ["scope"; "frozen_scope"; "published_scope"; "release_scope"; "acquire_scope"] -> ()
+      | _ -> raise (Syntax_error (mk_loc $loc(parent),
+          "Expected a Ghost scope wrapper with one binder, or a Ghost.State scope wrapper with two binders"))
       end;
-      { scope_operation = operation; scope_state = state; scope_body = body } }
+      let mode = match f with
+        | Qdot (_, kind) -> begin match kind.pid_str with
+            | "frozen_scope" -> Frozen_scope
+            | "published_scope" -> Published_scope
+            | "release_scope" -> Release_scope
+            | "acquire_scope" -> Acquire_scope
+            | _ -> General_scope end
+        | _ -> General_scope in
+      { scope_mode = mode; scope_operation = operation; scope_state = state; scope_body = body } }
 ;
 
 return_adapter:
@@ -406,13 +442,13 @@ anchor_token:
 | LEFTSQ anchor_token* RIGHTSQ { () }
 | LEFTBRC anchor_token* RIGHTBRC { () }
 | LIDENT | UIDENT | OP1 | OP2 | OP3 | OP4
-| OPPREF | QUOTE_LIDENT | BACKQUOTE_LIDENT | ATTRIBUTE | INTEGER | FLOAT | CHAR
+| OPPREF | QUOTE_LIDENT | BACKQUOTE_LIDENT | POLY_TAG | ATTRIBUTE | INTEGER | FLOAT | CHAR
 | STRING | REQUIRES | ENSURES | VARIANT | PURE | INVARIANT | PREDICATE
 | FOLD | UNFOLD | ASSERT | ATOMIC | ATOMIC_REQUIRES | ATOMIC_ENSURES | ATOMIC_RAISES
 | RAISES | COMMIT | RETURNING | TYPE | VIEW | ACTION | INITIALLY
 | PERFORMS | CONSUMES | LINEARIZES | LEADSTO | CONTINUES | WAIT | ON
 | HELPS | AS | PROOF | AT | LEMMA | RETURNS | OF
-| BEGIN | END | MODULE | STRUCT | FUN | SET_OF_PREDICATE | FRACTION
+| BEGIN | END | MODULE | STRUCT | FUN | SET_OF_PREDICATE | FRACTION | WRITER | RELEASE
 | ELSE | EXISTS | FALSE | FORALL | IF | IN | LET
 | REC | NONREC | MATCH | NOT | OLD | THEN | TRUE | WITH
 | CONJ | AMPAMP | ARROW | BAR | BARBAR | COLON | COLONCOLON
@@ -423,6 +459,7 @@ anchor_token:
 ;
 
 step_action:
+| scope_expression { (Wrapped_scope, mk_loc $loc) }
 | INVARIANT term { (Loop, mk_loc $loc) }
 | INVARIANT LEFTPAR FUN pat_arg ARROW term RIGHTPAR
     { (Loop, mk_loc $loc) }
@@ -481,6 +518,26 @@ proof_decl:
           "A Ghost." ^ kind ^ " argument must define operation"));
       if kind = "AU" then Proof_au { au_name = n; au_operation = target }
       else Proof_task { task_name = n; task_operation = target } }
+| MODULE n = uident EQUAL f = uqualid LEFTPAR STRUCT
+    LET field = lident owner = shared_field_owner EQUAL selector = term END RIGHTPAR
+    { let kind = match f with
+      | Qdot (Qid ghost, facade) when ghost.pid_str = "Ghost" ->
+          begin match facade.pid_str with
+          | "Frozen" -> Frozen
+          | "Relaxed" -> Relaxed
+          | "History" -> raise (Syntax_error (qualid_loc f,
+              "Ghost.History has been renamed to Ghost.Relaxed"))
+          | _ -> raise (Syntax_error (qualid_loc f,
+              "Expected Ghost.Frozen or Ghost.Relaxed"))
+          end
+      | _ -> raise (Syntax_error (qualid_loc f,
+          "Expected Ghost.Frozen or Ghost.Relaxed"))
+      in
+      if field.pid_str <> "field" then
+        raise (Syntax_error (field.pid_loc,
+          "A shared-field facade argument must define field"));
+      Proof_access_field { access_name = n; access_kind = kind;
+        access_owner = owner; access_selector = selector } }
 | MODULE n = uident EQUAL f = uqualid args = proof_module_argument*
     { Proof_resource { resource_name = n; resource_functor = f; resource_arguments = args } }
 | LET recursive = boption(REC) n = lident ps = pred_param* COLON ty = typ
@@ -508,13 +565,17 @@ proof_decl:
           function_variant = List.concat variants; function_body = body } }
 | LEMMA attribute = ATTRIBUTE? n = lident ps = lemma_param* rs = lemma_returns?
     cs = lemma_clause* EQUAL body = proof_expr
-    { let requires, ensures, variant =
+    { let requires, ensures, variant, opens =
         List.fold_left
-          (fun (requires, ensures, variant) -> function
-            | `Requires t -> (t :: requires, ensures, variant)
-            | `Ensures t -> (requires, t :: ensures, variant)
-            | `Variant t -> (requires, ensures, t :: variant))
-          ([], [], []) cs
+          (fun (requires, ensures, variant, opens) -> function
+            | `Requires t -> (t :: requires, ensures, variant, opens)
+            | `Ensures t -> (requires, t :: ensures, variant, opens)
+            | `Variant t -> (requires, ensures, t :: variant, opens)
+            | `Opens (at, entries) ->
+                if opens <> None then
+                  raise (Syntax_error (at, "A lemma has at most one opens clause"));
+                (requires, ensures, variant, Some (at, entries)))
+          ([], [], [], None) cs
       in
       let n = match attribute with
         | None -> n
@@ -525,7 +586,7 @@ proof_decl:
         lemma_name = n; lemma_params = ps;
         lemma_returns = (match rs with None -> [] | Some rs -> rs);
         lemma_requires = List.rev requires; lemma_ensures = List.rev ensures;
-        lemma_variant = List.concat (List.rev variant); lemma_body = body;
+        lemma_variant = List.concat (List.rev variant); lemma_opens = opens; lemma_body = body;
       } }
 | TYPE ps = loption(type_parameters) n = lident EQUAL LEFTBRC fs = semicolon_list1(state_field) RIGHTBRC
     { Proof_state { state_name = n; state_params = ps; state_fields = fs } }
@@ -554,6 +615,10 @@ proof_decl:
 
 proof_module_body:
 | STRUCT items = proof_item* END { split_items items }
+;
+
+shared_field_owner:
+| LEFTPAR owner = mpat COLON ty = typ RIGHTPAR { (owner, ty) }
 ;
 
 proof_definition_constraints:
@@ -589,6 +654,28 @@ lemma_clause:
 | REQUIRES LEFTPAR t = term RIGHTPAR { `Requires t }
 | ENSURES LEFTPAR t = term RIGHTPAR { `Ensures t }
 | VARIANT t = proof_variant { `Variant t }
+| OPENS LEFTBRC ts = loption(semicolon_list1(mask_entry)) RIGHTBRC
+    { `Opens (mk_loc $loc, ts) }
+;
+
+mask_entry:
+| q = qualid args = mask_argument*
+    { let wildcard t = match t.term_desc with
+        | Tvar (Qid id) -> id.pid_str = "_"
+        | _ -> false in
+      let _ = List.fold_left (fun seen t ->
+        if seen && not (wildcard t) then
+          raise (Syntax_error (t.term_loc,
+            "Wildcards in an opens entry must be trailing"));
+        seen || wildcard t) false args in
+      List.fold_left
+        (fun f arg -> mk_term (Tapply (f, arg)) (f.term_loc.loc_start, arg.term_loc.loc_end))
+        (mk_term (Tvar q) $loc(q)) args }
+;
+
+mask_argument:
+| t = term_arg { t }
+| UNDERSCORE { mk_term (Tvar (Qid (mk_pid "_" $loc))) $loc }
 ;
 
 proof_variant:
@@ -727,10 +814,21 @@ proof_app:
 | e = proof_postfix { e }
 | f = proof_app arg = proof_postfix
     { proof_term (Tapply (term_of_proof f, term_of_proof arg)) $loc }
-| f = proof_postfix FRACTION COLON fraction = proof_postfix
+| f = proof_postfix labels = nonempty_list(own_label(proof_own_arg))
     location = proof_postfix value = proof_postfix
-    { proof_term (fractional_own (term_of_proof f) (term_of_proof fraction)
+    { proof_term (own_application (term_of_proof f) labels
         (term_of_proof location) (term_of_proof value) $loc) $loc }
+
+;
+
+proof_own_arg:
+| e = proof_postfix { term_of_proof e }
+;
+
+%inline own_label(X):
+| FRACTION COLON value = X { `Fraction value }
+| WRITER COLON value = X { `Writer value }
+| RELEASE COLON value = X { `Release value }
 ;
 
 proof_postfix:
@@ -887,8 +985,9 @@ term_:
 | term_arg located(term_arg)+
     { let join f (a, e) = mk_term (Tapply (f, a)) ($startpos, e) in
       (List.fold_left join $1 $2).term_desc }
-| f = term_arg FRACTION COLON fraction = term_arg location = term_arg value = term_arg
-    { fractional_own f fraction location value $loc }
+| f = term_arg labels = nonempty_list(own_label(term_arg))
+    location = term_arg value = term_arg
+    { own_application f labels location value $loc }
 | IF g = term THEN t1 = term ELSE t2 = term
     { Tif (g, t1, t2) }
 | LET ids = pat EQUAL t1 = term IN t2 = term
@@ -1064,16 +1163,38 @@ ty_tuple:
 ;
 
 ty_arg:
+| UNDERSCORE
+    { PTtyany }
 | q = lqualid
     { PTtyapp (q, []) }
 | v = quote_lident
     { PTtyvar v }
+| LEFTSQ tags = row_tags RIGHTSQ
+    { PTvariant (Closed_row, tags) }
+| LEFTSQ bound = OP1 tags = row_tags RIGHTSQ
+    { let bound = match bound with
+        | ">" -> Lower_row
+        | "<" -> Upper_row
+        | _ -> raise (Syntax_error (mk_loc $loc(bound),
+            "A polymorphic-variant type bound is < or >"))
+      in PTvariant (bound, tags) }
 | LEFTPAR ty = typ RIGHTPAR
     { ty }
 | ty = ty_arg q = lqualid
     { PTtyapp (q, [ty]) }
 | LEFTPAR ty = typ COMMA l = separated_nonempty_list(COMMA, typ)  RIGHTPAR id=lqualid
     { PTtyapp (id, ty :: l) }
+;
+
+row_tags:
+| tags = separated_nonempty_list(BAR, row_tag) { tags }
+;
+
+row_tag:
+| tag = POLY_TAG { mk_pid tag $loc }
+| tag = POLY_TAG OF typ
+    { raise (Syntax_error (mk_loc $loc,
+        "Polymorphic-variant type indices support constant tags only: `" ^ tag)) }
 ;
 
 

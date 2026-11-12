@@ -1,0 +1,3 @@
+module Count = Ghost.Frozen (struct
+  let field (Node cell : node) = cell.count
+end)

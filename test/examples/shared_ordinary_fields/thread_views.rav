@@ -1,0 +1,296 @@
+// One execution view is shared by all field families.
+interface ThreadContextSpec {
+  pred context(owner: Ref, view: Set[Ref])
+  pred seen(owner: Ref, lower: Set[Ref])
+  inv released(channel: Ref; payload: Ref, release: Set[Ref])
+
+  proc create_thread() returns (owner: Ref)
+    ensures context(owner, {})
+    opens {}
+
+  proc publish(executing: Ref, payload: Ref, ghost view: Set[Ref])
+    returns (channel: Ref)
+    requires context(executing, view)
+    ensures context(executing, view ++ {channel})
+      && released(channel, payload, view) && seen(executing, {channel})
+    opens {}
+
+  atomic proc acquire(executing: Ref, channel: Ref, ghost payload: Ref,
+      ghost view: Set[Ref], ghost release: Set[Ref]) returns (observed: Ref)
+    requires context(executing, view) && released(channel, payload, release)
+    ensures context(executing, view ++ release ++ {channel})
+      && released(channel, payload, release)
+      && seen(executing, release ++ {channel}) && observed == payload
+    opens released(channel, _, _)
+
+  lemma snapshot(owner: Ref, view: Set[Ref])
+    requires context(owner, view)
+    ensures context(owner, view) && seen(owner, view)
+    opens {}
+
+  lemma duplicate_seen(owner: Ref, lower: Set[Ref])
+    requires seen(owner, lower)
+    ensures seen(owner, lower) && seen(owner, lower)
+    opens {}
+
+  lemma reconcile(owner: Ref, view: Set[Ref], lower: Set[Ref])
+    requires context(owner, view) && seen(owner, lower)
+    ensures context(owner, view) && seen(owner, lower) && lower subseteq view
+    opens {}
+
+  proc fork_context(parent: Ref, ghost view: Set[Ref]) returns (child: Ref)
+    requires context(parent, view)
+    ensures context(parent, view) && context(child, view) && child != parent
+    opens {}
+
+  proc join_context(parent: Ref, child: Ref,
+      ghost parent_view: Set[Ref], ghost child_view: Set[Ref])
+    requires context(parent, parent_view) && context(child, child_view) && parent != child
+    ensures context(parent, parent_view ++ child_view)
+    opens {}
+}
+
+module ThreadContext :> ThreadContextSpec {
+  module Channels: Library.Type { rep type T = Ref }
+  module Views = Library.SetRA[Channels]
+  module Authority = Library.Auth[Views]
+
+  ghost field frontier: Authority
+  field pointer: Ref
+  ghost field release_view: Set[Ref]
+
+  pred context(owner: Ref, view: Set[Ref]) {
+    own(owner.frontier, Authority.full(Views.set(view)))
+  }
+
+  pred seen(owner: Ref, lower: Set[Ref]) {
+    own(owner.frontier, Authority.frag(Views.set(lower)))
+  }
+
+  inv released(channel: Ref; payload: Ref, release: Set[Ref]) {
+    own(channel.pointer, payload, 1.0) && own(channel.release_view, release, 1.0)
+  }
+
+  // Only synchronization operations expose this transition through the interface.
+  lemma advance(owner: Ref, view: Set[Ref], added: Set[Ref])
+    requires context(owner, view)
+    ensures context(owner, view ++ added)
+    opens {}
+  {
+    unfold context(owner, view);
+    fpu(owner.frontier,
+      Authority.full(Views.set(view)),
+      Authority.full(Views.set(view ++ added)));
+    fold context(owner, view ++ added);
+  }
+
+  proc create_thread() returns (owner: Ref)
+    ensures context(owner, {})
+    opens {}
+  {
+    owner := new(frontier: Authority.full(Views.set({} : Set[Ref])));
+    fold context(owner, {});
+  }
+
+  proc publish(executing: Ref, payload: Ref, ghost view: Set[Ref])
+    returns (channel: Ref)
+    requires context(executing, view)
+    ensures context(executing, view ++ {channel})
+      && released(channel, payload, view) && seen(executing, {channel})
+    opens {}
+  {
+    channel := new(pointer: payload, release_view: view);
+    fold released(channel, payload, view);
+    advance(executing, view, {channel});
+    snapshot(executing, view ++ {channel});
+    unfold seen(executing, view ++ {channel});
+    fold seen(executing, {channel});
+  }
+
+  atomic proc acquire(executing: Ref, channel: Ref, ghost payload: Ref,
+      ghost view: Set[Ref], ghost release: Set[Ref]) returns (observed: Ref)
+    requires context(executing, view) && released(channel, payload, release)
+    ensures context(executing, view ++ release ++ {channel})
+      && released(channel, payload, release)
+      && seen(executing, release ++ {channel}) && observed == payload
+    opens released(channel, _, _)
+  {
+    unfold released(channel, payload, release);
+    observed := channel.pointer;
+    fold released(channel, payload, release);
+    advance(executing, view, release ++ {channel});
+    snapshot(executing, view ++ release ++ {channel});
+    unfold seen(executing, view ++ release ++ {channel});
+    fold seen(executing, release ++ {channel});
+  }
+
+  lemma snapshot(owner: Ref, view: Set[Ref])
+    requires context(owner, view)
+    ensures context(owner, view) && seen(owner, view)
+    opens {}
+  {
+    unfold context(owner, view);
+    fold context(owner, view);
+    fold seen(owner, view);
+  }
+
+  lemma duplicate_seen(owner: Ref, lower: Set[Ref])
+    requires seen(owner, lower)
+    ensures seen(owner, lower) && seen(owner, lower)
+    opens {}
+  {
+    unfold seen(owner, lower);
+    fold seen(owner, lower);
+    fold seen(owner, lower);
+  }
+
+  lemma reconcile(owner: Ref, view: Set[Ref], lower: Set[Ref])
+    requires context(owner, view) && seen(owner, lower)
+    ensures context(owner, view) && seen(owner, lower) && lower subseteq view
+    opens {}
+  {
+    unfold context(owner, view);
+    unfold seen(owner, lower);
+    assert lower subseteq view;
+    fold context(owner, view);
+    fold seen(owner, lower);
+  }
+
+  // The source counterpart is a synchronized fork, not a ghost-only copy rule.
+  proc fork_context(parent: Ref, ghost view: Set[Ref]) returns (child: Ref)
+    requires context(parent, view)
+    ensures context(parent, view) && context(child, view) && child != parent
+    opens {}
+  {
+    unfold context(parent, view);
+    child := new(frontier: Authority.full(Views.set(view)));
+    assert child != parent;
+    fold context(parent, view);
+    fold context(child, view);
+  }
+
+  // The source counterpart must wait for the child and consume its returned context.
+  proc join_context(parent: Ref, child: Ref,
+      ghost parent_view: Set[Ref], ghost child_view: Set[Ref])
+    requires context(parent, parent_view) && context(child, child_view) && parent != child
+    ensures context(parent, parent_view ++ child_view)
+    opens {}
+  {
+    unfold context(child, child_view);
+    advance(parent, parent_view, child_view);
+  }
+}
+
+interface ThreadedFieldSpec[E: Library.Type] {
+  pred private_cell(cell: Ref, value: E)
+  inv published(channel: Ref; cell: Ref, value: E, release: Set[Ref])
+
+  proc create(initial: E) returns (cell: Ref)
+    ensures private_cell(cell, initial)
+    opens {}
+
+  proc write_private(cell: Ref, value: E, ghost previous: E)
+    requires private_cell(cell, previous)
+    ensures private_cell(cell, value)
+    opens {}
+
+  proc publish(executing: Ref, cell: Ref, ghost view: Set[Ref], ghost value: E)
+    returns (channel: Ref)
+    requires ThreadContext.context(executing, view) && private_cell(cell, value)
+    ensures ThreadContext.context(executing, view ++ {channel}) && published(channel, cell, value, view)
+      && ThreadContext.seen(executing, {channel})
+    opens {}
+
+  atomic proc acquire(executing: Ref, channel: Ref, cell: Ref,
+      ghost view: Set[Ref], ghost value: E, ghost release: Set[Ref])
+    returns (observed: Ref)
+    requires ThreadContext.context(executing, view) && published(channel, cell, value, release)
+    ensures ThreadContext.context(executing, view ++ release ++ {channel})
+      && published(channel, cell, value, release)
+      && ThreadContext.seen(executing, release ++ {channel}) && observed == cell
+    opens published(channel, _, _, _), ThreadContext.released(channel, _, _)
+
+  atomic proc read_frozen(executing: Ref, cell: Ref, channel: Ref,
+      ghost view: Set[Ref], ghost value: E, ghost release: Set[Ref])
+    returns (result: E)
+    requires ThreadContext.context(executing, view) && published(channel, cell, value, release)
+      && channel in view
+    ensures ThreadContext.context(executing, view) && published(channel, cell, value, release)
+      && result == value
+    opens published(channel, _, _, _)
+
+}
+
+module ThreadedField[E: Library.Type] :> ThreadedFieldSpec[E] {
+  field current: E
+
+  pred private_cell(cell: Ref, value: E) {
+    own(cell.current, value, 1.0)
+  }
+
+  inv published(channel: Ref; cell: Ref, value: E, release: Set[Ref]) {
+    ThreadContext.released(channel, cell, release) && own(cell.current, value, 1.0)
+  }
+
+  proc create(initial: E) returns (cell: Ref)
+    ensures private_cell(cell, initial)
+    opens {}
+  {
+    cell := new(current: initial);
+    fold private_cell(cell, initial);
+  }
+
+  proc write_private(cell: Ref, value: E, ghost previous: E)
+    requires private_cell(cell, previous)
+    ensures private_cell(cell, value)
+    opens {}
+  {
+    unfold private_cell(cell, previous);
+    cell.current := value;
+    fold private_cell(cell, value);
+  }
+
+  proc publish(executing: Ref, cell: Ref, ghost view: Set[Ref], ghost value: E)
+    returns (channel: Ref)
+    requires ThreadContext.context(executing, view) && private_cell(cell, value)
+    ensures ThreadContext.context(executing, view ++ {channel})
+      && published(channel, cell, value, view) && ThreadContext.seen(executing, {channel})
+    opens {}
+  {
+    unfold private_cell(cell, value);
+    channel := ThreadContext.publish(executing, cell, view);
+    fold published(channel, cell, value, view);
+  }
+
+  atomic proc acquire(executing: Ref, channel: Ref, cell: Ref,
+      ghost view: Set[Ref], ghost value: E, ghost release: Set[Ref])
+    returns (observed: Ref)
+    requires ThreadContext.context(executing, view) && published(channel, cell, value, release)
+    ensures ThreadContext.context(executing, view ++ release ++ {channel})
+      && published(channel, cell, value, release)
+      && ThreadContext.seen(executing, release ++ {channel}) && observed == cell
+    opens published(channel, _, _, _), ThreadContext.released(channel, _, _)
+  {
+    unfold published(channel, cell, value, release);
+    observed := ThreadContext.acquire(executing, channel, cell, view, release);
+    fold published(channel, cell, value, release);
+  }
+
+  atomic proc read_frozen(executing: Ref, cell: Ref, channel: Ref,
+      ghost view: Set[Ref], ghost value: E, ghost release: Set[Ref])
+    returns (result: E)
+    requires ThreadContext.context(executing, view) && published(channel, cell, value, release)
+      && channel in view
+    ensures ThreadContext.context(executing, view) && published(channel, cell, value, release)
+      && result == value
+    opens published(channel, _, _, _)
+  {
+    unfold published(channel, cell, value, release);
+    result := cell.current;
+    fold published(channel, cell, value, release);
+  }
+
+}
+
+module ThreadCounters = ThreadedField[Int]
+module ThreadFlags = ThreadedField[Bool]

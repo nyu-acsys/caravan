@@ -1,0 +1,20 @@
+module Value = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)
+
+predicate safe (cell : cell) (current : int) (writes : (Ghost.t * int) set) =
+  Value.state cell current writes &&
+  (forall event : Ghost.t, value : int. Set.mem (event, value) writes -> value >= 0)
+
+lemma unpack (cell : cell) (current : int) (writes : (Ghost.t * int) set)
+  requires (safe cell current writes)
+  ensures (Value.state cell current writes &&
+    (forall event : Ghost.t, value : int. Set.mem (event, value) writes -> value >= 0)) =
+  unfold safe cell current writes
+
+lemma pack (cell : cell) (current : int) (writes : (Ghost.t * int) set)
+  requires (Value.state cell current writes &&
+    (forall event : Ghost.t, value : int. Set.mem (event, value) writes -> value >= 0))
+  ensures (safe cell current writes) =
+  fold safe cell current writes
+
+invariant nonnegative (cell : cell) =
+  exists current : int, writes : (Ghost.t * int) set. safe cell current writes

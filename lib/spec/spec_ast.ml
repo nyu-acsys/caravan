@@ -33,11 +33,15 @@ type ghost_module = { ghost_module_name : id; ghost_module_interface : qualid }
 
 let rec qualid_loc = function Qid id -> id.pid_loc | Qdot (_, id) -> id.pid_loc
 
+type row_bound = Closed_row | Lower_row | Upper_row
+
 type pty =
+  | PTtyany
   | PTtyvar of id
   | PTtyapp of qualid * pty list
   | PTtuple of pty list
   | PTarrow of pty * pty
+  | PTvariant of row_bound * id list
 
 type labelled_arg = Lwild | Lunit of Location.t | Lvar of id | Lghost of id * pty
 type binder = id * pty option
@@ -174,7 +178,15 @@ type initialization =
   | Initial_record of (id * term) list
   | Initial_let of pat * proof_expr * initialization
 
+type scope_mode =
+  | General_scope
+  | Frozen_scope
+  | Published_scope
+  | Release_scope
+  | Acquire_scope
+
 type access_scope = {
+  scope_mode : scope_mode;
   scope_operation : id;
   scope_state : pat option;
   scope_body : proof_expr;
@@ -193,6 +205,8 @@ type proof_module_argument =
 type proof_module_parameter =
   | Proof_named_parameter of id * qualid
   | Proof_unit_parameter of Location.t
+
+type access_kind = Frozen | Relaxed
 
 (** The definition of a proof's type. *)
 type type_kind =
@@ -233,6 +247,7 @@ type outline_step =
 and step_action =
   | Linearize  (** [commit], [returning p -> commit] or [performs a]. *)
   | Scope  (** A proof around the access or call, [(fun step -> e)]. *)
+  | Wrapped_scope  (** An explicit Ghost wrapper around an access or call. *)
   | Initializes  (** The ghost fields of an allocation, [initializes [...]]. *)
   | Loop  (** An invariant at the first expression of a loop body. *)
 
@@ -286,6 +301,12 @@ type proof_decl =
     }
   | Proof_au of { au_name : id; au_operation : qualid }
   | Proof_task of { task_name : id; task_operation : qualid }
+  | Proof_access_field of {
+      access_name : id;
+      access_kind : access_kind;
+      access_owner : pat * pty;
+      access_selector : term;
+    }
   | Proof_field of { field_name : id; field_type : pty }
   | Proof_function of {
       function_name : id;
@@ -302,6 +323,7 @@ type proof_decl =
       lemma_requires : term list;
       lemma_ensures : term list;
       lemma_variant : term list;
+      lemma_opens : (Location.t * term list) option;
       lemma_body : proof_expr;
     }
   | Proof_state of {

@@ -149,6 +149,9 @@ let rec matches (a : Parsetree.expression) (e : Parsetree.expression) =
         List.equal same_parameter left right && matches left_body right_body
     | Pexp_field (a, fa), Pexp_field (e, fe) ->
         Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt) && matches a e
+    | Pexp_setfield (a, fa, va), Pexp_setfield (e, fe, ve) ->
+        Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt)
+        && matches a e && matches va ve
     | Pexp_constraint (a, _), _ -> matches a e
     | _, Pexp_constraint (e, _) -> matches a e
     | _ -> false
@@ -485,12 +488,13 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
               | Loop ->
                   let* body = loop_body definition code ~at:anchor_loc in
                   Ok body.pexp_loc.loc_start
-              | Linearize | Initializes | Scope -> Ok (step_end code)
+              | Linearize | Initializes | Scope | Wrapped_scope -> Ok (step_end code)
             in
             let prefix =
               match action with
               | Linearize | Initializes | Loop -> ""
               | Scope -> "Ghost.scope "
+              | Wrapped_scope -> ""
             in
             let* context =
               uses ~visible ~step_loc:action_loc ~regions:(regions_of regions code)
@@ -500,7 +504,7 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let* export =
               match (export, action) with
               | None, _ -> Ok None
-              | Some pattern, Scope -> Ok (Some (key, pattern))
+              | Some pattern, (Scope | Wrapped_scope) -> Ok (Some (key, pattern))
               | Some pattern, _ ->
                   error pattern.pat_loc "Only a scope (fun step -> e) exports a value"
             in
@@ -518,7 +522,7 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let previous =
               match action with
               | Loop -> previous
-              | Linearize | Initializes | Scope -> place.pos_cnum
+              | Linearize | Initializes | Scope | Wrapped_scope -> place.pos_cnum
             in
             Ok (previous, visible, annotation :: annotations)
         | On_return { return_loc; return_adapter } ->

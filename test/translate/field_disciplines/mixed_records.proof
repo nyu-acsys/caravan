@@ -1,0 +1,60 @@
+module Payload = Ghost.Relaxed (struct let field (cell : 'a cell) = cell.payload end)
+
+proof result = make next payload
+  ensures (own result.next next && own result.label 7 &&
+    own ~writer:Ghost.self result.count 0 &&
+    exists event : Ghost.t.
+      Payload.private_state Ghost.self result payload (Set.singleton (event, payload))) = ()
+
+proof result = next cell
+  requires (own cell.next channel)
+  ensures (own cell.next channel && result === channel) = ()
+
+proof result = label cell
+  requires (own cell.label value)
+  ensures (own cell.label value && result === value) = ()
+
+proof result = load [value : 'a] cell
+  requires (own cell.next channel && own channel value)
+  ensures (own cell.next channel && own channel value && result === value) = ()
+
+proof result = load_pattern [value : 'a] cell
+  requires (own cell.next channel && own channel value)
+  ensures (own cell.next channel && own channel value && result === value) = ()
+
+invariant stable_label (cell : 'a cell) (value : int) = own cell.label value
+
+proof result = shared_label cell
+  requires (stable_label cell value)
+  ensures (stable_label cell value && result === value) =
+  at (cell.label) (fun read ->
+    unfold stable_label cell value;
+    let result = read () in
+    fold stable_label cell value;
+    result)
+
+module Use (Storage : Storage) = struct
+  proof result = make next
+    ensures (own result.next next && own ~writer:Ghost.self result.count 0) = ()
+  proof result = next cell
+    requires (own ~fraction:Permission.half cell.next channel)
+    ensures (own ~fraction:Permission.half cell.next channel && result === channel) = ()
+end
+
+proof result = generic_client () ensures (result === 42) = ()
+
+proof result = make_node next
+  ensures (match result with Node cell ->
+    own cell.next next && own ~writer:Ghost.self cell.count 0) = ()
+proof result = node_next [channel : 'a Atomic.t] node
+  requires (match node with Node cell -> own cell.next channel)
+  ensures ((match node with Node cell -> own cell.next channel) && result === channel) = ()
+
+module Fresh () = struct
+  proof result = make next
+    ensures (own result.next next && own ~writer:Ghost.self result.count 0) = ()
+  proof result = next cell
+    requires (own cell.next channel)
+    ensures (own cell.next channel && result === channel) = ()
+end
+proof result = fresh_client () ensures (result === true) = ()

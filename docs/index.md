@@ -78,8 +78,8 @@ and clients. They also serve as verification regressions.
 Caravan is under active development. It supports a growing first-order subset of
 OCaml, including polymorphic functions, algebraic data types, records, modules and
 functors, mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
-tasks, exceptions, and constant GADT witnesses. It does not yet cover the full
-OCaml language. The [OCaml coverage guide](/tutorial/ocaml-subset)
+tasks, exceptions, and GADTs with constant witnesses or constructor-set indices.
+It does not yet cover the full OCaml language. The [OCaml coverage guide](/tutorial/ocaml-subset)
 describes the supported constructs and current restrictions.
 
 The [Caravan tutorial](/tutorial/) starts with a first verified file, then

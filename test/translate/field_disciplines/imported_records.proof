@@ -1,0 +1,69 @@
+module Box = Ghost.Frozen (struct let field (cell : 'a Record_shapes.box) = cell.value end)
+module AliasBox = Ghost.Frozen (struct let field (cell : 'a Record_shapes.alias) = cell.value end)
+module Payload = Ghost.Relaxed (struct let field (cell : 'a Record_shapes.cell) = cell.payload end)
+module Nested = Ghost.Relaxed (struct let field (cell : Record_shapes.Nested.t) = cell.item end)
+module MixedPayload = Ghost.Relaxed (struct let field (cell : 'a Record_shapes.mixed) = cell.payload end)
+
+proof result = make_frozen frozen
+  ensures (own ~writer:Ghost.self result.frozen frozen) = ()
+proof result = rewrite_frozen cell value
+  requires (own ~writer:Ghost.self cell.frozen previous)
+  ensures (own ~writer:Ghost.self cell.frozen value && result === value) = ()
+proof result = make_box value
+  ensures (own ~writer:Ghost.self result.value value) = ()
+proof result = read_alias cell
+  requires (own ~writer:Ghost.self cell.value value)
+  ensures (own ~writer:Ghost.self cell.value value && result === value) = ()
+proof result = read_module_alias cell
+  requires (own ~writer:Ghost.self cell.value value)
+  ensures (own ~writer:Ghost.self cell.value value && result === value) = ()
+proof result = freeze_alias cell
+  requires (own ~writer:Ghost.self cell.value value)
+  ensures (Box.visible Ghost.self result value) =
+  on return AliasBox.freeze cell
+proof result = read_frozen cell
+  requires (Box.visible Ghost.self cell value)
+  ensures (Box.visible Ghost.self cell value && result === value) =
+  at (cell.value) Ghost.frozen_scope (fun read -> let result = read () in result)
+
+proof result = make_relaxed payload
+  ensures (exists event : Ghost.t.
+    Payload.private_state Ghost.self result payload (Set.singleton (event, payload))) = ()
+proof result = read_relaxed cell
+  requires (Payload.state cell current writes)
+  ensures (Payload.state cell current writes && exists event : Ghost.t.
+    Payload.observed cell event result && Set.mem (event, result) writes) = ()
+proof write_relaxed cell payload
+  requires (Payload.private_state Ghost.self cell previous writes)
+  ensures (exists event : Ghost.t.
+    Payload.private_state Ghost.self cell payload (Set.union writes (Set.singleton (event, payload))) &&
+    Payload.observed cell event payload) = ()
+proof result = make_nested item
+  ensures (exists event : Ghost.t.
+    Nested.private_state Ghost.self result item (Set.singleton (event, item))) = ()
+proof result = read_nested cell
+  requires (Nested.state cell current writes)
+  ensures (Nested.state cell current writes && exists event : Ghost.t.
+    Nested.observed cell event result && Set.mem (event, result) writes) = ()
+
+proof result = make_first item ensures (own ~writer:Ghost.self result.item item) = ()
+proof result = make_second item ensures (own ~writer:Ghost.self result.item item) = ()
+proof result = read_first cell
+  requires (own ~writer:Ghost.self cell.item value)
+  ensures (own ~writer:Ghost.self cell.item value && result === value) = ()
+proof result = read_second cell
+  requires (own ~writer:Ghost.self cell.item value)
+  ensures (own ~writer:Ghost.self cell.item value && result === value) = ()
+
+proof result = make_mixed next payload
+  ensures (own result.next next && own ~writer:Ghost.self result.count 0 &&
+    exists event : Ghost.t.
+      MixedPayload.private_state Ghost.self result payload (Set.singleton (event, payload))) = ()
+proof result = next cell
+  requires (own cell.next pointer)
+  ensures (own cell.next pointer && result === pointer) = ()
+proof result = load_next [value : 'a] cell
+  requires (own cell.next pointer && own pointer value)
+  ensures (own cell.next pointer && own pointer value && result === value) = ()
+proof result = clients value ensures (result === value) =
+  at (load_next mixed) (fun load -> let result = load value in result)

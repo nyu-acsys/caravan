@@ -12,9 +12,9 @@ compiler does not make an arbitrary library call verifiable.
 | Values | `int`, `bool`, `unit`, tuples, lists, options, variants, immutable records. | No general support for strings, floats, arrays, or objects. |
 | Control flow | `let`, `if`, pattern matching, sequencing, recursive functions, `while` and `for` loops. | Supply loop invariants when the inferred facts are insufficient; `variant` annotations on executable functions and loops are not yet supported. |
 | Functions | Named first-order functions, local helpers and captures, recursion, and rank-one polymorphism. | No general function-valued parameters, returned closures, or callbacks; no independently generalized helper that also depends on enclosing type parameters. |
-| Data types | Parameterized variants and records, including mutable records, regular recursive types, and aliases. | Inline constructor records and nonregular recursive data types are unsupported. |
+| Data types | Parameterized variants and records, including mutable records and mutable inline constructor records, regular recursive types, and aliases. | Immutable inline constructor records and nonregular recursive data types are unsupported. |
 | Mutable state | References, mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
-| GADTs | Constant witness types, including Saturn's result-selection witnesses. | Not arbitrary GADTs or dependent payloads. |
+| GADTs | Constant witness types, including Saturn's result-selection witnesses, and payload constructors indexed by sets of constant polymorphic-variant tags. | No arbitrary dependent payloads, existential payload types, or runtime polymorphic variants. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
 | Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, native mutexes with ownership effects and task cleanup, and native conditions. | `Mutex.protect` is unsupported; blocking and deadlock freedom are not proved. |
 
@@ -40,6 +40,27 @@ let replace cell value = cell.contents <- value
 Every field of a heap record requires ownership to read, including fields declared
 immutable in OCaml. Parameterized record fields retain their source-value bounds
 when generic operations are instantiated at concrete types.
+
+GADT indices can restrict which constructors a value may have. For example:
+
+```ocaml
+type ('a, _) node =
+  | Null : ('a, [> `Null ]) node
+  | Node : { mutable value : 'a } -> ('a, [> `Node ]) node
+
+and 'a link = Link : ('a, [< `Null | `Node ]) node -> 'a link [@@unboxed]
+```
+
+The type ``('a, [ `Node ]) node`` permits only `Node`, while `Link` can contain
+`Null` or `Node`. Constructor payloads retain their ordinary type parameters and
+ownership requirements. Constructor patterns may also appear directly in function
+parameters; verification checks that their arguments match. Constant-tag rows can also occur in `.proof` type
+annotations, using ``[ `Node ]``, ``[> `Node ]``, or ``[< `Null | `Node ]``.
+These rows describe type indices; polymorphic-variant values are not supported.
+This does not provide general GADT reasoning about arbitrary type equations or
+existential payload types. Abstract constructor-set indices and polymorphic indices
+shared between an argument and result are not yet supported; independent producer
+rows and fixed constructor sets are supported.
 
 Checked `variant` annotations currently apply to logical functions and lemmas in
 `.proof` files. Executable functions and loops are verified for partial correctness,

@@ -1,0 +1,123 @@
+// The task receives the child's fixed execution identity, including on ordinary calls.
+interface ViewTask {
+  type Result
+  pred result(value: Result, final_view: Set[Ref])
+
+  proc run(executing: Ref, ghost initial: Set[Ref])
+    returns (value: Result, ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, initial)
+    ensures ThreadContext.context(executing, final_view) && result(value, final_view)
+}
+
+// A checked handoff model for the resource transfer trusted by Domain's facade.
+module ViewForkJoin[Task: ViewTask] {
+  module Claim = Library.Excl[Library.Unit]
+
+  field ready: Bool
+  field value: Task.Result
+  ghost field view: Set[Ref]
+  ghost field executor: Ref
+  ghost field claim: Claim
+
+  inline pred ticket(handle: Ref) {
+    own(handle.claim, Claim.excl(()))
+  }
+
+  inv completion(handle: Ref; child: Ref) {
+    exists done: Bool, claimed: Bool, answer: Task.Result, final_view: Set[Ref] ::
+      own(handle.ready, done, 1.0) && own(handle.value, answer, 1.0)
+      && own(handle.view, final_view, 1.0) && own(handle.executor, child, 1.0)
+      && (done ? (claimed ? ticket(handle)
+        : ThreadContext.context(child, final_view) && Task.result(answer, final_view)) : true)
+  }
+
+  proc worker(handle: Ref, child: Ref, ghost initial: Set[Ref])
+    requires completion(handle, child) && ThreadContext.context(child, initial)
+  {
+    var answer: Task.Result;
+    ghost var final_view: Set[Ref];
+    answer, final_view := Task.run(child, initial);
+    atomic {
+      unfold completion(handle, child);
+      handle.value := answer;
+      handle.view := final_view;
+      handle.ready := true;
+      fold completion(handle, child)[claimed := false];
+    }
+  }
+
+  proc fork(parent: Ref, ghost initial: Set[Ref], unused: Task.Result)
+    returns (handle: Ref, child: Ref)
+    requires ThreadContext.context(parent, initial)
+    ensures ThreadContext.context(parent, initial) && completion(handle, child)
+      && ticket(handle) && parent != child
+  {
+    child := ThreadContext.fork_context(parent, initial);
+    handle := new(ready: false, value: unused, view: {},
+      executor: child, claim: Claim.excl(()));
+    fold completion(handle, child)[claimed := false];
+    spawn worker(handle, child, initial);
+  }
+
+  proc join(parent: Ref, handle: Ref, child: Ref, ghost initial: Set[Ref])
+    returns (answer: Task.Result, ghost final_view: Set[Ref])
+    requires ThreadContext.context(parent, initial) && completion(handle, child)
+      && ticket(handle) && parent != child
+    ensures ThreadContext.context(parent, initial ++ final_view) && Task.result(answer, final_view)
+  {
+    ghost var claimed: Bool;
+    var done: Bool;
+    atomic {
+      unfold completion(handle, child)[claimed := claimed];
+      done := handle.ready;
+      answer := handle.value;
+      final_view := handle.view;
+      fold completion(handle, child)[claimed := true];
+    }
+    if (!done) {
+      answer, final_view := join(parent, handle, child, initial);
+    } else {
+      ThreadContext.join_context(parent, child, initial, final_view);
+    }
+  }
+}
+
+module FlagTask : ViewTask {
+  type Result = (Ref, Ref)
+
+  pred result(value: Result, final_view: Set[Ref]) {
+    value#0 in final_view &&
+      (exists release: Set[Ref] :: ThreadFlags.published(value#0, value#1, true, release))
+  }
+
+  proc run(executing: Ref, ghost initial: Set[Ref])
+    returns (value: Result, ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, initial)
+    ensures ThreadContext.context(executing, final_view) && result(value, final_view)
+  {
+    val cell := ThreadFlags.create(true);
+    val channel := ThreadFlags.publish(executing, cell, initial, true);
+    final_view := initial ++ {channel};
+    value := (channel, cell);
+    fold result(value, final_view);
+  }
+}
+
+module FlagForkJoin = ViewForkJoin[FlagTask]
+
+proc spawned_task_join()
+  opens FlagForkJoin.completion, ThreadFlags.published, ThreadContext.released
+{
+  val parent := ThreadContext.create_thread();
+  var handle: Ref;
+  var child: Ref;
+  handle, child := FlagForkJoin.fork(parent, {}, (null, null));
+  var value: FlagTask.Result;
+  ghost var final_view: Set[Ref];
+  value, final_view := FlagForkJoin.join(parent, handle, child, {});
+  ghost var release: Set[Ref];
+  unfold FlagTask.result(value, final_view)[release := release];
+  val observed := ThreadFlags.read_frozen(parent, value#1, value#0,
+    final_view, true, release);
+  assert observed;
+}

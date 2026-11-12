@@ -1,0 +1,15 @@
+proc acquired_cache_need_not_be_latest()
+  opens ThreadContext.released
+{
+  val initial := CacheEvent.write(0, true, 4);
+  val refreshed := CacheEvent.write(3, true, 7);
+  val history := CacheWrites.create(initial);
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val channel := ThreadContext.publish(writer, history, {});
+  CacheWrites.record(history, {initial}, refreshed);
+  val acquired := ThreadContext.acquire(reader, channel, history, {}, {});
+  val observed := sample_cache(history, reader, channel, {initial, refreshed}, {channel}, {});
+  CacheWrites.reconcile(history, {initial, refreshed}, observed);
+  assert observed.value == 3;
+}

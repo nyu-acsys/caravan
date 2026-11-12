@@ -183,7 +183,7 @@ let declared_type_variables ~types ~parameters (f : func) =
               Option.value_map data.id ~default:path ~f:(fun id -> Path.Pident id))
         in
         Ctype.newconstr path (List.map arguments ~f:normalize)
-    | desc -> Ctype.newty (Btype.copy_type_desc normalize desc)
+    | desc -> Ctype.newty (Compiler_types.map_desc normalize desc)
   in
   let named scheme =
     List.filter_map scheme.Polymorphic_functions.variables ~f:(fun typ ->
@@ -222,11 +222,14 @@ let declared_type_variables ~types ~parameters (f : func) =
       else
         let correspondence =
           let* scheme =
-            Polymorphic_functions.discover ~expand:normalize ~at:f.loc declaration
+            Polymorphic_functions.discover ~expand:normalize
+              ~project:(Datatypes.representation_arguments types)
+              ~at:f.loc declaration
           in
           let* arguments =
-            Polymorphic_functions.instantiate ~expand:normalize ~at:f.loc scheme
-              ~declaration ~occurrence:f.scheme_type
+            Polymorphic_functions.instantiate ~expand:normalize
+              ~project:(Datatypes.representation_arguments types)
+              ~at:f.loc scheme ~declaration ~occurrence:f.scheme_type
           in
           Ok
             (List.filter_map names ~f:(fun (name, typ) ->
@@ -396,8 +399,7 @@ let formals ?(names = []) ctx (f : func) =
           let+ x = State.fresh "unit" in
           let l = loc pat_loc in
           (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
-      | Tparam_pat
-          { pat_desc = Tpat_any | Tpat_record _ | Tpat_tuple _; pat_type; pat_loc; _ }
+      | Tparam_pat { pat_type; pat_loc; _ }
         when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
           let* typ = State.typ ctx ~at:pat_loc pat_type in
           let contract_name = Option.join (List.nth names i) in
@@ -417,48 +419,53 @@ let pattern_params ctx (f : func) formals =
     State.all (List.zip_exn f.params formals)
       ~f:(fun ((p : Typedtree.function_param), (ocaml, _, _)) ->
         match (p.fp_kind, ocaml) with
-        | ( Tparam_pat
-              ({ pat_desc = Tpat_any | Tpat_record _ | Tpat_tuple _; pat_loc; _ } as pat),
-            Some (_, x) ) ->
+        | Tparam_pat { pat_desc = Tpat_var _; _ }, _ -> State.return []
+        | Tparam_pat pat, Some (_, x) ->
+            let pat_loc = pat.pat_loc in
             let l = loc pat_loc in
             let value = R.Expr.var ~loc:l (name ~loc:l x) in
             let* access, cond, binds = pattern ctx pat value in
-            begin match cond with
-            | Some _ ->
-                State.of_result (unsupported pat_loc "A refutable pattern as a parameter")
-            | None ->
-                let* stmts =
-                  State.all binds ~f:(fun (id, value, t) ->
-                      let* typ = State.typ ctx ~at:pat_loc t in
-                      let* () = State.note_domain ctx.given.types t in
-                      let+ y = State.bind_name ~typ:t id in
-                      R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
-                        (ident ~loc:l y)
-                      @ assert_admissible ctx ~loc:l t y)
-                in
-                (* The variables of a record's fields are its fields. *)
-                let+ () =
-                  match pat.pat_desc with
-                  | Tpat_record (fields, _) ->
-                      State.iter fields ~f:(fun (_, label, p) ->
-                          match p.pat_desc with
-                          | Tpat_var (id, _, _) ->
-                              let* y = State.find_name id in
-                              begin match y with
-                              | Some y ->
-                                  State.modify_carried (fun c ->
-                                      {
-                                        c with
-                                        fields_of =
-                                          (y, (label.lbl_name, value)) :: c.fields_of;
-                                      })
-                              | None -> State.return ()
-                              end
-                          | _ -> State.return ())
-                  | _ -> State.return ()
-                in
-                access :: stmts
-            end
+            let* checked =
+              match cond with
+              | Some condition ->
+                  let+ checked =
+                    State.check ~at:pat_loc "This parameter pattern may not match"
+                      condition
+                  in
+                  [ checked ]
+              | None -> State.return []
+            in
+            let* stmts =
+              State.all binds ~f:(fun (id, value, t) ->
+                  let* typ = State.typ ctx ~at:pat_loc t in
+                  let* () = State.note_domain ctx.given.types t in
+                  let+ y = State.bind_name ~typ:t id in
+                  R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
+                    (ident ~loc:l y)
+                  @ assert_admissible ctx ~loc:l t y)
+            in
+            (* The variables of a record's fields are its fields. *)
+            let+ () =
+              match pat.pat_desc with
+              | Tpat_record (fields, _) ->
+                  State.iter fields ~f:(fun (_, label, p) ->
+                      match p.pat_desc with
+                      | Tpat_var (id, _, _) ->
+                          let* y = State.find_name id in
+                          begin match y with
+                          | Some y ->
+                              State.modify_carried (fun c ->
+                                  {
+                                    c with
+                                    fields_of =
+                                      (y, (label.lbl_name, value)) :: c.fields_of;
+                                  })
+                          | None -> State.return ()
+                          end
+                      | _ -> State.return ())
+              | _ -> State.return ()
+            in
+            (access @ checked) :: stmts
         | _ -> State.return [])
   in
   List.concat (List.concat bindings)
@@ -712,6 +719,7 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
   State.in_procedure
   @@
   let open State.Syntax in
+  let* () = State.of_result (Datatypes.validate_indices types ~at:f.loc f.scheme_type) in
   let l = loc f.loc in
   let* () =
     if f.trusted then
@@ -731,6 +739,30 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
     | [] -> State.return ()
     | _ -> State.of_result (unsupported f.loc "A pure function with ghost parameters")
   in
+  let* patterns =
+    State.all (List.zip_exn f.params formals)
+      ~f:(fun ((parameter : Typedtree.function_param), (formal, _, _)) ->
+        match (parameter.fp_kind, formal) with
+        | Tparam_pat pat, Some (_, formal) ->
+            let value =
+              R.Expr.var ~loc:(loc pat.pat_loc) (name ~loc:(loc pat.pat_loc) formal)
+            in
+            let* access, condition, bindings = pattern ctx pat value in
+            begin match access with
+            | [] ->
+                State.return
+                  ( List.map bindings ~f:(fun (id, value, _) ->
+                        (Ident.unique_name id, value)),
+                    condition )
+            | _ :: _ ->
+                State.of_result
+                  (unsupported pat.pat_loc
+                     "A mutable parameter pattern in a pure function")
+            end
+        | _ -> State.return ([], None))
+  in
+  let bindings = List.concat_map patterns ~f:fst in
+  let conditions = List.filter_map patterns ~f:snd in
   let calls_self = refers_to f in
   let clauses select = Option.value_map f.contract ~default:[] ~f:select in
   let* requires =
@@ -752,7 +784,7 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
               ]
         | _ -> None)
   in
-  let requires = domains @ requires in
+  let requires = conditions @ domains @ requires in
   let source_requires = clauses (fun c -> c.requires) in
   let resource_dependent term =
     List.exists (term_references [] term) ~f:(fun q ->
@@ -766,7 +798,7 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
           calls_self term || resource_dependent term)
     then None
     else
-      Datatypes.admissible ~loc:l ctx.given.types f.body.exp_type
+      Datatypes.result_admissible ~loc:l ctx.given.types f.body.exp_type
         (R.Expr.var ~loc:l (name ~loc:l result))
   in
   let ensures = Option.to_list result_domain @ ensures in
@@ -777,32 +809,11 @@ let func types ~shared ~ocaml_env ~preds ~funcs ~spec_funcs ~proof_support
                R.Expr.binary ~loc:l Impl pre post)))
   in
   let* result_typ = State.typ ctx ~at:f.body.exp_loc f.body.exp_type in
-  let* () = State.note_domain ctx.given.types f.body.exp_type in
-  let* bindings =
-    State.all (List.zip_exn f.params formals)
-      ~f:(fun ((parameter : Typedtree.function_param), (formal, _, _)) ->
-        match (parameter.fp_kind, formal) with
-        | Tparam_pat pat, Some (_, formal) ->
-            let value =
-              R.Expr.var ~loc:(loc pat.pat_loc) (name ~loc:(loc pat.pat_loc) formal)
-            in
-            let* access, condition, bindings = pattern ctx pat value in
-            begin match (access, condition) with
-            | [], None ->
-                State.return
-                  (List.map bindings ~f:(fun (id, value, _) ->
-                       (Ident.unique_name id, value)))
-            | _ :: _, _ ->
-                State.of_result
-                  (unsupported pat.pat_loc
-                     "A mutable parameter pattern in a pure function")
-            | [], Some _ ->
-                State.of_result
-                  (unsupported pat.pat_loc "A refutable pattern as a parameter")
-            end
-        | _ -> State.return [])
+  let* () =
+    State.note_domain ctx.given.types
+      (Datatypes.result_type ctx.given.types f.body.exp_type)
   in
-  let+ body = pure ctx ~funcs (List.concat bindings) f.body in
+  let+ body = pure ctx ~funcs bindings f.body in
   R.Callable.func ~loc:l
     ~formals:(List.map formals ~f:(fun (_, _, v) -> v))
     ~returns:[ R.Var.make ~loc:l (ident ~loc:l result) result_typ ]
@@ -1494,6 +1505,9 @@ let prepare_proc ~given ~past_structures ~proc_name (f : func) =
     }
   in
   let open State.Syntax in
+  let* () =
+    State.of_result (Datatypes.validate_indices given.types ~at:f.loc f.scheme_type)
+  in
   let l = loc f.loc in
   (* Facts about earlier states are ghost parameters and results. *)
   let split terms =
@@ -1519,14 +1533,7 @@ let prepare_proc ~given ~past_structures ~proc_name (f : func) =
       (List.zip_exn (List.zip_exn f.params arg_names) formals)
       ~f:(fun ((parameter, source), (formal, _, _)) ->
         match (parameter.Typedtree.fp_kind, source, formal) with
-        | ( Tparam_pat
-              {
-                pat_desc = Tpat_any | Tpat_var _ | Tpat_record _ | Tpat_tuple _;
-                pat_type;
-                _;
-              },
-            Some source,
-            Some (_, raven) ) ->
+        | Tparam_pat { pat_type; _ }, Some source, Some (_, raven) ->
             let* scope = State.get_scope in
             if List.Assoc.mem scope source ~equal:String.equal then State.return ()
             else State.set_scope ((source, (raven, Some pat_type)) :: scope)
@@ -1645,7 +1652,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   @@
   let open State.Syntax in
   let* execution_ctx, execution =
-    Mutex_execution.prepare_boundary { given; au = None } ~at:f.loc f.contract
+    Execution_context.prepare_boundary { given; au = None } ~at:f.loc f.contract
   in
   let given = execution_ctx.given in
   let* {
@@ -1769,22 +1776,25 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   let* () = State.set_scope scope in
   let implicit_decls = implicit in
   let implicit = List.map implicit ~f:(fun (_, _, _, var) -> var) in
-  let contract_env = Mutex_execution.entry_environment env in
+  let contract_env = Execution_context.entry_environment env in
   let specs fs =
     State.all fs ~f:(fun f ->
         State.map (Spec_terms.formula contract_env f) ~f:R.Spec.make)
   in
   (* Values of type [int] are in its range. *)
   let in_range = List.filter_map formals ~f:(fun (_, range, _) -> range) in
-  let* () = State.note_domain ctx.given.types f.body.exp_type in
+  let* () =
+    State.note_domain ctx.given.types
+      (Datatypes.result_type ctx.given.types f.body.exp_type)
+  in
   let result_in_range =
     if List.is_empty returns then None
     else
       match raising with
-      | None -> value_spec ctx ~loc:l f.body.exp_type result
+      | None -> result_spec ctx ~loc:l f.body.exp_type result
       | Some (_, outcome_typ) ->
           Option.map
-            (Datatypes.admissible ~loc:l ctx.given.types f.body.exp_type
+            (Datatypes.result_admissible ~loc:l ctx.given.types f.body.exp_type
                (R.Expr.var ~loc:l (name ~loc:l result)))
             ~f:(fun admissible ->
               R.Spec.make
@@ -1929,7 +1939,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
   in
   let* execution_ensures =
     State.map
-      (Mutex_execution.exit_resources env execution ~at:f.loc
+      (Execution_context.exit_resources env execution ~at:f.loc
          ~raising:(Option.is_some raising) f.contract)
       ~f:(List.map ~f:R.Spec.make)
   in

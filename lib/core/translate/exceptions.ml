@@ -183,6 +183,7 @@ let datatype ?(library = []) (structure : Typedtree.structure) =
         raven;
         fields = List.mapi args ~f:(fun i _ -> Printf.sprintf "%s_%d" raven i);
         args;
+        inline_record = None;
       }
     in
     Ok

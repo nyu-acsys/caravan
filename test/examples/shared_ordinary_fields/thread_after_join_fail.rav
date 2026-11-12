@@ -1,0 +1,9 @@
+proc reuse_child_context(parent: Ref, child: Ref, cell: Ref, channel: Ref)
+  requires parent != child && ThreadContext.context(parent, {})
+    && ThreadContext.context(child, {channel})
+    && ThreadCounters.published(channel, cell, 42, {})
+  opens ThreadCounters.published, ThreadContext.released
+{
+  ThreadContext.join_context(parent, child, {}, {channel});
+  val result := ThreadCounters.read_frozen(child, cell, channel, {channel}, 42, {});
+}

@@ -1,0 +1,23 @@
+// The earlier unindexed acquired predicate is transferable through an invariant.
+field unindexed_signal: Bool
+ghost field unindexed_cell: Ref
+ghost field unindexed_channel: Ref
+
+inv unindexed_mailbox(mail: Ref; cell: Ref, channel: Ref) {
+  own(mail.unindexed_signal, false, 1.0)
+    && own(mail.unindexed_cell, cell, 1.0) && own(mail.unindexed_channel, channel, 1.0)
+    && Counters.acquired(cell, channel, 42)
+}
+
+proc unindexed_receiver(mail: Ref, cell: Ref, channel: Ref)
+  returns (result: Int)
+  requires unindexed_mailbox(mail, cell, channel)
+  ensures unindexed_mailbox(mail, cell, channel) && result == 42
+  opens unindexed_mailbox(mail, cell, channel), Counters.published
+{
+  unfold unindexed_mailbox(mail, cell, channel);
+  Counters.duplicate(cell, channel, 42);
+  val signal := mail.unindexed_signal;
+  fold unindexed_mailbox(mail, cell, channel);
+  result := Counters.read_frozen(cell, channel, 42);
+}

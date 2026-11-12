@@ -15,6 +15,8 @@ type t = {
   proof_assets :
     Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list;
   layouts : Result_layouts.t list;
+  frozen_fields : Frozen_fields.t;
+  frozen_parameters : Frozen_parameters.t;
   checked_modules : Checked_modules.t list;
   checked_operations : Program_items.checked_operation list;
   pure : Procedures.func list;
@@ -163,6 +165,7 @@ let specialize_continuations (scopes : Program_scopes.t) =
             let* local =
               Polymorphic_functions.discover ~excluded:[ outer.scheme_type ]
                 ~expand:(Datatypes.expand scopes.types)
+                ~project:(Datatypes.representation_arguments scopes.types)
                 ~at:f.loc f.scheme_type
             in
             if List.is_empty local.variables then Ok f
@@ -170,6 +173,7 @@ let specialize_continuations (scopes : Program_scopes.t) =
               let* source_scheme =
                 Polymorphic_functions.discover ~additional:(parameter_types f)
                   ~expand:(Datatypes.expand scopes.types)
+                  ~project:(Datatypes.representation_arguments scopes.types)
                   ~at:f.loc f.scheme_type
               in
               let* _, _, _, specialization =
@@ -790,8 +794,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))
             in
             let* scheme =
-              Polymorphic_functions.discover ~at:signature.site.item_loc
-                signature.declaration.val_val.val_type
+              Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:signature.site.item_loc signature.declaration.val_val.val_type
             in
             let* () =
               if (not view.grouped) && not (List.is_empty scheme.variables) then
@@ -891,6 +896,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           in
           let* scheme =
             Polymorphic_functions.discover ~excluded ~expand:(Datatypes.expand types)
+              ~project:(Datatypes.representation_arguments types)
               ~at:f.loc f.scheme_type
           in
           let share_parent =
@@ -901,7 +907,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           else
             let* scheme =
               Polymorphic_functions.discover ~additional:(parameter_types f)
-                ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+                ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:f.loc f.scheme_type
             in
             let parent =
               Option.bind f.lexical_owner ~f:(fun owner ->
@@ -919,6 +927,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               | Some source ->
                   let* arguments =
                     Polymorphic_functions.instantiate ~expand:(Datatypes.expand types)
+                      ~project:(Datatypes.representation_arguments types)
                       ~at:f.loc source ~declaration:source.typ ~occurrence:f.scheme_type
                   in
                   Ok (Some Polymorphic_functions.{ source; arguments })
@@ -1043,7 +1052,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         in
         let* scheme =
           Polymorphic_functions.discover ~additional:(parameter_types f)
-            ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+            ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~at:f.loc f.scheme_type
         in
         let procedure_parameters =
           Option.value_map (function_worker polymorphic_functions f)
@@ -1125,7 +1136,10 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           Datatypes.with_paths
             (Datatypes.atomic_token ~path:au.Source.au_token_path
                ~procedure:(au_procedure au f) ~at:au.au_at
-               ~context:(Mutex_execution.enabled source.proof_resources)
+               ~context:
+                 (Execution_contract.context_layout
+                    ~mutex:(Mutex_execution.enabled source.proof_resources)
+                    ~visibility:(Source.visibility_required source))
                ())
             au.au_token_paths
         in
@@ -1140,7 +1154,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         | None -> Ok { data with parameters = au.au_parameters }
         | Some worker ->
             let* argument_projection =
-              Specializations.argument_projection ~at:f.loc scopes.specialized worker
+              Specializations.argument_projection ~types ~at:f.loc scopes.specialized
+                worker
             in
             let scope =
               match (au.au_application, Generic_modules.member generics f.id) with
@@ -1261,6 +1276,13 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         not
           (List.exists dependent_models ~f:(fun model ->
                String.equal (Generic_models.name model) (Generic_models.name data))))
+  in
+  let frozen_fields =
+    Frozen_fields.plan ~source ~inventory:scopes.inventory ~types ~layouts
+  in
+  let* frozen_parameters =
+    Frozen_parameters.plan ~fields:frozen_fields ~inventory:scopes.inventory ~types
+      generics
   in
   let data_types =
     List.filter data_types ~f:(fun data ->
@@ -1654,7 +1676,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         in
         let* implicit = implicit_parameters predicate in
         let* worker =
-          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key ~at
+          Generic_predicates.discover ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~key ~name:key ~at
             ~explicit:(List.length parameters - implicit)
             parameters
         in
@@ -1736,6 +1760,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let* arguments =
               Generic_parameters.instantiate ~environment:resource.resource_environment
                 ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:resource.resource_at worker
                 (List.map inputs ~f:Option.some)
             in
@@ -1773,12 +1798,14 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 in
                 let* scheme =
                   Generic_parameters.discover ~expand:(Datatypes.expand types)
+                    ~project:(Datatypes.representation_arguments types)
                     ~key:predicate.pred_name.pid_str ~name:predicate.pred_name.pid_str ~at
                     ~explicit:(List.length inputs) parameters
                 in
                 let* arguments =
                   Generic_parameters.instantiate ~environment
                     ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                    ~project:(Datatypes.representation_arguments types)
                     ~at scheme
                     (List.map inputs ~f:Option.some @ [ None ])
                 in
@@ -1834,8 +1861,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let key = lib.Library_modules.source_name ^ "." ^ predicate.S.pred_name.pid_str in
         let* implicit = implicit_parameters predicate in
         let* worker =
-          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key
-            ~at:predicate.pred_name.pid_loc
+          Generic_predicates.discover ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~key ~name:key ~at:predicate.pred_name.pid_loc
             ~explicit:(List.length parameters - implicit)
             parameters
         in
@@ -1863,6 +1891,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             in
             let* worker =
               Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:view.source.entry.name.pid_loc worker parameters
             in
             let name =
@@ -1994,6 +2023,15 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let proof_support =
           {
             empty_proof_support with
+            visibility_enabled = Source.visibility_required source;
+            access_fields = source.proof_access_fields;
+            field_encoding =
+              (if Source.visibility_required source then
+                 Field_encodings.resolve ~fields:frozen_fields
+                   ~parameters:frozen_parameters ~inventory:scopes.inventory
+                   ~disciplines:
+                     (source.field_disciplines @ source.signature_field_disciplines)
+               else empty_proof_support.field_encoding);
             execution_context_path = Source.mutex_context_path source.env;
             runtime_functions = task_runtime_functions;
             predicate_views =
@@ -2038,6 +2076,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         | Predicate _, Some worker, Some _ ->
             let* worker =
               Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:binding.entry.name.pid_loc worker binding.public_types
             in
             Ok (Some { worker with key = binding.public_key })
@@ -2065,6 +2104,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let declaration = Env.find_value path source.env in
             let* scheme =
               Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:value.val_loc declaration.val_type
             in
             if List.is_empty scheme.variables then Ok None
@@ -2095,6 +2135,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
       private_ra_types;
       proof_assets;
       layouts;
+      frozen_fields;
+      frozen_parameters;
       checked_modules;
       checked_operations;
       pure;

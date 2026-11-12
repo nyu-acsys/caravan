@@ -1,0 +1,10 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+proof rewrite [writer : Ghost.t] [event : Ghost.t] [published : Ghost.t set]
+    channel cell value
+  requires (Value.private_state writer cell previous event &&
+    Set.mem event published && own ~release:published channel 0)
+  ensures (own ~writer:Ghost.self cell.value value && own ~release:published channel 0) =
+  at (cell.value <- value) (fun write ->
+    Value.adopt cell published;
+    let result = write () in
+    result)

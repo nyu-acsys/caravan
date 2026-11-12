@@ -82,7 +82,12 @@ let kind (annotation : t) =
   | "predicate" :: _ -> Predicate
   | "module" :: _ -> Ghost_module
   | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
-  | ("Ghost.scope" | "Ghost.State.scope") :: _ -> Scope
+  | ( "Ghost.scope" | "Ghost.State.scope" | "Ghost.frozen_scope"
+    | "Ghost.State.frozen_scope" | "Ghost.published_scope" | "Ghost.State.published_scope"
+    | "Ghost.release_scope" | "Ghost.acquire_scope" | "Ghost.State.release_scope"
+    | "Ghost.State.acquire_scope" )
+    :: _ ->
+      Scope
   | "Ghost.returns" :: _ -> Returns
   | "proof" :: _ -> Proof
   | [ "manual" ] -> Manual

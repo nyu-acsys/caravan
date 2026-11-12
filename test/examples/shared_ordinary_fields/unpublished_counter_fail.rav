@@ -1,0 +1,8 @@
+// A reader without a synchronization lower bound may choose a private old write.
+proc private_history_is_not_a_publication()
+{
+  val history := Example.Writes.create(Example.Raw.payload(0));
+  Example.Writes.record(history, {Example.Raw.payload(0)}, Example.Raw.payload(42));
+  val raw := Example.Writes.sample(history, {Example.Raw.payload(0), Example.Raw.payload(42)});
+  assert raw == Example.Raw.payload(42);
+}

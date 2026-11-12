@@ -54,14 +54,14 @@ A witness argument other than a constructor or the caller's own witness is rejec
 Constructors with payloads, and index types with variables of their own, are rejected.
 
   $ caravan --shh payload.ml
-  [Error] File "payload.ml", line 1, columns 16-42:
+  [Error] File "payload.ml", line 1, columns 0-42:
   1 | type (_, _) t = Boxed : int -> ('a, int) t
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Unsupported Error: A GADT beyond constant witnesses is not supported yet.
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Unsupported Error: This GADT index or existential payload is not supported yet.
   [1]
   $ caravan --shh existential.ml
-  [Error] File "existential.ml", line 1, columns 16-38:
+  [Error] File "existential.ml", line 1, columns 0-38:
   1 | type (_, _) t = Wrap : ('a, 'b list) t
-                      ^^^^^^^^^^^^^^^^^^^^^^
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Unsupported Error: A GADT beyond constant witnesses is not supported yet.
   [1]

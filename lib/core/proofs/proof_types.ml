@@ -185,6 +185,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
              (Lexing.from_string
                 "module Ghost : sig\n\
                  type t\n\
+                 val self : t\n\
+                 val handoff : t -> t -> bool\n\
                  type ('owner, 'value) field\n\
                  module Mutex : sig\n\
                  end\n\
@@ -602,6 +604,32 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             | None ->
                 let* signatures = Proof_library.signatures at in
                 let functor_path = Proof_library.path_of_qualid resource_functor in
+                let functor_path =
+                  match (functor_path, resource_arguments) with
+                  | [ "Ghost"; "Mutex" ], [ S.Proof_module_argument module_name ] ->
+                      let actual =
+                        try
+                          let path, _ =
+                            Env.find_module_by_name (longident module_name) env
+                          in
+                          let path =
+                            Env.normalize_module_path None env path |> canonical_owner
+                          in
+                          resource_at_path env resources path
+                        with Stdlib.Not_found -> None
+                      in
+                      if
+                        Option.exists actual ~f:(fun resource ->
+                            let interface =
+                              [ Mutex_visibility_contract.resource_interface ]
+                            in
+                            List.equal String.equal resource.resource_functor interface
+                            || List.exists resource.resource_interfaces
+                                 ~f:(List.equal String.equal interface))
+                      then [ Mutex_visibility_contract.protocol_name ]
+                      else functor_path
+                  | _ -> functor_path
+                in
                 let* library =
                   match Proof_library.find signatures functor_path with
                   | Some library when allow_interfaces || not library.interface ->
@@ -904,6 +932,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                             | PTtyapp (name, arguments) ->
                                 S.PTtyapp (name, List.map arguments ~f:rename)
                             | PTtuple elements -> S.PTtuple (List.map elements ~f:rename)
+                            | (PTtyany | PTvariant _) as typ -> typ
                             | PTarrow (argument, result) ->
                                 S.PTarrow (rename argument, rename result)
                           in
@@ -1181,6 +1210,150 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 in
                 Ok (env, descriptors, resource :: resources, fields)
             end
+        | Proof_access_field { access_name; access_kind; access_owner; access_selector }
+          ->
+            let at = access_name.pid_loc in
+            let* access_field =
+              Access_fields.resolve ~environment:env ~name:access_name ~kind:access_kind
+                ~owner:access_owner ~selector:access_selector ~core_type
+            in
+            let* () =
+              if module_exists env access_name.pid_str then
+                Error
+                  (Report.error Type at
+                     (Printf.sprintf "The proof module %s is already declared"
+                        access_name.pid_str))
+              else Ok ()
+            in
+            let values =
+              match access_kind with
+              | S.Frozen ->
+                  let path, _ =
+                    Env.find_type_by_name
+                      (Ldot ({ txt = Lident "Ghost"; loc = at }, { txt = "t"; loc = at }))
+                      env
+                  in
+                  let executing = Ctype.newconstr path [] in
+                  let set, _ = Env.find_type_by_name (Lident "set") env in
+                  let view = Ctype.newconstr set [ executing ] in
+                  [
+                    facade_value ~at ("release", [ access_field.owner_type ], view);
+                    facade_value ~at ("release_private", [ access_field.owner_type ], view);
+                    facade_value ~at ("snapshot", [ access_field.owner_type ], executing);
+                    facade_value ~at
+                      ("split", [ access_field.owner_type ], Predef.type_unit);
+                    facade_value ~at
+                      ("adopt", [ access_field.owner_type; view ], Predef.type_unit);
+                    facade_value ~at
+                      ( "private_state",
+                        [
+                          executing;
+                          access_field.owner_type;
+                          access_field.value_type;
+                          executing;
+                        ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ("observe", [ access_field.owner_type; view ], Predef.type_unit);
+                    facade_value ~at
+                      ( "covered",
+                        [ view; access_field.owner_type; access_field.value_type ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ("freeze", [ access_field.owner_type ], Predef.type_unit);
+                    facade_value ~at
+                      ( "visible",
+                        [ executing; access_field.owner_type; access_field.value_type ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ( "transfer",
+                        [
+                          executing;
+                          executing;
+                          access_field.owner_type;
+                          access_field.value_type;
+                        ],
+                        Predef.type_unit );
+                    facade_value ~at
+                      ( "frozen",
+                        [ access_field.owner_type; access_field.value_type ],
+                        Predef.type_bool );
+                  ]
+              | S.Relaxed ->
+                  let path, _ =
+                    Env.find_type_by_name
+                      (Ldot ({ txt = Lident "Ghost"; loc = at }, { txt = "t"; loc = at }))
+                      env
+                  in
+                  let event = Ctype.newconstr path [] in
+                  let set, _ = Env.find_type_by_name (Lident "set") env in
+                  let entry =
+                    Ctype.newty
+                      (Ttuple [ (None, event); (None, access_field.value_type) ])
+                  in
+                  let entries = Ctype.newconstr set [ entry ] in
+                  let view = Ctype.newconstr set [ event ] in
+                  let snapshot =
+                    Ctype.newty (Ttuple [ (None, event); (None, entries) ])
+                  in
+                  [
+                    facade_value ~at
+                      ( "state",
+                        [ access_field.owner_type; access_field.value_type; entries ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ( "private_state",
+                        [
+                          event; access_field.owner_type; access_field.value_type; entries;
+                        ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ( "shared_state",
+                        [
+                          access_field.owner_type;
+                          access_field.value_type;
+                          entries;
+                          entries;
+                        ],
+                        Predef.type_bool );
+                    facade_value ~at
+                      ("published", [ access_field.owner_type ], Predef.type_bool);
+                    facade_value ~at
+                      ("visible", [ event; access_field.owner_type ], Predef.type_bool);
+                    facade_value ~at
+                      ("covered", [ view; access_field.owner_type ], Predef.type_bool);
+                    facade_value ~at ("publish", [ access_field.owner_type ], event);
+                    facade_value ~at ("release", [ access_field.owner_type ], view);
+                    facade_value ~at
+                      ("acquire", [ access_field.owner_type; view ], Predef.type_unit);
+                    facade_value ~at
+                      ("adopt", [ access_field.owner_type ], Predef.type_unit);
+                    facade_value ~at
+                      ( "transfer",
+                        [ event; event; access_field.owner_type ],
+                        Predef.type_unit );
+                    facade_value ~at
+                      ( "observed",
+                        [ access_field.owner_type; event; access_field.value_type ],
+                        Predef.type_bool );
+                    facade_value ~at ("snapshot", [ access_field.owner_type ], snapshot);
+                    facade_value ~at
+                      ( "observe",
+                        [ access_field.owner_type; access_field.value_type ],
+                        event );
+                    facade_value ~at
+                      ( "reconcile",
+                        [ access_field.owner_type; event; access_field.value_type ],
+                        Predef.type_unit );
+                    facade_value ~at
+                      ( "duplicate",
+                        [ access_field.owner_type; event; access_field.value_type ],
+                        Predef.type_unit );
+                  ]
+            in
+            let module_id = Ident.create_local access_name.pid_str in
+            let env = Env.add_module module_id Mp_present (Mty_signature values) env in
+            Ok (env, descriptors, resources, fields)
         | Proof_field { field_name = name; field_type } ->
             let at = name.pid_loc in
             let* () =
@@ -1755,7 +1928,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
           List.filter_map declarations ~f:(fun entry ->
               match entry.declaration with
               | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
-              | Proof_au _ | Proof_task _ ->
+              | Proof_au _ | Proof_task _ | Proof_access_field _ ->
                   Some entry.declaration
               | _ -> None)
         in
@@ -1774,7 +1947,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
               | _ :: _ ->
                   List.for_all proof ~f:(function
                     | S.Proof_type _ | Proof_function _ | Proof_resource _ | Proof_field _
-                    | Proof_au _ | Proof_task _ ->
+                    | Proof_au _ | Proof_task _ | Proof_access_field _ ->
                         true
                     | _ -> false)
               | [] -> false
@@ -1809,6 +1982,7 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
             | Proof_field { field_name; _ } -> Some field_name.pid_str
             | Proof_au { au_name; _ } -> Some au_name.pid_str
             | Proof_task { task_name; _ } -> Some task_name.pid_str
+            | Proof_access_field { access_name; _ } -> Some access_name.pid_str
             | _ -> None)
         in
         let without_shadowed bindings =
@@ -2020,11 +2194,28 @@ let scoped_proof_types ?only ?only_ids ?public_interface ?(previous_resources = 
                   match parameters with
                   | Some parameters -> Some (declared_type parameters boolean)
                   | None ->
-                      List.find_map local ~f:(function
-                        | Types.Sig_value (id, value, _)
-                          when String.equal (Ident.name id) name ->
-                            Some value.val_type
-                        | _ -> None)
+                      begin match actual_declaration with
+                      | Some (S.Proof_lemma { lemma_params; lemma_returns; _ }) ->
+                          let result =
+                            match lemma_returns with
+                            | [] ->
+                                Ast_helper.Typ.constr ~loc:at
+                                  { txt = Lident "unit"; loc = at }
+                                  []
+                            | [ (_, typ) ] -> core_type ~at typ
+                            | outputs ->
+                                Ast_helper.Typ.tuple ~loc:at
+                                  (List.map outputs ~f:(fun (_, typ) ->
+                                       (None, core_type ~at typ)))
+                          in
+                          Some (declared_type lemma_params result)
+                      | _ ->
+                          List.find_map local ~f:(function
+                            | Types.Sig_value (id, value, _)
+                              when String.equal (Ident.name id) name ->
+                                Some value.val_type
+                            | _ -> None)
+                      end
                 in
                 match actual with
                 | None

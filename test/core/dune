@@ -118,3 +118,57 @@
  (name domain_contract)
  (modules domain_contract)
  (libraries caravan_core raven-ivl.api))
+
+(test
+ (name visibility_contract)
+ (modules visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name domain_visibility_contract)
+ (modules domain_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name shared_field_selectors)
+ (modules shared_field_selectors)
+ (libraries base caravan_core caravan_spec compiler-libs.common)
+ (deps
+  shared_fields_fixture.ml
+  shared_fields_fixture.proof
+  shared_fields_alias_conflict_fixture.ml
+  shared_fields_alias_conflict_fixture.proof
+  shared_fields_alias_duplicate_fixture.ml
+  shared_fields_alias_duplicate_fixture.proof
+  ../translate/field_disciplines/partial.ml
+  ../translate/field_disciplines/partial.proof))
+
+(test
+ (name atomic_visibility_contract)
+ (modules atomic_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name frozen_visibility_contract)
+ (modules frozen_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name field_disciplines)
+ (modules field_disciplines)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name mutex_visibility_contract)
+ (modules mutex_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name generic_parameters)
+ (modules generic_parameters)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name relaxed_fields_contract)
+ (modules relaxed_fields_contract)
+ (libraries base caravan_core raven-ivl.api))

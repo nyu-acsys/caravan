@@ -49,6 +49,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     scopes
   in
   let mutex_execution = Mutex_execution.enabled scopes.source.proof_resources in
+  let visibility_execution = Source.visibility_required scopes.source in
   let declaration_context =
     Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
       ~unapplied_proofs:scopes.unapplied_proofs
@@ -481,7 +482,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         ~primitive_namespace ~generic_predicates ()
     in
     let* ctx = enrich_predicates ctx own_preds in
-    let ctx = { ctx with given = { ctx.given with mutex_execution } } in
+    let ctx =
+      { ctx with given = { ctx.given with mutex_execution; visibility_execution } }
+    in
     let ctx = operation_context ~abstract ~primitive_namespace operation ctx in
     let predicates q =
       let env =
@@ -689,7 +692,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                      let actual_ctx =
                        {
                          actual_ctx with
-                         given = { actual_ctx.given with mutex_execution };
+                         given =
+                           { actual_ctx.given with mutex_execution; visibility_execution };
                        }
                      in
                      let worker =
@@ -1065,6 +1069,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             State.of_result
               (Generic_predicates.discover
                  ~expand:(Datatypes.expand view.view_types)
+                 ~project:(Datatypes.representation_arguments view.view_types)
                  ~key:target ~name:(resource_worker_name target) ~at
                  ~explicit:(List.length parameter_types - implicit)
                  parameter_types)
@@ -1108,7 +1113,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     State.of_result
                       (Generic_predicates.instantiate ~environment
                          ~opaque:(Datatypes.is_opaque types)
-                         ~expand:(Datatypes.expand types) ~at actual
+                         ~expand:(Datatypes.expand types)
+                         ~project:(Datatypes.representation_arguments types)
+                         ~at actual
                          (List.map parameter_types ~f:Option.some))
                   in
                   let+ instance =
@@ -1192,16 +1199,37 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             match declaration.Typedtree.typ_manifest with
             | None when Generic_type_families.arity declaration > 0 ->
                 if aliases then
-                  let checked =
-                    List.find_exn checked_modules ~f:(fun checked ->
-                        phys_equal checked.Checked_modules.binding view.view_binding)
+                  let forwarding =
+                    Option.bind
+                      (Datatypes.find view.view_types
+                         (Subst.type_path view.view_binding.parameter_substitution
+                            (Path.Pdot (view.view_binding.actual_path, member_name))))
+                      ~f:(fun data ->
+                        Option.bind data.family ~f:(fun family ->
+                            Option.some_if
+                              (String.equal family.member "Carrier"
+                              && String.equal family.dictionary "Self"
+                              && Option.is_none family.argument_projection)
+                              family.worker))
                   in
-                  let owner = String.split checked.name ~on:'.' in
-                  let+ member =
-                    make_type_constructor_factory ~owner ~types:view.view_types ~name:stem
-                      declaration
-                  in
-                  Some member
+                  begin match forwarding with
+                  | Some target ->
+                      State.return
+                        (Some
+                           (R.Member.alias ~loc:l (ident ~loc:l stem)
+                              (qualified_name ~loc:l target)))
+                  | None ->
+                      let checked =
+                        List.find_exn checked_modules ~f:(fun checked ->
+                            phys_equal checked.Checked_modules.binding view.view_binding)
+                      in
+                      let owner = String.split checked.name ~on:'.' in
+                      let+ member =
+                        make_type_constructor_factory ~owner ~types:view.view_types
+                          ~name:stem declaration
+                      in
+                      Some member
+                  end
                 else
                   let target =
                     Option.value_map group.world
@@ -1354,6 +1382,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
             let view = symbolic_view group (String.split group.interface ~on:'.') in
             let* types = type_members group view ~aliases:false in
             let* resources = resource_members group view ~aliases:false in
+            let* frozen_fields =
+              State.of_result
+                (Frozen_parameters.members decls.frozen_parameters
+                   ~fields:decls.frozen_fields ~group ~inventory ~types:decls.types
+                   ~binding:view.view_binding ~aliases:false ())
+            in
             let* ghost_modules =
               State.of_result
                 (ghost_module_members ~aliases:false group.representative.argument)
@@ -1430,8 +1464,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               @ [
                   R.Member.module_ ~loc:l ~interface:true
                     (ident ~loc:l (Qualified_name.of_string group.interface).name)
-                    (types @ domains @ resources @ ghost_modules @ instances
-                   @ List.concat operations);
+                    (types @ domains @ resources @ frozen_fields @ ghost_modules
+                   @ instances @ List.concat operations);
                 ])))
   in
   let generic_interfaces = List.map generic_interfaces ~f:List.concat in
@@ -1496,13 +1530,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                     in
                     let* types = type_members group concrete ~aliases:true in
                     let* resources = resource_members group concrete ~aliases:true in
+                    let* frozen_fields =
+                      State.of_result
+                        (Frozen_parameters.members decls.frozen_parameters
+                           ~fields:decls.frozen_fields ~group ~inventory
+                           ~types:decls.types
+                           ~context:
+                             (Module_context.for_location scopes.module_contexts at)
+                           ~binding:view.binding ~aliases:true ())
+                    in
                     let* ghost_modules =
                       State.of_result (ghost_module_members ~aliases:true view.binding)
                     in
                     let+ support =
                       worker_support ~namespace:(String.split view.name ~on:'.') ~at ()
                     in
-                    ([], types @ support @ resources @ ghost_modules)
+                    ([], types @ support @ resources @ frozen_fields @ ghost_modules)
               in
               let* members =
                 State.all members ~f:(fun (operation, ctx, _, member) ->
@@ -1546,7 +1589,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                                 parameter.Module_inventory.argument.expected
                                   .signature_types ~f:(fun (member, declaration) ->
                                   if
-                                    Option.is_some declaration.Typedtree.typ_manifest
+                                    Generic_type_families.transparent declaration
+                                    || Option.is_some declaration.Typedtree.typ_manifest
                                     || Generic_type_families.arity declaration = 0
                                   then State.return []
                                   else
@@ -1858,6 +1902,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let* lemma_members, state =
     State.run_from state
     @@ State.all lemma_declarations ~f:(fun declaration ->
+        let open State.Syntax in
         let declaration_name = (Proof_scopes.name declaration).pid_str in
         let scope = declaration_scope declaration_name in
         let preds, spec_funcs, proof_support =
@@ -1866,6 +1911,99 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         let lemmas = lemma_context scope in
         let lemmas =
           module_lemmas (declaration_context declaration_name) ~project:Fn.id lemmas
+        in
+        let* declaration, lemmas, preds, spec_funcs =
+          match
+            ( declaration,
+              scoped_binding declaration_name,
+              callable_worker declaration_name )
+          with
+          | S.Proof_lemma lemma, Some binding, Some worker ->
+              begin match
+                Program_scopes.definition_resource ~source binding.entry.scope
+              with
+              | Some resource when Program_scopes.resource_has_required_lemma resource ->
+                  begin match
+                    ( Generic_assets.resource_worker resource,
+                      scopes.implementation resource )
+                  with
+                  | Some family, Some implementation ->
+                      let* signature =
+                        State.of_result
+                          (Report.expect ~at:lemma.lemma_name.pid_loc
+                             "The resource lemma signature"
+                             (List.Assoc.find lemmas declaration_name ~equal:String.equal))
+                      in
+                      let target = Fresh_names.fresh "resource_lemma" in
+                      let* variables =
+                        State.of_result
+                          (Generic_assets.infer_protected_arguments ~types
+                             ~environment:(declaration_environment declaration_name)
+                             ~at:lemma.lemma_name.pid_loc proof_support.resources resource
+                             worker.parameters)
+                      in
+                      let context_types = Generic_parameters.types worker types in
+                      let ctx =
+                        Proof_declarations.spec_context context_types ~shared
+                          ~ocaml_env:(declaration_environment declaration_name)
+                          ~preds ~spec_funcs
+                          ~primitive_namespace:(callable_namespace declaration_name)
+                          ~proof_support ~generic_predicates ()
+                      in
+                      let* instance =
+                        if
+                          String.equal family.name
+                            (String.concat ~sep:"." (callable_namespace declaration_name))
+                        then State.return family.name
+                        else
+                          State.value_instance ctx ~at:lemma.lemma_name.pid_loc
+                            ~target:family.name ~arguments:variables
+                      in
+                      let project target =
+                        if String.is_prefix target ~prefix:(implementation ^ ".") then
+                          instance ^ "." ^ target
+                        else target
+                      in
+                      let preds =
+                        List.map preds ~f:(fun (key, (target, parameters)) ->
+                            (key, (project target, parameters)))
+                      in
+                      let spec_funcs =
+                        List.map spec_funcs ~f:(fun (key, target) ->
+                            (key, project target))
+                      in
+                      let signature =
+                        {
+                          signature with
+                          lemma_raven =
+                            instance ^ "." ^ implementation ^ "."
+                            ^ binding.entry.name.pid_str;
+                          lemma_generic = None;
+                        }
+                      in
+                      let at = lemma.lemma_name.pid_loc in
+                      let term term_desc = { S.term_desc; term_loc = at } in
+                      let variable id = term (S.Tvar (S.Qid id)) in
+                      let call =
+                        List.fold lemma.lemma_params
+                          ~init:(variable (S.mk_id ~loc:at target))
+                          ~f:(fun call (id, _) -> term (S.Tapply (call, variable id)))
+                      in
+                      State.return
+                        ( S.Proof_lemma
+                            {
+                              lemma with
+                              lemma_body =
+                                { S.proof_desc = S.Proof_value call; proof_loc = at };
+                            },
+                          (target, signature) :: lemmas,
+                          preds,
+                          spec_funcs )
+                  | _ -> State.return (declaration, lemmas, preds, spec_funcs)
+                  end
+              | _ -> State.return (declaration, lemmas, preds, spec_funcs)
+              end
+          | _ -> State.return (declaration, lemmas, preds, spec_funcs)
         in
         proof_lemma types ~shared
           ~polymorphic_functions:
@@ -2330,7 +2468,11 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 logical_definition = false;
               }
             in
-            let* scheme = Polymorphic_functions.discover ~at:f.loc f.scheme_type in
+            let* scheme =
+              Polymorphic_functions.discover ~expand:(Datatypes.expand data)
+                ~project:(Datatypes.representation_arguments data)
+                ~at:f.loc f.scheme_type
+            in
             Ok
               ( f.id,
                 Domain_calls.
@@ -2493,6 +2635,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         with
         functions;
         mutex_execution;
+        visibility_execution;
         lifted;
         pasts;
         past_returns;

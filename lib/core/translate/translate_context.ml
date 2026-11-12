@@ -687,7 +687,7 @@ type atomic_universal = {
 
 type atomic_signature = {
   au_key : string;
-  au_context : bool;
+  au_context : Execution_contract.context_layout;
   au_generic : Generic_parameters.t option;
   au_owner : Path.t option;
   au_private : atomic_shape;
@@ -757,7 +757,22 @@ let map_atomic_types signature ~f =
   in
   run schema ~f
 
+type field_encoding =
+  | Ordinary_storage
+  | Immutable_storage of string
+  | Frozen_storage of string
+  | Relaxed_storage of string
+
 type proof_support = {
+  visibility_enabled : bool;
+  access_fields : Access_fields.t list;
+  field_encoding :
+    types:Datatypes.t list ->
+    namespace:string list ->
+    at:Location.t ->
+    owner:Types.type_expr ->
+    label:string ->
+    (field_encoding, error) Result.t;
   execution_context_path : Path.t option;
   runtime_functions : Qualified_name.t Path_bindings.t;
   predicate_views : string Path_bindings.t;
@@ -779,6 +794,10 @@ type proof_support = {
 
 let empty_proof_support =
   {
+    visibility_enabled = false;
+    access_fields = [];
+    field_encoding =
+      (fun ~types:_ ~namespace:_ ~at:_ ~owner:_ ~label:_ -> Ok Ordinary_storage);
     execution_context_path = None;
     runtime_functions = Path_bindings.empty;
     predicate_views = Path_bindings.empty;
@@ -1184,6 +1203,7 @@ type inputs = {
       (** Entry-context bindings in preconditions, rather than spatial context ownership.
       *)
   mutex_execution : bool;
+  visibility_execution : bool;
   execution_owner : R.Expr.t option;
   execution_entry_held : R.Expr.t option;
   manual : bool;
@@ -1228,6 +1248,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     execution_types = [];
     execution_contract = false;
     mutex_execution = false;
+    visibility_execution = false;
     execution_owner = None;
     execution_entry_held = None;
     manual = false;
@@ -1253,6 +1274,13 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
 let value_spec ctx ~loc typ variable =
   Option.map
     (Datatypes.admissible ~loc ctx.given.types typ (R.Expr.var ~loc (name ~loc variable)))
+    ~f:R.Spec.make
+
+(** Source results satisfy every choice of their universally quantified row indices. *)
+let result_spec ctx ~loc typ variable =
+  Option.map
+    (Datatypes.result_admissible ~loc ctx.given.types typ
+       (R.Expr.var ~loc (name ~loc variable)))
     ~f:R.Spec.make
 
 (** That [variable], the parameter at [position] of the function [id], is the tag of the
@@ -1327,6 +1355,43 @@ let source_type ?expected (given : inputs) ~at annotation =
       Ok expected
 
 (** The explicit state, with the operations that use a context's inputs. *)
+let execution_profile (given : inputs) =
+  Execution_contract.profile ~mutex:given.mutex_execution
+    ~visibility:given.visibility_execution
+
+let execution_enabled given = Execution_contract.enabled (execution_profile given)
+
+let visibility_view_type (given : inputs) ~at =
+  Source.ocaml_type given.env ~at
+    (S.PTtyapp
+       ( Qid (S.mk_id ~loc:at "set"),
+         [ PTtyapp (Qdot (Qid (S.mk_id ~loc:at "Ghost"), S.mk_id ~loc:at "t"), []) ] ))
+
+let visibility_encoding (given : inputs) =
+  given.visibility_execution || given.proof_support.visibility_enabled
+
+(** Generic alias structure prevents metadata queries from lowering source binders. *)
+let source_field_type_given (given : inputs) t label =
+  try
+    match
+      Types.get_desc (Ctype.expand_head given.env (Compiler_types.scheme_structure t))
+    with
+    | Tconstr (path, [ element ], _)
+      when Datatypes.is_atomic path && String.is_empty label ->
+        Some element
+    | Tconstr (path, args, _) -> (
+        let declaration = Env.find_type path given.env in
+        match declaration.type_kind with
+        | Type_record (fields, _) ->
+            Option.map
+              (List.find fields ~f:(fun field ->
+                   String.equal (Ident.name field.Types.ld_id) label))
+              ~f:(fun field ->
+                Ctype.apply given.env declaration.type_params field.ld_type args)
+        | _ -> None)
+    | _ -> None
+  with Stdlib.Not_found -> None
+
 module State = struct
   include State_monad
 
@@ -1359,21 +1424,26 @@ module State = struct
     modify (fun state ->
         { state with tables = { state.tables with mutex_support = true } })
 
-  let execution_arguments_for ~at owner =
-    let l = loc at in
-    let* held = fresh "caravan$call_held" in
-    let value = R.Expr.var ~loc:l (name ~loc:l held) in
-    return
-      ( R.Stmt.local ~loc:l ~ghost:true
-          ~typ:(Mutex_contract.held_set_type ~loc:l)
-          ~init:(R.Stmt.expr_rhs (Mutex_contract.snapshot ~loc:l owner))
-          (ident ~loc:l held),
-        [ owner; value ] )
+  let execution_arguments_for ~profile ~at owner =
+    match Execution_contract.layout profile with
+    | No_context -> return ([], [])
+    | Owner -> return ([], [ owner ])
+    | Owner_and_held ->
+        let l = loc at in
+        let* held = fresh "caravan$call_held" in
+        let value = R.Expr.var ~loc:l (name ~loc:l held) in
+        return
+          ( R.Stmt.local ~loc:l ~ghost:true
+              ~typ:(Execution_contract.held_set_type ~loc:l)
+              ~init:(R.Stmt.expr_rhs (Execution_contract.snapshot ~loc:l owner))
+              (ident ~loc:l held),
+            [ owner; value ] )
 
   let execution_arguments ctx ~at =
     match ctx.given.execution_owner with
     | None -> of_result (error at "This operation needs a native execution context")
-    | Some owner -> execution_arguments_for ~at owner
+    | Some owner ->
+        execution_arguments_for ~profile:(execution_profile ctx.given) ~at owner
 
   (** The value dictionaries of the types [arguments], requested for declaration. *)
   let dictionaries_given (given : inputs) ~at arguments =
@@ -1512,8 +1582,9 @@ module State = struct
     | Some ({ witness = Some witness; _ } as worker) ->
         let* arguments =
           of_result
-            (Polymorphic_functions.instantiate_worker ~expand ~at worker ~declaration
-               ~occurrence)
+            (Polymorphic_functions.instantiate_worker ~expand
+               ~project:(Datatypes.representation_arguments ctx.given.types)
+               ~at worker ~declaration ~occurrence)
         in
         let stem = (Qualified_name.of_string target).name in
         let* value =
@@ -1544,8 +1615,9 @@ module State = struct
     | Some worker ->
         let* arguments =
           of_result
-            (Polymorphic_functions.instantiate_worker ~expand ~at worker ~declaration
-               ~occurrence)
+            (Polymorphic_functions.instantiate_worker ~expand
+               ~project:(Datatypes.representation_arguments ctx.given.types)
+               ~at worker ~declaration ~occurrence)
         in
         let stem = (Qualified_name.of_string target).name in
         let recursive =
@@ -1586,7 +1658,16 @@ module State = struct
   let ref_field given ~at elt = cell_field given ~at elt "ref_contents"
 
   (** The field of atomics with contents of type [elt]. *)
-  let atomic_field given ~at elt = cell_field given ~at elt "atomic"
+  let visibility_atomic (given : inputs) ~at elt =
+    value_instance_given given ~at
+      ~target:(Execution_contract.module_name ^ ".Atomic")
+      ~arguments:[ elt ]
+
+  let atomic_field (given : inputs) ~at elt =
+    if visibility_encoding given then
+      let+ family = visibility_atomic given ~at elt in
+      family ^ ".contents"
+    else cell_field given ~at elt "atomic"
 
   let primitive_name key base =
     let path name = Datatypes.framed (String.split name ~on:'.') in
@@ -1657,9 +1738,21 @@ module State = struct
       String.concat ~sep:"." (given.primitive_namespace @ [ declaration_name ])
     in
     let* typ = of_result (Datatypes.typ given.types ~at elt) in
-    add_primitive ~namespace:given.primitive_namespace ~key ~base (fun declaration_name ->
-        Primitives.proc ~declaration_name ~field ~typ ~exact:key.exact ~int:key.bounded
-          ?admissibility:key.admissibility op)
+    if given.visibility_execution then
+      let* family = visibility_atomic given ~at elt in
+      begin match op with
+      | Primitives.Compare_and_set -> return (family ^ ".compare_and_set")
+      | Exchange -> return (family ^ ".exchange")
+      | Fetch_and_add ->
+          add_primitive ~namespace:given.primitive_namespace ~key ~base
+            (fun declaration_name ->
+              Primitives.visibility_fetch_add ~declaration_name ~family)
+      end
+    else
+      add_primitive ~namespace:given.primitive_namespace ~key ~base
+        (fun declaration_name ->
+          Primitives.proc ~declaration_name ~field ~typ ~exact:key.exact ~int:key.bounded
+            ?admissibility:key.admissibility op)
 
   (** The ordinary read or write of a mutable field. *)
   let ordinary_primitive (given : inputs) ~at ~field elt op =
@@ -1689,26 +1782,80 @@ module State = struct
       instance ^ ".value"
     else return field.raven_field
 
+  let shared_field (given : inputs) ~at owner label =
+    let* encoding =
+      of_result
+        (given.proof_support.field_encoding ~types:given.types
+           ~namespace:given.primitive_namespace ~at ~owner ~label)
+    in
+    match encoding with
+    | Ordinary_storage -> return None
+    | Immutable_storage tag | Frozen_storage tag | Relaxed_storage tag ->
+        let payload =
+          Option.first_some
+            (Option.bind (Datatypes.instantiated given.types owner) ~f:(fun data ->
+                 Option.map
+                   (List.find (Datatypes.all_fields data) ~f:(fun field ->
+                        String.equal field.Datatypes.label label))
+                   ~f:(fun field -> field.typ)))
+            (source_field_type_given given owner label)
+        in
+        let* payload =
+          of_result (Report.expect ~at "The stored type of a shared field" payload)
+        in
+        let target =
+          match encoding with
+          | Immutable_storage _ -> Immutable_fields_contract.module_name
+          | Frozen_storage _ -> Execution_contract.module_name ^ ".Frozen"
+          | Relaxed_storage _ -> Relaxed_fields_contract.module_name
+          | Ordinary_storage -> assert false
+        in
+        let* dictionaries = dictionaries_given given ~at [ payload ] in
+        let+ instance =
+          instance_given given ~target ~dictionaries:(tag :: dictionaries)
+        in
+        Some (encoding, instance)
+
+  let frozen_field given ~at owner label =
+    let* field = shared_field given ~at owner label in
+    match field with
+    | None | Some ((Ordinary_storage | Immutable_storage _), _) -> return None
+    | Some (Frozen_storage _, family) -> return (Some family)
+    | Some (Relaxed_storage _, _) ->
+        of_result
+          (error at "A Relaxed field uses its facade's state predicate instead of own")
+
+  let relaxed_field given ~at owner label =
+    let+ field = shared_field given ~at owner label in
+    match field with
+    | Some (Relaxed_storage _, family) -> Some family
+    | None | Some ((Ordinary_storage | Immutable_storage _ | Frozen_storage _), _) -> None
+
   (** Resolve storage from an occurrence, retaining its declaration's field identity. *)
   let field_of_type (given : inputs) ~at (t : Types.type_expr) label =
-    match Datatypes.desc given.types t with
-    | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents" ->
-        let+ field = ref_field given ~at elt in
-        Some field
-    | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
-        let+ field = atomic_field given ~at elt in
-        Some field
-    | _ ->
-        begin match Datatypes.instantiated given.types t with
-        | Some { heap = Some fields; _ } ->
-            begin match List.find fields ~f:(fun f -> String.equal f.label label) with
-            | None -> return None
-            | Some field ->
-                let+ field = record_field given ~at field in
-                Some field
-            end
-        | Some _ | None -> return None
-        end
+    let* shared = shared_field given ~at t label in
+    match shared with
+    | Some (_, family) -> return (Some (family ^ ".contents"))
+    | None -> (
+        match Datatypes.desc given.types t with
+        | Tconstr (p, [ elt ], _) when Datatypes.is_ref p && String.equal label "contents"
+          ->
+            let+ field = ref_field given ~at elt in
+            Some field
+        | Tconstr (p, [ elt ], _) when Datatypes.is_atomic p && String.is_empty label ->
+            let+ field = atomic_field given ~at elt in
+            Some field
+        | _ ->
+            begin match Datatypes.instantiated given.types t with
+            | Some { heap = Some fields; _ } ->
+                begin match List.find fields ~f:(fun f -> String.equal f.label label) with
+                | None -> return None
+                | Some field ->
+                    let+ field = record_field given ~at field in
+                    Some field
+                end
+            | Some _ | None -> return None
+            end)
 
   (** The field of this record occurrence, and whether access reads the heap. *)
   let field_of_label (given : inputs) ~at ~record_type
@@ -1722,26 +1869,129 @@ module State = struct
         | Some _ | None -> None
         end
 
-  let ordinary_read ?guard (given : inputs) ~at ~field ~elt r =
+  let require_memory_encoding (given : inputs) ~at operation =
+    if not given.visibility_execution then return ()
+    else
+      of_result
+        (Error
+           (Report.error Unsupported at
+              ("Shared-field memory encoding is not yet supported for " ^ operation)))
+
+  let shared_storage (given : inputs) ~worker field =
+    if not given.visibility_execution then return None
+    else
+      gets (fun state ->
+          List.find_map state.tables.function_instances ~f:(fun instance ->
+              let family =
+                String.concat ~sep:"."
+                  (instance.instance_namespace @ [ instance.instance_name ])
+              in
+              Option.some_if
+                (String.equal instance.instance_worker worker
+                && String.equal field (family ^ ".contents"))
+                family))
+
+  let frozen_storage given field =
+    shared_storage given ~worker:(Execution_contract.module_name ^ ".Frozen") field
+
+  let relaxed_storage given field =
+    shared_storage given ~worker:Relaxed_fields_contract.module_name field
+
+  let owner (given : inputs) ~at =
+    match given.execution_owner with
+    | Some owner -> return owner
+    | None -> of_result (error at "This field access needs an execution context")
+
+  let ordinary_read ?guard ?(immutable = false) ?(frozen = false) ?(published = false)
+      (given : inputs) ~at ~field ~elt r =
     let l = loc at in
-    let* proc = ordinary_primitive given ~at ~field elt Primitives.Read in
-    let* typ = of_result (Datatypes.typ given.types ~at elt) in
-    let+ x = fresh "tmp" in
-    let value = R.Expr.var ~loc:l (name ~loc:l x) in
-    let rhs = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r ]) in
-    let access =
-      match guard with
-      | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
-      | Some condition ->
-          R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
-          @ [ R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [] ]
+    let* relaxed = relaxed_storage given field in
+    let* family = frozen_storage given field in
+    let* proc, arguments =
+      match (relaxed, family) with
+      | Some _, _ when frozen ->
+          of_result (error at "Ghost.frozen_scope requires a Frozen field")
+      | Some family, _ when published ->
+          let+ owner = owner given ~at in
+          (family ^ ".read_published", [ owner; r ])
+      | Some family, _ -> return (family ^ ".read", [ r ])
+      | None, _ when published ->
+          of_result (error at "Ghost.published_scope requires a Relaxed field")
+      | None, Some family ->
+          let+ owner = owner given ~at in
+          ((family ^ if frozen then ".read_frozen" else ".read_private"), [ owner; r ])
+      | None, None when frozen ->
+          of_result (error at "Ghost.frozen_scope requires a Frozen field")
+      | None, None ->
+          let* () =
+            if immutable then return ()
+            else require_memory_encoding given ~at "ordinary field reads"
+          in
+          let operation =
+            if immutable then Primitives.Read_immutable else Primitives.Read
+          in
+          let+ proc = ordinary_primitive given ~at ~field elt operation in
+          (proc, [ r ])
     in
-    (access, value)
+    let* typ = of_result (Datatypes.typ given.types ~at elt) in
+    let* x = fresh "tmp" in
+    let value = R.Expr.var ~loc:l (name ~loc:l x) in
+    let rhs =
+      R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l proc) arguments)
+    in
+    let* access =
+      match relaxed with
+      | Some _ -> (
+          let+ event = fresh "relaxed_event" in
+          let event_value = R.Expr.var ~loc:l (name ~loc:l event) in
+          let declarations =
+            R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+            @ R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.ref ~loc:l)
+                (ident ~loc:l event)
+          in
+          let read = R.Stmt.assign ~loc:l [ value; event_value ] rhs in
+          declarations
+          @
+          match guard with
+          | None -> [ read ]
+          | Some condition -> [ R.Stmt.if_ ~loc:l condition [ read ] [] ])
+      | None ->
+          return
+            (match guard with
+            | None -> R.Stmt.local ~loc:l ~typ ~init:rhs (ident ~loc:l x)
+            | Some condition ->
+                R.Stmt.local ~loc:l ~typ (ident ~loc:l x)
+                @ [
+                    R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [];
+                  ])
+    in
+    return (access, value)
 
   let ordinary_write (given : inputs) ~at ~field ~elt r v =
     let l = loc at in
-    let+ proc = ordinary_primitive given ~at ~field elt Primitives.Write in
-    R.Stmt.call ~loc:l (R.Expr.call ~loc:l (qualified_name ~loc:l proc) [ r; v ])
+    let* relaxed = relaxed_storage given field in
+    let* frozen = frozen_storage given field in
+    let* proc, arguments =
+      match (relaxed, frozen) with
+      | Some family, _ ->
+          let+ owner = owner given ~at in
+          (family ^ ".write", [ owner; r; v ])
+      | None, Some family ->
+          let+ owner = owner given ~at in
+          (family ^ ".write", [ owner; r; v ])
+      | None, None ->
+          let* () = require_memory_encoding given ~at "ordinary field writes" in
+          let+ proc = ordinary_primitive given ~at ~field elt Primitives.Write in
+          (proc, [ r; v ])
+    in
+    let call = R.Expr.call ~loc:l (qualified_name ~loc:l proc) arguments in
+    match relaxed with
+    | Some _ ->
+        let+ event = fresh "relaxed_event" in
+        let target = R.Expr.var ~loc:l (name ~loc:l event) in
+        R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.ref ~loc:l) (ident ~loc:l event)
+        @ [ R.Stmt.assign ~loc:l [ target ] (R.Stmt.expr_rhs call) ]
+    | None -> return [ R.Stmt.call ~loc:l call ]
 end
 
 (** The atomic that the field [label] of a value of the immutable record type [t] holds:
@@ -1783,35 +2033,23 @@ let backend_field_type ctx (t : Types.type_expr) label =
       | _ -> None)
 
 (** Uses the source declaration before expanding implementation aliases. *)
-let source_field_type ctx t label =
-  try
-    match Types.get_desc (Ctype.expand_head ctx.given.env t) with
-    | Tconstr (path, [ element ], _)
-      when Datatypes.is_atomic path && String.is_empty label ->
-        Some element
-    | Tconstr (path, args, _) -> (
-        let declaration = Env.find_type path ctx.given.env in
-        match declaration.type_kind with
-        | Type_record (fields, _) ->
-            Option.map
-              (List.find fields ~f:(fun field ->
-                   String.equal (Ident.name field.Types.ld_id) label))
-              ~f:(fun field ->
-                Ctype.apply ctx.given.env declaration.type_params field.ld_type args)
-        | _ -> None)
-    | _ -> None
-  with Stdlib.Not_found -> None
+let source_field_type ctx t label = source_field_type_given ctx.given t label
 
 let field_type ctx t label =
-  Option.map (backend_field_type ctx t label) ~f:(fun fallback ->
-      match source_field_type ctx t label with
-      | None -> fallback
-      | Some source ->
-          if Option.is_some (atomic_in_record ctx t label) then
-            match Types.get_desc (Ctype.expand_head ctx.given.env source) with
-            | Tconstr (path, [ element ], _) when Datatypes.is_atomic path -> element
-            | _ -> fallback
-          else source)
+  let fallback = backend_field_type ctx t label in
+  match (fallback, source_field_type ctx t label) with
+  | None, Some source
+    when Option.exists (Datatypes.instantiated ctx.given.types t) ~f:(fun data ->
+             Option.is_some data.heap) ->
+      Some source
+  | None, _ -> None
+  | Some fallback, None -> Some fallback
+  | Some fallback, Some source ->
+      if Option.is_some (atomic_in_record ctx t label) then
+        match Types.get_desc (Ctype.expand_head ctx.given.env source) with
+        | Tconstr (path, [ element ], _) when Datatypes.is_atomic path -> Some element
+        | _ -> Some fallback
+      else Some source
 
 let prelude_call ~loc:l f args = R.Expr.call ~loc:l (name ~loc:l f) args
 
@@ -2151,10 +2389,7 @@ let atomic_arguments ~loc:l ?raising ?raised_result signature method_ values =
   | token :: rest ->
       let inputs, outputs = List.split_n rest (List.length signature.au_inputs) in
       let token, context =
-        if signature.au_context then
-          ( R.Expr.tuple_get ~loc:l token 0,
-            [ R.Expr.tuple_get ~loc:l token 1; R.Expr.tuple_get ~loc:l token 2 ] )
-        else (token, [])
+        Execution_contract.token_context ~loc:l signature.au_context token
       in
       let inputs = R.Expr.tuple ~loc:l (inputs @ context) in
       if
@@ -2238,6 +2473,57 @@ let resource_operation ?(lemma = false) env = function
                   lemma_outputs = (if lemma && is_unit result then [] else [ result ]);
                 }))
   | Qid _ -> None
+
+(** Facade methods retain the compiler declaration identity through module aliases. *)
+let access_method env q =
+  match q with
+  | S.Qdot (_, member) when not (List.is_empty env.ctx.given.proof_support.access_fields)
+    ->
+      Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+          let declaration = Env.find_value path env.ctx.given.env in
+          Option.map
+            (List.find env.ctx.given.proof_support.access_fields ~f:(fun field ->
+                 let methods =
+                   match field.Access_fields.kind with
+                   | S.Frozen ->
+                       [
+                         "freeze";
+                         "snapshot";
+                         "split";
+                         "adopt";
+                         "release_private";
+                         "private_state";
+                         "frozen";
+                         "visible";
+                         "release";
+                         "observe";
+                         "covered";
+                         "transfer";
+                       ]
+                   | Relaxed ->
+                       [
+                         "state";
+                         "shared_state";
+                         "private_state";
+                         "published";
+                         "visible";
+                         "covered";
+                         "publish";
+                         "release";
+                         "acquire";
+                         "adopt";
+                         "transfer";
+                         "observed";
+                         "snapshot";
+                         "observe";
+                         "reconcile";
+                         "duplicate";
+                       ]
+                 in
+                 List.mem methods member.pid_str ~equal:String.equal
+                 && Declaration_scope.same_place field.at declaration.val_loc))
+            ~f:(fun field -> (field, member.pid_str)))
+  | _ -> None
 
 let logical_signature env q =
   let context_signature () =
@@ -2504,9 +2790,56 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
         let original = List.Assoc.find env.ctx.given.preds key ~equal:String.equal in
         match original with
         | None ->
-            Option.bind (logical_signature env q) ~f:(fun signature ->
-                if Option.is_none signature.lemma_generic then Some signature.lemma_inputs
-                else None)
+            begin match (access_method env q, arguments) with
+            | ( Some
+                  ( field,
+                    (( "frozen" | "visible" | "covered" | "state" | "shared_state"
+                     | "private_state" | "observed" | "published" ) as method_) ),
+                _ ) ->
+                let count =
+                  match field.Access_fields.kind with
+                  | S.Relaxed -> if String.equal method_ "private_state" then 2 else 1
+                  | S.Frozen ->
+                      if
+                        List.mem
+                          [ "visible"; "covered"; "private_state" ]
+                          method_ ~equal:String.equal
+                      then 2
+                      else 1
+                in
+                let partial =
+                  List.fold (List.take arguments count)
+                    ~init:S.{ term_desc = Tvar q; term_loc = at }
+                    ~f:(fun fn arg -> S.{ term_desc = Tapply (fn, arg); term_loc = at })
+                in
+                Option.bind (Source.value_path env.ctx.given.env q) ~f:(fun path ->
+                    let declaration = Env.find_value path env.ctx.given.env in
+                    let inputs, _ = Proof_types.function_arguments declaration.val_type in
+                    let variables =
+                      match (method_, arguments, inputs) with
+                      | ( ("visible" | "covered" | "private_state"),
+                          { S.term_desc = Tvar (Qid writer); _ } :: _,
+                          typ :: _ )
+                        when not
+                               (List.Assoc.mem env.var_types writer.pid_str
+                                  ~equal:String.equal) ->
+                          (writer.pid_str, typ) :: env.var_types
+                      | _ -> env.var_types
+                    in
+                    Option.map
+                      (Result.ok
+                         (Source.infer_logical_expression
+                            ~type_variables:(source_type_variables env.ctx.given)
+                            env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                            ~variables partial))
+                      ~f:(fun typ ->
+                        List.take inputs count @ fst (Proof_types.function_arguments typ)))
+            | _ ->
+                Option.bind (logical_signature env q) ~f:(fun signature ->
+                    if Option.is_none signature.lemma_generic then
+                      Some signature.lemma_inputs
+                    else None)
+            end
         | Some (target, parameters) -> (
             match
               Generic_predicates.find ~target env.ctx.given.generic_predicates key
@@ -2527,13 +2860,16 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
                 in
                 match
                   let* predicate =
-                    Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at
-                      predicate parameters
+                    Generic_parameters.rebind ~expand:(Datatypes.expand env.data)
+                      ~project:(Datatypes.representation_arguments env.data)
+                      ~at predicate parameters
                   in
                   let* actuals =
                     Generic_predicates.instantiate ~environment:env.ctx.given.env
                       ~opaque:(Datatypes.is_opaque env.data)
-                      ~expand:(Datatypes.expand env.data) ~at predicate actuals
+                      ~expand:(Datatypes.expand env.data)
+                      ~project:(Datatypes.representation_arguments env.data)
+                      ~at predicate actuals
                   in
                   Ok (Generic_predicates.parameter_types predicate actuals)
                 with
@@ -2541,8 +2877,40 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
                 | Error _ -> None)))
     |> List.map ~f:(fun (id, typ) -> (id.S.pid_str, typ))
   in
-  let owned = List.concat_map terms ~f:owned @ passed in
+  let rec writer_names (term : S.term) =
+    match spine term [] with
+    | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+        [ _; _; _; { term_desc = Tvar (Qid writer); _ } ] ) ->
+        [ writer.pid_str ]
+    | _ -> List.concat_map (subterms term) ~f:writer_names
+  in
+  let writers =
+    List.concat_map terms ~f:writer_names |> List.stable_dedup ~compare:String.compare
+  in
   let open State.Syntax in
+  let* writer_types =
+    if List.is_empty writers then State.return []
+    else
+      let+ typ = State.of_result (Source.ghost_type env.ctx.given.env ~at) in
+      List.map writers ~f:(fun writer -> (writer, typ))
+  in
+  let rec release_names (term : S.term) =
+    match spine term [] with
+    | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+        [ _; _; _; _; { term_desc = Tvar (Qid lower); _ } ] ) ->
+        [ lower.pid_str ]
+    | _ -> List.concat_map (subterms term) ~f:release_names
+  in
+  let releases =
+    List.concat_map terms ~f:release_names |> List.stable_dedup ~compare:String.compare
+  in
+  let* release_types =
+    if List.is_empty releases then State.return []
+    else
+      let+ typ = State.of_result (visibility_view_type env.ctx.given ~at) in
+      List.map releases ~f:(fun lower -> (lower, typ))
+  in
+  let owned = List.concat_map terms ~f:owned @ passed @ writer_types @ release_types in
   let+ typed =
     State.all free ~f:(fun x ->
         match List.Assoc.find owned x ~equal:String.equal with

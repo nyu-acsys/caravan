@@ -642,6 +642,56 @@ let library_proof_scopes ~runtime_env env libraries =
   in
   Ok (env, scopes, entries, List.rev libraries)
 
+(** Resolve field modes once across the source and its module proof scopes. *)
+let canonical_field_paths (scopes : Proof_scopes.t) =
+  let type_paths =
+    List.concat_map scopes.scopes ~f:(fun scope ->
+        List.concat_map scope.Proof_scopes.structure.str_items ~f:(fun item ->
+            match item.Typedtree.str_desc with
+            | Tstr_type (_, declarations) ->
+                List.map declarations ~f:(fun declaration ->
+                    let local = Path.Pident declaration.Typedtree.typ_id in
+                    let public =
+                      match scope.owner with
+                      | None -> local
+                      | Some owner -> Path.Pdot (owner, declaration.typ_name.txt)
+                    in
+                    (local, public))
+            | _ -> []))
+  in
+  let rec canonicalize = function
+    | Path.Pextra_ty (parent, extra) -> Path.Pextra_ty (canonicalize parent, extra)
+    | path ->
+        Proof_scopes.canonical_owner scopes
+          (Option.value (List.Assoc.find type_paths path ~equal:Path.same) ~default:path)
+  in
+  canonicalize
+
+let access_field_declarations ~canonicalize (scopes : Proof_scopes.t) =
+  let* fields =
+    Result.all
+      (List.filter_map scopes.declarations ~f:(fun entry ->
+           match entry.Proof_scopes.declaration with
+           | Proof_access_field
+               { access_name; access_kind; access_owner; access_selector } ->
+               Some
+                 (Access_fields.resolve ~environment:entry.scope.environment
+                    ~name:access_name ~kind:access_kind ~owner:access_owner
+                    ~selector:access_selector ~core_type)
+           | _ -> None))
+  in
+  let fields =
+    List.map fields ~f:(fun field ->
+        { field with Access_fields.record_path = canonicalize field.record_path })
+  in
+  let* () = Access_fields.validate_registry fields in
+  Ok fields
+
+let interface_field_disciplines ?owner (interface : interface) =
+  match interface.typed_signature with
+  | None -> Ok []
+  | Some signature -> Field_disciplines.collect_signature ?owner signature
+
 (** Parses and type-checks [file], in the environment of the standard library and the
     libraries in its directory and [include_dirs]. The front end reports errors by
     raising; they are returned here. *)
@@ -830,10 +880,15 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 resource_arguments = [];
               }
           in
+          let environment =
+            add_spec_bindings ~source_modules:(source_module_ids typed)
+              (specification_bindings runtime_env root_env)
+              parent.Proof_scopes.environment
+          in
           let* local_env, _, all_resources, _, _, _ =
             Proof_types.elaborate_proof_types ~add_standard:false ~allow_interfaces:true
-              ~family_parameters ~previous:([], resources, [], [], [])
-              parent.Proof_scopes.environment None [ declaration ]
+              ~family_parameters ~previous:([], resources, [], [], []) environment None
+              [ declaration ]
           in
           let* signatures = Proof_library.signatures module_name.pid_loc in
           let* selected =
@@ -962,7 +1017,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                       carrier_manifest arguments
                   | Tvar _ | Tunivar _ -> typ
                   | description ->
-                      Btype.newgenty (Btype.copy_type_desc refine description)
+                      Btype.newgenty (Compiler_types.map_desc refine description)
                 in
                 let signature =
                   List.map signature ~f:(function
@@ -1226,6 +1281,27 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                                   resource.resource_parameters);
                          }))
             in
+            let canonicalize = canonical_field_paths proof_scopes in
+            let* field_disciplines =
+              Field_disciplines.collect_structure ~canonicalize typed
+            in
+            let* public_fields =
+              match interface with
+              | None -> Ok []
+              | Some interface -> interface_field_disciplines interface
+            in
+            let* library_fields =
+              Result.all
+                (List.map libraries ~f:(fun library ->
+                     interface_field_disciplines ~owner:(Path.Pident library.library_id)
+                       library.library))
+            in
+            let signature_field_disciplines =
+              public_fields @ List.concat library_fields
+            in
+            let* proof_access_fields =
+              access_field_declarations ~canonicalize proof_scopes
+            in
             Ok
               {
                 file;
@@ -1244,6 +1320,9 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 proof_resources;
                 signature_resources;
                 proof_fields = proof_fields @ implicit_fields;
+                field_disciplines;
+                signature_field_disciplines;
+                proof_access_fields;
                 proof_aus = proof_aus @ implicit_aus;
                 proof_tasks = proof_tasks @ implicit_tasks;
                 proof_applications;
@@ -1309,7 +1388,7 @@ let ocaml_type ?(variables = []) ?(closed = true) (env : Env.t) ~(at : Location.
             ~default:typ
             ~f:(fun (_, _, variable) -> variable)
       | Tvar _ | Tunivar _ -> typ
-      | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
+      | desc -> Ctype.newty (Compiler_types.map_desc restore desc)
     in
     Ok (if List.is_empty aliases then typed.ctyp_type else restore typed.ctyp_type)
   with exn -> (
@@ -1784,7 +1863,7 @@ let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) 
                     (List.Assoc.find placeholders typ ~equal:Types.eq_type)
                     ~default:typ
               | Tunivar _ -> typ
-              | desc -> Ctype.newty (Btype.copy_type_desc freeze desc)
+              | desc -> Ctype.newty (Compiler_types.map_desc freeze desc)
               end
         in
         let env, annotation_aliases =
@@ -1817,7 +1896,7 @@ let typed_logical_expression ?(is_list = fun _ -> false) ?(type_variables = []) 
                     ~f:(fun (_, _, original) -> original)
               end
           | Tvar _ | Tunivar _ -> typ
-          | desc -> Ctype.newty (Btype.copy_type_desc restore desc)
+          | desc -> Ctype.newty (Compiler_types.map_desc restore desc)
         in
         let variables = List.map variables ~f:(fun (name, typ) -> (name, freeze typ)) in
         let expected = Option.map expected ~f:freeze in
@@ -1990,7 +2069,7 @@ let infer_ghost_bindings ?(flexible = []) env ~at ~parameters ~variables ~constr
     | None -> (
         match Types.get_desc typ with
         | Tvar _ | Tunivar _ -> typ
-        | desc -> Ctype.newty (Btype.copy_type_desc project desc))
+        | desc -> Ctype.newty (Compiler_types.map_desc project desc))
   in
   let parameters = List.map parameters ~f:project in
   let variables = List.map variables ~f:(fun (name, typ) -> (name, project typ)) in
@@ -2100,7 +2179,7 @@ let infer_ghost_bindings ?(flexible = []) env ~at ~parameters ~variables ~constr
           | None -> (
               match Types.get_desc typ with
               | Tvar _ | Tunivar _ -> typ
-              | desc -> Ctype.newty (Btype.copy_type_desc restore_native desc))
+              | desc -> Ctype.newty (Compiler_types.map_desc restore_native desc))
         in
         let ghosts = List.map ghosts ~f:restore_native in
         let solved_aliases = List.map solved_aliases ~f:restore_native in

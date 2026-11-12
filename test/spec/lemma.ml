@@ -349,3 +349,33 @@ let () =
   let ordinary = loop "invariant true" in
   assert (ordinary.state_invariants = []);
   assert (List.length ordinary.invariants = 1)
+
+let () =
+  begin match
+    parse_proof
+      {|lemma inferred = ()
+      lemma closed opens {} = ()
+      lemma opened (x : int) opens { cell x _; Other.state; } = ()|}
+  with
+  | [ Proof_lemma inferred; Proof_lemma closed; Proof_lemma opened ] ->
+      assert (inferred.lemma_opens = None);
+      begin match closed.lemma_opens with
+      | Some (_, []) -> ()
+      | _ -> failwith "empty opens clause was not retained"
+      end;
+      begin match opened.lemma_opens with
+      | Some (_, [ _; _ ]) -> ()
+      | _ -> failwith "opens entries were not retained"
+      end
+  | _ -> failwith "unexpected opens declarations"
+  end;
+  begin match parse_proof "lemma repeated opens {} opens {} = ()" with
+  | exception Syntax_error (_, "A lemma has at most one opens clause") -> ()
+  | _ -> failwith "repeated opens clauses were accepted"
+  end
+
+let () =
+  begin match parse_proof "lemma invalid opens { cell _ x } = ()" with
+  | exception Syntax_error (_, "Wildcards in an opens entry must be trailing") -> ()
+  | _ -> failwith "nontrailing opens wildcard was accepted"
+  end

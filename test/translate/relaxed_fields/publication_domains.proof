@@ -1,0 +1,31 @@
+module Capacity = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)
+
+invariant is_zero (cell : cell) =
+  exists current : int, all : (Ghost.t * int) set, eligible : (Ghost.t * int) set.
+    Capacity.shared_state cell current all eligible &&
+    (forall event : Ghost.t, value : int. Set.mem (event, value) eligible -> value = 0)
+
+proof result = create ()
+  ensures (is_zero result && Capacity.visible Ghost.self result) =
+  on return begin
+    let (event, all) = Capacity.snapshot cell in
+    let _cut = Capacity.publish cell in
+    fold is_zero cell {current = 0; all = all; eligible = Set.singleton (event, 0)}
+  end
+
+proof result = read cell
+  requires (is_zero cell && Capacity.visible Ghost.self cell)
+  ensures (is_zero cell && Capacity.visible Ghost.self cell && result === 0) =
+  at (cell.value) Ghost.published_scope (fun load ->
+    let (current, all, eligible) = unfold is_zero cell {current; all; eligible} in
+    let result = load () in
+    let event = Capacity.observe cell result in
+    assert (Set.mem (event, result) eligible);
+    assert (result === 0);
+    fold is_zero cell {current = current; all = all; eligible = eligible};
+    result)
+
+module Reader = Ghost.Task (struct let operation = read end)
+
+proof result = client () ensures (result === 0) = ()
+proof result = parent_keeps () ensures (result === 0) = ()

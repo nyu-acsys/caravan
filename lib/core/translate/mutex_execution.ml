@@ -1,25 +1,14 @@
-(** The hidden execution owner and entry holdings of a native procedure. *)
+(** Mutex contract clauses and selection of the native lock protocol. *)
 
 open Base
 module R = Raven_api
 
-let variable ~loc text = R.Expr.var ~loc (R.Name.make ~loc text)
-let arguments ~loc ~owner ~held = [ variable ~loc owner; variable ~loc held ]
-
-let context ~loc ~owner ~held =
-  Mutex_contract.execution_context ~loc (variable ~loc owner) (variable ~loc held)
-
-let formals ~loc ~owner ~held =
-  [
-    R.Var.make ~loc ~ghost:true (R.Ident.make ~loc owner) (R.Type.ref ~loc);
-    R.Var.make ~loc ~ghost:true (R.Ident.make ~loc held)
-      (Mutex_contract.held_set_type ~loc);
-  ]
-
 let enabled resources =
   List.exists resources ~f:(fun resource ->
       List.equal String.equal resource.Source_core.resource_functor
-        [ Mutex_contract.protocol_name ])
+        [ Mutex_contract.protocol_name ]
+      || List.equal String.equal resource.resource_functor
+           [ Mutex_visibility_contract.protocol_name ])
 
 let has_context ?trusted environment terms =
   List.exists
@@ -133,88 +122,14 @@ let validate_contract ?trusted environment
           ~init:()
           ~f:(fun () terms -> channel terms)
 
-type boundary = {
-  formals : R.Var.t list;
-  arguments : R.Expr.t list;
-  resources : R.Expr.t list;
-}
-
-let prepare_boundary (ctx : Translate_context.context) ~at contract =
-  let open Translate_context in
-  let open State.Syntax in
-  let* () =
-    State.of_result
-      (validate_contract ?trusted:ctx.given.proof_support.execution_context_path
-         ctx.given.env contract)
-  in
-  if not ctx.given.mutex_execution then
-    State.return (ctx, { formals = []; arguments = []; resources = [] })
-  else
-    let l = loc at in
-    let* owner = State.fresh "caravan$execution_self" in
-    let* held = State.fresh "caravan$execution_entry_held" in
-    let ctx =
-      {
-        ctx with
-        given =
-          {
-            ctx.given with
-            execution_owner = Some (variable ~loc:l owner);
-            execution_entry_held = Some (variable ~loc:l held);
-          };
-      }
-    in
-    State.return
-      ( ctx,
-        {
-          formals = formals ~loc:l ~owner ~held;
-          arguments = arguments ~loc:l ~owner ~held;
-          resources = [ context ~loc:l ~owner ~held ];
-        } )
-
-let entry_environment (env : Translate_context.env) =
-  {
-    env with
-    ctx = { env.ctx with given = { env.ctx.given with execution_contract = true } };
-  }
-
-let exit_resources (env : Translate_context.env) (boundary : boundary) ~at ~raising
-    contract =
-  let open Translate_context in
-  let open State.Syntax in
-  if List.is_empty boundary.resources then State.return []
-  else
-    let l = loc at in
-    let+ conditions =
-      State.all
-        (exit_defaults ?trusted:env.ctx.given.proof_support.execution_context_path
-           env.ctx.given.env ~at ~raising contract) ~f:(function
-        | None -> State.return None
-        | Some term -> State.map (Spec_terms.formula env term) ~f:Option.some)
-    in
-    match conditions with
-    | [] -> []
-    | _ ->
-        let condition =
-          if List.exists conditions ~f:Option.is_none then None
-          else List.reduce (List.filter_opt conditions) ~f:(R.Expr.binary ~loc:l Or)
-        in
-        List.map boundary.resources ~f:(fun context ->
-            match condition with
-            | None -> context
-            | Some condition -> R.Expr.binary ~loc:l Impl condition context)
-
-let call_arguments ~at (boundary : boundary) =
-  match boundary.arguments with
-  | [] -> Translate_context.State.return ([], [])
-  | owner :: _ -> Translate_context.State.execution_arguments_for ~at owner
-
 let protocol ~at ~environment resources =
   let open Translate_context in
   let protocols =
     List.filter resources ~f:(fun resource ->
         List.equal String.equal resource.Source.resource_functor
-          [ Mutex_contract.protocol_name ])
+          [ Mutex_contract.protocol_name ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_visibility_contract.protocol_name ])
   in
   let local =
     List.filter protocols ~f:(fun resource ->

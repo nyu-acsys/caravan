@@ -1,0 +1,76 @@
+// Thread identities are explicit model parameters; a source bridge fixes the executor.
+proc publisher_and_receiver()
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val cell := ThreadCounters.create(0);
+  ThreadCounters.write_private(cell, 1, 0);
+  ThreadCounters.write_private(cell, 42, 1);
+  val channel := ThreadCounters.publish(writer, cell, {}, 42);
+  val own_value := ThreadCounters.read_frozen(writer, cell, channel, {channel}, 42, {});
+  assert own_value == 42;
+  val observed := ThreadCounters.acquire(reader, channel, cell, {}, 42, {});
+  assert observed == cell;
+  val value := ThreadCounters.read_frozen(reader, cell, channel, {channel}, 42, {});
+  assert value == 42;
+  ThreadContext.duplicate_seen(writer, {channel});
+  ThreadContext.reconcile(writer, {channel}, {channel});
+  ThreadContext.reconcile(reader, {channel}, {channel});
+}
+
+// A second release carries the first acquisition to a third thread.
+proc transitive_acquisition()
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val writer := ThreadContext.create_thread();
+  val relay := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val cell := ThreadCounters.create(42);
+  val first := ThreadCounters.publish(writer, cell, {}, 42);
+  val observed := ThreadCounters.acquire(relay, first, cell, {}, 42, {});
+  val flag := ThreadCounters.create(1);
+  val second := ThreadCounters.publish(relay, flag, {first}, 1);
+  val observed_flag := ThreadCounters.acquire(reader, second, flag, {}, 1, {first});
+  val value := ThreadCounters.read_frozen(reader, cell, first, {first, second}, 42, {});
+  assert value == 42;
+}
+
+proc fork_inherits_visibility()
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val parent := ThreadContext.create_thread();
+  val cell := ThreadCounters.create(42);
+  val channel := ThreadCounters.publish(parent, cell, {}, 42);
+  val child := ThreadContext.fork_context(parent, {channel});
+  assert child != parent;
+  val value := ThreadCounters.read_frozen(child, cell, channel, {channel}, 42, {});
+  assert value == 42;
+}
+
+proc join_imports_visibility()
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val parent := ThreadContext.create_thread();
+  val child := ThreadContext.fork_context(parent, {});
+  val cell := ThreadCounters.create(42);
+  val channel := ThreadCounters.publish(child, cell, {}, 42);
+  ThreadContext.join_context(parent, child, {}, {channel});
+  val value := ThreadCounters.read_frozen(parent, cell, channel, {channel}, 42, {});
+  assert value == 42;
+}
+
+// Publication cuts carry visibility between different field-value families.
+proc cross_type_acquisition()
+  opens ThreadCounters.published, ThreadFlags.published, ThreadContext.released
+{
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val payload := ThreadCounters.create(42);
+  val first := ThreadCounters.publish(writer, payload, {}, 42);
+  val flag := ThreadFlags.create(true);
+  val second := ThreadFlags.publish(writer, flag, {first}, true);
+  val observed := ThreadFlags.acquire(reader, second, flag, {}, true, {first});
+  val value := ThreadCounters.read_frozen(reader, payload, first, {first, second}, 42, {});
+  assert value == 42;
+}

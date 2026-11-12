@@ -54,15 +54,19 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
   let instantiate_predicate ~at parameters actuals =
     let expand = Datatypes.expand logical_types in
     let* predicate =
-      Generic_parameters.discover ~expand ~key:"SignaturePredicate"
-        ~name:"SignaturePredicate" ~at ~explicit:(List.length parameters) parameters
+      Generic_parameters.discover ~expand
+        ~project:(Datatypes.representation_arguments logical_types)
+        ~key:"SignaturePredicate" ~name:"SignaturePredicate" ~at
+        ~explicit:(List.length parameters) parameters
     in
     if List.is_empty predicate.variables then Ok parameters
     else
       let* arguments =
         Generic_parameters.instantiate ~environment
           ~opaque:(Datatypes.is_opaque logical_types)
-          ~expand ~at predicate actuals
+          ~expand
+          ~project:(Datatypes.representation_arguments logical_types)
+          ~at predicate actuals
       in
       Ok (Generic_parameters.parameter_types predicate arguments)
   in

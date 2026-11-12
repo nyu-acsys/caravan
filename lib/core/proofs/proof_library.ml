@@ -5,6 +5,8 @@ let ( let* ) = Result.( >>= )
 
 let canonical_path = function
   | [ "Ghost"; "MutexResource" ] -> [ Mutex_contract.resource_interface ]
+  | [ "Ghost"; "TransferableResource" ] ->
+      [ Mutex_visibility_contract.resource_interface ]
   | [ "Ghost"; "Mutex" ] -> [ Mutex_contract.protocol_name ]
   | path -> path
 
@@ -12,7 +14,9 @@ let mutex_signatures = Mutex_contract.source_signatures
 
 let signatures at =
   match L.standard_library () with
-  | Ok signatures -> Ok (signatures @ mutex_signatures ())
+  | Ok signatures ->
+      Ok
+        (signatures @ mutex_signatures () @ Mutex_visibility_contract.source_signatures ())
   | Error diagnostics ->
       let message =
         match diagnostics with
@@ -53,10 +57,12 @@ let is_resource_algebra signatures signature =
 
 let is_protected_resource signatures signature =
   List.exists (interface_paths signatures signature) ~f:(fun path ->
-      List.equal String.equal path [ Mutex_contract.resource_interface ])
+      List.equal String.equal path [ Mutex_contract.resource_interface ]
+      || List.equal String.equal path [ Mutex_visibility_contract.resource_interface ])
 
 let is_mutex_protocol (signature : L.module_signature) =
   List.equal String.equal signature.path [ Mutex_contract.protocol_name ]
+  || List.equal String.equal signature.path [ Mutex_visibility_contract.protocol_name ]
 
 let is_resource_interface signatures signature =
   signature.L.interface
@@ -261,8 +267,13 @@ let operation_type ?(family_arguments = []) ~at ~(signature : L.module_signature
   let* inputs =
     Result.all
       (List.map operation.inputs ~f:(fun (name, typ) ->
-           if is_mutex_protocol signature && String.equal name "self" then
-             Ok (owner_type ~at)
+           if
+             (is_mutex_protocol signature
+             || List.equal String.equal signature.path
+                  [ Mutex_visibility_contract.resource_interface ])
+             && List.mem [ "self"; "source"; "target" ] name ~equal:String.equal
+             && Poly.equal typ L.Ref
+           then Ok (owner_type ~at)
            else convert typ))
   in
   let* outputs =

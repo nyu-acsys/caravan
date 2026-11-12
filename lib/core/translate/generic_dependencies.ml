@@ -44,6 +44,7 @@ let declaration_references = function
         lemma_requires;
         lemma_ensures;
         lemma_variant;
+        lemma_opens;
         lemma_body;
         _;
       } ->
@@ -51,7 +52,8 @@ let declaration_references = function
         List.map (lemma_params @ lemma_returns) ~f:(fun (id, _) -> id.S.pid_str)
       in
       List.concat_map
-        (lemma_requires @ lemma_ensures @ lemma_variant)
+        (lemma_requires @ lemma_ensures @ lemma_variant
+        @ Option.value_map lemma_opens ~default:[] ~f:snd)
         ~f:(Translate_context.term_references bound)
       @ proof_references bound lemma_body
   | Proof_invariant { inv_params; inv_state = state, _; inv_body; _ } ->
@@ -71,7 +73,7 @@ let declaration_references = function
             (Option.value_map contents ~default:[] ~f:Translate_context.pat_names)
             result)
   | Proof_module _ | Proof_definition _ | Proof_type _ | Proof_resource _ | Proof_au _
-  | Proof_task _ | Proof_field _ | Proof_state _ ->
+  | Proof_task _ | Proof_field _ | Proof_state _ | Proof_access_field _ ->
       []
 
 let annotation_references (annotation : Annotation.t) =

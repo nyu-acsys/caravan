@@ -119,6 +119,7 @@ let history_outputs ?reuse ctx ~at ~callee ~argument_types ~prefix_count ~result
         let* worker =
           State.of_result
             (Generic_parameters.discover ~expand:(Datatypes.expand env.data)
+               ~project:(Datatypes.representation_arguments env.data)
                ~key:past.past_invariant ~name:past.past_invariant ~at
                ~explicit:(List.length past.past_inputs)
                parameters)
@@ -137,7 +138,9 @@ let history_outputs ?reuse ctx ~at ~callee ~argument_types ~prefix_count ~result
               State.of_result
                 (Generic_parameters.instantiate ~environment:env.ctx.given.env
                    ~opaque:(Datatypes.is_opaque env.data)
-                   ~expand:(Datatypes.expand env.data) ~at worker
+                   ~expand:(Datatypes.expand env.data)
+                   ~project:(Datatypes.representation_arguments env.data)
+                   ~at worker
                    (List.init prefix_count ~f:(fun _ -> None)
                    @ List.map argument_types ~f:Option.some
                    @ [ Some result_type; None ]))

@@ -1,0 +1,8 @@
+// A speculative read has not yet established that its result is a source value.
+proc unchecked(c: Ref, history: Ref, lifetime: Ref, ghost initial: Int)
+  returns (raw: Example.Raw)
+  requires Example.cell(c, history, lifetime, initial)
+  ensures raw != Example.Raw.discarded
+{
+  raw := Example.read(c, history, lifetime, initial);
+}

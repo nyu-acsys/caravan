@@ -64,6 +64,7 @@
         "not", NOT;
         "of", OF;
         "old", OLD;
+        "opens", OPENS;
         "performs", PERFORMS;
         "predicate", PREDICATE;
         "proof", PROOF;
@@ -193,6 +194,10 @@ let op_char_34   = op_char_3 | op_char_4
 let op_char_pref = ['!' '?']
 
 rule token = parse
+  | "~writer"
+      { WRITER }
+  | "~release"
+      { RELEASE }
   | "~fraction"
       { FRACTION }
   | "Set.of_predicate"
@@ -271,6 +276,8 @@ rule token = parse
       { QUOTE_LIDENT id }
   | "`" (lident as id) "`"
       { BACKQUOTE_LIDENT id }
+  | "`" ((lident | uident) as id)
+      { POLY_TAG id }
   | '_'
       { UNDERSCORE }
   | lident as id

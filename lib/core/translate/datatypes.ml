@@ -25,18 +25,25 @@ let framed components =
 
 let record_field_name record label = "record$" ^ framed [ record; label ]
 
-type ctor = {
-  ocaml : string;
-  raven : string;  (** Uncapitalized, as Raven's constructors are. *)
-  fields : string list;  (** The destructors of the arguments. *)
-  args : Types.type_expr list;
-}
-
 type field = {
   label : string;
   raven_field : string;
   typ : Types.type_expr;
-  generic : bool;  (** The declaration's payload depends on record parameters. *)
+  generic : bool;
+  constructor : string option;
+}
+
+type inline_record = {
+  record_parameters : Types.type_expr list;
+  record_fields : field list;
+}
+
+type ctor = {
+  ocaml : string;
+  raven : string;
+  fields : string list;
+  args : Types.type_expr list;
+  inline_record : inline_record option;
 }
 
 type collection_kind = Sequence | FinSet | Set | Map
@@ -62,12 +69,7 @@ type family_instance = {
   family_name : string;
 }
 
-type witness = {
-  indices : bool list;  (** Per type parameter, whether it is an index. *)
-  results : (string * Types.type_expr list) list;
-      (** Per constructor, by its Raven name, the arguments of its result type. *)
-}
-(** A GADT whose constructors are constant: a witness selecting types. *)
+type witness = Indexed_types.t
 
 type t = {
   id : Ident.t option;  (** [None] for Raven's [List] and [Option]. *)
@@ -91,12 +93,14 @@ type t = {
       (** The lexical scope containing parameters used by this value representation. *)
   family : family option;
   atomic_procedure : string option;
-  atomic_context : bool;
+  atomic_context : Execution_contract.context_layout;
   backend_type : Qualified_name.t option;
   library : Path.t option;
       (** The path of an abstract type that a library declares, trusted: Raven's [T] of a
           module with no definition of it. *)
   witness : witness option;
+  gadt : Indexed_types.t option;
+  unboxed : bool;
   extension_keys : (Shape.Uid.t * string) list;
       (** For [exn]: the key of each declared exception, its constructor's [ocaml]. *)
   extension_aliases : (Path.t * string) list;
@@ -111,8 +115,14 @@ let list =
     module_name = "List";
     ctors =
       [
-        { ocaml = "[]"; raven = "nil"; fields = []; args = [] };
-        { ocaml = "::"; raven = "::"; fields = [ "hd"; "tl" ]; args = [] };
+        { ocaml = "[]"; raven = "nil"; fields = []; args = []; inline_record = None };
+        {
+          ocaml = "::";
+          raven = "::";
+          fields = [ "hd"; "tl" ];
+          args = [];
+          inline_record = None;
+        };
       ];
     heap = None;
     parameters = [];
@@ -125,8 +135,10 @@ let list =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
-    atomic_context = false;
+    atomic_context = Execution_contract.No_context;
     witness = None;
+    gadt = None;
+    unboxed = false;
     extension_keys = [];
     extension_aliases = [];
     backend_type = None;
@@ -144,8 +156,14 @@ let option =
     module_name = "Option";
     ctors =
       [
-        { ocaml = "None"; raven = "none"; fields = []; args = [] };
-        { ocaml = "Some"; raven = "some"; fields = [ "value" ]; args = [] };
+        { ocaml = "None"; raven = "none"; fields = []; args = []; inline_record = None };
+        {
+          ocaml = "Some";
+          raven = "some";
+          fields = [ "value" ];
+          args = [];
+          inline_record = None;
+        };
       ];
     heap = None;
     parameters = [];
@@ -158,8 +176,10 @@ let option =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
-    atomic_context = false;
+    atomic_context = Execution_contract.No_context;
     witness = None;
+    gadt = None;
+    unboxed = false;
     extension_keys = [];
     extension_aliases = [];
     backend_type = None;
@@ -180,58 +200,31 @@ let rec type_variables variables t =
     variables. *)
 let witness_of_declaration (decl : Typedtree.type_declaration) cds =
   let unsupported at = Report.unsupported at "A GADT beyond constant witnesses" in
-  let* results =
-    Result.all
-      (List.map cds ~f:(fun (cd : Typedtree.constructor_declaration) ->
-           match (cd.cd_res, cd.cd_args) with
-           | Some result, Cstr_tuple [] ->
-               begin match Types.get_desc result.ctyp_type with
-               | Tconstr (_, arguments, _) -> Ok (cd, arguments)
-               | _ -> unsupported cd.cd_loc
-               end
-           | _ -> unsupported cd.cd_loc))
-  in
-  let is_variable t = match Types.get_desc t with Tvar _ -> true | _ -> false in
-  let ordinary_at index earlier =
-    List.for_all results ~f:(fun (_, arguments) ->
-        let argument = List.nth_exn arguments index in
-        is_variable argument
-        && not
-             (List.exists earlier ~f:(fun earlier ->
-                  Types.eq_type (List.nth_exn arguments earlier) argument)))
-  in
-  let _, indices =
-    List.foldi decl.typ_params ~init:([], []) ~f:(fun index (earlier, indices) _ ->
-        if ordinary_at index earlier then (index :: earlier, false :: indices)
-        else (earlier, true :: indices))
-  in
-  let indices = List.rev indices in
+  let* metadata = Indexed_types.analyze decl cds in
   let* () =
-    List.fold_result results ~init:() ~f:(fun () (cd, arguments) ->
-        let ordinary, index_types =
-          List.partition_map (List.zip_exn indices arguments) ~f:(fun (index, t) ->
-              if index then Second t else First t)
-        in
-        let distinct =
-          List.length
-            (List.dedup_and_sort ordinary ~compare:(fun a b ->
-                 Int.compare (Types.get_id a) (Types.get_id b)))
-          = List.length ordinary
-        in
-        let bound t = List.exists ordinary ~f:(Types.eq_type t) in
-        if
-          distinct
-          && List.for_all (List.fold index_types ~init:[] ~f:type_variables) ~f:bound
-        then Ok ()
-        else unsupported cd.cd_loc)
+    if
+      metadata.constant
+      && not
+           (List.exists metadata.roles ~f:(function
+             | Constructor_index -> true
+             | _ -> false))
+    then Ok ()
+    else unsupported decl.typ_loc
   in
-  Ok
-    {
-      indices;
-      results =
-        List.map results ~f:(fun (cd, arguments) ->
-            (String.uncapitalize cd.cd_name.txt, arguments));
-    }
+  let* () =
+    List.fold_result metadata.results ~init:() ~f:(fun () (_, arguments) ->
+        let ordinary = Indexed_types.parameters metadata arguments in
+        let index_types =
+          List.filter_map (List.zip_exn metadata.indices arguments)
+            ~f:(fun (index, typ) -> Option.some_if index typ)
+        in
+        if
+          List.for_all (List.fold index_types ~init:[] ~f:type_variables) ~f:(fun typ ->
+              List.exists ordinary ~f:(Types.eq_type typ))
+        then Ok ()
+        else unsupported decl.typ_loc)
+  in
+  Ok metadata
 
 (** Whether [decl] declares a GADT witness. *)
 let is_witness_declaration (decl : Typedtree.type_declaration) =
@@ -247,32 +240,111 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
   let at = decl.typ_loc in
   match decl.typ_kind with
   | Ttype_variant cds ->
-      let* witness =
-        if List.exists cds ~f:(fun cd -> Option.is_some cd.cd_res) then
-          Result.map (witness_of_declaration decl cds) ~f:Option.some
+      let indexed = List.exists cds ~f:(fun cd -> Option.is_some cd.Typedtree.cd_res) in
+      let* gadt =
+        if indexed then Result.map (Indexed_types.analyze decl cds) ~f:Option.some
         else Ok None
       in
+      let witness =
+        Result.ok (witness_of_declaration decl cds) |> Option.filter ~f:(fun _ -> indexed)
+      in
+      let* () =
+        match (gadt, witness) with
+        | Some metadata, None
+          when List.exists metadata.roles ~f:(function Value_index -> true | _ -> false)
+          ->
+            Report.unsupported at "A GADT beyond constant witnesses"
+        | _ -> Ok ()
+      in
       let ctor (cd : Typedtree.constructor_declaration) =
-        match (cd.cd_res, cd.cd_args) with
-        | Some _, _ ->
-            Ok
-              {
-                ocaml = cd.cd_name.txt;
-                raven = String.uncapitalize cd.cd_name.txt;
-                fields = [];
-                args = [];
-              }
-        | None, Cstr_tuple cts ->
+        let canonical typ =
+          match gadt with
+          | None -> typ
+          | Some metadata ->
+              let source =
+                Indexed_types.parameters metadata
+                  (List.Assoc.find_exn metadata.results
+                     (String.uncapitalize cd.cd_name.txt)
+                     ~equal:String.equal)
+              in
+              let target = Indexed_types.parameters metadata decl.typ_type.type_params in
+              let rec replace typ =
+                match
+                  List.find (List.zip_exn source target) ~f:(fun (original, _) ->
+                      Types.eq_type original typ)
+                with
+                | Some (_, target) -> target
+                | None ->
+                    begin match Types.get_desc typ with
+                    | Tvar _ | Tunivar _ -> typ
+                    | description ->
+                        Btype.newgenty (Compiler_types.map_desc replace description)
+                    end
+              in
+              replace typ
+        in
+        match cd.cd_args with
+        | Cstr_tuple cts ->
             let raven = String.uncapitalize cd.cd_name.txt in
             Ok
               {
                 ocaml = cd.cd_name.txt;
                 raven;
                 fields = List.mapi cts ~f:(fun i _ -> Printf.sprintf "%s_%d" raven i);
-                args = List.map cts ~f:(fun (ct : Typedtree.core_type) -> ct.ctyp_type);
+                args = List.map cts ~f:(fun ct -> canonical ct.Typedtree.ctyp_type);
+                inline_record = None;
               }
-        | None, Cstr_record _ ->
-            Report.unsupported cd.cd_loc "A constructor with a record"
+        | Cstr_record labels ->
+            let* () =
+              if
+                List.exists labels ~f:(fun label ->
+                    Poly.equal label.Typedtree.ld_mutable Mutable)
+              then Ok ()
+              else Report.unsupported cd.cd_loc "An immutable inline constructor record"
+            in
+            let* description =
+              match
+                List.find
+                  (Datarepr.constructors_of_type ~current_unit:None
+                     (Path.Pident decl.typ_id) decl.typ_type) ~f:(fun (id, _) ->
+                    Ident.same id cd.cd_id)
+              with
+              | Some (_, description) -> Ok description
+              | None -> Report.unsupported cd.cd_loc "This inline constructor record"
+            in
+            let* parameters =
+              match description.Data_types.cstr_inlined with
+              | Some record -> Ok (List.map record.Types.type_params ~f:canonical)
+              | None -> Report.unsupported cd.cd_loc "This inline constructor record"
+            in
+            let fields =
+              List.map labels ~f:(fun label ->
+                  let typ = canonical label.Typedtree.ld_type.ctyp_type in
+                  {
+                    label = label.ld_name.txt;
+                    raven_field =
+                      record_field_name
+                        (decl.typ_name.txt ^ "$" ^ cd.cd_name.txt)
+                        label.ld_name.txt;
+                    typ;
+                    generic = not (List.is_empty (type_variables [] typ));
+                    constructor = Some cd.cd_name.txt;
+                  })
+            in
+            Ok
+              {
+                ocaml = cd.cd_name.txt;
+                raven = String.uncapitalize cd.cd_name.txt;
+                fields = [ String.uncapitalize cd.cd_name.txt ^ "_record" ];
+                args =
+                  [
+                    Ctype.newconstr
+                      (Path.Pextra_ty (Path.Pident decl.typ_id, Pcstr_ty cd.cd_name.txt))
+                      parameters;
+                  ];
+                inline_record =
+                  Some { record_parameters = parameters; record_fields = fields };
+              }
       in
       let* ctors = Result.all (List.map cds ~f:ctor) in
       Ok
@@ -295,8 +367,14 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
-          atomic_context = false;
+          atomic_context = Execution_contract.No_context;
           witness;
+          gadt;
+          unboxed =
+            List.exists decl.typ_attributes ~f:(fun attribute ->
+                List.mem
+                  [ "unboxed"; "ocaml.unboxed" ]
+                  attribute.Parsetree.attr_name.txt ~equal:String.equal);
           extension_keys = [];
           extension_aliases = [];
           backend_type = None;
@@ -328,6 +406,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
                      raven_field = record_field_name name label;
                      typ;
                      generic = not (List.is_empty (type_variables [] typ));
+                     constructor = None;
                    })),
             [] )
         else
@@ -338,6 +417,7 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
                 raven = String.uncapitalize name;
                 fields = labels;
                 args = types;
+                inline_record = None;
               };
             ] )
       in
@@ -360,8 +440,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
-          atomic_context = false;
+          atomic_context = Execution_contract.No_context;
           witness = None;
+          gadt = None;
+          unboxed = false;
           extension_keys = [];
           extension_aliases = [];
           backend_type = None;
@@ -390,8 +472,10 @@ let of_declaration (decl : Typedtree.type_declaration) : (t, Report.error) Resul
           domain_scope = None;
           family = None;
           atomic_procedure = None;
-          atomic_context = false;
+          atomic_context = Execution_contract.No_context;
           witness = None;
+          gadt = None;
+          unboxed = false;
           extension_keys = [];
           extension_aliases = [];
           backend_type = None;
@@ -416,7 +500,22 @@ let with_name (d : t) module_name =
   let record_name = String.uncapitalize module_name in
   let ctors =
     List.map d.ctors ~f:(fun c ->
-        if String.is_empty c.ocaml then { c with raven = record_name } else c)
+        let c = if String.is_empty c.ocaml then { c with raven = record_name } else c in
+        {
+          c with
+          inline_record =
+            Option.map c.inline_record ~f:(fun record ->
+                {
+                  record with
+                  record_fields =
+                    List.map record.record_fields ~f:(fun field ->
+                        {
+                          field with
+                          raven_field =
+                            record_field_name (record_name ^ "$" ^ c.ocaml) field.label;
+                        });
+                });
+        })
   in
   let heap =
     Option.map d.heap ~f:(fun fields ->
@@ -456,8 +555,10 @@ let library_type ~library ~library_id ~at name =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
-    atomic_context = false;
+    atomic_context = Execution_contract.No_context;
     witness = None;
+    gadt = None;
+    unboxed = false;
     extension_keys = [];
     extension_aliases = [];
     backend_type = None;
@@ -525,12 +626,12 @@ let atomic_carrier ~loc ~context procedure =
     R.Type.atomic_token ~loc
       (Qualified_name.raven ~loc (Qualified_name.of_string procedure))
   in
-  if context then
-    R.Type.tuple ~loc [ raw; R.Type.ref ~loc; R.Type.fin_set ~loc (R.Type.ref ~loc) ]
-  else raw
+  match Execution_contract.context_types ~loc context with
+  | [] -> raw
+  | fields -> R.Type.tuple ~loc (raw :: fields)
 
 (** A nominal proof token for an existing atomic procedure. *)
-let atomic_token ?(context = false) ~path ~procedure ~at () =
+let atomic_token ?(context = Execution_contract.No_context) ~path ~procedure ~at () =
   {
     list with
     id = None;
@@ -564,8 +665,10 @@ let collection id kind =
     domain_scope = None;
     family = None;
     atomic_procedure = None;
-    atomic_context = false;
+    atomic_context = Execution_contract.No_context;
     witness = None;
+    gadt = None;
+    unboxed = false;
     extension_keys = [];
     extension_aliases = [];
     backend_type = None;
@@ -590,10 +693,57 @@ let sequence id = collection id Sequence
 let is_sequence (d : t) = match d.collection with Some Sequence -> true | _ -> false
 
 (** The data type of the type constructor [p]: one of [types], a list or an option. *)
-let find (types : t list) (p : Path.t) =
+let all_fields data =
+  Option.value data.heap ~default:[]
+  @ List.concat_map data.ctors ~f:(fun constructor ->
+      Option.value_map constructor.inline_record ~default:[] ~f:(fun record ->
+          record.record_fields))
+
+let runtime_parameters data =
+  match (data.gadt, data.witness) with
+  | Some metadata, None -> Indexed_types.parameters metadata data.parameters
+  | _ -> data.parameters
+
+let rec find (types : t list) (p : Path.t) =
   if Path.same p Predef.path_list then Some list
   else if Path.same p Predef.path_option then Some option
-  else List.find types ~f:(fun d -> declares d p)
+  else
+    match (List.find types ~f:(fun d -> declares d p), p) with
+    | Some data, _ -> Some data
+    | None, Pextra_ty (parent, Pcstr_ty name) ->
+        Option.bind (find types parent) ~f:(fun owner ->
+            Option.bind
+              (List.find owner.ctors ~f:(fun ctor -> String.equal ctor.ocaml name))
+              ~f:(fun constructor ->
+                Option.map constructor.inline_record ~f:(fun record ->
+                    {
+                      owner with
+                      id = None;
+                      paths = [ p ];
+                      library = None;
+                      module_name = owner.module_name ^ "$" ^ name;
+                      parameters = record.record_parameters;
+                      ctors = [];
+                      heap = Some record.record_fields;
+                      gadt = None;
+                      witness = None;
+                      unboxed = false;
+                      family = None;
+                      backend_type = None;
+                      alias = None;
+                      value_constraint = None;
+                    })))
+    | None, (Pident _ | Pdot _ | Papply _ | Pextra_ty (_, Pext_ty)) -> None
+
+let representation_arguments types path arguments =
+  match find types path with
+  | Some data when Option.is_none data.witness ->
+      begin match data.gadt with
+      | Some metadata when List.length metadata.roles = List.length arguments ->
+          Indexed_types.parameters metadata arguments
+      | Some _ | None -> arguments
+      end
+  | Some _ | None -> arguments
 
 (** Compiler aliases of referenced external types share their underlying representation.
 *)
@@ -732,7 +882,7 @@ let substitution parameters arguments =
         | None ->
             begin match Types.get_desc typ with
             | Tconstr _ | Ttuple _ | Tarrow _ | Tpoly _ ->
-                Btype.newgenty (Btype.copy_type_desc substitute (Types.get_desc typ))
+                Btype.newgenty (Compiler_types.map_desc substitute (Types.get_desc typ))
             | _ -> typ
             end
       in
@@ -768,6 +918,145 @@ let rec expand (types : t list) (t : Types.type_expr) =
       begin match Types.get_desc t with Tpoly (body, []) -> expand types body | _ -> t
       end
 
+(** Constructor-set rows retain source constraints despite sharing a runtime carrier. *)
+let indexed_instance types typ =
+  match Types.get_desc typ with
+  | Tconstr (path, arguments, _) ->
+      Option.bind (find types path) ~f:(fun data ->
+          Option.bind data.gadt ~f:(fun metadata ->
+              Option.some_if
+                (Option.is_none data.witness
+                && List.exists metadata.roles ~f:(function
+                  | Constructor_index -> true
+                  | _ -> false)
+                && List.length arguments = List.length metadata.roles)
+                (data, metadata, List.map arguments ~f:(expand types))))
+  | _ -> None
+
+let validate_indices types ~at signature =
+  let rec visit seen typ =
+    let typ = expand types typ in
+    let id = Types.get_id typ in
+    if Set.mem seen id then Ok seen
+    else
+      let seen = Set.add seen id in
+      let* () =
+        match indexed_instance types typ with
+        | None -> Ok ()
+        | Some (_, metadata, arguments) ->
+            List.fold_result (List.zip_exn metadata.roles arguments) ~init:()
+              ~f:(fun () (role, argument) ->
+                match role with
+                | Parameter | Value_index -> Ok ()
+                | Constructor_index ->
+                    if
+                      Result.is_ok
+                        (Indexed_types.row_tags ~required:false (expand types argument))
+                    then Ok ()
+                    else Report.unsupported at "An abstract constructor-set index")
+      in
+      match Types.get_desc typ with
+      | Tconstr (_, args, _) -> List.fold_result args ~init:seen ~f:visit
+      | Tarrow (_, input, output, _) ->
+          let* seen = visit seen input in
+          visit seen output
+      | Ttuple fields ->
+          List.fold_result fields ~init:seen ~f:(fun seen (_, typ) -> visit seen typ)
+      | Tpoly (body, _) -> visit seen body
+      | _ -> Ok seen
+  in
+  let rec rows seen typ =
+    let typ = expand types typ in
+    let id = Types.get_id typ in
+    if Set.mem seen id then (seen, [])
+    else
+      let seen = Set.add seen id in
+      let children children =
+        List.fold children ~init:(seen, []) ~f:(fun (seen, found) typ ->
+            let seen, more = rows seen typ in
+            (seen, more @ found))
+      in
+      match Types.get_desc typ with
+      | Tvariant row -> (seen, [ row ])
+      | Tconstr (_, args, _) -> children args
+      | Tarrow (_, input, output, _) -> children [ input; output ]
+      | Ttuple fields -> children (List.map fields ~f:snd)
+      | Tpoly (body, _) -> rows seen body
+      | _ -> (seen, [])
+  in
+  let shared_row left right =
+    Types.eq_type (Types.row_more left) (Types.row_more right)
+    || List.exists (Types.row_fields left) ~f:(fun (_, left) ->
+        match Types.row_field_repr left with
+        | Reither _ ->
+            List.exists (Types.row_fields right) ~f:(fun (_, right) ->
+                match Types.row_field_repr right with
+                | Reither _ -> Types.eq_row_field_ext left right
+                | Rpresent _ | Rabsent -> false)
+        | Rpresent _ | Rabsent -> false)
+  in
+  let rec split arguments typ =
+    match Types.get_desc (expand types typ) with
+    | Tarrow (_, argument, result, _) -> split (argument :: arguments) result
+    | Tpoly (body, _) -> split arguments body
+    | _ -> (arguments, typ)
+  in
+  let* _ = visit (Set.empty (module Int)) signature in
+  let arguments, result = split [] signature in
+  let inputs =
+    List.concat_map arguments ~f:(fun argument ->
+        snd (rows (Set.empty (module Int)) argument))
+  in
+  let rec check seen typ =
+    let typ = expand types typ in
+    let id = Types.get_id typ in
+    if Set.mem seen id then Ok seen
+    else
+      let seen = Set.add seen id in
+      let* () =
+        match indexed_instance types typ with
+        | None -> Ok ()
+        | Some (_, metadata, arguments) ->
+            let arguments = List.map arguments ~f:(expand types) in
+            begin match
+              ( Indexed_types.allowed ~result:false metadata arguments,
+                Indexed_types.allowed ~result:true metadata arguments )
+            with
+            | Ok upper, Ok lower when not (List.equal String.equal upper lower) ->
+                let correlated =
+                  List.exists (List.zip_exn metadata.roles arguments)
+                    ~f:(fun (role, argument) ->
+                      match (role, Types.get_desc argument) with
+                      | Constructor_index, Tvariant row ->
+                          List.exists inputs ~f:(shared_row row)
+                      | _ -> false)
+                in
+                if correlated then
+                  Report.unsupported at
+                    "A polymorphic constructor-set index shared by arguments and result"
+                else Ok ()
+            | Ok _, Ok _ | Error (), _ | _, Error () -> Ok ()
+            end
+      in
+      match Types.get_desc typ with
+      | Tconstr (_, args, _) -> List.fold_result args ~init:seen ~f:check
+      | Tarrow (_, input, output, _) ->
+          let* seen = check seen input in
+          check seen output
+      | Ttuple fields ->
+          List.fold_result fields ~init:seen ~f:(fun seen (_, typ) -> check seen typ)
+      | Tpoly (body, _) -> check seen body
+      | _ -> Ok seen
+  in
+  Result.map (check (Set.empty (module Int)) result) ~f:(fun _ -> ())
+
+let validate_callable_indices types ~at ~args ~result =
+  let signature =
+    List.fold_right args ~init:result ~f:(fun argument result ->
+        Btype.newgenty (Tarrow (Nolabel, argument, result, Types.commu_ok)))
+  in
+  validate_indices types ~at signature
+
 (** Logical zero-argument aliases retain their separate domain metadata. *)
 let rec expand_parameterized types t =
   match Types.get_desc t with
@@ -783,7 +1072,7 @@ let desc types t = Types.get_desc (expand types t)
 (** Express native locally abstract types through their quantified variables. *)
 let quantified_type types typ =
   let rec project typ =
-    let copy desc = Ctype.newty (Btype.copy_type_desc project desc) in
+    let copy desc = Ctype.newty (Compiler_types.map_desc project desc) in
     match Types.get_desc typ with
     | Tvar _ | Tunivar _ -> typ
     | Tconstr (path, [], _) as desc ->
@@ -808,7 +1097,19 @@ let instantiate (data : t) arguments =
         data with
         ctors =
           List.map data.ctors ~f:(fun ctor ->
-              { ctor with args = List.map ctor.args ~f:substitute });
+              {
+                ctor with
+                args = List.map ctor.args ~f:substitute;
+                inline_record =
+                  Option.map ctor.inline_record ~f:(fun record ->
+                      {
+                        record_parameters =
+                          List.map record.record_parameters ~f:substitute;
+                        record_fields =
+                          List.map record.record_fields ~f:(fun field ->
+                              { field with typ = substitute field.typ });
+                      });
+              });
         heap =
           Option.map data.heap
             ~f:(List.map ~f:(fun field -> { field with typ = substitute field.typ }));
@@ -829,7 +1130,7 @@ let value_family types typ =
       Option.bind (find types path) ~f:(fun data ->
           Option.some_if
             (is_value_family data && List.length arguments = List.length data.parameters)
-            (data, arguments))
+            (data, representation_arguments types path arguments))
   | _ -> None
 
 (** Variable IDs are local to the typed binding and never become generated names. *)
@@ -1120,7 +1421,8 @@ let rec type_key types t =
     | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
         let data = Option.value_exn (find types p) in
         Option.map
-          (Option.all (List.map arguments ~f:(type_key types)))
+          (Option.all
+             (List.map (representation_arguments types p arguments) ~f:(type_key types)))
           ~f:(fun arguments ->
             Applied_key
               (Option.value data.module_path ~default:[ data.module_name ], arguments))
@@ -1160,43 +1462,70 @@ and dictionary_type_key types t =
              @ String.split family.dictionary ~on:'.',
              arguments ))
   | _ ->
-      begin match abstract_value_constraint types t with
-      | Some { Qualified_name.path; name = "holds" } when not (List.is_empty path) ->
-          Some (Named_key ("dictionary" :: path))
-      | constraint_ ->
+      begin match indexed_instance types (expand types t) with
+      | Some (data, metadata, arguments) ->
           let* carrier = type_key types t in
-          let* domain =
-            match constraint_ with
-            | Some predicate ->
-                Some (Named_key (("domain" :: predicate.path) @ [ predicate.name ]))
-            | None when is_int types t -> Some (Named_key [ "bounded_int" ])
-            | None when not (has_domain types t) -> Some (Named_key [ "unrestricted" ])
-            | None ->
-                begin match desc types t with
-                | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
-                    Option.map (dictionary_type_key types element) ~f:(fun key ->
-                        List_key key)
-                | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
-                    Option.map (dictionary_type_key types element) ~f:(fun key ->
-                        Option_key key)
-                | Tconstr (path, arguments, _)
-                  when Option.exists (find types path) ~f:is_value_family ->
-                    let data = Option.value_exn (find types path) in
-                    Option.map
-                      (Option.all (List.map arguments ~f:(dictionary_type_key types)))
-                      ~f:(fun arguments ->
-                        Applied_key
-                          (String.split (value_family_name data) ~on:'.', arguments))
-                | Ttuple components ->
-                    Option.map
-                      (Option.all
-                         (List.map components ~f:(fun (_, element) ->
-                              dictionary_type_key types element)))
-                      ~f:(fun keys -> Tuple_key keys)
-                | _ -> Some (Named_key [ "nominal" ])
-                end
+          let allowed =
+            Option.value
+              (Result.ok (Indexed_types.allowed ~result:false metadata arguments))
+              ~default:(List.map data.ctors ~f:(fun ctor -> ctor.raven))
           in
-          Some (Tuple_key [ carrier; domain ])
+          let* payloads =
+            Option.all
+              (List.map
+                 (Indexed_types.parameters metadata arguments)
+                 ~f:(dictionary_type_key types))
+          in
+          Some
+            (Tuple_key
+               [
+                 carrier; Applied_key ([ "indexed"; data.module_name ] @ allowed, payloads);
+               ])
+      | None ->
+          begin match abstract_value_constraint types t with
+          | Some { Qualified_name.path; name = "holds" } when not (List.is_empty path) ->
+              Some (Named_key ("dictionary" :: path))
+          | constraint_ ->
+              let* carrier = type_key types t in
+              let* domain =
+                match constraint_ with
+                | Some predicate ->
+                    Some (Named_key (("domain" :: predicate.path) @ [ predicate.name ]))
+                | None when is_int types t -> Some (Named_key [ "bounded_int" ])
+                | None when not (has_domain types t) ->
+                    Some (Named_key [ "unrestricted" ])
+                | None ->
+                    begin match desc types t with
+                    | Tconstr (path, [ element ], _) when Path.same path Predef.path_list
+                      ->
+                        Option.map (dictionary_type_key types element) ~f:(fun key ->
+                            List_key key)
+                    | Tconstr (path, [ element ], _)
+                      when Path.same path Predef.path_option ->
+                        Option.map (dictionary_type_key types element) ~f:(fun key ->
+                            Option_key key)
+                    | Tconstr (path, arguments, _)
+                      when Option.exists (find types path) ~f:is_value_family ->
+                        let data = Option.value_exn (find types path) in
+                        Option.map
+                          (Option.all
+                             (List.map
+                                (representation_arguments types path arguments)
+                                ~f:(dictionary_type_key types)))
+                          ~f:(fun arguments ->
+                            Applied_key
+                              (String.split (value_family_name data) ~on:'.', arguments))
+                    | Ttuple components ->
+                        Option.map
+                          (Option.all
+                             (List.map components ~f:(fun (_, element) ->
+                                  dictionary_type_key types element)))
+                          ~f:(fun keys -> Tuple_key keys)
+                    | _ -> Some (Named_key [ "nominal" ])
+                    end
+              in
+              Some (Tuple_key [ carrier; domain ])
+          end
       end
 
 let rec key_name = function
@@ -1319,7 +1648,7 @@ let domain_identity types t =
     | Tconstr (path, arguments, _) when Option.exists (find types path) ~f:is_value_family
       ->
         Option.to_list (Option.bind (find types path) ~f:(fun data -> data.domain_scope))
-        @ List.concat_map arguments ~f:(scopes seen)
+        @ List.concat_map (representation_arguments types path arguments) ~f:(scopes seen)
     | Tconstr (path, [], _) ->
         begin match find types path with
         | Some { heap = Some _; _ } -> []
@@ -1392,34 +1721,51 @@ let rec domain_key ~namespace types t =
   | None when is_int types t -> "bounded_int"
   | None when not (has_domain types t) -> "unrestricted"
   | None -> (
-      match desc types t with
-      | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
-          "list$" ^ framed [ domain_key ~namespace types element ]
-      | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
-          "option$" ^ framed [ domain_key ~namespace types element ]
-      | Tconstr (path, arguments, _)
-        when Option.exists (find types path) ~f:is_value_family ->
-          let data = Option.value_exn (find types path) in
-          "family$"
+      match indexed_instance types (expand types t) with
+      | Some (data, metadata, arguments) ->
+          let allowed =
+            Option.value
+              (Result.ok (Indexed_types.allowed ~result:false metadata arguments))
+              ~default:(List.map data.ctors ~f:(fun ctor -> ctor.raven))
+          in
+          "indexed$"
           ^ framed
-              (framed (String.split (value_family_name data) ~on:'.')
-              :: List.map arguments ~f:(fun argument ->
-                  Option.value_map (dictionary_name types argument) ~default:"unsupported"
-                    ~f:(fun dictionary ->
-                      framed (relative_path namespace (String.split dictionary ~on:'.'))))
-              )
-      | Ttuple components ->
-          "tuple$"
-          ^ framed (List.map components ~f:(fun (_, t) -> domain_key ~namespace types t))
-      | _ ->
-          "nominal$"
-          ^ framed
-              (Option.value_map (structural_constraint_name types t) ~default:[]
-                 ~f:(fun name ->
-                   let parts = String.split name ~on:'.' in
-                   if List.is_prefix parts ~prefix:namespace ~equal:String.equal then
-                     List.drop parts (List.length namespace)
-                   else parts)))
+              (data.module_name :: framed allowed
+              :: List.map
+                   (Indexed_types.parameters metadata arguments)
+                   ~f:(domain_key ~namespace types))
+      | None -> (
+          match desc types t with
+          | Tconstr (path, [ element ], _) when Path.same path Predef.path_list ->
+              "list$" ^ framed [ domain_key ~namespace types element ]
+          | Tconstr (path, [ element ], _) when Path.same path Predef.path_option ->
+              "option$" ^ framed [ domain_key ~namespace types element ]
+          | Tconstr (path, arguments, _)
+            when Option.exists (find types path) ~f:is_value_family ->
+              let data = Option.value_exn (find types path) in
+              "family$"
+              ^ framed
+                  (framed (String.split (value_family_name data) ~on:'.')
+                  :: List.map (representation_arguments types path arguments)
+                       ~f:(fun argument ->
+                         Option.value_map (dictionary_name types argument)
+                           ~default:"unsupported" ~f:(fun dictionary ->
+                             framed
+                               (relative_path namespace (String.split dictionary ~on:'.'))))
+                  )
+          | Ttuple components ->
+              "tuple$"
+              ^ framed
+                  (List.map components ~f:(fun (_, t) -> domain_key ~namespace types t))
+          | _ ->
+              "nominal$"
+              ^ framed
+                  (Option.value_map (structural_constraint_name types t) ~default:[]
+                     ~f:(fun name ->
+                       let parts = String.split name ~on:'.' in
+                       if List.is_prefix parts ~prefix:namespace ~equal:String.equal then
+                         List.drop parts (List.length namespace)
+                       else parts))))
 
 and dictionary_name types t =
   match desc types t with
@@ -1445,8 +1791,9 @@ and dictionary_name types t =
                     ])
               in
               match value_family types t with
-              | Some (data, _) when Option.is_none data.library && not data.mathematical
-                ->
+              | Some (data, _)
+                when Option.is_none data.library && (not data.mathematical)
+                     && Option.is_none (indexed_instance types (expand types t)) ->
                   dictionary ^ ".Self"
               | _ -> dictionary))
 
@@ -1586,14 +1933,19 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
       end
   | Tconstr (p, arguments, _) when Option.exists (find types p) ~f:is_value_family ->
       let data = Option.value_exn (find types p) in
-      let* arguments = Result.all (List.map arguments ~f:(typ types ?self ~at)) in
+      let* arguments =
+        Result.all
+          (List.map (representation_arguments types p arguments) ~f:(typ types ?self ~at))
+      in
       begin match self with
       | Some self when declares self p ->
           let source_arguments =
             match desc types t with Tconstr (_, arguments, _) -> arguments | _ -> []
           in
-          if List.equal Types.eq_type self.parameters source_arguments then
-            Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
+          if
+            List.equal Types.eq_type (runtime_parameters self)
+              (representation_arguments types p source_arguments)
+          then Ok (R.Type.named ~loc:l (R.Name.make ~loc:l "T") [])
           else Report.unsupported at "A nonregular recursive datatype"
       | _ ->
           let path = Option.value data.module_path ~default:[ data.module_name ] in
@@ -1728,6 +2080,40 @@ let admissible ~loc types t value =
         (Qualified_name.raven ~loc (Qualified_name.of_string name))
         [ value ])
 
+(** Universally chosen result rows promise only constructors required by every choice. *)
+let result_type types typ =
+  let rec project typ =
+    let typ = expand types typ in
+    match Types.get_desc typ with
+    | Tvar _ | Tunivar _ -> typ
+    | Tconstr (path, arguments, memo) ->
+        let arguments = List.map arguments ~f:project in
+        let arguments =
+          match find types path with
+          | Some { gadt = Some metadata; witness = None; _ }
+            when List.length metadata.roles = List.length arguments ->
+              List.map2_exn metadata.roles arguments ~f:(fun role argument ->
+                  match (role, Indexed_types.row_tags ~required:true argument) with
+                  | Constructor_index, Ok (_, tags) ->
+                      let row =
+                        Types.create_row
+                          ~fields:
+                            (List.map tags ~f:(fun tag -> (tag, Types.rf_present None)))
+                          ~more:(Btype.newgenty Tnil) ~closed:true ~fixed:None ~name:None
+                      in
+                      Btype.newgenty (Tvariant row)
+                  | Constructor_index, Error () -> argument
+                  | (Parameter | Value_index), _ -> argument)
+          | _ -> arguments
+        in
+        Btype.newgenty (Tconstr (path, arguments, memo))
+    | description -> Btype.newgenty (Compiler_types.map_desc project description)
+  in
+  project typ
+
+let result_admissible ~loc types typ value =
+  admissible ~loc types (result_type types typ) value
+
 type domain_node =
   | Domain_function of Types.type_expr * string
   | Value_dictionary of Types.type_expr * string option
@@ -1741,7 +2127,7 @@ let domain_nodes ?(dictionaries = false) types requested =
         [ element ]
     | Tconstr (path, arguments, _) when Option.exists (find types path) ~f:is_value_family
       ->
-        arguments
+        representation_arguments types path arguments
     | Tconstr (path, [], _) ->
         Option.value_map (find types path) ~default:[] ~f:(fun data ->
             List.concat_map data.ctors ~f:(fun ctor -> ctor.args))
@@ -1785,7 +2171,9 @@ let domain_nodes ?(dictionaries = false) types requested =
 
 let dictionary_declaration_name types typ name =
   match value_family types typ with
-  | Some (data, _) when Option.is_none data.library && not data.mathematical ->
+  | Some (data, _)
+    when Option.is_none data.library && (not data.mathematical)
+         && Option.is_none (indexed_instance types (expand types typ)) ->
       Option.value (String.chop_suffix name ~suffix:".Self") ~default:name
   | _ -> name
 
@@ -1867,7 +2255,10 @@ let domain_members ?(dictionaries = false) types requested =
       | Tconstr (path, arguments, _)
         when Option.exists (find types path) ~f:is_value_family ->
           let data = Option.value_exn (find types path) in
-          let* arguments = Result.all (List.map arguments ~f:module_arg) in
+          let* arguments =
+            Result.all
+              (List.map (representation_arguments types path arguments) ~f:module_arg)
+          in
           Ok (Some (value_family_name data), arguments)
       | Ttuple components ->
           let* arguments =
@@ -1877,24 +2268,60 @@ let domain_members ?(dictionaries = false) types requested =
       | _ -> Ok (None, [])
     in
     let name = Qualified_name.of_string qualified in
-    match factory with
-    | Some factory ->
-        Ok
-          (R.Member.instance ~loc:l
-             ~def:(q factory, arguments)
-             (ident name.name) (q factory))
-    | None ->
-        let* carrier = typ types ~at:Location.none t in
-        let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
-        let body =
+    match indexed_instance types (expand types t) with
+    | Some (data, metadata, source_arguments) ->
+        let* carrier = typ types ~at:data.at t in
+        let factory = value_family_name data in
+        let allowed =
           Option.value
-            (admissible ~loc:l types t value)
-            ~default:(R.Expr.bool ~loc:l true)
+            (Result.ok (Indexed_types.allowed ~result:false metadata source_arguments))
+            ~default:(List.map data.ctors ~f:(fun ctor -> ctor.raven))
+        in
+        let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
+        let call member arguments =
+          R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Payload" ] member) arguments
+        in
+        let tags =
+          Option.value
+            (List.reduce
+               (List.map allowed ~f:(fun constructor ->
+                    R.Expr.is_ ~loc:l value (ident constructor)))
+               ~f:(R.Expr.binary ~loc:l Or))
+            ~default:(R.Expr.bool ~loc:l false)
+        in
+        let unrestricted =
+          if List.length allowed = List.length data.ctors then call "unrestricted" []
+          else R.Expr.bool ~loc:l false
         in
         Ok
-          (Prelude.value_dictionary ~loc:l ~name:name.name ~carrier
-             ~unrestricted:(R.Expr.bool ~loc:l (not (has_domain types t)))
-             ~body)
+          (Prelude.value_dictionary_with_members ~loc:l ~parameters:[] ~name:name.name
+             ~carrier ~unrestricted
+             ~body:(R.Expr.binary ~loc:l And (call "holds" [ value ]) tags)
+             ~members:
+               [
+                 R.Member.instance ~loc:l
+                   ~def:(q factory, arguments)
+                   (ident "Payload") (q factory);
+               ])
+    | None -> (
+        match factory with
+        | Some factory ->
+            Ok
+              (R.Member.instance ~loc:l
+                 ~def:(q factory, arguments)
+                 (ident name.name) (q factory))
+        | None ->
+            let* carrier = typ types ~at:Location.none t in
+            let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
+            let body =
+              Option.value
+                (admissible ~loc:l types t value)
+                ~default:(R.Expr.bool ~loc:l true)
+            in
+            Ok
+              (Prelude.value_dictionary ~loc:l ~name:name.name ~carrier
+                 ~unrestricted:(R.Expr.bool ~loc:l (not (has_domain types t)))
+                 ~body))
   in
   let require_identity t =
     match domain_identity types t with
@@ -1970,11 +2397,16 @@ let rec immediate (types : t list) (t : Types.type_expr) =
   | Tconstr (p, _, _)
     when Option.exists (find types p) ~f:(fun d -> Option.is_some d.heap) ->
       true
-  | Tconstr (p, [], _) ->
-      begin match find types p with
+  | Tconstr (p, arguments, _) ->
+      begin match
+        Option.bind (find types p) ~f:(fun data -> instantiate data arguments)
+      with
       | Some { heap = Some _; _ } -> true
+      | Some { unboxed = true; ctors = [ { args = [ payload ]; _ } ]; _ } ->
+          immediate types payload
       | Some { ctors = _ :: _ as ctors; _ } ->
-          List.for_all ctors ~f:(fun c -> List.is_empty c.args)
+          List.for_all ctors ~f:(fun c ->
+              List.is_empty c.args || Option.is_some c.inline_record)
       | _ -> false
       end
   | Tpoly (t, []) -> immediate types t
@@ -2036,12 +2468,10 @@ let record_field_member types ~at (field : field) =
 let fields ?declarations (types : t list) : (R.Member.t list, Report.error) Result.t =
   Result.all
     (List.concat_map (Option.value declarations ~default:types) ~f:(fun data ->
-         List.map
-           (Option.value data.heap ~default:[])
-           ~f:(record_field_member types ~at:data.at)))
+         List.map (all_fields data) ~f:(record_field_member types ~at:data.at)))
 
 let family_parameters ~loc ~interface (data : t) =
-  List.mapi data.parameters ~f:(fun index _ ->
+  List.mapi (runtime_parameters data) ~f:(fun index _ ->
       ( R.Ident.make ~loc ("A" ^ Int.to_string index),
         Qualified_name.raven ~loc (Qualified_name.of_string interface) ))
 
@@ -2058,7 +2488,7 @@ let value_family_members types (data : t) =
     let leaf = List.last_exn owner in
     let parameters = family_parameters ~loc:l ~interface:Prelude.value_interface data in
     let arguments =
-      List.mapi data.parameters ~f:(fun index _ ->
+      List.mapi (runtime_parameters data) ~f:(fun index _ ->
           R.Type.named ~loc:l
             (R.Name.make ~loc:l ~path:[ "A" ^ Int.to_string index ] "Carrier")
             [])
@@ -2109,7 +2539,7 @@ let value_family_members types (data : t) =
           [] )
     else
       let variables =
-        List.mapi data.parameters ~f:(fun index variable ->
+        List.mapi (runtime_parameters data) ~f:(fun index variable ->
             variable_type ~variable ~owner
               ~parameter:("A" ^ Int.to_string index)
               ~at:data.at)
@@ -2197,7 +2627,7 @@ let member ?(parameters = true) (types : t list) (d : t) :
   let l = loc d.at in
   let variables =
     List.mapi
-      (if parameters then d.parameters else [])
+      (if parameters then runtime_parameters d else [])
       ~f:(fun index variable ->
         let parameter = "A" ^ Int.to_string index in
         {

@@ -75,6 +75,7 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
         let vb = entry.binding in
         match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
         | Tpat_var (id, _, _), Some (params, body) ->
+            let* () = Datatypes.validate_indices data ~at:vb.vb_loc vb.vb_pat.pat_type in
             let site = entry.site in
             let* own =
               contract_with_origin_after ~scope:site.scope site.annotations
@@ -579,9 +580,14 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
   let libraries = library_calls libraries in
   let is_target (e : Typedtree.expression) =
     match e.exp_desc with
+    | Texp_field (_, _, label) ->
+        Poly.equal label.lbl_atomic Nonatomic
+        && Array.exists label.lbl_all ~f:(fun field ->
+            Poly.equal field.Data_types.lbl_mut Mutable)
+    | Texp_setfield (_, _, label, _) ->
+        Poly.equal label.lbl_mut Mutable && Poly.equal label.lbl_atomic Nonatomic
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
-        Option.exists (atomic_name path) ~f:(fun op ->
-            not (String.is_prefix op ~prefix:"make"))
+        Option.is_some (atomic_name path)
         ||
         match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
         | Ok path ->
@@ -597,7 +603,9 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
     | _ -> false
   in
   attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
-    ~description:"Ghost.scope must follow an Atomic access or a checked procedure call"
+    ~description:
+      "Ghost.scope must follow an ordinary field access, an Atomic access or a checked \
+       procedure call"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
@@ -1662,7 +1670,7 @@ let signature_contract (signature : Module_inventory.signature_value) =
 type prepared_callable = {
   prepared_formals : R.Var.t list;
   prepared_args : R.Expr.t list;
-  prepared_execution : Mutex_execution.boundary;
+  prepared_execution : Execution_context.boundary;
   prepared_execution_aliases : (string * Mutex_execution.witness) list;
   prepared_implicit : (string * string * Types.type_expr * R.Type.t * R.Loc.t) list;
   prepared_roles : (bool * bool) list;
@@ -1705,12 +1713,18 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   in
   let open State.Syntax in
   let* () =
+    State.of_result
+      (Datatypes.validate_callable_indices ctx.given.types ~at ~args ~result)
+  in
+  let* () =
     State.modify (fun (s : State.state) ->
         { s with names = { s.names with used = Set.add s.names.used "r" } })
   in
-  let* ctx, execution = Mutex_execution.prepare_boundary ctx ~at contract in
+  let* ctx, execution = Execution_context.prepare_boundary ctx ~at contract in
   let* result_typ = State.typ ctx ~at result in
-  let* () = State.note_domain ctx.given.types result in
+  let* () =
+    State.note_domain ctx.given.types (Datatypes.result_type ctx.given.types result)
+  in
   let* result_name, names = State.of_result header_names in
   let* params =
     State.all (List.zip_exn names args) ~f:(fun (n, t) ->
@@ -1799,7 +1813,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
         ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
   let* logical_requires =
-    State.all requires ~f:(formula (Mutex_execution.entry_environment env))
+    State.all requires ~f:(formula (Execution_context.entry_environment env))
   in
   let clauses ?atomic terms =
     State.all terms ~f:(fun t ->
@@ -1814,7 +1828,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
           Exceptions.raises_postconditions ctx.given.types ~at raises set))
   in
   let* execution_ensures =
-    Mutex_execution.exit_resources env execution ~at ~raising:(Option.is_some outcome)
+    Execution_context.exit_resources env execution ~at ~raising:(Option.is_some outcome)
       contract
   in
   let+ atomic_ensures =
@@ -1834,7 +1848,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   let in_range = List.map input_domains ~f:R.Spec.make in
   let prepared_logical_ensures =
     let result_domain =
-      Datatypes.admissible ~loc:l ctx.given.types result
+      Datatypes.result_admissible ~loc:l ctx.given.types result
         (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
     in
     List.map
@@ -1846,11 +1860,11 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   in
   let result_in_range =
     match outcome with
-    | None -> Option.to_list (value_spec ctx ~loc:l result "r")
+    | None -> Option.to_list (result_spec ctx ~loc:l result "r")
     | Some (_, raised, typ) ->
         Option.to_list
           (Option.map
-             (Datatypes.admissible ~loc:l ctx.given.types result
+             (Datatypes.result_admissible ~loc:l ctx.given.types result
                 (R.Expr.var ~loc:l (name ~loc:l "r")))
              ~f:(fun admissible ->
                R.Spec.make
@@ -1888,7 +1902,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
     prepared_pre_formulas = input_domains @ logical_requires @ execution.resources;
     prepared_post_formulas =
       Option.to_list
-        (Datatypes.admissible ~loc:l ctx.given.types result
+        (Datatypes.result_admissible ~loc:l ctx.given.types result
            (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r")))
       @ logical_ensures @ execution_ensures;
   }
@@ -1919,7 +1933,7 @@ let forwarding_body ?actual ~at ~self ~target ~result ~atomic prepared =
   let actual = Option.value actual ~default:prepared in
   let* execution_stmts, execution_args =
     if List.is_empty actual.prepared_execution.formals then State.return ([], [])
-    else Mutex_execution.call_arguments ~at prepared.prepared_execution
+    else Execution_context.call_arguments ~at prepared.prepared_execution
   in
   let available =
     List.filter_map (List.zip_exn prepared.prepared_implicit implicit_args)
@@ -2069,15 +2083,22 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
 
 (** An assumed library value or procedure, using the shared contract preparation. *)
 let library_function ?raising ?opens ctx ~(at : Location.t) ~name ~args ~result contract =
+  let open State.Syntax in
+  let* () =
+    State.of_result
+      (Datatypes.validate_callable_indices ctx.given.types ~at ~args ~result)
+  in
   match (args, contract) with
   | [], None ->
       let open State.Syntax in
-      let* () = State.note_domain ctx.given.types result in
+      let* () =
+        State.note_domain ctx.given.types (Datatypes.result_type ctx.given.types result)
+      in
       let+ result_type = State.typ ctx ~at result in
       let l = loc at in
       R.Callable.func ~loc:l
         ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
-        ~ensures:(Option.to_list (value_spec ctx ~loc:l result "r"))
+        ~ensures:(Option.to_list (result_spec ctx ~loc:l result "r"))
         (ident ~loc:l name) None
   | [], Some _ ->
       State.of_result

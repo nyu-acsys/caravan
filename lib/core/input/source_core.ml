@@ -143,6 +143,9 @@ type t = {
   proof_resources : proof_resource list;
   signature_resources : (Location.t * proof_resource) list;
   proof_fields : proof_field list;
+  field_disciplines : Field_disciplines.t list;
+  signature_field_disciplines : Field_disciplines.t list;
+  proof_access_fields : Access_fields.t list;
   proof_aus : proof_au list;
   proof_tasks : proof_task list;
   proof_applications : Functor_context.application list;
@@ -156,6 +159,16 @@ type t = {
   project_dependencies : string list;
   spec_bindings : Types.signature;
 }
+
+let visibility_required source =
+  Field_disciplines.shared source.field_disciplines
+  || Field_disciplines.shared source.signature_field_disciplines
+  || (not (List.is_empty source.proof_access_fields))
+  || List.exists source.proof_resources ~f:(fun resource ->
+      List.equal String.equal resource.resource_functor
+        [ Mutex_visibility_contract.resource_interface ]
+      || List.equal String.equal resource.resource_functor
+           [ Mutex_visibility_contract.protocol_name ])
 
 let library_proof_for_owner source owner =
   Option.bind owner ~f:(fun owner ->
@@ -309,6 +322,7 @@ let rec longident : S.qualid -> Longident.t = function
 
 let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
   match t with
+  | PTtyany -> Ast_helper.Typ.any ~loc:at ()
   | PTtyvar id -> Ast_helper.Typ.var ~loc:id.pid_loc id.pid_str
   | PTtyapp (q, args) ->
       let loc = S.qualid_loc q in
@@ -319,6 +333,20 @@ let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
       Ast_helper.Typ.tuple ~loc:at (List.map ts ~f:(fun t -> (None, core_type ~at t)))
   | PTarrow (a, b) ->
       Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at a) (core_type ~at b)
+  | PTvariant (bound, tags) ->
+      let fields =
+        List.map tags ~f:(fun tag ->
+            Ast_helper.Rf.tag ~loc:tag.pid_loc
+              { txt = tag.pid_str; loc = tag.pid_loc }
+              true [])
+      in
+      let closed, present =
+        match bound with
+        | Closed_row -> (Asttypes.Closed, None)
+        | Lower_row -> (Open, None)
+        | Upper_row -> (Closed, Some [])
+      in
+      Ast_helper.Typ.variant ~loc:at fields closed present
 
 let find_type_by_name env name =
   try Some (Env.find_type_by_name (Lident name) env) with Stdlib.Not_found -> None

@@ -1,0 +1,2 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+module Reader = Ghost.Task (struct let operation = read end)

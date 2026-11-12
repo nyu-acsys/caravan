@@ -1,0 +1,10 @@
+module Value = Ghost.Frozen (struct
+  let field (cell : 'a cell) = cell.value
+end)
+
+module Reader = Ghost.Task (struct let operation = read end)
+module Factory = Ghost.Task (struct let operation = create end)
+
+module Worker (A : Element) = struct
+  module Job = Ghost.Task (struct let operation = work end)
+end

@@ -1,0 +1,1 @@
+module Reader = Ghost.Task (struct let operation = read end)

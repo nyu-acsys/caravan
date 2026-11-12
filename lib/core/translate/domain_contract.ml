@@ -72,11 +72,18 @@ let runtime_support ~loc model =
        ~params:[ (ident ~loc "Task", reference ~loc model.signature_name) ]
        (ident ~loc model.runtime_name.name)
        [
+         R.Member.field ~loc ~ghost:true (ident ~loc "join_token") (R.Type.ref ~loc);
          R.Member.callable
            (R.Callable.func ~loc ~formals:[ handle ] ~returns:[ captures ]
               (ident ~loc "captures_of") None);
          R.Member.callable
-           (R.Callable.func ~loc ~kind:Pred ~formals:[ handle ] (ident ~loc "claim") None);
+           (R.Callable.func ~loc ~kind:Pred ~formals:[ handle ] (ident ~loc "claim")
+              (Some
+                 (R.Expr.own ~loc
+                    [
+                      R.Expr.field ~loc (variable ~loc "h") (name ~loc "join_token");
+                      variable ~loc "h";
+                    ])));
          R.Member.callable
            (R.Callable.func ~loc ~kind:Pred ~inline:true ~formals:[ handle; captures ]
               (ident ~loc "handle")

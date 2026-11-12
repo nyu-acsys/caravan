@@ -1027,7 +1027,9 @@ let run ~(history : History.encoding) (scopes : Program_scopes.t)
               let* scheme =
                 Polymorphic_functions.discover
                   ~additional:(Program_declarations.parameter_types f)
-                  ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+                  ~expand:(Datatypes.expand types)
+                  ~project:(Datatypes.representation_arguments types)
+                  ~at:f.loc f.scheme_type
               in
               (* Application contracts are checked even when their body is shared. *)
               let contract_types =

@@ -32,6 +32,7 @@ let name = function
   | Proof_au { au_name; _ } -> au_name
   | Proof_task { task_name; _ } -> task_name
   | Proof_field { field_name; _ } -> field_name
+  | Proof_access_field { access_name; _ } -> access_name
   | Proof_function { function_name; _ } -> function_name
   | Proof_lemma { lemma_name; _ } -> lemma_name
   | Proof_state { state_name; _ } -> state_name

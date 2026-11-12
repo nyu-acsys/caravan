@@ -1,0 +1,10 @@
+predicate [@inline] edge (node : ('a, [ `Node ]) node) (channel : 'a link Atomic.t) =
+  match node with Node cell -> own cell.next channel
+
+proof result = next [channel : 'a link Atomic.t] node
+  requires (edge node channel)
+  ensures (edge node channel && result === channel) = ()
+
+proof result = load_next [channel : 'a link Atomic.t] [value : 'a link] node
+  requires (edge node channel && own channel value)
+  ensures (edge node channel && own channel value && result === value) = ()

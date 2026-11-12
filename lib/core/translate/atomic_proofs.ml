@@ -141,6 +141,15 @@ let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loo
           State.return [ Mutex_contract.execution_context ~loc:l owner held ]
       | _ -> State.return []
   in
+  let execution_invariants =
+    execution_invariants
+    @
+    if ctx.given.visibility_execution then
+      Option.to_list
+        (Option.map ctx.given.execution_owner
+           ~f:(Execution_contract.visibility_context ~loc:l))
+    else []
+  in
   let env =
     List.fold free ~init:env ~f:(fun env (x, raven, t, _, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })

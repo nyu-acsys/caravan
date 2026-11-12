@@ -1,0 +1,21 @@
+module Value = Ghost.Frozen (struct
+  let field (cell : cell) = cell.value
+end)
+
+module Box = Ghost.Frozen (struct
+  let field (cell : 'a box) = cell.contents
+end)
+
+module Count = Ghost.Frozen (struct
+  let field (Node cell : node) = cell.count
+end)
+
+module Generic (Storage : Storage) = struct
+  module Item = Ghost.Frozen (struct
+    let field (cell : 'a Storage.t) = cell.item
+  end)
+end
+
+module ActualItem = Ghost.Frozen (struct
+  let field (cell : 'a Storage.t) = cell.item
+end)

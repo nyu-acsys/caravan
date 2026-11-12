@@ -105,11 +105,14 @@ let declaration_shape declaration =
       ("proof_module", true, [ module_loc ])
   | Proof_predicate p ->
       ("predicate", false, List.map (Option.to_list p.pred_body) ~f:term)
-  | Proof_lemma { lemma_requires; lemma_ensures; lemma_variant; lemma_body; _ } ->
+  | Proof_lemma
+      { lemma_requires; lemma_ensures; lemma_variant; lemma_opens; lemma_body; _ } ->
       ( "lemma",
         false,
         lemma_body.proof_loc
-        :: List.map (lemma_requires @ lemma_ensures @ lemma_variant) ~f:term )
+        :: List.map (lemma_requires @ lemma_ensures @ lemma_variant) ~f:term
+        @ Option.value_map lemma_opens ~default:[] ~f:(fun (at, entries) ->
+            at :: List.map entries ~f:term) )
   | Proof_function { function_body; function_variant; _ } ->
       ("function", false, List.map (function_body :: function_variant) ~f:term)
   | Proof_invariant { inv_body; _ } -> ("invariant", false, [ term inv_body ])
@@ -128,6 +131,8 @@ let declaration_shape declaration =
   | Proof_au _ -> ("atomic_update", false, [])
   | Proof_task _ -> ("domain_task", false, [])
   | Proof_field _ -> ("field", false, [])
+  | Proof_access_field { access_selector; _ } ->
+      ("shared_field", false, [ term access_selector ])
   | Proof_state _ -> ("state", false, [])
 
 let runtime_modules ~parent typed =

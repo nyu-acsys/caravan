@@ -148,8 +148,10 @@ let types resources data =
 let transparent_protected_resource resource =
   resource.resource_definition
   && Option.is_some resource.resource_descriptor.alias
-  && List.equal String.equal resource.resource_functor
-       [ Mutex_contract.resource_interface ]
+  && (List.equal String.equal resource.resource_functor
+        [ Mutex_contract.resource_interface ]
+     || List.equal String.equal resource.resource_functor
+          [ Mutex_visibility_contract.resource_interface ])
 
 (** Manifest carrier constraints use a refined interface at the public boundary. *)
 let interface_name resource =
@@ -172,6 +174,8 @@ let protected_carrier resources resource =
       if
         List.equal String.equal resource.resource_functor
           [ Mutex_contract.resource_interface ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_visibility_contract.resource_interface ]
       then
         Option.bind resource.resource_descriptor.alias
           ~f:(Datatypes.instantiate_alias resource.resource_parameters arguments)
@@ -180,7 +184,9 @@ let protected_carrier resources resource =
         | Some path -> actual path
         | None
           when List.equal String.equal resource.resource_functor
-                 [ Mutex_contract.protocol_name ] ->
+                 [ Mutex_contract.protocol_name ]
+               || List.equal String.equal resource.resource_functor
+                    [ Mutex_visibility_contract.protocol_name ] ->
             List.find_map resource.resource_arguments ~f:(function
               | Module_argument path -> actual path
               | Type_argument _ -> None)
@@ -205,7 +211,9 @@ let infer_protected_arguments ?(fallback = []) ~types ~environment ~at resources
         List.filter_map candidates ~f:(fun candidate ->
             Result.ok
               (Generic_parameters.instantiate ~environment
-                 ~opaque:(Datatypes.is_opaque types) ~expand ~at probe [ Some candidate ]))
+                 ~opaque:(Datatypes.is_opaque types) ~expand
+                 ~project:(Datatypes.representation_arguments types)
+                 ~at probe [ Some candidate ]))
         |> List.fold ~init:[] ~f:(fun choices arguments ->
             if List.mem choices arguments ~equal then choices else arguments :: choices)
       in

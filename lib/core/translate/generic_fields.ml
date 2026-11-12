@@ -24,7 +24,9 @@ let specialize ~types ~environment ~at ~owner ~value (field : Source.proof_field
     let ( let* ) = Result.( >>= ) in
     let* arguments =
       Generic_parameters.instantiate ~environment ~opaque:(Datatypes.is_opaque types)
-        ~expand:(Datatypes.expand types) ~at worker [ owner; value ]
+        ~expand:(Datatypes.expand types)
+        ~project:(Datatypes.representation_arguments types)
+        ~at worker [ owner; value ]
       |> Result.map_error ~f:(fun _ ->
           Report.error Type at
             "Cannot infer consistent type parameters for this ghost field from its owner \

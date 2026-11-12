@@ -1,0 +1,3 @@
+module Counter = Ghost.Frozen (struct
+  let field (record : fields) = record.counter
+end)

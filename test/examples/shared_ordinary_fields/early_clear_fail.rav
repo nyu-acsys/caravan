@@ -1,0 +1,5 @@
+proc clear_without_retirement(c: Ref, history: Ref, lifetime: Ref, ghost initial: Int)
+  requires Example.cell(c, history, lifetime, initial)
+{
+  Example.clear(c, history, lifetime, initial);
+}

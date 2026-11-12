@@ -1,0 +1,13 @@
+module References: Library.Type { rep type T = Ref }
+module ReferencePayload = Payload[References]
+
+field linear: Int
+
+// Duplicating the origin of a stored pointer cannot duplicate its pointee.
+proc duplicate_payload(history: Ref, p: Ref)
+  requires ReferencePayload.Writes.observation(history, ReferencePayload.Raw.payload(p))
+    && own(p.linear, 42, 1.0)
+  ensures own(p.linear, 42, 1.0) && own(p.linear, 42, 1.0)
+{
+  ReferencePayload.Writes.duplicate(history, ReferencePayload.Raw.payload(p));
+}

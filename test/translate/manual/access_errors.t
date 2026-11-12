@@ -46,14 +46,14 @@ Access proofs preserve the operation, its result, and its source attachment.
   [Error] File "access_nonatomic_call_fail.ml", line 2, columns 0-63:
   2 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.scope must follow an Atomic access or a checked procedure call.
+  Type Error: Ghost.scope must follow an ordinary field access, an Atomic access or a checked procedure call.
   [1]
 
   $ caravan --shh access_existing_value_fail.ml
   [Error] File "access_existing_value_fail.ml", line 4, columns 0-63:
   4 | (*@ Ghost.scope (fun read -> let result = read () in result) *)
       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  Type Error: Ghost.scope must follow an Atomic access or a checked procedure call.
+  Type Error: Ghost.scope must follow an ordinary field access, an Atomic access or a checked procedure call.
   [1]
 
   $ caravan --shh access_automatic_fail.ml

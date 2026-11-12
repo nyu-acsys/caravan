@@ -15,11 +15,17 @@ let map_group types ~f =
       | Ttuple fields -> List.map fields ~f:snd
       | _ -> failwith "A type projection must preserve tuple structure")
 
+(** Preserve row constraints when rebuilding compiler type structure. *)
+let map_desc f = function
+  | Types.Tvariant row ->
+      Types.Tvariant (Btype.copy_row f true row false (f (Types.row_more row)))
+  | description -> Btype.copy_type_desc f description
+
 (** Fresh generic structure lets compiler instantiation reach quantified variables. *)
 let rec scheme_structure typ =
   match Types.get_desc typ with
   | Tvar _ | Tunivar _ -> typ
-  | desc -> Btype.newgenty (Btype.copy_type_desc scheme_structure desc)
+  | desc -> Btype.newgenty (map_desc scheme_structure desc)
 
 let prefix = "$caravan_"
 

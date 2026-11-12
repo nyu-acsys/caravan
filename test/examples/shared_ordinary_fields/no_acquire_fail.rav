@@ -1,0 +1,7 @@
+// A receiving reader has a publication handle, but no synchronization capability.
+proc publication_without_acquire(cell: Ref, channel: Ref)
+  requires Counters.published(channel, 42)
+  opens Counters.published
+{
+  val result := Counters.read_frozen(cell, channel, 42);
+}

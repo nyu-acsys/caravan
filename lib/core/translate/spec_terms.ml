@@ -50,13 +50,16 @@ let infer_atomic_signature env ~at ?expected signature method_ actuals =
       else
         let parameters = inputs @ outputs in
         let* generic =
-          Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at generic
-            parameters
+          Generic_parameters.rebind ~expand:(Datatypes.expand env.data)
+            ~project:(Datatypes.representation_arguments env.data)
+            ~at generic parameters
         in
         let inference =
           Generic_parameters.instantiate ~environment:env.ctx.given.env
             ~opaque:(Datatypes.is_opaque env.data)
-            ~expand:(Datatypes.expand env.data) ~at generic
+            ~expand:(Datatypes.expand env.data)
+            ~project:(Datatypes.representation_arguments env.data)
+            ~at generic
             (actuals @ expected_outputs env outputs expected)
         in
         let* arguments =
@@ -180,6 +183,9 @@ let rec term_type env (t : S.term) =
         },
         [ _ ] ) ) ->
       Some Predef.type_int
+  | Tvar (Qdot (Qid ghost, self)), _
+    when String.equal ghost.pid_str "Ghost" && String.equal self.pid_str "self" ->
+      Result.ok (Source.ghost_type env.ctx.given.env ~at:t.term_loc)
   | Tvar (Qid { pid_str = x; _ }), _ ->
       List.Assoc.find env.var_types x ~equal:String.equal
   | _, ({ term_desc = Tvar (Qid { pid_str = "drop" | "take"; _ }); _ }, [ _; s ]) ->
@@ -616,7 +622,9 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
               }
         | None ->
             State.of_result
-              (Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at original
+              (Generic_parameters.rebind ~expand:(Datatypes.expand env.data)
+                 ~project:(Datatypes.representation_arguments env.data)
+                 ~at original
                  (signature.lemma_inputs @ signature.lemma_outputs))
       in
       let target = Qualified_name.of_string signature.lemma_raven in
@@ -649,7 +657,9 @@ let instantiate_proof_signature env ~at ?expected ?term signature args =
           let inferred =
             Generic_parameters.instantiate ~environment:env.ctx.given.env
               ~opaque:(Datatypes.is_opaque env.data)
-              ~expand:(Datatypes.expand env.data) ~at worker (supplied @ outputs)
+              ~expand:(Datatypes.expand env.data)
+              ~project:(Datatypes.representation_arguments env.data)
+              ~at worker (supplied @ outputs)
           in
           match (inferred, protected) with
           | Ok _, _ | Error _, None -> inferred
@@ -731,13 +741,16 @@ let predicate_instance env ~at ~key ~target args =
         match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
         | None -> Ok worker
         | Some (_, parameters) ->
-            Generic_parameters.rebind ~expand:(Datatypes.expand env.data) ~at worker
-              parameters
+            Generic_parameters.rebind ~expand:(Datatypes.expand env.data)
+              ~project:(Datatypes.representation_arguments env.data)
+              ~at worker parameters
       in
       let* arguments =
         Generic_predicates.instantiate ~environment:env.ctx.given.env
           ~opaque:(Datatypes.is_opaque env.data)
-          ~expand:(Datatypes.expand env.data) ~at worker
+          ~expand:(Datatypes.expand env.data)
+          ~project:(Datatypes.representation_arguments env.data)
+          ~at worker
           (List.map args ~f:(term_type env))
       in
       Ok (Some (worker, arguments))
@@ -942,6 +955,14 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
   | Tconst _ -> State.of_result (unsupported at "This constant")
   | Tvar (Qid { pid_str = x; _ }) when is_constructor x -> constructor env t []
   | Tvar (Qdot (_, id)) when is_constructor id.pid_str -> constructor env t []
+  | Tvar (Qdot (Qid ghost, self))
+    when String.equal ghost.pid_str "Ghost" && String.equal self.pid_str "self" ->
+      begin match env.ctx.given.execution_owner with
+      | Some owner -> State.return owner
+      | None ->
+          State.of_result
+            (error at "Ghost.self requires an executing procedure's context")
+      end
   | Tvar q when Option.is_some (logical_signature env q) ->
       logical_application ~term:t env ~at (Option.value_exn (logical_signature env q)) []
   | Tvar (Qid { pid_str = x; _ })
@@ -1422,10 +1443,22 @@ and application env (t : S.term) =
   let at = t.term_loc in
   let l = loc at in
   let head, args = spine t [] in
+  let field_method =
+    match head.term_desc with Tvar q -> access_method env q | _ -> None
+  in
   match (head.term_desc, args) with
   | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result
         (error head.term_loc "A local proof value cannot be called as a logical function")
+  | Tvar (Qdot (Qid ghost, method_)), [ source; target ]
+    when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "handoff" ->
+      let* typ = State.of_result (Source.ghost_type env.ctx.given.env ~at) in
+      let* values = typed_arguments env ~at [ typ; typ ] [ source; target ] in
+      begin match values with
+      | [ source; target ] ->
+          State.return (Execution_contract.visibility_handoff ~loc:l source target)
+      | _ -> State.of_result (error at "A handoff needs two execution owners")
+      end
   | Tvar q, [ source_owner; held ]
     when Source.is_mutex_context
            ?trusted:env.ctx.given.proof_support.execution_context_path env.ctx.given.env q
@@ -1468,6 +1501,183 @@ and application env (t : S.term) =
     ->
       State.of_result
         (error at "Ghost.Mutex.context expects an owner and a held-lock set")
+  | Tvar _, args
+    when Option.exists field_method ~f:(fun (field, _) ->
+             Poly.equal field.Access_fields.kind S.Relaxed) ->
+      let field, method_ = Option.value_exn field_method in
+      let reference name_ =
+        ( R.Var.make ~loc:l (ident ~loc:l name_) (R.Type.ref ~loc:l),
+          R.Expr.var ~loc:l (name ~loc:l name_) )
+      in
+      let state ?executing owner current entries published =
+        let* family, receiver, selected = field_selection env field t owner in
+        let* current = formula env current in
+        let* entries = formula env entries in
+        let event_var, event = reference "caravan$relaxed_event" in
+        let cut_var, cut = reference "caravan$relaxed_cut" in
+        let* bound, published, shared =
+          match published with
+          | Some published ->
+              let+ published = formula env published in
+              ([ event_var; cut_var ], published, true)
+          | None ->
+              let published_name = "caravan$relaxed_published" in
+              let published_type =
+                R.Type.set ~loc:l
+                  (R.Type.named ~loc:l (qualified_name ~loc:l (family ^ ".Entry")) [])
+              in
+              let published = R.Expr.var ~loc:l (name ~loc:l published_name) in
+              State.return
+                ( [
+                    event_var;
+                    R.Var.make ~loc:l (ident ~loc:l published_name) published_type;
+                    cut_var;
+                  ],
+                  published,
+                  false )
+        in
+        let* executing =
+          match executing with
+          | None -> State.return None
+          | Some executing ->
+              let+ executing = formula env executing in
+              Some executing
+        in
+        let private_bound, private_owner =
+          match executing with
+          | Some executing ->
+              ([], R.Expr.tuple ~loc:l [ R.Expr.bool ~loc:l true; executing ])
+          | None ->
+              let private_name = "caravan$relaxed_private_owner" in
+              ( [
+                  R.Var.make ~loc:l (ident ~loc:l private_name)
+                    (R.Type.tuple ~loc:l [ R.Type.bool ~loc:l; R.Type.ref ~loc:l ]);
+                ],
+                R.Expr.var ~loc:l (name ~loc:l private_name) )
+        in
+        let bound = bound @ private_bound in
+        let state =
+          R.Expr.call ~loc:l
+            (qualified_name ~loc:l (family ^ ".state"))
+            [ receiver; current; event; entries; published; cut; private_owner ]
+        in
+        let body =
+          if shared then
+            R.Expr.binary ~loc:l And
+              (R.Expr.binary ~loc:l Neq cut (R.Expr.null ~loc:l))
+              state
+          else state
+        in
+        let body =
+          match executing with
+          | None -> body
+          | Some executing ->
+              R.Expr.binary ~loc:l And body
+                (R.Expr.binary ~loc:l And
+                   (R.Expr.binary ~loc:l Eq cut (R.Expr.null ~loc:l))
+                   (Visibility_contract.seen ~loc:l
+                      ~module_name:Execution_contract.module_name executing
+                      (R.Expr.set ~loc:l [ event ])))
+        in
+        State.return (R.Expr.binary ~loc:l And selected (R.Expr.exists ~loc:l bound body))
+      in
+      let publication ?executing ?covered owner =
+        let* family, receiver, selected = field_selection env field t owner in
+        let cut_var, cut = reference "caravan$relaxed_cut" in
+        let published =
+          R.Expr.call ~loc:l
+            (qualified_name ~loc:l (family ^ ".published"))
+            [ receiver; cut ]
+        in
+        let+ body =
+          match (executing, covered) with
+          | Some executing, _ ->
+              let+ executing = formula env executing in
+              R.Expr.binary ~loc:l And published
+                (Visibility_contract.seen ~loc:l
+                   ~module_name:Execution_contract.module_name executing
+                   (R.Expr.set ~loc:l [ cut ]))
+          | None, Some lower ->
+              let+ lower = formula env lower in
+              R.Expr.binary ~loc:l And published (R.Expr.binary ~loc:l In cut lower)
+          | None, None -> State.return published
+        in
+        R.Expr.binary ~loc:l And selected (R.Expr.exists ~loc:l [ cut_var ] body)
+      in
+      begin match (method_, args) with
+      | "state", [ owner; current; entries ] -> state owner current entries None
+      | "private_state", [ executing; owner; current; entries ] ->
+          state ~executing owner current entries None
+      | "shared_state", [ owner; current; entries; published ] ->
+          state owner current entries (Some published)
+      | "published", [ owner ] -> publication owner
+      | "visible", [ executing; owner ] -> publication ~executing owner
+      | "covered", [ lower; owner ] -> publication ~covered:lower owner
+      | "observed", [ owner; event; value ] ->
+          let* family, receiver, selected = field_selection env field t owner in
+          let* event = formula env event in
+          let+ value = formula env value in
+          R.Expr.binary ~loc:l And selected
+            (R.Expr.call ~loc:l
+               (qualified_name ~loc:l (family ^ ".observed"))
+               [ receiver; event; value ])
+      | ( ( "snapshot" | "observe" | "reconcile" | "duplicate" | "publish" | "release"
+          | "acquire" | "adopt" | "transfer" ),
+          _ ) ->
+          State.of_result
+            (error at "Relaxed journal operations are only allowed as proof steps")
+      | _ -> State.of_result (error at "Incorrect arguments for a Relaxed field resource")
+      end
+  | Tvar _, args when Option.is_some field_method ->
+      let field, method_ = Option.value_exn field_method in
+      let resource ?executing ?covered owner value =
+        let* family, receiver, selected = frozen_selection env field t owner in
+        let* value = formula env value in
+        let cut_name = "caravan$frozen_cut" in
+        let cut = R.Expr.var ~loc:l (name ~loc:l cut_name) in
+        let frozen =
+          R.Expr.call ~loc:l
+            (qualified_name ~loc:l (family ^ ".frozen"))
+            [ receiver; value; cut ]
+        in
+        let+ body =
+          match (executing, covered) with
+          | None, None -> State.return frozen
+          | None, Some view ->
+              let+ view = formula env view in
+              R.Expr.binary ~loc:l And frozen (R.Expr.binary ~loc:l In cut view)
+          | Some executing, _ ->
+              let+ owner = formula env executing in
+              R.Expr.binary ~loc:l And frozen
+                (Visibility_contract.seen ~loc:l
+                   ~module_name:Execution_contract.module_name owner
+                   (R.Expr.set ~loc:l [ cut ]))
+        in
+        R.Expr.binary ~loc:l And selected
+          (R.Expr.exists ~loc:l
+             [ R.Var.make ~loc:l (ident ~loc:l cut_name) (R.Type.ref ~loc:l) ]
+             body)
+      in
+      begin match (method_, args) with
+      | "private_state", [ executing; owner; value; event ] ->
+          let* family, receiver, selected = field_selection env field t owner in
+          let* executing = formula env executing in
+          let* value = formula env value in
+          let+ event = formula env event in
+          R.Expr.binary ~loc:l And selected
+            (R.Expr.call ~loc:l
+               (qualified_name ~loc:l (family ^ ".ownership"))
+               [ receiver; value; R.Expr.real ~loc:l 1.; executing; event ])
+      | "frozen", [ owner; value ] -> resource owner value
+      | "visible", [ executing; owner; value ] -> resource ~executing owner value
+      | "covered", [ view; owner; value ] -> resource ~covered:view owner value
+      | ( ( "freeze" | "release" | "release_private" | "observe" | "snapshot" | "split"
+          | "adopt" | "transfer" ),
+          _ ) ->
+          State.of_result
+            (error at "Field visibility operations are only allowed as proof steps")
+      | _ -> State.of_result (error at "Incorrect arguments for a Frozen field resource")
+      end
   | Tvar q, args when Option.is_some (atomic_method env q) ->
       let signature, method_ = Option.value_exn (atomic_method env q) in
       begin match (method_, atomic_inputs signature method_) with
@@ -1576,7 +1786,11 @@ and application env (t : S.term) =
                   (R.Expr.binary ~loc:l And
                      (R.Expr.binary ~loc:l In hc registrations)
                      (R.Expr.binary ~loc:l Eq (R.Expr.index ~loc:l on hc) key)))))
-  | Tvar (Qid { pid_str = "own"; _ }), ([ location; v ] | [ location; v; _ ]) ->
+  | ( Tvar (Qid { pid_str = "own"; _ }),
+      ( [ location; v ]
+      | [ location; v; _ ]
+      | [ location; v; _; _ ]
+      | [ location; v; _; _; _ ] ) ) ->
       let* expected =
         match ghost_projection env location with
         | None -> State.return (location_type env location)
@@ -1599,11 +1813,68 @@ and application env (t : S.term) =
                  ~expected v)
         | _ -> State.return ()
       in
-      let* location = location_of ?expected env location in
+      let* frozen =
+        match (ghost_projection env location, location.term_desc) with
+        | None, Tfield (owner, Qid label) ->
+            begin match term_type env owner with
+            | Some typ -> State.frozen_field env.ctx.given ~at typ label.pid_str
+            | None -> State.return None
+            end
+        | _ -> State.return None
+      in
+      let* writer =
+        match args with
+        | [ _; _; _; writer ] ->
+            let* () =
+              match frozen with
+              | Some _ -> State.return ()
+              | None ->
+                  State.of_result
+                    (error at "The writer argument is supported only for Frozen fields")
+            in
+            let* owner_type = State.of_result (Source.ghost_type env.ctx.given.env ~at) in
+            let* () =
+              State.of_result
+                (Source.check_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                   ~variables:(Logical_context.variables env)
+                   ~expected:owner_type writer)
+            in
+            State.map (formula env writer) ~f:Option.some
+        | _ -> State.return None
+      in
+      let* receiver =
+        match (frozen, location.term_desc) with
+        | Some _, Tfield (owner, _) -> State.map (formula env owner) ~f:Option.some
+        | _ -> State.return None
+      in
+      let* location, release_location = location_with_release ?expected env location in
       let* v = expected_formula env expected v in
+      let* lower =
+        match args with
+        | [ _; _; _; _; lower ] ->
+            let* () =
+              if Option.is_some release_location then State.return ()
+              else
+                State.of_result
+                  (error at "A release bound requires visibility-aware atomic ownership")
+            in
+            let* expected = State.of_result (visibility_view_type env.ctx.given ~at) in
+            let* () =
+              State.of_result
+                (Source.check_logical_expression
+                   ~type_variables:(source_type_variables env.ctx.given)
+                   env.ctx.given.env
+                   ~variables:(Logical_context.variables env)
+                   ~functions:(List.map env.funcs ~f:fst) ~expected lower)
+            in
+            State.map (formula env lower) ~f:Option.some
+        | _ -> State.return None
+      in
       let+ fraction =
         match args with
-        | [ _; _; fraction ] ->
+        | [ _; _; fraction ] | [ _; _; fraction; _ ] | [ _; _; fraction; _; _ ] ->
             let* () =
               match ghost_projection env (List.hd_exn args) with
               | Some (field, _) when resource_field env field ->
@@ -1629,7 +1900,48 @@ and application env (t : S.term) =
             [ fraction ]
         | _ -> State.return []
       in
-      R.Expr.own ~loc:l ([ location; v ] @ fraction)
+      let value_ownership = R.Expr.own ~loc:l ([ location; v ] @ fraction) in
+      begin match (frozen, receiver) with
+      | Some family, Some receiver ->
+          let permission =
+            match fraction with [ fraction ] -> fraction | _ -> R.Expr.real ~loc:l 1.0
+          in
+          let ownership writer =
+            R.Expr.call ~loc:l
+              (qualified_name ~loc:l (family ^ ".ownership"))
+              [ receiver; v; permission; writer ]
+          in
+          begin match writer with
+          | Some writer -> ownership writer
+          | None ->
+              let writer_name = "caravan$frozen_writer" in
+              let writer = R.Expr.var ~loc:l (name ~loc:l writer_name) in
+              R.Expr.exists ~loc:l
+                [ R.Var.make ~loc:l (ident ~loc:l writer_name) (R.Type.ref ~loc:l) ]
+                (ownership writer)
+          end
+      | _ ->
+          begin match release_location with
+          | None -> value_ownership
+          | Some release_location ->
+              let release_name = "caravan$atomic_release" in
+              let release = R.Expr.var ~loc:l (name ~loc:l release_name) in
+              R.Expr.exists ~loc:l
+                [
+                  R.Var.make ~loc:l (ident ~loc:l release_name)
+                    (Visibility_contract.view_type ~loc:l);
+                ]
+                (R.Expr.binary ~loc:l And value_ownership
+                   (let ownership =
+                      R.Expr.own ~loc:l ([ release_location; release ] @ fraction)
+                    in
+                    match lower with
+                    | None -> ownership
+                    | Some lower ->
+                        R.Expr.binary ~loc:l And ownership
+                          (R.Expr.binary ~loc:l Subseteq lower release)))
+          end
+      end
   | Tvar (Qid { pid_str = "([])"; _ }), [ s; i ] ->
       let* s = formula env s in
       let+ i = formula env i in
@@ -1770,6 +2082,68 @@ and application env (t : S.term) =
       R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "List" ] f) args
   | _ -> State.of_result (unsupported at "A call of a function in a contract")
 
+and field_selection ?(expected = Predef.type_bool) env (field : Access_fields.t)
+    (application : S.term) owner =
+  let at = application.term_loc in
+  let l = loc at in
+  let* () =
+    State.of_result
+      (Source.check_logical_expression
+         ~type_variables:(source_type_variables env.ctx.given)
+         env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+         ~variables:(Logical_context.variables env)
+         ~expected application)
+  in
+  let* owner_type =
+    State.of_result
+      (Source.infer_logical_expression
+         ~type_variables:(source_type_variables env.ctx.given)
+         env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+         ~variables:(Logical_context.variables env)
+         owner)
+  in
+  let* receiver = formula env owner in
+  let rec project (pattern : Typedtree.pattern) typ receiver =
+    match pattern.pat_desc with
+    | Tpat_var _ -> State.return (typ, receiver, R.Expr.bool ~loc:l true)
+    | Tpat_construct (_, constructor, [ inner ], _) ->
+        begin match
+          occurrence_constructor ~environment:pattern.pat_env env.data typ constructor
+        with
+        | Some (_, constructor) ->
+            begin match (constructor.args, constructor.fields) with
+            | [ inner_type ], [ slot ] ->
+                let condition =
+                  R.Expr.is_ ~loc:l receiver (ident ~loc:l constructor.raven)
+                in
+                let+ typ, receiver, selected =
+                  project inner inner_type
+                    (R.Expr.field ~loc:l receiver (qualified_name ~loc:l slot))
+                in
+                (typ, receiver, R.Expr.binary ~loc:l And condition selected)
+            | _ ->
+                State.of_result (unsupported at "This shared-field receiver projection")
+            end
+        | None ->
+            State.of_result (unsupported at "This shared-field receiver constructor")
+        end
+    | _ -> State.of_result (unsupported at "This shared-field receiver pattern")
+  in
+  let* receiver_type, receiver, selected =
+    project field.receiver_pattern owner_type receiver
+  in
+  let* family =
+    match field.kind with
+    | S.Frozen -> State.frozen_field env.ctx.given ~at receiver_type field.label.lbl_name
+    | S.Relaxed ->
+        State.relaxed_field env.ctx.given ~at receiver_type field.label.lbl_name
+  in
+  let+ family = State.of_result (Report.expect ~at "The shared field family" family) in
+  (family, receiver, selected)
+
+and frozen_selection ?(expected = Predef.type_bool) env field application owner =
+  field_selection ~expected env field application owner
+
 and typed_arguments env ~at inputs args =
   let is_list = is_list_term env in
   if List.length args <> List.length inputs then
@@ -1871,8 +2245,24 @@ and quantified env (t : S.term) =
 
 (** The location [t], as in [own r.count n]: a field of a variable of known type. *)
 and location_of ?expected env (t : S.term) =
+  let+ location, _ = location_with_release ?expected env t in
+  location
+
+and location_with_release ?expected env (t : S.term) =
   let at = t.term_loc in
   let l = loc at in
+  let located ?(atomic = false) receiver field =
+    let location = R.Expr.field ~loc:l receiver (qualified_name ~loc:l field) in
+    let release =
+      if atomic && visibility_encoding env.ctx.given then
+        let contents = Qualified_name.of_string field in
+        Some
+          (R.Expr.field ~loc:l receiver
+             (R.Name.make ~loc:l ~path:contents.path "release"))
+      else None
+    in
+    (location, release)
+  in
   let* () =
     let owner = match t.term_desc with Tfield (owner, _) -> owner | _ -> t in
     match term_type env owner with
@@ -1908,7 +2298,7 @@ and location_of ?expected env (t : S.term) =
              ~expected:field.field_owner owner)
       in
       let+ owner = formula env owner in
-      R.Expr.field ~loc:l owner (qualified_name ~loc:l (ghost_field_name field))
+      (R.Expr.field ~loc:l owner (qualified_name ~loc:l (ghost_field_name field)), None)
   | None -> (
       let* () =
         match spine t [] with
@@ -1931,16 +2321,13 @@ and location_of ?expected env (t : S.term) =
           | Some typ -> begin
               let* field = State.field_of_type env.ctx.given ~at typ label in
               match (field, atomic_in_record env.ctx typ label) with
-              | Some field, _ ->
-                  State.return (R.Expr.field ~loc:l r (qualified_name ~loc:l field))
+              | Some field, _ -> State.return (located r field)
               | None, Some atomic -> begin
                   (* An atomic that an immutable record holds. *)
                   let atomic_ref = R.Expr.field ~loc:l r (qualified_name ~loc:l label) in
                   let* field = State.field_of_type env.ctx.given ~at atomic "" in
                   match field with
-                  | Some field ->
-                      State.return
-                        (R.Expr.field ~loc:l atomic_ref (qualified_name ~loc:l field))
+                  | Some field -> State.return (located ~atomic:true atomic_ref field)
                   | None ->
                       State.of_result
                         (error at (Printf.sprintf "%s has no mutable field %s" x label))
@@ -1960,8 +2347,7 @@ and location_of ?expected env (t : S.term) =
             | Some typ -> State.field_of_type env.ctx.given ~at typ ""
           in
           match field with
-          | Some field ->
-              State.return (R.Expr.field ~loc:l r (qualified_name ~loc:l field))
+          | Some field -> State.return (located ~atomic:true r field)
           | None ->
               State.of_result
                 (error at
@@ -1969,15 +2355,12 @@ and location_of ?expected env (t : S.term) =
         end
       | _ -> begin
           (* An atomic given by an expression, as [last s.cells]. *)
-          let* field =
-            match term_type env t with
-            | Some typ -> State.field_of_type env.ctx.given ~at typ ""
-            | None -> State.return None
-          in
+          let* typ = State.of_result (equality_term_type env t) in
+          let* field = State.field_of_type env.ctx.given ~at typ "" in
           match field with
           | Some field ->
               let+ r = formula env t in
-              R.Expr.field ~loc:l r (qualified_name ~loc:l field)
+              located ~atomic:true r field
           | None ->
               State.of_result
                 (unsupported at
@@ -2121,7 +2504,12 @@ and spec_match env ~at ?scrutinee ?scrutinee_type v (cases : (S.pat * S.term) li
         | _ -> None
         end
   in
-  match flat [] cases with
+  let indexed =
+    Option.exists scrutinee_type ~f:(fun typ ->
+        Option.is_some
+          (Datatypes.indexed_instance env.data (Datatypes.expand env.data typ)))
+  in
+  match if indexed then None else flat [] cases with
   | Some flat ->
       let case = function
         | `Any id, (p, body) ->

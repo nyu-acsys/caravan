@@ -321,7 +321,19 @@ let proof_context (proof_env : Proof_env.t) ?current_procedure ?at scope preds s
               {
                 signature with
                 lemma_raven =
-                  Option.value (definition_target binding) ~default:signature.lemma_raven;
+                  begin match signature.lemma_generic with
+                  | Some worker
+                    when Option.exists
+                           (Program_scopes.definition_resource ~source binding.entry.scope)
+                           ~f:(fun resource ->
+                             Program_scopes.resource_has_required_lemma resource
+                             && Option.is_some (Generic_assets.resource_worker resource))
+                    ->
+                      worker.name ^ "." ^ Generic_parameters.member worker
+                  | Some _ | None ->
+                      Option.value (definition_target binding)
+                        ~default:signature.lemma_raven
+                  end;
               } )))
   in
   ( private_preds @ preds,
@@ -499,8 +511,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
         @ [ Fresh_names.fresh ("PolyProof$" ^ (Qualified_name.of_string key).name) ])
     in
     let* worker =
-      Generic_parameters.discover ~expand:(Datatypes.expand types) ~key ~name ~at
-        ~explicit parameters
+      Generic_parameters.discover ~expand:(Datatypes.expand types)
+        ~project:(Datatypes.representation_arguments types)
+        ~key ~name ~at ~explicit parameters
     in
     let worker =
       { worker with name = Generic_family_plan.proof family_plan key worker.name }
@@ -925,6 +938,14 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
   let resources, ghost_fields = proof_assets None in
   let proof_support =
     {
+      visibility_enabled = Source.visibility_required source;
+      access_fields = source.proof_access_fields;
+      field_encoding =
+        (if Source.visibility_required source then
+           Field_encodings.resolve ~fields:decls.frozen_fields
+             ~parameters:decls.frozen_parameters ~inventory:scopes.inventory
+             ~disciplines:(source.field_disciplines @ source.signature_field_disciplines)
+         else empty_proof_support.field_encoding);
       execution_context_path = Source.mutex_context_path source.env;
       runtime_functions =
         Path_bindings.of_list
@@ -1069,8 +1090,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
         in
         let* scheme =
           State.of_result
-            (Polymorphic_functions.discover ~expand:(Datatypes.expand types) ~at:f.loc
-               f.scheme_type)
+            (Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+               ~project:(Datatypes.representation_arguments types)
+               ~at:f.loc f.scheme_type)
         in
         let source_arguments =
           List.map scheme.variables ~f:(fun variable ->
@@ -1095,7 +1117,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
           | None ->
               begin match Types.get_desc typ with
               | Tvar _ | Tunivar _ -> typ
-              | desc -> Ctype.newty (Btype.copy_type_desc source_type desc)
+              | desc -> Ctype.newty (Compiler_types.map_desc source_type desc)
               end
         in
         let preds, spec_funcs, proof_support =
@@ -1138,7 +1160,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
           | Some _, None -> State.return (Some [])
           | Some _, Some worker ->
               State.of_result
-                (Specializations.argument_projection ~at:au_source.au_at
+                (Specializations.argument_projection ~types ~at:au_source.au_at
                    scopes.specialized worker)
         in
         let worker =
@@ -1264,7 +1286,10 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                  map_atomic_types
                    {
                      au_key = key;
-                     au_context = Mutex_execution.enabled source.proof_resources;
+                     au_context =
+                       Execution_contract.context_layout
+                         ~mutex:(Mutex_execution.enabled source.proof_resources)
+                         ~visibility:(Source.visibility_required source);
                      au_generic;
                      au_owner = owner;
                      au_private = shape;
@@ -1309,7 +1334,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                      let* arguments =
                        State.of_result
                          (Polymorphic_functions.instantiate
-                            ~expand:(Datatypes.expand types) ~at:au_source.au_at
+                            ~expand:(Datatypes.expand types)
+                            ~project:(Datatypes.representation_arguments types)
+                            ~at:au_source.au_at
                             { typ = declaration; variables = generic.variables }
                             ~declaration ~occurrence:signature.au_source.au_operation_type)
                      in

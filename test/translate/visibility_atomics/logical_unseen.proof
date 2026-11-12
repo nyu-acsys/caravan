@@ -1,0 +1,8 @@
+module Value = Ghost.Frozen (struct
+  let field (cell : cell) = cell.value
+end)
+
+predicate contents (channel : int Atomic.t) (published : Ghost.t set)
+  (flag [@implicit] : int) = own ~release:published channel flag
+
+module Receive = Ghost.AU (struct let operation = receive end)

@@ -1,0 +1,14 @@
+proc cache_without_acquisition()
+  opens ThreadContext.released
+{
+  val private_write := CacheEvent.write(99, false, 0);
+  val published_write := CacheEvent.write(3, true, 7);
+  val history := CacheWrites.create(private_write);
+  CacheWrites.record(history, {private_write}, published_write);
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val channel := ThreadContext.publish(writer, history, {});
+  val observed := sample_cache(history, reader, channel, {private_write, published_write}, {}, {});
+  CacheWrites.reconcile(history, {private_write, published_write}, observed);
+  assert observed.value <= 4;
+}

@@ -55,6 +55,13 @@ variants, or lists, in both code and specifications. Tests against nullary
 constructors such as `xs = []` remain supported. Use identity to compare references,
 and explicit owned reads to compare their contents.
 
+Mutable inline constructor records retain the identity of their allocated block.
+Physical equality and CAS are exact for a variant whose constructors are nullary
+or mutable inline records. An unboxed wrapper such as the `Link` type in the
+[coverage guide](./ocaml-subset#sec:expressions-types-and-effects) preserves that
+identity without another allocation. An ordinary boxed constructor containing a
+reference does not inherit the reference's exact identity model.
+
 OCaml's physical comparison and `Atomic.compare_and_set` compare boxed immutable
 values, such as nonempty lists, by physical identity. Structurally equal values
 need not be the same allocation, so structural equality does not guarantee CAS

@@ -29,14 +29,119 @@ let scope = State.map State.get_scope ~f:latest
     variables in scope. *)
 let scope_env ctx = State.map scope ~f:(env_of_scope ctx)
 
+let field_proof_signature env (term : S.term) kind method_ =
+  let head, arguments = spine term [] in
+  let prefix_count = if String.equal method_ "transfer" then 3 else 1 in
+  let partial =
+    match head.term_desc with
+    | Tvar qualified when List.length arguments >= prefix_count ->
+        let prefix = List.take arguments prefix_count in
+        let application =
+          List.fold prefix ~init:head ~f:(fun fn arg ->
+              S.{ term with term_desc = Tapply (fn, arg) })
+        in
+        Some (qualified, prefix, application)
+    | _ -> None
+  in
+  Option.bind partial ~f:(fun (qualified, prefix, partial) ->
+      Option.bind
+        (Result.ok (equality_term_type env partial))
+        ~f:(fun partial_type ->
+          let remaining, result = Proof_types.function_arguments partial_type in
+          let outputs =
+            match (kind, method_) with
+            | S.Relaxed, "snapshot" ->
+                begin match Types.get_desc result with
+                | Ttuple [ (_, event); (_, entries) ] -> Some [ event; entries ]
+                | _ -> None
+                end
+            | S.Relaxed, "observe"
+            | S.Frozen, "snapshot"
+            | _, ("publish" | "release" | "release_private") ->
+                Some [ result ]
+            | S.Frozen, "observe"
+            | ( _,
+                ( "freeze" | "split" | "reconcile" | "duplicate" | "acquire" | "adopt"
+                | "transfer" ) ) ->
+                Some []
+            | _ -> None
+          in
+          Option.bind outputs ~f:(fun outputs ->
+              Option.map
+                (Result.ok (Result.all (List.map prefix ~f:(equality_term_type env))))
+                ~f:(fun prefix_types ->
+                  {
+                    lemma_raven = qualid_key qualified;
+                    lemma_constant = false;
+                    lemma_generic = None;
+                    lemma_inputs = prefix_types @ remaining;
+                    lemma_implicit_count = 0;
+                    lemma_outputs = outputs;
+                  }))))
+
 (** A call of a checked proof lemma, separate from logical function applications. *)
 let lemma_call ?expected env (t : S.term) =
   let open State.Syntax in
   let head, args = spine t [] in
-  match head.term_desc with
-  | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+  let field_method =
+    match head.term_desc with Tvar q -> access_method env q | _ -> None
+  in
+  match (head.term_desc, field_method) with
+  | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result (error id.pid_loc "A local proof value cannot be called as a lemma")
-  | Tvar q ->
+  | Tvar _, Some (field, method_) ->
+      let* signature =
+        State.of_result
+          (Report.expect ~at:t.term_loc "A shared-field proof operation"
+             (field_proof_signature env t field.Access_fields.kind method_))
+      in
+      if List.length args <> List.length signature.lemma_inputs then
+        State.of_result (error t.term_loc "Incorrect shared-field operation arguments")
+      else
+        let execution_prefix =
+          match field.kind with
+          | S.Frozen ->
+              List.mem
+                [ "freeze"; "release"; "release_private"; "observe"; "adopt" ]
+                method_ ~equal:String.equal
+          | S.Relaxed ->
+              List.mem
+                [ "publish"; "release"; "acquire"; "adopt" ]
+                method_ ~equal:String.equal
+        in
+        let* prefix, owner, rest =
+          match (method_, args) with
+          | "transfer", source :: target :: owner :: rest ->
+              let* source = formula env source in
+              let+ target = formula env target in
+              ([ source; target ], owner, rest)
+          | _, owner :: rest when execution_prefix ->
+              let+ executing =
+                State.of_result
+                  (Report.expect ~at:t.term_loc
+                     "An executing context for field publication"
+                     env.ctx.given.execution_owner)
+              in
+              ([ executing ], owner, rest)
+          | _, owner :: rest -> State.return ([], owner, rest)
+          | _ ->
+              State.of_result
+                (error t.term_loc "A shared-field operation needs its field owner")
+        in
+        let expected = Generic_parameters.aggregate signature.lemma_outputs in
+        let* family, receiver, selected = field_selection ~expected env field t owner in
+        let+ rest = State.all rest ~f:(formula env) in
+        let native_method =
+          match (field.kind, method_) with
+          | S.Frozen, "freeze" -> "freeze_owned"
+          | S.Relaxed, "observe" -> "observation"
+          | _ -> method_
+        in
+        ( R.Expr.call ~loc:(loc t.term_loc)
+            (qualified_name ~loc:(loc t.term_loc) (family ^ "." ^ native_method))
+            (prefix @ (receiver :: selected :: rest)),
+          signature.lemma_outputs )
+  | Tvar q, None ->
       let display = qualid_key q in
       begin match
         Option.first_some
@@ -480,23 +585,32 @@ let proof_call ?expected env t =
         | _ -> method_
       in
       let call = R.Expr.call ~loc:l (name ~loc:l method_) values in
-      if signature.au_context && String.equal method_ "bindAU" then
+      if
+        (not (Poly.equal signature.au_context Execution_contract.No_context))
+        && String.equal method_ "bindAU"
+      then
         let* owner =
           State.of_result
             (Report.expect ~at:t.term_loc "The atomic call's execution owner"
                env.ctx.given.execution_owner)
         in
         let* held =
-          State.of_result
-            (Report.expect ~at:t.term_loc "The atomic call's entry holdings"
-               env.ctx.given.execution_entry_held)
+          match signature.au_context with
+          | Execution_contract.Owner_and_held ->
+              State.map
+                (State.of_result
+                   (Report.expect ~at:t.term_loc "The atomic call's entry holdings"
+                      env.ctx.given.execution_entry_held))
+                ~f:Option.some
+          | No_context | Owner -> State.return None
         in
         let+ raw = State.fresh "au_raw_token" in
         ( R.Stmt.local ~loc:l ~ghost:true
             ~typ:
               (R.Type.atomic_token ~loc:l (qualified_name ~loc:l signature.au_procedure))
             ~init:(R.Stmt.expr_rhs call) (ident ~loc:l raw),
-          R.Expr.tuple ~loc:l [ R.Expr.var ~loc:l (name ~loc:l raw); owner; held ],
+          R.Expr.tuple ~loc:l
+            ([ R.Expr.var ~loc:l (name ~loc:l raw); owner ] @ Option.to_list held),
           outputs )
       else State.return ([], call, outputs)
   | _ ->
@@ -511,10 +625,15 @@ let proof_signature env (t : S.term) =
       begin match head.term_desc with
       | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
       | Tvar q ->
-          Option.first_some
-            (resource_operation ~lemma:true env q)
-            (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
-               ~equal:String.equal)
+          begin match access_method env q with
+          | Some (field, method_) ->
+              field_proof_signature env t field.Access_fields.kind method_
+          | None ->
+              Option.first_some
+                (resource_operation ~lemma:true env q)
+                (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
+                   ~equal:String.equal)
+          end
       | _ -> None
       end
 
@@ -1003,7 +1122,7 @@ let join_proof_result_types ?expected env ~at branches =
         | None -> (
             match Types.get_desc typ with
             | Tvar _ | Tunivar _ -> typ
-            | desc -> Ctype.newty (Btype.copy_type_desc instantiate desc))
+            | desc -> Ctype.newty (Compiler_types.map_desc instantiate desc))
       in
       let types = List.map types ~f:instantiate in
       let variables =
@@ -1525,10 +1644,18 @@ let access_captures_outcome annotation ~outputs =
 
 (** A checked wrapper invokes the original operation once: its statements, and the value
     of the operation, which [run] gives. *)
-let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
-    =
+let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_types = [])
+    ?(output_types = []) run =
   let open State.Syntax in
   let* scope = State.of_result (Annotation.scope annotation) in
+  let* () =
+    if
+      not (Poly.equal scope.scope_mode S.General_scope || Poly.equal scope.scope_mode mode)
+    then
+      State.of_result
+        (error annotation.loc "This scope does not match the attached operation")
+    else State.return ()
+  in
   let export = Option.bind annotation.Annotation.outline ~f:(fun o -> o.export) in
   let stateful = Option.is_some scope.scope_state || Option.is_some export in
   let operation = scope.scope_operation

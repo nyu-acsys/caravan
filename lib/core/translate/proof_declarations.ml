@@ -336,6 +336,81 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
           error lemma_name.pid_loc "A recursive lemma needs a variant"
       | _ -> Ok ()))
 
+(** Mask entries identify resources and an optional argument prefix. *)
+let lemma_mask_entry env (term : S.term) =
+  let open State.Syntax in
+  let at = term.term_loc in
+  let l = loc at in
+  let head, arguments = spine term [] in
+  let wildcard () = R.Expr.var ~loc:l (name ~loc:l "_") in
+  let source_wildcard term =
+    match term.S.term_desc with
+    | Tvar (Qid id) -> String.equal id.pid_str "_"
+    | _ -> false
+  in
+  let prefix types =
+    if List.length arguments > List.length types then
+      State.of_result (error at "Too many arguments in an opens entry")
+    else
+      let supplied =
+        List.take_while arguments ~f:(fun term -> not (source_wildcard term))
+      in
+      let+ values =
+        State.all
+          (List.zip_exn (List.take types (List.length supplied)) supplied)
+          ~f:(fun (typ, argument) -> expected_formula env (Some typ) argument)
+      in
+      if List.is_empty arguments then []
+      else
+        values
+        @ List.init (List.length types - List.length supplied) ~f:(fun _ -> wildcard ())
+  in
+  match head.term_desc with
+  | Tvar q ->
+      begin match access_method env q with
+      | Some (field, "frozen") ->
+          begin match arguments with
+          | [ owner ] ->
+              let* expected = State.of_result (equality_term_type env term) in
+              let+ family, receiver, _ =
+                frozen_selection ~expected env field term owner
+              in
+              ( qualified_name ~loc:l (family ^ ".frozen"),
+                [ receiver; wildcard (); wildcard () ] )
+          | _ ->
+              State.of_result
+                (error at "A Frozen opens entry names its cell: Value.frozen cell")
+          end
+      | Some _ ->
+          State.of_result (error at "An opens entry must name a predicate or invariant")
+      | None ->
+          let key = logical_key env q in
+          begin match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
+          | Some (target, types) ->
+              let* instance =
+                State.of_result (predicate_instance env ~at ~key ~target arguments)
+              in
+              let types =
+                Option.value_map instance ~default:types ~f:(fun (worker, parameters) ->
+                    Generic_parameters.parameter_types worker parameters)
+              in
+              let* target = predicate_target env ~at ~key ~target arguments in
+              let+ arguments = prefix types in
+              (qualified_name ~loc:l target, arguments)
+          | None ->
+              begin match logical_signature env q with
+              | Some signature ->
+                  let* signature =
+                    instantiate_proof_signature env ~at signature arguments
+                  in
+                  let+ arguments = prefix signature.lemma_inputs in
+                  (qualified_name ~loc:l signature.lemma_raven, arguments)
+              | None -> State.of_result (error at "Unknown resource in opens clause")
+              end
+          end
+      end
+  | _ -> State.of_result (error at "An opens entry must name a predicate or invariant")
+
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof_support
     ~predicate_bodies ?member_name ?(primitive_namespace = []) ?(generic_predicates = [])
@@ -349,6 +424,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         lemma_requires;
         lemma_ensures;
         lemma_variant;
+        lemma_opens;
         lemma_body;
       } ->
       let open State.Syntax in
@@ -365,6 +441,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
           | Some worker ->
               Result.map
                 (Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                   ~project:(Datatypes.representation_arguments types)
                    ~at:lemma_name.pid_loc worker
                    (signature.lemma_inputs @ signature.lemma_outputs))
                 ~f:Option.some)
@@ -438,6 +515,13 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
       let* requires = specs lemma_requires in
       let* ensures = specs lemma_ensures in
       let* decreases = State.all lemma_variant ~f:(formula env) in
+      let* opens =
+        match lemma_opens with
+        | None -> State.return None
+        | Some (at, entries) ->
+            let+ entries = State.all entries ~f:(lemma_mask_entry env) in
+            Some (loc at, entries)
+      in
       let body_env =
         {
           env with
@@ -454,7 +538,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         ~auto:(List.mem lemma_name.pid_attrs "auto" ~equal:String.equal)
         ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
         ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
-        ~requires ~ensures ~decreases
+        ~requires ~ensures ~decreases ?opens
         (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
         (Some body)
   | _ -> State.of_result (error Location.none "Expected a lemma declaration")
@@ -946,7 +1030,7 @@ let predicates (source : Source.t) inventory =
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
       | Proof_module _ | Proof_definition _ | Proof_state _ | Proof_action _
       | Proof_lemma _ | Proof_type _ | Proof_resource _ | Proof_field _ | Proof_function _
-      | Proof_au _ | Proof_task _ ->
+      | Proof_au _ | Proof_task _ | Proof_access_field _ ->
           Ok None
       | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
         ->
@@ -1301,12 +1385,6 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
   in
   let specializations = List.map inventory.Module_inventory.specializations ~f:prepare in
   let definitions = List.map inventory.definitions ~f:prepare in
-  let groups =
-    Generic_modules.plan ~definitions
-      ~proof_layout:(Generic_proofs.has_models source)
-      specializations
-  in
-  let annotations = Source.annotations source in
   let rec field_term (term : S.term) =
     match S.past_membership term with
     | Some (element, _, _) -> field_term element
@@ -1332,6 +1410,26 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
         List.exists
           (c.S.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures)
           ~f:field_term
+  in
+  let annotations = Source.annotations source in
+  let record_parameters (specialization : Module_inventory.specialization) =
+    List.exists specialization.parameters ~f:(fun parameter ->
+        List.exists parameter.Module_inventory.argument.expected.signature_types
+          ~f:(fun (_, declaration) ->
+            match declaration.Typedtree.typ_kind with
+            | Ttype_record _ -> true
+            | _ -> false))
+  in
+  let field_layout (specialization : Module_inventory.specialization) =
+    Generic_proofs.has_models source specialization
+    || record_parameters specialization
+       && List.exists specialization.body_members ~f:(fun (_, id) ->
+           List.exists functions ~f:(fun function_ ->
+               Ident.same function_.id id && field_contract function_.contract))
+  in
+  let groups =
+    Generic_modules.plan ~inventory ~definitions ~proof_layout:field_layout
+      specializations
   in
   let* groups =
     all groups ~f:(fun group ->
@@ -1420,7 +1518,8 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
                   in
                   List.for_all instance.argument.expected.signature_types
                     ~f:(fun (_, declaration) ->
-                      Option.is_some declaration.Typedtree.typ_manifest
+                      Generic_type_families.transparent declaration
+                      || Option.is_some declaration.Typedtree.typ_manifest
                       ||
                       if Generic_type_families.arity declaration > 0 then
                         let concrete, t =
@@ -1449,7 +1548,8 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
              (supported_functions
              && (Option.is_some group.definition || representation_stable)
              && (not explicit_proofs)
-             && (not (List.exists parameter_contracts ~f:field_contract))
+             && (record_parameters group.representative
+                || not (List.exists parameter_contracts ~f:field_contract))
              && List.for_all (List.concat modes) ~f:Fn.id)
              group))
   in

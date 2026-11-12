@@ -1,0 +1,2 @@
+predicate owned_by (cell : cell) (value : int) =
+  own ~writer:Ghost.self cell.value value

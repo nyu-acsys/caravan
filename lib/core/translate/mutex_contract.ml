@@ -97,28 +97,19 @@ let fresh ~loc mutex = R.Expr.call ~loc (member ~loc "fresh") [ mutex ]
 let held ~loc mutex self = R.Expr.call ~loc (member ~loc "held") [ mutex; self ]
 let resource_interface = "Caravan$Mutex$Resource"
 let protocol_name = "Caravan$Mutex$Protocol"
-let execution_name = "Caravan$Mutex$Execution"
-let execution_interface = "Caravan$Mutex$ExecutionSignature"
+let execution_name = Execution_contract.module_name
+let execution_interface = Execution_contract.interface_name
 let native_name = "Caravan$Mutex$Native"
-let held_set_type ~loc = R.Type.fin_set ~loc (R.Type.ref ~loc)
-let empty_held_set ~loc = R.Expr.annotated (R.Expr.set ~loc []) (held_set_type ~loc)
-
-let acquired_set ~loc held_set mutex =
-  R.Expr.binary ~loc Union held_set (R.Expr.set ~loc [ mutex ])
-
-let released_set ~loc held_set mutex =
-  R.Expr.binary ~loc Diff held_set (R.Expr.set ~loc [ mutex ])
-
-let execution_call ~loc text arguments =
-  R.Expr.call ~loc (R.Name.make ~loc ~path:[ execution_name ] text) arguments
-
-let execution_context ~loc self held_set =
-  execution_call ~loc "context" [ self; held_set ]
-
-let execution_finished ~loc self = execution_call ~loc "finished" [ self ]
-let start ~loc = execution_call ~loc "start" []
-let finish ~loc self = execution_call ~loc "finish" [ self ]
-let snapshot ~loc self = execution_call ~loc "snapshot" [ self ]
+let held_set_type = Execution_contract.held_set_type
+let empty_held_set = Execution_contract.empty_held_set
+let acquired_set = Execution_contract.acquired_set
+let released_set = Execution_contract.released_set
+let execution_call = Execution_contract.call
+let execution_context = Execution_contract.context
+let execution_finished = Execution_contract.finished
+let start = Execution_contract.start
+let finish = Execution_contract.finish
+let snapshot = Execution_contract.snapshot
 
 module C = Checked_signatures
 
@@ -317,135 +308,7 @@ let resource_signature ~loc () =
     ]
 
 let execution_support ~loc () =
-  let self = variable ~loc "self" in
-  let held_set = variable ~loc "held_set" in
-  let parameter text typ = R.Var.make ~loc ~ghost:true (ident ~loc text) typ in
-  let reference text = parameter text (R.Type.ref ~loc) in
-  let held_set_parameter ?(implicit = false) text =
-    R.Var.make ~loc ~ghost:true ~implicit (ident ~loc text) (held_set_type ~loc)
-  in
-  let context self held_set =
-    R.Expr.call ~loc (local ~loc "context") [ self; held_set ]
-  in
-  let finished = R.Expr.call ~loc (local ~loc "finished") [ self ] in
-  let declaration text formals body =
-    R.Member.callable (R.Callable.func ~loc ~kind:Pred ~formals (ident ~loc text) body)
-  in
-  let context_declaration body =
-    R.Member.callable
-      (R.Callable.func ~loc ~kind:Pred
-         ~formals:[ reference "self" ]
-         ~returns:[ held_set_parameter ~implicit:true "held_set" ]
-         (ident ~loc "context") body)
-  in
-  let start body =
-    R.Member.callable
-      (R.Callable.proc ~loc
-         ~returns:[ reference "self" ]
-         ~ensures:[ R.Spec.make (context self (empty_held_set ~loc)) ]
-         (ident ~loc "start") body)
-  in
-  let finish body =
-    R.Member.callable
-      (R.Callable.proc ~loc
-         ~formals:[ reference "self" ]
-         ~requires:[ R.Spec.make (context self (empty_held_set ~loc)) ]
-         ~ensures:[ R.Spec.make finished ]
-         (ident ~loc "finish") body)
-  in
-  let snapshot body =
-    let current = variable ~loc "current" in
-    R.Member.callable
-      (R.Callable.proc ~loc ~kind:Lemma
-         ~formals:[ reference "self"; held_set_parameter ~implicit:true "held_set" ]
-         ~returns:[ held_set_parameter "current" ]
-         ~requires:[ R.Spec.make (context self held_set) ]
-         ~ensures:
-           [
-             R.Spec.make (context self held_set);
-             R.Spec.make (R.Expr.binary ~loc Eq current held_set);
-           ]
-         (ident ~loc "snapshot") body)
-  in
-  let exclusive body =
-    R.Member.callable
-      (R.Callable.proc ~loc ~kind:Lemma
-         ~formals:
-           [ reference "self"; held_set_parameter "first"; held_set_parameter "second" ]
-         ~requires:
-           [
-             R.Spec.make
-               (R.Expr.binary ~loc And
-                  (context self (variable ~loc "first"))
-                  (context self (variable ~loc "second")));
-           ]
-         ~ensures:[ R.Spec.make (R.Expr.bool ~loc false) ]
-         (ident ~loc "exclusive") body)
-  in
-  let capability held_set =
-    R.Expr.call ~loc (R.Name.make ~loc ~path:[ "Token" ] "excl") [ held_set ]
-  in
-  let own held_set =
-    R.Expr.own ~loc
-      [ R.Expr.field ~loc self (local ~loc "execution_token"); capability held_set ]
-  in
-  [
-    R.Member.module_ ~loc ~interface:true
-      (ident ~loc execution_interface)
-      [
-        context_declaration None;
-        declaration "finished" [ reference "self" ] None;
-        start None;
-        finish None;
-        snapshot None;
-        exclusive None;
-      ];
-    R.Member.module_ ~loc ~sealed:true
-      ~implements:[ (local ~loc execution_interface, []) ]
-      (ident ~loc execution_name)
-      [
-        R.Member.instance ~loc
-          ~def:(R.Name.make ~loc ~path:[ "Library" ] "Excl", [ held_set_type ~loc ])
-          (ident ~loc "Token")
-          (R.Name.make ~loc ~path:[ "Library" ] "Excl");
-        R.Member.field ~loc ~ghost:true
-          (ident ~loc "execution_token")
-          (R.Type.named ~loc (local ~loc "Token") []);
-        context_declaration (Some (own held_set));
-        declaration "finished" [ reference "self" ] (Some (own (empty_held_set ~loc)));
-        start
-          (Some
-             [
-               R.Stmt.ghost_block ~loc
-                 [
-                   R.Stmt.assign ~loc [ self ]
-                     (R.Stmt.new_rhs
-                        [
-                          ( local ~loc "execution_token",
-                            Some (capability (empty_held_set ~loc)) );
-                        ]);
-                 ];
-               R.Stmt.fold ~loc (local ~loc "context") [ self; empty_held_set ~loc ];
-               R.Stmt.return ~loc [ self ];
-             ]);
-        finish
-          (Some
-             [
-               R.Stmt.unfold ~loc (local ~loc "context") [ self; empty_held_set ~loc ];
-               R.Stmt.fold ~loc (local ~loc "finished") [ self ];
-             ]);
-        snapshot
-          (Some
-             [ R.Stmt.assign ~loc [ variable ~loc "current" ] (R.Stmt.expr_rhs held_set) ]);
-        exclusive
-          (Some
-             [
-               R.Stmt.unfold ~loc (local ~loc "context") [ self; variable ~loc "first" ];
-               R.Stmt.unfold ~loc (local ~loc "context") [ self; variable ~loc "second" ];
-               R.Stmt.assert_ ~loc (R.Spec.make (R.Expr.bool ~loc false));
-             ]);
-      ];
-  ]
+  Execution_contract.support ~loc ~mutex:true ~visibility:false ()
 
 let protocol ~loc () =
   let reference ?(ghost = true) text =
@@ -618,12 +481,15 @@ let native_support ~loc () =
 let create_in_execution ~loc self =
   R.Expr.call ~loc (R.Name.make ~loc ~path:[ native_name ] "create") [ self ]
 
-let protocol_support ~loc () =
-  (resource_signature ~loc () :: execution_support ~loc ())
+let protocol_support ~loc ?(visibility = false) () =
+  resource_signature ~loc ()
+  :: Execution_contract.support ~loc ~mutex:true ~visibility ()
   @ [ native_support ~loc (); protocol ~loc () ]
 
-let complete_support ~loc () =
-  support ~loc () @ Condition_contract.support ~loc () @ protocol_support ~loc ()
+let complete_support ~loc ?(visibility = false) () =
+  support ~loc ()
+  @ Condition_contract.support ~loc ()
+  @ protocol_support ~loc ~visibility ()
 
 let instance ~loc ~name ~resource =
   let target = local ~loc protocol_name in

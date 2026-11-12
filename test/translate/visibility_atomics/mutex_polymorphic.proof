@@ -1,0 +1,19 @@
+module Value = Ghost.Frozen (struct let field (cell : 'a cell) = cell.value end)
+module Payload : Ghost.TransferableResource with type 'a t = 'a cell = struct
+  type 'a t = 'a cell
+  predicate resource (self : Ghost.t) (cell : 'a t) = Value.visible self cell 0
+  lemma move (source : Ghost.t) (target : Ghost.t) (cell : 'a t)
+    opens {}
+    requires (Ghost.handoff source target && resource source cell)
+    ensures (Ghost.handoff source target && resource target cell) =
+    unfold resource source cell;
+    Value.transfer source target cell 0;
+    fold resource target cell
+  lemma transfer (source : Ghost.t) (target : Ghost.t) (cell : 'a t)
+    requires (Ghost.handoff source target && resource source cell)
+    ensures (Ghost.handoff source target && resource target cell) =
+    move source target cell
+
+end
+module Alias = Payload
+module Guard = Ghost.Mutex (Alias)

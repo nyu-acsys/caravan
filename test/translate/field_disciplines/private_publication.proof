@@ -1,0 +1,40 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+
+proof result = publish_at_link initial
+  requires (initial = 0 || initial = 1)
+  ensures (result === (if initial = 0 then 0 else 2)) =
+  at (Atomic.compare_and_set channel 0 1) Ghost.State.release_scope (fun cas () ->
+    let event = Value.snapshot cell in
+    assert (Value.private_state Ghost.self cell 0 event);
+    let lower = Value.release_private cell in
+    assert (Set.mem event lower);
+    let linked = cas lower in
+    (linked, lower));
+  at (let first_value = cell.value) Ghost.State.frozen_scope (fun read lower ->
+    Value.freeze cell;
+    assert (Value.covered lower cell 0);
+    let result = read () in
+    (result, lower));
+  at (Atomic.compare_and_set channel 1 2) Ghost.State.release_scope (fun cas _ ->
+    let event = Value.snapshot cell in
+    assert (Value.private_state Ghost.self cell 2 event);
+    let lower = Value.release_private cell in
+    assert (Set.mem event lower);
+    let linked = cas lower in
+    (linked, lower));
+  at (let second_value = cell.value) Ghost.State.frozen_scope (fun read lower ->
+    Value.freeze cell;
+    assert (Value.covered lower cell 2);
+    let result = read () in
+    (result, lower))
+
+proof result = acquire_then_rewrite [writer : Ghost.t] [event : Ghost.t]
+    [published : Ghost.t set] channel cell value
+  requires (Value.private_state writer cell previous event &&
+    Set.mem event published && own ~release:published channel 0)
+  ensures (own ~writer:Ghost.self cell.value value &&
+    own ~release:published channel 0 && result === value) =
+  at (Atomic.get channel) Ghost.acquire_scope (fun acquire ->
+    let result = acquire published in
+    Value.adopt cell published;
+    result)

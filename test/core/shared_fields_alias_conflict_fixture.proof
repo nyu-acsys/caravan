@@ -1,0 +1,9 @@
+module Cells = struct
+  module Frozen = Ghost.Frozen (struct
+    let field (n : t) = n.count
+  end)
+end
+
+module Relaxed = Ghost.Relaxed (struct
+  let field (n : Cells.t) = n.count
+end)

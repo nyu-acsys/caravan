@@ -1,0 +1,8 @@
+proc use_foreign_authority(executing: Ref, writer: Ref, cell: Ref, channel: Ref)
+  requires executing != writer && ThreadContext.context(executing, {})
+    && ThreadContext.context(writer, {channel})
+    && ThreadCounters.published(channel, cell, 42, {})
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val result := ThreadCounters.read_frozen(executing, cell, channel, {channel}, 42, {});
+}

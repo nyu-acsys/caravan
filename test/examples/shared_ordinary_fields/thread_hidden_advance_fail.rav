@@ -1,0 +1,6 @@
+lemma advance_without_synchronization(executing: Ref, channel: Ref)
+  requires ThreadContext.context(executing, {})
+  ensures ThreadContext.context(executing, {channel})
+{
+  ThreadContext.advance(executing, {}, {channel});
+}

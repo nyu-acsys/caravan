@@ -1,0 +1,7 @@
+module Left = Ghost.Frozen (struct
+  let field (cell : cell) = cell.left
+end)
+
+module Right = Ghost.Frozen (struct
+  let field (cell : cell) = cell.right
+end)

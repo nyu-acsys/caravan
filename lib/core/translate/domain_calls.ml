@@ -69,7 +69,9 @@ let specialize ~types ~environment ~at task actuals =
   else
     let* arguments =
       Generic_parameters.instantiate ~environment ~opaque:(Datatypes.is_opaque types)
-        ~expand:(Datatypes.expand types) ~at task.domain_worker actuals
+        ~expand:(Datatypes.expand types)
+        ~project:(Datatypes.representation_arguments types)
+        ~at task.domain_worker actuals
       |> Result.map_error ~f:(fun _ ->
           Report.error Type at
             "Cannot infer consistent task type parameters from the handle and captured \
@@ -305,6 +307,7 @@ let analyze ~canonical ~types ~tasks ~functions function_ =
                   else
                     let* arguments =
                       Polymorphic_functions.instantiate ~expand:(Datatypes.expand types)
+                        ~project:(Datatypes.representation_arguments types)
                         ~at:expression.exp_loc function_.scheme
                         ~declaration:function_.scheme.typ ~occurrence:callee.exp_type
                     in

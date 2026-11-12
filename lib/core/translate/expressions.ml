@@ -200,16 +200,68 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
                 in
                 fst (Option.value_exn field))
           in
+          let checkpoint =
+            let* owner = State.owner ctx.given ~at in
+            let+ stamp = State.fresh "write_event" in
+            let event = R.Expr.var ~loc:l (name ~loc:l stamp) in
+            let preparation =
+              R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.ref ~loc:l)
+                ~init:
+                  (R.Stmt.expr_rhs
+                     (Visibility_contract.call ~loc:l
+                        ~module_name:Execution_contract.module_name
+                        "visibility_checkpoint" [ owner ]))
+                (ident ~loc:l stamp)
+            in
+            (owner, event, preparation)
+          in
+          let* initializers =
+            State.all (List.zip_exn fields args) ~f:(fun (field, value) ->
+                let* relaxed = State.relaxed_storage ctx.given field in
+                let contents = (qualified_name ~loc:l field, Some value) in
+                match relaxed with
+                | Some family ->
+                    let+ owner, event, preparation = checkpoint in
+                    ( preparation,
+                      contents
+                      :: Relaxed_fields_contract.initial_fields ~loc:l ~family ~value
+                           ~event ~owner,
+                      Some (family, owner, value, event) )
+                | None -> (
+                    let* frozen = State.frozen_storage ctx.given field in
+                    match frozen with
+                    | None -> State.return ([], [ contents ], None)
+                    | Some family ->
+                        let+ owner, event, preparation = checkpoint in
+                        ( preparation,
+                          contents
+                          :: Frozen_visibility_contract.initial_fields ~loc:l ~family
+                               ~owner ~event,
+                          None )))
+          in
           let* x = State.fresh "tmp" in
           let* views, view_args = view_allocation ctx ~loc:l fields in
           let+ explicit = allocation_initializers ctx e in
           let init =
             R.Stmt.new_rhs
-              (List.map2_exn fields args ~f:(fun f v -> (qualified_name ~loc:l f, Some v))
+              (List.concat_map initializers ~f:(fun (_, fields, _) -> fields)
               @ view_args @ explicit)
           in
-          ( stmts @ views @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x),
-            R.Expr.var ~loc:l (name ~loc:l x) )
+          let result = R.Expr.var ~loc:l (name ~loc:l x) in
+          let initialize =
+            List.filter_map initializers ~f:(fun (_, _, state) ->
+                Option.map state ~f:(fun (family, owner, value, event) ->
+                    R.Stmt.call ~loc:l
+                      (R.Expr.call ~loc:l
+                         (qualified_name ~loc:l (family ^ ".initialize"))
+                         [ owner; result; value; event ])))
+          in
+          ( stmts
+            @ List.concat_map initializers ~f:(fun (preparation, _, _) -> preparation)
+            @ views
+            @ R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x)
+            @ initialize,
+            result )
       | Some ({ ctors = [ c ]; _ } as d) ->
           let+ value = constructor_value ctx ~at ~result_type:e.exp_type d c args in
           (stmts, value)
@@ -223,10 +275,39 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       in
       match field with
       | Some (field, true) ->
-          let+ reading, value =
-            State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type v
+          let annotation =
+            List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
           in
-          (stmts @ reading, value)
+          let* reading, value =
+            match annotation with
+            | None ->
+                State.ordinary_read
+                  ~immutable:(Poly.equal label.lbl_mut Immutable)
+                  ctx.given ~at ~field ~elt:e.exp_type v
+            | Some annotation ->
+                let* () =
+                  if ctx.given.manual then State.return ()
+                  else
+                    State.of_result
+                      (error annotation.loc "Ghost.scope requires a manual function proof")
+                in
+                let* scope = State.of_result (Annotation.scope annotation) in
+                access_proof ctx annotation ~result_type:e.exp_type
+                  ~mode:
+                    (if Poly.equal scope.scope_mode S.Published_scope then
+                       S.Published_scope
+                     else S.Frozen_scope)
+                  (fun _ ->
+                    let+ statements, value =
+                      State.ordinary_read
+                        ~immutable:(Poly.equal label.lbl_mut Immutable)
+                        ~frozen:(Poly.equal scope.scope_mode S.Frozen_scope)
+                        ~published:(Poly.equal scope.scope_mode S.Published_scope)
+                        ctx.given ~at ~field ~elt:e.exp_type v
+                    in
+                    (statements, value, [], []))
+          in
+          State.return (stmts @ reading, value)
       | Some (field, false) -> begin
           let value = R.Expr.field ~loc:l v (qualified_name ~loc:l field) in
           match Datatypes.admissible ~loc:l ctx.given.types e.exp_type value with
@@ -250,10 +331,14 @@ and expr_body ~tail ~keep_scope (ctx : context) (e : Typedtree.expression) :
       let* field = State.field_of_label ctx.given ~at ~record_type label in
       match field with
       | Some (field, true) ->
-          let+ writing =
-            State.ordinary_write ctx.given ~at ~field ~elt:value_type record value
+          let+ writing, result =
+            native_access ctx e (fun _ ->
+                let+ writing =
+                  State.ordinary_write ctx.given ~at ~field ~elt:value_type record value
+                in
+                (writing, unit_value ~loc:l, [], []))
           in
-          (value_stmts @ record_stmts @ [ writing ], unit_value ~loc:l)
+          (value_stmts @ record_stmts @ writing, result)
       | _ -> State.of_result (unsupported at "This field")
     end
   | Texp_match (scrutinee, cases, [], partial)
@@ -643,7 +728,9 @@ and mutex_call ctx (e : Typedtree.expression) operation args =
               (R.Stmt.expr_rhs
                  (match ctx.given.execution_owner with
                  | None -> Mutex_contract.create ~loc:l
-                 | Some owner -> Mutex_contract.create_in_execution ~loc:l owner))
+                 | Some owner when ctx.given.mutex_execution ->
+                     Mutex_contract.create_in_execution ~loc:l owner
+                 | Some _ -> Mutex_contract.create ~loc:l))
             (ident ~loc:l result),
           value,
           [],
@@ -819,13 +906,22 @@ and domain_call ctx (e : Typedtree.expression) domain =
         in
         let* handle_name = State.fresh "domain" in
         let* child_statements, child_arguments =
-          if not ctx.given.mutex_execution then State.return ([], [])
+          let execution = execution_profile ctx.given in
+          if not (Execution_contract.enabled execution) then State.return ([], [])
           else
+            let* initialization, parents =
+              if ctx.given.visibility_execution then
+                let+ parent = State.owner ctx.given ~at in
+                (Execution_contract.start_child ~loc:l parent, [ parent ])
+              else State.return (Execution_contract.start ~loc:l, [])
+            in
             let+ child = State.fresh "domain_child" in
             ( R.Stmt.local ~loc:l ~ghost:true ~typ:(R.Type.ref ~loc:l)
-                ~init:(R.Stmt.expr_rhs (Mutex_contract.start ~loc:l))
+                ~init:(R.Stmt.expr_rhs initialization)
                 (ident ~loc:l child),
-              [ R.Expr.var ~loc:l (name ~loc:l child) ] )
+              Execution_contract.captured_values execution
+                (R.Expr.var ~loc:l (name ~loc:l child))
+              @ parents )
         in
         let adapter =
           { task.domain_runtime with name = "fork$" ^ task.domain_template }
@@ -858,7 +954,8 @@ and domain_call ctx (e : Typedtree.expression) domain =
         + List.length task.domain_ghost_inputs
         + List.length task.domain_implicit_inputs
         + (2 * task.domain_history_inputs)
-        + if ctx.given.mutex_execution then 1 else 0
+        + List.length
+            (Execution_contract.captured_types ~loc:l (execution_profile ctx.given))
       in
       let output_count =
         List.length task.domain_ghost_outputs + (2 * task.domain_history_outputs)
@@ -939,20 +1036,29 @@ and domain_call ctx (e : Typedtree.expression) domain =
         let propagation, after_call =
           if capture_outcome then ([], propagation) else (propagation, [])
         in
+        let* join, unfolding =
+          if ctx.given.visibility_execution then
+            let+ receiver = State.owner ctx.given ~at in
+            let sibling prefix =
+              Qualified_name.raven ~loc:l
+                { task.domain_runtime with name = prefix ^ task.domain_template }
+            in
+            (R.Expr.call ~loc:l (sibling "join$") [ handle; captures; receiver ], [])
+          else
+            State.return
+              ( Domain_contract.join ~loc:l ~runtime:task.domain_runtime handle captures,
+                [
+                  R.Stmt.unfold ~loc:l (member task "postcondition")
+                    [ captures; result; ghosts; outcome ];
+                ] )
+        in
         State.return
           ( R.Stmt.local ~loc:l ~typ:result_type (ident ~loc:l result_name)
             @ R.Stmt.local ~loc:l ~ghost:true ~typ:ghosts_type (ident ~loc:l ghosts_name)
             @ R.Stmt.local ~loc:l ~typ:outcome_type (ident ~loc:l outcome_name)
             @ history_decls
-            @ [
-                R.Stmt.assign ~loc:l [ result; ghosts; outcome ]
-                  (R.Stmt.expr_rhs
-                     (Domain_contract.join ~loc:l ~runtime:task.domain_runtime handle
-                        captures));
-                R.Stmt.unfold ~loc:l (member task "postcondition")
-                  [ captures; result; ghosts; outcome ];
-              ]
-            @ history_assign @ propagation,
+            @ [ R.Stmt.assign ~loc:l [ result; ghosts; outcome ] (R.Stmt.expr_rhs join) ]
+            @ unfolding @ history_assign @ propagation,
             (if is_unit e.exp_type then unit_value ~loc:l else result),
             (public @ if capture_outcome then [ outcome ] else []),
             after_call )
@@ -981,6 +1087,7 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
   | _ when Option.is_some (atomic_name path) ->
       atomic ctx e (Option.value_exn (atomic_name path)) args
   | Some "ref", [ v ] ->
+      let* () = State.require_memory_encoding ctx.given ~at "reference initialization" in
       let allocation =
         Datatypes.allocation_tag ~prefix:"ref_" ~suffix:"_contents" ctx.given.types
           v.exp_type
@@ -1006,7 +1113,7 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
       let* v_stmts, v = expr ctx v in
       let* r_stmts, r = expr ctx r in
       let+ writing = State.ordinary_write ctx.given ~at ~field ~elt r v in
-      (v_stmts @ r_stmts @ [ writing ], unit_value ~loc:l)
+      (v_stmts @ r_stmts @ writing, unit_value ~loc:l)
   | Some (("incr" | "decr") as op), [ r ] ->
       let* field = contents r in
       let* stmts, r = expr ctx r in
@@ -1015,22 +1122,61 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
       let binop : R.Expr.binop = if String.equal op "incr" then Plus else Minus in
       let v' = Prelude.runtime_binary ~loc:l binop v (R.Expr.int ~loc:l 1) in
       let+ writing = State.ordinary_write ctx.given ~at ~field ~elt:int_type r v' in
-      (stmts @ reading @ [ writing ], unit_value ~loc:l)
+      (stmts @ reading @ writing, unit_value ~loc:l)
   | _ -> apply_operator ctx e path declaration occurrence args
 
 (** The application of [Atomic.op] to [args], in [e]. *)
 and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) =
   let at = e.exp_loc in
   let l = loc at in
+  let visibility_arguments ~write arguments =
+    if not ctx.given.visibility_execution then State.return ([], arguments)
+    else
+      match ctx.given.execution_owner with
+      | None ->
+          State.of_result (error at "This atomic operation needs an execution context")
+      | Some owner ->
+          if not write then State.return ([], owner :: arguments)
+          else
+            let* prior = State.fresh "caravan$atomic_prior" in
+            let value = R.Expr.var ~loc:l (name ~loc:l prior) in
+            State.return
+              ( R.Stmt.local ~loc:l ~ghost:true
+                  ~typ:(Visibility_contract.view_type ~loc:l)
+                  ~init:
+                    (R.Stmt.expr_rhs
+                       (Visibility_contract.snapshot ~loc:l
+                          ~module_name:Execution_contract.module_name owner))
+                  (ident ~loc:l prior),
+                owner :: value :: arguments )
+  in
+  let atomic_result ~typ ~init ~published target =
+    if not (published && ctx.given.visibility_execution) then
+      State.return (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l target))
+    else
+      let+ output = State.fresh "caravan$atomic_published" in
+      R.Stmt.local ~loc:l ~typ (ident ~loc:l target)
+      @ R.Stmt.local ~loc:l ~ghost:true
+          ~typ:(Visibility_contract.view_type ~loc:l)
+          (ident ~loc:l output)
+      @ [
+          R.Stmt.assign ~loc:l
+            [
+              R.Expr.var ~loc:l (name ~loc:l target);
+              R.Expr.var ~loc:l (name ~loc:l output);
+            ]
+            init;
+        ]
+  in
   let element (t : Types.type_expr) =
     match Datatypes.desc ctx.given.types t with
     | Tconstr (_, [ elt ], _) -> State.return elt
     | _ -> State.of_result (unsupported at "This atomic")
   in
   (* How the step linearizes the function: as its annotation says, or by default. *)
-  let* annotation = State.of_result (linearization ctx e) in
+  let* linearization_annotation = State.of_result (linearization ctx e) in
   let how default =
-    match (annotation, default) with
+    match (linearization_annotation, default) with
     | None, _ -> State.return default
     | Some (S.Performs a), _ ->
         begin match named_action ctx a with
@@ -1053,18 +1199,21 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
   in
   (* The result of [f] applied to the atomic and [args], in a variable, a step that
      linearizes the function by default as [default] says. *)
-  let result ?(default = `Commit) ?op ~contents f atomic args =
+  let result ?(default = `Commit) ?op ?step_arguments ~contents f atomic args =
     let* typ = State.typ ctx ~at e.exp_type in
     let* x = State.fresh "tmp" in
     let v = R.Expr.var ~loc:l (name ~loc:l x) in
-    let init =
-      R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l f) (atomic :: args))
-    in
+    let* preparation, arguments = visibility_arguments ~write:true (atomic :: args) in
+    let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (qualified_name ~loc:l f) arguments) in
     let* how = how default in
-    let step = Option.map op ~f:(fun (op, field) -> (op, field, atomic, args, v)) in
+    let step =
+      Option.map op ~f:(fun (op, field) ->
+          (op, field, atomic, Option.value step_arguments ~default:args, v))
+    in
+    let* access = atomic_result ~typ ~init ~published:true x in
     let+ step =
       linearize ?step ~value:v ~access_type:e.exp_type ~contents ctx ~at how
-        (R.Stmt.local ~loc:l ~typ ~init (ident ~loc:l x))
+        (preparation @ access)
     in
     (step, v)
   in
@@ -1074,6 +1223,11 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | _ -> element e.exp_type
   in
   let* field = State.atomic_field ctx.given ~at elt in
+  let* visibility_family =
+    if ctx.given.visibility_execution then
+      State.map (State.visibility_atomic ctx.given ~at elt) ~f:Option.some
+    else State.return None
+  in
   let* nested = State.of_result (nested_stateful_read ctx.given.access_proofs e) in
   let* stmts, values =
     match nested with
@@ -1083,67 +1237,311 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
     | None -> operands ctx args
   in
   let primitive op = State.primitive ctx.given ~at elt op in
-  match (op, values) with
-  | ("make" | "make_contended"), [ v ] ->
-      let allocation =
-        Datatypes.allocation_tag ~prefix:"atomic_" ~suffix:"" ctx.given.types elt
+  let* publication =
+    match
+      List.Assoc.find ctx.given.access_proofs (Domain_calls.key e) ~equal:Poly.equal
+    with
+    | None -> State.return None
+    | Some annotation ->
+        let+ scope = State.of_result (Annotation.scope annotation) in
+        if
+          Poly.equal scope.scope_mode S.Release_scope
+          || Poly.equal scope.scope_mode S.Acquire_scope
+        then Some (annotation, scope.scope_mode)
+        else None
+  in
+  match publication with
+  | Some (annotation, mode) ->
+      let* () =
+        if ctx.given.manual then State.return ()
+        else
+          State.of_result
+            (error annotation.loc "Publication scopes require a manual function proof")
       in
-      let* x = State.fresh "tmp" in
-      let* views, view_args = view_allocation ctx ~loc:l (Option.to_list allocation) in
-      let+ explicit = allocation_initializers ctx e in
-      let init =
-        R.Stmt.new_rhs ((qualified_name ~loc:l field, Some v) :: (view_args @ explicit))
+      let* () =
+        if Option.is_none linearization_annotation then State.return ()
+        else
+          State.of_result
+            (error annotation.loc
+               "A publication scope cannot be combined with an automatic linearization \
+                annotation")
       in
-      ( stmts @ views @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l) ~init (ident ~loc:l x),
-        R.Expr.var ~loc:l (name ~loc:l x) )
-  | "get", [ a ] ->
+      let* family =
+        State.of_result
+          (Report.expect ~at "Visibility-aware atomics for a publication scope"
+             visibility_family)
+      in
+      let* () =
+        if String.is_prefix op ~prefix:"make" then
+          let allocation =
+            Datatypes.allocation_tag ~prefix:"atomic_" ~suffix:"" ctx.given.types elt
+          in
+          let* views, fields = view_allocation ctx ~loc:l (Option.to_list allocation) in
+          let* explicit = allocation_initializers ctx e in
+          if List.is_empty views && List.is_empty fields && List.is_empty explicit then
+            State.return ()
+          else
+            State.of_result
+              (unsupported at "Shared-mode atomic allocation with attached ghost fields")
+        else State.return ()
+      in
+      let* owner = State.owner ctx.given ~at in
+      let* view_type = State.of_result (visibility_view_type ctx.given ~at) in
       let* typ = State.typ ctx ~at e.exp_type in
-      let* x = State.fresh "tmp" in
-      let read = R.Stmt.expr_rhs (R.Expr.field ~loc:l a (qualified_name ~loc:l field)) in
-      let* how = how `Abort in
-      let value = R.Expr.var ~loc:l (name ~loc:l x) in
-      let* step =
-        linearize ~value ~access_type:e.exp_type ~contents:elt ctx ~at how
-          (R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+      let run views =
+        let* lower =
+          match views with
+          | [ view ] -> State.return view
+          | _ ->
+              State.of_result
+                (error annotation.loc "A publication step takes one visibility view")
+        in
+        let prefix = [ owner; lower ] in
+        let call method_ args =
+          R.Stmt.expr_rhs
+            (R.Expr.call ~loc:l
+               (qualified_name ~loc:l (family ^ "." ^ method_))
+               (prefix @ args))
+        in
+        match (mode, op, values) with
+        | S.Acquire_scope, "get", [ address ] ->
+            let+ x = State.fresh "tmp" in
+            ( R.Stmt.local ~loc:l ~typ
+                ~init:(call "get_acquire" [ address ])
+                (ident ~loc:l x),
+              R.Expr.var ~loc:l (name ~loc:l x),
+              [],
+              [] )
+        | S.Acquire_scope, "compare_and_set", [ address; old_value; new_value ] ->
+            let* x = State.fresh "tmp" in
+            let+ statements =
+              atomic_result ~typ
+                ~init:
+                  (call "compare_and_set_acquire"
+                     [
+                       address;
+                       R.Expr.bool ~loc:l (Datatypes.immediate ctx.given.types elt);
+                       old_value;
+                       new_value;
+                     ])
+                ~published:true x
+            in
+            (statements, R.Expr.var ~loc:l (name ~loc:l x), [], [])
+        | S.Release_scope, "set", [ address; value ] ->
+            let+ published = State.fresh "caravan$atomic_published" in
+            ( R.Stmt.local ~loc:l ~ghost:true
+                ~typ:(Visibility_contract.view_type ~loc:l)
+                ~init:(call "set" [ address; value ])
+                (ident ~loc:l published),
+              unit_value ~loc:l,
+              [],
+              [] )
+        | S.Release_scope, ("fetch_and_add" | "incr" | "decr"), _ ->
+            let* address, amount =
+              match (op, values) with
+              | "fetch_and_add", [ address; amount ] -> State.return (address, amount)
+              | ("incr" | "decr"), [ address ] ->
+                  State.return
+                    (address, R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1))
+              | _ -> State.of_result (error at "Invalid atomic publication operation")
+            in
+            let* target = primitive Fetch_and_add in
+            let* x = State.fresh "tmp" in
+            let+ statements =
+              atomic_result ~typ:(R.Type.int ~loc:l)
+                ~init:
+                  (R.Stmt.expr_rhs
+                     (R.Expr.call ~loc:l
+                        (qualified_name ~loc:l target)
+                        (prefix @ [ address; amount ])))
+                ~published:true x
+            in
+            ( statements,
+              (if String.equal op "fetch_and_add" then R.Expr.var ~loc:l (name ~loc:l x)
+               else unit_value ~loc:l),
+              [],
+              [] )
+        | S.Release_scope, ("make" | "make_contended" | "exchange" | "compare_and_set"), _
+          ->
+            let* method_, args =
+              match (op, values) with
+              | ("make" | "make_contended"), [ value ] -> State.return ("make", [ value ])
+              | "exchange", [ address; value ] ->
+                  State.return ("exchange", [ address; value ])
+              | "compare_and_set", [ address; old_value; new_value ] ->
+                  State.return
+                    ( "compare_and_set",
+                      [
+                        address;
+                        R.Expr.bool ~loc:l (Datatypes.immediate ctx.given.types elt);
+                        old_value;
+                        new_value;
+                      ] )
+              | _ -> State.of_result (error at "Invalid atomic publication operation")
+            in
+            let* x = State.fresh "tmp" in
+            let+ statements =
+              atomic_result ~typ ~init:(call method_ args) ~published:true x
+            in
+            (statements, R.Expr.var ~loc:l (name ~loc:l x), [], [])
+        | _ ->
+            State.of_result
+              (error annotation.loc
+                 "This publication scope does not match the atomic operation")
       in
-      let+ () = record_read ctx ~atomic:a value in
-      (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
-  | "set", [ a; v ] ->
-      let* how = how `Commit in
-      let+ step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx ~at
-          how
-          [ write ~loc:l a field v ]
+      let* statements, value =
+        access_proof ctx annotation ~mode ~result_type:e.exp_type
+          ~input_types:[ view_type ] run
       in
-      (stmts @ step, unit_value ~loc:l)
-  | "exchange", [ a; v ] ->
-      let* f = primitive Exchange in
-      let+ reading, r = result ~contents:elt f a [ v ] in
-      (stmts @ reading, r)
-  | "compare_and_set", [ a; old_val; new_val ] ->
-      let* f = primitive Compare_and_set in
-      let+ reading, r =
-        result ~default:`Cas ~op:("compare_and_set", field) ~contents:elt f a
-          [ old_val; new_val ]
+      let+ () =
+        match (op, values) with
+        | "get", [ address ] -> record_read ctx ~atomic:address value
+        | _ -> State.return ()
       in
-      (stmts @ reading, r)
-  | "fetch_and_add", [ a; n ] ->
-      let* f = primitive Fetch_and_add in
-      let+ reading, r = result ~contents:elt f a [ n ] in
-      (stmts @ reading, r)
-  | (("incr" | "decr") as op), [ a ] ->
-      let* f = primitive Fetch_and_add in
-      let* x = State.fresh "tmp" in
-      let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
-      let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l (name ~loc:l f) [ a; n ]) in
-      let* how = how `Commit in
-      let+ step =
-        linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx ~at
-          how
-          (R.Stmt.local ~loc:l ~typ:(R.Type.int ~loc:l) ~init (ident ~loc:l x))
-      in
-      (stmts @ step, unit_value ~loc:l)
-  | _ -> State.of_result (unsupported at ("Atomic." ^ op))
+      (stmts @ statements, value)
+  | None ->
+      begin match (op, values) with
+      | ("make" | "make_contended"), [ v ] ->
+          let allocation =
+            Datatypes.allocation_tag ~prefix:"atomic_" ~suffix:"" ctx.given.types elt
+          in
+          let* x = State.fresh "tmp" in
+          let* views, view_args =
+            view_allocation ctx ~loc:l (Option.to_list allocation)
+          in
+          let* explicit = allocation_initializers ctx e in
+          let* preparation, init =
+            match visibility_family with
+            | None ->
+                State.return
+                  ( [],
+                    R.Stmt.new_rhs
+                      ((qualified_name ~loc:l field, Some v) :: (view_args @ explicit)) )
+            | Some family ->
+                let* () =
+                  if
+                    List.is_empty views && List.is_empty view_args
+                    && List.is_empty explicit
+                  then State.return ()
+                  else
+                    State.of_result
+                      (unsupported at
+                         "Shared-mode atomic allocation with attached ghost fields")
+                in
+                let+ preparation, arguments = visibility_arguments ~write:true [ v ] in
+                ( preparation,
+                  R.Stmt.expr_rhs
+                    (R.Expr.call ~loc:l
+                       (qualified_name ~loc:l (family ^ ".make"))
+                       arguments) )
+          in
+          let* () =
+            if
+              (not ctx.given.manual)
+              && List.Assoc.mem ctx.given.access_proofs (Domain_calls.key e)
+                   ~equal:Poly.equal
+            then State.of_result (error at "Ghost.scope requires a manual function proof")
+            else State.return ()
+          in
+          let* access = atomic_result ~typ:(R.Type.ref ~loc:l) ~init ~published:true x in
+          let+ wrapped, value =
+            native_access ctx e (fun _ ->
+                State.return
+                  (views @ preparation @ access, R.Expr.var ~loc:l (name ~loc:l x), [], []))
+          in
+          (stmts @ wrapped, value)
+      | "get", [ a ] ->
+          let* typ = State.typ ctx ~at e.exp_type in
+          let* x = State.fresh "tmp" in
+          let* preparation, read =
+            match visibility_family with
+            | None ->
+                State.return
+                  ( [],
+                    R.Stmt.expr_rhs (R.Expr.field ~loc:l a (qualified_name ~loc:l field))
+                  )
+            | Some family ->
+                let+ preparation, arguments = visibility_arguments ~write:false [ a ] in
+                ( preparation,
+                  R.Stmt.expr_rhs
+                    (R.Expr.call ~loc:l
+                       (qualified_name ~loc:l (family ^ ".get"))
+                       arguments) )
+          in
+          let* how = how `Abort in
+          let value = R.Expr.var ~loc:l (name ~loc:l x) in
+          let* step =
+            linearize ~value ~access_type:e.exp_type ~contents:elt ctx ~at how
+              (preparation @ R.Stmt.local ~loc:l ~typ ~init:read (ident ~loc:l x))
+          in
+          let+ () = record_read ctx ~atomic:a value in
+          (stmts @ step, R.Expr.var ~loc:l (name ~loc:l x))
+      | "set", [ a; v ] ->
+          let* how = how `Commit in
+          let* access =
+            match visibility_family with
+            | None -> State.return [ write ~loc:l a field v ]
+            | Some family ->
+                let* preparation, arguments = visibility_arguments ~write:true [ a; v ] in
+                let+ published = State.fresh "caravan$atomic_published" in
+                preparation
+                @ R.Stmt.local ~loc:l ~ghost:true
+                    ~typ:(Visibility_contract.view_type ~loc:l)
+                    ~init:
+                      (R.Stmt.expr_rhs
+                         (R.Expr.call ~loc:l
+                            (qualified_name ~loc:l (family ^ ".set"))
+                            arguments))
+                    (ident ~loc:l published)
+          in
+          let+ step =
+            linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx
+              ~at how access
+          in
+          (stmts @ step, unit_value ~loc:l)
+      | "exchange", [ a; v ] ->
+          let* f = primitive Exchange in
+          let+ reading, r = result ~contents:elt f a [ v ] in
+          (stmts @ reading, r)
+      | "compare_and_set", [ a; old_val; new_val ] ->
+          let* f = primitive Compare_and_set in
+          let arguments =
+            if ctx.given.visibility_execution then
+              [
+                R.Expr.bool ~loc:l (Datatypes.immediate ctx.given.types elt);
+                old_val;
+                new_val;
+              ]
+            else [ old_val; new_val ]
+          in
+          let+ reading, r =
+            result ~default:`Cas ~op:("compare_and_set", field)
+              ~step_arguments:[ old_val; new_val ] ~contents:elt f a arguments
+          in
+          (stmts @ reading, r)
+      | "fetch_and_add", [ a; n ] ->
+          let* f = primitive Fetch_and_add in
+          let+ reading, r = result ~contents:elt f a [ n ] in
+          (stmts @ reading, r)
+      | (("incr" | "decr") as op), [ a ] ->
+          let* f = primitive Fetch_and_add in
+          let* x = State.fresh "tmp" in
+          let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
+          let* preparation, arguments = visibility_arguments ~write:true [ a; n ] in
+          let procedure =
+            if ctx.given.visibility_execution then qualified_name ~loc:l f
+            else name ~loc:l f
+          in
+          let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l procedure arguments) in
+          let* how = how `Commit in
+          let* access = atomic_result ~typ:(R.Type.int ~loc:l) ~init ~published:true x in
+          let+ step =
+            linearize ~value:(unit_value ~loc:l) ~access_type:e.exp_type ~contents:elt ctx
+              ~at how (preparation @ access)
+          in
+          (stmts @ step, unit_value ~loc:l)
+      | _ -> State.of_result (unsupported at ("Atomic." ^ op))
+      end
 
 (** The application of the operator or function at [path] to [args], in [e]. *)
 and apply_operator ctx (e : Typedtree.expression) (path : Path.t) declaration occurrence
@@ -1504,7 +1902,7 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
   let callee_name = qualified_name ~loc:l (Option.value actual_target ~default:f) in
   let* execution_statements, execution_arguments =
     if
-      ctx.given.mutex_execution
+      execution_enabled ctx.given
       && List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
           String.equal target f)
     then State.execution_arguments ctx ~at:e.exp_loc
@@ -1688,7 +2086,9 @@ and pattern ?guard ctx (p : Typedtree.pattern) (v : R.Expr.t) =
                 State.return (p, ([], R.Expr.field ~loc:l v (qualified_name ~loc:l field)))
             | Some (field, true) ->
                 let+ access, value =
-                  State.ordinary_read ?guard ctx.given ~at ~field ~elt:p.pat_type v
+                  State.ordinary_read ?guard
+                    ~immutable:(Poly.equal label.lbl_mut Immutable)
+                    ctx.given ~at ~field ~elt:p.pat_type v
                 in
                 (p, (access, value))
             | None -> State.of_result (unsupported at "This field"))
@@ -1898,6 +2298,11 @@ and flat_cases ctx v cases =
     | [] -> Some []
     | [ ((p : Typedtree.pattern), rhs) ] when Option.is_some (flat_arg p) ->
         Some [ (`Any (Option.map (Option.join (flat_arg p)) ~f:fst, p), rhs) ]
+    | ((p : Typedtree.pattern), _) :: _
+      when Option.is_some
+             (Datatypes.indexed_instance ctx.given.types
+                (Datatypes.expand ctx.given.types p.pat_type)) ->
+        None
     | ((p : Typedtree.pattern), rhs) :: rest ->
         begin match p.pat_desc with
         | Tpat_construct (_, cstr, ps, _) ->

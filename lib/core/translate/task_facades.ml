@@ -97,8 +97,10 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
             | Tparam_optional_default _ -> None)
       in
       let* probe =
-        Generic_parameters.discover ~key:backend ~name:backend ~at
-          ~explicit:(List.length native_types)
+        Generic_parameters.discover
+          ~expand:(Datatypes.expand given.types)
+          ~project:(Datatypes.representation_arguments given.types)
+          ~key:backend ~name:backend ~at ~explicit:(List.length native_types)
           (project operation.body.exp_type :: native_types)
       in
       let given = { given with types = Generic_predicates.types probe given.types } in
@@ -172,7 +174,10 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
         | _ -> error at "The task handle must have type Domain.t"
       in
       let* worker =
-        Generic_parameters.discover ~key:backend
+        Generic_parameters.discover
+          ~expand:(Datatypes.expand given.types)
+          ~project:(Datatypes.representation_arguments given.types)
+          ~key:backend
           ~name:
             (String.concat ~sep:"."
                (context.Module_context.namespace @ [ "DomainTask$" ^ backend ^ "$Worker" ]))
@@ -190,13 +195,17 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
       in
       let native_arity = 1 + native_count in
       let* native_worker =
-        Generic_parameters.discover ~key:backend ~name:worker.name ~at
-          ~explicit:native_arity
+        Generic_parameters.discover
+          ~expand:(Datatypes.expand given.types)
+          ~project:(Datatypes.representation_arguments given.types)
+          ~key:backend ~name:worker.name ~at ~explicit:native_arity
           (List.take worker.parameters native_arity)
       in
       let* handle_worker =
-        Generic_parameters.discover ~key:backend ~name:worker.name ~at
-          ~explicit:native_arity
+        Generic_parameters.discover
+          ~expand:(Datatypes.expand given.types)
+          ~project:(Datatypes.representation_arguments given.types)
+          ~key:backend ~name:worker.name ~at ~explicit:native_arity
           (List.take handle_types native_arity)
       in
       let* to_handle =
@@ -216,7 +225,10 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
                 (String.chop_suffix view.backend ~suffix:("." ^ view.source.backend))
             in
             let* worker =
-              Generic_parameters.rebind ~expand:Fn.id ~at worker handle_types
+              Generic_parameters.rebind
+                ~project:(Datatypes.representation_arguments given.types)
+                ~expand:(Datatypes.expand given.types)
+                ~at worker handle_types
             in
             Ok
               {
@@ -372,36 +384,23 @@ let member ~given ~past_structures ~proc_name task =
   in
   let captures = R.Expr.var ~loc:l (name ~loc:l "captures") in
   let output = R.Expr.var ~loc:l (name ~loc:l "ghosts") in
+  let execution = execution_profile given in
+  let execution_types = Execution_contract.captured_types ~loc:l execution in
   let capture_count =
     List.length types + List.length ghost_types
     + (2 * List.length prepared.past_pres)
-    + if given.mutex_execution then 1 else 0
+    + List.length execution_types
   in
   let output_count = List.length output_types + (2 * List.length prepared.past_posts) in
   let projection value count index =
     if count = 1 then value else R.Expr.tuple_get ~loc:l value index
   in
   let child = projection captures capture_count (capture_count - 1) in
-  let empty = Mutex_contract.empty_held_set ~loc:l in
+  let empty = Execution_contract.empty_held_set ~loc:l in
   let execution_environment env owner =
-    if not given.mutex_execution then env
+    if not (Execution_contract.enabled execution) then env
     else
-      let env =
-        {
-          env with
-          ctx =
-            {
-              env.ctx with
-              given =
-                {
-                  env.ctx.given with
-                  execution_owner = Some owner;
-                  execution_entry_held = Some empty;
-                  execution_contract = true;
-                };
-            };
-        }
-      in
+      let env = Execution_context.child_environment ~loc:l env owner in
       List.fold task.execution_bindings ~init:env ~f:(fun env (source, kind) ->
           bind env source
             (Value (match kind with Mutex_execution.Owner -> owner | Held -> empty)))
@@ -487,20 +486,25 @@ let member ~given ~past_structures ~proc_name task =
         Datatypes.admissible ~loc:l given.types typ value)
     @ pre
     @ [ history_formula pre_history pre_values ]
-    @
-    if given.mutex_execution then [ Mutex_contract.execution_context ~loc:l child empty ]
-    else []
+    @ Execution_contract.initial_resources ~loc:l execution child
   in
-  let* normal = contract_postcondition_formulas environment ~at contract.ensures in
-  let normal =
-    Option.to_list
-      (Datatypes.admissible ~loc:l given.types f.body.exp_type
-         (R.Expr.var ~loc:l (name ~loc:l "result")))
-    @ normal
-    @ [ history_formula post_history post_values ]
-  in
-  let* result_type = State.typ ctx ~at f.body.exp_type in
-  let* outcome_type, post =
+  let post_for ?receiver environment =
+    let postconditions environment terms =
+      let* environment, terms =
+        match receiver with
+        | None -> State.return (environment, terms)
+        | Some receiver -> Resource_transfer.reindexed environment ~receiver terms
+      in
+      contract_postcondition_formulas environment ~at terms
+    in
+    let* normal = postconditions environment contract.ensures in
+    let normal =
+      Option.to_list
+        (Datatypes.admissible ~loc:l given.types f.body.exp_type
+           (R.Expr.var ~loc:l (name ~loc:l "result")))
+      @ normal
+      @ [ history_formula post_history post_values ]
+    in
     if not (raising_contract contract) then
       State.return (R.Type.tuple ~loc:l [], conjunction normal)
     else
@@ -521,7 +525,7 @@ let member ~given ~past_structures ~proc_name task =
       let clauses =
         Exceptions.raises_postconditions given.types ~at contract.raises set
       in
-      let* exceptional = contract_postcondition_formulas environment ~at clauses in
+      let* exceptional = postconditions environment clauses in
       let normal =
         R.Expr.binary ~loc:l Impl
           (R.Expr.binary ~loc:l Eq outcome (no_exception ~loc:l outcome_typ))
@@ -529,10 +533,10 @@ let member ~given ~past_structures ~proc_name task =
       in
       State.return (outcome_typ, conjunction (normal :: exceptional))
   in
+  let* result_type = State.typ ctx ~at f.body.exp_type in
+  let* outcome_type, post = post_for environment in
   let captures_type =
-    tuple_type ~loc:l
-      (types @ ghost_types @ witness_types pre_history
-      @ if given.mutex_execution then [ R.Type.ref ~loc:l ] else [])
+    tuple_type ~loc:l (types @ ghost_types @ witness_types pre_history @ execution_types)
   in
   let outputs_type = tuple_type ~loc:l (output_types @ witness_types post_history) in
   let contract_name = contract_name task in
@@ -575,6 +579,8 @@ let member ~given ~past_structures ~proc_name task =
   let* child_name = State.fresh "domain_child" in
   let adapter_child = R.Expr.var ~loc:l (name ~loc:l child_name) in
   let adapter_environment = execution_environment prepared.environment adapter_child in
+  let* parent_name = State.fresh "domain_parent" in
+  let adapter_parent = R.Expr.var ~loc:l (name ~loc:l parent_name) in
   let proof_values =
     List.map (ghosts @ implicits) ~f:(fun (_, raven, _) ->
         R.Expr.var ~loc:l (name ~loc:l raven))
@@ -590,18 +596,25 @@ let member ~given ~past_structures ~proc_name task =
   let capture_value =
     tuple ~loc:l
       (native_values @ proof_values @ history_values
-      @ if given.mutex_execution then [ adapter_child ] else [])
+      @ Execution_contract.captured_values execution adapter_child)
   in
   let* adapter_pre =
-    State.all contract.requires ~f:(Spec_terms.formula adapter_environment)
+    if given.visibility_execution then
+      Resource_transfer.formulas adapter_environment ~receiver:adapter_parent
+        contract.requires
+    else State.all contract.requires ~f:(Spec_terms.formula adapter_environment)
   in
   let adapter_pre =
     List.filter_map prepared.formals ~f:(fun (_, spec, _) -> spec)
     @ List.map (adapter_pre @ List.map adapter_history ~f:snd) ~f:R.Spec.make
-    @
-    if given.mutex_execution then
-      [ R.Spec.make (Mutex_contract.execution_context ~loc:l adapter_child empty) ]
-    else []
+    @ List.map
+        (if given.visibility_execution then
+           Execution_contract.component_resources execution
+             ~held_locks:(Execution_contract.context ~loc:l adapter_child empty)
+             ~visibility:
+               (Execution_contract.visibility_handoff ~loc:l adapter_parent adapter_child)
+         else Execution_contract.initial_resources ~loc:l execution adapter_child)
+        ~f:R.Spec.make
   in
   let* proof_formals =
     State.all ghosts ~f:(fun (_, raven, typ) ->
@@ -618,11 +631,32 @@ let member ~given ~past_structures ~proc_name task =
   let adapter_formals =
     List.map prepared.formals ~f:(fun (_, _, v) -> v)
     @ proof_formals @ history_formals
-    @ (if given.mutex_execution then
-         [ R.Var.make ~loc:l ~ghost:true (ident ~loc:l child_name) (R.Type.ref ~loc:l) ]
+    @ List.map execution_types ~f:(fun typ ->
+        R.Var.make ~loc:l ~ghost:true (ident ~loc:l child_name) typ)
+    @ (if given.visibility_execution then
+         [ R.Var.make ~loc:l ~ghost:true (ident ~loc:l parent_name) (R.Type.ref ~loc:l) ]
        else [])
     @ List.filter_map prepared.implicit ~f:(fun (source, _, _, v) ->
         Option.some_if (not (supplied source)) v)
+  in
+  let* transfers =
+    if given.visibility_execution then
+      let+ transfer =
+        Resource_transfer.transfer adapter_environment ~source:adapter_parent
+          ~target:adapter_child contract.requires
+      in
+      transfer
+      @ [
+          R.Stmt.call ~loc:l
+            (Execution_contract.visibility_end_handoff ~loc:l adapter_parent adapter_child);
+        ]
+    else State.return []
+  in
+  let* retained =
+    if given.visibility_execution then
+      Resource_transfer.retained_formulas adapter_environment ~receiver:adapter_parent
+        contract.requires
+    else State.return []
   in
   let adapter =
     R.Member.callable
@@ -630,20 +664,25 @@ let member ~given ~past_structures ~proc_name task =
          ~returns:[ R.Var.make ~loc:l (ident ~loc:l handle_name) (R.Type.ref ~loc:l) ]
          ~requires:adapter_pre
          ~ensures:
-           [
-             R.Spec.make
-               (R.Expr.call ~loc:l (name ~loc:l task.backend)
-                  ((result :: native_values) @ proof_values));
-             R.Spec.make
-               (R.Expr.binary ~loc:l Eq
-                  (Domain_contract.captures ~loc:l ~runtime result)
-                  capture_value);
-           ]
+           ((if given.visibility_execution then
+               R.Spec.make (Execution_contract.visibility_context ~loc:l adapter_parent)
+               :: List.map retained ~f:R.Spec.make
+             else [])
+           @ [
+               R.Spec.make
+                 (R.Expr.call ~loc:l (name ~loc:l task.backend)
+                    ((result :: native_values) @ proof_values));
+               R.Spec.make
+                 (R.Expr.binary ~loc:l Eq
+                    (Domain_contract.captures ~loc:l ~runtime result)
+                    capture_value);
+             ])
          (ident ~loc:l ("fork$" ^ task.backend))
          (Some
-            (R.Stmt.local ~loc:l ~ghost:true ~const:true ~typ:captures_type
-               ~init:(R.Stmt.expr_rhs capture_value)
-               (ident ~loc:l capture_name)
+            (transfers
+            @ R.Stmt.local ~loc:l ~ghost:true ~const:true ~typ:captures_type
+                ~init:(R.Stmt.expr_rhs capture_value)
+                (ident ~loc:l capture_name)
             @ [
                 R.Stmt.fold ~loc:l
                   (qualified_name ~loc:l (contract_name ^ ".precondition"))
@@ -657,7 +696,7 @@ let member ~given ~past_structures ~proc_name task =
   in
   (* Check the actual worker's completion contract for the trusted native runtime. *)
   let* completion =
-    if not given.mutex_execution then State.return []
+    if not (Execution_contract.enabled execution) then State.return []
     else
       let* target, _ =
         State.polymorphic_application ctx ~at ~path:task.source.task_operation_path
@@ -682,7 +721,9 @@ let member ~given ~past_structures ~proc_name task =
           (qualified_name ~loc:l target)
           (native_values
           @ List.take proof_values (List.length ghosts)
-          @ history_values @ [ adapter_child; empty ] @ worker_implicits)
+          @ history_values
+          @ Execution_contract.initial_arguments ~loc:l execution adapter_child
+          @ worker_implicits)
       in
       let result_name = prepared.result in
       let* output_name = State.fresh "domain_worker_ghosts" in
@@ -729,7 +770,7 @@ let member ~given ~past_structures ~proc_name task =
                   @ [
                       (if List.is_empty returned then R.Stmt.call ~loc:l call
                        else R.Stmt.assign ~loc:l returned (R.Stmt.expr_rhs call));
-                      R.Stmt.call ~loc:l (Mutex_contract.finish ~loc:l adapter_child);
+                      R.Stmt.call ~loc:l (Execution_contract.finish ~loc:l adapter_child);
                       R.Stmt.assign ~loc:l [ output ]
                         (R.Stmt.expr_rhs (tuple ~loc:l (List.map outputs ~f:fst)));
                     ]
@@ -753,6 +794,101 @@ let member ~given ~past_structures ~proc_name task =
                     ])));
         ]
   in
+  let* receiving =
+    if not given.visibility_execution then State.return []
+    else
+      let receiver = R.Expr.var ~loc:l (name ~loc:l "receiver") in
+      let handle = R.Expr.var ~loc:l (name ~loc:l "joined") in
+      let result = R.Expr.var ~loc:l (name ~loc:l "result") in
+      let ghosts = R.Expr.var ~loc:l (name ~loc:l "ghosts") in
+      let outcome = R.Expr.var ~loc:l (name ~loc:l "outcome") in
+      let reference text =
+        R.Var.make ~loc:l ~ghost:true (ident ~loc:l text) (R.Type.ref ~loc:l)
+      in
+      let returned =
+        [
+          R.Var.make ~loc:l (ident ~loc:l "result") result_type;
+          R.Var.make ~loc:l ~ghost:true (ident ~loc:l "ghosts") outputs_type;
+          R.Var.make ~loc:l (ident ~loc:l "outcome") outcome_type;
+        ]
+      in
+      let* _, received_post = post_for ~receiver environment in
+      let outcome_environment =
+        {
+          (bind environment outcome_name (Value outcome)) with
+          var_types =
+            (outcome_name, Translate_context.outcome_type) :: environment.var_types;
+        }
+      in
+      let* normal_transfers =
+        Resource_transfer.transfer environment ~source:child ~target:receiver
+          contract.ensures
+      in
+      let* transfer =
+        if not (raising_contract contract) then State.return normal_transfers
+        else
+          let normal =
+            R.Stmt.if_ ~loc:l
+              (R.Expr.binary ~loc:l Eq outcome (no_exception ~loc:l outcome_type))
+              normal_transfers []
+          in
+          let set =
+            Exceptions.declared_raises
+              ~resolve:(Exceptions.resolver given.types f.environment)
+              contract
+          in
+          let clauses =
+            Exceptions.raises_postconditions given.types ~at contract.raises set
+          in
+          let+ exceptional =
+            Resource_transfer.transfer outcome_environment ~source:child ~target:receiver
+              clauses
+          in
+          normal :: exceptional
+      in
+      State.return
+        [
+          R.Member.callable
+            (R.Callable.proc ~loc:l
+               ~formals:
+                 [
+                   R.Var.make ~loc:l (ident ~loc:l "joined") (R.Type.ref ~loc:l);
+                   R.Var.make ~loc:l ~ghost:true (ident ~loc:l "captures") captures_type;
+                   reference "receiver";
+                 ]
+               ~returns:returned
+               ~requires:
+                 [
+                   R.Spec.make
+                     (Domain_contract.handle ~loc:l ~runtime [ handle; captures ]);
+                   R.Spec.make (Execution_contract.visibility_context ~loc:l receiver);
+                 ]
+               ~ensures:
+                 [
+                   R.Spec.make received_post;
+                   R.Spec.make (Execution_contract.visibility_context ~loc:l receiver);
+                 ]
+               (ident ~loc:l ("join$" ^ task.backend))
+               (Some
+                  ([
+                     R.Stmt.assign ~loc:l [ result; ghosts; outcome ]
+                       (R.Stmt.expr_rhs
+                          (Domain_contract.join ~loc:l ~runtime handle captures));
+                     R.Stmt.unfold ~loc:l
+                       (qualified_name ~loc:l (contract_name ^ ".postcondition"))
+                       [ captures; result; ghosts; outcome ];
+                     R.Stmt.call ~loc:l
+                       (Execution_contract.begin_join ~loc:l receiver child);
+                   ]
+                  @ transfer
+                  @ [
+                      R.Stmt.call ~loc:l
+                        (Execution_contract.visibility_end_handoff ~loc:l child receiver);
+                      R.Stmt.call ~loc:l (Execution_contract.finish ~loc:l child);
+                      R.Stmt.return ~loc:l [ result; ghosts; outcome ];
+                    ])));
+        ]
+  in
   let dependencies =
     List.filter_map
       ((f.body.exp_type :: parameter_types)
@@ -767,15 +903,11 @@ let member ~given ~past_structures ~proc_name task =
           ~outcome:outcome_type ~requires:(conjunction pre)
           ~ensures:
             (conjunction
-               (post
-               ::
-               (if given.mutex_execution then
-                  [ Mutex_contract.execution_finished ~loc:l child ]
-                else [])));
+               (post :: Execution_contract.completion_resources ~loc:l execution child));
         Domain_contract.runtime_instance ~loc:l model ~name:runtime_name
           ~task:(Qualified_name.of_string contract_name);
         alias;
         adapter;
       ]
-      @ completion,
+      @ completion @ receiving,
       dependencies )
