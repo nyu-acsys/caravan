@@ -908,6 +908,14 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                  "The module operation has a different ordinary or logically atomic \
                   contract kind"
            in
+           let* () =
+             State.of_result
+               (Raw_contract.check ~at
+                  ~related:[ (actual_at, "The actual operation's contract") ]
+                  ~expected:(Raw_contract.of_contract operation.operation_contract)
+                  ~actual:(Raw_contract.of_contract actual_contract)
+                  ())
+           in
            let signature_implicit prepared =
              List.filter (List.zip_exn prepared.prepared_implicit prepared.prepared_roles)
                ~f:(fun ((source, _, _, _, _), _) ->
@@ -2624,6 +2632,22 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
           List.Assoc.add procedure_signatures ~equal:String.equal (body_proc_name f)
             signature)
     in
+    let procedure_signatures =
+      List.fold functions.Path_bindings.entries ~init:procedure_signatures
+        ~f:(fun signatures (path, target) ->
+          match
+            List.find checked_operations ~f:(fun operation ->
+                List.mem operation.operation_paths path ~equal:Path.same)
+          with
+          | None -> signatures
+          | Some operation -> (
+              match
+                List.Assoc.find signatures operation.operation_name ~equal:String.equal
+              with
+              | None -> signatures
+              | Some signature ->
+                  List.Assoc.add signatures target signature ~equal:String.equal))
+    in
     let given =
       {
         (declaration_inputs data ~shared:(body_shared f) ~env:f.environment
@@ -2636,6 +2660,13 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
         functions;
         mutex_execution;
         visibility_execution;
+        raw_flow =
+          List.exists procedure_signatures ~f:(fun (_, signature) ->
+              Raw_contract.any signature.procedure_raw)
+          || List.exists
+               (scopes.source.field_disciplines
+              @ scopes.source.signature_field_disciplines) ~f:(fun field ->
+                 field.Field_disciplines.raw);
         lifted;
         pasts;
         past_returns;

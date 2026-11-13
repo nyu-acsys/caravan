@@ -186,6 +186,7 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
                 "module Ghost : sig\n\
                  type t\n\
                  val self : t\n\
+                 val raw : 'a -> 'a option\n\
                  val handoff : t -> t -> bool\n\
                  type ('owner, 'value) field\n\
                  module Mutex : sig\n\

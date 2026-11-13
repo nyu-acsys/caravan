@@ -78,10 +78,11 @@ let eligible ~inventory ?(definition = false) (source : Module_inventory.special
                              ~record_path:field.Field_disciplines.record_path
                              ~position:field.position
                          in
-                         Poly.equal
-                           (Option.value_map origin ~default:field.kind ~f:(fun origin ->
-                                origin.Field_disciplines.kind))
-                           Field_disciplines.Frozen))
+                         not
+                           (Poly.equal
+                              (Option.value_map origin ~default:field.kind
+                                 ~f:(fun origin -> origin.Field_disciplines.kind))
+                              Field_disciplines.Ordinary)))
             | _ -> false))
   in
   let body =

@@ -1,0 +1,4 @@
+module Producer = struct
+  proof (result [@raw]) = forward value
+    ensures (Ghost.raw result === Some value) = ()
+end

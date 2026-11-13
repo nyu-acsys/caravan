@@ -35,7 +35,14 @@ let parameter_slots inventory (signature : Module_inventory.signature_view) =
                    Some
                      {
                        member;
-                       field = { field with kind };
+                       field =
+                         {
+                           field with
+                           kind;
+                           raw =
+                             Option.value_map origin ~default:field.raw ~f:(fun origin ->
+                                 origin.raw);
+                         };
                        name =
                          Frozen_fields.kind_prefix kind
                          ^ "Tag$"

@@ -1,0 +1,12 @@
+module Payload = Ghost.Relaxed (struct let field (cell : 'a Alias.t) = cell.value end)
+proof result = allocate value
+  ensures (exists event : Ghost.t. Payload.state result (Some value) (Set.singleton (event, Some value))) = ()
+proof result = read [value : bool] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : bool option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)

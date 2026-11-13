@@ -159,3 +159,16 @@ let contract (annotation : t) : (Spec_ast.contract, Report.error) Result.t =
   try Ok (Spec_parser.contract Spec_lexer.token lexbuf) with
   | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
   | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+
+(** The unique contract following a declaration in its lexical scope. *)
+let contract_after ?scope ~item_loc ~next annotations =
+  let follows (annotation : t) =
+    Declaration_scope.following ?scope ~item_loc ~next annotation.loc
+    && Poly.equal (kind annotation) Contract
+  in
+  match List.filter annotations ~f:follows with
+  | [] -> Ok None
+  | [ annotation ] ->
+      Result.map (contract annotation) ~f:(fun contract -> Some (contract, annotation))
+  | _ :: annotation :: _ ->
+      Error (Report.error Type annotation.loc "A function has at most one contract")

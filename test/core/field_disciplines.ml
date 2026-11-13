@@ -118,3 +118,33 @@ let () =
   assert (
     List.exists fields ~f:(fun field ->
         field.D.immutable && String.equal field.label "next"))
+
+let () =
+  let fields =
+    get
+      (D.collect_structure
+         (structure "type t = { mutable value : bool [@caravan.relaxed] [@caravan.raw] }"))
+  in
+  let raw = List.hd_exn fields in
+  assert raw.raw;
+  assert (
+    match Types.get_desc (D.storage_type raw) with
+    | Tconstr (path, [ _ ], _) -> Path.same path Predef.path_option
+    | _ -> false);
+  let ordinary = { raw with raw = false } in
+  assert (Result.is_error (D.check ~at:Location.none ~expected:ordinary ~actual:raw));
+  assert (Result.is_error (D.check ~at:Location.none ~expected:raw ~actual:ordinary));
+  assert (Result.is_error (D.parse_raw ~kind:(Some D.Frozen) [ attribute "caravan.raw" ]));
+  assert (
+    Result.is_error
+      (D.parse_raw ~kind:(Some D.Relaxed)
+         [
+           attribute
+             ~payload:
+               (PStr
+                  [
+                    Ast_helper.Str.eval
+                      (Ast_helper.Exp.constant (Ast_helper.Const.integer "1"));
+                  ])
+             "caravan.raw";
+         ]))

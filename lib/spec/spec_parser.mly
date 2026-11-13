@@ -28,6 +28,31 @@
           "Only [@implicit] is supported on " ^ kind ^ " parameters"))
     in (x, ty)
 
+  let outline_parameters arguments =
+    if not (List.exists (function Lvar _ -> true | _ -> false) arguments) then None
+    else Some (List.filter_map (function
+      | Lvar id -> Some id
+      | Lunit at -> Some (mk_id ~loc:at "_")
+      | Lwild | Lghost _ -> None) arguments)
+
+  let raw_binder x attributes =
+    List.fold_left (fun x (attribute, at) ->
+      if attribute <> "raw" then
+        raise (Syntax_error (at, "Only [@raw] is supported on ordinary contract binders"));
+      if List.mem "raw" x.pid_attrs then
+        raise (Syntax_error (at, "Duplicate [@raw] contract binder attribute"));
+      add_attr x "raw") x attributes
+
+  let ghost_binder x attributes =
+    match attributes with
+    | [] -> x
+    | (_, at) :: _ ->
+        raise (Syntax_error (at, "Ghost parameters cannot have ordinary contract binder attributes"))
+
+  let raw_arguments = List.exists (function
+    | Lvar id -> List.mem "raw" id.pid_attrs
+    | Lunit _ | Lwild | Lghost _ -> false)
+
   let proof_value t = { proof_desc = Proof_value t; proof_loc = t.term_loc }
 
   let rec term_of_proof e =
@@ -333,32 +358,36 @@ proof_item:
 ;
 
 outline(steps):
-| PROOF n = lident COMMA rs = separated_nonempty_list(COMMA, ret_value)
+| PROOF n = outline_binder COMMA rs = separated_nonempty_list(COMMA, ret_value)
     EQUAL b = outline_body(steps)
-    { ignore rs;
-      match b with
+    { match b with
       | `Steps _ -> raise (Syntax_error (n.pid_loc, "Ghost results are followed by = and the call"))
-      | `Contract (f, fs, contract_end, ss) ->
-          let params = List.filter_map (function Lvar x -> Some x | _ -> None) fs in
-          { outline_name = f; outline_params = (if params = [] then None else Some params);
+      | `Contract (f, fs, contract_end, header_end, ss) ->
+          let contract_end =
+            if contract_end = None && (n.pid_attrs <> [] || raw_arguments rs) then Some header_end
+            else contract_end in
+          let params = outline_parameters fs in
+          { outline_name = f; outline_params = params;
             outline_contract = Option.map (fun e ->
               { (mk_loc $loc) with loc_start = $startpos(n); loc_end = e }) contract_end;
             outline_steps = ss; outline_loc = mk_loc $loc } }
-| PROOF n = lident ps = fun_arg* cs = outline_clause* EQUAL b = outline_body(steps)
-    { let params ps =
-        match List.filter_map (function Lvar x -> Some x | _ -> None) ps with
-        | [] -> None
-        | xs -> Some xs
-      in
-      let header_end = match cs with [] -> None | _ -> Some $endpos(cs) in
+| PROOF n = outline_binder ps = fun_arg* cs = outline_clause* EQUAL b = outline_body(steps)
+    { let params = outline_parameters in
+      let header_end = match cs with
+        | [] -> if raw_arguments ps then Some $endpos(ps) else None
+        | _ -> Some $endpos(cs) in
       match b with
       | `Steps ss ->
+          if n.pid_attrs <> [] then
+            raise (Syntax_error (n.pid_loc, "An attributed result binder is followed by = and the call"));
           { outline_name = n; outline_params = params ps;
             outline_contract =
               Option.map (fun e -> { (mk_loc $loc) with loc_start = $startpos(n); loc_end = e })
                 header_end;
             outline_steps = ss; outline_loc = mk_loc $loc }
-      | `Contract (f, fs, contract_end, ss) ->
+      | `Contract (f, fs, contract_end, argument_end, ss) ->
+          let contract_end =
+            if contract_end = None && n.pid_attrs <> [] then Some argument_end else contract_end in
           if ps <> [] || cs <> [] then
             raise (Syntax_error (n.pid_loc, "A result name is followed by = and the call"));
           { outline_name = f; outline_params = params fs;
@@ -371,9 +400,13 @@ outline(steps):
 outline_body(steps):
 | ss = steps { `Steps ss }
 | f = lident fs = fun_arg* cs = outline_clause* EQUAL ss = steps
-    { `Contract (f, fs, (match cs with [] -> None | _ -> Some $endpos(cs)), ss) }
+    { `Contract (f, fs,
+        (match cs with [] -> if raw_arguments fs then Some $endpos(fs) else None
+         | _ -> Some $endpos(cs)), $endpos(fs), ss) }
 | ATOMIC f = lident fs = fun_arg* cs = outline_clause* EQUAL ss = steps
-    { `Contract (f, fs, (match cs with [] -> None | _ -> Some $endpos(cs)), ss) }
+    { `Contract (f, fs,
+        (match cs with [] -> if raw_arguments fs then Some $endpos(fs) else None
+         | _ -> Some $endpos(cs)), $endpos(fs), ss) }
 ;
 
 (* A clause of an outline's contract, parenthesized as a lemma's. *)
@@ -414,7 +447,7 @@ outline_step:
 | AT LEFTPAR anchor_loc = anchor RIGHTPAR action = step_action
     { let action, action_loc = action in
       At { anchor_loc; action; action_loc; export = None } }
-| a = lident LEFTPAR anchor RIGHTPAR step_action
+| a = lident LEFTPAR bad_step_anchor RIGHTPAR step_action
     { raise (Syntax_error (a.pid_loc,
         "A step is at (code) followed by its step, or on return followed by ghost code")) }
 | ON r = lident adapter = return_adapter_expr
@@ -437,11 +470,20 @@ anchor:
 ;
 
 (* Anchors are parsed as OCaml by Outline; this grammar preserves their balanced range. *)
+bad_step_anchor:
+| anchor_nonident_token anchor_token* { mk_loc $loc }
+;
+
 anchor_token:
+| LIDENT { () }
+| anchor_nonident_token { () }
+;
+
+anchor_nonident_token:
 | LEFTPAR anchor_token* RIGHTPAR { () }
 | LEFTSQ anchor_token* RIGHTSQ { () }
 | LEFTBRC anchor_token* RIGHTBRC { () }
-| LIDENT | UIDENT | OP1 | OP2 | OP3 | OP4
+| UIDENT | OP1 | OP2 | OP3 | OP4
 | OPPREF | QUOTE_LIDENT | BACKQUOTE_LIDENT | POLY_TAG | ATTRIBUTE | INTEGER | FLOAT | CHAR
 | STRING | REQUIRES | ENSURES | VARIANT | PURE | INVARIANT | PREDICATE
 | FOLD | UNFOLD | ASSERT | ATOMIC | ATOMIC_REQUIRES | ATOMIC_ENSURES | ATOMIC_RAISES
@@ -912,7 +954,7 @@ clause:
 header_app:
 | nm=lident_rich args=fun_arg*
     { nm, args }
-|  arg1=fun_arg nm=op_symbol arg2=fun_arg
+|  arg1=plain_fun_arg nm=op_symbol arg2=plain_fun_arg
     { let nm = mk_id ~loc:(mk_loc $loc(nm)) nm in
         nm, [arg1; arg2] }
 
@@ -928,20 +970,36 @@ header:
     true, { hd_name = nm; hd_ret = [ Lwild ]; hd_args = args } }
 ;
 
+binder_attribute:
+| attribute = ATTRIBUTE { attribute, mk_loc $loc }
+;
+
+outline_binder:
+| id = lident attributes = binder_attribute* { raw_binder id attributes }
+| LEFTPAR id = lident attributes = binder_attribute+ RIGHTPAR
+    { raw_binder id attributes }
+;
+
 fun_arg:
+| arg = plain_fun_arg { arg }
+| LEFTPAR id = lident attributes = binder_attribute+ RIGHTPAR
+  { Lvar (raw_binder id attributes) }
+;
+
+plain_fun_arg:
 | LEFTPAR RIGHTPAR
   { Lunit (mk_loc $loc) }
-| id = lident
-  { Lvar id }
-| LEFTSQ id=lident COLON ty=typ RIGHTSQ
-  { Lghost (id, ty) }
+| id = lident attributes = binder_attribute*
+  { Lvar (raw_binder id attributes) }
+| LEFTSQ id=lident attributes = binder_attribute* COLON ty=typ RIGHTSQ
+  { Lghost (ghost_binder id attributes, ty) }
 ;
 
 ret_value:
-| id = lident
-  { Lvar id }
-| LEFTSQ id=lident COLON ty=typ RIGHTSQ
-  { Lghost (id, ty) }
+| id = lident attributes = binder_attribute*
+  { Lvar (raw_binder id attributes) }
+| LEFTSQ id=lident attributes = binder_attribute* COLON ty=typ RIGHTSQ
+  { Lghost (ghost_binder id attributes, ty) }
 ;
 
 

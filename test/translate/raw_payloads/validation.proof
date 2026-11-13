@@ -1,0 +1,97 @@
+module Payload = Ghost.Relaxed (struct let field (cell : 'a cell) = cell.value end)
+module Phases = SetRA (struct type t = bool end)
+module Authority = Auth (Phases)
+let lifetime : ('a cell, Authority.t) Ghost.field = Ghost.field ()
+
+predicate [@inline] retired (cell : 'a cell) =
+  own (Ghost.at lifetime cell) (Authority.frag (Phases.set (Set.singleton true)))
+
+invariant shared (head : bool Atomic.t) (cell : 'a cell) =
+  exists initial : 'a, moved : bool, current : 'a option, writes : (Ghost.t * 'a option) set, phases : bool set.
+    own head moved && Payload.state cell current writes &&
+    own (Ghost.at lifetime cell) (Authority.auth (Phases.set phases)) &&
+    (Set.mem true phases -> moved) &&
+    (forall event : Ghost.t, raw : 'a option. Set.mem (event, raw) writes ->
+      raw === Some initial || (raw === None && Set.mem true phases))
+
+lemma extend_lifetime (cell : 'a cell) (phases : bool set)
+  requires (own (Ghost.at lifetime cell) (Authority.auth (Phases.set phases)))
+  ensures (own (Ghost.at lifetime cell)
+    (Authority.auth (Phases.set (Set.union phases (Set.singleton true))))) =
+  Ghost.fpu (Ghost.at lifetime cell)
+    (Authority.auth (Phases.set phases)) (Authority.full (Phases.set phases));
+  Ghost.fpu (Ghost.at lifetime cell)
+    (Authority.full (Phases.set phases))
+    (Authority.full (Phases.set (Set.union phases (Set.singleton true))))
+
+lemma mark_retired (cell : 'a cell) (phases : bool set)
+  requires (own (Ghost.at lifetime cell) (Authority.auth (Phases.set phases)))
+  ensures (own (Ghost.at lifetime cell)
+    (Authority.auth (Phases.set (Set.union phases (Set.singleton true)))) && retired cell) =
+  extend_lifetime cell phases;
+  Ghost.fpu (Ghost.at lifetime cell)
+    (Authority.auth (Phases.set (Set.union phases (Set.singleton true))))
+    (Authority.auth_frag (Phases.set (Set.union phases (Set.singleton true)))
+      (Phases.set (Set.singleton true)))
+
+proof result = create value
+  ensures (match result with head, cell -> shared head cell) =
+  at ({ value }) initializes [Ghost.init lifetime (Authority.auth (Phases.set (Set.singleton false)))];
+  on return begin
+    let (event, writes) = Payload.snapshot cell in
+    fold shared head cell {initial = value; moved = false; current = Some value; writes = writes;
+      phases = Set.singleton false}
+  end
+
+proof retire head cell
+  requires (shared head cell)
+  ensures (shared head cell && retired cell) =
+  at (Atomic.set head true) (fun store ->
+    let (initial, moved, current, writes, phases) =
+      unfold shared head cell {initial; moved; current; writes; phases} in
+    let result = store () in
+    mark_retired cell phases;
+    fold shared head cell {initial = initial; moved = true; current = current; writes = writes;
+      phases = Set.union phases (Set.singleton true)};
+    result)
+
+proof clear head cell
+  requires (shared head cell)
+  ensures (shared head cell) =
+  at (Atomic.set head true) (fun store ->
+    let (initial, moved, current, writes, phases) =
+      unfold shared head cell {initial; moved; current; writes; phases} in
+    let result = store () in
+    mark_retired cell phases;
+    fold shared head cell {initial = initial; moved = true; current = current; writes = writes;
+      phases = Set.union phases (Set.singleton true)};
+    result);
+  at (cell.value <- Obj.magic ()) (fun store ->
+    let (initial, moved, current, writes, phases) =
+      unfold shared head cell {initial; moved; current; writes; phases} in
+    assert (Set.mem true phases);
+    let result = store () in
+    let (event, updated) = Payload.snapshot cell in
+    fold shared head cell {initial = initial; moved = moved; current = None; writes = updated; phases = phases};
+    result)
+
+proof result = peek head cell
+  requires (shared head cell)
+  ensures (shared head cell) =
+  let event = at (let value = cell.value) (fun read ->
+    let (initial, moved, current, writes, phases) =
+      unfold shared head cell {initial; moved; current; writes; phases} in
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    fold shared head cell {initial = initial; moved = moved; current = current; writes = writes; phases = phases};
+    (result, event)) in
+  at (Atomic.get head) (fun load ->
+    let (initial, moved, current, writes, phases) =
+      unfold shared head cell {initial; moved; current; writes; phases} in
+    Payload.reconcile cell event (Ghost.raw value);
+    let result = load () in
+    if not result then assert (Ghost.raw value === Some initial) else ();
+    fold shared head cell {initial = initial; moved = moved; current = current; writes = writes; phases = phases};
+    result)
+
+proof result = client value = ()

@@ -1041,6 +1041,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   in
   let* procedure_signatures =
     all funcs ~f:(fun f ->
+        let raw = Raw_contract.of_contract f.contract in
+        let* () =
+          if Raw_contract.any raw && is_pure f then
+            unsupported f.loc "Raw boundaries of a pure function"
+          else Ok ()
+        in
         let outputs = ghost_results f in
         let* () =
           match outputs with
@@ -1072,9 +1078,82 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               procedure_inputs;
               procedure_outputs;
               procedure_result = f.body.exp_type;
-              procedure_returns_value = not (is_unit f.body.exp_type);
+              procedure_returns_value = raw.result || not (is_unit f.body.exp_type);
+              procedure_raw = raw;
             } ))
   in
+  let* imported_signatures =
+    all libraries ~f:(fun library ->
+        let* contracts = library_contracts library in
+        all contracts ~f:(fun (member, (contract, at)) ->
+            let raw = Raw_contract.of_contract (Some contract) in
+            if not (Raw_contract.any raw) then Ok None
+            else
+              let path = Path.Pdot (library.Library_modules.library_path, member) in
+              let declaration = Env.find_value path source.env in
+              let* scheme =
+                Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                  ~project:(Datatypes.representation_arguments types)
+                  ~at declaration.val_type
+              in
+              let rec result typ =
+                match Types.get_desc typ with
+                | Tarrow (_, _, result_type, _) | Tpoly (result_type, []) ->
+                    result result_type
+                | _ -> typ
+              in
+              let result = result declaration.val_type in
+              Ok
+                (Some
+                   ( library.library_name ^ "." ^ member,
+                     {
+                       procedure_parameters = scheme.variables;
+                       procedure_variables = [];
+                       procedure_inputs = [];
+                       procedure_outputs = [];
+                       procedure_result = result;
+                       procedure_returns_value = raw.result || not (is_unit result);
+                       procedure_raw = raw;
+                     } ))))
+  in
+  let procedure_signatures =
+    procedure_signatures @ List.filter_opt (List.concat imported_signatures)
+  in
+  let checked_signatures =
+    List.filter_map checked_operations ~f:(fun operation ->
+        let raw = Raw_contract.of_contract operation.operation_contract in
+        if not (Raw_contract.any raw) then None
+        else
+          let scheme =
+            Option.map operation.operation_worker ~f:(fun worker ->
+                worker.Polymorphic_functions.scheme)
+          in
+          let typ =
+            Option.value_map scheme
+              ~default:operation.operation_signature.declaration.val_val.val_type
+              ~f:(fun scheme -> scheme.Polymorphic_functions.typ)
+          in
+          let rec result typ =
+            match Types.get_desc typ with
+            | Tarrow (_, _, result_type, _) | Tpoly (result_type, []) ->
+                result result_type
+            | _ -> typ
+          in
+          let result = result typ in
+          Some
+            ( operation.operation_name,
+              {
+                procedure_parameters =
+                  Option.value_map scheme ~default:[] ~f:(fun scheme -> scheme.variables);
+                procedure_variables = [];
+                procedure_inputs = [];
+                procedure_outputs = [];
+                procedure_result = result;
+                procedure_returns_value = raw.result || not (is_unit result);
+                procedure_raw = raw;
+              } ))
+  in
+  let procedure_signatures = procedure_signatures @ checked_signatures in
   let procedure_signatures = with_body_names procedure_signatures in
   let au_plan = au_plan ~asset_context in
   let au_procedure =

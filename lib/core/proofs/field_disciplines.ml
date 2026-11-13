@@ -13,6 +13,7 @@ type t = {
   label : string;
   kind : kind;
   immutable : bool;
+  raw : bool;
   value_type : Types.type_expr;
   declared_at : Location.t;
   at : Location.t;
@@ -72,6 +73,28 @@ let parse_attributes attributes =
   let* seen = List.fold_result attributes ~init:None ~f:add in
   Ok (Option.map seen ~f:fst)
 
+let parse_raw ~kind attributes =
+  let raw =
+    List.filter attributes ~f:(fun attribute ->
+        String.equal attribute.Parsetree.attr_name.txt "caravan.raw")
+  in
+  match raw with
+  | [] -> Ok false
+  | [ attribute ] ->
+      if not (Poly.equal kind (Some Relaxed)) then
+        error attribute.attr_loc
+          "The [@caravan.raw] attribute requires [@caravan.relaxed]"
+      else
+        begin match attribute.attr_payload with
+        | PStr [] -> Ok true
+        | PStr _ | PSig _ | PTyp _ | PPat _ ->
+            error attribute.attr_loc "The [@caravan.raw] field attribute takes no payload"
+        end
+  | attribute :: _ -> error attribute.attr_loc "Duplicate [@caravan.raw] field attribute"
+
+let storage_type field =
+  if field.raw then Predef.type_option field.value_type else field.value_type
+
 let shared fields =
   List.exists fields ~f:(fun field -> not (Poly.equal field.kind Ordinary))
 
@@ -130,6 +153,7 @@ let field_metadata ~canonicalize { path; boxed; labels } =
   let record_path = canonicalize path in
   let field position (label : Types.label_declaration) =
     let* discipline = parse_attributes label.ld_attributes in
+    let* raw = parse_raw ~kind:discipline label.ld_attributes in
     let attribute =
       List.find label.ld_attributes ~f:(fun attribute ->
           Option.is_some (attribute_kind attribute))
@@ -149,6 +173,7 @@ let field_metadata ~canonicalize { path; boxed; labels } =
                label = Ident.name label.ld_id;
                kind = Option.value discipline ~default:Ordinary;
                immutable = false;
+               raw;
                value_type = label.ld_type;
                declared_at = label.ld_loc;
                at;
@@ -163,6 +188,7 @@ let field_metadata ~canonicalize { path; boxed; labels } =
                label = Ident.name label.ld_id;
                kind = Ordinary;
                immutable = true;
+               raw = false;
                value_type = label.ld_type;
                declared_at = label.ld_loc;
                at;
@@ -183,13 +209,15 @@ let of_declaration path declaration =
   Ok (List.concat fields)
 
 let check ~at ~expected ~actual =
-  if Poly.equal expected.kind actual.kind then Ok ()
+  if Poly.equal expected.kind actual.kind && Bool.equal expected.raw actual.raw then Ok ()
   else
     error
       ~related:[ (expected.at, "The signature field"); (actual.at, "The actual field") ]
       at
       (Printf.sprintf "Field %s requires %s access, but the actual field uses %s access"
-         expected.label (kind_name expected.kind) (kind_name actual.kind))
+         expected.label
+         (kind_name expected.kind ^ if expected.raw then " raw" else "")
+         (kind_name actual.kind ^ if actual.raw then " raw" else ""))
 
 type occurrence = Record of record_fields | Attribute of Parsetree.attribute
 
@@ -233,7 +261,10 @@ let collect ?owner ?(canonicalize = Fn.id) visit =
       base with
       attribute =
         (fun self attribute ->
-          if Option.is_some (attribute_kind attribute) || obsolete_attribute attribute
+          if
+            Option.is_some (attribute_kind attribute)
+            || obsolete_attribute attribute
+            || String.equal attribute.Parsetree.attr_name.txt "caravan.raw"
           then add [ Attribute attribute ];
           base.attribute self attribute);
       attributes = (fun self attributes -> List.iter attributes ~f:(self.attribute self));

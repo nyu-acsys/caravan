@@ -183,7 +183,7 @@ let plan ~(source : Source.t) ~inventory ~types ~layouts =
         in
         let instances =
           List.filter_map
-            (field.value_type
+            (Field_disciplines.storage_type field
             :: List.map selections ~f:(fun (facade, _) -> facade.value_type))
             ~f:(fun payload ->
               Option.map (dictionary payload) ~f:(fun dict -> (dict, payload)))

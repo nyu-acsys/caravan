@@ -1,0 +1,6 @@
+module Stdlib = struct
+  module Obj = struct
+    proof result = magic () ensures (result === true) = ()
+  end
+end
+proof result = normal () ensures (result === true) = ()

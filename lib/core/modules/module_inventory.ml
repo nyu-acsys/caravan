@@ -1232,6 +1232,27 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             match member view.values name with
             | None -> missing signature_value.site.item_loc name
             | Some value ->
+                let declared (site : site) =
+                  Annotation.contract_after ~scope:site.scope ~item_loc:site.item_loc
+                    ~next:site.next site.annotations
+                in
+                let* expected = declared signature_value.site in
+                let* own = declared !value.site in
+                let* previous =
+                  List.map !value.signatures ~f:(fun signature -> declared signature.site)
+                  |> Result.all
+                in
+                let* () =
+                  List.fold_result
+                    (Option.to_list own @ List.filter_opt previous)
+                    ~init:()
+                    ~f:(fun () (actual, annotation) ->
+                      Raw_contract.check ~at
+                        ~related:[ (annotation.loc, "Its other contract") ]
+                        ~expected:(Raw_contract.of_contract (Option.map expected ~f:fst))
+                        ~actual:(Raw_contract.of_contract (Some actual))
+                        ())
+                in
                 let declarations =
                   List.map signature.signature_ghost_modules ~f:(fun (_, ghost) ->
                       ghost.ghost_declaration)
@@ -2289,7 +2310,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let projected (field : Field_disciplines.t) =
     match List.Assoc.find projections field.label_id ~equal:Ident.same with
     | None -> field
-    | Some declaration -> { field with kind = declaration.kind; at = declaration.at }
+    | Some declaration ->
+        { field with kind = declaration.kind; raw = declaration.raw; at = declaration.at }
   in
   let effective (field : Field_disciplines.t) =
     match
@@ -2299,7 +2321,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     | None -> projected field
     | Some (_, origin) ->
         let origin = projected origin in
-        { field with kind = origin.kind; at = origin.at }
+        { field with kind = origin.kind; raw = origin.raw; at = origin.at }
   in
   let* () =
     List.fold_result !field_aliases ~init:() ~f:(fun () (expected, actual) ->

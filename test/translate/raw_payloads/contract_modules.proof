@@ -1,0 +1,10 @@
+module Native = struct
+  proof (result [@raw]) = forward (value [@raw])
+    ensures (Ghost.raw result === Ghost.raw value) = ()
+end
+module Make (T : Transport) = struct
+  proof (result [@raw]) = forward (value [@raw])
+    ensures (Ghost.raw result === Ghost.raw value) = ()
+end
+proof (result [@raw]) = dummy ()
+  ensures (Ghost.raw result === (None : bool option)) = ()

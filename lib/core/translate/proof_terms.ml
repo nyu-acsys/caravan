@@ -1792,6 +1792,15 @@ let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_t
                 [ result; packed_value ~loc:(loc rhs.proof_loc) outputs ],
               packed_type [ result_type; packed_type output_types ] )
         in
+        let* raw_result = State.raw_value result in
+        let* () =
+          match raw_result with
+          | Some raw when not (List.is_empty output_types) ->
+              State.register_raw
+                (R.Expr.tuple_get ~loc:(loc rhs.proof_loc) result_value 0)
+                raw
+          | Some _ | None -> State.return ()
+        in
         let* env =
           State.of_result (bind_proof_pattern env pattern result_ty result_value)
         in

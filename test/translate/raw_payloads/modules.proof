@@ -1,0 +1,24 @@
+module Make (C : Cell) = struct
+  module Payload = Ghost.Relaxed (struct let field (cell : C.t) = cell.value end)
+  proof result = read [value : int] cell
+    requires (Payload.state cell (Some value) writes &&
+      forall event : Ghost.t, raw : int option. Set.mem (event, raw) writes -> raw === Some value)
+    ensures (Payload.state cell (Some value) writes && result = value) =
+    at (cell.value) (fun read ->
+      let result = read () in
+      let event = Payload.observe cell (Ghost.raw result) in
+      Payload.reconcile cell event (Ghost.raw result);
+      result)
+end
+module Fresh () = struct
+  module Payload = Ghost.Relaxed (struct let field (cell : t) = cell.value end)
+  proof result = read [value : bool] cell
+    requires (Payload.state cell (Some value) writes &&
+      forall event : Ghost.t, raw : bool option. Set.mem (event, raw) writes -> raw === Some value)
+    ensures (Payload.state cell (Some value) writes && result === value) =
+    at (cell.value) (fun read ->
+      let result = read () in
+      let event = Payload.observe cell (Ghost.raw result) in
+      Payload.reconcile cell event (Ghost.raw result);
+      result)
+end

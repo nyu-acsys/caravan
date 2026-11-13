@@ -201,13 +201,15 @@ let resolve ~core_type ~environment ~(name : S.id) ~kind
         in
         normalize (Data_types.lbl_res_type_path selected))
   in
+  let* discipline = Field_disciplines.parse_attributes selected.lbl_attributes in
+  let* raw = Field_disciplines.parse_raw ~kind:discipline selected.lbl_attributes in
   Ok
     {
       name;
       kind;
       owner_type = receiver_pattern.pat_type;
       receiver_pattern;
-      value_type;
+      value_type = (if raw then Predef.type_option value_type else value_type);
       label = selected;
       record_path;
       at;

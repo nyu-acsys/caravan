@@ -50,6 +50,11 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
             unsupported at "A task facade for a logically atomic contract"
         | Some _ -> Ok ()
       in
+      let* () =
+        if Raw_contract.any (Raw_contract.of_contract operation.contract) then
+          unsupported at "A task facade for a raw boundary"
+        else Ok ()
+      in
       let* binding =
         match (view, task.task_scope) with
         | Some view, _ -> Ok (Some view.Proof_bindings.source)

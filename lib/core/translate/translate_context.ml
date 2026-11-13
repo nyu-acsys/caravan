@@ -267,6 +267,9 @@ module State_monad = struct
     outline_exports : (string * (R.Expr.t * Types.type_expr)) list;
         (** The values that steps of the function's outline exported, by their keys. *)
     return_covered : bool;
+    cleared_bindings : Ident.t list;
+    raw_values : (R.Expr.t * R.Expr.t) list;
+        (** Speculative projections and their immutable option carriers. *)
     fields_of : (string * (string * R.Expr.t)) list;
     formals : R.Expr.t list;
     facts : R.Spec.t list;
@@ -306,6 +309,8 @@ module State_monad = struct
     call_targets : (string list * string) list;
     procedure_implicits : (string * string list) list;
         (** The actual implicit parameters of procedures already translated. *)
+    raw_families : string list;
+        (** Relaxed field families whose stored values are raw options. *)
     defaults : default_request list;
     condition_support : bool;
     mutex_support : bool;  (** Whether native mutex allocation is used. *)
@@ -478,6 +483,8 @@ module State_monad = struct
       proof_state = None;
       outline_exports = [];
       return_covered = false;
+      cleared_bindings = [];
+      raw_values = [];
       fields_of = [];
       formals = [];
       facts = [];
@@ -505,6 +512,7 @@ module State_monad = struct
           function_instances = [];
           call_targets = [];
           procedure_implicits = [];
+          raw_families = [];
           defaults = [];
           condition_support = false;
           mutex_support = false;
@@ -590,6 +598,21 @@ module State_monad = struct
           };
       } )
 
+  let cleared_binding id =
+    gets (fun state -> List.mem state.carried.cleared_bindings id ~equal:Ident.same)
+
+  let bind_cleared id =
+    modify_carried (fun carried ->
+        { carried with cleared_bindings = id :: carried.cleared_bindings })
+
+  let raw_value value =
+    gets (fun state ->
+        List.Assoc.find state.carried.raw_values value ~equal:R.Expr.alpha_equal)
+
+  let register_raw value raw =
+    modify_carried (fun carried ->
+        { carried with raw_values = (value, raw) :: carried.raw_values })
+
   (** The variables bound so far, by their OCaml names, latest first, with their Raven
       names and types. *)
   let get_scope = gets (fun s -> s.names.scope)
@@ -647,6 +670,7 @@ type procedure_signature = {
   procedure_outputs : (string * Types.type_expr) list;
   procedure_result : Types.type_expr;
   procedure_returns_value : bool;
+  procedure_raw : Raw_contract.t;
 }
 
 let map_procedure_types signature ~f =
@@ -762,6 +786,7 @@ type field_encoding =
   | Immutable_storage of string
   | Frozen_storage of string
   | Relaxed_storage of string
+  | Raw_relaxed_storage of string
 
 type proof_support = {
   visibility_enabled : bool;
@@ -1204,6 +1229,8 @@ type inputs = {
       *)
   mutex_execution : bool;
   visibility_execution : bool;
+  raw_flow : bool;
+  raw_return : bool;
   execution_owner : R.Expr.t option;
   execution_entry_held : R.Expr.t option;
   manual : bool;
@@ -1249,6 +1276,8 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     execution_contract = false;
     mutex_execution = false;
     visibility_execution = false;
+    raw_flow = false;
+    raw_return = false;
     execution_owner = None;
     execution_entry_held = None;
     manual = false;
@@ -1790,7 +1819,10 @@ module State = struct
     in
     match encoding with
     | Ordinary_storage -> return None
-    | Immutable_storage tag | Frozen_storage tag | Relaxed_storage tag ->
+    | Immutable_storage tag
+    | Frozen_storage tag
+    | Relaxed_storage tag
+    | Raw_relaxed_storage tag ->
         let payload =
           Option.first_some
             (Option.bind (Datatypes.instantiated given.types owner) ~f:(fun data ->
@@ -1807,12 +1839,37 @@ module State = struct
           match encoding with
           | Immutable_storage _ -> Immutable_fields_contract.module_name
           | Frozen_storage _ -> Execution_contract.module_name ^ ".Frozen"
-          | Relaxed_storage _ -> Relaxed_fields_contract.module_name
+          | Relaxed_storage _ | Raw_relaxed_storage _ ->
+              Relaxed_fields_contract.module_name
           | Ordinary_storage -> assert false
         in
+        let payload =
+          match encoding with
+          | Raw_relaxed_storage _ -> Predef.type_option payload
+          | _ -> payload
+        in
         let* dictionaries = dictionaries_given given ~at [ payload ] in
-        let+ instance =
+        let* instance =
           instance_given given ~target ~dictionaries:(tag :: dictionaries)
+        in
+        let+ () =
+          match encoding with
+          | Raw_relaxed_storage _ ->
+              modify (fun state ->
+                  {
+                    state with
+                    tables =
+                      {
+                        state.tables with
+                        raw_families =
+                          (if
+                             List.mem state.tables.raw_families instance
+                               ~equal:String.equal
+                           then state.tables.raw_families
+                           else instance :: state.tables.raw_families);
+                      };
+                  })
+          | _ -> return ()
         in
         Some (encoding, instance)
 
@@ -1821,14 +1878,14 @@ module State = struct
     match field with
     | None | Some ((Ordinary_storage | Immutable_storage _), _) -> return None
     | Some (Frozen_storage _, family) -> return (Some family)
-    | Some (Relaxed_storage _, _) ->
+    | Some ((Relaxed_storage _ | Raw_relaxed_storage _), _) ->
         of_result
           (error at "A Relaxed field uses its facade's state predicate instead of own")
 
   let relaxed_field given ~at owner label =
     let+ field = shared_field given ~at owner label in
     match field with
-    | Some (Relaxed_storage _, family) -> Some family
+    | Some ((Relaxed_storage _ | Raw_relaxed_storage _), family) -> Some family
     | None | Some ((Ordinary_storage | Immutable_storage _ | Frozen_storage _), _) -> None
 
   (** Resolve storage from an occurrence, retaining its declaration's field identity. *)
@@ -1902,6 +1959,40 @@ module State = struct
     | Some owner -> return owner
     | None -> of_result (error at "This field access needs an execution context")
 
+  let raw_storage field =
+    gets (fun state ->
+        List.exists state.tables.raw_families ~f:(fun family ->
+            String.equal field (family ^ ".contents")))
+
+  let raw_type given ~at typ =
+    of_result (Datatypes.typ given.types ~at (Predef.type_option typ))
+
+  let raw_project ~loc raw = R.Expr.field ~loc raw (name ~loc "value")
+
+  let raw_inject given ~at ~elt value =
+    let* raw = raw_value value in
+    match raw with
+    | Some raw -> return raw
+    | None ->
+        let+ typ = raw_type given ~at elt in
+        R.Expr.annotated
+          (R.Expr.call ~loc:(loc at)
+             (qualified_name ~loc:(loc at) "Option.some")
+             [ value ])
+          typ
+
+  let check_raw ~at value =
+    let* raw = raw_value value in
+    match raw with
+    | None -> return []
+    | Some raw ->
+        let+ statement =
+          check ~at
+            "This speculative value may be cleared; validate its payload before using it"
+            (R.Expr.is_ ~loc:(loc at) raw (ident ~loc:(loc at) "some"))
+        in
+        [ statement ]
+
   let ordinary_read ?guard ?(immutable = false) ?(frozen = false) ?(published = false)
       (given : inputs) ~at ~field ~elt r =
     let l = loc at in
@@ -1933,7 +2024,9 @@ module State = struct
           let+ proc = ordinary_primitive given ~at ~field elt operation in
           (proc, [ r ])
     in
-    let* typ = of_result (Datatypes.typ given.types ~at elt) in
+    let* raw = raw_storage field in
+    let stored_type = if raw then Predef.type_option elt else elt in
+    let* typ = of_result (Datatypes.typ given.types ~at stored_type) in
     let* x = fresh "tmp" in
     let value = R.Expr.var ~loc:l (name ~loc:l x) in
     let rhs =
@@ -1965,12 +2058,24 @@ module State = struct
                     R.Stmt.if_ ~loc:l condition [ R.Stmt.assign ~loc:l [ value ] rhs ] [];
                   ])
     in
-    return (access, value)
+    if not raw then return (access, value)
+    else
+      let* payload_type = of_result (Datatypes.typ given.types ~at elt) in
+      let* payload_name = fresh "raw_payload" in
+      let payload = R.Expr.var ~loc:l (name ~loc:l payload_name) in
+      let+ () = register_raw payload value in
+      ( access
+        @ R.Stmt.local ~loc:l ~typ:payload_type
+            ~init:(R.Stmt.expr_rhs (raw_project ~loc:l value))
+            (ident ~loc:l payload_name),
+        payload )
 
   let ordinary_write (given : inputs) ~at ~field ~elt r v =
     let l = loc at in
     let* relaxed = relaxed_storage given field in
     let* frozen = frozen_storage given field in
+    let* raw = raw_storage field in
+    let* v = if raw then raw_inject given ~at ~elt v else return v in
     let* proc, arguments =
       match (relaxed, frozen) with
       | Some family, _ ->
@@ -2065,6 +2170,22 @@ let stdlib_name (p : Path.t) =
   | Pdot (Pident m, x) when Ident.persistent m && String.equal (Ident.name m) "Stdlib" ->
       Some x
   | _ -> None
+
+(** The standard unit-word clearing cast, without accepting arbitrary casts. *)
+let unit_clear_cast path (declaration : Types.value_description) =
+  let standard =
+    match path with
+    | Path.Pdot (Pident owner, "magic") ->
+        Ident.persistent owner && String.equal (Ident.name owner) "Stdlib__Obj"
+    | Pdot (Pdot (Pident owner, "Obj"), "magic") ->
+        Ident.persistent owner && String.equal (Ident.name owner) "Stdlib"
+    | _ -> false
+  in
+  standard
+  &&
+  match declaration.val_kind with
+  | Val_prim primitive -> String.equal primitive.prim_name "%identity"
+  | Val_reg | Val_ivar _ | Val_self _ | Val_anc _ -> false
 
 (** The name of [p] if it is a value of [Stdlib.Atomic]. *)
 let atomic_name (p : Path.t) =

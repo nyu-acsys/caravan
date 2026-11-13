@@ -17,3 +17,7 @@
 (test
  (name own_labels)
  (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name raw_headers)
+ (libraries caravan_spec compiler-libs.common))

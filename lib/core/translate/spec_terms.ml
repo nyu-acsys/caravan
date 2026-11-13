@@ -973,8 +973,19 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       application env t
   | Tvar (Qid { pid_str = x; _ }) ->
       begin match (List.Assoc.find env.vars x ~equal:String.equal, x) with
-      | Some (Raven x), _ -> State.return (R.Expr.var ~loc:l (name ~loc:l x))
-      | Some (Value v), _ -> State.return v
+      | Some (Raven x), _ ->
+          let value = R.Expr.var ~loc:l (name ~loc:l x) in
+          let* raw = State.raw_value value in
+          if Option.is_some raw then
+            State.of_result
+              (error at "Use Ghost.raw to refer to a speculative payload in a proof")
+          else State.return value
+      | Some (Value v), _ ->
+          let* raw = State.raw_value v in
+          if Option.is_some raw then
+            State.of_result
+              (error at "Use Ghost.raw to refer to a speculative payload in a proof")
+          else State.return v
       | Some (State fields), _ ->
           (* A record bound by its fields is their constructor's application. *)
           begin match
@@ -1056,7 +1067,13 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let variable ~at x t =
         let* ty = State.typ env.ctx ~at t in
         let l = loc at in
-        let+ raven = if env.logical_definition then State.fresh x else State.return x in
+        let* raw =
+          State.gets (fun (state : State.state) ->
+              not (List.is_empty state.carried.raw_values))
+        in
+        let+ raven =
+          if env.logical_definition || raw then State.fresh x else State.return x
+        in
         (raven, t, R.Var.make ~loc:l (ident ~loc:l raven) ty)
       in
       let* bound =
@@ -1450,6 +1467,28 @@ and application env (t : S.term) =
   | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result
         (error head.term_loc "A local proof value cannot be called as a logical function")
+  | Tvar (Qdot (Qid ghost, method_)), [ argument ]
+    when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "raw" ->
+      let* value =
+        match argument.term_desc with
+        | Tvar (Qid id) ->
+            begin match List.Assoc.find env.vars id.pid_str ~equal:String.equal with
+            | Some (Raven x) -> State.return (R.Expr.var ~loc:l (name ~loc:l x))
+            | Some (Value value) -> State.return value
+            | Some (State _) | None -> formula env argument
+            end
+        | _ -> formula env argument
+      in
+      let* raw = State.raw_value value in
+      begin match raw with
+      | Some raw -> State.return raw
+      | None ->
+          let* payload =
+            term_type env argument |> fun typ ->
+            State.of_result (Report.expect ~at "The payload type of Ghost.raw" typ)
+          in
+          State.raw_inject env.ctx.given ~at ~elt:payload value
+      end
   | Tvar (Qdot (Qid ghost, method_)), [ source; target ]
     when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "handoff" ->
       let* typ = State.of_result (Source.ghost_type env.ctx.given.env ~at) in

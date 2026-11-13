@@ -1,0 +1,9 @@
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.proof)
+  (glob_files *.mli)
+  (glob_files alias_erasure_root/*)
+  (glob_files imports/*.mli)))

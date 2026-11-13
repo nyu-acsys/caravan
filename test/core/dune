@@ -172,3 +172,8 @@
  (name relaxed_fields_contract)
  (modules relaxed_fields_contract)
  (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name raw_contract)
+ (modules raw_contract)
+ (libraries base caravan_core caravan_spec compiler-libs.common))

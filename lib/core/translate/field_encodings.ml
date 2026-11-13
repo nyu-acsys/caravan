@@ -5,10 +5,10 @@ open Translate_context
 
 let ( let* ) = Result.( >>= )
 
-let storage kind tag =
+let storage ?(raw = false) kind tag =
   match kind with
   | Field_disciplines.Frozen -> Frozen_storage tag
-  | Relaxed -> Relaxed_storage tag
+  | Relaxed -> if raw then Raw_relaxed_storage tag else Relaxed_storage tag
   | Ordinary -> Immutable_storage tag
 
 let resolve ~fields ~parameters ~inventory ~disciplines ~types ~namespace ~at ~owner
@@ -50,6 +50,7 @@ let resolve ~fields ~parameters ~inventory ~disciplines ~types ~namespace ~at ~o
                 then
                   Some
                     ( slot.field.kind,
+                      slot.field.raw,
                       if inside interface then
                         Frozen_parameters.interface_reference parameters ~stage ~slot
                       else
@@ -59,7 +60,7 @@ let resolve ~fields ~parameters ~inventory ~disciplines ~types ~namespace ~at ~o
         |> List.stable_dedup ~compare:Poly.compare
       in
       begin match candidates with
-      | [ (kind, tag) ] -> Ok (storage kind tag)
+      | [ (kind, raw, tag) ] -> Ok (storage ~raw kind tag)
       | _ :: _ :: _ ->
           Report.unsupported at ("An ambiguous shared-field family for " ^ label)
       | [] -> (
@@ -134,7 +135,7 @@ let resolve ~fields ~parameters ~inventory ~disciplines ~types ~namespace ~at ~o
                 end
           in
           match (tag, metadata) with
-          | Some tag, Some field -> Ok (storage field.kind tag)
+          | Some tag, Some field -> Ok (storage ~raw:field.raw field.kind tag)
           | Some _, None | None, _ -> Ok Ordinary_storage)
       end
   | _ -> Ok Ordinary_storage

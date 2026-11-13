@@ -1,0 +1,5 @@
+proof (result [@raw]) = forward (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value) = ()
+proof (result [@raw]) = dummy ()
+  ensures (Ghost.raw result === (None : bool option)) = ()
+proof unit_dummy () = ()
