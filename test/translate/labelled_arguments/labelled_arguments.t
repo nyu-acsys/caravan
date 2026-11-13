@@ -11,11 +11,9 @@ including reordered labels, patterns, aliases, pure functions and generic module
   $ caravan --shh -I imports imports.ml
   Verification successful.
 
-Optional parameters and calls remain unsupported.
+Optional parameters and calls retain their option-valued input slots.
 
-  $ caravan --shh optional.ml > optional.out 2>&1
-  [1]
-  $ grep -q 'Unsupported Error:' optional.out
-  $ caravan --shh -I imports optional_call.ml > call.out 2>&1
-  [1]
-  $ grep -q 'An optional or omitted argument' call.out
+  $ caravan --shh optional.ml
+  Verification successful.
+  $ caravan --shh -I imports optional_call.ml
+  Verification successful.

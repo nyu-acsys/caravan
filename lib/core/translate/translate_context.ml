@@ -585,8 +585,10 @@ module State_monad = struct
   let find_name id = gets (fun s -> name_in s.names id)
 
   (** The Raven name of the OCaml variable [id] of type [typ], bound now. *)
-  let bind_name ?typ (id : Ident.t) s =
-    let name = Fresh_names.unused s.names.used (Ident.name id) in
+  let bind_name ?typ ?base (id : Ident.t) s =
+    let name =
+      Fresh_names.unused s.names.used (Option.value base ~default:(Ident.name id))
+    in
     ( Ok name,
       {
         s with
@@ -2290,15 +2292,11 @@ let unop_of_path (p : Path.t) =
 
 let unit_value ~loc = R.Expr.tuple ~loc []
 
-let required_argument = function
-  | Asttypes.Nolabel | Labelled _ -> true
-  | Optional _ -> false
-
-(** Fully supplied arguments in the compiler's checked parameter order. *)
+(** Fully supplied arguments, including option-valued optional slots. *)
 let supplied_args ~at (args : (Asttypes.arg_label * Typedtree.apply_arg) list) =
   all args ~f:(function
-    | (Nolabel | Labelled _), Arg e -> Ok e
-    | _ -> unsupported at "An optional or omitted argument")
+    | _, Arg e -> Ok e
+    | _, Omitted _ -> unsupported at "An omitted argument or partial application")
 
 (** What a name in a contract stands for: a Raven variable, or a value, such as the field
     of a matched value that a pattern names. *)

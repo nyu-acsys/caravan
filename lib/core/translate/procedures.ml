@@ -115,8 +115,10 @@ let ghost_results (f : func) =
 let contract_names (f : func) (header : S.header option) n =
   let ocaml_names =
     List.map f.params ~f:(fun p ->
-        match p.fp_kind with
-        | Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } -> Some (Ident.name id)
+        match (p.fp_arg_label, p.fp_kind) with
+        | Optional label, _ -> Some label
+        | (Nolabel | Labelled _), Tparam_pat { pat_desc = Tpat_var (id, _, _); _ } ->
+            Some (Ident.name id)
         | _ -> None)
   in
   match header with
@@ -381,14 +383,18 @@ let formals ?(names = []) ?(raw = Raw_contract.of_header None) ctx (f : func) =
     (List.mapi f.params ~f:(fun i p -> (i, p)))
     ~f:(fun (i, (p : Typedtree.function_param)) ->
       match p.fp_kind with
-      | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
-        when required_argument p.fp_arg_label ->
+      | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ } ->
           let native_type =
             if Raw_contract.argument raw i then Predef.type_option pat_type else pat_type
           in
           let* typ = State.typ ctx ~at:pat_loc native_type in
           let* () = State.note_domain ctx.given.types native_type in
-          let+ x = State.bind_name ~typ:pat_type id in
+          let base =
+            match p.fp_arg_label with
+            | Optional label -> Some (label ^ "_argument")
+            | Nolabel | Labelled _ -> None
+          in
+          let+ x = State.bind_name ~typ:pat_type ?base id in
           let spec =
             match witness_condition ctx ~loc:(loc pat_loc) f.id i x with
             | Some condition -> Some (R.Spec.make condition)
@@ -402,7 +408,7 @@ let formals ?(names = []) ?(raw = Raw_contract.of_header None) ctx (f : func) =
           let+ x = State.fresh "unit" in
           let l = loc pat_loc in
           (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
-      | Tparam_pat { pat_type; pat_loc; _ } when required_argument p.fp_arg_label ->
+      | Tparam_pat { pat_type; pat_loc; _ } ->
           let* typ = State.typ ctx ~at:pat_loc pat_type in
           let contract_name = Option.join (List.nth names i) in
           let* () = State.note_domain ctx.given.types pat_type in
@@ -446,27 +452,7 @@ let pattern_params ctx (f : func) formals =
                     (ident ~loc:l y)
                   @ assert_admissible ctx ~loc:l t y)
             in
-            (* The variables of a record's fields are its fields. *)
-            let+ () =
-              match pat.pat_desc with
-              | Tpat_record (fields, _) ->
-                  State.iter fields ~f:(fun (_, label, p) ->
-                      match p.pat_desc with
-                      | Tpat_var (id, _, _) ->
-                          let* y = State.find_name id in
-                          begin match y with
-                          | Some y ->
-                              State.modify_carried (fun c ->
-                                  {
-                                    c with
-                                    fields_of =
-                                      (y, (label.lbl_name, value)) :: c.fields_of;
-                                  })
-                          | None -> State.return ()
-                          end
-                      | _ -> State.return ())
-              | _ -> State.return ()
-            in
+            let+ () = record_projection_bindings pat value in
             (access @ checked) :: stmts
         | _ -> State.return [])
   in

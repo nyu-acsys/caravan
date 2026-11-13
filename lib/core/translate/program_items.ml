@@ -75,6 +75,7 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
         let vb = entry.binding in
         match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
         | Tpat_var (id, _, _), Some (params, body) ->
+            let* params, body = Optional_parameters.lower params body in
             let* () = Datatypes.validate_indices data ~at:vb.vb_loc vb.vb_pat.pat_type in
             let site = entry.site in
             let* own =
@@ -361,6 +362,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
     ~f:(fun
         ((vb : Typedtree.value_binding), id, params, body, (rest : Typedtree.expression))
       ->
+      let* params, body = Optional_parameters.lower params body in
       let* contract =
         contract_with_origin_after annotations ~item_loc:vb.vb_loc
           ~next:(Some rest.exp_loc)

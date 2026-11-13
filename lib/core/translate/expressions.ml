@@ -16,6 +16,28 @@ let captured_arguments ~at ~values names captured =
           | None -> error at (Printf.sprintf "%s is not in scope here" (Ident.name id))
           end)
 
+(** Retains the receiver of destructured fields for implicit argument inference. *)
+let rec record_projection_bindings (pattern : Typedtree.pattern) receiver =
+  match pattern.pat_desc with
+  | Tpat_alias (pattern, _, _, _, _) -> record_projection_bindings pattern receiver
+  | Tpat_record (fields, _) ->
+      State.iter fields ~f:(fun (_, label, pattern) ->
+          match pattern.pat_desc with
+          | Tpat_var (id, _, _) ->
+              let* name = State.find_name id in
+              begin match name with
+              | Some name ->
+                  State.modify_carried (fun carried ->
+                      {
+                        carried with
+                        fields_of =
+                          (name, (label.lbl_name, receiver)) :: carried.fields_of;
+                      })
+              | None -> State.return ()
+              end
+          | _ -> State.return ())
+  | _ -> State.return ()
+
 let constructor_value ctx ~at ~result_type data constructor arguments =
   let value =
     R.Expr.call ~loc:(loc at)
@@ -642,7 +664,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
                   State.of_result
                     (unsupported vb.vb_pat.pat_loc "A refutable pattern in a let binding")
               | None ->
-                  let+ defs =
+                  let* defs =
                     State.all binds ~f:(fun (id, value, t) ->
                         let* typ = State.typ ctx ~at t in
                         let* () = State.note_domain ctx.given.types t in
@@ -660,6 +682,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
                         if Option.is_some raw then []
                         else assert_admissible ctx ~loc:l t x)
                   in
+                  let+ () = record_projection_bindings vb.vb_pat v in
                   reading @ List.concat defs)
       in
       let last = List.last_exn bindings in
@@ -2342,7 +2365,8 @@ and match_cases ?(raw = false) ?commits ?otherwise ?arm ~tail ctx ~at v
   let case_commits = List.zip_exn (List.map cases ~f:snd) commits in
   (* The body of a case, after defining the variables of its pattern, with the join of
      the positions after it, and the path it ends in. *)
-  let case_body ?(names = enclosing_names) join binds (rhs : Typedtree.expression) =
+  let case_body ?source_pattern ?(names = enclosing_names) join binds
+      (rhs : Typedtree.expression) =
     let* () = State.set_scope names in
     let+ (stmts, join), ended =
       State.arm start
@@ -2359,6 +2383,11 @@ and match_cases ?(raw = false) ?commits ?otherwise ?arm ~tail ctx ~at v
                let+ x = State.bind_name ~typ:t id in
                R.Stmt.local ~loc:l ~typ ~init:(R.Stmt.expr_rhs value) (ident ~loc:l x)
                @ assert_admissible ctx ~loc:l t x)
+         in
+         let* () =
+           match source_pattern with
+           | None -> State.return ()
+           | Some pattern -> record_projection_bindings pattern v
          in
          (* A case of a match on a witness has its own types, and its value is converted
             to the type the witness selects. *)
@@ -2436,11 +2465,11 @@ and match_cases ?(raw = false) ?commits ?otherwise ?arm ~tail ctx ~at v
               (fails, join, ends)
           | [ (p, rhs) ] when total ->
               let* access, _, binds = pattern ctx p v in
-              let+ body, join, ended = case_body join binds rhs in
+              let+ body, join, ended = case_body ~source_pattern:p join binds rhs in
               (access @ body, join, ended :: ends)
           | (p, rhs) :: rest -> begin
               let* access, cond, binds = pattern ctx p v in
-              let* body, join, ended = case_body join binds rhs in
+              let* body, join, ended = case_body ~source_pattern:p join binds rhs in
               let ends = ended :: ends in
               match cond with
               | None -> State.return (access @ body, join, ends)

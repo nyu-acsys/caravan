@@ -1,0 +1,5 @@
+proof result = identity value ensures (result === value) = ()
+proof result = choose value token
+  ensures (result === (match value with None -> 42 | Some v -> v)) =
+  at (identity 42) (fun step -> let result = step () in result)
+proof client () = ()

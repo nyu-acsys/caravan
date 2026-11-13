@@ -14,6 +14,7 @@ type definition = {
   cases : bool;  (** Written with [function], whose argument a contract names. *)
   path : string list;  (** The modules it is in. *)
   body : Parsetree.expression;
+  defaults : Parsetree.expression list;
   at : Location.t;
 }
 (** A function of the program: its name, parameter names, and body. *)
@@ -45,10 +46,33 @@ let rec function_of (e : Parsetree.expression) =
   | Pexp_newtype (_, e) | Pexp_constraint (e, _) -> function_of e
   | _ -> ([], false, e)
 
+(** Defaults outside the extracted body are separate conditional proof regions. *)
+let rec defaults_of (expression : Parsetree.expression) =
+  match expression.pexp_desc with
+  | Pexp_function (parameters, _, Pfunction_body body) ->
+      List.filter_map parameters ~f:(fun parameter ->
+          match parameter.Parsetree.pparam_desc with
+          | Pparam_val (_, default, _) -> default
+          | Pparam_newtype _ -> None)
+      @ defaults_of body
+  | Pexp_newtype (_, expression) | Pexp_constraint (expression, _) ->
+      defaults_of expression
+  | _ -> []
+
+let code_roots definition = definition.defaults @ [ definition.body ]
+
 let definition ~path (binding : Parsetree.value_binding) =
   Option.map (pattern_name binding.pvb_pat) ~f:(fun name ->
       let parameters, cases, body = function_of binding.pvb_expr in
-      { name; parameters; cases; path; body; at = binding.pvb_loc })
+      {
+        name;
+        parameters;
+        cases;
+        path;
+        body;
+        defaults = defaults_of binding.pvb_expr;
+        at = binding.pvb_loc;
+      })
 
 (** The functions that [structure] defines, in its modules and functors too. *)
 let rec definitions ?(path = []) (structure : Parsetree.structure) =
@@ -228,7 +252,7 @@ let step_end (e : Parsetree.expression) =
     subexpressions, by location: branches, loop bodies, functions, and right operands of
     [&&] and [||]. An expression runs whenever another does if its regions are among the
     other's. *)
-let regions (body : Parsetree.expression) =
+let regions ?(inside = []) (body : Parsetree.expression) =
   let found = ref [] in
   let rec visit regions (e : Parsetree.expression) =
     found :=
@@ -257,14 +281,31 @@ let regions (body : Parsetree.expression) =
           [ (_, a); (_, b) ] ) ->
         visit regions a;
         visit (region 1) b
-    | Pexp_function _ | Pexp_lazy _ -> children (region 0) e
+    | Pexp_function (parameters, _, _) ->
+        let defaults =
+          List.filter_map parameters ~f:(fun parameter ->
+              match parameter.Parsetree.pparam_desc with
+              | Pparam_val (_, default, _) -> default
+              | Pparam_newtype _ -> None)
+        in
+        children ~defaults (region 0) e
+    | Pexp_lazy _ -> children (region 0) e
     | _ -> children regions e
-  and children regions e =
-    let expr _ e = visit regions e in
+  and children ?(defaults = []) regions e =
+    let expr _ e =
+      let regions =
+        if
+          List.exists defaults ~f:(fun default ->
+              Poly.equal default.Parsetree.pexp_loc e.Parsetree.pexp_loc)
+        then (e.pexp_loc.loc_start.pos_cnum, 1) :: regions
+        else regions
+      in
+      visit regions e
+    in
     let iterator = { Ast_iterator.default_iterator with expr } in
     Ast_iterator.default_iterator.expr iterator e
   in
-  visit [] body;
+  visit inside body;
   !found
 
 let regions_of regions (e : Parsetree.expression) =
@@ -299,8 +340,8 @@ let anchor_place ~proof_text definition ~excluded ~previous (anchor_loc : Locati
   let* name, anchor = anchor_expression ~proof_text anchor_loc in
   let code =
     match name with
-    | None -> subexpressions definition.body
-    | Some name -> bound_to name definition.body
+    | None -> List.concat_map (code_roots definition) ~f:subexpressions
+    | Some name -> List.concat_map (code_roots definition) ~f:(bound_to name)
   in
   let candidates =
     List.filter code ~f:(fun e ->
@@ -441,7 +482,9 @@ let loop_body definition (code : Parsetree.expression) ~at =
     | _ -> expression
   in
   let bodies =
-    List.filter_map (subexpressions definition.body) ~f:(fun expression ->
+    List.filter_map
+      (List.concat_map (code_roots definition) ~f:subexpressions)
+      ~f:(fun expression ->
         match expression.pexp_desc with
         | (Pexp_while (_, body) | Pexp_for (_, _, _, _, body))
           when Poly.equal (first body).pexp_loc code.pexp_loc ->
@@ -458,7 +501,7 @@ let loop_body definition (code : Parsetree.expression) ~at =
     linearizations make it manual. *)
 let rec outline_annotations ~proof_text definitions (outline : S.outline) =
   let* definition = definition_of definitions outline in
-  let locals = local_definitions definition.body in
+  let locals = List.concat_map (code_roots definition) ~f:local_definitions in
   let nested =
     List.filter_map outline.outline_steps ~f:(function S.Nested o -> Some o | _ -> None)
   in
@@ -470,7 +513,11 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
       (List.map nested ~f:(fun o ->
            Result.map (definition_of locals o) ~f:(fun d -> d.at)))
   in
-  let regions = regions definition.body in
+  let regions =
+    regions definition.body
+    @ List.concat_map definition.defaults ~f:(fun default ->
+        regions ~inside:[ (default.pexp_loc.loc_start.pos_cnum, 0) ] default)
+  in
   let shadow visible names =
     List.filter visible ~f:(fun b ->
         not (List.exists (binding_names b) ~f:(List.mem names ~equal:String.equal)))

@@ -20,3 +20,12 @@ predicate [@inline] allocated (owner : Ghost.t) (node : ('a, [ `Node ]) node)
 
 proof result = make_node (value [@raw]) capacity counter next
   ensures (allocated Ghost.self result (Ghost.raw value) capacity counter next) = ()
+
+predicate [@inline] empty_queue (owner : Ghost.t) (queue : 'a t) (limit : int) =
+  queue.capacity = limit && exists node : ('a, [ `Node ]) node.
+    own queue.head node && own queue.tail node &&
+    allocated owner node (None : 'a option) limit 0 Null
+
+proof result = create capacity token
+  ensures (empty_queue Ghost.self result
+    (match capacity with None -> max_int | Some limit -> limit)) = ()

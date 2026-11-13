@@ -1,0 +1,23 @@
+let after (token : unit option) (before : int) (value : int) : int =
+  match token with None -> value | Some _ -> before
+
+proof result = later [before : int] cell token record
+  requires (cell === record && own cell.value before)
+  ensures (own cell.value (after token before 1) && result = after token before 1) = ()
+proof result = earlier [before : int] record cell token unit
+  requires (cell === record && own cell.value before)
+  ensures (own cell.value (after token before 1) && result = before) = ()
+proof result = interleaved [before : int] cell first middle second last
+  requires (cell === middle && cell === last && own cell.value before)
+  ensures (own cell.value (after second (after first before 1) 2) &&
+    result === (after first before 1, after second (after first before 1) 2)) = ()
+proof result = some token input
+  requires (match input with None -> false | Some _ -> true)
+  ensures (match input with None -> false | Some value -> result === value) = ()
+proof result = selected value token
+  requires (match value with Some None -> false | _ -> true)
+  ensures (result === (match value with None -> 42 | Some (Some v) -> v | Some None -> 0)) = ()
+proof client () =
+  at (later first first) (fun step -> let result = step 0 in result);
+  at (earlier second second ()) (fun step -> let result = step 0 in result);
+  at (interleaved third third third) (fun step -> let result = step 0 in result)

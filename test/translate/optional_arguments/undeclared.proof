@@ -1,0 +1,1 @@
+proof result = choose value token ensures (true) = ()

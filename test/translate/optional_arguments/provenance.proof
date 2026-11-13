@@ -1,0 +1,5 @@
+proof result = retain [queue : queue] head
+  requires (head === queue.head)
+  ensures (result === queue.head) = ()
+proof result = choose token queue ensures (result === queue.head) = ()
+proof client () = ()

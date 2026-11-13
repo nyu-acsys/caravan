@@ -1,4 +1,4 @@
-Saturn's constructor owns its link cell, payload/capacity journals, and counter.
+Saturn's constructors own their link cells, payload/capacity journals, and counters.
 
   $ caravan --shh bounded_queue.ml
   Verification successful.
@@ -13,6 +13,9 @@ changing the extracted upstream implementation.
   > 
   > let integer () = make_node ~counter:1 ~value:42 ~capacity:2 Null
   > let boolean () = make_node ~capacity:1 ~value:true ~counter:2 Null
+  > let default () : int t = create ()
+  > let explicit () : bool t = create ~capacity:3 ()
+  > let forwarded () : int t = create ?capacity:(Some 0) ()
   > ML
   $ cat bounded_queue.proof > clients.proof
   $ cat >> clients.proof <<'PROOF'
@@ -24,6 +27,9 @@ changing the extracted upstream implementation.
   > 
   > proof result = boolean ()
   >   ensures (allocated Ghost.self result (Some true) 1 2 Null) = ()
+  > proof result = default () ensures (empty_queue Ghost.self result max_int) = ()
+  > proof result = explicit () ensures (empty_queue Ghost.self result 3) = ()
+  > proof result = forwarded () ensures (empty_queue Ghost.self result 0) = ()
   > PROOF
   $ caravan --shh clients.ml
   Verification successful.

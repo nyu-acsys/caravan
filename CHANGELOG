@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Fully supplied labelled arguments work across functions, imports, aliases, and functors.
+- Fully supplied labelled and optional arguments, including effectful defaults, work across functions, imports, aliases, and functors.
 - Constructor-set GADTs support polymorphic payloads, mutable inline records, and unboxed wrappers.
 - Polymorphic mutable records support allocation, ownership contracts, reads, and writes through generic functions, modules, and functors.
 - Native mutex and condition proofs support polymorphic protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.

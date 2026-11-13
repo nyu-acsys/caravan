@@ -27,3 +27,15 @@ and 'a link = Link : ('a, [< `Null | `Node ]) node -> 'a link [@@unboxed]
 
 let[@inline] make_node ~value ~capacity ~counter next =
   Node { next = Atomic.make (Link next); value; capacity; counter }
+
+type 'a t = {
+  head : ('a, [ `Node ]) node Atomic.t;
+  capacity : int;
+  tail : ('a, [ `Node ]) node Atomic.t;
+}
+
+let create ?(capacity = Int.max_int) () =
+  let value = Obj.magic () in
+  let node = make_node ~value ~capacity ~counter:0 Null in
+  let head = Atomic.make_contended node and tail = Atomic.make_contended node in
+  { head; capacity; tail }
