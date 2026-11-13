@@ -2290,11 +2290,15 @@ let unop_of_path (p : Path.t) =
 
 let unit_value ~loc = R.Expr.tuple ~loc []
 
-(** The arguments of an application, if all are given and unlabelled. *)
-let plain_args ~at (args : (Asttypes.arg_label * Typedtree.apply_arg) list) =
+let required_argument = function
+  | Asttypes.Nolabel | Labelled _ -> true
+  | Optional _ -> false
+
+(** Fully supplied arguments in the compiler's checked parameter order. *)
+let supplied_args ~at (args : (Asttypes.arg_label * Typedtree.apply_arg) list) =
   all args ~f:(function
-    | Nolabel, Arg e -> Ok e
-    | _ -> unsupported at "A labelled, optional or omitted argument")
+    | (Nolabel | Labelled _), Arg e -> Ok e
+    | _ -> unsupported at "An optional or omitted argument")
 
 (** What a name in a contract stands for: a Raven variable, or a value, such as the field
     of a matched value that a pattern names. *)

@@ -382,7 +382,7 @@ let formals ?(names = []) ?(raw = Raw_contract.of_header None) ctx (f : func) =
     ~f:(fun (i, (p : Typedtree.function_param)) ->
       match p.fp_kind with
       | Tparam_pat { pat_desc = Tpat_var (id, _, _); pat_type; pat_loc; _ }
-        when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
+        when required_argument p.fp_arg_label ->
           let native_type =
             if Raw_contract.argument raw i then Predef.type_option pat_type else pat_type
           in
@@ -402,8 +402,7 @@ let formals ?(names = []) ?(raw = Raw_contract.of_header None) ctx (f : func) =
           let+ x = State.fresh "unit" in
           let l = loc pat_loc in
           (None, None, R.Var.make ~loc:l (ident ~loc:l x) (R.Type.tuple ~loc:l []))
-      | Tparam_pat { pat_type; pat_loc; _ }
-        when Poly.equal p.fp_arg_label Asttypes.Nolabel ->
+      | Tparam_pat { pat_type; pat_loc; _ } when required_argument p.fp_arg_label ->
           let* typ = State.typ ctx ~at:pat_loc pat_type in
           let contract_name = Option.join (List.nth names i) in
           let* () = State.note_domain ctx.given.types pat_type in

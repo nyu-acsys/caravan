@@ -345,7 +345,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
               in
               let rec arrows (t : Types.type_expr) =
                 match Types.get_desc t with
-                | Tarrow (Nolabel, a, r, _) ->
+                | Tarrow (_, a, r, _) ->
                     let args, result = arrows r in
                     (Datatypes.expand types a :: args, result)
                 | Tpoly (t, []) -> arrows t

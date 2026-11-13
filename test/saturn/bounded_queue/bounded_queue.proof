@@ -1,0 +1,22 @@
+module Payload = Ghost.Relaxed (struct
+  let field (Node record : ('a, [< `Node ]) node) = record.value
+end)
+module Capacity = Ghost.Relaxed (struct
+  let field (Node record : ('a, [< `Node ]) node) = record.capacity
+end)
+module Counter = Ghost.Frozen (struct
+  let field (Node record : ('a, [< `Node ]) node) = record.counter
+end)
+
+predicate [@inline] allocated (owner : Ghost.t) (node : ('a, [ `Node ]) node)
+    (raw : 'a option) (capacity : int) (counter : int)
+    (next : ('a, [ `Null | `Node ]) node) =
+  exists channel : 'a link Atomic.t, payload_event : Ghost.t, capacity_event : Ghost.t.
+    (match node with Node record ->
+      own record.next channel && own ~writer:owner record.counter counter) &&
+    own channel (Link next) &&
+    Payload.state node raw (Set.singleton (payload_event, raw)) &&
+    Capacity.state node capacity (Set.singleton (capacity_event, capacity))
+
+proof result = make_node (value [@raw]) capacity counter next
+  ensures (allocated Ghost.self result (Ghost.raw value) capacity counter next) = ()

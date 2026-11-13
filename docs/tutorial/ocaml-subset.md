@@ -11,7 +11,7 @@ compiler does not make an arbitrary library call verifiable.
 | --- | --- | --- |
 | Values | `int`, `bool`, `unit`, tuples, lists, options, variants, immutable records. | No general support for strings, floats, arrays, or objects. |
 | Control flow | `let`, `if`, pattern matching, sequencing, recursive functions, `while` and `for` loops. | Supply loop invariants when the inferred facts are insufficient; `variant` annotations on executable functions and loops are not yet supported. |
-| Functions | Named first-order functions, local helpers and captures, recursion, and rank-one polymorphism. | No general function-valued parameters, returned closures, or callbacks; no independently generalized helper that also depends on enclosing type parameters. |
+| Functions | Named first-order functions, fully supplied labelled arguments, local helpers and captures, recursion, and rank-one polymorphism. | Optional arguments are unsupported; no general function-valued parameters, returned closures, or callbacks; no independently generalized helper that also depends on enclosing type parameters. |
 | Data types | Parameterized variants and records, including mutable records and mutable inline constructor records, regular recursive types, and aliases. | Immutable inline constructor records and nonregular recursive data types are unsupported. |
 | Mutable state | References, mutable records, and supported `Atomic` operations. | Reads/writes require ownership; ordinary fields are non-atomic. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses, and payload constructors indexed by sets of constant polymorphic-variant tags. | No arbitrary dependent payloads, existential payload types, or runtime polymorphic variants. |

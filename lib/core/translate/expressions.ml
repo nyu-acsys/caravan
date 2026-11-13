@@ -578,7 +578,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
         ( stmts @ leave @ R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
           R.Expr.var ~loc:l (name ~loc:l x) )
   | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
-      let* args = State.of_result (plain_args ~at args) in
+      let* args = State.of_result (supplied_args ~at args) in
       apply ctx e path declaration callee.exp_type args
   | Texp_apply _ -> State.of_result (unsupported at "This application")
   | Texp_ifthenelse (c, e1, e2) ->
@@ -2934,7 +2934,7 @@ and pure ?(reads = []) ctx ~funcs (values : (string * R.Expr.t) list)
       not_pure "Physical equality on values that are not immediate"
   | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
     begin
-      let* args = State.of_result (plain_args ~at args) in
+      let* args = State.of_result (supplied_args ~at args) in
       let* () =
         if polymorphic_ordering ctx path args then
           State.of_result (unsupported at "Ordering on polymorphic values")

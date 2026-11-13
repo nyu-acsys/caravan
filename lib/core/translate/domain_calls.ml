@@ -193,7 +193,7 @@ let spawn ~types ~tasks (callback : Typedtree.expression) =
       begin match body.exp_desc with
       | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, arguments) ->
           let* task = task_for_path ~tasks body path in
-          let* arguments = plain_args ~at:body.exp_loc arguments in
+          let* arguments = supplied_args ~at:body.exp_loc arguments in
           let* task =
             instantiate task body.exp_type
               (List.map arguments ~f:(fun argument -> Some argument.Typedtree.exp_type))
@@ -281,7 +281,7 @@ let analyze ~canonical ~types ~tasks ~functions function_ =
         (List.concat_map evaluated ~f:(fun (_, calls, _) -> calls) @ calls, value)
     | Texp_apply (({ exp_desc = Texp_ident (path, _, _); _ } as callee), arguments) ->
         let* path = normalized expression path in
-        let* arguments = plain_args ~at:expression.exp_loc arguments in
+        let* arguments = supplied_args ~at:expression.exp_loc arguments in
         begin match (operation path, arguments) with
         | Some Spawn, [ callback ] ->
             let+ task, arguments = spawn ~types ~tasks callback in

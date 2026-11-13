@@ -1,0 +1,6 @@
+(library
+ (name caravan_saturn_bounded_queue)
+ (wrapped false))
+
+(cram
+ (deps %{bin:caravan} %{bin:raven} bounded_queue.ml bounded_queue.proof))
