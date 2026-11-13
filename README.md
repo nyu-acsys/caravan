@@ -88,6 +88,8 @@ Run `dune exec -- caravan example.ml` to use the local build.
 The [build guide](https://nyu-acsys.github.io/caravan/tutorial/#sec:build-from-source)
 also describes using a sibling Raven checkout.
 
-Run the regression tests with `dune runtest -j2` and check formatting with
-`dune build @fmt -j2`. See [extension development](vs-code/README.md) and
+Run the quick regression suite with `dune build @quick -j2`, the comprehensive suite
+with `dune runtest -j2`, and formatting checks with `dune build @fmt -j2`.
+See [test coverage](test/README.md#running-the-suites),
+[extension development](vs-code/README.md), and
 [site development](docs/README.md) for their separate build instructions.

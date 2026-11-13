@@ -302,7 +302,14 @@ let client probe =
   R.Member.callable (R.Callable.proc ~loc (ident "client") (Some statements))
 
 let check probe =
-  let result = R.verify (R.Program.make ~loc (support @ [ client probe ])) in
+  let select_member =
+    match probe with
+    | Valid -> None
+    | _ -> Some (fun (check : R.Progress.check) -> String.equal check.name "client")
+  in
+  let result =
+    R.verify ?select_member (R.Program.make ~loc (support @ [ client probe ]))
+  in
   if List.mem [ Valid; Published_valid; Adopted_valid ] probe ~equal:Poly.equal then (
     if not result.verified then
       failwith

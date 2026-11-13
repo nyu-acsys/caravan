@@ -151,3 +151,70 @@ let () =
     M.finish ~verified:false (project (independent :: inventory) [ first; failed; own ])
   in
   assert (Poly.equal (find members independent.id).status M.Verified)
+
+(* Source focus retains descendants and enclosing groups without checking siblings. *)
+let () =
+  let root =
+    M.make ~name:"members.ml" ~kind:"file" ~name_loc:(at 0 100) ~extent:(at 0 100)
+      ~group:true ()
+  in
+  let scope = member ~parent:root.id ~group:true "Scope" 1 95 in
+  let outer = member ~parent:scope.id "Scope.outer" 10 60 in
+  let helper = member ~parent:outer.id "Scope.outer.helper" 20 30 in
+  let sibling = member ~parent:scope.id "Scope.sibling" 70 90 in
+  let inventory = [ root; scope; outer; helper; sibling ] in
+  let outer_selection = get (M.select inventory "Scope.outer") in
+  let selected selection member =
+    M.selected_check inventory selection (check "generated" member.M.extent Pending)
+  in
+  assert (selected outer_selection outer);
+  assert (selected outer_selection helper);
+  assert (selected outer_selection scope);
+  assert (not (selected outer_selection sibling));
+  let helper_selection = get (M.select inventory "Scope.outer.helper") in
+  assert (selected helper_selection helper);
+  assert (not (selected helper_selection outer));
+  assert (selected helper_selection root);
+  assert (
+    M.selected_check inventory helper_selection
+      (check "file_gate" (at ~file:"generated.rav" 0 1) Pending));
+  let module_selection = get (M.select inventory "Scope") in
+  List.iter [ outer; helper; sibling ] ~f:(fun member ->
+      assert (selected module_selection member));
+  let states =
+    M.project inventory
+      {
+        R.Progress.phase = Final;
+        checks = [ check "outer" outer.extent Verified ];
+        diagnostics = [];
+      }
+    |> M.selected_status outer_selection
+    |> M.summarize
+  in
+  assert (Poly.equal (find states sibling.id).status M.Skipped);
+  assert (not (find states sibling.id).cached);
+  assert (Result.is_error (M.select inventory "missing"));
+  let duplicate = { sibling with name = outer.name } in
+  assert (Result.is_error (M.select [ root; scope; outer; duplicate ] outer.name))
+
+let () =
+  let root = member ~group:true "root" 0 100 in
+  let runtime = member ~parent:root.id ~group:true "Scope" 1 40 in
+  let proof = member ~parent:runtime.id ~group:true "Scope" 50 90 in
+  assert (Result.is_ok (M.select [ root; runtime; proof ] "Scope"));
+  let unrelated = { proof with parent = Some root.id } in
+  assert (Result.is_error (M.select [ root; runtime; unrelated ] "Scope"));
+  let declaration =
+    M.make ~parent:runtime.id ~name:"Scope.owned" ~kind:"predicate" ~name_loc:(at 10 11)
+      ~extent:(at 10 20) ~declaration_only:true ()
+  in
+  let definition =
+    M.make ~parent:proof.id ~name:"Scope.owned" ~kind:"predicate" ~name_loc:(at 60 61)
+      ~extent:(at 60 70) ()
+  in
+  let inventory = [ root; runtime; proof; declaration; definition ] in
+  assert (Result.is_ok (M.select inventory "Scope.owned"));
+  let second_definition = { declaration with declaration_only = false } in
+  assert (
+    Result.is_error
+      (M.select [ root; runtime; proof; second_definition; definition ] "Scope.owned"))

@@ -320,10 +320,15 @@ let duplicate_private =
     [ binary And (ownership one owner) (ownership one owner) ]
     []
 
-let verify members = R.verify (R.Program.make ~loc (support @ members))
+let verify ?select_member members =
+  R.verify ?select_member (R.Program.make ~loc (support @ members))
 
-let expect_failure member code =
-  let result = verify [ member ] in
+let expect_failure (text, member) code =
+  let result =
+    verify
+      ~select_member:(fun (check : R.Progress.check) -> String.equal check.name text)
+      [ member ]
+  in
   if result.verified then failwith "Accepted an invalid frozen-field operation";
   if
     List.exists result.diagnostics ~f:(fun diagnostic ->
@@ -355,15 +360,15 @@ let () =
       (String.concat ~sep:"\n" (List.map valid.diagnostics ~f:R.Diagnostic.to_string));
   List.iter
     [
-      recipient_writes;
-      foreign_freeze;
-      transferred_private_read;
-      foreign_read;
-      write_after_freeze;
-      refreeze;
-      partial_freeze;
-      other_field;
-      synchronized_read ~wrong_channel:true;
+      ("recipient_writes", recipient_writes);
+      ("foreign_freeze", foreign_freeze);
+      ("transferred_private_read", transferred_private_read);
+      ("foreign_read", foreign_read);
+      ("write_after_freeze", write_after_freeze);
+      ("refreeze", refreeze);
+      ("partial_freeze", partial_freeze);
+      ("other_field", other_field);
+      ("wrong_channel", synchronized_read ~wrong_channel:true);
     ]
     ~f:(fun member -> expect_failure member R.Diagnostic.Precondition);
-  expect_failure duplicate_private R.Diagnostic.Postcondition
+  expect_failure ("duplicate_private", duplicate_private) R.Diagnostic.Postcondition

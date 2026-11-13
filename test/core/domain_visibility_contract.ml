@@ -58,8 +58,14 @@ let client probe =
        (ident "client") (Some statements))
 
 let check ~mutex probe =
+  let select_member =
+    match probe with
+    | Valid -> None
+    | Transfer_after_end | Finish_during_handoff | Foreign_parent ->
+        Some (fun (check : R.Progress.check) -> String.equal check.name "client")
+  in
   let result =
-    R.verify
+    R.verify ?select_member
       (R.Program.make ~loc
          (Caravan_core.Prelude.value_signature
          :: (E.support ~loc ~mutex ~visibility:true () @ [ client probe ])))

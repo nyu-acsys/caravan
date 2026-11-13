@@ -124,8 +124,14 @@ let client probe =
                 ])))
 
 let check probe =
+  let select_member =
+    match probe with
+    | Acquire -> None
+    | No_acquire | Failed_try | Notify _ ->
+        Some (fun (check : R.Progress.check) -> String.equal check.name "client")
+  in
   let result =
-    R.verify
+    R.verify ?select_member
       (R.Program.make ~loc
          (Caravan_core.Prelude.value_signature
          :: (M.complete_support ~loc ~visibility:true ()

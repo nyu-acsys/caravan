@@ -22,7 +22,7 @@ Incorrect initial contents fail at the exposing lemma's precondition.
   $ mkdir wrong_contents
   $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue.ml > wrong_contents/michael_scott_queue.ml
-  $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue.ml
+  $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list wrong_contents/michael_scott_queue.ml
   [Error] File "wrong_contents/michael_scott_queue.proof", line 121, columns 20-63:
   121 |     let cell_list = expose_built_chain (Some q.head) tail_ list in
                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -38,7 +38,7 @@ The builder must return its designated terminal cell.
   $ mkdir wrong_terminal
   $ cp michael_scott_queue.mli michael_scott_queue_intf.mli michael_scott_queue.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue.ml > wrong_terminal/michael_scott_queue.ml
-  $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue.ml
+  $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list.build_next wrong_terminal/michael_scott_queue.ml
   [Error] File "wrong_terminal/michael_scott_queue.proof", line 118, columns 19-46:
   118 |     on return fold built_chain result tail_ xs
                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^

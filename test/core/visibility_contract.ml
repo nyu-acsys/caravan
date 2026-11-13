@@ -211,7 +211,22 @@ let member = function
                  (ident "acquired"))))
 
 let check probe expected =
-  let result = R.verify (R.Program.make ~loc (support @ [ member probe ])) in
+  let selected_name =
+    match probe with
+    | Valid -> None
+    | Duplicate_context -> Some "duplicate_context"
+    | Foreign_context -> Some "foreign_context"
+    | Retarget_seen -> Some "retarget_seen"
+    | Private_advance -> Some "private_advance"
+    | Private_acquire | Private_acquire_release -> Some "private_acquisition"
+  in
+  let select_member =
+    Option.map selected_name ~f:(fun text (check : R.Progress.check) ->
+        String.equal check.name text)
+  in
+  let result =
+    R.verify ?select_member (R.Program.make ~loc (support @ [ member probe ]))
+  in
   match expected with
   | None ->
       if not result.verified then
@@ -252,8 +267,13 @@ let check_execution ?(after_finish = false) ~mutex ~visibility () =
                 (ident "finished_view")
             else [])))
   in
+  let select_member =
+    if after_finish then
+      Some (fun (check : R.Progress.check) -> String.equal check.name "execution_client")
+    else None
+  in
   let result =
-    R.verify
+    R.verify ?select_member
       (R.Program.make ~loc
          (Caravan_core.Prelude.value_signature
          :: (E.support ~loc ~mutex ~visibility () @ [ client ])))

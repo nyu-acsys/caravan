@@ -161,8 +161,17 @@ Run `caravan --help` for the complete command-line interface. Common options are
 | `--no-dune` | Disable automatic Dune dependency discovery. |
 | `--smt-timeout MS` | Set the timeout per solver query; the default is 10000 ms. |
 | `--cache-dir DIR` | Reuse successful checks with unchanged proof dependencies. |
+| `--only NAME` | Check one source member or module and its attached proof obligations. |
 | `--emit-rav` | Inspect the generated Raven program instead of verifying it. |
 | `--check-stdlib` | Check bundled mathematical models and lemmas. |
+
+For focused verification, `caravan --only of_list queue.ml` checks `of_list`,
+its local helpers, and attached proof steps. Qualified names select nested members,
+such as `of_list.build_next`; a module name selects its descendants. Enclosing
+module and file checks still run, and the entire input is parsed, typed, and
+translated. Other implementations are assumed through their contracts, so use a
+full run to validate the whole program. Omitted members appear as skipped in
+machine-readable results, even if their previous results are cached.
 
 A solver timeout means the obligation was not proved within the budget; it does
 not establish a counterexample. Cached results are reused only when Raven's proof

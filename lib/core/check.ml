@@ -136,7 +136,8 @@ let prepare ?(discover_dependencies = true) ~include_dirs ~history file =
     (analyze ~include_dirs ~discover_dependencies file)
     ~f:(prepare_scopes ~history)
 
-let verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
+let verify_prepared ?selection ?cache_dir ?on_progress ~collect_members ~smt_timeout
+    prepared =
   let explain diagnostic =
     blame ~explicit_proof_files:prepared.explicit_proof_files
       (explain prepared.origins diagnostic)
@@ -160,7 +161,13 @@ let verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
           }
       | Typed | Scheduled | Progress -> snapshot
     in
-    let members = Editor_members.project prepared.members snapshot in
+    let members =
+      Editor_members.project prepared.members snapshot |> fun members ->
+      match selection with
+      | None -> members
+      | Some selection ->
+          Editor_members.selected_status selection members |> Editor_members.summarize
+    in
     latest := members;
     match snapshot.phase with
     | Final -> ()
@@ -188,13 +195,31 @@ let verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
     let on_progress =
       if collect_members || Option.is_some on_progress then Some update else None
     in
-    R.verify
+    let select_member =
+      Option.map selection ~f:(Editor_members.selected_check prepared.members)
+    in
+    R.verify ?select_member
       ~options:{ R.default_options with smt_timeout }
       ?cache_dir ?on_progress prepared.program
   in
   ( result.verified,
     prepared.warnings @ List.map result.diagnostics ~f:explain,
     Editor_members.finish ~verified:result.verified !latest )
+
+let verify ?only ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared =
+  let selection =
+    match only with
+    | None -> Ok None
+    | Some name -> Result.map (Editor_members.select prepared.members name) ~f:Option.some
+  in
+  match selection with
+  | Error error ->
+      ( false,
+        prepared.warnings @ [ Report.to_diagnostic error ],
+        Editor_members.finish ~verified:false prepared.members )
+  | Ok selection ->
+      verify_prepared ?selection ?cache_dir ?on_progress ~collect_members ~smt_timeout
+        prepared
 
 (** Structured verification results shared by the command line and editors. *)
 let analysis_error file error =
@@ -220,8 +245,8 @@ let annotations_only ?(discover_dependencies = true) ~include_dirs file =
         members;
       }
 
-let run ?cache_dir ?on_progress ?(collect_members = true) ?(discover_dependencies = true)
-    ~include_dirs ~history ~smt_timeout file =
+let run ?only ?cache_dir ?on_progress ?(collect_members = true)
+    ?(discover_dependencies = true) ~include_dirs ~history ~smt_timeout file =
   match analyze ~include_dirs ~discover_dependencies file with
   | Error error -> analysis_error file error
   | Ok ((source, _, annotations, members) as analysis) ->
@@ -237,7 +262,7 @@ let run ?cache_dir ?on_progress ?(collect_members = true) ?(discover_dependencie
           }
       | Ok prepared ->
           let verified, diagnostics, members =
-            verify ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared
+            verify ?only ?cache_dir ?on_progress ~collect_members ~smt_timeout prepared
           in
           {
             file;
@@ -250,7 +275,7 @@ let run ?cache_dir ?on_progress ?(collect_members = true) ?(discover_dependencie
       end
 
 (** The human-readable command line, including the generated-program escape hatch. *)
-let file ?cache_dir ?(discover_dependencies = true) ~include_dirs ~history ~emit_rav
+let file ?only ?cache_dir ?(discover_dependencies = true) ~include_dirs ~history ~emit_rav
     ~smt_timeout file =
   if emit_rav then (
     match prepare ~include_dirs ~discover_dependencies ~history file with
@@ -263,8 +288,8 @@ let file ?cache_dir ?(discover_dependencies = true) ~include_dirs ~history ~emit
         true)
   else
     let result =
-      run ?cache_dir ~collect_members:false ~include_dirs ~discover_dependencies ~history
-        ~smt_timeout file
+      run ?only ?cache_dir ~collect_members:false ~include_dirs ~discover_dependencies
+        ~history ~smt_timeout file
     in
     List.iter result.diagnostics ~f:Report.print_diagnostic;
     if result.verified then Logs.app (fun m -> m "Verification successful.");

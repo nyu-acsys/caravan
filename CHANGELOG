@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `--only` verifies a source member or module together with its local helpers and companion proof obligations.
 - Fully supplied labelled and optional arguments, including effectful defaults, work across functions, imports, aliases, and functors.
 - Constructor-set GADTs support polymorphic payloads, mutable inline records, and unboxed wrappers.
 - Polymorphic mutable records support allocation, ownership contracts, reads, and writes through generic functions, modules, and functors.

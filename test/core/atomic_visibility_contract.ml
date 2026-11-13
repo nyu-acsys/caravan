@@ -193,10 +193,15 @@ let free_acquire =
                 (cell_call "get" [ owner; location; value; released; half ]);
             ])))
 
-let verify members = R.verify (R.Program.make ~loc (support @ members))
+let verify ?select_member members =
+  R.verify ?select_member (R.Program.make ~loc (support @ members))
 
-let expect_failure member code =
-  let result = verify [ member ] in
+let expect_failure (text, member) code =
+  let result =
+    verify
+      ~select_member:(fun (check : R.Progress.check) -> String.equal check.name text)
+      [ member ]
+  in
   assert (not result.verified);
   assert (
     List.exists result.diagnostics ~f:(fun diagnostic ->
@@ -215,5 +220,7 @@ let () =
   if not valid.verified then
     failwith
       (String.concat ~sep:"\n" (List.map valid.diagnostics ~f:R.Diagnostic.to_string));
-  expect_failure (publication_chain ~wrong_owner:true) R.Diagnostic.Postcondition;
-  expect_failure free_acquire R.Diagnostic.Precondition
+  expect_failure
+    ("publication_chain", publication_chain ~wrong_owner:true)
+    R.Diagnostic.Postcondition;
+  expect_failure ("free_acquire", free_acquire) R.Diagnostic.Precondition

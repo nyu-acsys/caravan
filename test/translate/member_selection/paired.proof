@@ -1,0 +1,3 @@
+module Scope = struct
+  lemma bad ensures (false) = ()
+end

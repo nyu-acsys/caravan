@@ -20,7 +20,7 @@ Building an empty chain cannot establish the input contents.
   $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.ml > wrong_contents/michael_scott_queue_lseg.ml
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.proof > wrong_contents/michael_scott_queue_lseg.proof
-  $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_contents/michael_scott_queue_lseg.ml
+  $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list wrong_contents/michael_scott_queue_lseg.ml
   [Error] File "wrong_contents/michael_scott_queue_lseg.proof", line 1096, columns 12-47:
   1096 |   on return initialize_built_queue q tail_ list
                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -36,7 +36,7 @@ The builder must return the owned terminal cell at the end of the chain.
   $ mkdir wrong_terminal
   $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli michael_scott_queue_lseg.proof wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue_lseg.ml > wrong_terminal/michael_scott_queue_lseg.ml
-  $ caravan --shh -I ../backoff --smt-timeout=30000 wrong_terminal/michael_scott_queue_lseg.ml
+  $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list.build_next wrong_terminal/michael_scott_queue_lseg.ml
   [Error] File "wrong_terminal/michael_scott_queue_lseg.proof", line 1090, columns 19-68:
   1090 |       | [] -> fold segment result tail_ [] Finset.empty Finset.empty
                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

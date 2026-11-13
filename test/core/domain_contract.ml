@@ -201,7 +201,16 @@ let program ~unit_result ~throws ~ghost_results probe =
     ]
 
 let check ~unit_result ?(throws = false) ?(ghost_results = false) probe expected =
-  let result = R.verify (program ~unit_result ~throws ~ghost_results probe) in
+  let select_member =
+    match probe with
+    | Valid -> None
+    | Duplicate_join | Premature_access | Forged_normal | Wrong_captures | Mutated_ghost
+      ->
+        Some (fun (check : R.Progress.check) -> String.equal check.name "Checks.client")
+  in
+  let result =
+    R.verify ?select_member (program ~unit_result ~throws ~ghost_results probe)
+  in
   match expected with
   | None ->
       if not result.verified then

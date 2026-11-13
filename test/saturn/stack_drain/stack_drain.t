@@ -1,9 +1,4 @@
-Verify the implementation and client against the same Treiber interface.
-
-  $ caravan --shh -I ../backoff ../treiber_stack/treiber_stack.ml
-  Verification successful.
-
-The client uses only the imported abstract stack contract.
+Verify the client against the imported abstract Treiber stack contract.
 
   $ caravan --shh stack_drain.ml
   Verification successful.

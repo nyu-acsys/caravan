@@ -25,8 +25,4 @@
   treiber_stack.mli
   (glob_files *.ml)
   (glob_files *.mli)
-  (glob_files *.proof)
-  ../treiber_stack/treiber_stack.ml
-  ../treiber_stack/treiber_stack.mli
-  ../treiber_stack/treiber_stack.proof
-  ../backoff/backoff.mli))
+  (glob_files *.proof)))

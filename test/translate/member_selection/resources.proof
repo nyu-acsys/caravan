@@ -1,0 +1,5 @@
+module Checked = struct
+  predicate owned (cell : t) = own cell.count 0
+  proof make = on return fold owned result
+  lemma bad ensures (false) = ()
+end

@@ -23,6 +23,7 @@ type member = {
   parent : string option;
   group : bool;
   trusted : bool;
+  declaration_only : bool;
   ranges : Location.t list;
   own_status : status;
   status : status;
@@ -45,8 +46,8 @@ let identity ~kind (at : Location.t) =
   Printf.sprintf "%s:%d:%d:%s" at.loc_start.pos_fname at.loc_start.pos_cnum
     at.loc_end.pos_cnum kind
 
-let make ?parent ?(group = false) ?(trusted = false) ?ranges ~name ~kind ~name_loc ~extent
-    () =
+let make ?parent ?(group = false) ?(trusted = false) ?(declaration_only = false) ?ranges
+    ~name ~kind ~name_loc ~extent () =
   let status = if trusted then Trusted else Unchecked in
   {
     id = identity ~kind name_loc;
@@ -57,6 +58,7 @@ let make ?parent ?(group = false) ?(trusted = false) ?ranges ~name ~kind ~name_l
     parent;
     group;
     trusted;
+    declaration_only;
     ranges = Option.value ranges ~default:[ extent ];
     own_status = status;
     status;
@@ -68,7 +70,7 @@ let make ?parent ?(group = false) ?(trusted = false) ?ranges ~name ~kind ~name_l
 let size (at : Location.t) = at.loc_end.pos_cnum - at.loc_start.pos_cnum
 let contains = Declaration_scope.contains
 
-let unique_innermost members at =
+let unique_innermost ?(contains = contains) members at =
   let candidates =
     List.filter_map members ~f:(fun member ->
         List.filter member.ranges ~f:(fun range -> contains range at)
@@ -182,6 +184,49 @@ let runtime_module_for_scope bindings (scope : Proof_scopes.scope) =
            (Declaration_scope.same_place member.extent scope.source_location)
            member))
 
+(** Signature declarations retain their namespace in a companion interface. *)
+let signature_namespace signature at =
+  let rec signature_namespace namespace signature =
+    List.find_map signature ~f:(fun (item : Parsetree.signature_item) ->
+        match item.psig_desc with
+        | Psig_module declaration -> declaration_namespace namespace declaration
+        | Psig_recmodule declarations ->
+            List.find_map declarations ~f:(declaration_namespace namespace)
+        | _ -> None)
+  and declaration_namespace namespace (declaration : Parsetree.module_declaration) =
+    if not (Declaration_scope.contains_in_input declaration.pmd_loc at) then None
+    else
+      let namespace = namespace @ Option.to_list declaration.pmd_name.txt in
+      Some (module_namespace namespace declaration.pmd_type)
+  and module_namespace namespace (body : Parsetree.module_type) =
+    match body.pmty_desc with
+    | Pmty_signature signature ->
+        Option.value (signature_namespace namespace signature) ~default:namespace
+    | Pmty_functor (_, body) | Pmty_with (body, _) -> module_namespace namespace body
+    | _ -> namespace
+  in
+  Option.value (signature_namespace [] signature) ~default:[]
+
+(** A line directive can give a function's expressions several filenames. *)
+let expression_ranges (func : Procedures.func) =
+  let filenames = ref (Set.empty (module String)) in
+  let location _ (at : Location.t) =
+    if
+      Declaration_scope.contains_in_input func.loc at
+      && (not (String.is_empty at.loc_start.pos_fname))
+      && at.loc_start.pos_cnum >= 0
+    then filenames := Set.add !filenames at.loc_start.pos_fname
+  in
+  let iterator = { Tast_iterator.default_iterator with location } in
+  iterator.expr iterator func.body;
+  Set.to_list !filenames
+  |> List.map ~f:(fun file ->
+      {
+        func.loc with
+        loc_start = { func.loc.loc_start with pos_fname = file };
+        loc_end = { func.loc.loc_end with pos_fname = file };
+      })
+
 let collect (scopes : Program_scopes.t) =
   let source = scopes.source in
   let root =
@@ -190,8 +235,10 @@ let collect (scopes : Program_scopes.t) =
   in
   let module_bindings = runtime_modules ~parent:root.id source.typed in
   let modules = List.map module_bindings ~f:snd in
-  let module_parent at =
-    Option.value_map (unique_innermost modules at) ~default:root.id ~f:(fun m -> m.id)
+  let runtime_parent at =
+    Option.value_map
+      (unique_innermost ~contains:Declaration_scope.contains_in_input modules at)
+      ~default:root.id ~f:(fun member -> member.id)
   in
   let functions =
     List.map scopes.funcs ~f:(fun (func : Procedures.func) ->
@@ -203,14 +250,16 @@ let collect (scopes : Program_scopes.t) =
                    (Option.map annotation.origin ~f:(fun (origin : Annotation.origin) ->
                         origin.loc)))
         in
-        let parent = module_parent func.loc in
+        let parent = runtime_parent func.loc in
         let name =
           match List.find modules ~f:(fun member -> String.equal member.id parent) with
           | Some owner -> owner.name ^ "." ^ Ident.name func.id
           | None -> Ident.name func.id
         in
         make ~parent ~name ~kind:"function" ~name_loc:func.name_loc ~extent:func.loc
-          ~trusted:func.trusted ~ranges:(func.loc :: contract_ranges) ())
+          ~trusted:func.trusted
+          ~ranges:((func.loc :: contract_ranges) @ expression_ranges func)
+          ())
     |> List.dedup_and_sort ~compare:(fun a b -> String.compare a.id b.id)
   in
   let functions =
@@ -218,13 +267,41 @@ let collect (scopes : Program_scopes.t) =
         let outer =
           List.filter functions ~f:(fun candidate ->
               (not (String.equal candidate.id member.id))
-              && contains candidate.extent member.extent)
+              && size candidate.extent > size member.extent
+              && Declaration_scope.contains_in_input candidate.extent member.extent)
         in
         let parent =
-          Option.value_map (unique_innermost outer member.extent) ~default:member.parent
+          Option.value_map
+            (unique_innermost ~contains:Declaration_scope.contains_in_input
+               (List.map outer ~f:(fun member ->
+                    { member with ranges = [ member.extent ] }))
+               member.extent)
+            ~default:member.parent
             ~f:(fun outer -> Some outer.id)
         in
         { member with parent })
+  in
+  let short_names =
+    List.map scopes.funcs ~f:(fun (func : Procedures.func) ->
+        (identity ~kind:"function" func.name_loc, Ident.name func.id))
+    |> Map.of_alist_reduce (module String) ~f:(fun first _ -> first)
+  in
+  let qualified =
+    List.sort functions ~compare:(fun left right ->
+        Int.compare (size right.extent) (size left.extent))
+    |> List.fold
+         ~init:(Map.empty (module String))
+         ~f:(fun names member ->
+           let name =
+             match Option.bind member.parent ~f:(Map.find names) with
+             | None -> member.name
+             | Some parent -> parent ^ "." ^ Map.find_exn short_names member.id
+           in
+           Map.set names ~key:member.id ~data:name)
+  in
+  let functions =
+    List.map functions ~f:(fun member ->
+        { member with name = Map.find_exn qualified member.id })
   in
   let functions =
     List.fold source.outline_annotations ~init:functions
@@ -257,7 +334,12 @@ let collect (scopes : Program_scopes.t) =
         let member =
           make ~parent
             ~name:(String.concat ~sep:"." qualified)
-            ~kind ~name_loc:name.pid_loc ~extent ~group ()
+            ~kind ~name_loc:name.pid_loc ~extent ~group
+            ~declaration_only:
+              (match declaration with
+              | S.Proof_predicate predicate -> Option.is_none predicate.pred_body
+              | _ -> false)
+            ()
         in
         member
         ::
@@ -267,17 +349,45 @@ let collect (scopes : Program_scopes.t) =
             proof member.id qualified module_declarations
         | _ -> []))
   in
-  let annotation_predicates ~interface annotations =
+  let annotation_predicates ?signature ~interface annotations =
     List.filter_map annotations ~f:(fun (annotation : Annotation.t) ->
         if not (Annotation.predicate_declaration ~interface annotation) then None
         else
           match Annotation.predicate annotation with
           | Error _ -> None
           | Ok predicate ->
+              let owner =
+                match signature with
+                | None ->
+                    let parent = runtime_parent annotation.loc in
+                    List.find modules ~f:(fun member -> String.equal member.id parent)
+                | Some signature ->
+                    let name =
+                      String.concat ~sep:"."
+                        (signature_namespace signature annotation.loc)
+                    in
+                    begin match
+                      List.filter modules ~f:(fun member -> String.equal member.name name)
+                    with
+                    | [ owner ] -> Some owner
+                    | _ -> None
+                    end
+              in
+              let parent =
+                Option.value_map owner ~default:root.id ~f:(fun owner -> owner.id)
+              in
+              let namespace =
+                match signature with
+                | Some signature -> signature_namespace signature annotation.loc
+                | None ->
+                    Option.value_map owner ~default:[] ~f:(fun owner -> [ owner.name ])
+              in
+              let name =
+                String.concat ~sep:"." (namespace @ [ predicate.pred_name.pid_str ])
+              in
               Some
-                (make
-                   ~parent:(module_parent annotation.loc)
-                   ~name:predicate.pred_name.pid_str
+                (make ~parent ~name
+                   ~declaration_only:(Option.is_none predicate.pred_body)
                    ~kind:(if predicate.pred_persistent then "invariant" else "predicate")
                    ~name_loc:predicate.pred_name.pid_loc ~extent:annotation.loc ()))
   in
@@ -285,7 +395,7 @@ let collect (scopes : Program_scopes.t) =
     annotation_predicates ~interface:false scopes.annotations
     @ Option.value_map source.interface ~default:[]
         ~f:(fun (interface : Source.interface) ->
-          annotation_predicates ~interface:true
+          annotation_predicates ~signature:interface.signature ~interface:true
             (Annotation.of_comments interface.interface_comments))
   in
   (root :: modules) @ functions @ proof root.id [] source.proof @ predicates
@@ -318,6 +428,101 @@ let check_location (check : R.Progress.check) =
 let same_check (a : R.Progress.check) (b : R.Progress.check) =
   String.equal a.name b.name
   && Declaration_scope.same_place (check_location a) (check_location b)
+
+let check_owner inventory check =
+  Option.first_some
+    (unique_innermost inventory (check_location check))
+    (List.find inventory ~f:(fun member -> String.equal member.kind "file"))
+
+type selection = { selected : Set.M(String).t; required : Set.M(String).t }
+
+(** Source declarations own their descendants; enclosing groups retain their checks. *)
+let select inventory name =
+  let by_id =
+    Map.of_alist_reduce
+      (module String)
+      ~f:(fun first _ -> first)
+      (List.map inventory ~f:(fun member -> (member.id, member)))
+  in
+  let rec belongs initial seen id =
+    if Set.mem initial id then true
+    else if Set.mem seen id then false
+    else
+      Option.exists (Map.find by_id id) ~f:(fun member ->
+          Option.exists member.parent ~f:(belongs initial (Set.add seen id)))
+  in
+  let below owner member =
+    belongs (Set.singleton (module String) owner) (Set.empty (module String)) member
+  in
+  let comparable left right = below left right || below right left in
+  let matches =
+    List.filter inventory ~f:(fun member ->
+        (not (String.equal member.kind "file")) && String.equal member.name name)
+    |> List.dedup_and_sort ~compare:(fun left right -> String.compare left.id right.id)
+  in
+  let at =
+    Option.value_map (List.hd inventory) ~default:Location.none ~f:(fun member ->
+        member.name_loc)
+  in
+  let paired =
+    let chain key =
+      List.for_all matches ~f:(fun left ->
+          List.for_all matches ~f:(fun right ->
+              Option.equal String.equal (key left) (key right)
+              || Option.value_map (key left) ~default:false ~f:(fun left ->
+                  Option.value_map (key right) ~default:false ~f:(comparable left))))
+    in
+    match matches with
+    | [] -> false
+    | first :: _ ->
+        List.for_all matches ~f:(fun member -> member.group)
+        && chain (fun member -> Some member.id)
+        || List.for_all matches ~f:(fun member ->
+               String.equal member.kind "predicate"
+               || String.equal member.kind "invariant")
+           && List.for_all matches ~f:(fun member -> String.equal member.kind first.kind)
+           && List.count matches ~f:(fun member -> not member.declaration_only) <= 1
+           && chain (fun member -> member.parent)
+  in
+  match matches with
+  | [] ->
+      Error
+        (Report.error Type at
+           (Printf.sprintf "There is no member or module named %s to verify" name))
+  | _ :: _ :: _ when not paired ->
+      Error (Report.error Type at (Printf.sprintf "The member name %s is ambiguous" name))
+  | _ ->
+      let initial = Set.of_list (module String) (List.map matches ~f:(fun m -> m.id)) in
+      let selected =
+        List.filter inventory ~f:(fun member ->
+            belongs initial (Set.empty (module String)) member.id)
+        |> List.map ~f:(fun member -> member.id)
+        |> Set.of_list (module String)
+      in
+      let rec groups seen id =
+        if Set.mem seen id then seen
+        else
+          let seen = Set.add seen id in
+          match Map.find by_id id with
+          | None -> seen
+          | Some member -> Option.value_map member.parent ~default:seen ~f:(groups seen)
+      in
+      let ancestors = Set.fold selected ~init:(Set.empty (module String)) ~f:groups in
+      let required =
+        Set.filter ancestors ~f:(fun id ->
+            Set.mem selected id
+            || Option.exists (Map.find by_id id) ~f:(fun member -> member.group))
+      in
+      Ok { selected; required }
+
+let selected_check inventory selection check =
+  Option.value_map (check_owner inventory check) ~default:true ~f:(fun member ->
+      Set.mem selection.required member.id)
+
+let selected_status selection members =
+  List.map members ~f:(fun member ->
+      if member.trusted || Set.mem selection.required member.id then member
+      else { member with own_status = Skipped; status = Skipped; cached = false })
 
 let dedup_checks (checks : R.Progress.check list) =
   let outcome_rank = function
@@ -384,11 +589,9 @@ let summarize members =
       { member with status; cached; counts })
 
 let project inventory (progress : R.Progress.t) =
-  let root = List.find inventory ~f:(fun member -> String.equal member.kind "file") in
   let attributed =
     List.filter_map (dedup_checks progress.checks) ~f:(fun check ->
-        let owner = unique_innermost inventory (check_location check) in
-        Option.map (Option.first_some owner root) ~f:(fun owner -> (owner.id, check)))
+        Option.map (check_owner inventory check) ~f:(fun owner -> (owner.id, check)))
   in
   List.map inventory ~f:(fun member ->
       let checks =
