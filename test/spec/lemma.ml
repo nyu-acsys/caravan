@@ -348,7 +348,11 @@ let () =
   assert (state.invariants = []);
   let ordinary = loop "invariant true" in
   assert (ordinary.state_invariants = []);
-  assert (List.length ordinary.invariants = 1)
+  assert (List.length ordinary.invariants = 1);
+  let fold = loop "invariant (fun (sum, count) remaining -> count >= 0)" in
+  assert (List.length (fst (List.hd fold.state_invariants)) = 2);
+  let saved = loop "invariant (fun accumulator remaining saved -> saved = 0)" in
+  assert (List.length (fst (List.hd saved.state_invariants)) = 3)
 
 let () =
   begin match

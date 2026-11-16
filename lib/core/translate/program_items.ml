@@ -126,11 +126,9 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                         Annotation.contract_after ~scope:site.scope
                           ~item_loc:site.item_loc ~next:site.next site.annotations
                       in
-                      Raw_contract.check ~at:site.item_loc
+                      Callable_contract.check ~at:site.item_loc
                         ~related:[ (annotation.loc, "The implementation contract") ]
-                        ~expected:(Raw_contract.of_contract (Option.map expected ~f:fst))
-                        ~actual:(Raw_contract.of_contract (Some actual))
-                        ())
+                        ~expected:(Option.map expected ~f:fst) ~actual:(Some actual) ())
             in
             let* contract =
               match (own, supplied) with
@@ -267,11 +265,9 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                             ()
                             ((signature : Module_inventory.signature_value), expected)
                           ->
-                          Raw_contract.check ~at:signature.site.item_loc
+                          Callable_contract.check ~at:signature.site.item_loc
                             ~related:[ (target.loc, "The aliased operation") ]
-                            ~expected:(Raw_contract.of_contract expected)
-                            ~actual:(Raw_contract.of_contract target.contract)
-                            ())
+                            ~expected ~actual:target.contract ())
                     in
                     let paths =
                       List.fold entry.paths ~init:target.paths ~f:(fun paths path ->
@@ -445,7 +441,12 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
             in
             let header =
               {
-                S.hd_name = S.mk_id ~loc:vb.vb_loc (Ident.name id);
+                S.hd_name =
+                  S.mk_id ~loc:vb.vb_loc
+                    ~attrs:
+                      (Option.value_map c.header ~default:[] ~f:(fun h ->
+                           h.hd_name.pid_attrs))
+                    (Ident.name id);
                 hd_ret =
                   Option.value_map c.header ~default:[ S.Lwild ] ~f:(fun h -> h.hd_ret);
                 hd_args =
@@ -538,16 +539,28 @@ let attached_annotations ?(all_expressions = false) ?(innermost = false)
   iterator.structure iterator typed;
   let* attached =
     all attached ~f:(fun (anchor, annotation) ->
+        let target =
+          Option.bind annotation.Annotation.outline ~f:(fun outline -> outline.target)
+        in
         let candidates =
           List.filter !expressions ~f:(fun (e, _) ->
-              (anchor = step_end e
-              &&
-              match e.exp_desc with
-              | Texp_apply (callee, _) -> anchor >= callee.exp_loc.loc_end.pos_cnum
-              | _ -> true)
-              || anchor = e.exp_loc.loc_end.pos_cnum
-              || List.exists e.exp_extra ~f:(fun (_, at, _) ->
-                  anchor = at.loc_end.pos_cnum))
+              match target with
+              | Some target ->
+                  let matches (at : Location.t) =
+                    at.loc_start.pos_cnum = target.loc_start.pos_cnum
+                    && at.loc_end.pos_cnum = target.loc_end.pos_cnum
+                  in
+                  matches e.exp_loc
+                  || List.exists e.exp_extra ~f:(fun (_, at, _) -> matches at)
+              | None ->
+                  (anchor = step_end e
+                  &&
+                  match e.exp_desc with
+                  | Texp_apply (callee, _) -> anchor >= callee.exp_loc.loc_end.pos_cnum
+                  | _ -> true)
+                  || anchor = e.exp_loc.loc_end.pos_cnum
+                  || List.exists e.exp_extra ~f:(fun (_, at, _) ->
+                      anchor = at.loc_end.pos_cnum))
         in
         match
           List.min_elt candidates ~compare:(fun (a, _) (b, _) ->
@@ -647,7 +660,8 @@ let pure_functions (funcs : func list) =
       (List.map funcs ~f:(fun f ->
            let clauses =
              Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
-                 c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures @ c.variant)
+                 c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures @ c.variant
+                 @ Option.value_map c.opens ~default:[] ~f:snd)
            in
            Result.all_unit
              (List.map clauses ~f:(fun term ->
@@ -669,7 +683,8 @@ let pure_functions (funcs : func list) =
     List.concat_map funcs ~f:(fun f ->
         Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
             List.concat_map
-              (c.requires @ c.ensures @ c.variant)
+              (c.requires @ c.ensures @ c.variant
+              @ Option.value_map c.opens ~default:[] ~f:snd)
               ~f:(fun t ->
                 List.filter_map
                   (term_references (contract_bound_names f) t)
@@ -1700,6 +1715,8 @@ let signature_contract (signature : Module_inventory.signature_value) =
     ~next:site.next
 
 type prepared_callable = {
+  prepared_physical_atomic : bool;
+  prepared_opens : (R.Loc.t * (R.Name.t * R.Expr.t list) list) option;
   prepared_formals : R.Var.t list;
   prepared_args : R.Expr.t list;
   prepared_execution : Execution_context.boundary;
@@ -1753,6 +1770,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
                (List.length names) (List.length args))
   in
   let open State.Syntax in
+  let* () = State.of_result (Callable_contract.validate contract) in
   let* () =
     State.of_result
       (match contract with
@@ -1901,7 +1919,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
     Execution_context.exit_resources env execution ~at ~raising:(Option.is_some outcome)
       contract
   in
-  let+ atomic_ensures =
+  let* atomic_ensures =
     contract_postconditions env ~at ~atomic:true
       (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
       @ Option.value_map outcome ~default:[] ~f:(fun _ ->
@@ -1909,6 +1927,7 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
             (List.map atomic_raises ~f:(fun (p, t) -> (p, Some t)))
             (State.Raises [])))
   in
+  let+ opens = contract_opens env contract in
   let ensures = List.map logical_ensures ~f:R.Spec.make in
   let input_domains =
     List.filter_map params ~f:(fun (_, raven, typ, marked, _) ->
@@ -1944,6 +1963,8 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
                     admissible)))
   in
   {
+    prepared_physical_atomic = Callable_contract.physically_atomic contract;
+    prepared_opens = opens;
     prepared_formals =
       List.map params ~f:(fun (_, _, _, _, v) -> v)
       @ execution.formals
@@ -1976,9 +1997,10 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   }
 
 let prepared_member ?opens ~at ~name body prepared =
-  R.Callable.proc ~loc:(loc at) ?opens ~formals:prepared.prepared_formals
-    ~returns:prepared.prepared_returns ~requires:prepared.prepared_requires
-    ~ensures:prepared.prepared_ensures
+  let opens = Option.first_some opens prepared.prepared_opens in
+  R.Callable.proc ~loc:(loc at) ~atomic:prepared.prepared_physical_atomic ?opens
+    ~formals:prepared.prepared_formals ~returns:prepared.prepared_returns
+    ~requires:prepared.prepared_requires ~ensures:prepared.prepared_ensures
     (ident ~loc:(loc at) name)
     body
 
@@ -2172,15 +2194,17 @@ let library_function ?raising ?opens ctx ~(at : Location.t) ~name ~args ~result 
       State.of_result
         (unsupported at "A contract of a library's value other than a function")
   | _ ->
-      State.map
-        (prepare_callable ?raising ctx ~at ~args ~result contract)
-        ~f:(prepared_member ?opens ~at ~name None)
+      let* prepared = prepare_callable ?raising ctx ~at ~args ~result contract in
+      let+ opens = State.of_result (merge_opens ~at prepared.prepared_opens opens) in
+      prepared_member ?opens ~at ~name None prepared
 
 (** Stable import facts neither consume ownership nor inspect mutable state. *)
 let stable_library_contract ctx ~at ~persistent ~description (contract : S.contract) =
   let* () =
     if
       contract.S.atomic || contract.pure
+      || Callable_contract.physically_atomic (Some contract)
+      || Option.is_some contract.opens
       || (not
             (List.is_empty contract.requires
             && List.is_empty contract.atomic_requires

@@ -71,6 +71,7 @@ let input parameter pattern typ =
 
 let bind parameter pattern selected body =
   let at = parameter.fp_loc in
+  let extent = { at with Location.loc_end = body.exp_loc.loc_end } in
   match pattern.pat_desc with
   | Tpat_var _ ->
       let binding =
@@ -82,7 +83,8 @@ let bind parameter pattern selected body =
           vb_loc = at;
         }
       in
-      expression body ~at body.exp_type (Texp_let (Nonrecursive, [ binding ], body))
+      expression body ~at:extent body.exp_type
+        (Texp_let (Nonrecursive, [ binding ], body))
   | _ ->
       let case =
         {
@@ -92,7 +94,7 @@ let bind parameter pattern selected body =
           c_rhs = body;
         }
       in
-      expression body ~at body.exp_type
+      expression body ~at:extent body.exp_type
         (Texp_match (selected, [ case ], [], parameter.fp_partial))
 
 let lower params body =

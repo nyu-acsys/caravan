@@ -1,0 +1,6 @@
+proof result = ordinary flag
+  ensures (result === (if flag then (1, Some 1) else (2, None))) =
+  on return begin
+    assert (selected = 1 || selected = 2);
+    assert (from_match === (if flag then Some selected else None))
+  end

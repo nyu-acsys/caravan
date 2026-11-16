@@ -985,4 +985,5 @@ let lowerable ?(value_paths = Path_bindings.empty) source
   in
   terms names
     (contract.requires @ contract.ensures @ contract.atomic_requires
-   @ contract.atomic_ensures @ contract.variant)
+   @ contract.atomic_ensures @ contract.variant
+    @ Option.value_map contract.opens ~default:[] ~f:snd)

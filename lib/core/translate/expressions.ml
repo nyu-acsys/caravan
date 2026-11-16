@@ -243,7 +243,9 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
           (stmts @ List.concat_map named ~f:fst, value)
       end
   | Texp_tuple components ->
-      let+ stmts, components = operands ctx (List.map components ~f:snd) in
+      let+ stmts, components =
+        operands ~continue_state:true ctx (List.map components ~f:snd)
+      in
       (stmts, R.Expr.tuple ~loc:l components)
   | Texp_record { fields; extended_expression = None; _ } ->
       let fields = Array.to_list fields in
@@ -264,7 +266,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
               | Some (field, true) -> State.raw_storage field
               | _ -> State.return false
             in
-            expr ~allow_raw:raw ctx value)
+            expr ~continue_state:true ~allow_raw:raw ctx value)
       in
       let stmts = List.concat_map evaluated ~f:fst in
       let args = List.rev_map evaluated ~f:snd in
@@ -600,8 +602,13 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
         ( stmts @ leave @ R.Stmt.local ~loc:l ~typ (ident ~loc:l x),
           R.Expr.var ~loc:l (name ~loc:l x) )
   | Texp_apply (({ exp_desc = Texp_ident (path, _, declaration); _ } as callee), args) ->
-      let* args = State.of_result (supplied_args ~at args) in
-      apply ctx e path declaration callee.exp_type args
+      let* normalized =
+        State.of_result (Source.normalize_value_path e.exp_env ~at path)
+      in
+      if stdlib_list_fold_left normalized then fold_left ctx e args
+      else
+        let* args = State.of_result (supplied_args ~at args) in
+        apply ctx e path declaration callee.exp_type args
   | Texp_apply _ -> State.of_result (unsupported at "This application")
   | Texp_ifthenelse (c, e1, e2) ->
       let* polarity = cas_polarity c in
@@ -1235,6 +1242,9 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
   match (stdlib_name path, args) with
   | _ when Option.is_some (atomic_name path) ->
       atomic ctx e (Option.value_exn (atomic_name path)) args
+  | Some "ignore", [ value ] ->
+      let+ statements, _ = expr ctx value in
+      (statements, unit_value ~loc:l)
   | Some "ref", [ v ] ->
       let* () = State.require_memory_encoding ctx.given ~at "reference initialization" in
       let allocation =
@@ -1377,7 +1387,9 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
       State.map (State.visibility_atomic ctx.given ~at elt) ~f:Option.some
     else State.return None
   in
-  let* nested = State.of_result (nested_stateful_read ctx.given.access_proofs e) in
+  let* nested =
+    State.of_result (nested_stateful_atomic_argument ctx.given.access_proofs e)
+  in
   let* stmts, values =
     match nested with
     | Some argument ->
@@ -2243,9 +2255,135 @@ and established ctx (arg : Typedtree.expression) value =
   | _ -> State.return ([], value)
 
 (** The statements evaluating [args], right to left as OCaml does, and their values. *)
-and operands ctx (args : Typedtree.expression list) =
-  let+ evaluated = State.all (List.rev args) ~f:(fun arg -> expr ctx arg) in
+and operands ?(continue_state = false) ctx (args : Typedtree.expression list) =
+  let+ evaluated =
+    State.all (List.rev args) ~f:(fun arg -> expr ~continue_state ctx arg)
+  in
   (List.concat_map evaluated ~f:fst, List.rev_map evaluated ~f:snd)
+
+(** A statically known callback runs directly in a list traversal, with no closure value.
+*)
+and fold_left ctx (e : Typedtree.expression) arguments =
+  let at = e.exp_loc in
+  let l = loc at in
+  let* callback, initial, values =
+    match arguments with
+    | [ (Nolabel, Arg callback); (Nolabel, Arg initial); (Nolabel, Arg values) ] ->
+        State.return (callback, initial, values)
+    | _ ->
+        State.of_result
+          (unsupported at "A partially applied List.fold_left; supply all three arguments")
+  in
+  let* parameters, body =
+    match callback.exp_desc with
+    | Texp_function
+        ( [
+            { fp_arg_label = Nolabel; fp_kind = Tparam_pat accumulator; _ };
+            { fp_arg_label = Nolabel; fp_kind = Tparam_pat element; _ };
+          ],
+          Tfunction_body body ) ->
+        State.return ([ accumulator; element ], body)
+    | _ ->
+        State.of_result
+          (unsupported callback.exp_loc
+             "A List.fold_left callback other than an inline function with two parameters")
+  in
+  let* () = no_loop_before_linearizing ~at in
+  let* spec, annotation =
+    State.of_result
+      (loop_spec ~target:at ctx ~after:(List.last_exn parameters).pat_loc body)
+  in
+  let* setup, arguments = operands ctx [ initial; values ] in
+  let initial_value, values_value =
+    match arguments with [ initial; values ] -> (initial, values) | _ -> assert false
+  in
+  let local source_type base value =
+    let* typ = State.typ ctx ~at source_type in
+    let* () = State.note_domain ctx.given.types source_type in
+    let+ variable =
+      State.bind_name ~typ:source_type ~base (Ident.create_local ("caravan$" ^ base))
+    in
+    ( variable,
+      R.Expr.var ~loc:l (name ~loc:l variable),
+      R.Stmt.local ~loc:l ~const:false ~typ ~init:(R.Stmt.expr_rhs value)
+        (ident ~loc:l variable) )
+  in
+  let* accumulator, accumulator_value, accumulator_decl =
+    local initial.exp_type "fold_accumulator" initial_value
+  in
+  let* remaining, remaining_value, remaining_decl =
+    local values.exp_type "fold_remaining" values_value
+  in
+  let* raising = loop_raising ctx ~at ~spec None body in
+  let guard = Option.map raising ~f:(fun (_, _, _, guard, _) -> guard) in
+  let decl, exceptional =
+    Option.value_map raising ~default:([], []) ~f:(fun (decl, _, _, _, terms) ->
+        (decl, terms))
+  in
+  let* invariants =
+    loop_invariants
+      ~inputs:
+        [ (accumulator_value, initial.exp_type); (remaining_value, values.exp_type) ]
+      ?guard ?annotation ctx ~at spec
+      ~relation:(fun _ -> State.return None)
+  in
+  let* loop_scope = State.get_scope in
+  let* body_stmts, reaching =
+    in_loop raising (fun () ->
+        let head = R.Expr.field ~loc:l remaining_value (qualified_name ~loc:l "hd") in
+        let* bindings =
+          State.all
+            (List.zip_exn parameters [ accumulator_value; head ])
+            ~f:(fun (parameter, value) ->
+              let* reading, condition, bindings = pattern ctx parameter value in
+              let* () =
+                match condition with
+                | None -> State.return ()
+                | Some _ ->
+                    State.of_result
+                      (unsupported parameter.pat_loc "A refutable fold callback parameter")
+              in
+              let* definitions =
+                State.all bindings ~f:(fun (id, value, source_type) ->
+                    let* typ = State.typ ctx ~at source_type in
+                    let* () = State.note_domain ctx.given.types source_type in
+                    let+ variable = State.bind_name ~typ:source_type id in
+                    R.Stmt.local ~loc:l ~const:true ~typ ~init:(R.Stmt.expr_rhs value)
+                      (ident ~loc:l variable)
+                    @ assert_admissible ctx ~loc:l source_type variable)
+              in
+              let+ () = record_projection_bindings parameter value in
+              reading @ List.concat definitions)
+        in
+        let* body_stmts, result = expr ctx body in
+        let* () = State.set_scope loop_scope in
+        State.return
+          (List.concat bindings @ body_stmts
+          @ [
+              assign (accumulator, l) result;
+              assign (remaining, l)
+                (R.Expr.field ~loc:l remaining_value (qualified_name ~loc:l "tl"));
+            ]))
+  in
+  let* propagation =
+    match raising with
+    | None -> State.return []
+    | Some (_, outcome, typ, _, _) -> propagate ~at ~certain:false ~typ outcome reaching
+  in
+  let condition =
+    R.Expr.not_ ~loc:l (R.Expr.is_ ~loc:l remaining_value (ident ~loc:l "nil"))
+  in
+  let condition =
+    Option.value_map guard ~default:condition ~f:(fun guard ->
+        R.Expr.binary ~loc:l And condition guard)
+  in
+  State.return
+    ( setup @ accumulator_decl @ remaining_decl @ decl
+      @ [
+          R.Stmt.while_ ~loc:l ~invariants:(invariants @ exceptional) condition body_stmts;
+        ]
+      @ propagation,
+      accumulator_value )
 
 (** The accesses and condition for matching [p] against [v], and its bindings. *)
 and pattern ?guard ?(allow_raw = false) ctx (p : Typedtree.pattern) (v : R.Expr.t) =
@@ -2407,8 +2545,7 @@ and match_cases ?(raw = false) ?commits ?otherwise ?arm ~tail ctx ~at v
          in
          let* finish = finish_arm ctx ~tail value in
          let* value =
-           if raw then State.raw_inject ctx.given ~at:rhs.exp_loc ~elt:rhs.exp_type value
-           else State.return value
+           branch_value ctx ~raw ~at:rhs.exp_loc ~elt:rhs.exp_type ~target value
          in
          let assignment =
            Option.value_map target ~default:[] ~f:(fun t -> [ assign t value ])
@@ -2593,9 +2730,7 @@ and conditional_arms ?(raw = false) ctx ~at ?polarity ~tail c (e1 : Typedtree.ex
          | None ->
              let* finish = finish_arm ctx ~tail (unit_value ~loc:l) in
              let+ value =
-               if raw then
-                 State.raw_inject ctx.given ~at ~elt:Predef.type_unit (unit_value ~loc:l)
-               else State.return (unit_value ~loc:l)
+               branch_value ctx ~raw ~at ~elt:Predef.type_unit ~target (unit_value ~loc:l)
              in
              finish
              @ Option.value_map target ~default:[] ~f:(fun target ->
@@ -2603,10 +2738,7 @@ and conditional_arms ?(raw = false) ctx ~at ?polarity ~tail c (e1 : Typedtree.ex
          | Some e ->
              let* stmts, v = expr ~tail ~allow_raw:raw ctx e in
              let* finish = finish_arm ctx ~tail v in
-             let+ v =
-               if raw then State.raw_inject ctx.given ~at:e.exp_loc ~elt:e.exp_type v
-               else State.return v
-             in
+             let+ v = branch_value ctx ~raw ~at:e.exp_loc ~elt:e.exp_type ~target v in
              let assignment =
                Option.value_map target ~default:[] ~f:(fun t -> [ assign t v ])
              in
@@ -2809,6 +2941,20 @@ and handled ctx ~at ~tail (e : Typedtree.expression) ~cases ~protected ~normal =
   let+ pending = after_branch ~loc:l before in
   (stmts @ pending, v)
 
+(** A join is speculative only when one of its source arms is speculative. *)
+and branch_value ctx ~raw ~at ~elt ~target value =
+  if not raw then State.return value
+  else
+    let* speculative = State.raw_value value in
+    let* () =
+      match (speculative, target) with
+      | Some _, Some (target, _) ->
+          State.modify_carried (fun carried ->
+              { carried with raw_joins = Set.add carried.raw_joins target })
+      | _ -> State.return ()
+    in
+    State.raw_inject ctx.given ~at ~elt value
+
 (** The statements [make target] computing the value of [e] into a new variable [target],
     and that variable; no variable if [e] is of type unit. *)
 and branch ?(raw = false) ctx (e : Typedtree.expression) make =
@@ -2830,7 +2976,12 @@ and branch ?(raw = false) ctx (e : Typedtree.expression) make =
       let* payload_type = State.typ ctx ~at:e.exp_loc e.exp_type in
       let* payload_name = State.fresh "raw_join" in
       let payload = R.Expr.var ~loc:l (name ~loc:l payload_name) in
-      let+ () = State.register_raw payload value in
+      let* speculative =
+        State.gets (fun (state : State.state) -> Set.mem state.carried.raw_joins x)
+      in
+      let+ () =
+        if speculative then State.register_raw payload value else State.return ()
+      in
       ( statements
         @ R.Stmt.local ~loc:l ~const:true ~typ:payload_type
             ~init:(R.Stmt.expr_rhs (State.raw_project ~loc:l value))

@@ -336,81 +336,6 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
           error lemma_name.pid_loc "A recursive lemma needs a variant"
       | _ -> Ok ()))
 
-(** Mask entries identify resources and an optional argument prefix. *)
-let lemma_mask_entry env (term : S.term) =
-  let open State.Syntax in
-  let at = term.term_loc in
-  let l = loc at in
-  let head, arguments = spine term [] in
-  let wildcard () = R.Expr.var ~loc:l (name ~loc:l "_") in
-  let source_wildcard term =
-    match term.S.term_desc with
-    | Tvar (Qid id) -> String.equal id.pid_str "_"
-    | _ -> false
-  in
-  let prefix types =
-    if List.length arguments > List.length types then
-      State.of_result (error at "Too many arguments in an opens entry")
-    else
-      let supplied =
-        List.take_while arguments ~f:(fun term -> not (source_wildcard term))
-      in
-      let+ values =
-        State.all
-          (List.zip_exn (List.take types (List.length supplied)) supplied)
-          ~f:(fun (typ, argument) -> expected_formula env (Some typ) argument)
-      in
-      if List.is_empty arguments then []
-      else
-        values
-        @ List.init (List.length types - List.length supplied) ~f:(fun _ -> wildcard ())
-  in
-  match head.term_desc with
-  | Tvar q ->
-      begin match access_method env q with
-      | Some (field, "frozen") ->
-          begin match arguments with
-          | [ owner ] ->
-              let* expected = State.of_result (equality_term_type env term) in
-              let+ family, receiver, _ =
-                frozen_selection ~expected env field term owner
-              in
-              ( qualified_name ~loc:l (family ^ ".frozen"),
-                [ receiver; wildcard (); wildcard () ] )
-          | _ ->
-              State.of_result
-                (error at "A Frozen opens entry names its cell: Value.frozen cell")
-          end
-      | Some _ ->
-          State.of_result (error at "An opens entry must name a predicate or invariant")
-      | None ->
-          let key = logical_key env q in
-          begin match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
-          | Some (target, types) ->
-              let* instance =
-                State.of_result (predicate_instance env ~at ~key ~target arguments)
-              in
-              let types =
-                Option.value_map instance ~default:types ~f:(fun (worker, parameters) ->
-                    Generic_parameters.parameter_types worker parameters)
-              in
-              let* target = predicate_target env ~at ~key ~target arguments in
-              let+ arguments = prefix types in
-              (qualified_name ~loc:l target, arguments)
-          | None ->
-              begin match logical_signature env q with
-              | Some signature ->
-                  let* signature =
-                    instantiate_proof_signature env ~at signature arguments
-                  in
-                  let+ arguments = prefix signature.lemma_inputs in
-                  (qualified_name ~loc:l signature.lemma_raven, arguments)
-              | None -> State.of_result (error at "Unknown resource in opens clause")
-              end
-          end
-      end
-  | _ -> State.of_result (error at "An opens entry must name a predicate or invariant")
-
 (** Checked proof declarations share logical types, but introduce no runtime code. *)
 let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof_support
     ~predicate_bodies ?member_name ?(primitive_namespace = []) ?(generic_predicates = [])
@@ -519,7 +444,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         match lemma_opens with
         | None -> State.return None
         | Some (at, entries) ->
-            let+ entries = State.all entries ~f:(lemma_mask_entry env) in
+            let+ entries = State.all entries ~f:(mask_entry env) in
             Some (loc at, entries)
       in
       let body_env =
@@ -563,8 +488,12 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
   let name = ident ~loc:l (Option.value declaration_name ~default:p.pred_name.pid_str) in
   match def with
   | Direct_invariant body ->
-      let+ body = quantified env body in
-      (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body), [])
+      let* body = quantified env body in
+      let+ implicit = State.of_result (implicit_parameters p) in
+      let explicit, implicit = List.split_n params (List.length params - implicit) in
+      ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars explicit) ~returns:(vars implicit)
+          name (Some body),
+        [] )
   | Body body ->
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
@@ -944,9 +873,11 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let body =
         match existentials with [] -> body | _ -> R.Expr.exists ~loc:l existentials body
       in
-      State.return
-        ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body),
-          List.filter_opt parts @ transitions )
+      let+ implicit = State.of_result (implicit_parameters p) in
+      let explicit, implicit = List.split_n params (List.length params - implicit) in
+      ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars explicit) ~returns:(vars implicit)
+          name (Some body),
+        List.filter_opt parts @ transitions )
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A
@@ -1038,6 +969,13 @@ let predicates (source : Source.t) inventory =
             match state_type with
             | PTtyapp (Qid t, state_arguments)
               when List.Assoc.mem states t.pid_str ~equal:String.equal ->
+                let* () =
+                  if List.mem state.pid_attrs "implicit" ~equal:String.equal then
+                    error state.pid_loc
+                      "An invariant state record is already hidden; mark its ordinary \
+                       parameters implicit instead"
+                  else Ok ()
+                in
                 let state_parameters, fields =
                   List.Assoc.find_exn states t.pid_str ~equal:String.equal
                 in

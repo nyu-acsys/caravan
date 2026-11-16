@@ -170,12 +170,17 @@ let rec matches (a : Parsetree.expression) (e : Parsetree.expression) =
           | Pparam_newtype left, Pparam_newtype right -> String.equal left.txt right.txt
           | _ -> false
         in
-        List.equal same_parameter left right && matches left_body right_body
+        List.equal same_parameter left right
+        && (matches left_body right_body
+           || String.equal
+                (Stdlib.Format.asprintf "%a" Pprintast.expression left_body)
+                (Stdlib.Format.asprintf "%a" Pprintast.expression right_body))
     | Pexp_field (a, fa), Pexp_field (e, fe) ->
         Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt) && matches a e
     | Pexp_setfield (a, fa, va), Pexp_setfield (e, fe, ve) ->
         Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt)
         && matches a e && matches va ve
+    | Pexp_sequence (a, b), Pexp_sequence (e, f) -> matches a e && matches b f
     | Pexp_constraint (a, _), _ -> matches a e
     | _, Pexp_constraint (e, _) -> matches a e
     | _ -> false
@@ -334,10 +339,36 @@ let within (outer : Location.t) (inner : Location.t) =
   outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
 
+(** An OCaml attribute selects one of several identical source expressions. *)
+let anchor_occurrence (anchor : Parsetree.expression) =
+  let attributes =
+    List.filter anchor.pexp_attributes ~f:(fun attribute ->
+        String.equal attribute.Parsetree.attr_name.txt "occurrence")
+  in
+  match attributes with
+  | [] -> Ok None
+  | [ attribute ] ->
+      begin match attribute.attr_payload with
+      | PStr
+          [ { pstr_desc = Pstr_eval ({ pexp_desc = Pexp_constant constant; _ }, _); _ } ]
+        ->
+          begin match constant.pconst_desc with
+          | Pconst_integer (text, None) ->
+              begin match Int.of_string_opt text with
+              | Some index when index > 0 -> Ok (Some index)
+              | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+              end
+          | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+          end
+      | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+      end
+  | _ -> error anchor.pexp_loc "An anchor has at most one occurrence attribute"
+
 (** The code of the step's anchor in [definition]'s body, after [previous], outside the
     local functions with outlines of their own, [excluded]. *)
 let anchor_place ~proof_text definition ~excluded ~previous (anchor_loc : Location.t) =
   let* name, anchor = anchor_expression ~proof_text anchor_loc in
+  let* occurrence = anchor_occurrence anchor in
   let code =
     match name with
     | None -> List.concat_map (code_roots definition) ~f:subexpressions
@@ -349,17 +380,34 @@ let anchor_place ~proof_text definition ~excluded ~previous (anchor_loc : Locati
         && (not (List.exists excluded ~f:(fun at -> within at e.pexp_loc)))
         && matches anchor e)
   in
-  match candidates with
-  | [ e ] -> Ok e
-  | [] ->
-      error anchor_loc
-        (Printf.sprintf "This anchor matches no code of %s after the previous step"
-           definition.name)
-  | candidates ->
-      error anchor_loc
-        (Printf.sprintf "This anchor matches %d places of %s, at %s"
-           (List.length candidates) definition.name
-           (String.concat ~sep:", " (List.map candidates ~f:(fun e -> place e.pexp_loc))))
+  let candidates =
+    List.sort candidates ~compare:(fun left right ->
+        Int.compare left.Parsetree.pexp_loc.loc_start.pos_cnum
+          right.Parsetree.pexp_loc.loc_start.pos_cnum)
+  in
+  match occurrence with
+  | Some index ->
+      begin match List.nth candidates (index - 1) with
+      | Some expression -> Ok expression
+      | None ->
+          error anchor_loc
+            (Printf.sprintf
+               "This anchor has %d remaining matches, so occurrence %d does not exist"
+               (List.length candidates) index)
+      end
+  | None -> (
+      match candidates with
+      | [ e ] -> Ok e
+      | [] ->
+          error anchor_loc
+            (Printf.sprintf "This anchor matches no code of %s after the previous step"
+               definition.name)
+      | candidates ->
+          error anchor_loc
+            (Printf.sprintf "This anchor matches %d places of %s, at %s"
+               (List.length candidates) definition.name
+               (String.concat ~sep:", "
+                  (List.map candidates ~f:(fun e -> place e.pexp_loc)))))
 
 (** The function that [outline] proves: the one of its name, or, if several have it, the
     one whose parameters its header names. A header's contract may rename the parameters
@@ -433,7 +481,8 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
         match b with
         | Export { code; code_regions; pattern; _ }
           when not
-                 (List.is_prefix regions ~prefix:code_regions ~equal:Poly.equal
+                 (List.is_prefix (List.rev regions) ~prefix:(List.rev code_regions)
+                    ~equal:Poly.equal
                  && (step_end code).pos_cnum <= place) ->
             error step_loc
               (Printf.sprintf
@@ -446,6 +495,7 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
   let in_order = List.filter visible ~f:(fun b -> List.mem used b ~equal:phys_equal) in
   Ok
     {
+      Annotation.target = None;
       Annotation.export = None;
       imports =
         List.filter_map in_order ~f:(function
@@ -489,6 +539,21 @@ let loop_body definition (code : Parsetree.expression) ~at =
         | (Pexp_while (_, body) | Pexp_for (_, _, _, _, body))
           when Poly.equal (first body).pexp_loc code.pexp_loc ->
             Some body
+        | Pexp_apply
+            ( {
+                pexp_desc =
+                  Pexp_ident
+                    { txt = Lident "fold_left" | Ldot (_, { txt = "fold_left"; _ }); _ };
+                _;
+              },
+              [ (_, callback); _; _ ] ) ->
+            begin match callback.pexp_desc with
+            | Pexp_function (_, _, Pfunction_body body)
+              when Poly.equal expression.pexp_loc code.pexp_loc
+                   || Poly.equal (first body).pexp_loc code.pexp_loc ->
+                Some body
+            | _ -> None
+            end
         | _ -> None)
   in
   match bodies with
@@ -556,8 +621,14 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
                   error pattern.pat_loc "Only a scope (fun step -> e) exports a value"
             in
             let annotation =
-              synthesized ~prefix ~outline:{ context with export } ~proof_text
-                ~origin:action_loc place
+              let target =
+                match action with
+                | Scope | Wrapped_scope | Loop -> Some code.pexp_loc
+                | Linearize | Initializes -> None
+              in
+              synthesized ~prefix
+                ~outline:{ context with target; export }
+                ~proof_text ~origin:action_loc place
             in
             let visible =
               match export with

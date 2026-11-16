@@ -18,10 +18,13 @@ let sources =
     ("treiber_stack/treiber_stack.mli", "8fce1984f67b2eb286143e8ebf3ea2fd");
   ]
 
-let strip_annotations text =
+let strip_annotations ?(implementation = false) text =
   let lexbuf = Lexing.from_string text in
   Lexer.init ();
-  let signature = Parse.interface lexbuf in
+  let parsed =
+    if implementation then `Structure (Parse.implementation lexbuf)
+    else `Signature (Parse.interface lexbuf)
+  in
   let annotations =
     List.filter_map (Lexer.comments ()) ~f:(fun (_, (loc : Location.t)) ->
         Option.some_if
@@ -37,7 +40,10 @@ let strip_annotations text =
     else Ast_iterator.default_iterator.attribute iterator attribute
   in
   let iterator = { Ast_iterator.default_iterator with attribute } in
-  iterator.signature iterator signature;
+  begin match parsed with
+  | `Structure structure -> iterator.structure iterator structure
+  | `Signature signature -> iterator.signature iterator signature
+  end;
   let length = String.length text in
   let rec line_start offset =
     if offset = 0 || Char.equal text.[offset - 1] '\n' then offset
@@ -58,7 +64,15 @@ let strip_annotations text =
         let first = line_start start and last = line_end stop in
         if whitespace first start && whitespace stop last then
           (first, if last < length then last + 1 else last)
-        else (start, stop))
+        else
+          let rec preceding_space start =
+            if
+              start > first
+              && (Char.equal text.[start - 1] ' ' || Char.equal text.[start - 1] '\t')
+            then preceding_space (start - 1)
+            else start
+          in
+          (preceding_space start, stop))
     |> List.sort ~compare:(fun (left, _) (right, _) -> Int.compare left right)
   in
   let buffer = Buffer.create length in
@@ -112,6 +126,13 @@ let tutorial_stack_body source =
   match String.substr_index source ~pattern:"\nlet integer_lifo () =" with
   | Some index -> String.rstrip (String.prefix source index) ^ "\n"
   | None -> failwith "Missing tutorial blocking-stack client marker"
+
+(* Safe header and extracted body with local bounded-queue correctness fixes. *)
+let () =
+  check_digest "bounded_queue/bounded_queue.ml (extraction with queue fixes)"
+    "9e867819560361b05d910b38ef76d7f8"
+    (strip_annotations ~implementation:true
+       (Stdio.In_channel.read_all "../saturn/bounded_queue/bounded_queue.ml"))
 
 let () =
   check_digest "ocaml5_tutorial/blocking_stack/blocking_stack.ml (upstream module)"

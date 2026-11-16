@@ -383,7 +383,7 @@ let run (source : Source.t) : (t, error) Result.t =
         @ List.map specialized ~f:(fun specialized ->
             specialized.Specializations.original))
   in
-  let state_targets = ref [] and nested_reads = ref [] in
+  let state_targets = ref [] and nested_atomics = ref [] in
   let remember (e : Typedtree.expression) =
     state_targets :=
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) :: !state_targets
@@ -400,7 +400,7 @@ let run (source : Source.t) : (t, error) Result.t =
     | _ -> ()
   in
   let visit iterator (e : Typedtree.expression) =
-    if Option.is_some (atomic_read_argument e) then nested_reads := e :: !nested_reads;
+    if Option.is_some (atomic_argument e) then nested_atomics := e :: !nested_atomics;
     begin match e.exp_desc with
     | Texp_let (Nonrecursive, [ binding ], body) ->
         remember binding.vb_expr;
@@ -409,6 +409,12 @@ let run (source : Source.t) : (t, error) Result.t =
     | Texp_sequence (left, right) ->
         remember left;
         lexical_tail right
+    | Texp_tuple components ->
+        List.iter components ~f:(fun (_, operand) -> remember operand)
+    | Texp_record { fields; extended_expression = None; _ } ->
+        Array.iter fields ~f:(function
+          | _, Typedtree.Overridden (_, value) -> remember value
+          | _, Kept _ -> ())
     | Texp_ifthenelse (_, yes, no) ->
         lexical_tail yes;
         Option.iter no ~f:lexical_tail
@@ -425,8 +431,8 @@ let run (source : Source.t) : (t, error) Result.t =
       iterator.expr iterator f.body);
   let* () =
     Result.all_unit
-      (List.map !nested_reads ~f:(fun e ->
-           let* argument = nested_stateful_read access_proofs e in
+      (List.map !nested_atomics ~f:(fun e ->
+           let* argument = nested_stateful_atomic_argument access_proofs e in
            Option.iter argument ~f:(fun argument ->
                remember e;
                remember argument);
@@ -442,7 +448,8 @@ let run (source : Source.t) : (t, error) Result.t =
            then
              error a.loc
                "A stateful scope needs a direct let binding, sequence continuation, \
-                lexical tail, or directly nested stateful read"
+                tuple or record operand, lexical tail, or directly nested stateful \
+                atomic access"
            else Ok ()))
   in
   let tails = ref [] in

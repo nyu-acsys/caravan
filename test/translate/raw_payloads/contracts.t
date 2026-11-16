@@ -37,3 +37,8 @@ Public aliases cannot erase raw calling conventions.
   $ caravan --shh alias_erasure_root/erase.ml > interface.out 2>&1
   [1]
   $ grep -q 'Argument 1 has different raw modes' interface.out
+
+Ordinary branch results remain usable in proofs in a module with raw storage.
+
+  $ caravan --shh ordinary_branches.ml
+  Verification successful.

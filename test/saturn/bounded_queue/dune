@@ -1,6 +1,19 @@
 (library
  (name caravan_saturn_bounded_queue)
- (wrapped false))
+ (wrapped false)
+ (modules bounded_queue)
+ (libraries caravan_saturn_backoff))
 
 (cram
- (deps %{bin:caravan} %{bin:raven} bounded_queue.ml bounded_queue.proof))
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  bounded_queue.ml
+  bounded_queue.proof
+  constructor_clients.ml
+  constructor_clients.proof
+  helper_clients.ml
+  helper_clients.proof
+  wrap_prefix.ml
+  wrap_harness.ml
+  (glob_files ../backoff/*.mli)))

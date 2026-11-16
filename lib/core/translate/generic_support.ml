@@ -9,13 +9,19 @@ let domain_dependencies requests =
   List.fold requests
     ~init:(Map.empty (module String))
     ~f:(fun dependencies request ->
+      let families =
+        Datatypes.family_domain_dependencies ~dictionaries:true request.domain_types
+          [ request.domain_type ]
+        |> List.map ~f:(fun (name, families) ->
+            (name, List.map families ~f:(fun family -> family.Datatypes.family_name)))
+      in
       List.fold
-        (Datatypes.family_domain_dependencies ~dictionaries:true request.domain_types
-           [ request.domain_type ]) ~init:dependencies
-        ~f:(fun dependencies (name, families) ->
+        (families
+        @ Datatypes.refinement_dependencies request.domain_types [ request.domain_type ])
+        ~init:dependencies
+        ~f:(fun dependencies (name, prerequisites) ->
           Map.update dependencies name ~f:(fun existing ->
-              List.map families ~f:(fun family -> family.Datatypes.family_name)
-              @ Option.value existing ~default:[])))
+              prerequisites @ Option.value existing ~default:[])))
 
 let nodes ~namespace ~at ~domains ~domain_dependencies
     ~(instances : function_instance list) =

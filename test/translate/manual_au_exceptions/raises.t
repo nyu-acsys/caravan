@@ -14,6 +14,12 @@ An operation whose only polymorphic parameter is its result index needs no backe
   $ caravan --shh index_only.ml
   Verification successful.
 
+Nominal constructor-set arguments are erased from AU and task discovery while
+payload parameters and witness-selected result indices remain in source tokens.
+
+  $ caravan --shh constructor_set.ml
+  Verification successful.
+
 Existing tuple-valued ghost results retain their meaning on calls that may raise.
 
   $ caravan --shh pair_client.ml

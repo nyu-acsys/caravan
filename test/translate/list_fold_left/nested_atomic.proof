@@ -1,0 +1,8 @@
+proof copied =
+  at (read source) Ghost.State.scope (fun step () ->
+    let result = step () in
+    (result, result));
+  at (Atomic.make (read source)) Ghost.State.scope (fun step (saved : int) ->
+    assert (saved = value);
+    let result = step () in
+    (result, saved))

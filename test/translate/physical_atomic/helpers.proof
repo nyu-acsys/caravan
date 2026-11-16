@@ -1,0 +1,18 @@
+invariant shared (cell : cell) = own cell.channel 4
+
+proof result = read [@atomic] cell
+  requires (own cell.channel value)
+  ensures (own cell.channel value && result = value) = ()
+
+proof write [@atomic] cell value
+  requires (own cell.channel previous)
+  ensures (own cell.channel value) = ()
+
+proof result = protected_read cell
+  requires (shared cell)
+  ensures (shared cell && result = 4) =
+  at (read cell) (fun read ->
+    unfold shared cell;
+    let result = read () in
+    fold shared cell;
+    result)

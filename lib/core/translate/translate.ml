@@ -1858,8 +1858,28 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               let* members =
                 Datatypes.domain_members ~dictionaries:true cell_environment requested
               in
+              let refinements =
+                List.concat_map (state.tables.domains @ state.tables.dictionaries)
+                  ~f:(fun request ->
+                    Datatypes.requested_refinements request.domain_types
+                      [ request.domain_type ])
+                |> List.filter_map ~f:(fun (data, allowed) ->
+                    let paths =
+                      data.Datatypes.paths
+                      @ Option.to_list (Option.map data.id ~f:(fun id -> Path.Pident id))
+                    in
+                    Option.bind
+                      (List.find_map paths ~f:(Datatypes.find cell_environment))
+                      ~f:(fun data ->
+                        Option.some_if
+                          (List.exists layout_types ~f:(fun layout ->
+                               Option.equal (List.equal String.equal)
+                                 data.Datatypes.module_path layout.Datatypes.module_path))
+                          (let name = Datatypes.refinement_factory_name data allowed in
+                           (name, Datatypes.refinement_factory data allowed name))))
+              in
               Ok
-                ( members,
+                ( Datatypes.unique_domain_members (refinements @ members),
                   Datatypes.value_templates ~dictionaries:true cell_environment requested
                 )
             in
@@ -1867,7 +1887,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               List.filter_map layout_domain_members ~f:(fun (name, member) ->
                   Option.some_if
                     (List.equal String.equal (Qualified_name.of_string name).path
-                       [ world; "Shape" ])
+                       [ world; "Shape" ]
+                    && not (List.Assoc.mem family_members name ~equal:String.equal))
                     member)
             in
             let world_domains =

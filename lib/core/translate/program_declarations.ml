@@ -1080,6 +1080,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               procedure_result = f.body.exp_type;
               procedure_returns_value = raw.result || not (is_unit f.body.exp_type);
               procedure_raw = raw;
+              procedure_physical_atomic = Callable_contract.physically_atomic f.contract;
+              procedure_pure = is_pure f;
             } ))
   in
   let* imported_signatures =
@@ -1087,7 +1089,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let* contracts = library_contracts library in
         all contracts ~f:(fun (member, (contract, at)) ->
             let raw = Raw_contract.of_contract (Some contract) in
-            if not (Raw_contract.any raw) then Ok None
+            if
+              not
+                (Raw_contract.any raw
+                || Callable_contract.physically_atomic (Some contract)
+                || contract.pure)
+            then Ok None
             else
               let path = Path.Pdot (library.Library_modules.library_path, member) in
               let declaration = Env.find_value path source.env in
@@ -1114,6 +1121,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                        procedure_result = result;
                        procedure_returns_value = raw.result || not (is_unit result);
                        procedure_raw = raw;
+                       procedure_physical_atomic =
+                         Callable_contract.physically_atomic (Some contract);
+                       procedure_pure = contract.pure;
                      } ))))
   in
   let procedure_signatures =
@@ -1122,7 +1132,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   let checked_signatures =
     List.filter_map checked_operations ~f:(fun operation ->
         let raw = Raw_contract.of_contract operation.operation_contract in
-        if not (Raw_contract.any raw) then None
+        if
+          not
+            (Raw_contract.any raw
+            || Callable_contract.physically_atomic operation.operation_contract)
+        then None
         else
           let scheme =
             Option.map operation.operation_worker ~f:(fun worker ->
@@ -1151,6 +1165,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 procedure_result = result;
                 procedure_returns_value = raw.result || not (is_unit result);
                 procedure_raw = raw;
+                procedure_physical_atomic =
+                  Callable_contract.physically_atomic operation.operation_contract;
+                procedure_pure = false;
               } ))
   in
   let procedure_signatures = procedure_signatures @ checked_signatures in

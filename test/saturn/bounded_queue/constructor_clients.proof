@@ -1,0 +1,56 @@
+module Constructor_clients = struct
+  proof result = full_at_one value
+    opens {Counter.frozen}
+    ensures (not result)
+    raises Full -> (false) =
+    at (try_push queue value) (fun invoke ->
+      let built = unfold constructed_queue Ghost.self queue 1 [value] in
+      let result = invoke built.key in result)
+
+  proof result = fifo_two first second
+    opens {Counter.frozen}
+    ensures (match result with removed, next, empty ->
+      removed === first && next === second && empty === None)
+    raises Empty -> (false)
+    raises Full -> (false) =
+    let key = at (let removed = pop_exn queue) (fun invoke ->
+      let built = unfold constructed_queue Ghost.self queue 2 [first; second] in
+      let result = invoke built.key in (result, built.key)) in
+    at (let next = pop_exn queue) (fun invoke -> let result = invoke key in result);
+    at (pop_opt queue) (fun invoke -> let result = invoke key in result)
+
+  proof result = empty_zero ()
+    opens {Counter.frozen}
+    ensures (match result with empty, full -> empty && full)
+    raises Full -> (false) =
+    let key = at (let empty = is_empty queue) (fun invoke ->
+      let built = unfold constructed_queue Ghost.self queue 0 ([] : int list) in
+      let result = invoke built.key in (result, built.key)) in
+    at (is_full queue) (fun invoke -> let result = invoke key in result)
+
+  proof result = spare_reuse first second
+    opens {Counter.frozen}
+    ensures (match result with accepted, removed, next ->
+      accepted && removed === first && next === second)
+    raises Empty -> (false)
+    raises Full -> (false) =
+    let key = at (let accepted = try_push queue second) (fun invoke ->
+      let built = unfold constructed_queue Ghost.self queue 2 [first] in
+      let result = invoke built.key in (result, built.key)) in
+    at (let removed = pop_exn queue) (fun invoke -> let result = invoke key in result);
+    at (push_exn queue first) (fun invoke -> let result = invoke key in result);
+    at (pop_exn queue) (fun invoke -> let result = invoke key in result)
+
+  proof result = oversized first second
+    opens {Counter.frozen}
+    ensures (false)
+    raises Full -> (true) = ()
+
+  proof result = default_capacity first second
+    opens {Counter.frozen}
+    ensures (result = max_int)
+    raises Full -> (false) =
+    at (capacity_of queue) (fun invoke ->
+      let _built = unfold constructed_queue Ghost.self queue max_int [first; second] in
+      let result = invoke () in result)
+end

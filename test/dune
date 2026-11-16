@@ -25,6 +25,9 @@
   ; moonpool/parker
   (alias moonpool/parker/parker)
   (alias moonpool/parker/parker_fail)
+  ; saturn/bounded_queue
+  (alias saturn/bounded_queue/push_contracts)
+  (alias saturn/bounded_queue/wraparound)
   ; saturn/treiber_stack
   (alias saturn/treiber_stack/treiber_stack)
   ; stdlib
@@ -47,6 +50,7 @@
   (alias translate/basics/function_cases)
   (alias translate/basics/function_cases_type_fail)
   (alias translate/basics/ill_typed)
+  (alias translate/basics/ignore)
   (alias translate/basics/match_binding_scope_leak_fail)
   (alias translate/basics/mathematical_integer)
   (alias translate/basics/mathematical_integer_fail)
@@ -138,12 +142,16 @@
   (alias translate/indexed_gadts/indexed_gadts)
   ; translate/labelled_arguments
   (alias translate/labelled_arguments/labelled_arguments)
+  ; translate/executable_masks
+  (alias translate/executable_masks/executable_masks)
   ; translate/lemma_masks
   (alias translate/lemma_masks/lemma_masks)
   ; translate/libraries
   (alias translate/libraries/include_dirs)
   (alias translate/libraries/library_contracts)
   (alias translate/libraries/library_contracts_fail)
+  ; translate/list_fold_left
+  (alias translate/list_fold_left/fold)
   ; translate/logical_recursion
   (alias translate/logical_recursion/recursion)
   ; translate/loop_outlines
@@ -188,6 +196,8 @@
   (alias translate/mutex/ownership)
   ; translate/optional_arguments
   (alias translate/optional_arguments/optional_arguments)
+  ; translate/physical_atomic
+  (alias translate/physical_atomic/physical_atomic)
   ; translate/outlines
   (alias translate/outlines/initializers)
   (alias translate/outlines/outlines)
@@ -217,6 +227,8 @@
   (alias translate/polymorphic_records/records)
   ; translate/polymorphic_storage
   (alias translate/polymorphic_storage/storage)
+  ; translate/prophecies
+  (alias translate/prophecies/prophecies)
   ; translate/predicates
   (alias translate/predicates/direct_invariants)
   (alias translate/predicates/lemmas_implicit)

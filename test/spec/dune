@@ -21,3 +21,7 @@
 (test
  (name raw_headers)
  (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name executable_opens)
+ (libraries caravan_spec compiler-libs.common))

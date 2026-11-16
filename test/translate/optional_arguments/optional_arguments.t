@@ -64,3 +64,8 @@ Partial applications remain unsupported.
   $ caravan --shh partial.ml > partial.out 2>&1
   [1]
   $ grep -q 'Unsupported Error:' partial.out
+
+Body scopes after defaults and entry patterns retain their enclosing function.
+
+  $ caravan --shh body_scopes.ml
+  Verification successful.

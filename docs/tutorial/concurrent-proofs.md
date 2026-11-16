@@ -5,6 +5,19 @@ invocation and completion. It supports modular linearizability proofs even when
 the implementation performs several accesses and retries. `atomic` in a contract
 does not assert that the whole implementation is physically atomic.
 
+A helper can declare physical atomicity by putting `[@atomic]` after its name in
+the contract, for example `proof result = read [@atomic] cell ...`. Such a helper
+can be called while an invariant is open. Caravan checks a conservative source
+subset allowing at most one modeled atomic effect, with pure preparation; it
+rejects ordinary mutable accesses and unsupported effects. Two accesses in
+different branches also exceed this initial check. Imported declarations assume
+this guarantee, and module implementations must preserve it. This attribute is
+distinct from the `atomic` keyword for logically atomic contracts.
+
+Function contracts can specify an invariant footprint with `opens {resource …}`;
+`opens {}` promises that no invariants are opened. The syntax matches proof
+lemmas. Omitting the clause keeps contract-based mask inference.
+
 For each example below, download its implementation, interface, and proof into
 one directory. Invoke Caravan on the `.ml` implementation; it loads the sibling
 `.mli` and `.proof` files automatically. Both examples are checked by the

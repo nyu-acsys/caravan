@@ -8,14 +8,19 @@ open Proof_terms
 
 (** The specification of the loop whose body is [body], in an annotation between [after]
     and the body, as [while c do (*@ invariant P *) ... done]. *)
-let loop_spec ctx ~(after : Location.t) (body : Typedtree.expression) =
+let loop_spec ?target ctx ~(after : Location.t) (body : Typedtree.expression) =
   let between (a : Annotation.t) =
     a.loc.loc_start.pos_cnum >= after.loc_end.pos_cnum
     && a.loc.loc_end.pos_cnum <= body.exp_loc.loc_start.pos_cnum
   in
   match
     List.filter ctx.given.annotations ~f:(fun a ->
-        between a && Poly.equal (Annotation.kind a) Annotation.Loop)
+        Poly.equal (Annotation.kind a) Annotation.Loop
+        && (between a
+           || Option.exists target ~f:(fun target ->
+               Option.exists a.outline ~f:(fun outline ->
+                   Option.exists outline.target ~f:(fun actual ->
+                       Poly.equal actual target)))))
   with
   | [] ->
       Ok
@@ -72,7 +77,8 @@ let loop_outline_terms annotation terms =
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
     as the value of the loop's condition. The invariants of [spec] hold under [guard] if
     given, as for a loop that may raise, when it has not. *)
-let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loop_spec)
+let rec loop_invariants ?(counter = "") ?(inputs = []) ?guard ?annotation ctx ~at
+    (spec : S.loop_spec)
     ~(relation : ((string * string) * R.Expr.t) list -> R.Expr.t option State.t) =
   let open State.Syntax in
   let l = loc at in
@@ -95,20 +101,42 @@ let rec loop_invariants ?(counter = "") ?guard ?annotation ctx ~at (spec : S.loo
   in
   let* env, state_invariants =
     State.fold spec.state_invariants ~init:(env, [])
-      ~f:(fun (env, terms) (pattern, body) ->
-        let* value, ty = proof_state ~at:pattern.S.pat_loc in
-        let* _ = State.of_result (bind_proof_pattern env pattern ty value) in
-        let+ source = State.fresh "caravan$loop_state" in
-        let id = S.mk_id ~loc:pattern.pat_loc source in
-        let variable = S.mk_term (Tvar (Qid id)) pattern.pat_loc in
-        let term = S.mk_term (Tlet (pattern, variable, body)) body.term_loc in
-        let env =
-          {
-            (bind env source (Value value)) with
-            var_types = (source, ty) :: env.var_types;
-          }
+      ~f:(fun (env, terms) (patterns, body) ->
+        let* values =
+          match patterns with
+          | [ pattern ] ->
+              let+ state = proof_state ~at:pattern.S.pat_loc in
+              [ state ]
+          | [ _; _ ] when List.length inputs = 2 -> State.return inputs
+          | [ _; _; state ] when List.length inputs = 2 ->
+              let+ state = proof_state ~at:state.S.pat_loc in
+              inputs @ [ state ]
+          | _ ->
+              State.of_result
+                (error body.term_loc
+                   "A loop invariant takes its ghost state, or a fold's accumulator and \
+                    remaining list, optionally followed by its ghost state")
         in
-        (env, terms @ [ term ]))
+        let* env, bindings =
+          State.fold (List.zip_exn patterns values) ~init:(env, [])
+            ~f:(fun (env, bindings) (pattern, (value, ty)) ->
+              let* _ = State.of_result (bind_proof_pattern env pattern ty value) in
+              let+ source = State.fresh "caravan$loop_input" in
+              let id = S.mk_id ~loc:pattern.pat_loc source in
+              let variable = S.mk_term (Tvar (Qid id)) pattern.pat_loc in
+              let env =
+                {
+                  (bind env source (Value value)) with
+                  var_types = (source, ty) :: env.var_types;
+                }
+              in
+              (env, bindings @ [ (pattern, variable) ]))
+        in
+        let term =
+          List.fold_right bindings ~init:body ~f:(fun (pattern, value) body ->
+              S.mk_term (Tlet (pattern, value, body)) body.term_loc)
+        in
+        State.return (env, terms @ [ term ]))
   in
   let* terms =
     State.of_result (loop_outline_terms annotation (spec.invariants @ state_invariants))

@@ -165,6 +165,10 @@ let eligible ~inventory ?(definition = false) (source : Module_inventory.special
               | Ok (Some Spawn), Texp_function _ ->
                   function_roots := callback :: !function_roots
               | _ -> ())
+          | Texp_apply (_, [ (_, Typedtree.Arg callback); _; _ ])
+            when Option.is_some (Translate_context.inline_list_fold_left_body expression)
+            ->
+              function_roots := callback :: !function_roots
           | _ -> ());
           if heap_type ~env:expression.exp_env expression.exp_type then
             heap_access := true;

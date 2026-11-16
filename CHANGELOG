@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- One-shot `Ghost.Prophecy` predictions support linearizability proofs with future-dependent linearization points.
+- Standard-library `ignore` evaluates its argument while discarding its result.
+- Executable contracts support explicit invariant masks with `opens {…}`, using the same syntax as proof lemmas.
+- Access helpers can declare checked physical atomicity with `[@atomic]` contracts, including through imports and functors.
 - `--only` verifies a source member or module together with its local helpers and companion proof obligations.
 - Fully supplied labelled and optional arguments, including effectful defaults, work across functions, imports, aliases, and functors.
 - Constructor-set GADTs support polymorphic payloads, mutable inline records, and unboxed wrappers.
@@ -13,9 +17,10 @@ All notable changes to this project will be documented in this file.
 - Native mutex and condition proofs support polymorphic protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.
 - Proof-defined modules support type aliases, including nonrecursive aliases, and parameterized manifest carrier constraints.
 - Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
-- Proof outlines support loop invariants, OCaml closure and record anchors, and ghost return adapters.
+- Proof outlines support loop invariants, OCaml closure and record anchors, occurrence selectors, and ghost return adapters.
 - The OCaml 5 tutorial blocking stack verifies with polymorphic LIFO contracts and Domain handoff clients.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.
+- Inline `List.fold_left` callbacks support loop invariants, effects, exceptions, and ghost-state proof scopes.
 
 ### Changed
 

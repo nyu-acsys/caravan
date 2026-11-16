@@ -1518,6 +1518,7 @@ let prepare_proc ~given ~past_structures ~proc_name (f : func) =
     }
   in
   let open State.Syntax in
+  let* () = State.of_result (Callable_contract.validate f.contract) in
   let* () =
     State.of_result
       (if
@@ -1749,6 +1750,16 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
          ghosts;
        } =
     prepare_proc ~given ~past_structures ~proc_name f
+  in
+  let* () =
+    if Callable_contract.physically_atomic f.contract && not f.trusted then
+      Physical_atomic.check ctx
+        ~patterns:
+          (List.map f.params ~f:(fun parameter ->
+               match parameter.Typedtree.fp_kind with
+               | Tparam_pat pattern | Tparam_optional_default (pattern, _) -> pattern))
+        f.body
+    else State.return ()
   in
   let l = loc f.loc in
   let* () =
@@ -2163,7 +2174,7 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
                       "The local attribute is supported only on trusted imports"
                   else Ok ()))))
   in
-  let* opens =
+  let* attribute_opens =
     State.of_result
       (Result.map
          (Result.all
@@ -2173,6 +2184,8 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
          ~f:(fun clauses ->
            Option.map (List.find_map clauses ~f:Fn.id) ~f:(fun at -> (loc at, []))))
   in
+  let* explicit_opens = contract_opens env f.contract in
+  let* opens = State.of_result (merge_opens ~at:f.loc explicit_opens attribute_opens) in
   if f.trusted then begin
     (* Its contract, assumed: the body is not translated. *)
     let* () =
@@ -2187,7 +2200,9 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
           })
     in
     State.return
-      (R.Callable.proc ~loc:l ?opens ~formals:all_formals
+      (R.Callable.proc ~loc:l
+         ~atomic:(Callable_contract.physically_atomic f.contract)
+         ?opens ~formals:all_formals
          ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
          ~requires ~ensures
          (ident ~loc:l (Option.value declaration_name ~default:proc_name))
@@ -2353,7 +2368,9 @@ let proc ~given ~past_structures ~proc_name ~pure ?declaration_name ?pure_name (
       no_outcome @ bind_au @ bound @ first @ stmts @ assignment @ establish @ last
       @ history_returns
     in
-    R.Callable.proc ~loc:l ?opens ~formals:all_formals
+    R.Callable.proc ~loc:l
+      ~atomic:(Callable_contract.physically_atomic f.contract)
+      ?opens ~formals:all_formals
       ~returns:(returns @ ghost_return_vars @ past_returns @ outcome_returns)
       ~requires ~ensures
       (ident ~loc:l (Option.value declaration_name ~default:proc_name))
@@ -2487,7 +2504,12 @@ let inherit_contracts (funcs : func list) =
           in
           let header =
             {
-              S.hd_name = S.mk_id ~loc:f.loc (Ident.name f.id);
+              S.hd_name =
+                S.mk_id ~loc:f.loc
+                  ~attrs:
+                    (Option.value_map contract.header ~default:[] ~f:(fun h ->
+                         h.hd_name.pid_attrs))
+                  (Ident.name f.id);
               hd_ret =
                 Option.value_map contract.header ~default:[ S.Lwild ] ~f:(fun h ->
                     h.hd_ret);

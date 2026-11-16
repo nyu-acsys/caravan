@@ -7,3 +7,10 @@ lemma mathematical_extension (ignored : unit)
   ensures (
     Stdlib_model.List.reverse (Stdlib_model.List.reverse [max_int + 1])
       === [max_int + 1]) = ()
+
+
+lemma appended_members (values : integer list) (value : integer)
+  ensures (List.length (values @ [value]) = List.length values + 1)
+  ensures (List.mem value (values @ [value]))
+  ensures (forall item : integer. List.mem item values -> List.mem item (values @ [value])) =
+  Stdlib_model.List.append_singleton values value

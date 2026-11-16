@@ -5,6 +5,8 @@ open Base
 open Caravan_spec
 
 type outline = {
+  target : Location.t option;
+      (** The source expression explicitly selected by an outline scope. *)
   export : (string * Spec_ast.pat) option;
       (** The key under which the step keeps the value it exports, and its pattern. *)
   imports : (string * Spec_ast.pat) list;
@@ -156,9 +158,13 @@ let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =
     by its clauses. The lexer and the parser report errors by raising. *)
 let contract (annotation : t) : (Spec_ast.contract, Report.error) Result.t =
   let lexbuf = lexbuf annotation in
-  try Ok (Spec_parser.contract Spec_lexer.token lexbuf) with
+  try
+    let contract = Spec_parser.contract Spec_lexer.token lexbuf in
+    Result.map (Callable_contract.validate (Some contract)) ~f:(fun () -> contract)
+  with
   | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
   | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+  | Spec_ast.Syntax_error (loc, message) -> Error (Report.error Syntax loc message)
 
 (** The unique contract following a declaration in its lexical scope. *)
 let contract_after ?scope ~item_loc ~next annotations =

@@ -7,7 +7,7 @@ The bundled mathematical model and its algebra are checked independently.
   $ grep -c 'reverse_involution' list.fingerprints
   1
   $ grep -c 'caravan_stdlib_list_' list.fingerprints
-  5
+  7
 
 Clients use the checked algebra without checking the library's proofs again.
 The mathematical model also applies outside OCaml's machine-integer domain.

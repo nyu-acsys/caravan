@@ -49,6 +49,14 @@
     | (_, at) :: _ ->
         raise (Syntax_error (at, "Ghost parameters cannot have ordinary contract binder attributes"))
 
+  let callable_name x attributes =
+    List.fold_left (fun x (attribute, at) ->
+      if attribute <> "atomic" then
+        raise (Syntax_error (at, "Only [@atomic] is supported on contract names"));
+      if List.mem "atomic" x.pid_attrs then
+        raise (Syntax_error (at, "Duplicate [@atomic] contract name attribute"));
+      add_attr x "atomic") x attributes
+
   let raw_arguments = List.exists (function
     | Lvar id -> List.mem "raw" id.pid_attrs
     | Lunit _ | Lwild | Lghost _ -> false)
@@ -155,6 +163,10 @@
     | `Raises (p, post) -> { c with raises = (p, post) :: c.raises }
     | `Atomic_raises (p, post) -> { c with atomic_raises = (p, post) :: c.atomic_raises }
     | `Variant -> { c with variant = t :: c.variant }
+    | `Opens (at, entries) ->
+        if c.opens <> None then
+          raise (Syntax_error (at, "A contract has at most one opens clause"));
+        { c with opens = Some (at, entries) }
     | `Pure -> { c with pure = true }
     | `Continues f -> { c with continues = Some f }
 
@@ -374,11 +386,11 @@ outline(steps):
 | PROOF n = outline_binder ps = fun_arg* cs = outline_clause* EQUAL b = outline_body(steps)
     { let params = outline_parameters in
       let header_end = match cs with
-        | [] -> if raw_arguments ps then Some $endpos(ps) else None
+        | [] -> if raw_arguments ps || List.mem "atomic" n.pid_attrs then Some $endpos(ps) else None
         | _ -> Some $endpos(cs) in
       match b with
       | `Steps ss ->
-          if n.pid_attrs <> [] then
+          if n.pid_attrs <> [] && not (List.mem "atomic" n.pid_attrs) then
             raise (Syntax_error (n.pid_loc, "An attributed result binder is followed by = and the call"));
           { outline_name = n; outline_params = params ps;
             outline_contract =
@@ -403,10 +415,18 @@ outline_body(steps):
     { `Contract (f, fs,
         (match cs with [] -> if raw_arguments fs then Some $endpos(fs) else None
          | _ -> Some $endpos(cs)), $endpos(fs), ss) }
+| f = lident attributes = binder_attribute+ fs = fun_arg* cs = outline_clause* EQUAL ss = steps
+    { let f = callable_name f attributes in
+      `Contract (f, fs,
+        Some (match cs with [] -> $endpos(fs) | _ -> $endpos(cs)), $endpos(fs), ss) }
 | ATOMIC f = lident fs = fun_arg* cs = outline_clause* EQUAL ss = steps
     { `Contract (f, fs,
         (match cs with [] -> if raw_arguments fs then Some $endpos(fs) else None
          | _ -> Some $endpos(cs)), $endpos(fs), ss) }
+| ATOMIC f = lident attributes = binder_attribute+ fs = fun_arg* cs = outline_clause* EQUAL ss = steps
+    { let f = callable_name f attributes in
+      `Contract (f, fs,
+        Some (match cs with [] -> $endpos(fs) | _ -> $endpos(cs)), $endpos(fs), ss) }
 ;
 
 (* A clause of an outline's contract, parenthesized as a lemma's. *)
@@ -419,6 +439,7 @@ outline_clause:
 | RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
 | RAISES mpat_app {}
 | ATOMIC_RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
+| OPENS LEFTBRC loption(semicolon_list1(mask_entry)) RIGHTBRC {}
 ;
 
 (* Steps in program order. [let p = at (a) (fun step -> e) in ...] exports the value that
@@ -503,7 +524,7 @@ anchor_nonident_token:
 step_action:
 | scope_expression { (Wrapped_scope, mk_loc $loc) }
 | INVARIANT term { (Loop, mk_loc $loc) }
-| INVARIANT LEFTPAR FUN pat_arg ARROW term RIGHTPAR
+| INVARIANT LEFTPAR FUN nonempty_list(pat_arg) ARROW term RIGHTPAR
     { (Loop, mk_loc $loc) }
 | COMMIT { (Linearize, mk_loc $loc) }
 | COMMIT term_arg { (Linearize, mk_loc $loc) }
@@ -638,7 +659,7 @@ proof_decl:
     { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty; type_recursive = true } }
 | TYPE NONREC ps = loption(type_parameters) n = lident EQUAL ty = typ
     { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty; type_recursive = false } }
-| INVARIANT n = lident ps = pred_param+ EQUAL t = term
+| INVARIANT n = lident ps = predicate_param+ EQUAL t = term
     { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
                         inv_state = List.hd ps; inv_body = t } }
@@ -931,8 +952,8 @@ ghost_witnesses:
 
 loop_clause:
 | INVARIANT t = term { `Invariant t }
-| INVARIANT LEFTPAR FUN state = pat_arg ARROW t = term RIGHTPAR
-    { `State_invariant (state, t) }
+| INVARIANT LEFTPAR FUN states = nonempty_list(pat_arg) ARROW t = term RIGHTPAR
+    { `State_invariant (states, t) }
 | VARIANT t = term { `Variant t }
 | RAISES p = mpat_app ARROW t = term { `Raises (p, Some t) }
 | RAISES p = mpat_app { `Raises (p, None) }
@@ -947,16 +968,34 @@ clause:
 | RAISES p = mpat_app { `Raises (p, None), mk_term Ttrue $loc }
 | ATOMIC_RAISES p = mpat_app ARROW t = term { `Atomic_raises (p, t), t }
 | VARIANT t = term { `Variant, t }
+| OPENS LEFTBRC ts = loption(semicolon_list1(mask_entry)) RIGHTBRC
+    { `Opens (mk_loc $loc, ts), mk_term Ttrue $loc }
 | PURE { `Pure, mk_term Ttrue $loc }
 | CONTINUES f = lident { `Continues f, mk_term Ttrue $loc }
 ;
 
 header_app:
-| nm=lident_rich args=fun_arg*
-    { nm, args }
-|  arg1=plain_fun_arg nm=op_symbol arg2=plain_fun_arg
+| initial = header_initial args=fun_arg*
+    { let nm, attributes = initial in callable_name nm attributes, args }
+| initial = header_initial nm=op_symbol arg2=plain_fun_arg
+    { let id, attributes = initial in
+      let nm = mk_id ~loc:(mk_loc $loc(nm)) nm in
+      nm, [Lvar (raw_binder id attributes); arg2] }
+| arg1=header_nonvariable_arg nm=op_symbol arg2=plain_fun_arg
     { let nm = mk_id ~loc:(mk_loc $loc(nm)) nm in
         nm, [arg1; arg2] }
+;
+
+header_initial:
+| id = lident attributes = binder_attribute* { id, attributes }
+| id = lident_op_id attributes = binder_attribute* { id, attributes }
+;
+
+header_nonvariable_arg:
+| LEFTPAR RIGHTPAR { Lunit (mk_loc $loc) }
+| LEFTSQ id=lident attributes = binder_attribute* COLON ty=typ RIGHTSQ
+  { Lghost (ghost_binder id attributes, ty) }
+;
 
 header:
 | ret=ret_name EQUAL atomic=boption(ATOMIC) app = header_app
@@ -975,7 +1014,9 @@ binder_attribute:
 ;
 
 outline_binder:
-| id = lident attributes = binder_attribute* { raw_binder id attributes }
+| id = lident attributes = binder_attribute*
+    { if List.exists (fun (attribute, _) -> attribute = "atomic") attributes
+      then callable_name id attributes else raw_binder id attributes }
 | LEFTPAR id = lident attributes = binder_attribute+ RIGHTPAR
     { raw_binder id attributes }
 ;

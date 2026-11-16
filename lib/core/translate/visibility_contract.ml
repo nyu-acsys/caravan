@@ -305,6 +305,36 @@ let members ~loc ~implementation =
         R.Stmt.fold ~loc (local ~loc "visibility_seen") [ owner; current ];
         R.Stmt.fold ~loc (local ~loc "visibility_seen") [ owner; lower ];
       ];
+    lemma "visibility_union"
+      [ reference "owner"; view_parameter "left"; view_parameter "right" ]
+      [ view_parameter "combined" ]
+      [ seen (variable ~loc "left"); seen (variable ~loc "right") ]
+      [
+        seen (variable ~loc "left");
+        seen (variable ~loc "right");
+        seen (variable ~loc "combined");
+        R.Expr.binary ~loc Eq (variable ~loc "combined")
+          (R.Expr.binary ~loc Union (variable ~loc "left") (variable ~loc "right"));
+      ]
+      [
+        R.Stmt.call ~loc
+          (R.Expr.call ~loc
+             (local ~loc "visibility_duplicate")
+             [ owner; variable ~loc "left" ]);
+        R.Stmt.call ~loc
+          (R.Expr.call ~loc
+             (local ~loc "visibility_duplicate")
+             [ owner; variable ~loc "right" ]);
+        R.Stmt.unfold ~loc (local ~loc "visibility_seen") [ owner; variable ~loc "left" ];
+        R.Stmt.unfold ~loc (local ~loc "visibility_seen") [ owner; variable ~loc "right" ];
+        R.Stmt.assign ~loc
+          [ variable ~loc "combined" ]
+          (R.Stmt.expr_rhs
+             (R.Expr.binary ~loc Union (variable ~loc "left") (variable ~loc "right")));
+        R.Stmt.fold ~loc
+          (local ~loc "visibility_seen")
+          [ owner; variable ~loc "combined" ];
+      ];
     lemma "visibility_reconcile"
       [ reference "owner"; view_parameter "lower" ]
       [ view_parameter "current" ]

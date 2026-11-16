@@ -104,6 +104,8 @@ type contract = {
       (** What holds atomically when the function linearizes by raising an exception:
           [atomic raises E -> t]. *)
   variant : term list;
+  opens : (Location.t * term list) option;
+      (** [None] infers the footprint; an explicit empty clause keeps it closed. *)
   pure : bool;
   continues : id option;
       (** The function whose atomic update a local function continues, [continues push]:
@@ -121,13 +123,14 @@ let empty_contract =
     raises = [];
     atomic_raises = [];
     variant = [];
+    opens = None;
     pure = false;
     continues = None;
   }
 
 type loop_spec = {
   invariants : term list;
-  state_invariants : (pat * term) list;
+  state_invariants : (pat list * term) list;
   loop_variant : term list;
   loop_raises : (pat * term option) list;
       (** What holds when the loop stops by raising an exception: [raises E x -> t]. *)

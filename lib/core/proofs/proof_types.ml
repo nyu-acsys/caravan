@@ -16,6 +16,20 @@ let rec function_arguments typ =
       (monotype argument :: arguments, result)
   | _ -> ([], typ)
 
+(** Facade schemes retain source result indices and erase constructor-set indices. *)
+let operation_arguments environment path arguments =
+  let roles =
+    try Some (Indexed_types.compiler_roles (Env.find_type path environment))
+    with Stdlib.Not_found -> None
+  in
+  match roles with
+  | Some roles when List.length roles = List.length arguments ->
+      List.filter_map (List.zip_exn roles arguments) ~f:(fun (role, argument) ->
+          match role with
+          | Indexed_types.Parameter | Value_index -> Some argument
+          | Constructor_index -> None)
+  | Some _ | None -> arguments
+
 let interface_type_declarations = function
   | None -> []
   | Some (interface : interface) ->
@@ -179,19 +193,35 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
     else
       let* () = reserve_module env "Ghost" in
       let* () = reserve_module env "Permission" in
+      let visibility =
+        if
+          Option.exists (find_type_by_name env "set") ~f:(fun (_, declaration) ->
+              declaration.Types.type_arity = 1)
+        then
+          "val merge_views : t -> t set -> t set -> t set\n\
+           val seen : t -> t set -> bool\n\
+           val weaken_view : t -> t set -> t set -> unit\n"
+        else ""
+      in
       let env =
         signature env
           (Parse.interface
              (Lexing.from_string
-                "module Ghost : sig\n\
-                 type t\n\
-                 val self : t\n\
-                 val raw : 'a -> 'a option\n\
-                 val handoff : t -> t -> bool\n\
-                 type ('owner, 'value) field\n\
-                 module Mutex : sig\n\
-                 end\n\
-                 end"))
+                ("module Ghost : sig\n\
+                  type t\n\
+                  val self : t\n\
+                  val raw : 'a -> 'a option\n\
+                  val handoff : t -> t -> bool\n" ^ visibility
+               ^ "type ('owner, 'value) field\n\
+                  module Prophecy : sig\n\
+                  type 'a t\n\
+                  val create : unit -> 'a t * 'a\n\
+                  val owns : 'a t -> 'a -> bool\n\
+                  val resolve : 'a t -> 'a -> unit\n\
+                  end\n\
+                  module Mutex : sig\n\
+                  end\n\
+                  end")))
       in
       let ghost_id, ghost_module = Env.find_module_by_name (Lident "Ghost") env in
       let owner = Ctype.newconstr (Path.Pdot (ghost_id, "t")) [] in
@@ -375,7 +405,10 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             let* operation_path, operation_type, args, result =
               resolve_operation env ~at ~kind:"AU" operation
             in
-            let* scheme = Polymorphic_functions.discover ~at operation_type in
+            let* scheme =
+              Polymorphic_functions.discover ~project:(operation_arguments env) ~at
+                operation_type
+            in
             let parameters = scheme.variables in
             let declaration =
               let params =
@@ -461,7 +494,10 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
             let* operation_path, operation_type, args, result =
               resolve_operation env ~at ~kind:"Task" operation
             in
-            let* scheme = Polymorphic_functions.discover ~at operation_type in
+            let* scheme =
+              Polymorphic_functions.discover ~project:(operation_arguments env) ~at
+                operation_type
+            in
             let* domain_path =
               try
                 let domain =

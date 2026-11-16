@@ -1,0 +1,13 @@
+module Native = struct
+  invariant live (cell : int Atomic.t) = own cell 7
+
+  proof result = read cell
+    opens { live cell }
+    requires (live cell)
+    ensures (live cell && result = 7) =
+    at (Atomic.get cell) (fun load ->
+      unfold live cell;
+      let result = load () in
+      fold live cell;
+      result)
+end

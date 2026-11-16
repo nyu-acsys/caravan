@@ -8,6 +8,7 @@ type t = { families : Generic_families.t }
 let contract_terms (contract : S.contract) =
   contract.requires @ contract.ensures @ contract.atomic_requires
   @ contract.atomic_ensures @ contract.variant
+  @ Option.value_map contract.opens ~default:[] ~f:snd
 
 let rec proof_references bound (expression : S.proof_expr) =
   let term = Translate_context.term_references bound in
@@ -111,7 +112,8 @@ let rec runtime_references (expression : Typedtree.expression) =
         (body :: List.map bindings ~f:(fun binding -> binding.Typedtree.vb_expr), [])
     | Texp_apply (callee, arguments) ->
         ( callee
-          :: List.filter_map arguments ~f:(function
+          :: Option.to_list (Translate_context.inline_list_fold_left_body expression)
+          @ List.filter_map arguments ~f:(function
             | _, Typedtree.Arg argument -> Some argument
             | _, Omitted () -> None),
           [] )

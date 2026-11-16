@@ -1,0 +1,24 @@
+invariant shared (cell : int Atomic.t) (value [@implicit] : int) = own cell value
+
+proof result = create value ensures (shared result value) =
+  on return fold shared result value
+
+proof result = read [value : int] cell
+  requires (shared cell value)
+  ensures (shared cell value && result = value) =
+  at (Atomic.get cell) (fun load ->
+    unfold shared cell value;
+    let result = load () in
+    fold shared cell value;
+    result)
+
+proof change cell requires (own cell previous) ensures (own cell 1) = ()
+
+type counter_state = { observed : int }
+invariant captured (cell : int Atomic.t) (fixed [@implicit] : int) (state : counter_state) =
+  own cell state.observed && state.observed = fixed
+
+lemma initialize_captured (cell : int Atomic.t) (value : int)
+  requires (own cell value)
+  ensures (captured cell value) =
+  fold captured cell value

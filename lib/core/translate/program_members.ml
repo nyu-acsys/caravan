@@ -910,11 +910,9 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            in
            let* () =
              State.of_result
-               (Raw_contract.check ~at
+               (Callable_contract.check ~at
                   ~related:[ (actual_at, "The actual operation's contract") ]
-                  ~expected:(Raw_contract.of_contract operation.operation_contract)
-                  ~actual:(Raw_contract.of_contract actual_contract)
-                  ())
+                  ~expected:operation.operation_contract ~actual:actual_contract ())
            in
            let signature_implicit prepared =
              List.filter (List.zip_exn prepared.prepared_implicit prepared.prepared_roles)
@@ -1035,8 +1033,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
            in
            let member =
              if inherit_contract then
-               R.Callable.proc ~loc:(loc at) ~formals:expected.prepared_formals
-                 ~returns:expected.prepared_returns
+               R.Callable.proc ~loc:(loc at) ~atomic:expected.prepared_physical_atomic
+                 ~formals:expected.prepared_formals ~returns:expected.prepared_returns
                  (ident ~loc:(loc at) operation.operation_member)
                  (Some body)
              else

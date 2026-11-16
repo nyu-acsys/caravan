@@ -1211,6 +1211,9 @@ let is_reference_type path arguments =
 (** The opaque reference type used for proof-only storage. *)
 let is_ghost (p : Path.t) = String.equal (Path.name p) "Ghost.t"
 
+(** The proof-only one-shot prophecy handle. *)
+let is_prophecy (p : Path.t) = String.equal (Path.name p) "Ghost.Prophecy.t"
+
 (** The fractional permission type of specifications. *)
 let is_permission (p : Path.t) = String.equal (Path.name p) "Permission.t"
 
@@ -1388,6 +1391,8 @@ let rec type_key types t =
     | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Some Unit_key
     | Tconstr (p, [], _) when is_permission p -> Some Permission_key
     | Tconstr (p, [], _) when is_ghost p -> Some Ref_key
+    | Tconstr (p, [ element ], _) when is_prophecy p ->
+        unary (fun key -> Applied_key ([ "Ghost"; "Prophecy" ], [ key ])) element
     | Tconstr (p, arguments, _) when is_reference_type p arguments -> Some Ref_key
     | Tconstr (p, [ element ], _) when Path.same p Predef.path_list ->
         unary (fun key -> List_key key) element
@@ -1895,6 +1900,9 @@ let rec typ (types : t list) ?self ~(at : Location.t) (t : Types.type_expr) :
   | Tconstr (p, [], _) when Path.same p Predef.path_bool -> Ok (R.Type.bool ~loc:l)
   | Tconstr (p, [], _) when Path.same p Predef.path_unit -> Ok (R.Type.tuple ~loc:l [])
   | Tconstr (p, [], _) when is_ghost p -> Ok (R.Type.ref ~loc:l)
+  | Tconstr (p, [ element ], _) when is_prophecy p ->
+      let* element = typ types ?self ~at element in
+      Ok (R.Prophecy.type_ ~loc:l element)
   | Tconstr (p, [], _) when is_permission p -> Ok (R.Type.real ~loc:l)
   | Tconstr (p, [ elt ], _)
     when Path.same p Predef.path_list || Path.same p Predef.path_option ->
@@ -2114,9 +2122,79 @@ let result_type types typ =
 let result_admissible ~loc types typ value =
   admissible ~loc types (result_type types typ) value
 
+let family_parameters ~loc ~interface (data : t) =
+  List.mapi (runtime_parameters data) ~f:(fun index _ ->
+      ( R.Ident.make ~loc ("A" ^ Int.to_string index),
+        Qualified_name.raven ~loc (Qualified_name.of_string interface) ))
+
+let indexed_dictionary types typ =
+  Option.map
+    (indexed_instance types (expand types typ))
+    ~f:(fun (data, metadata, arguments) ->
+      let allowed =
+        Option.value
+          (Result.ok (Indexed_types.allowed ~result:false metadata arguments))
+          ~default:(List.map data.ctors ~f:(fun ctor -> ctor.raven))
+        |> List.sort ~compare:String.compare
+      in
+      (data, allowed))
+
+let refinement_factory_name data allowed =
+  let family = Qualified_name.of_string (value_family_name data) in
+  let key = framed (family.name :: allowed) in
+  String.concat ~sep:"."
+    (family.path
+    @ [ Fresh_names.for_key ~key:("ValueRefinement$" ^ key) (family.name ^ "$Refined") ])
+
+let refinement_factory (data : t) allowed qualified =
+  let l = loc data.at in
+  let q text = Qualified_name.raven ~loc:l (Qualified_name.of_string text) in
+  let ident text = R.Ident.make ~loc:l text in
+  let parameters = family_parameters ~loc:l ~interface:Prelude.value_interface data in
+  let arguments =
+    List.mapi (runtime_parameters data) ~f:(fun index _ ->
+        R.Type.named ~loc:l (q ("A" ^ Int.to_string index)) [])
+  in
+  let carrier_arguments =
+    List.mapi (runtime_parameters data) ~f:(fun index _ ->
+        R.Type.named ~loc:l (q ("A" ^ Int.to_string index ^ ".Carrier")) [])
+  in
+  let carrier =
+    R.Type.named ~loc:l
+      (q
+         (String.concat ~sep:"."
+            (Option.value data.module_path ~default:[ data.module_name ])))
+      carrier_arguments
+  in
+  let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
+  let call member arguments =
+    R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Payload" ] member) arguments
+  in
+  let tags =
+    Option.value
+      (List.reduce
+         (List.map allowed ~f:(fun constructor ->
+              R.Expr.is_ ~loc:l value (ident constructor)))
+         ~f:(R.Expr.binary ~loc:l Or))
+      ~default:(R.Expr.bool ~loc:l false)
+  in
+  let unrestricted =
+    if List.length allowed = List.length data.ctors then call "unrestricted" []
+    else R.Expr.bool ~loc:l false
+  in
+  let factory = value_family_name data in
+  Prelude.value_dictionary_with_members ~loc:l ~parameters
+    ~name:(Qualified_name.of_string qualified).name ~carrier ~unrestricted
+    ~body:(R.Expr.binary ~loc:l And (call "holds" [ value ]) tags)
+    ~members:
+      [
+        R.Member.instance ~loc:l ~def:(q factory, arguments) (ident "Payload") (q factory);
+      ]
+
 type domain_node =
   | Domain_function of Types.type_expr * string
   | Value_dictionary of Types.type_expr * string option
+  | Refinement_factory of t * string list * string
 
 (** Plans declarations and template requirements with one dependency traversal. *)
 let domain_nodes ?(dictionaries = false) types requested =
@@ -2153,6 +2231,16 @@ let domain_nodes ?(dictionaries = false) types requested =
     | None, Some name when Set.mem seen name -> (seen, nodes)
     | None, Some name ->
         let seen = Set.add seen name in
+        let seen, nodes =
+          match indexed_dictionary types t with
+          | Some (data, allowed) ->
+              let factory = refinement_factory_name data allowed in
+              if Set.mem seen factory then (seen, nodes)
+              else
+                ( Set.add seen factory,
+                  Refinement_factory (data, allowed, factory) :: nodes )
+          | None -> (seen, nodes)
+        in
         if String.equal name Prelude.value_int then
           (seen, Value_dictionary (t, Some name) :: nodes)
         else if container types t then
@@ -2184,7 +2272,20 @@ let family_domain_dependencies ?(dictionaries = false) types requested =
     | Value_dictionary (typ, Some name) ->
         Some
           (dictionary_declaration_name types typ name, family_dependencies types [ typ ])
-    | Value_dictionary (_, None) -> None)
+    | Value_dictionary (_, None) | Refinement_factory _ -> None)
+
+let refinement_dependencies types requested =
+  List.filter_map (domain_nodes ~dictionaries:true types requested) ~f:(function
+    | Refinement_factory (data, _, name) -> Some (name, [ value_family_name data ])
+    | Value_dictionary (typ, Some name) ->
+        Option.map (indexed_dictionary types typ) ~f:(fun (data, allowed) ->
+            (name, [ refinement_factory_name data allowed ]))
+    | Domain_function _ | Value_dictionary (_, None) -> None)
+
+let requested_refinements types requested =
+  List.filter_map (domain_nodes ~dictionaries:true types requested) ~f:(function
+    | Refinement_factory (data, allowed, _) -> Some (data, allowed)
+    | Domain_function _ | Value_dictionary _ -> None)
 
 (** The monomorphic domain functions needed by the requested carriers. Mathematical
     collections and abstract library carriers retain their own logical contracts. *)
@@ -2268,41 +2369,13 @@ let domain_members ?(dictionaries = false) types requested =
       | _ -> Ok (None, [])
     in
     let name = Qualified_name.of_string qualified in
-    match indexed_instance types (expand types t) with
-    | Some (data, metadata, source_arguments) ->
-        let* carrier = typ types ~at:data.at t in
-        let factory = value_family_name data in
-        let allowed =
-          Option.value
-            (Result.ok (Indexed_types.allowed ~result:false metadata source_arguments))
-            ~default:(List.map data.ctors ~f:(fun ctor -> ctor.raven))
-        in
-        let value = R.Expr.var ~loc:l (R.Name.make ~loc:l "value") in
-        let call member arguments =
-          R.Expr.call ~loc:l (R.Name.make ~loc:l ~path:[ "Payload" ] member) arguments
-        in
-        let tags =
-          Option.value
-            (List.reduce
-               (List.map allowed ~f:(fun constructor ->
-                    R.Expr.is_ ~loc:l value (ident constructor)))
-               ~f:(R.Expr.binary ~loc:l Or))
-            ~default:(R.Expr.bool ~loc:l false)
-        in
-        let unrestricted =
-          if List.length allowed = List.length data.ctors then call "unrestricted" []
-          else R.Expr.bool ~loc:l false
-        in
+    match indexed_dictionary types t with
+    | Some (data, allowed) ->
+        let factory = refinement_factory_name data allowed in
         Ok
-          (Prelude.value_dictionary_with_members ~loc:l ~parameters:[] ~name:name.name
-             ~carrier ~unrestricted
-             ~body:(R.Expr.binary ~loc:l And (call "holds" [ value ]) tags)
-             ~members:
-               [
-                 R.Member.instance ~loc:l
-                   ~def:(q factory, arguments)
-                   (ident "Payload") (q factory);
-               ])
+          (R.Member.instance ~loc:l
+             ~def:(q factory, arguments)
+             (ident name.name) (q factory))
     | None -> (
         match factory with
         | Some factory ->
@@ -2333,6 +2406,8 @@ let domain_members ?(dictionaries = false) types requested =
   let* members =
     Result.all
       (List.map (domain_nodes ~dictionaries types requested) ~f:(function
+        | Refinement_factory (data, allowed, name) ->
+            Ok (Some (name, refinement_factory data allowed name))
         | Value_dictionary (_, None) ->
             Report.unsupported Location.none "This source value dictionary"
         | Value_dictionary (_, Some name) when String.equal name Prelude.value_int ->
@@ -2357,7 +2432,7 @@ type value_template =
 
 let value_templates ?(dictionaries = false) types requested =
   List.filter_map (domain_nodes ~dictionaries types requested) ~f:(function
-    | Domain_function _ | Value_dictionary (_, None) -> None
+    | Domain_function _ | Value_dictionary (_, None) | Refinement_factory _ -> None
     | Value_dictionary (t, Some _) -> (
         if is_int types t then Some Int_dictionary
         else
@@ -2469,11 +2544,6 @@ let fields ?declarations (types : t list) : (R.Member.t list, Report.error) Resu
   Result.all
     (List.concat_map (Option.value declarations ~default:types) ~f:(fun data ->
          List.map (all_fields data) ~f:(record_field_member types ~at:data.at)))
-
-let family_parameters ~loc ~interface (data : t) =
-  List.mapi (runtime_parameters data) ~f:(fun index _ ->
-      ( R.Ident.make ~loc ("A" ^ Int.to_string index),
-        Qualified_name.raven ~loc (Qualified_name.of_string interface) ))
 
 (** Canonical dictionaries for source datatypes and imported abstract families. *)
 let value_family_members types (data : t) =

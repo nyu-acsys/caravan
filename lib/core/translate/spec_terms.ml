@@ -190,7 +190,7 @@ let rec term_type env (t : S.term) =
       List.Assoc.find env.var_types x ~equal:String.equal
   | _, ({ term_desc = Tvar (Qid { pid_str = "drop" | "take"; _ }); _ }, [ _; s ]) ->
       term_type env s
-  | _, ({ term_desc = Tvar (Qid { pid_str = "++"; _ }); _ }, [ a; b ]) ->
+  | _, ({ term_desc = Tvar (Qid { pid_str = "++" | "@"; _ }); _ }, [ a; b ]) ->
       Option.first_some (term_type env a) (term_type env b)
   | Trecord (Some base, _), _ -> term_type env base
   | Trecord (None, _), _ ->
@@ -1356,6 +1356,17 @@ and expected_formula env (expected : Types.type_expr option) (t : S.term) =
     | _ -> false
   in
   match (expected, literal t) with
+  | Some expected, _ when match t.term_desc with Ttuple _ -> true | _ -> false ->
+      begin match (t.term_desc, Datatypes.desc env.data expected) with
+      | Ttuple values, Ttuple types when List.length values = List.length types ->
+          let* values =
+            State.all (List.zip_exn values types) ~f:(fun (value, (_, typ)) ->
+                expected_formula env (Some typ) value)
+          in
+          let+ typ = State.typ env.ctx ~at:t.term_loc expected in
+          R.Expr.annotated (R.Expr.tuple ~loc:(loc t.term_loc) values) typ
+      | _ -> formula env t
+      end
   | Some _, _
     when match t.term_desc with
          | Tfield ({ term_desc = Trecord _; _ }, Qid _) -> true
@@ -1467,6 +1478,19 @@ and application env (t : S.term) =
   | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result
         (error head.term_loc "A local proof value cannot be called as a logical function")
+  | _, [ prophecy; value ]
+    when Option.equal String.equal (prophecy_operation t) (Some "owns") ->
+      let* () =
+        State.of_result
+          (Source.check_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
+             ~expected:Predef.type_bool t)
+      in
+      let* prophecy = formula env prophecy in
+      let+ value = formula env value in
+      R.Prophecy.owns ~loc:l prophecy value
   | Tvar (Qdot (Qid ghost, method_)), [ argument ]
     when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "raw" ->
       let* value =
@@ -1489,6 +1513,20 @@ and application env (t : S.term) =
           in
           State.raw_inject env.ctx.given ~at ~elt:payload value
       end
+  | Tvar (Qdot (Qid ghost, method_)), [ owner; lower ]
+    when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "seen" ->
+      let* () =
+        State.of_result
+          (Source.check_logical_expression
+             ~type_variables:(source_type_variables env.ctx.given)
+             env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
+             ~expected:Predef.type_bool t)
+      in
+      let* owner = formula env owner in
+      let+ lower = formula env lower in
+      Visibility_contract.seen ~loc:l ~module_name:Execution_contract.module_name owner
+        lower
   | Tvar (Qdot (Qid ghost, method_)), [ source; target ]
     when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "handoff" ->
       let* typ = State.of_result (Source.ghost_type env.ctx.given.env ~at) in

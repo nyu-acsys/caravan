@@ -1,0 +1,17 @@
+proof result = identity value ensures (result === value) = ()
+
+proof result = selected value token
+  requires (match value with None -> true | Some supplied -> 0 <= supplied && supplied <= 100)
+  ensures (result = (match value with None -> 8 | Some supplied -> supplied + 1)) =
+  let chosen = at (let selected = identity (value + 1)) (fun step ->
+    let result = step () in (result, result)) in
+  on return assert (result === chosen)
+
+proof result = pattern value pair
+  requires (pair === (2, 1) && (match value with None -> true | Some supplied -> supplied = 7))
+  ensures (result = 8) =
+  let chosen = at (let selected = identity (value + first)) (fun step ->
+    let result = step () in (result, result)) in
+  on return assert (result = chosen - 1)
+
+proof result = clients () ensures (result === (8, 10, 8)) = ()

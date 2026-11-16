@@ -1247,11 +1247,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                     (Option.to_list own @ List.filter_opt previous)
                     ~init:()
                     ~f:(fun () (actual, annotation) ->
-                      Raw_contract.check ~at
+                      Callable_contract.check ~at
                         ~related:[ (annotation.loc, "Its other contract") ]
-                        ~expected:(Raw_contract.of_contract (Option.map expected ~f:fst))
-                        ~actual:(Raw_contract.of_contract (Some actual))
-                        ())
+                        ~expected:(Option.map expected ~f:fst) ~actual:(Some actual) ())
                 in
                 let declarations =
                   List.map signature.signature_ghost_modules ~f:(fun (_, ghost) ->

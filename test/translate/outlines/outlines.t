@@ -13,6 +13,14 @@ every path to it; the earlier steps' state is not threaded through scopes.
   $ caravan --shh exports.ml
   Verification successful.
 
+Explicit outline scopes select the nested operand even when the enclosing operator
+or checked call ends at the same position. Inline scopes retain comment attachment.
+
+  $ caravan --shh nested_operands.ml
+  Verification successful.
+  $ caravan --shh nested_operand_comments.ml
+  Verification successful.
+
   $ caravan --shh conditional_export.ml
   [Error] File "conditional_export.proof", line 11, column 28 to line 16, column 11:
   11 |   at (let b = Atomic.get c) (fun step ->

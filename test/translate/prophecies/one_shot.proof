@@ -1,0 +1,34 @@
+predicate prediction (prophecy : bool Ghost.Prophecy.t) (value : bool) =
+  Ghost.Prophecy.owns prophecy value
+
+lemma allocate (token : unit) returns (prophecy : bool Ghost.Prophecy.t) (value : bool)
+  ensures (prediction prophecy value) =
+  let (prophecy : bool Ghost.Prophecy.t), (value : bool) = Ghost.Prophecy.create () in
+  fold prediction prophecy value;
+  (prophecy, value)
+
+lemma resolve (prophecy : bool Ghost.Prophecy.t) (predicted : bool) (actual : bool)
+  requires (prediction prophecy predicted)
+  ensures (predicted = actual) =
+  unfold prediction prophecy predicted;
+  Ghost.Prophecy.resolve prophecy actual
+
+proof result = observe cell
+  requires (own cell true)
+  ensures (own cell true && result) =
+  let (prophecy : bool Ghost.Prophecy.t), (predicted : bool) = Ghost.Prophecy.create () in
+  at (Atomic.get cell) (fun read ->
+    let result = read () in
+    Ghost.Prophecy.resolve prophecy result;
+    assert (predicted = result);
+    result)
+
+lemma roundtrip (actual : bool) =
+  let (prophecy, predicted) = allocate () in
+  resolve prophecy predicted actual;
+  assert (predicted = actual)
+
+lemma resolve_generic (prophecy : 'a Ghost.Prophecy.t) (predicted : 'a) (actual : 'a)
+  requires (Ghost.Prophecy.owns prophecy predicted)
+  ensures (predicted === actual) =
+  Ghost.Prophecy.resolve prophecy actual

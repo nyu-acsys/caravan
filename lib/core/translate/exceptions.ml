@@ -362,6 +362,11 @@ let uses ~key ?witness ?(application_raises = fun _ -> None) (body : Typedtree.e
         :: List.concat_map split ~f:(fun ((value, _), rhs) ->
             if Option.is_some value then sub rhs else [])
     | (Texp_while _ | Texp_for _), None -> children (scan caught (loops + 1)) e
+    | Texp_apply _, None
+      when Option.is_some (Translate_context.inline_list_fold_left_body e) ->
+        children sub e
+        @ scan caught (loops + 1)
+            (Option.value_exn (Translate_context.inline_list_fold_left_body e))
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args), None ->
         let witness_argument =
           List.find_map args ~f:(fun (_, arg) ->

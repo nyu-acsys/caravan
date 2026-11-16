@@ -270,6 +270,7 @@ module State_monad = struct
     cleared_bindings : Ident.t list;
     raw_values : (R.Expr.t * R.Expr.t) list;
         (** Speculative projections and their immutable option carriers. *)
+    raw_joins : Set.M(String).t;  (** Targets with a speculative source arm. *)
     fields_of : (string * (string * R.Expr.t)) list;
     formals : R.Expr.t list;
     facts : R.Spec.t list;
@@ -485,6 +486,7 @@ module State_monad = struct
       return_covered = false;
       cleared_bindings = [];
       raw_values = [];
+      raw_joins = Set.empty (module String);
       fields_of = [];
       formals = [];
       facts = [];
@@ -673,6 +675,8 @@ type procedure_signature = {
   procedure_result : Types.type_expr;
   procedure_returns_value : bool;
   procedure_raw : Raw_contract.t;
+  procedure_physical_atomic : bool;
+  procedure_pure : bool;
 }
 
 let map_procedure_types signature ~f =
@@ -2173,6 +2177,25 @@ let stdlib_name (p : Path.t) =
       Some x
   | _ -> None
 
+let stdlib_list_fold_left = function
+  | Path.Pdot (Pident owner, "fold_left") ->
+      Ident.persistent owner && String.equal (Ident.name owner) "Stdlib__List"
+  | Pdot (Pdot (Pident owner, "List"), "fold_left") ->
+      Ident.persistent owner && String.equal (Ident.name owner) "Stdlib"
+  | _ -> false
+
+let inline_list_fold_left_body (expression : Typedtree.expression) =
+  match expression.exp_desc with
+  | Texp_apply
+      ( { exp_desc = Texp_ident (path, _, _); _ },
+        [ (_, Arg { exp_desc = Texp_function (_, Tfunction_body body); _ }); _; _ ] )
+    when Option.exists
+           (Result.ok
+              (Source.normalize_value_path expression.exp_env ~at:expression.exp_loc path))
+           ~f:stdlib_list_fold_left ->
+      Some body
+  | _ -> None
+
 (** The standard unit-word clearing cast, without accepting arbitrary casts. *)
 let unit_clear_cast path (declaration : Types.value_description) =
   let standard =
@@ -2709,6 +2732,13 @@ let ghost_operation t =
   match spine t [] with
   | { S.term_desc = Tvar (Qdot (Qid m, op)); _ }, _ when String.equal m.pid_str "Ghost" ->
       Some op.pid_str
+  | _ -> None
+
+let prophecy_operation t =
+  match spine t [] with
+  | { S.term_desc = Tvar (Qdot (Qdot (Qid root, module_), method_)); _ }, _
+    when String.equal root.pid_str "Ghost" && String.equal module_.pid_str "Prophecy" ->
+      Some method_.pid_str
   | _ -> None
 
 let is_ghost_fpu t = Option.equal String.equal (ghost_operation t) (Some "fpu")

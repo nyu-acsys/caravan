@@ -1,0 +1,15 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.frozen end)
+module Cache = Ghost.Relaxed (struct let field (cell : cell) = cell.relaxed end)
+
+proof result = read [@atomic] cell
+  requires (own ~writer:Ghost.self cell.frozen value)
+  ensures (own ~writer:Ghost.self cell.frozen value && result = value) = ()
+
+proof write [@atomic] cell value
+  requires (own ~writer:Ghost.self cell.frozen previous)
+  ensures (own ~writer:Ghost.self cell.frozen value) = ()
+
+proof result = relaxed_read [@atomic] [current : int] [writes : (Ghost.t * int) set] cell
+  requires (Cache.private_state Ghost.self cell current writes)
+  ensures (Cache.private_state Ghost.self cell current writes &&
+    exists event : Ghost.t. Cache.observed cell event result && Set.mem (event, result) writes) = ()

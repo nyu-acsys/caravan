@@ -65,7 +65,13 @@ let exercise_body =
       R.Stmt.assert_ ~loc (R.Spec.make (binary Subseteq (var "previous") (var "current")));
     ]
   @ result "acquired" (call "visibility_reconcile" [ owner; singleton cut ])
+  @ result "combined" (call "visibility_union" [ owner; var "current"; var "acquired" ])
   @ [
+      R.Stmt.assert_ ~loc (R.Spec.make (binary Subseteq (var "current") (var "combined")));
+      R.Stmt.assert_ ~loc
+        (R.Spec.make (binary Subseteq (var "acquired") (var "combined")));
+      R.Stmt.call ~loc (call "visibility_duplicate" [ owner; var "current" ]);
+      R.Stmt.call ~loc (call "visibility_duplicate" [ owner; var "acquired" ]);
       R.Stmt.assert_ ~loc (R.Spec.make (binary In cut (var "acquired")));
       R.Stmt.call ~loc (call "visibility_duplicate" [ owner; singleton cut ]);
     ]
@@ -109,6 +115,7 @@ type probe =
   | Duplicate_context
   | Foreign_context
   | Retarget_seen
+  | Unseen_union
   | Private_advance
   | Private_acquire
   | Private_acquire_release
@@ -172,6 +179,23 @@ let member = function
              ]
            ~ensures:[ R.Spec.make (external_seen (var "other") (singleton cut)) ]
            (ident "retarget_seen") (Some []))
+  | Unseen_union ->
+      R.Member.callable
+        (R.Callable.proc ~loc ~kind:Lemma
+           ~formals:[ reference "owner"; reference "cut" ]
+           ~requires:
+             [
+               R.Spec.make (external_context owner);
+               R.Spec.make (external_seen owner (V.empty_view ~loc));
+             ]
+           (ident "unseen_union")
+           (Some
+              (R.Stmt.local ~loc ~ghost:true ~typ:(V.view_type ~loc)
+                 ~init:
+                   (R.Stmt.expr_rhs
+                      (V.call ~loc ~module_name:"Execution" "visibility_union"
+                         [ owner; V.empty_view ~loc; singleton cut ]))
+                 (ident "fabricated"))))
   | Private_advance ->
       R.Member.callable
         (R.Callable.proc ~loc ~kind:Lemma
@@ -217,6 +241,7 @@ let check probe expected =
     | Duplicate_context -> Some "duplicate_context"
     | Foreign_context -> Some "foreign_context"
     | Retarget_seen -> Some "retarget_seen"
+    | Unseen_union -> Some "unseen_union"
     | Private_advance -> Some "private_advance"
     | Private_acquire | Private_acquire_release -> Some "private_acquisition"
   in
@@ -296,6 +321,7 @@ let () =
   check Duplicate_context (Some (`Code R.Diagnostic.Postcondition));
   check Foreign_context (Some (`Code R.Diagnostic.Precondition));
   check Retarget_seen (Some (`Code R.Diagnostic.Postcondition));
+  check Unseen_union (Some (`Code R.Diagnostic.Precondition));
   check Private_advance (Some `Private);
   check Private_acquire (Some `Private);
   check Private_acquire_release (Some `Private)

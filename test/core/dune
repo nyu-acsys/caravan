@@ -82,6 +82,7 @@
  (modules source_parity)
  (libraries base stdio compiler-libs.common)
  (deps
+  ../saturn/bounded_queue/bounded_queue.ml
   ../moonpool/parker/parker_.ml
   ../ocaml5_tutorial/blocking_stack/blocking_stack.ml
   ../saturn/michael_scott_queue/michael_scott_queue.ml

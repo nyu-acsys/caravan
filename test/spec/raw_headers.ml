@@ -66,6 +66,31 @@ let () =
   | { hd_args = [ Lvar left; Lvar right ]; _ } -> assert (not (raw left || raw right))
   | _ -> assert false
   end;
+  List.iter
+    (fun (source, atomic) ->
+      match (extracted_contract source).header with
+      | Some
+          { hd_name; hd_args = [ Lvar value; Lvar capacity; Lvar counter; Lvar next ]; _ }
+        ->
+          assert (List.mem "atomic" hd_name.pid_attrs = atomic);
+          assert (raw value && not (raw capacity || raw counter || raw next))
+      | _ -> assert false)
+    [
+      ("proof result = make_node (value [@raw]) capacity counter next = ()", false);
+      ( "proof result = make_node (value [@raw]) capacity counter next ensures (true) = ()",
+        false );
+      ( "proof result = make_node [@atomic] (value [@raw]) capacity counter next = ()",
+        true );
+      ( "proof result = make_node [@atomic] (value [@raw]) capacity counter next ensures \
+         (true) = ()",
+        true );
+    ];
+  List.iter
+    (fun source ->
+      match (extracted_contract source).header with
+      | Some { hd_name; _ } -> assert (List.mem "atomic" hd_name.pid_attrs)
+      | None -> assert false)
+    [ "proof result = read [@atomic] cell = ()"; "proof touch [@atomic] () = ()" ];
   List.iter (reject contract)
     [
       "result = forward (value [@raw] [@raw])";
