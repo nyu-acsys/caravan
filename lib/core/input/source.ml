@@ -285,6 +285,8 @@ let parse_proof ~file text : (S.proof_file, Report.error) Result.t =
       Error (Report.error Syntax loc message)
   | Caravan_spec.Spec_parser.Error ->
       Error (Report.error Syntax (lexeme_loc ()) "Syntax error")
+  | Caravan_spec.Spec_ast.Syntax_error (loc, message) ->
+      Error (Report.error Syntax loc message)
 
 let load_proof file = parse_proof ~file (Stdio.In_channel.read_all file)
 

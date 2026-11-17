@@ -176,6 +176,29 @@ operations available only in specifications and proofs:
 to a mathematical sequence while preserving order and length. Logical collections
 also include `'a set` and `('k, 'v) map`; use `integer` for unbounded indices.
 
+A list whose elements each own separate resources is described by a list segment
+over an element predicate. The predicate takes the element's position, as an
+`integer`, the element, and the list after it, then any parameters of its own:
+
+```proof
+<!--@include: ../examples/proof_syntax.proof{45,48}-->
+```
+
+`list_segment counters over counter_at` declares `counters_seg cells position`,
+which holds `counter_at` for each element of `cells`, numbered from `position`, and
+`counters_hole cells position index`, the same without the element at `index`.
+`counters_located cells position index cell` says that `cell` is that element, and
+`counters_suffix cells position index` is the list after it. The lemmas
+`counters_expose` and `counters_restore` take the element's predicate out of the
+segment and put it back:
+
+```proof
+<!--@include: ../examples/proof_syntax.proof{50,56}-->
+```
+
+The element predicate's own parameters follow the position in the segment
+predicates, and precede the index in the lemmas.
+
 More elaborate proofs can use resource-algebra modules, ghost fields, and
 frame-preserving updates. The
 [Raven tutorial](https://nyu-acsys.github.io/raven/tutorial/) explains those proof

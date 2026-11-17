@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - The OCaml 5 tutorial blocking stack verifies with polymorphic LIFO contracts and Domain handoff clients.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.
 - Inline `List.fold_left` callbacks support loop invariants, effects, exceptions, and ghost-state proof scopes.
+- `list_segment s over p` declares a list predicate iterating `p`, with lemmas that take one element out and put it back.
 
 ### Changed
 

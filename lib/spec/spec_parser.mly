@@ -85,9 +85,26 @@
     | Tapply (f, { term_desc = Trecord (None, fields); _ }) -> (f, fields)
     | _ -> (t, [])
 
+  (* A list segment over a predicate declared before it stands for its declarations. *)
   let split_items items =
-    ( List.filter_map (function `Decl d -> Some d | `Outline _ -> None) items,
-      List.filter_map (function `Outline o -> Some o | `Decl _ -> None) items )
+    let expand declarations = function
+      | `Decl d -> d :: declarations
+      | `Segment (name, element, loc) ->
+          let predicate =
+            List.find_map (function
+              | Proof_predicate p when p.pred_name.pid_str = element.pid_str -> Some p
+              | _ -> None) declarations
+          in
+          begin match predicate with
+          | Some p -> List.rev_append (List_segment.declarations ~loc ~name p) declarations
+          | None ->
+              raise (Syntax_error (element.pid_loc,
+                "The element predicate of a list segment must be declared before it"))
+          end
+      | `Outline _ -> declarations
+    in
+    ( List.rev (List.fold_left expand [] items),
+      List.filter_map (function `Outline o -> Some o | `Decl _ | `Segment _ -> None) items )
 
   (* The record types that no invariant takes as its state are logical records. *)
   let logical_records declarations =
@@ -202,6 +219,7 @@
 %token REQUIRES ENSURES VARIANT OPENS PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES ATOMIC_RAISES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS AS PROOF AT
+%token LIST_SEGMENT
 %token LEMMA RETURNS OF BEGIN END MODULE STRUCT FUN SET_OF_PREDICATE FRACTION WRITER RELEASE
 
 (* Keywords *)
@@ -366,6 +384,10 @@ proof:
 
 proof_item:
 | d = proof_decl { `Decl d }
+| LIST_SEGMENT n = lident o = lident p = lident
+    { if o.pid_str <> "over" then
+        raise (Syntax_error (o.pid_loc, "Expected list_segment name over predicate"));
+      `Segment (n, p, mk_loc $loc) }
 | o = outline(outline_steps) { `Outline o }
 ;
 

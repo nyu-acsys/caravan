@@ -57,6 +57,7 @@
         "initially", INITIALLY;
         "invariant", INVARIANT;
         "let", LET;
+        "list_segment", LIST_SEGMENT;
         "lemma", LEMMA;
         "match", MATCH;
         "mod", OP3 "mod";

@@ -48,7 +48,7 @@
         },
         {
           "name": "storage.type.caravan",
-          "match": "(?<![A-Za-z0-9_'])\\b(?:action|lemma|module|type|predicate|proof|view|struct)(?![A-Za-z0-9_'])"
+          "match": "(?<![A-Za-z0-9_'])\\b(?:action|lemma|list_segment|module|type|predicate|proof|view|struct)(?![A-Za-z0-9_'])"
         },
         {
           "name": "storage.modifier.caravan",
