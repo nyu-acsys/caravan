@@ -184,7 +184,7 @@ let declarations ~loc ~(name : id) (element : predicate) : proof_decl list =
         lemma_params;
         lemma_returns = [];
         lemma_requires = requires;
-        lemma_ensures = ensures;
+        lemma_ensures = List.map (fun t -> ([], t)) ensures;
         lemma_variant = [ var nodes ];
         lemma_opens = Some (loc, []);
         lemma_body = body;

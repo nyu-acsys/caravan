@@ -76,7 +76,9 @@ and term_desc =
   | Tinfix of term * id * term
       (** A chain of infix operations, as [e1 < e2 < e3], until [chain] desugars it. *)
   | Tif of term * term * term
-  | Tquant of quant * binder list * term
+  | Tquant of quant * binder list * triggers * term
+      (** [forall x y [t1, t2 | t3]. body], with alternative triggers of one or more
+          terms. *)
   | Tcomprehension of (id * pty) * term
   | Tattr of string * term
   | Tlet of pat * term * term
@@ -86,6 +88,8 @@ and term_desc =
   | Trecord of term option * (id * term) list
       (** A record, [{ f = e; ... }], or one updating another, [{ r with f = e; ... }]. *)
   | Told of term
+
+and triggers = term list list
 
 type header = { hd_name : id; hd_ret : labelled_arg list; hd_args : labelled_arg list }
 (** The header of a contract: [r = f x y], with ghost arguments in brackets. *)
@@ -324,7 +328,9 @@ type proof_decl =
       lemma_params : (id * pty) list;
       lemma_returns : (id * pty) list;
       lemma_requires : term list;
-      lemma_ensures : term list;
+      lemma_ensures : (triggers * term) list;
+          (** Postconditions with their triggers, which only an auto lemma's have:
+              [ensures [t]. p]. *)
       lemma_variant : term list;
       lemma_opens : (Location.t * term list) option;
       lemma_body : proof_expr;
@@ -386,6 +392,10 @@ let mk_term t l = { term_desc = t; term_loc = l }
 
 (** The terms of a record: what it updates, if anything, then its field values. *)
 let record_terms base fields = Option.to_list base @ List.map snd fields
+
+(** The terms of postconditions with triggers, the triggers' included. *)
+let postcondition_terms ensures =
+  List.concat_map (fun (triggers, t) -> t :: List.concat triggers) ensures
 
 (** The application of the operator [op] to [args]. *)
 let mk_op_apply op args =

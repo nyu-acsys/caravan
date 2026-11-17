@@ -613,7 +613,7 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
           | _ -> Ok ()
         in
         Ok (Option.first_some yes_type no_type)
-    | Tquant (_, binders, body) ->
+    | Tquant (_, binders, triggers, body) ->
         let* added =
           Result.all
             (List.map binders ~f:(fun (id, typ) ->
@@ -625,11 +625,11 @@ let terms ?expected ?(logical_types = []) ?(restricted = false) ?(proof_ids = []
                  in
                  Ok (id.S.pid_str, typ)))
         in
-        let* typ =
-          walk
-            (added @ Source.shadow_record_projections (List.map added ~f:fst) variables)
-            body
+        let inner =
+          added @ Source.shadow_record_projections (List.map added ~f:fst) variables
         in
+        let* _ = Result.all (List.map (List.concat triggers) ~f:(walk inner)) in
+        let* typ = walk inner body in
         let* () = require ~at:body.term_loc Predef.type_bool typ in
         Ok (Some Predef.type_bool)
     | Tcomprehension ((id, typ), body) ->
@@ -937,13 +937,15 @@ let lowerable ?(value_paths = Path_bindings.empty) source
         let* () = value bound (Qid operator) in
         terms bound [ left; right ]
     | Tif (condition, yes, no) -> terms bound [ condition; yes; no ]
-    | Tquant (_, binders, body) ->
+    | Tquant (_, binders, triggers, body) ->
         let* _ =
           Result.all
             (List.map binders ~f:(fun (id, typ) ->
                  Option.value_map typ ~default:(Ok ()) ~f:(check_type id.S.pid_loc)))
         in
-        term (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+        terms
+          (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound)
+          (body :: List.concat triggers)
     | Tcomprehension ((id, typ), body) ->
         let* () = check_type id.pid_loc typ in
         term (id.pid_str :: bound) body

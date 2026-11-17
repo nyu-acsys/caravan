@@ -438,7 +438,12 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
             R.Spec.make value)
       in
       let* requires = specs lemma_requires in
-      let* ensures = specs lemma_ensures in
+      let* ensures =
+        State.all lemma_ensures ~f:(fun (triggers, t) ->
+            let* triggers = State.all triggers ~f:(State.all ~f:(formula env)) in
+            let+ value = formula env t in
+            R.Spec.make ~triggers value)
+      in
       let* decreases = State.all lemma_variant ~f:(formula env) in
       let* opens =
         match lemma_opens with
@@ -1332,8 +1337,11 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
         | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
             field_term a || field_term b
         | Tif (a, b, c) -> field_term a || field_term b || field_term c
-        | Tquant (_, _, t) | Tcomprehension (_, t) | Tattr (_, t) | Tcast (t, _) | Told t
-          ->
+        | Tquant (_, _, _, t)
+        | Tcomprehension (_, t)
+        | Tattr (_, t)
+        | Tcast (t, _)
+        | Told t ->
             field_term t
         | Tmatch (t, cases) ->
             field_term t || List.exists cases ~f:(fun (_, t) -> field_term t)

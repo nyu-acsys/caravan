@@ -63,8 +63,8 @@ Inference fails when no ownership identifies the missing value.
   8 |   let result = read cell in
                      ^^^^^^^^^
   Verification Error: A precondition may not hold for this call.
-  File "lemmas_implicit_unowned.proof", line 3, columns 12-26:
+  File "lemmas_implicit_unowned.proof", line 3, columns 11-27:
   3 |   requires (own cell value)
-                  ^^^^^^^^^^^^^^
+                 ^^^^^^^^^^^^^^^^
   Related Location: This own predicate may not hold.
   [1]

@@ -24,6 +24,10 @@ ensures (let (tuple a b) p ((&& (infix ((+ a) b) = 3)) (infix (field t next) = N
 pure
 > ensures exists x y. x * y = 4
 ensures (exists x y. (infix ((* x) y) = 4))
+> ensures forall x y [f x y | g x, h y]. f x y = g x + h y
+ensures (forall x y [((f x) y) | (g x), (h y)]. (infix ((f x) y) = ((+ (g x)) (h y))))
+> ensures forall l : int list [length l]. length l >= 0
+ensures (forall l:ty [(length l)]. (infix (length l) >= 0))
 > ensures r = Some [x; y] && l = [] && f [1] = x :: l
 ensures ((&& (infix r = (Some ((:: x) ((:: y) []))))) ((&& (infix l = [])) (infix (f ((:: 1) [])) = ((:: x) l))))
 > ensures x = 1 +

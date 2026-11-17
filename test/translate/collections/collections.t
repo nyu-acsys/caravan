@@ -6,9 +6,9 @@
   1 | lemma removed (s : int finset) (x : int)
                    ^
   Verification Error: A postcondition may not hold at this return point.
-  File "collections_fail.proof", line 2, columns 11-60:
+  File "collections_fail.proof", line 2, columns 10-61:
   2 |   ensures (Finset.mem x (Finset.diff s (Finset.singleton x))) = ()
-                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
   [1]
 

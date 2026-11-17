@@ -1700,7 +1700,7 @@ let rec logical_expression ~functions ~is_list (term : S.term) =
   | Ttuple values ->
       let* values = Result.all (List.map values ~f:exp) in
       Ok (Ast_helper.Exp.tuple ~loc (List.map values ~f:(fun value -> (None, value))))
-  | Tquant (_, binders, body) ->
+  | Tquant (_, binders, _, body) ->
       let names = List.map binders ~f:(fun (id, _) -> id.S.pid_str) in
       let is_list = shadow_list_projection is_list names in
       let functions = shadow_logical_functions names functions in

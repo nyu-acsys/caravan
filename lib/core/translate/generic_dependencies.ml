@@ -53,7 +53,9 @@ let declaration_references = function
         List.map (lemma_params @ lemma_returns) ~f:(fun (id, _) -> id.S.pid_str)
       in
       List.concat_map
-        (lemma_requires @ lemma_ensures @ lemma_variant
+        (lemma_requires
+        @ S.postcondition_terms lemma_ensures
+        @ lemma_variant
         @ Option.value_map lemma_opens ~default:[] ~f:snd)
         ~f:(Translate_context.term_references bound)
       @ proof_references bound lemma_body

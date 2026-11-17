@@ -1027,7 +1027,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       let* a = formula env a in
       let+ b = formula env b in
       R.Expr.ite ~loc:l c a b
-  | Tquant (Tforall, [ (c, Some key_type) ], body)
+  | Tquant (Tforall, [ (c, Some key_type) ], [], body)
     when match spine (S.chain body) [] with
          | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ w; _ ] -> (
              match waiting_application w with
@@ -1063,7 +1063,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
               (R.Expr.binary ~loc:l Impl registered rest))
       in
       List.reduce_exn each ~f:(R.Expr.binary ~loc:l And)
-  | Tquant (q, binders, body) ->
+  | Tquant (q, binders, triggers, body) ->
       let variable ~at x t =
         let* ty = State.typ env.ctx ~at t in
         let l = loc at in
@@ -1134,6 +1134,7 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                 State.iter fields ~f:(fun (_, (_, typ, _)) ->
                     State.note_domain env.data typ))
       in
+      let* triggers = State.all triggers ~f:(State.all ~f:(formula env)) in
       let+ body = formula env body in
       let variables =
         List.concat_map bound ~f:(fun (_, _, binding) ->
@@ -1162,10 +1163,12 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
       in
       let guard = List.reduce ranges ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
       begin match (q, guard) with
-      | Tforall, None -> R.Expr.forall ~loc:l vars body
-      | Tforall, Some g -> R.Expr.forall ~loc:l vars (R.Expr.binary ~loc:l Impl g body)
-      | Texists, None -> R.Expr.exists ~loc:l vars body
-      | Texists, Some g -> R.Expr.exists ~loc:l vars (R.Expr.binary ~loc:l And g body)
+      | Tforall, None -> R.Expr.forall ~loc:l ~triggers vars body
+      | Tforall, Some g ->
+          R.Expr.forall ~loc:l ~triggers vars (R.Expr.binary ~loc:l Impl g body)
+      | Texists, None -> R.Expr.exists ~loc:l ~triggers vars body
+      | Texists, Some g ->
+          R.Expr.exists ~loc:l ~triggers vars (R.Expr.binary ~loc:l And g body)
       end
   | Tcomprehension ((id, ty), body) ->
       let* ty = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in

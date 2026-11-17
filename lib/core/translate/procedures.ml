@@ -293,8 +293,9 @@ let ghost_signature ?(flexible = []) ~types ~parameters (f : func) =
     | Tapply (callee, argument) -> callable callee && check argument
     | Tinfix (left, _, right) -> check left && check right
     | Tif (condition, yes, no) -> check condition && check yes && check no
-    | Tquant (_, binders, body) ->
-        functions_known (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+    | Tquant (_, binders, triggers, body) ->
+        let bound = List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound in
+        List.for_all (body :: List.concat triggers) ~f:(functions_known bound)
     | Tcomprehension ((id, _), body) -> functions_known (id.pid_str :: bound) body
     | Tlet (pattern, rhs, body) ->
         check rhs && functions_known (pat_names pattern @ bound) body

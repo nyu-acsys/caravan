@@ -84,6 +84,10 @@ that predicate and establishes it at the return point:
 
 These declarations go directly in
 [`proof_syntax.proof`](../examples/proof_syntax.proof), without annotation comments.
+As in `.mli` annotations, `requires`, `ensures`, and exceptional clauses do not
+need enclosing parentheses. In a `.proof` contract or lemma, bare `=` starts the
+proof body: group structural equality as `(x = y)` where it would otherwise meet
+that boundary. Equality written with `===` needs no such grouping.
 The predicate body says what `stored` owns. `fold` packages the freshly allocated
 field's ownership into that predicate. `proof make = on return ...` attaches this
 step to the constructor's return, without changing its runtime body.
@@ -105,7 +109,7 @@ if `let identity (value : int) = value` has this companion contract and proof:
 
 ```proof
 proof result, [copy : int] = identity value
-  ensures (result === value && copy === value) =
+  ensures result === value && copy === value =
   on return Ghost.returns (fun result () -> result)
 ```
 
@@ -140,6 +144,20 @@ Here the empty-list case is immediate. In the other case, the recursive lemma ca
 supplies the fact about the tail. Raven checks both the postcondition and the
 variant decrease. Runtime recursion does not thereby acquire a termination proof.
 Lemma bodies can also use `let`, `if`, `assert`, and other lemma calls.
+
+A lemma marked `[@auto]` needs no call: the solver applies it wherever a term
+matching its trigger occurs. The brackets before a postcondition give its
+triggers:
+
+```proof
+<!--@include: ../examples/proof_syntax.proof{58,60}-->
+```
+
+Each trigger must mention every parameter. Without triggers, the solver chooses
+its own, which can make it apply a lemma too often and slow down verification.
+Quantifiers take triggers the same way, as in
+`forall x y [f x y | g x, h y]. p`: `|` separates alternative triggers, and a
+trigger of several terms, separated by `,`, matches only when all of them occur.
 
 Trailing parameters marked `[@implicit]` may be inferred from owned resources.
 This applies to ordinary predicates and to lemma parameters:

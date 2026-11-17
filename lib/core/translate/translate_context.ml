@@ -2803,8 +2803,10 @@ let rec term_names (t : S.term) : string list =
   | Tvar (Qid id) -> [ id.pid_str ]
   | Tapply (a, b) | Tinfix (a, _, b) -> term_names a @ term_names b
   | Tif (a, b, c) -> term_names a @ term_names b @ term_names c
-  | Tquant (_, binders, body) ->
-      without (List.map binders ~f:(fun (id, _) -> id.S.pid_str)) (term_names body)
+  | Tquant (_, binders, triggers, body) ->
+      without
+        (List.map binders ~f:(fun (id, _) -> id.S.pid_str))
+        (List.concat_map (body :: List.concat triggers) ~f:term_names)
   | Tcomprehension ((id, _), body) -> without [ id.pid_str ] (term_names body)
   | Tlet (p, a, b) -> term_names a @ without (pat_names p) (term_names b)
   | Tmatch (t, cases) ->
@@ -2819,13 +2821,8 @@ let rec term_names (t : S.term) : string list =
 let subterms (t : S.term) =
   match t.term_desc with
   | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
-  | Tfield (t, _)
-  | Tquant (_, _, t)
-  | Tcomprehension (_, t)
-  | Tattr (_, t)
-  | Tcast (t, _)
-  | Told t ->
-      [ t ]
+  | Tquant (_, _, triggers, t) -> t :: List.concat triggers
+  | Tfield (t, _) | Tcomprehension (_, t) | Tattr (_, t) | Tcast (t, _) | Told t -> [ t ]
   | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) -> [ a; b ]
   | Tif (a, b, c) -> [ a; b; c ]
   | Tmatch (t, cases) -> t :: List.map cases ~f:snd
@@ -2840,8 +2837,9 @@ let rec term_references bound (t : S.term) =
   | Ttrue | Tfalse | Tconst _ -> []
   | Tapply (a, b) | Tinfix (a, _, b) -> refs a @ refs b
   | Tif (a, b, c) -> refs a @ refs b @ refs c
-  | Tquant (_, binders, body) ->
-      term_references (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+  | Tquant (_, binders, triggers, body) ->
+      let bound = List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound in
+      List.concat_map (body :: List.concat triggers) ~f:(term_references bound)
   | Tcomprehension ((id, _), body) -> term_references (id.pid_str :: bound) body
   | Tlet (p, a, b) -> refs a @ term_references (pat_names p @ bound) b
   | Tmatch (t, cases) ->
@@ -2858,7 +2856,7 @@ let name_loc (terms : S.term list) x ~default =
     | Tvar (Qid id) when String.equal id.pid_str x -> Some id.pid_loc
     | Tapply (a, b) | Tinfix (a, _, b) -> Option.first_some (find a) (find b)
     | Tif (a, b, c) -> List.find_map [ a; b; c ] ~f:find
-    | Tquant (_, _, t)
+    | Tquant (_, _, _, t)
     | Tcomprehension (_, t)
     | Tattr (_, t)
     | Tcast (t, _)

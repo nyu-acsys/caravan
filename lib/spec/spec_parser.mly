@@ -18,6 +18,29 @@
   let mk_pid pid ?(fixity = Normal) l = mk_id pid ~fixity ~attrs:[] ~loc:(mk_loc l)
   let mk_term d l = { term_desc = d; term_loc = mk_loc l }
   let mk_pat p l = { pat_desc = p; pat_loc = mk_loc l }
+
+  (* The terms in brackets, last first, each with the separator before it. Followed by
+     a dot they are triggers, separated by [,] and [|]; otherwise a list's elements. *)
+  let list_elements items =
+    List.fold_left
+      (fun elements (separator, t) ->
+        match separator with
+        | Some (s, at) when s <> ";" ->
+            raise (Syntax_error (at, "A list literal separates its elements with ;"))
+        | _ -> t :: elements)
+      [] items
+
+  let triggers items =
+    let add (groups, current) (separator, t) =
+      match separator with
+      | None -> (groups, t :: current)
+      | Some (",", _) -> (groups, t :: current)
+      | Some ("|", _) -> (List.rev current :: groups, [ t ])
+      | Some (_, at) ->
+          raise (Syntax_error (at, "Triggers are separated by , and alternatives by |"))
+    in
+    let groups, current = List.fold_left add ([], []) (List.rev items) in
+    List.rev (List.rev current :: groups)
   let mk_proof d l = { proof_desc = d; proof_loc = mk_loc l }
 
   let implicit_parameter kind (x, attribute, at, ty) =
@@ -451,16 +474,16 @@ outline_body(steps):
         Some (match cs with [] -> $endpos(fs) | _ -> $endpos(cs)), $endpos(fs), ss) }
 ;
 
-(* A clause of an outline's contract, parenthesized as a lemma's. *)
+(* A proof clause leaves bare [=] for the following proof body. *)
 outline_clause:
 | CONTINUES lident {}
-| REQUIRES LEFTPAR term RIGHTPAR {}
-| ENSURES LEFTPAR term RIGHTPAR {}
-| ATOMIC_REQUIRES LEFTPAR term RIGHTPAR {}
-| ATOMIC_ENSURES LEFTPAR term RIGHTPAR {}
-| RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
+| REQUIRES proof_clause_term {}
+| ENSURES proof_clause_term {}
+| ATOMIC_REQUIRES proof_clause_term {}
+| ATOMIC_ENSURES proof_clause_term {}
+| RAISES mpat_app ARROW proof_clause_term {}
 | RAISES mpat_app {}
-| ATOMIC_RAISES mpat_app ARROW LEFTPAR term RIGHTPAR {}
+| ATOMIC_RAISES mpat_app ARROW proof_clause_term {}
 | OPENS LEFTBRC loption(semicolon_list1(mask_entry)) RIGHTBRC {}
 ;
 
@@ -654,7 +677,10 @@ proof_decl:
         List.fold_left
           (fun (requires, ensures, variant, opens) -> function
             | `Requires t -> (t :: requires, ensures, variant, opens)
-            | `Ensures t -> (requires, t :: ensures, variant, opens)
+            | `Ensures (at, ts, t) ->
+                if ts <> [] && attribute <> Some "auto" then
+                  raise (Syntax_error (at, "Only an auto lemma's postconditions have triggers"));
+                (requires, (ts, t) :: ensures, variant, opens)
             | `Variant t -> (requires, ensures, t :: variant, opens)
             | `Opens (at, entries) ->
                 if opens <> None then
@@ -736,8 +762,9 @@ lemma_returns:
 ;
 
 lemma_clause:
-| REQUIRES LEFTPAR t = term RIGHTPAR { `Requires t }
-| ENSURES LEFTPAR t = term RIGHTPAR { `Ensures t }
+| REQUIRES t = proof_clause_term { `Requires t }
+| ENSURES t = proof_clause_term { `Ensures (mk_loc $loc, [], t) }
+| ENSURES ts = triggers t = proof_clause_term { `Ensures (mk_loc $loc(ts), ts, t) }
 | VARIANT t = proof_variant { `Variant t }
 | OPENS LEFTBRC ts = loption(semicolon_list1(mask_entry)) RIGHTBRC
     { `Opens (mk_loc $loc, ts) }
@@ -890,7 +917,9 @@ proof_value_expr:
 | l = proof_value_expr o = BACKQUOTE_LIDENT r = proof_value_expr
     { proof_term (mk_op_apply (mk_pid o $loc) [term_of_proof l; term_of_proof r]) $loc }
 | q = quant l = comma_list1(quant_vars) DOT t = proof_value_expr
-    { proof_term (Tquant (q, List.concat l, term_of_proof t)) $loc }
+    { proof_term (Tquant (q, List.concat l, [], term_of_proof t)) $loc }
+| q = quant l = comma_list1(quant_vars) ts = triggers t = proof_value_expr %prec DOT
+    { proof_term (Tquant (q, List.concat l, ts, term_of_proof t)) $loc }
 | a = attr t = proof_value_expr %prec prec_named
     { proof_term (Tattr (a, term_of_proof t)) $loc }
 ;
@@ -1083,25 +1112,32 @@ cast:
 | COLON ty = ty_arg  { ty }
 ;
 
-term: t = mk_term(term_) { t }
+term: t = logical_term(infix_op_1) { t }
 ;
 
-term_:
+(* Parentheses restore ordinary equality inside a proof clause. *)
+proof_clause_term: t = logical_term(clause_comparison) { t }
+;
+
+logical_term(comparison): t = mk_term(logical_term_(comparison)) { t }
+;
+
+logical_term_(comparison):
 | term_arg_
     { chain_desc $1 }
-| NOT t = term
+| NOT t = logical_term(comparison)
     { mk_op_apply (mk_pid "not" $loc($1)) [t] }
-| OLD term
-    { Told $2 }
-| op = prefix_op t = term %prec prec_prefix_op
+| OLD t = logical_term(comparison)
+    { Told t }
+| op = prefix_op t = logical_term(comparison) %prec prec_prefix_op
     { mk_op_apply op [t] }
-| l = term ; o = infix_op_1 ; r = term
+| l = logical_term(comparison); o = comparison; r = logical_term(comparison)
     { Tinfix (l, o, r) }
-| l = term ; o = infix_op_234 ; r = term
+| l = logical_term(comparison); o = infix_op_234; r = logical_term(comparison)
     { mk_op_apply o [l; r] }
-| l = term ; COLONCOLON ; r = term
+| l = logical_term(comparison); COLONCOLON; r = logical_term(comparison)
     { mk_op_apply (mk_pid ~fixity:Mixfix "::" $loc) [l; r] }
-| l = term ; o = BACKQUOTE_LIDENT ; r = term
+| l = logical_term(comparison); o = BACKQUOTE_LIDENT; r = logical_term(comparison)
     { mk_op_apply (mk_pid o $loc) [l; r] }
 | term_arg located(term_arg)+
     { let join f (a, e) = mk_term (Tapply (f, a)) ($startpos, e) in
@@ -1109,31 +1145,32 @@ term_:
 | f = term_arg labels = nonempty_list(own_label(term_arg))
     location = term_arg value = term_arg
     { own_application f labels location value $loc }
-| IF g = term THEN t1 = term ELSE t2 = term
+| IF g = term THEN t1 = term ELSE t2 = logical_term(comparison)
     { Tif (g, t1, t2) }
-| LET ids = pat EQUAL t1 = term IN t2 = term
+| LET ids = pat EQUAL t1 = term IN t2 = logical_term(comparison)
    { Tlet(ids, t1, t2) }
-| LET id = attrs(lident_op_id) EQUAL t1 = term IN t2 = term
+| LET id = attrs(lident_op_id) EQUAL t1 = term IN t2 = logical_term(comparison)
    { Tlet (mk_pat (Pid id) $loc(id), t1, t2) }
-| q = quant l = comma_list1(quant_vars) DOT t = term
-    { Tquant (q, List.concat l, t) }
-| MATCH t = term WITH ioption(BAR) cases = match_cases
+| q = quant l = comma_list1(quant_vars) DOT t = logical_term(comparison)
+    { Tquant (q, List.concat l, [], t) }
+| q = quant l = comma_list1(quant_vars) ts = triggers t = logical_term(comparison) %prec DOT
+    { Tquant (q, List.concat l, ts, t) }
+| MATCH t = term WITH ioption(BAR) cases = match_cases(comparison)
     { Tmatch (t, cases) }
-| a = attr t = term %prec prec_named
+| a = attr t = logical_term(comparison) %prec prec_named
     { Tattr (a, t) }
-| t = term ty = cast
+| t = logical_term(comparison) ty = cast
     { Tcast (t, ty) }
 ;
 
-
 (* As in OCaml, the cases of a match extend as far as possible. *)
-match_cases:
-| c = match_case %prec below_BAR { [c] }
-| c = match_case BAR cs = match_cases { c :: cs }
+match_cases(comparison):
+| c = match_case(comparison) %prec below_BAR { [c] }
+| c = match_case(comparison) BAR cs = match_cases(comparison) { c :: cs }
 ;
 
-match_case:
-| p = mpat ARROW t = term { p, t }
+match_case(comparison):
+| p = mpat ARROW t = logical_term(comparison) { p, t }
 ;
 
 (* The patterns of match cases, as OCaml's: tuples of [::]s of constructor applications. *)
@@ -1186,6 +1223,11 @@ pat_:
 | l=comma_list2(pat_arg) { Ptuple l }
 | p=pat_arg COLON t=typ { Pcast (p, t) }
 
+(* Alternative triggers, each of one or more terms: [[t1, t2 | t3].]. *)
+triggers:
+| LEFTSQ items = bracket_items RIGHTSQ DOT { triggers items }
+;
+
 quant_vars:
 | l = binder_var+ ty = cast? { List.map (fun id -> id, ty) l }
 ;
@@ -1209,6 +1251,24 @@ term_arg_:
 | FALSE                     { Tfalse }
 | o = oppref ; a = term_arg { mk_op_apply o [a] }
 | t = term_sub_             { t }
+(* Not a [term_dot]: a dot after the brackets makes them triggers. *)
+| LEFTSQ items = bracket_items ioption(SEMICOLON) RIGHTSQ
+    { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($4)))) $loc($4) in
+      let cons t l =
+        mk_term (mk_op_apply (mk_id ~fixity:Mixfix ~loc:t.term_loc "::") [ t; l ]) $loc
+      in
+      (List.fold_right cons (list_elements items) nil).term_desc }
+;
+
+bracket_items:
+| t = term { [ (None, t) ] }
+| items = bracket_items s = bracket_separator t = term { (Some s, t) :: items }
+;
+
+bracket_separator:
+| SEMICOLON { (";", mk_loc $loc) }
+| COMMA { (",", mk_loc $loc) }
+| BAR { ("|", mk_loc $loc) }
 ;
 
 term_dot_:
@@ -1231,12 +1291,6 @@ term_block_:
     { Trecord (None, fs) }
 | LEFTBRC r = term_arg WITH fs = semicolon_list1(field_value) RIGHTBRC
     { Trecord (Some r, fs) }
-| LEFTSQ ts = semicolon_list1(term) RIGHTSQ
-    { let nil = mk_term (Tvar (Qid (mk_pid "[]" $loc($3)))) $loc($3) in
-      let cons t l =
-        mk_term (mk_op_apply (mk_id ~fixity:Mixfix ~loc:t.term_loc "::") [ t; l ]) $loc
-      in
-      (List.fold_right cons ts nil).term_desc }
 ;
 
 term_sub_:
@@ -1345,9 +1399,12 @@ prefix_op:
 ;
 
 %inline infix_op_1:
-| o = OP1   { mk_pid ~fixity:Infix o $loc }
-| EQUAL     { mk_pid ~fixity:Infix "=" $loc }
-| LTGT      { mk_pid ~fixity:Infix "<>" $loc }
+| o = clause_comparison { o }
+| EQUAL { mk_pid ~fixity:Infix "=" $loc }
+
+%inline clause_comparison:
+| o = OP1 { mk_pid ~fixity:Infix o $loc }
+| LTGT { mk_pid ~fixity:Infix "<>" $loc }
 %inline infix_op_234:
 | o = OP2   { mk_pid ~fixity:Infix o $loc }
 | o = OP3   { mk_pid ~fixity:Infix o $loc }

@@ -35,7 +35,7 @@ The companion proof can name that incoming option `requested`:
 
 ```proof
 proof result = choose requested token
-  ensures (result === (match requested with None -> 42 | Some value -> value)) = ()
+  ensures result === (match requested with None -> 42 | Some value -> value) = ()
 ```
 
 `choose ()` supplies `None`, `choose ~value:7 ()` supplies `Some 7`, and
@@ -214,8 +214,8 @@ imports implicitly promise the same preservation. In a contract, name the entry
 context and require availability when acquiring an existing mutex:
 
 ```proof
-requires (Ghost.Mutex.context self held &&
-  not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+requires Ghost.Mutex.context self held &&
+  not (Finset.mem mutex held) && Guard.is_mutex mutex cell
 ```
 
 These names are inferred contract witnesses, without explicit ghost-call adapters.
@@ -231,10 +231,10 @@ with the mutex held:
 
 ```proof
 proof acquire mutex cell
-  requires (Ghost.Mutex.context self held &&
-    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
-  ensures (Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
-    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell) = ()
+  requires Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell
+  ensures Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)) &&
+    Guard.is_mutex mutex cell && Guard.held mutex self && Cell.resource cell = ()
 ```
 
 A release helper requires the held token and protected resource and states

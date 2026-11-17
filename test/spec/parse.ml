@@ -33,10 +33,12 @@ let rec term t =
   | Tapply (f, a) -> "(" ^ term f ^ " " ^ term a ^ ")"
   | Tinfix (a, o, b) -> "(infix " ^ term a ^ " " ^ o.pid_str ^ " " ^ term b ^ ")"
   | Tif (c, a, b) -> "(if " ^ term c ^ " " ^ term a ^ " " ^ term b ^ ")"
-  | Tquant (q, bs, t) ->
+  | Tquant (q, bs, ts, t) ->
       let q = match q with Tforall -> "forall" | Texists -> "exists" in
       let b (id, ty) = id.pid_str ^ match ty with Some _ -> ":ty" | None -> "" in
-      "(" ^ q ^ " " ^ String.concat " " (List.map b bs) ^ ". " ^ term t ^ ")"
+      "(" ^ q ^ " "
+      ^ String.concat " " (List.map b bs)
+      ^ triggers ts ^ ". " ^ term t ^ ")"
   | Tcomprehension ((id, _), body) -> "(set " ^ id.pid_str ^ ":ty. " ^ term body ^ ")"
   | Tattr (a, t) -> "(attr " ^ a ^ " " ^ term t ^ ")"
   | Tlet (p, a, b) -> "(let " ^ pat p ^ " " ^ term a ^ " " ^ term b ^ ")"
@@ -50,6 +52,12 @@ let rec term t =
       let field (id, t) = id.pid_str ^ " = " ^ term t in
       "(record " ^ base ^ String.concat "; " (List.map field fs) ^ ")"
   | Told t -> "(old " ^ term t ^ ")"
+
+and triggers = function
+  | [] -> ""
+  | ts ->
+      let trigger t = String.concat ", " (List.map term t) in
+      " [" ^ String.concat " | " (List.map trigger ts) ^ "]"
 
 let arg = function
   | Lwild -> "_"
@@ -89,6 +97,8 @@ let () =
          | None -> match y with A -> true | B -> false|};
       "ensures let (a, b) = p in a + b = 3 && t.next = None pure";
       "ensures exists x y. x * y = 4";
+      "ensures forall x y [f x y | g x, h y]. f x y = g x + h y";
+      "ensures forall l : int list [length l]. length l >= 0";
       "ensures r = Some [x; y] && l = [] && f [1] = x :: l";
       "ensures x = 1 +";
       "ensures x ` y";

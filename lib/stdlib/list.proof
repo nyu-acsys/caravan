@@ -28,7 +28,7 @@ lemma reverse_append (first : 'a list) (second : 'a list)
       append_assoc (reverse second) (reverse tail) [head]
 
 lemma [@auto] reverse_involution (values : 'a list)
-  ensures (reverse (reverse values) === values)
+  ensures [reverse (reverse values)]. reverse (reverse values) === values
   variant values =
   match values with
   | [] -> ()

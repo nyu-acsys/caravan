@@ -327,8 +327,8 @@ let lemma_call ?expected env (t : S.term) =
 let rec predicate_existentials (t : S.term) =
   match t.term_desc with
   | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
-  | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
-  | Tquant (Tforall, _, body)
+  | Tquant (Texists, bindings, _, body) -> bindings @ predicate_existentials body
+  | Tquant (Tforall, _, _, body)
   | Tcomprehension (_, body)
   | Tattr (_, body)
   | Tcast (body, _)

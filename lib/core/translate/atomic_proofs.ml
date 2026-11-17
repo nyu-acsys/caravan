@@ -540,7 +540,7 @@ let specialize_shared env ~terms =
         State.fold arguments ~init:env ~f:visit
     | _ ->
         begin match term.term_desc with
-        | Tquant (_, binders, body) ->
+        | Tquant (_, binders, _, body) ->
             let* bindings =
               State.all binders ~f:(fun (id, annotation) ->
                   match annotation with

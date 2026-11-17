@@ -1,0 +1,14 @@
+let rec len (values : 'a list) : integer
+  variant values =
+  match values with
+  | [] -> 0
+  | _ :: tail -> 1 + len tail
+
+lemma [@auto] len_nonnegative (values : 'a list)
+  ensures [len values]. (len values >= 0)
+  variant values =
+  match values with
+  | [] -> ()
+  | _ :: tail -> len_nonnegative tail
+
+let doubled (values : 'a list) : integer = 2 * len values

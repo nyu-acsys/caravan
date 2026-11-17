@@ -752,7 +752,7 @@ type definition =
     [forall i. g -> own s.cells.(i) v]: the index, the guard, the field and the value. *)
 let chain_of ~state (t : S.term) =
   match t.term_desc with
-  | Tquant (Tforall, [ (i, _) ], body) ->
+  | Tquant (Tforall, [ (i, _) ], [], body) ->
       begin match spine (S.chain body) [] with
       | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ guard; owned ] ->
           begin match spine owned [] with
@@ -831,7 +831,7 @@ let invariant_parts types (st : structure) body =
                       :: existential field :: mentioned);
                   part_owns = contents field;
                 }
-          | _, Tquant (Tforall, _, _) when mentions_own t ->
+          | _, Tquant (Tforall, _, _, _) when mentions_own t ->
               Some
                 {
                   part_pred = member_name st ("part_" ^ Int.to_string n);

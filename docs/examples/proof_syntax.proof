@@ -10,7 +10,7 @@ let rec logical_length (values : int list) : integer
   | _ :: tail -> 1 + logical_length tail
 
 lemma length_nonnegative (values : int list)
-  ensures (logical_length values >= 0)
+  ensures logical_length values >= 0
   variant values =
   match values with
   | [] -> ()
@@ -20,21 +20,21 @@ predicate remembered (cell : int ref) (value [@implicit] : int) =
   own cell.contents value
 
 lemma retain (cell : int ref) (value [@implicit] : int)
-  requires (remembered cell value)
-  ensures (remembered cell value) =
+  requires remembered cell value
+  ensures remembered cell value =
   ()
 
 lemma retain_seven (cell : int ref)
-  requires (remembered cell 7)
-  ensures (remembered cell 7) =
+  requires remembered cell 7
+  ensures remembered cell 7 =
   retain cell
 
 predicate some_value (cell : int ref) =
   exists value : int. own cell.contents value
 
 lemma unpack_and_repack (cell : int ref)
-  requires (some_value cell)
-  ensures (some_value cell) =
+  requires some_value cell
+  ensures some_value cell =
   let observed = unfold some_value cell {value} in
   fold some_value cell {value = observed}
 
@@ -54,3 +54,7 @@ lemma visit (cells : int ref list) (index : integer) (cell : int ref)
   let observed = unfold counter_at index cell (counters_suffix cells 0 index) {value} in
   fold counter_at index cell (counters_suffix cells 0 index) {value = observed};
   counters_restore cells 0 index cell
+
+lemma [@auto] length_nonnegative_everywhere (values : int list)
+  ensures [logical_length values]. logical_length values >= 0 =
+  length_nonnegative values

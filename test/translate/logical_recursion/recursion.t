@@ -28,8 +28,8 @@ Missing measures, non-decreasing recursion, and false automatic lemmas are rejec
   1 | lemma [@auto] impossible (value : bool)
                               ^
   Verification Error: A postcondition may not hold at this return point.
-  File "bad_auto.proof", line 2, columns 11-30:
+  File "bad_auto.proof", line 2, columns 10-31:
   2 |   ensures (value === not value) = ()
-                 ^^^^^^^^^^^^^^^^^^^
+                ^^^^^^^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
   [1]

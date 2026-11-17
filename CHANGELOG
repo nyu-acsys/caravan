@@ -22,9 +22,11 @@ All notable changes to this project will be documented in this file.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.
 - Inline `List.fold_left` callbacks support loop invariants, effects, exceptions, and ghost-state proof scopes.
 - `list_segment s over p` declares a list predicate iterating `p`, with lemmas that take one element out and put it back.
+- Quantifiers and auto lemmas' postconditions accept explicit triggers, as in `forall x [f x]. p`.
 
 ### Changed
 
+- Proof-file contracts and lemmas accept unparenthesized clauses, matching interface annotations.
 - Executable integer arithmetic follows OCaml wraparound semantics, including intermediate results and pure functions.
 - Polymorphic module predicates can be instantiated at concrete types in predicate definitions.
 

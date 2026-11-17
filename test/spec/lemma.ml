@@ -383,3 +383,33 @@ let () =
   | exception Syntax_error (_, "Wildcards in an opens entry must be trailing") -> ()
   | _ -> failwith "nontrailing opens wildcard was accepted"
   end
+
+(* An auto lemma's postcondition carries alternative triggers, each of one or more terms. *)
+let () =
+  match
+    parse_proof
+      "lemma [@auto] l (x : int) ensures [f x | g x, h x]. (f x = g x) ensures (h x = 0) \
+       = ()"
+  with
+  | [ Proof_lemma { lemma_ensures = [ ([ [ _ ]; [ _; _ ] ], _); ([], _) ]; _ } ] -> ()
+  | _ -> failwith "lemma triggers were not parsed"
+
+(* Brackets are triggers only before a dot, wherever whitespace falls; otherwise a list. *)
+let () =
+  begin match
+    parse_proof "lemma [@auto] l (x : int list) ensures [f x] . f x === x = ()"
+  with
+  | [ Proof_lemma { lemma_ensures = [ ([ [ _ ] ], _) ]; _ } ] -> ()
+  | _ -> failwith "spaced lemma trigger was not parsed"
+  end;
+  begin match parse_proof "lemma l (x : int list) ensures [x; x] === x @ x = ()" with
+  | [ Proof_lemma { lemma_ensures = [ ([], _) ]; _ } ] -> ()
+  | _ -> failwith "postcondition starting with a list literal was not parsed"
+  end;
+  begin match parse_proof "lemma [@auto] l (x : int) ensures [f x; g x]. f x = ()" with
+  | exception Syntax_error (_, "Triggers are separated by , and alternatives by |") -> ()
+  | _ -> failwith "semicolon between triggers was accepted"
+  end;
+  match parse_proof "lemma l (x : int) ensures [x, x] === [] = ()" with
+  | exception Syntax_error (_, "A list literal separates its elements with ;") -> ()
+  | _ -> failwith "comma in a list literal was accepted"

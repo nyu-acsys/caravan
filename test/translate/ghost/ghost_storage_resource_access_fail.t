@@ -8,8 +8,8 @@ Resource fields keep their algebra's ownership semantics.
   [1]
 
   $ caravan --shh ghost_storage_fraction_resource_fail.ml
-  [Error] File "ghost_storage_fraction_resource_fail.proof", line 5, columns 12-72:
+  [Error] File "ghost_storage_fraction_resource_fail.proof", line 5, columns 11-73:
   5 |   requires (own ~fraction:Permission.half (Ghost.at facts cell) Facts.id) = ()
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Type Error: Resource fields do not take a fractional permission.
   [1]

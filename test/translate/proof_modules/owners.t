@@ -11,8 +11,8 @@ Scoped lemma bodies are verified.
   2 |   lemma impossible ensures (false) = ()
                         ^
   Verification Error: A postcondition may not hold at this return point.
-  File "scoped_body_fail.proof", line 2, columns 28-33:
+  File "scoped_body_fail.proof", line 2, columns 27-34:
   2 |   lemma impossible ensures (false) = ()
-                                  ^^^^^
+                                 ^^^^^^^
   Related Location: This assertion may not hold.
   [1]

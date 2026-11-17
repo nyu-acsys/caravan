@@ -112,7 +112,9 @@ let declaration_shape declaration =
       ( "lemma",
         false,
         lemma_body.proof_loc
-        :: List.map (lemma_requires @ lemma_ensures @ lemma_variant) ~f:term
+        :: List.map
+             (lemma_requires @ S.postcondition_terms lemma_ensures @ lemma_variant)
+             ~f:term
         @ Option.value_map lemma_opens ~default:[] ~f:(fun (at, entries) ->
             at :: List.map entries ~f:term) )
   | Proof_function { function_body; function_variant; _ } ->
