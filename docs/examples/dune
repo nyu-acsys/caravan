@@ -6,7 +6,11 @@
   automatic_cell
   manual_cell
   proof_syntax
-  ghost_scopes))
+  ghost_scopes
+  owned_job
+  frozen_job
+  relaxed_job
+  raw_result))
 
 (cram
  (deps

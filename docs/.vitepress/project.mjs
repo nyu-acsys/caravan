@@ -7,8 +7,9 @@ export const tutorialChapters = [
   { path: 'tutorial/', label: '1', title: 'Getting started' },
   { path: 'tutorial/contracts', label: '2', title: 'Contracts and ownership' },
   { path: 'tutorial/concurrent-proofs', label: '3', title: 'Concurrent proofs' },
-  { path: 'tutorial/ocaml-subset', label: '4', title: 'OCaml coverage' },
-  { path: 'tutorial/semantics', label: '5', title: 'Semantics and verification limits' }
+  { path: 'tutorial/weak-memory', label: '4', title: 'Weak memory' },
+  { path: 'tutorial/ocaml-subset', label: '5', title: 'OCaml coverage' },
+  { path: 'tutorial/semantics', label: '6', title: 'Semantics and verification limits' }
 ]
 
 export default {

@@ -267,5 +267,6 @@ Ghost values, allocations, and updates have no runtime effects. Manual and
 automatic modes share the same translation of executable OCaml and the same
 primitive models.
 
-Continue with [OCaml coverage](./ocaml-subset) and the
+Continue with [weak memory](./weak-memory) for advanced shared-field disciplines
+and release/acquire proofs, then [OCaml coverage](./ocaml-subset) and the
 [semantic conventions](./semantics).

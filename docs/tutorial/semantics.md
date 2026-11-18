@@ -1,4 +1,4 @@
-# 5. Semantics and verification limits
+# 6. Semantics and verification limits
 
 A proof establishes properties of Caravan's runtime model under the function's
 precondition and its dependency contracts. The following distinctions matter when
@@ -85,12 +85,17 @@ does not establish progress or allocation-sensitive ABA arguments.
 
 ## Memory access and evaluation {#sec:memory-access-and-evaluation}
 
-Ownership makes ordinary reference and mutable-record accesses race-free.
+By default, ownership makes ordinary reference and mutable-record accesses race-free.
 A positive fraction permits reads; full ownership permits writes. These accesses
 use non-atomic contracts, so a proof cannot open a shared invariant around an
 ordinary access as if it were atomic. Use `Atomic` operations where shared accesses
 need atomicity. Caravan relies on OCaml's race-free/atomic execution model; it does
 not justify racy ordinary reads or writes by assuming every field access is atomic.
+
+The [weak-memory chapter](./weak-memory) describes advanced field disciplines and
+release/acquire proofs. Their explicit annotations and visibility obligations
+change how those accesses are verified; the default ownership rules above do not
+by themselves justify such accesses or establish publication between domains.
 
 The translator evaluates ordinary application arguments right to left and preserves
 short-circuit behavior of `&&` and `||`. OCaml does not promise a general argument

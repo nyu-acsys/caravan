@@ -117,6 +117,7 @@ Use a Raven revision compatible with the one in `RAVEN_REVISION`. The full
 cover further configuration.
 
 Continue with [contracts and ownership](./contracts), then compare
-[automatic and manual concurrent proofs](./concurrent-proofs). The remaining
-chapters describe [OCaml coverage](./ocaml-subset) and
-[semantic conventions](./semantics).
+[automatic and manual concurrent proofs](./concurrent-proofs). Continue with
+[weak memory](./weak-memory) for advanced shared-field disciplines and
+release/acquire proofs. The remaining chapters describe
+[OCaml coverage](./ocaml-subset) and [semantic conventions](./semantics).

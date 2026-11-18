@@ -32,7 +32,8 @@ Caravan is under active development. It supports a first-order subset of OCaml 5
 including polymorphic functions, algebraic data types, records, modules and
 functors, mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
 tasks, native mutexes and condition variables, exceptions, and GADTs with constant
-witnesses or constructor-set indices.
+witnesses or constructor-set indices. Explicit frozen and relaxed field disciplines
+support [weak-memory reasoning](https://nyu-acsys.github.io/caravan/tutorial/weak-memory).
 See the [tutorial](https://nyu-acsys.github.io/caravan/tutorial/) for examples,
 [language coverage](https://nyu-acsys.github.io/caravan/tutorial/ocaml-subset), and
 [semantic conventions](https://nyu-acsys.github.io/caravan/tutorial/semantics).
