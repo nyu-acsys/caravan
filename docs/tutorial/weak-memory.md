@@ -213,6 +213,13 @@ unrestricted read may return the value of any write in the journal. It need not 
 the latest one, observing a write does not acquire that write's visibility, and two
 successive reads may even return values in decreasing order of their writes.
 
+This model over-approximates OCaml's actual weak-memory behavior. Every value that
+OCaml's memory model allows a racing read to return comes from a write in the
+journal, but the journal also contains writes that OCaml rules out, such as writes
+older than one the reading domain has already made or acquired. A proof about a
+relaxed field is therefore sound, but some properties that hold for the running
+program cannot be proved with this model alone.
+
 `Progress.state job current writes` describes the full journal, where `current` is
 the value of the most recent write. That is a fact about the order of writes, not a
 promise about what the next read returns. `Progress.observe job value` returns the
