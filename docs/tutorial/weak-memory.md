@@ -87,9 +87,11 @@ to another is only sound at an operation that really synchronizes the two domain
 such as `Domain.spawn`, `Domain.join` or a mutex; the contracts of those operations
 are what transfer ownership. Holding a fraction of ownership does not act as a
 fence, and race freedom must hold over the whole execution, including the
-transitions into and out of the code that relies on it. Likewise, an ordinary load
-stays non-atomic: reading a default field while a shared invariant is open does not
-turn the read into an atomic access.
+transitions into and out of the code that relies on it. Likewise, reading or writing
+a default field is not an atomic step, so a proof cannot open a shared invariant
+around it the way it can around an `Atomic` operation. Caravan rejects such an
+access with the error "Cannot take a non-atomic step while an invariant or atomic
+update is open."
 
 ## Publication and acquired visibility {#sec:publication-and-acquired-visibility}
 
