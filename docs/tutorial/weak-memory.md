@@ -1,151 +1,203 @@
 # 4. Weak memory
 
-OCaml's ordinary mutable fields are not sequentially consistent atomics. Most
-Caravan proofs can nevertheless use ordinary ownership and reason about their
-values directly. More advanced algorithms deliberately allow some ordinary
-accesses to race; these need an explicit field discipline and a proof of which
-observations are safe.
+OCaml's ordinary mutable fields are not sequentially consistent atomics: when two
+domains access the same field without synchronization, a read may return an older
+value than the most recent write. Most Caravan proofs never encounter this, because
+ownership already rules out such races, and the proof can reason about field values
+as in a sequential program. Some concurrent algorithms, however, deliberately let
+ordinary fields race. Verifying them requires stating, for each such field, which
+values a racing read may return.
 
-This chapter develops a job descriptor in stages: first with exclusive ownership,
-then with a frozen workload and a relaxed progress estimate. A separate result-slot
-example introduces speculative payload validation. These examples use manual
-proofs in companion `.proof` files; their runtime bodies contain no proof steps.
+Caravan does this through **field disciplines**: per-field rules that determine what
+a proof must establish before a read or write, and what it learns from a read. This
+chapter introduces them one at a time:
+
+| Discipline | Annotation | A read returns |
+| --- | --- | --- |
+| Default | none | the current value, given ownership |
+| Immutable | none (an immutable field) | the initialized value |
+| Frozen | `[@caravan.frozen]` | the final value, once the field is frozen and its last write is visible |
+| Relaxed | `[@caravan.relaxed]` | some earlier write, constrained by a proof invariant |
+| Raw | `[@caravan.relaxed] [@caravan.raw]` | a speculative value that must be validated before use |
+
+## The running example {#sec:weak-memory-example}
+
+The chapter follows a **job descriptor**: a small record that one domain prepares and
+then hands to a worker domain. It describes a unit of work by an identifier `id` and
+the amount of work to be done. A later version adds `completed`, an estimate of the
+progress the worker has made. The versions are:
+
+- [`owned_job.ml`](../examples/owned_job.ml): the preparing domain sets the amount
+  of work and then passes the whole job to the worker. Only one domain accesses the
+  job at a time, so default ownership suffices.
+- [`frozen_job.ml`](../examples/frozen_job.ml): the amount of work, now `total`, is
+  written during creation and never changes afterwards. Both domains read it
+  concurrently without owning it. The example also passes the job through an
+  atomic channel.
+- [`relaxed_job.ml`](../examples/relaxed_job.ml): the worker records its progress in
+  `completed` while the preparing domain reads it concurrently, racing with those
+  writes. The proof bounds the values such a read can return.
+
+A separate example, [`raw_result.ml`](../examples/raw_result.ml), shows a result slot
+that is cleared after use, and a reader that loads the slot first and only afterwards
+checks whether the load was still valid.
+
+All examples use manual proofs in companion `.proof` files; the OCaml code contains
+no proof steps. Each version is a separate program because of a current restriction:
+once a program uses frozen or relaxed fields, Caravan rejects reads and writes of
+default mutable fields anywhere in that program. Immutable fields remain supported
+alongside them.
 
 ## Default fields and local race freedom {#sec:default-fields-and-local-race-freedom}
 
-The default rules are the familiar ownership rules from
+Unless a mutable field is annotated otherwise, Caravan verifies its reads and writes
+with the ownership rules from
 [contracts and ownership](./contracts#sec:function-contracts-and-heap-ownership):
-a positive permission fraction allows a read, and full ownership allows a write.
-Compatible read fractions agree on the value. A writer cannot coexist with another
-reader or writer holding permission for the same location.
+reading a field requires a positive fraction of its ownership, and writing it
+requires full ownership. Domains that hold fractions of the same field agree on its
+value, and while one domain can write a field, no other domain can read or write it.
 
-Here a job has an immutable identifier and a mutable amount of work. The preparing
-domain changes the work, then hands the job to a worker:
+In the first version of the job, `id` is immutable and `work` is mutable. The
+preparing domain sets `work` and then hands the job to a worker:
 
 <<< ../examples/owned_job.ml{caravan}
 
-The contracts track ownership through preparation and inspection:
+The contracts state which ownership each function needs and returns:
 
 <<< ../examples/owned_job.proof{proof}
 
-`Ghost.Task` associates the worker call with its contract. `Domain.spawn` transfers
-its required resource to the worker; `Domain.join` returns the postcondition.
-The parent cannot inspect or change `job.work` while the worker owns it. Readers
-can instead share positive fractions when their contracts preserve those fractions.
-No weak-memory annotations are needed for this default discipline.
+`Ghost.Task` attaches a contract to the function that the worker runs, here
+`inspect`. `Domain.spawn` transfers the resources that this contract requires to
+the worker, and `Domain.join` returns what it ensures. Until the join, the parent
+no longer owns `job.work`, so it can neither read nor change it. If several
+domains only need to read a field, they can instead share fractions of its
+ownership. None of this needs any weak-memory annotation.
 
-OCaml's **data-race-freedom guarantee** allows sequentially consistent reasoning
-for correctly synchronized programs. Its **local** guarantee extends sequential
-reasoning to appropriately isolated, race-free portions of programs that may race
-elsewhere. This is why an unrelated race need not invalidate a private computation.
-See the [OCaml memory-model chapter](https://ocaml.org/manual/5.5/memorymodel.html)
-for the guarantee and its boundaries.
+Why is ownership enough here? OCaml guarantees that a program without data races
+behaves as if its accesses were sequentially consistent. Its **local** version of
+this guarantee also covers parts of a program that are race-free even when other
+parts race, so a race on one location does not affect reasoning about a private
+computation elsewhere. Ownership rules out races on the fields it covers, which is
+what lets Caravan reason about their values as in a sequential program. The
+[OCaml memory-model chapter](https://ocaml.org/manual/5.5/memorymodel.html)
+describes the guarantee and its limits.
 
-Caravan's default contracts enforce exclusive writes and compatible reads; real
-synchronization operations support ownership handoffs. This is not a rule that any
-fraction of ownership acts as a fence. Isolation must hold over the relevant
-execution, including transitions into and out of a protected region. An ordinary
-load remains non-atomic: opening a shared invariant around it does not make it a
-legal atomic access.
-
-The advanced encodings below track visibility explicitly. Currently Caravan
-rejects default mutable-field accesses in an execution using that encoding.
-Keep default storage separate or choose an appropriate explicit discipline for
-its fields. Immutable fields remain supported. The default and advanced jobs
-are therefore separate versions of the example.
+Ownership itself is not synchronization. Moving ownership of a field from one domain
+to another is only sound at an operation that really synchronizes the two domains,
+such as `Domain.spawn`, `Domain.join` or a mutex; the contracts of those operations
+are what transfer ownership. Holding a fraction of ownership does not act as a
+fence, and race freedom must hold over the whole execution, including the
+transitions into and out of the code that relies on it. Likewise, an ordinary load
+stays non-atomic: reading a default field while a shared invariant is open does not
+turn the read into an atomic access.
 
 ## Publication and acquired visibility {#sec:publication-and-acquired-visibility}
 
-Two facts must be distinguished:
+The remaining disciplines allow a domain to read a field that it does not own. The
+proof then has to show that the reading domain has seen the write it relies on, and
+it must keep apart two kinds of facts:
 
-- **A fact about shared storage:** for example, a field has been frozen at `42`.
-- **Visibility for an executing domain:** the domain has acquired the writes
-  needed to read that field as `42`.
+- **A fact about the shared field,** for example that a field has been frozen with
+  the value `42`.
+- **A fact about what an executing domain has seen,** for example that the domain
+  has synchronized with the write of `42`, so that reading the field returns `42`.
 
-Sharing a persistent storage fact does not itself supply the second fact. An
-actual runtime operation supplies synchronization: for example, an atomic
-publication followed by an acquiring atomic access, spawning a worker, joining a
-worker, or a mutex handoff. OCaml's `Atomic` operations remain sequentially
-consistent: release/acquire here describes their effect on ordinary memory,
-not a new choice of memory-order flags.
+A fact of the first kind can be shared freely, but sharing it does not provide the
+second. Only a runtime operation that synchronizes domains provides the second kind:
+an atomic write followed by an atomic read of the same location, spawning or joining
+a worker, or handing over a mutex. In the terms used below, the atomic write
+**releases** the writer's earlier writes and the atomic read **acquires** them.
+OCaml's `Atomic` operations are always sequentially consistent; release and
+acquire describe what they make visible about ordinary fields, not separate memory
+orders that a program can choose.
 
-The proof records visibility using ghost write markers and sets of markers.
-A marker identifies a checkpoint in the proof; creating or copying one does not
-execute a runtime fence. `Ghost.self` denotes the current executor, and field
-facades expose `visible` predicates indexed by that executor. The supported
-handoff machinery propagates those facts at the corresponding runtime operation.
+Proofs track what a domain has seen with ghost values:
 
-For explicit atomic publication, `Ghost.release_scope` supplies the published
-view to the attached operation and `Ghost.acquire_scope` obtains a covered view
-from the attached access. The field facade's `release`, `covered`, and
-`observe`/`acquire` operations connect the view to the particular field discipline.
-The view is a lower bound on acquired knowledge, not a complete description of
-all memory visible to the runtime.
+- A **write marker** (of type `Ghost.t`) names a point in a domain's sequence of
+  writes. Creating or copying a marker has no runtime effect.
+- A **view** is a set of markers. It is a lower bound on what a domain has seen,
+  not a complete description of the memory visible to it.
+- `Ghost.self` denotes the domain executing the current code.
+- Each frozen or relaxed field gets a **facade**, a ghost module that provides the
+  field's predicates and operations. Its `visible` predicate, indexed by a domain
+  such as `Ghost.self`, states what that domain has seen of the field.
 
-Our jobs use `Domain.spawn` so that the first examples can focus on the field
-rules. The task mechanism transports the applicable visibility facts to the
-worker. Reading an arbitrary atomic cell is not sufficient: the proof must link
-the synchronization to the writes whose visibility is required.
+The contracts of `Domain.spawn`, `Domain.join` and the mutex operations transfer
+these facts automatically. For an explicit atomic handoff, the proof wraps the
+atomic operations: `Ghost.release_scope` attaches a view to an atomic write, and
+`Ghost.acquire_scope` obtains that view from an atomic read of the same location.
+The facade's `release`, `covered` and `observe` operations connect such a view to
+the field.
+
+The jobs below mostly use `Domain.spawn`, so that the examples can concentrate on
+the field rules. Note that reading some unrelated atomic does not help: the proof
+must connect the synchronizing operation to the particular writes that need to be
+visible.
 
 ## Immutable and frozen fields {#sec:immutable-and-frozen-fields}
 
-An immutable record slot cannot change after initialization. Reading `job.id`
-returns its initialized value, including when other locations have races.
-However, an immutable slot containing a pointer does not make the pointed-to
-object immutable, and reading the pointer does not acquire its later mutations.
+An immutable field cannot change after the record is initialized, so a read
+returns its initial value, regardless of races on other fields. If the field holds
+a pointer, though, the object it points to is not thereby immutable, and reading
+the pointer does not acquire that object's later changes.
 
-A **frozen** field is mutable during preparation and becomes immutable through a
-checked proof protocol. This supports descriptors whose final workload is known
-only after construction:
+A **frozen** field may be written while its record is being prepared and becomes
+immutable once the proof freezes it. This suits fields whose final value is only
+known after allocation, such as the job's `total`:
 
 <<< ../examples/frozen_job.ml{caravan}
 
-The proof introduces a facade for the field, seals it on return from `create`,
-and requests frozen reads for `workload`:
+The proof creates a facade `Total` for the field, freezes the field when `create`
+returns, and reads it in `workload` through a frozen read:
 
 <<< ../examples/frozen_job.proof{proof}
 
-`Ghost.Frozen` selects the declared field; it does not allocate another runtime
-cell. Before freezing, full ownership permits writes and private reads use the
-recorded writer's visibility. Transferring private storage to another writer
-requires acquiring the preceding write's visibility; possession of the storage
-resource alone is insufficient.
+`Ghost.Frozen` creates the facade for the field that `field` selects; it does not
+allocate a runtime cell. Before the field is frozen, writing it requires full
+ownership, and the owning domain can read it because it has seen its own writes.
+To pass the unfrozen field to another writer, that writer must first acquire the
+previous write; transferring ownership alone is not enough.
 
-`Total.freeze job` consumes private ownership and establishes a persistent frozen
-fact. Subsequent writes are forbidden by the proof protocol. It adds no runtime
-instruction. `Total.visible Ghost.self job total` combines that frozen fact with
-the current executor's acquired visibility of its final write.
+`Total.freeze job` gives up ownership of the field and establishes a persistent
+fact that the field is frozen; the proof rejects any later write. Freezing executes
+no runtime instruction. `Total.visible Ghost.self job total` combines the frozen
+fact with the fact that the current domain has seen the final write, of `total`.
 
-`Ghost.frozen_scope` wraps the source load selected by `at (job.total)`. Calling
-`read ()` performs that exact load; the wrapper does not insert an atomic load.
-The frozen fact excludes later writes, and acquired visibility excludes older
-values, so the result is exactly `total`.
+In `workload`, `Ghost.frozen_scope` wraps the load selected by `at (job.total)`.
+Calling `read ()` performs exactly that load; the wrapper does not make it atomic.
+Because the field is frozen, no newer value can exist, and because the domain has
+seen the final write, no older value can be returned, so the read yields exactly
+`total`.
 
-The parent and worker can both retain the visibility fact. In `client`, they read
-the same frozen workload and the equality assertion verifies. The immutable `id`
-is protected by the small `identity` invariant: its read can use that invariant
-because the slot has no subsequent writes. It acquires no visibility for `total`.
+Spawning the worker in `client` passes this visibility fact on, so the parent and
+the worker read the same `total` and the final assertion verifies. Reading the
+immutable `id` in `identifier` relies on the small `identity` invariant, which holds
+ownership of `id`; this is possible because `id` is never written again. Reading
+`id` acquires nothing about `total`.
 
-The same example includes explicit atomic publication. `publish` obtains a view
-with `Total.release` and supplies it to `Atomic.make` through a release scope.
-Its ghost return value names that view. The `Total.covered published job total`
-postcondition connects the frozen field to it. In `receive`, the atomic load
-acquires the covered view and `Total.observe` establishes the executor's
-field-specific visibility before the frozen load.
+The same example also passes the job through an atomic channel. In `publish`,
+`Total.release` obtains a view that includes the final write of `total`, and the
+release scope attaches it to the channel created by `Atomic.make`. The ghost return
+value `published` names this view, and `Total.covered published job total` states
+that it includes the final write. In `receive`, the atomic read acquires the view,
+and `Total.observe` turns it into the domain's visibility of `total`, which the
+frozen read then needs.
 
 ## Relaxed fields and write journals {#sec:relaxed-fields-and-write-journals}
 
-Now add a progress estimate that may change after publication:
+The third version adds a progress estimate, which the worker updates after the job
+has been shared:
 
 <<< ../examples/relaxed_job.ml{caravan}
 
-`total` remains frozen. `completed` uses `[@caravan.relaxed]`, allowing ordinary
-reads and writes whose proof accounts for weak observations. This attribute does
-not change OCaml's generated runtime operation or promise an atomic counter.
-In particular, a read-modify-write expression on the field is not an atomic
+`total` is still frozen. `completed` is annotated `[@caravan.relaxed]`: other domains
+may read and write it concurrently with ordinary loads and stores, and the proof must
+account for reads that return outdated values. The annotation does not change the
+code OCaml generates, and it does not make the field an atomic counter; in
+particular, an expression that reads and then writes the field is not an atomic
 increment.
 
-The proof declares a second facade:
+The proof declares a second facade for it:
 
 ```proof
 module Progress = Ghost.Relaxed (struct
@@ -153,127 +205,141 @@ module Progress = Ghost.Relaxed (struct
 end)
 ```
 
-A relaxed field has a **write journal** containing pairs `(event, value)`. An
-unrestricted read may select any entry in that journal. Its result need not be
-the current value, and observing an entry does not acquire the write's visibility.
-Even successive reads need not produce an increasing sequence.
+Caravan models a relaxed field by its **write journal**: the set of all writes to
+the field, each a pair `(event, value)` of a write marker and the written value. An
+unrestricted read may return the value of any write in the journal. It need not be
+the latest one, observing a write does not acquire that write's visibility, and two
+successive reads may even return values in decreasing order of their writes.
 
-`Progress.state job current writes` exposes the complete journal while hiding
-publication metadata. `current` records the last executed write in the model; it is not a promise about
-what the next reader will observe. `Progress.observe job value` returns an event
-for the observation, and `Progress.observed job event value` records a persistent
-fact about that journal entry. Such a fact remains useful after later writes.
+`Progress.state job current writes` describes the full journal, where `current` is
+the value of the most recent write. That is a fact about the order of writes, not a
+promise about what the next read returns. `Progress.observe job value` returns the
+marker of the write that a read observed, and `Progress.observed job event value`
+records that observation as a persistent fact, which remains true after later
+writes.
 
-An invariant can constrain every entry, allowing a read to establish the same
-constraint despite staleness. For example, if every write is between `0` and a
-fixed limit, every unrestricted read is within those bounds. The job example adds
-a preparation value of `-1` to demonstrate when a stronger argument is necessary.
+Because a read can return any write in the journal, an invariant that constrains
+every write also constrains every read. For example, if every write of `completed`
+lies between `0` and the job's total, so does every read, however outdated. The job
+writes `-1` while it is being prepared, which breaks this simple argument; the next
+section shows how to rule that value out.
 
 ## Publication cuts and bounded observations {#sec:publication-cuts-and-bounded-observations}
 
-`create` first initializes `completed` to `-1`, then writes `0` before publishing.
-We want acquired readers to obtain a value between `0` and `total`, although the
-complete write journal still contains `-1`.
+`create` first initializes `completed` to `-1` and then sets it to `0` before the job
+is shared. A domain that has acquired the job should read a value between `0` and
+`total`, even though the journal still contains the write of `-1`.
 
-The proof tracks two sets: `all`, the complete journal, and `eligible`, the entries
-available to an acquired published read:
+The proof therefore tracks two sets of writes: `all`, the full journal, and
+`eligible`, the writes that a domain that has acquired the publication can still
+observe:
 
 <<< ../examples/relaxed_job.proof{proof}
 
-During preparation, writes form an ordered private chain. `Progress.publish job`
-establishes a **publication cut** at its final write. Initially `eligible`
-contains only that write of `0`; later writes extend both journals. Publication
-is a ghost operation, so the cut still needs to reach readers through real
-synchronization. `Progress.visible Ghost.self job` records the acquired cut.
+While the job is private, its writes to `completed` happen in one domain, in a known
+order. `Progress.publish job` places a **publication cut** after the last of them.
+Initially, `eligible` contains only that last write, of `0`; later writes are added
+to both sets. Publishing is a ghost operation, so the cut still has to reach other
+domains through a real synchronizing operation, here `Domain.spawn`.
+`Progress.visible Ghost.self job` states that the current domain has acquired the
+cut.
 
-`Progress.shared_state job current all eligible` exposes the published state.
-The `progress` invariant bounds all entries below by `-1`, but bounds eligible
-entries below by `0`. `set_completed` preserves both properties when it adds a
-new value between `0` and the limit. It promises bounds, not that each new value
-exceeds the preceding one.
+`Progress.shared_state job current all eligible` describes the field after
+publication. The `progress` invariant bounds every write in `all` by `-1` from below
+and every write in `eligible` by `0`, and both by `limit` from above.
+`set_completed` preserves the invariant for any new value between `0` and `limit`.
+It guarantees these bounds, not that each new value is larger than the previous one.
 
-`sample_unrestricted` reads from `all`, giving only the weaker lower bound.
-`sample` requests `Ghost.published_scope` and requires acquired visibility; its
-observation must belong to `eligible`, establishing the stronger lower bound.
-Changing that wrapper to an ordinary scope makes the stronger proof fail.
-Acquiring the cut excludes preparation values; it does not promise freshness
-with respect to subsequent writes.
+`sample_unrestricted` reads without having acquired the cut, so its result is only
+known to be in `all`, which gives the weaker lower bound `-1`. `sample` uses
+`Ghost.published_scope` and requires the domain to have acquired the cut, so its
+result is in `eligible`, which gives the lower bound `0`. Replacing that wrapper by
+an ordinary scope makes the proof of the stronger bound fail. Acquiring the cut
+excludes the values written during preparation, but it does not make the read
+return the latest write.
 
-In `client`, spawning `finish` transfers the frozen workload's visibility to the
-worker. The parent samples progress while the worker may update it. The estimate
-is bounded, but the proof does not claim that it equals `total`, even after the
-join: the local estimate was obtained before the join.
+In `client`, spawning `finish` passes the visibility of the frozen `total` to the
+worker, which then sets the progress to `total`. Meanwhile, the parent samples the
+progress. The proof shows that the sample lies between `0` and `total`, but not that
+it equals `total`: the parent took the sample before joining the worker.
 
-The explicit `[limit : int]` arguments are ghost parameters: access wrappers pass
-the bound to helper contracts without changing runtime calls. The `opens` clauses
-on `finish` and `client` allow their callees to open the frozen-field and progress
-invariants. They describe the proof's invariant mask, not memory fences.
+The bracketed `[limit : int]` parameters are ghost parameters, which pass the bound
+to the contracts of helper functions without changing the runtime calls. The `opens`
+clauses of `finish` and `client` allow their callees to open the invariants of the
+frozen field and of the progress. They concern the proof's invariant masks and have
+nothing to do with memory fences.
 
-The publication protocol requires an ordered private prefix. An unordered write
-by another executor invalidates that private-chain certificate; simply recording
-the most recent writer cannot repair it. After publication, relaxed writes remain
-allowed and need only preserve the journal invariant.
+The publication cut relies on the private writes having happened in one known order.
+A write by another domain before publication breaks this, and remembering which
+domain wrote last does not repair it. After publication, relaxed writes are
+unrestricted except that they must preserve the journal invariant.
 
 ## Raw result slots and validation {#sec:raw-result-slots-and-validation}
 
-Some algorithms clear a payload slot after retiring its object, to release a
-reference for garbage collection. A reader may load the payload before checking
-whether the object is still live. This needs a representation argument in
-addition to relaxed-memory reasoning.
+Some concurrent data structures clear a slot once the object it belongs to is
+retired, so that the garbage collector can reclaim the slot's contents. A reader may
+then load the slot before it checks whether the object is still live, and the value
+it loaded may be the clearing value rather than a real payload. Verifying such a
+reader requires reasoning about what the loaded word represents, in addition to the
+relaxed-memory reasoning above.
 
-The following small example uses a monotone retirement flag. Once `head` is true,
-the slot is retired and its payload may be cleared:
+In the following example, an atomic flag `head` marks the slot as retired. The flag
+only ever changes from `false` to `true`, and once it is `true`, the slot's payload
+may be cleared:
 
 <<< ../examples/raw_result.ml{caravan}
 
-`[@caravan.raw]` is an additional discipline on a relaxed field. The supported
-`Obj.magic ()` occurrence is a specific clearing marker; this does not enable
-general unsafe casts. Raw journals use a logical option carrier: `Some value`
-for an admissible payload write and `None` for a cleared word. Those options are
-proof representations, not the runtime storage layout.
+`[@caravan.raw]` adds rules on top of a relaxed field. Clearing the slot is written
+`Obj.magic ()`; Caravan supports this one occurrence as the clearing value, not
+unsafe casts in general. In the proof, the journal of a raw field holds options:
+`Some value` for a write of a payload and `None` for a write that clears the slot.
+These options are only how the proof represents the writes; the slot itself still
+holds the payload or the clearing word.
 
-A raw load produces a speculative value. `Ghost.raw value` describes its journal
-representation without claiming that it is a valid ordinary payload. Before
-validation, the value cannot be returned as a payload, passed to ordinary
-consumers, dereferenced, or pattern-matched as its source type.
+A read of a raw field produces a speculative value. `Ghost.raw value` describes which
+journal entry it represents, without claiming that it is a valid payload. Until the
+proof has validated the value, the program may not return it as a payload, pass it
+to other code, dereference it, or pattern-match on it as a value of the field's
+type.
 
-The proof records retirement before clearing and reconciles the selected journal
-entry at the following atomic validation:
+The proof records the retirement before the slot is cleared, and connects the entry
+that the read observed to the atomic check of the flag that follows it:
 
 <<< ../examples/raw_result.proof{proof}
 
-`peek` loads the payload first, then reads the flag. A cleared observation implies
-that retirement has already occurred. Because the flag never returns to false,
-a validation observing false rules out a cleared entry. The proof then establishes
-`Ghost.raw value === Some initial`, making it legal to return `Some value` on that
-branch. The retired branch discards the speculative value and returns `None`.
-Returning `Some value` on both branches is rejected.
+`peek` loads the payload first and then reads the flag. If the load observed the
+clearing write, the retirement had already happened, so the flag was already `true`.
+Since the flag never becomes `false` again, a check that finds it `false` rules out
+the clearing write. The proof then establishes `Ghost.raw value === Some initial`,
+which makes returning `Some value` on that branch legal. On the other branch, the
+speculative value is discarded and `peek` returns `None`. Returning `Some value` on
+both branches is rejected.
 
-The validation argument depends on this lifetime protocol and the source ordering
-between the load and its atomic check. An arbitrary later atomic access does not
-validate a payload. Algorithms that reuse states also need an appropriate no-ABA
-argument. See the [OCaml runtime's memory-model note
-MM](https://github.com/ocaml/ocaml/blob/5.5/runtime/memory.c) for the ordering boundary
-underlying this pattern.
+This argument depends on the retirement protocol and on the program order between
+the load and the atomic check that follows it. An atomic access somewhere else does
+not validate the payload. Algorithms that reuse slots or states also need an argument
+that rules out ABA problems. The
+[memory-model notes in OCaml's runtime](https://github.com/ocaml/ocaml/blob/5.5/runtime/memory.c)
+describe the ordering guarantee that this pattern relies on.
 
 ## Choosing a discipline {#sec:choosing-a-discipline}
 
 | Need | Discipline |
 | --- | --- |
-| Private mutation or synchronized ownership transfer | Default ownership |
-| A value fixed at allocation | Immutable field |
-| Private preparation followed by shared exact reads | Frozen field plus acquired visibility |
-| Stale observations constrained by a write invariant | Relaxed field and complete journal |
-| Exclude preparation writes after acquiring publication | Relaxed field with a publication cut |
-| Speculative loads of storage that may contain a clearing word | Raw relaxed field plus validation |
+| Private mutation, or ownership transfer at a synchronization point | Default ownership |
+| A value fixed when the record is created | Immutable field |
+| Private preparation followed by exact reads in several domains | Frozen field plus acquired visibility |
+| Possibly outdated reads, constrained by an invariant on all writes | Relaxed field and its write journal |
+| Excluding writes made before publication, for domains that acquired it | Relaxed field with a publication cut |
+| Speculative loads of a slot that may hold a clearing value | Raw relaxed field plus validation |
 
-These are proof disciplines for existing source operations. Annotations do not
-insert fences, turn ordinary increments into atomic ones, or establish
-linearizability by themselves. The journal invariants, actual synchronization,
-and operation contracts still have to justify the desired behaviour.
+These disciplines are proof rules for the existing source operations. The
+annotations do not insert fences, make increments atomic, or establish
+linearizability. Those properties still have to follow from the journal invariants,
+the actual synchronization, and the operations' contracts.
 
-The source listings above link to the examples and their companion proofs.
-Save each `.ml` beside its matching `.proof` and run:
+The source listings above link to the examples and their companion proofs. Save each
+`.ml` file beside its `.proof` file and run:
 
 ```bash
 caravan owned_job.ml
@@ -283,7 +349,7 @@ caravan raw_result.ml
 ```
 
 The [Saturn bounded queue](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/bounded_queue)
-uses these disciplines together in a larger data-structure proof.
+combines these disciplines in a larger data-structure proof.
 
 Continue with [OCaml coverage](./ocaml-subset) and
 [semantics and verification limits](./semantics).
