@@ -300,12 +300,30 @@ module State_monad = struct
 
   type primitive = { key : primitive_key; name : string; member : R.Member.t }
 
+  (** The names of the requests of a table, so that a request is made once per name;
+      [unnamed] if a request without a name was made. *)
+  module Request_names = struct
+    type t = { named : Set.M(String).t; unnamed : bool }
+
+    let empty = { named = Set.empty (module String); unnamed = false }
+
+    let mem names = function
+      | None -> names.unnamed
+      | Some name -> Set.mem names.named name
+
+    let add names = function
+      | None -> { names with unnamed = true }
+      | Some name -> { names with named = Set.add names.named name }
+  end
+
   type tables = {
     primitives : (string list * primitive list) list;
         (** The atomic operations used so far, by the namespace they are declared in, and
             by their names (see {!Primitives}). *)
     domains : domain_request list;
+    domain_names : Request_names.t;  (** The constraint names of [domains]. *)
     dictionaries : domain_request list;
+    dictionary_names : Request_names.t;  (** The dictionary names of [dictionaries]. *)
     function_instances : function_instance list;
     call_targets : (string list * string) list;
     procedure_implicits : (string * string list) list;
@@ -412,18 +430,22 @@ module State_monad = struct
           in
           List.fold
             (carriers @ Datatypes.family_argument_types types requested)
-            ~init:state.tables.dictionaries
-            ~f:(fun previous typ ->
-              if List.is_empty instances then previous
-              else if
-                List.exists previous ~f:(fun request ->
-                    Option.equal String.equal
-                      (Datatypes.dictionary_name request.domain_types request.domain_type)
-                      (Datatypes.dictionary_name types typ))
-              then previous
-              else previous @ [ { domain_types = types; domain_type = typ } ])
+            ~init:(state.tables.dictionaries, state.tables.dictionary_names)
+            ~f:(fun ((previous, names) as unchanged) typ ->
+              if List.is_empty instances then unchanged
+              else
+                let name = Datatypes.dictionary_name types typ in
+                if Request_names.mem names name then unchanged
+                else
+                  ( previous @ [ { domain_types = types; domain_type = typ } ],
+                    Request_names.add names name ))
         in
-        { state with tables = { state.tables with function_instances; dictionaries } })
+        let dictionaries, dictionary_names = dictionaries in
+        {
+          state with
+          tables =
+            { state.tables with function_instances; dictionaries; dictionary_names };
+        })
 
   let note_domain types typ =
     let* () = note_families types [ typ ] in
@@ -432,12 +454,7 @@ module State_monad = struct
     | Some name when String.equal name Prelude.in_range -> return ()
     | Some name ->
         modify (fun s ->
-            if
-              List.exists s.tables.domains ~f:(fun request ->
-                  Option.equal String.equal
-                    (Datatypes.constraint_name request.domain_types request.domain_type)
-                    (Some name))
-            then s
+            if Request_names.mem s.tables.domain_names (Some name) then s
             else
               {
                 s with
@@ -446,6 +463,7 @@ module State_monad = struct
                     s.tables with
                     domains =
                       s.tables.domains @ [ { domain_types = types; domain_type = typ } ];
+                    domain_names = Request_names.add s.tables.domain_names (Some name);
                   };
               })
 
@@ -510,7 +528,9 @@ module State_monad = struct
         {
           primitives = [];
           domains = [];
+          domain_names = Request_names.empty;
           dictionaries = [];
+          dictionary_names = Request_names.empty;
           function_instances = [];
           call_targets = [];
           procedure_implicits = [];
@@ -1489,12 +1509,7 @@ module State = struct
         | Some dictionary ->
             let* () =
               modify (fun state ->
-                  if
-                    List.exists state.tables.dictionaries ~f:(fun request ->
-                        Option.equal String.equal
-                          (Datatypes.dictionary_name request.domain_types
-                             request.domain_type)
-                          (Some dictionary))
+                  if Request_names.mem state.tables.dictionary_names (Some dictionary)
                   then state
                   else
                     {
@@ -1505,6 +1520,9 @@ module State = struct
                           dictionaries =
                             state.tables.dictionaries
                             @ [ { domain_types = given.types; domain_type = argument } ];
+                          dictionary_names =
+                            Request_names.add state.tables.dictionary_names
+                              (Some dictionary);
                         };
                     })
             in
