@@ -1502,6 +1502,9 @@ let prepare_proc ~given ~past_structures ~proc_name (f : func) =
         {
           given with
           current_procedure = Some proc_name;
+          opened =
+            Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
+                Option.value_map c.opens ~default:[] ~f:snd);
           raw_return = raw.result;
           raw_flow = given.raw_flow || Raw_contract.any raw;
           manual = f.manual;

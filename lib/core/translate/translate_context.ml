@@ -1153,6 +1153,7 @@ let implicit_parameters (predicate : S.predicate) =
 type predicate_body = {
   definition : S.term;
   inline : bool;  (** Never folded or unfolded. *)
+  openable : bool;  (** Declared by [invariant]: what a step can open. *)
   environment : Env.t;
   project_type : Types.type_expr -> Types.type_expr;
 }
@@ -1249,6 +1250,9 @@ type inputs = {
       (** The predicates, by their OCaml names, with their Raven names and parameter
           types. *)
   current_procedure : string option;
+  opened : S.term list;
+      (** The entries of the current procedure's opens clause: the invariants that steps
+          at primitive accesses open around their proofs. *)
   execution_types : Types.type_expr list;
   execution_contract : bool;
       (** Entry-context bindings in preconditions, rather than spatial context ownership.
@@ -1298,6 +1302,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     env;
     preds;
     current_procedure = None;
+    opened = [];
     execution_types = [];
     execution_contract = false;
     mutex_execution = false;

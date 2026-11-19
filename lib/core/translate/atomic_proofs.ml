@@ -2355,7 +2355,7 @@ let linearize ?step ?value ?access_type ?contents ctx ~at
     | None, _, _ -> State.return access
     | Some annotation, Some result, Some result_type ->
         State.map ~f:fst
-          (access_proof ctx annotation ~result_type (fun _ ->
+          (access_proof ctx annotation ~result_type ~bracket:true (fun _ ->
                State.return (access, result, [], [])))
     | Some annotation, _, _ ->
         State.of_result

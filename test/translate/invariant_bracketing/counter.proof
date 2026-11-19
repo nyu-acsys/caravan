@@ -1,0 +1,41 @@
+invariant counter (c : int Atomic.t) = exists value : int. own c value && 0 <= value && value <= 1000
+
+proof result = get c
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c && 0 <= result && result <= 1000) =
+  at (Atomic.get c) (fun read -> let result = read () in result)
+
+proof result = observe c
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c && result <= 1000) =
+  at (Atomic.get c) (fun read ->
+    let result = read () in
+    assert (result = current.value);
+    result)
+
+proof result = try_reset c v
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c) =
+  at (Atomic.compare_and_set c v 0) (fun cas ->
+    let result = cas () in
+    fold counter c {value = (if result then 0 else current.value)};
+    result)
+
+proof result = get_twice c
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c && 0 <= result) =
+  at ((get c)[@occurrence 1]) (fun invoke -> let result = invoke () in result)
+
+proof result = get_namespace c
+  opens { counter _ }
+  requires (counter c)
+  ensures (counter c && 0 <= result) =
+  at (Atomic.get c) (fun read ->
+    unfold counter c;
+    let result = read () in
+    fold counter c;
+    result)

@@ -1865,10 +1865,105 @@ let access_captures_outcome annotation ~outputs =
   in
   Ok (binding scope.scope_body)
 
+(** [body], the proof of a step at a primitive access, with the invariants of the opens
+    clause opened around it: unfolded where it first uses the unfolded state or the
+    operation, under the name [current] (or, if several, the invariant's own name), and
+    folded unchanged before its result. A proof that unfolds an invariant itself keeps it
+    in its hands; one that folds it itself replaces only the unchanged fold. *)
+let bracketed env ~operation (body : S.proof_expr) =
+  let head (t : S.term) =
+    match spine t [] with
+    | { term_desc = Tvar q; _ }, _ when Option.is_none (access_method env q) ->
+        Some (logical_key env q, q)
+    | _ -> None
+  in
+  (* An instance of an invariant, rather than a namespace such as [live _]. *)
+  let openable (t : S.term) =
+    let _, arguments = spine t [] in
+    Option.exists (head t) ~f:(fun (key, _) ->
+        Option.exists
+          (List.Assoc.find env.ctx.given.predicate_bodies key ~equal:String.equal)
+          ~f:(fun body -> body.openable && not body.inline))
+    && not
+         (List.exists arguments ~f:(fun (a : S.term) ->
+              match a.term_desc with
+              | Tvar (Qid id) -> String.equal id.pid_str "_"
+              | _ -> false))
+  in
+  (* The invariants that [p] unfolds, and those it folds. *)
+  let rec handled (p : S.proof_expr) =
+    let key t = Option.to_list (Option.map (head t) ~f:fst) in
+    let both (u1, f1) (u2, f2) = (u1 @ u2, f1 @ f2) in
+    match p.proof_desc with
+    | Proof_unfold (t, _) -> (key t, [])
+    | Proof_fold (t, _) -> ([], key t)
+    | Proof_value _ | Proof_assert _ -> ([], [])
+    | Proof_let (_, a, b) | Proof_seq (a, b) | Proof_if (_, a, b) ->
+        both (handled a) (handled b)
+    | Proof_match (_, cases) ->
+        List.fold cases ~init:([], []) ~f:(fun acc (_, p) -> both acc (handled p))
+  in
+  let candidates =
+    List.filter_map env.ctx.given.opened ~f:(fun t ->
+        if openable t then Option.map (head t) ~f:(fun h -> (t, h)) else None)
+  in
+  let unfolded, folded = handled body in
+  let proof ~at desc = { S.proof_desc = desc; proof_loc = at } in
+  let rec before_result fold (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_let (pattern, value, rest) ->
+        Option.map (before_result fold rest) ~f:(fun rest ->
+            { p with proof_desc = Proof_let (pattern, value, rest) })
+    | Proof_seq (first, rest) ->
+        Option.map (before_result fold rest) ~f:(fun rest ->
+            { p with proof_desc = Proof_seq (first, rest) })
+    | Proof_value _ -> Some (proof ~at:p.proof_loc (Proof_seq (fold, p)))
+    | _ -> None
+  in
+  let open_around body ((t : S.term), (key, q)) =
+    let at = body.S.proof_loc in
+    let refolded =
+      if List.mem folded key ~equal:String.equal then Some body
+      else before_result (proof ~at (Proof_fold (t, []))) body
+    in
+    match refolded with
+    | None -> body
+    | Some _ when List.mem unfolded key ~equal:String.equal -> body
+    | Some body ->
+        let name =
+          match (candidates, q) with
+          | [ _ ], _ -> "current"
+          | _, (S.Qid id | Qdot (_, id)) -> id.pid_str
+        in
+        let unfold = proof ~at (Proof_unfold (t, [])) in
+        let named = List.mem (proof_names body) name ~equal:String.equal in
+        let opened (rest : S.proof_expr) =
+          if named then
+            let pattern = { S.pat_desc = Pid (S.mk_id ~loc:at name); pat_loc = at } in
+            proof ~at:rest.proof_loc (Proof_let (pattern, unfold, rest))
+          else proof ~at:rest.proof_loc (Proof_seq (unfold, rest))
+        in
+        let uses (p : S.proof_expr) =
+          List.exists (proof_names p) ~f:(fun x ->
+              String.equal x operation || (named && String.equal x name))
+        in
+        let rec place (p : S.proof_expr) =
+          match p.proof_desc with
+          | Proof_let (pattern, value, rest) when not (uses value) ->
+              { p with proof_desc = Proof_let (pattern, value, place rest) }
+          | Proof_seq (first, rest) when not (uses first) ->
+              { p with proof_desc = Proof_seq (first, place rest) }
+          | _ -> opened p
+        in
+        place body
+  in
+  List.fold (List.rev candidates) ~init:body ~f:open_around
+
 (** A checked wrapper invokes the original operation once: its statements, and the value
-    of the operation, which [run] gives. *)
+    of the operation, which [run] gives. With [bracket], the step is at a primitive
+    access, which opens the invariants of the opens clause around its proof. *)
 let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_types = [])
-    ?(output_types = []) run =
+    ?(output_types = []) ?(bracket = false) run =
   let open State.Syntax in
   let* scope = State.of_result (Annotation.scope annotation) in
   let* () =
@@ -2075,7 +2170,8 @@ let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_t
       (Option.exists scope.scope_state ~f:(fun p ->
            List.mem (pat_names p) operation.pid_str ~equal:String.equal))
   in
-  before env visible body
+  before env visible
+    (if bracket then bracketed env ~operation:operation.pid_str body else body)
 
 let return_proof ctx annotation ~result_type ~result =
   let open State.Syntax in

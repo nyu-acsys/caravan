@@ -202,6 +202,14 @@ are rejected in manual functions, so the two styles cannot both manage one updat
 Manual proofs can open and close direct invariants, call structural lemmas around
 atomic accesses, abort an update by restoring its precondition, or let another
 thread commit a stored token. Raven checks permissions and atomicity in all cases.
+
+A step at an atomic access opens the invariants that the function's `opens` clause
+names by instance, such as `opens {is_queue t}`. Caravan unfolds the invariant
+before the step's proof first uses its state or the operation, names that state
+`current` (or the invariant's name, if several are open), and folds it unchanged
+before the result. An explicit `fold` replaces the unchanged one, for a step that
+changes the state; an explicit `unfold` leaves the invariant to the proof. Steps at
+calls of checked procedures open nothing, since the callee opens what it needs.
 The complete [segment-based queue](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue_lseg)
 illustrates this style, including helping and exceptional completion.
 

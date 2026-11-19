@@ -385,7 +385,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
                       (error annotation.loc "Ghost.scope requires a manual function proof")
                 in
                 let* scope = State.of_result (Annotation.scope annotation) in
-                access_proof ctx annotation ~result_type:e.exp_type
+                access_proof ctx annotation ~result_type:e.exp_type ~bracket:true
                   ~mode:
                     (if Poly.equal scope.scope_mode S.Published_scope then
                        S.Published_scope
@@ -867,7 +867,7 @@ and native_access ctx (e : Typedtree.expression) run =
       (statements, value)
   | Some annotation ->
       access_proof ctx annotation ~result_type:e.exp_type ~input_types:[] ~output_types:[]
-        (fun values -> run (Some values))
+        ~bracket:true (fun values -> run (Some values))
 
 and mutex_call ctx (e : Typedtree.expression) operation args =
   let at = e.exp_loc in
@@ -1551,7 +1551,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
                  "This publication scope does not match the atomic operation")
       in
       let* statements, value =
-        access_proof ctx annotation ~mode ~result_type:e.exp_type
+        access_proof ctx annotation ~mode ~result_type:e.exp_type ~bracket:true
           ~input_types:[ view_type ] run
       in
       let+ () =
@@ -2004,6 +2004,9 @@ and call ?actual_target ?type_instance ?universal ctx (e : Typedtree.expression)
   | Some annotation ->
       let+ statements, value =
         access_proof ctx annotation ~result_type:e.exp_type
+          ~bracket:
+            (Option.exists signature ~f:(fun signature ->
+                 signature.procedure_physical_atomic))
           ~input_types:(List.map inputs ~f:snd)
           ~output_types:
             (List.map outputs ~f:snd @ if capture_outcome then [ outcome_type ] else [])

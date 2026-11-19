@@ -1799,6 +1799,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 {
                   definition = body;
                   inline = p.pred_inline;
+                  openable =
+                    (match definition with Direct_invariant _ -> true | _ -> false);
                   environment = ocaml_env;
                   project_type = Fn.id;
                 } )
@@ -1813,6 +1815,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 {
                   definition = body;
                   inline = predicate.pred_inline;
+                  openable = false;
                   environment = binding.environment;
                   project_type = Proof_bindings.public_type scoped_proofs;
                 } )
@@ -1836,6 +1839,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   {
                     definition = body;
                     inline = predicate.pred_inline;
+                    openable = false;
                     environment = binding.environment;
                     project_type = Proof_bindings.public_type scoped_proofs;
                   } )
@@ -1859,6 +1863,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                   {
                     definition = body;
                     inline = predicate.pred_inline;
+                    openable = false;
                     environment = view.source.environment;
                     project_type = (fun ty -> project (view.project_type ty));
                   } )
@@ -1874,6 +1879,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 {
                   definition = body;
                   inline = predicate.pred_inline;
+                  openable = false;
                   environment = binding.environment;
                   project_type = Fn.id;
                 } )
