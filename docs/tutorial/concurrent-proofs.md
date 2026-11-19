@@ -210,6 +210,15 @@ before the step's proof first uses its state or the operation, names that state
 before the result. An explicit `fold` replaces the unchanged one, for a step that
 changes the state; an explicit `unfold` leaves the invariant to the proof. Steps at
 calls of checked procedures open nothing, since the callee opens what it needs.
+
+In a long function, `cut p` summarizes the proof so far: Caravan proves `p` and
+verifies the rest of the function from `p` and the values of variables alone, which
+can make the rest much cheaper to check. It is ghost code, in an annotation
+`(*@ cut p *)` or a proof outline's step. In a step that opens invariants, Caravan
+closes them before the cut. The summary must restate everything the rest needs,
+including a pending atomic update (`Push.pending token ...`) and the range of an
+integer read before the cut; the contract's visibility context and the parameters'
+types are kept implicitly.
 The complete [segment-based queue](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue_lseg)
 illustrates this style, including helping and exceptional completion.
 

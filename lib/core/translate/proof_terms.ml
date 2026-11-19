@@ -641,23 +641,6 @@ and predicate_application env ~unfold t witnesses make =
   | _ ->
       State.of_result (error t.term_loc "Expected a predicate applied to its arguments")
 
-(** Ghost annotations invoke checked proof operations. *)
-let proof_statement env =
-  let open State.Syntax in
-  function
-  | S.Fold t -> predicate_use env ~unfold:false t [] R.Stmt.fold
-  | Unfold t -> predicate_use env ~unfold:true t [] R.Stmt.unfold
-  | Fold_with (t, ws) -> predicate_use env ~unfold:false t ws R.Stmt.fold
-  | Unfold_with (t, ws) -> predicate_use env ~unfold:true t ws R.Stmt.unfold
-  | Assert t ->
-      let+ value = formula env t in
-      R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make value)
-  | Ghost_call t ->
-      let* call, outputs = lemma_call env t in
-      if not (List.is_empty outputs) then
-        State.of_result (error t.term_loc "Bind all the results of this lemma")
-      else State.return (R.Stmt.call ~loc:(loc t.term_loc) call)
-
 type proof_target = { target_name : string; target_type : Types.type_expr }
 
 let atomic_proof_signature env t =
@@ -758,6 +741,50 @@ let proof_call ?expected env t =
   | _ ->
       State.map (lemma_call ?expected env t) ~f:(fun (call, outputs) ->
           ([], call, outputs))
+
+(** A cut by [t]: it is proved, and the rest is verified from it and the values of
+    variables alone. *)
+let cut env (t : S.term) =
+  let open State.Syntax in
+  let l = loc t.term_loc in
+  let+ value = formula env t in
+  (* A cut restates what contracts carry implicitly: the visibility context and the
+     type facts of the program parameters. *)
+  let implicit =
+    if env.ctx.given.visibility_execution then
+      Option.to_list
+        (Option.map env.ctx.given.execution_owner
+           ~f:(Execution_contract.visibility_context ~loc:l))
+    else []
+  in
+  let typed =
+    List.filter_map env.ctx.given.program_parameters ~f:(fun (raven, t) ->
+        Datatypes.admissible ~loc:l env.ctx.given.types t
+          (R.Expr.var ~loc:l (name ~loc:l raven)))
+  in
+  let value =
+    List.fold (implicit @ typed) ~init:value ~f:(fun value resource ->
+        R.Expr.binary ~loc:l And value resource)
+  in
+  R.Stmt.cut ~loc:l (R.Spec.make value)
+
+(** Ghost annotations invoke checked proof operations. *)
+let proof_statement env =
+  let open State.Syntax in
+  function
+  | S.Fold t -> predicate_use env ~unfold:false t [] R.Stmt.fold
+  | Unfold t -> predicate_use env ~unfold:true t [] R.Stmt.unfold
+  | Fold_with (t, ws) -> predicate_use env ~unfold:false t ws R.Stmt.fold
+  | Unfold_with (t, ws) -> predicate_use env ~unfold:true t ws R.Stmt.unfold
+  | Assert t ->
+      let+ value = formula env t in
+      R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make value)
+  | Cut t -> cut env t
+  | Ghost_call t ->
+      let* call, outputs = lemma_call env t in
+      if not (List.is_empty outputs) then
+        State.of_result (error t.term_loc "Bind all the results of this lemma")
+      else State.return (R.Stmt.call ~loc:(loc t.term_loc) call)
 
 let proof_signature env (t : S.term) =
   let head, _ = spine t [] in
@@ -1345,7 +1372,7 @@ let rec proof_result_types ?expected env (body : S.proof_expr) =
       let+ ts = proof_value_types ?expected env t in
       Some ts
   | Proof_assert { term_desc = Tfalse; _ } -> State.return None
-  | Proof_assert _ | Proof_fold _ -> State.return (Some [])
+  | Proof_assert _ | Proof_cut _ | Proof_fold _ -> State.return (Some [])
   | Proof_unfold (_, []) -> State.return (Some [])
   | Proof_unfold (predicate, witnesses) ->
       State.of_result (unfold_result_types env predicate witnesses)
@@ -1600,6 +1627,9 @@ let rec proof_expression env targets (body : S.proof_expr) =
       | Tfalse -> State.return [ statement ]
       | _ -> unit_statement statement
       end
+  | Proof_cut t ->
+      let* statement = cut env t in
+      unit_statement statement
   | Proof_fold (t, witnesses) ->
       let* statement = predicate_use env ~unfold:false t witnesses R.Stmt.fold in
       unit_statement statement
@@ -1791,7 +1821,7 @@ let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
 (** Free names in proof expressions, respecting lexical bindings. *)
 let rec proof_names (body : S.proof_expr) =
   match body.proof_desc with
-  | Proof_value t | Proof_assert t | Proof_unfold (t, _) -> term_names t
+  | Proof_value t | Proof_assert t | Proof_cut t | Proof_unfold (t, _) -> term_names t
   | Proof_fold (t, witnesses) ->
       term_names t @ List.concat_map witnesses ~f:(fun (_, t) -> term_names t)
   | Proof_seq (a, b) -> proof_names a @ proof_names b
@@ -1868,8 +1898,9 @@ let access_captures_outcome annotation ~outputs =
 (** [body], the proof of a step at a primitive access, with the invariants of the opens
     clause opened around it: unfolded where it first uses the unfolded state or the
     operation, under the name [current] (or, if several, the invariant's own name), and
-    folded unchanged before its result. A proof that unfolds an invariant itself keeps it
-    in its hands; one that folds it itself replaces only the unchanged fold. *)
+    folded unchanged before its result, or before its first cut, which can only be made
+    with the invariants closed. A proof that unfolds an invariant itself keeps it in its
+    hands; one that folds it itself replaces only the unchanged fold. *)
 let bracketed env ~operation (body : S.proof_expr) =
   let head (t : S.term) =
     match spine t [] with
@@ -1897,7 +1928,7 @@ let bracketed env ~operation (body : S.proof_expr) =
     match p.proof_desc with
     | Proof_unfold (t, _) -> (key t, [])
     | Proof_fold (t, _) -> ([], key t)
-    | Proof_value _ | Proof_assert _ -> ([], [])
+    | Proof_value _ | Proof_assert _ | Proof_cut _ -> ([], [])
     | Proof_let (_, a, b) | Proof_seq (a, b) | Proof_if (_, a, b) ->
         both (handled a) (handled b)
     | Proof_match (_, cases) ->
@@ -1911,6 +1942,8 @@ let bracketed env ~operation (body : S.proof_expr) =
   let proof ~at desc = { S.proof_desc = desc; proof_loc = at } in
   let rec before_result fold (p : S.proof_expr) =
     match p.proof_desc with
+    | Proof_seq ({ proof_desc = Proof_cut _; _ }, _) ->
+        Some (proof ~at:p.proof_loc (Proof_seq (fold, p)))
     | Proof_let (pattern, value, rest) ->
         Option.map (before_result fold rest) ~f:(fun rest ->
             { p with proof_desc = Proof_let (pattern, value, rest) })

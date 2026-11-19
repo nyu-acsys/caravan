@@ -47,7 +47,7 @@ let support ~loc () =
   let event = variable "event" in
   let entries = variable "entries" in
   let published_entries = variable "published_entries" in
-  let cut = variable "cut" in
+  let cut = variable "cut_point" in
   let private_owner = variable "private_owner" in
   let owner = variable "owner" in
   let null = R.Expr.null ~loc in
@@ -127,7 +127,7 @@ let support ~loc () =
       ghost ~implicit:true "event" reference;
       ghost ~implicit:true "entries" entries_type;
       ghost ~implicit:true "published_entries" entries_type;
-      ghost ~implicit:true "cut" reference;
+      ghost ~implicit:true "cut_point" reference;
       ghost ~implicit:true "private_owner" private_owner_type;
     ]
   in
@@ -218,7 +218,7 @@ let support ~loc () =
           (R.Type.named ~loc (name "CutAuth") []);
         R.Member.field ~loc ~ghost:true (ident "private_owner") private_owner_type;
         predicate ~inline:true "published" [ address ]
-          ~returns:[ ghost ~implicit:true "cut" reference ]
+          ~returns:[ ghost ~implicit:true "cut_point" reference ]
           (binary And (binary Neq cut null)
              (R.Expr.own ~loc [ field "publication"; cut_chunk "frag" (agreement cut) ]));
         R.Member.field ~loc ~ghost:true (ident "writes")
@@ -438,7 +438,7 @@ let support ~loc () =
                  (variable "publication_cut") private_owner);
           ];
         procedure ~kind:Lemma "release"
-          [ executing; address; guard; ghost ~implicit:true "cut" reference ]
+          [ executing; address; guard; ghost ~implicit:true "cut_point" reference ]
           [ ghost "released_view" (Visibility_contract.view_type ~loc) ]
           [ permitted; context; published cut; seen owner cut ]
           [
@@ -459,7 +459,7 @@ let support ~loc () =
             address;
             guard;
             ghost "lower" (Visibility_contract.view_type ~loc);
-            ghost ~implicit:true "cut" reference;
+            ghost ~implicit:true "cut_point" reference;
           ]
           []
           [
@@ -488,7 +488,7 @@ let support ~loc () =
             ghost "target" reference;
             address;
             guard;
-            ghost ~implicit:true "cut" reference;
+            ghost ~implicit:true "cut_point" reference;
           ]
           []
           [

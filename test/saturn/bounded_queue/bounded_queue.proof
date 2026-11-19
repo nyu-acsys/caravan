@@ -1160,6 +1160,17 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     issue_fact key current.nodes current.head.position (Head_seen current.head);
     restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
       info following state;
+    cut (is_queue t key && old_tail === info.cell && known key info &&
+      sampled_head key current.head &&
+      Counter.visible Ghost.self old_tail info.word && Capacity.visible Ghost.self old_tail &&
+      retained_view Ghost.self info.incoming && Ghost.seen Ghost.self info.incoming &&
+      min_int <= info.word && info.word <= max_int &&
+      allocated Ghost.self new_node (Some value) candidate_capacity candidate_counter Null &&
+      (exists source_value : 'a. value === source_value) &&
+      Push.pending token t new_node old_tail mono key info value
+        candidate_capacity candidate_counter &&
+      0 <= result && result <= max_int &&
+      result <= t.capacity - (info.position - current.head.position));
     (result, current.head)) in
   let validation = at (let old_head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
     let (prophecy : bool Ghost.Prophecy.t), (terminal : bool) = Ghost.Prophecy.create () in

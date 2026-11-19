@@ -26,6 +26,7 @@ let rec proof_kinds expr =
   | Proof_match (_, cases) ->
       "match" :: List.concat_map (fun (_, body) -> proof_kinds body) cases
   | Proof_assert _ -> [ "assert" ]
+  | Proof_cut _ -> [ "cut" ]
   | Proof_fold (_, witnesses) ->
       [ (if witnesses = [] then "fold" else "fold with witnesses") ]
   | Proof_unfold (_, names) -> [ (if names = [] then "unfold" else "unfold with names") ]

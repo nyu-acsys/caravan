@@ -1253,6 +1253,9 @@ type inputs = {
   opened : S.term list;
       (** The entries of the current procedure's opens clause: the invariants that steps
           at primitive accesses open around their proofs. *)
+  program_parameters : (string * Types.type_expr) list;
+      (** The current procedure's program parameters, by their Raven names, with their
+          types: what a cut restates the type facts of, as the precondition gives them. *)
   execution_types : Types.type_expr list;
   execution_contract : bool;
       (** Entry-context bindings in preconditions, rather than spatial context ownership.
@@ -1303,6 +1306,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     preds;
     current_procedure = None;
     opened = [];
+    program_parameters = [];
     execution_types = [];
     execution_contract = false;
     mutex_execution = false;

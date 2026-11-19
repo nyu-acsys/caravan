@@ -34,7 +34,7 @@ let members ~loc ~implementation =
   let value = variable "value" in
   let writer = variable "last_writer" in
   let fraction = variable "q" in
-  let cut = variable "cut" in
+  let cut = variable "cut_point" in
   let event = variable "event" in
   let next_event = variable "next_event" in
   let result = variable "result" in
@@ -75,7 +75,7 @@ let members ~loc ~implementation =
   let executing = ghost "owner" reference in
   let address = formal "location" reference in
   let implicit_value = ghost ~implicit:true "value" value_type in
-  let implicit_cut = ghost ~implicit:true "cut" reference in
+  let implicit_cut = ghost ~implicit:true "cut_point" reference in
   let implicit_writer = ghost ~implicit:true "last_writer" reference in
   let implicit_event = ghost ~implicit:true "event" reference in
   let positive = binary Gt fraction (R.Expr.real ~loc 0.0) in
@@ -119,7 +119,7 @@ let members ~loc ~implementation =
   @ [
       R.Member.callable
         (R.Callable.func ~loc ~kind:Inv ~formals:[ address ]
-           ~returns:[ implicit_value; ghost ~implicit:true "cut" reference ]
+           ~returns:[ implicit_value; ghost ~implicit:true "cut_point" reference ]
            (ident "frozen")
            (if implementation then
               Some
@@ -191,7 +191,7 @@ let members ~loc ~implementation =
         [ assign result (field "contents") ];
       procedure ~kind:Lemma "freeze"
         [ executing; address; implicit_value; implicit_event ]
-        [ ghost ~implicit:true "cut" reference ]
+        [ ghost ~implicit:true "cut_point" reference ]
         [ context; ownership value one owner ]
         [ context; frozen; seen; binary Eq cut event ]
         [
@@ -329,7 +329,7 @@ let members ~loc ~implementation =
         []
         [ context; variable "selected"; ownership value one owner ]
         [ context; call "frozen" [ location; value; event ]; seen_event owner ]
-        (R.Stmt.local ~loc ~ghost:true ~typ:reference (ident "cut")
+        (R.Stmt.local ~loc ~ghost:true ~typ:reference (ident "cut_point")
         @ [ assign cut (call "freeze" [ owner; location; value; event ]) ]);
       procedure ~kind:Lemma "release"
         [
@@ -359,7 +359,7 @@ let members ~loc ~implementation =
       procedure
         ~opens:[ (name "frozen", [ location; value; cut ]) ]
         "read_frozen"
-        [ executing; address; implicit_value; ghost ~implicit:true "cut" reference ]
+        [ executing; address; implicit_value; ghost ~implicit:true "cut_point" reference ]
         [ formal "result" value_type ]
         [ context; frozen; seen ]
         [ context; frozen; seen; binary Eq result value; holds result ]

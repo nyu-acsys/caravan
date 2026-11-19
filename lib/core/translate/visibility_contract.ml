@@ -354,21 +354,21 @@ let members ~loc ~implementation =
   @ [
       lemma "visibility_checkpoint"
         [ reference "owner" ]
-        [ reference "cut" ]
+        [ reference "cut_point" ]
         [ context ]
         [
           context;
-          seen (R.Expr.set ~loc [ variable ~loc "cut" ]);
-          R.Expr.binary ~loc Neq (variable ~loc "cut") (R.Expr.null ~loc);
+          seen (R.Expr.set ~loc [ variable ~loc "cut_point" ]);
+          R.Expr.binary ~loc Neq (variable ~loc "cut_point") (R.Expr.null ~loc);
         ]
         ([
            R.Stmt.ghost_block ~loc
-             [ R.Stmt.assign ~loc [ variable ~loc "cut" ] (R.Stmt.new_rhs []) ];
+             [ R.Stmt.assign ~loc [ variable ~loc "cut_point" ] (R.Stmt.new_rhs []) ];
          ]
         @ R.Stmt.local ~loc ~ghost:true ~typ:(view_type ~loc)
             ~init:
               (R.Stmt.expr_rhs
-                 (acquire ~loc owner (R.Expr.set ~loc [ variable ~loc "cut" ])))
+                 (acquire ~loc owner (R.Expr.set ~loc [ variable ~loc "cut_point" ])))
             (ident ~loc "checkpoint_view"));
     ]
   @

@@ -83,7 +83,7 @@ let kind (annotation : t) =
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
   | "module" :: _ -> Ghost_module
-  | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
+  | ("fold" | "unfold" | "assert" | "cut" | "lemma") :: _ -> Ghost
   | ( "Ghost.scope" | "Ghost.State.scope" | "Ghost.frozen_scope"
     | "Ghost.State.frozen_scope" | "Ghost.published_scope" | "Ghost.State.published_scope"
     | "Ghost.release_scope" | "Ghost.acquire_scope" | "Ghost.State.release_scope"

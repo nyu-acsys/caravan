@@ -50,6 +50,7 @@
         "atomic", ATOMIC;
         "begin", BEGIN;
         "commit", COMMIT;
+        "cut", CUT;
         "rec", REC;
         "fold", FOLD;
         "fun", FUN;

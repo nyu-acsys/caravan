@@ -51,7 +51,7 @@ let loop_outline_terms annotation terms =
                  Result.map (logical body) ~f:(fun body -> (pattern, body))))
         in
         Ok (term (Tmatch (value, cases)))
-    | Proof_assert _ | Proof_fold _ | Proof_unfold _ | Proof_seq _ ->
+    | Proof_assert _ | Proof_cut _ | Proof_fold _ | Proof_unfold _ | Proof_seq _ ->
         error expression.proof_loc
           "An outline binding used by a loop invariant must be a logical expression"
   in

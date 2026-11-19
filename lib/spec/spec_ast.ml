@@ -165,6 +165,8 @@ type ghost_stmt =
   | Fold of term
   | Unfold of term
   | Assert of term
+  | Cut of term
+      (** Proves its assertion, and verifies the rest from that assertion alone. *)
   | Fold_with of term * (id * term) list
   | Unfold_with of term * (id * term) list
   | Ghost_call of term
@@ -178,6 +180,7 @@ and proof_desc =
   | Proof_if of term * proof_expr * proof_expr
   | Proof_match of term * (pat * proof_expr) list
   | Proof_assert of term
+  | Proof_cut of term
   | Proof_fold of term * (id * term) list
   | Proof_unfold of term * id list
 

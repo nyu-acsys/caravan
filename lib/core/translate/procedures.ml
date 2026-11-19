@@ -498,6 +498,18 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
   let types =
     List.filter_map named ~f:(fun (x, _, t) -> Option.map t ~f:(fun t -> (x, t)))
   in
+  let ctx =
+    {
+      ctx with
+      given =
+        {
+          ctx.given with
+          program_parameters =
+            List.filter_map params ~f:(fun (_, raven, t) ->
+                Option.map t ~f:(fun t -> (raven, t)));
+        };
+    }
+  in
   let env =
     {
       ctx;

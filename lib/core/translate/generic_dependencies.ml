@@ -14,7 +14,8 @@ let rec proof_references bound (expression : S.proof_expr) =
   let term = Translate_context.term_references bound in
   let proof = proof_references bound in
   match expression.proof_desc with
-  | Proof_value value | Proof_assert value | Proof_unfold (value, _) -> term value
+  | Proof_value value | Proof_assert value | Proof_cut value | Proof_unfold (value, _) ->
+      term value
   | Proof_fold (value, witnesses) ->
       term value @ List.concat_map witnesses ~f:(fun (_, value) -> term value)
   | Proof_let (pattern, value, body) ->
@@ -95,6 +96,7 @@ let annotation_references (annotation : Annotation.t) =
             | S.Fold term
             | Unfold term
             | Assert term
+            | Cut term
             | Unfold_with (term, _)
             | Ghost_call term ->
                 terms [ term ]

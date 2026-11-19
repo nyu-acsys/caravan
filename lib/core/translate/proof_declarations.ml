@@ -304,7 +304,7 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
     | Proof_match (_, cases) ->
         List.concat_map cases ~f:(fun (pattern, body) ->
             calls at (pat_names pattern @ bound) body)
-    | Proof_fold _ | Proof_unfold _ | Proof_assert _ -> []
+    | Proof_fold _ | Proof_unfold _ | Proof_assert _ | Proof_cut _ -> []
   in
   let graph =
     List.filter_map declarations ~f:(function

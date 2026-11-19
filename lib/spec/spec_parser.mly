@@ -96,7 +96,7 @@
     | Proof_match (t, cases) ->
         { term_desc = Tmatch (t, List.map (fun (p, body) -> p, term_of_proof body) cases);
           term_loc = e.proof_loc }
-    | Proof_seq _ | Proof_assert _ | Proof_fold _ | Proof_unfold _ ->
+    | Proof_seq _ | Proof_assert _ | Proof_cut _ | Proof_fold _ | Proof_unfold _ ->
         raise (Syntax_error (e.proof_loc,
           "A proof operation cannot occur in a logical expression"))
 
@@ -239,7 +239,7 @@
 
 (* Contract tokens *)
 
-%token REQUIRES ENSURES VARIANT OPENS PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT ATOMIC
+%token REQUIRES ENSURES VARIANT OPENS PURE INVARIANT PREDICATE FOLD UNFOLD ASSERT CUT ATOMIC
 %token ATOMIC_REQUIRES ATOMIC_ENSURES ATOMIC_RAISES RAISES COMMIT RETURNING TYPE VIEW LEFTBRC RIGHTBRC
 %token ACTION INITIALLY PERFORMS CONSUMES LINEARIZES LEADSTO CONTINUES WAIT ON HELPS AS PROOF AT
 %token LIST_SEGMENT
@@ -552,7 +552,7 @@ anchor_nonident_token:
 | UIDENT | OP1 | OP2 | OP3 | OP4
 | OPPREF | QUOTE_LIDENT | BACKQUOTE_LIDENT | POLY_TAG | ATTRIBUTE | INTEGER | FLOAT | CHAR
 | STRING | REQUIRES | ENSURES | VARIANT | PURE | INVARIANT | PREDICATE
-| FOLD | UNFOLD | ASSERT | ATOMIC | ATOMIC_REQUIRES | ATOMIC_ENSURES | ATOMIC_RAISES
+| FOLD | UNFOLD | ASSERT | CUT | ATOMIC | ATOMIC_REQUIRES | ATOMIC_ENSURES | ATOMIC_RAISES
 | RAISES | COMMIT | RETURNING | TYPE | VIEW | ACTION | INITIALLY
 | PERFORMS | CONSUMES | LINEARIZES | LEADSTO | CONTINUES | WAIT | ON
 | HELPS | AS | PROOF | AT | LEMMA | RETURNS | OF
@@ -875,6 +875,7 @@ ghost_stmt:
 | UNFOLD t = term ws = ghost_witnesses?
     { match ws with None -> Unfold t | Some ws -> Unfold_with (t, ws) }
 | ASSERT t = term { Assert t }
+| CUT t = term { Cut t }
 | LEMMA t = term { Ghost_call t }
 ;
 
@@ -892,6 +893,8 @@ proof_nonseq:
     { mk_proof (Proof_match (term_of_proof t, cases)) $loc }
 | ASSERT t = proof_value_expr
     { mk_proof (Proof_assert (term_of_proof t)) $loc }
+| CUT t = proof_value_expr
+    { mk_proof (Proof_cut (term_of_proof t)) $loc }
 | FOLD t = proof_value_expr
     { let t, ws = record_argument (term_of_proof t) in
       mk_proof (Proof_fold (t, ws)) $loc }
