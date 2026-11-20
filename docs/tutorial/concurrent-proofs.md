@@ -199,6 +199,15 @@ proof code. This is the external-outline form of an inline
 selects manual mode. Automatic `commit`, `returning`, and `performs` annotations
 are rejected in manual functions, so the two styles cannot both manage one update.
 
+In the proof of an operation, `access`, `commit`, `commit_raise` and `abort` on its
+own update, and `pending`, `committed` and `raised` about it, may omit the update's
+arguments: they are the operation's parameters, so `Read.access token` and
+`Read.commit token result` suffice here. A step at a call that fulfills the update,
+such as a retry calling the operation recursively, can delegate it to the call:
+`Read.delegate token invoke args` opens the update, runs the call with its ghost
+arguments `args`, and commits with the call's result, or with its exception if it
+raised.
+
 Manual proofs can open and close direct invariants, call structural lemmas around
 atomic accesses, abort an update by restoring its precondition, or let another
 thread commit a stored token. Raven checks permissions and atomicity in all cases.

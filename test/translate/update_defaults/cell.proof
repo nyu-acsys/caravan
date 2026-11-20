@@ -1,0 +1,17 @@
+predicate [@inline] contents (cell : 'a Atomic.t) (value : 'a) = own cell value
+
+module Read = Ghost.AU (struct let operation = read end)
+module Again = Ghost.AU (struct let operation = read_again end)
+
+proof read =
+  at (Atomic.get cell) (fun step ->
+    let token = Read.bind () in
+    let value = Read.access token in
+    let result = step () in
+    Read.commit token result;
+    result)
+
+proof read_again =
+  at (read cell) (fun invoke ->
+    let token = Again.bind () in
+    Again.delegate token invoke ())

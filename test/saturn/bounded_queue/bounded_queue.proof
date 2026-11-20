@@ -1290,8 +1290,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
       min_int <= info.word && info.word <= max_int &&
       allocated Ghost.self new_node (Some value) candidate_capacity candidate_counter Null &&
       (exists source_value : 'a. value === source_value) &&
-      Push.pending token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter &&
+      Push.pending token &&
       0 <= result && result <= max_int &&
       result <= t.capacity - (info.position - current.head.position));
     (result, current.head)) in
@@ -1308,14 +1307,11 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
       assert (wrap_once (t.capacity - wrap_once (info.word - current.head.word)) = 0);
       if terminal then begin
         length_at t current;
-        let values = Push.access token t new_node old_tail mono key info value
-          candidate_capacity candidate_counter in
+        let values = Push.access token in
         assert (values === current.values && List.length values = t.capacity);
         begin match mono with
-        | Bool -> Push.commit token t new_node old_tail mono key info value
-            candidate_capacity candidate_counter false
-        | Unit -> Push.commit_raise token t new_node old_tail mono key info value
-            candidate_capacity candidate_counter Full
+        | Bool -> Push.commit token false
+        | Unit -> Push.commit_raise token Full
         end
       end else ()
     end else ();
@@ -1333,16 +1329,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     restore_at t current info following changed;
     result);
   at (push_as t new_node old_tail mono) (fun invoke ->
-    let values = Push.access token t new_node old_tail mono key info value
-      candidate_capacity candidate_counter in
-    let (result, outcome) = invoke (key, info, value, candidate_capacity, candidate_counter) in
-    begin match outcome with
-    | None -> Push.commit token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter result
-    | Some exception_ -> Push.commit_raise token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter exception_
-    end;
-    result);
+    Push.delegate token invoke (key, info, value, candidate_capacity, candidate_counter));
   let successor = at ((get_next old_tail)[@occurrence 1]) (fun read ->
     position_at t current sampled;
     let (following, state) = expose_at t current info in
@@ -1367,16 +1354,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
         next in
     (result, next)) in
   at (push_as t new_node next mono) (fun invoke ->
-    let values = Push.access token t new_node old_tail mono key info value
-      candidate_capacity candidate_counter in
-    let (result, outcome) = invoke (key, successor, value, candidate_capacity, candidate_counter) in
-    begin match outcome with
-    | None -> Push.commit token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter result
-    | Some exception_ -> Push.commit_raise token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter exception_
-    end;
-    result);
+    Push.delegate token invoke (key, successor, value, candidate_capacity, candidate_counter));
   at (set_capacity new_node (capacity - 1)) (fun write ->
     let candidate = unfold allocated Ghost.self new_node (Some value)
       candidate_capacity candidate_counter Null in
@@ -1410,8 +1388,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let fresh = {cell = new_node; initial = Some value; word = wrap_once (info.word + 1);
       turn = info.turn + correction (info.word + 1); position = info.position + 1;
       incoming = released; cleanup = candidate.cleanup_key} in
-    let values = Push.access token t new_node old_tail mono key info value
-      candidate_capacity candidate_counter in
+    let values = Push.access token in
     let result = cas (state.channel,
       (match following with [] -> (Link Null : 'a link) | next :: _ -> Link next.cell),
       state.released, released) in
@@ -1431,10 +1408,8 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
           fresh_state value;
         Ghost.write (Ghost.at contents key) (current.values @ [value]);
         begin match mono with
-        | Bool -> Push.commit token t new_node old_tail mono key info value
-            candidate_capacity candidate_counter true
-        | Unit -> Push.commit token t new_node old_tail mono key info value
-            candidate_capacity candidate_counter ()
+        | Bool -> Push.commit token true
+        | Unit -> Push.commit token ()
         end;
         Stdlib_model.List.append_singleton current.nodes fresh;
         waiting_help t key current.waiting current.watching current.nodes fresh (current.values @ [value]);
@@ -1444,7 +1419,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
           cells = Finset.union current.cells (Finset.singleton new_node)};
         (None : 'a node_info option)
       end else begin
-        Push.abort token t new_node old_tail mono key info value candidate_capacity candidate_counter;
+        Push.abort token;
         let next = match following with [] -> assert false | next :: _ -> next in
         issue_at key current (Published next);
         restore_at t current info following state;
@@ -1473,16 +1448,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     issue_at key current (Published next);
     (result, next)) in
   at (push_as t new_node (link_as_node (get_next old_tail)) mono) (fun invoke ->
-    let values = Push.access token t new_node old_tail mono key info value
-      candidate_capacity candidate_counter in
-    let (result, outcome) = invoke (key, retry_info, value, capacity - 1, wrap_once (info.word + 1)) in
-    begin match outcome with
-    | None -> Push.commit token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter result
-    | Some exception_ -> Push.commit_raise token t new_node old_tail mono key info value
-        candidate_capacity candidate_counter exception_
-    end;
-    result);
+    Push.delegate token invoke (key, retry_info, value, capacity - 1, wrap_once (info.word + 1)));
   at (Atomic.compare_and_set t.tail old_tail new_node) Ghost.release_scope (fun cas ->
     let (fresh, _failed_next) = attempt in
     let result = cas fresh.incoming in
@@ -1512,11 +1478,7 @@ proof result = atomic try_push [key : Ghost.t] t value
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Bool) (fun invoke ->
     let token = Try_push.bind () in
-    let values = Try_push.access token t value key in
-    let (result, outcome) = invoke (key, info, value, 0, 0) in
-    assert (outcome === None);
-    Try_push.commit token t value key result;
-    result)
+    Try_push.delegate token invoke (key, info, value, 0, 0))
 
 proof result = atomic push_exn [key : Ghost.t] t value
   opens {is_queue t; Counter.frozen}
@@ -1534,13 +1496,7 @@ proof result = atomic push_exn [key : Ghost.t] t value
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Unit) (fun invoke ->
     let token = Push_exn.bind () in
-    let values = Push_exn.access token t value key in
-    let (result, outcome) = invoke (key, info, value, 0, 0) in
-    begin match outcome with
-    | None -> Push_exn.commit token t value key ()
-    | Some exception_ -> Push_exn.commit_raise token t value key exception_
-    end;
-    result)
+    Push_exn.delegate token invoke (key, info, value, 0, 0))
 
 module Peek = Ghost.AU (struct let operation = peek_as end)
 
@@ -1559,7 +1515,7 @@ proof result = atomic peek_as [key : Ghost.t] t poly
     issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let successor = at (fenceless_get_next old_head) (fun read ->
-    let values = Peek.access token t poly key in
+    let values = Peek.access token in
     let (following, state) = expose_at t current sampled in
     let result = read (state.channel,
       first_link following,
@@ -1570,13 +1526,13 @@ proof result = atomic peek_as [key : Ghost.t] t poly
     | [] ->
         no_values_at t current;
         begin match poly with
-        | Option -> Peek.commit token t poly key None
-        | Value -> Peek.commit_raise token t poly key Empty
+        | Option -> Peek.commit token None
+        | Value -> Peek.commit_raise token Empty
         end;
         sampled
     | next :: _ ->
         issue_at key current (Published next);
-        Peek.abort token t poly key;
+        Peek.abort token;
         next in
     (result, next)) in
   let event = at (let value = r.value) (fun read ->
@@ -1588,7 +1544,7 @@ proof result = atomic peek_as [key : Ghost.t] t poly
     (result, event)) in
   at (Atomic.get t.head) (fun read ->
     let next = successor in
-    let values = Peek.access token t poly key in
+    let values = Peek.access token in
     let (following, state) = expose_at t current next in
     Payload.reconcile next.cell event (Ghost.raw value);
     let result = read () in
@@ -1601,19 +1557,13 @@ proof result = atomic peek_as [key : Ghost.t] t poly
       let item = match current.values with [] -> assert false | item :: _ -> item in
       assert (Ghost.raw value === Some item);
       begin match poly with
-      | Option -> Peek.commit token t poly key (Some item)
-      | Value -> Peek.commit token t poly key item
+      | Option -> Peek.commit token (Some item)
+      | Value -> Peek.commit token item
       end
-    end else Peek.abort token t poly key;
+    end else Peek.abort token;
     result);
   at (peek_as t poly) (fun invoke ->
-    let values = Peek.access token t poly key in
-    let (result, outcome) = invoke key in
-    begin match outcome with
-    | None -> Peek.commit token t poly key result
-    | Some exception_ -> Peek.commit_raise token t poly key exception_
-    end;
-    result)
+    Peek.delegate token invoke key)
 
 module Peek_opt = Ghost.AU (struct let operation = peek_opt end)
 module Peek_exn = Ghost.AU (struct let operation = peek_exn end)
@@ -1626,11 +1576,7 @@ proof result = atomic peek_opt [key : Ghost.t] t
     result === (match values with [] -> None | item :: _ -> Some item)) =
   at (peek_as t Option) (fun invoke ->
     let token = Peek_opt.bind () in
-    let values = Peek_opt.access token t key in
-    let (result, outcome) = invoke key in
-    assert (outcome === None);
-    Peek_opt.commit token t key result;
-    result)
+    Peek_opt.delegate token invoke key)
 
 proof result = atomic peek_exn [key : Ghost.t] t
   opens {is_queue t}
@@ -1641,13 +1587,7 @@ proof result = atomic peek_exn [key : Ghost.t] t
   atomic raises Empty -> (queue t key values && values === []) =
   at (peek_as t Value) (fun invoke ->
     let token = Peek_exn.bind () in
-    let values = Peek_exn.access token t key in
-    let (result, outcome) = invoke key in
-    begin match outcome with
-    | None -> Peek_exn.commit token t key result
-    | Some exception_ -> Peek_exn.commit_raise token t key exception_
-    end;
-    result)
+    Peek_exn.delegate token invoke key)
 
 module Pop = Ghost.AU (struct let operation = pop_as end)
 
@@ -1667,7 +1607,7 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let successor = at (fenceless_get_next old_head) (fun read ->
-    let values = Pop.access token t backoff poly key in
+    let values = Pop.access token in
     let (following, state) = expose_at t current sampled in
     let result = read (state.channel, first_link following,
       state.released) in
@@ -1677,18 +1617,18 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     | [] ->
         no_values_at t current;
         begin match poly with
-        | Option -> Pop.commit token t backoff poly key None
-        | Value -> Pop.commit_raise token t backoff poly key Empty
-        | Unit -> Pop.commit_raise token t backoff poly key Empty
+        | Option -> Pop.commit token None
+        | Value -> Pop.commit_raise token Empty
+        | Unit -> Pop.commit_raise token Empty
         end;
         sampled
     | next :: _ ->
         issue_at key current (Published next);
-        Pop.abort token t backoff poly key;
+        Pop.abort token;
         next in
     (result, next)) in
   at (Atomic.compare_and_set t.head old_head new_head) Ghost.release_scope (fun cas ->
-    let values = Pop.access token t backoff poly key in
+    let values = Pop.access token in
     let result = cas successor.incoming in
     if result then begin
       same_cell_at t current sampled current.head;
@@ -1698,16 +1638,16 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
       let updated = retire_at t current successor in
       Ghost.write (Ghost.at contents key) updated;
       begin match poly with
-      | Option -> Pop.commit token t backoff poly key (Some item)
-      | Value -> Pop.commit token t backoff poly key item
-      | Unit -> Pop.commit token t backoff poly key ()
+      | Option -> Pop.commit token (Some item)
+      | Value -> Pop.commit token item
+      | Unit -> Pop.commit token ()
       end;
       grow_facts key current.nodes current.head.position current.nodes successor.position;
       issue_fact key current.nodes successor.position (Head_seen successor);
       fold is_queue t key {nodes = current.nodes; head = successor; tail = current.tail;
         values = updated; cells = current.cells}
     end else begin
-      Pop.abort token t backoff poly key;
+      Pop.abort token;
       fold is_queue t key
     end;
     result);
@@ -1732,13 +1672,7 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     restore_at t current successor following changed;
     result);
   at (pop_as t (Backoff.once backoff) poly) (fun invoke ->
-    let values = Pop.access token t backoff poly key in
-    let (result, outcome) = invoke key in
-    begin match outcome with
-    | None -> Pop.commit token t backoff poly key result
-    | Some exception_ -> Pop.commit_raise token t backoff poly key exception_
-    end;
-    result)
+    Pop.delegate token invoke key)
 
 module Pop_opt = Ghost.AU (struct let operation = pop_opt end)
 module Pop_exn = Ghost.AU (struct let operation = pop_exn end)
@@ -1753,11 +1687,7 @@ proof result = atomic pop_opt [key : Ghost.t] t
     | item :: rest -> queue t key rest && result === Some item) =
   at (pop_as t Backoff.default Option) (fun invoke ->
     let token = Pop_opt.bind () in
-    let values = Pop_opt.access token t key in
-    let (result, outcome) = invoke key in
-    assert (outcome === None);
-    Pop_opt.commit token t key result;
-    result)
+    Pop_opt.delegate token invoke key)
 
 proof result = atomic pop_exn [key : Ghost.t] t
   opens {is_queue t}
@@ -1769,13 +1699,7 @@ proof result = atomic pop_exn [key : Ghost.t] t
   atomic raises Empty -> (queue t key values && values === []) =
   at (pop_as t Backoff.default Value) (fun invoke ->
     let token = Pop_exn.bind () in
-    let values = Pop_exn.access token t key in
-    let (result, outcome) = invoke key in
-    begin match outcome with
-    | None -> Pop_exn.commit token t key result
-    | Some exception_ -> Pop_exn.commit_raise token t key exception_
-    end;
-    result)
+    Pop_exn.delegate token invoke key)
 
 proof result = atomic drop_exn [key : Ghost.t] t
   opens {is_queue t}
@@ -1785,13 +1709,7 @@ proof result = atomic drop_exn [key : Ghost.t] t
   atomic raises Empty -> (queue t key values && values === []) =
   at (pop_as t Backoff.default Unit) (fun invoke ->
     let token = Drop_exn.bind () in
-    let values = Drop_exn.access token t key in
-    let (result, outcome) = invoke key in
-    begin match outcome with
-    | None -> Drop_exn.commit token t key ()
-    | Some exception_ -> Drop_exn.commit_raise token t key exception_
-    end;
-    result)
+    Drop_exn.delegate token invoke key)
 
 proof result = atomic is_empty [key : Ghost.t] t
   opens {is_queue t}
@@ -1800,7 +1718,7 @@ proof result = atomic is_empty [key : Ghost.t] t
   atomic ensures (queue t key values && (result <-> values === [])) =
   let token = Empty.bind () in
   let (sampled, reg) = at (let head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
-    let values = Empty.access token t key in
+    let values = Empty.access token in
     let (following, state) = expose_at t current current.head in
     let result = read current.head.incoming in
     restore_at t current current.head following state;
@@ -1809,11 +1727,11 @@ proof result = atomic is_empty [key : Ghost.t] t
     | next :: _ ->
         position_at t current next;
         head_value_at t current next;
-        Empty.commit token t key false;
+        Empty.commit token false;
         true
     | [] ->
         no_values_at t current;
-        Empty.abort token t key;
+        Empty.abort token;
         false in
     let reg = Ghost.alloc [
       Ghost.init waiting_token token;
@@ -1906,10 +1824,10 @@ proof result = atomic snapshot [key : Ghost.t] t
           assert (sampled_tail.position = List.length current.nodes - 1);
           counter_difference sampled.word sampled_tail.word sampled.position sampled_tail.position
             sampled.turn sampled_tail.turn;
-          let values = Snapshot.access token t key in
+          let values = Snapshot.access token in
           fold snapshot_value Ghost.self head tail (List.length values)
             {first = sampled.word; last = sampled_tail.word};
-          Snapshot.commit token t key (head, tail)
+          Snapshot.commit token (head, tail)
         end else ();
         sampled_tail in
     issue_at key current (Head_seen current.head);
@@ -1921,10 +1839,7 @@ proof result = atomic snapshot [key : Ghost.t] t
     fold is_queue t key {tail = (if result then next else current.tail)};
     result);
   at ((snapshot t)[@occurrence 1]) (fun invoke ->
-    let values = Snapshot.access token t key in
-    let result = invoke key in
-    Snapshot.commit token t key result;
-    result);
+    Snapshot.delegate token invoke key);
   at (Atomic.get t.head) (fun read ->
     let (prophecy, success, seen_head, _next) = checkpoint in
     let result = read () in
@@ -1936,10 +1851,7 @@ proof result = atomic snapshot [key : Ghost.t] t
     end else assert (not success);
     result);
   at (snapshot t) (fun invoke ->
-    let values = Snapshot.access token t key in
-    let result = invoke key in
-    Snapshot.commit token t key result;
-    result)
+    Snapshot.delegate token invoke key)
 
 proof result = atomic length [key : Ghost.t] t
   opens {is_queue t; Counter.frozen}
@@ -1948,12 +1860,12 @@ proof result = atomic length [key : Ghost.t] t
   atomic ensures (queue t key values && result = List.length values) =
   at (snapshot t) (fun invoke ->
     let token = Length.bind () in
-    let values = Length.access token t key in
+    let values = Length.access token in
     let result = invoke key in
     let (head, tail) = result in
     let (first, last) = unfold snapshot_value Ghost.self head tail (List.length values)
       {first; last} in
-    Length.commit token t key (wrap_once (last - first));
+    Length.commit token (wrap_once (last - first));
     result)
 
 proof result = atomic is_full [key : Ghost.t] t
@@ -1963,7 +1875,7 @@ proof result = atomic is_full [key : Ghost.t] t
   atomic ensures (queue t key values && (result <-> List.length values = t.capacity)) =
   at (length t) (fun invoke ->
     let token = Is_full.bind () in
-    let values = Is_full.access token t key in
+    let values = Is_full.access token in
     let result = invoke key in
-    Is_full.commit token t key (result = t.capacity);
+    Is_full.commit token (result = t.capacity);
     result)

@@ -626,6 +626,22 @@ let rec contract_env ctx ~spec_funcs (f : func) formals ~result =
     List.fold implicit ~init:env ~f:(fun env (x, raven, t, _) ->
         { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
   in
+  let env =
+    {
+      env with
+      ctx =
+        {
+          env.ctx with
+          given =
+            {
+              env.ctx.given with
+              own_update_arguments =
+                List.map params ~f:(fun (x, _, _) -> x)
+                @ List.map ghosts ~f:(fun (x, _, _) -> x);
+            };
+        };
+    }
+  in
   (result_name, env, implicit, ghosts)
 
 (** [env] with the names that preconditions of [f] define by a constructor's arguments, as

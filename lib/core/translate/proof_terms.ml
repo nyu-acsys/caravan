@@ -742,6 +742,276 @@ let proof_call ?expected env t =
       State.map (lemma_call ?expected env t) ~f:(fun (call, outputs) ->
           ([], call, outputs))
 
+(** [t] with the update operations on the current procedure's own atomic update that omit
+    its arguments given them: the procedure's parameters, which must not be rebound where
+    they are omitted. *)
+let rec with_update_arguments env ~bound (t : S.term) =
+  let ( let* ) = Result.( >>= ) in
+  let ( let+ ) r f = Result.map r ~f in
+  let return = Result.return in
+  let sub ?(bound = bound) t = with_update_arguments env ~bound t in
+  let at = t.S.term_loc in
+  let* desc =
+    match t.term_desc with
+    | Ttrue | Tfalse | Tconst _ | Tvar _ -> return t.term_desc
+    | Tfield (a, f) ->
+        let+ a = sub a in
+        S.Tfield (a, f)
+    | Tapply _ ->
+        (* An application is checked once, as a whole: not its partial applications. *)
+        let head, args = spine t [] in
+        let* head = match head.term_desc with Tvar _ -> return head | _ -> sub head in
+        let+ args = Result.all (List.map args ~f:sub) in
+        (List.fold args ~init:head ~f:(fun f a -> S.mk_term (Tapply (f, a)) at)).term_desc
+    | Tinfix (a, op, b) ->
+        let* a = sub a in
+        let+ b = sub b in
+        S.Tinfix (a, op, b)
+    | Tif (c, a, b) ->
+        let* c = sub c in
+        let* a = sub a in
+        let+ b = sub b in
+        S.Tif (c, a, b)
+    | Tquant (q, binders, triggers, body) ->
+        let bound = List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound in
+        let* triggers =
+          Result.all
+            (List.map triggers ~f:(fun ts -> Result.all (List.map ts ~f:(sub ~bound))))
+        in
+        let+ body = sub ~bound body in
+        S.Tquant (q, binders, triggers, body)
+    | Tcomprehension ((x, ty), body) ->
+        let+ body = sub ~bound:(x.pid_str :: bound) body in
+        S.Tcomprehension ((x, ty), body)
+    | Tattr (a, body) ->
+        let+ body = sub body in
+        S.Tattr (a, body)
+    | Tlet (p, value, body) ->
+        let* value = sub value in
+        let+ body = sub ~bound:(S.pat_names p @ bound) body in
+        S.Tlet (p, value, body)
+    | Tmatch (scrutinee, cases) ->
+        let* scrutinee = sub scrutinee in
+        let+ cases =
+          Result.all
+            (List.map cases ~f:(fun (p, body) ->
+                 let+ body = sub ~bound:(S.pat_names p @ bound) body in
+                 (p, body)))
+        in
+        S.Tmatch (scrutinee, cases)
+    | Tcast (a, ty) ->
+        let+ a = sub a in
+        S.Tcast (a, ty)
+    | Ttuple ts ->
+        let+ ts = Result.all (List.map ts ~f:sub) in
+        S.Ttuple ts
+    | Trecord (base, fields) ->
+        let* base =
+          match base with
+          | None -> return None
+          | Some b ->
+              let+ b = sub b in
+              Some b
+        in
+        let+ fields =
+          Result.all
+            (List.map fields ~f:(fun (f, v) ->
+                 let+ v = sub v in
+                 (f, v)))
+        in
+        S.Trecord (base, fields)
+    | Told a ->
+        let+ a = sub a in
+        S.Told a
+  in
+  let t = { t with term_desc = desc } in
+  let head, args = spine t [] in
+  match head.term_desc with
+  | Tvar q ->
+      begin match atomic_method env q with
+      | Some (signature, method_)
+        when Option.equal String.equal env.ctx.given.current_procedure
+               (Some signature.au_procedure)
+             && List.mem
+                  [
+                    "access";
+                    "abort";
+                    "commit";
+                    "commit_raise";
+                    "pending";
+                    "committed";
+                    "raised";
+                  ]
+                  method_ ~equal:String.equal -> begin
+          let defaults = env.ctx.given.own_update_arguments in
+          match (Translate_context.atomic_inputs signature method_, args) with
+          | Some (inputs, _), token :: rest
+            when List.length inputs - List.length args = List.length signature.au_inputs
+                 && List.length defaults = List.length signature.au_inputs ->
+              begin match List.find defaults ~f:(List.mem bound ~equal:String.equal) with
+              | Some x ->
+                  error at
+                    (Printf.sprintf
+                       "%s is rebound here: give the update's arguments explicitly" x)
+              | None ->
+                  let var x = S.mk_term (Tvar (Qid (S.mk_id ~loc:at x))) at in
+                  return
+                    (List.fold
+                       ((token :: List.map defaults ~f:var) @ rest)
+                       ~init:head
+                       ~f:(fun f a -> S.mk_term (Tapply (f, a)) at))
+              end
+          | _ -> return t
+        end
+      | _ -> return t
+      end
+  | _ -> return t
+
+(** [with_update_arguments] throughout the proof [p]. *)
+let rec proof_with_update_arguments env ~bound (p : S.proof_expr) =
+  let ( let* ) = Result.( >>= ) in
+  let ( let+ ) r f = Result.map r ~f in
+  let term ?(bound = bound) t = with_update_arguments env ~bound t in
+  let proof ?(bound = bound) p = proof_with_update_arguments env ~bound p in
+  let+ desc =
+    match p.proof_desc with
+    | Proof_value t ->
+        let+ t = term t in
+        S.Proof_value t
+    | Proof_assert t ->
+        let+ t = term t in
+        S.Proof_assert t
+    | Proof_cut t ->
+        let+ t = term t in
+        S.Proof_cut t
+    | Proof_unfold (t, names) ->
+        let+ t = term t in
+        S.Proof_unfold (t, names)
+    | Proof_fold (t, witnesses) ->
+        let* t = term t in
+        let+ witnesses =
+          Result.all
+            (List.map witnesses ~f:(fun (x, w) ->
+                 let+ w = term w in
+                 (x, w)))
+        in
+        S.Proof_fold (t, witnesses)
+    | Proof_let (pattern, value, body) ->
+        let* value = proof value in
+        let+ body = proof ~bound:(S.pat_names pattern @ bound) body in
+        S.Proof_let (pattern, value, body)
+    | Proof_seq (a, b) ->
+        let* a = proof a in
+        let+ b = proof b in
+        S.Proof_seq (a, b)
+    | Proof_if (c, a, b) ->
+        let* c = term c in
+        let* a = proof a in
+        let+ b = proof b in
+        S.Proof_if (c, a, b)
+    | Proof_match (t, cases) ->
+        let* t = term t in
+        let+ cases =
+          Result.all
+            (List.map cases ~f:(fun (pattern, body) ->
+                 let+ body = proof ~bound:(S.pat_names pattern @ bound) body in
+                 (pattern, body)))
+        in
+        S.Proof_match (t, cases)
+  in
+  { p with proof_desc = desc }
+
+(** The names an outline step imports from earlier ones. *)
+let imported_names (outline : Annotation.outline option) =
+  Option.value_map outline ~default:[] ~f:(fun o ->
+      List.concat_map o.Annotation.imports ~f:(fun (_, pattern) -> S.pat_names pattern))
+
+(** [body] with a delegation, [X.delegate token step arguments] as its value, expanded:
+    the update is opened, the step runs with the arguments, and the update commits with
+    its result, or with its exception if it raised. *)
+let rec delegated env ~operation ~outcome (body : S.proof_expr) =
+  match body.proof_desc with
+  | Proof_let (pattern, value, rest) ->
+      Result.map (delegated env ~operation ~outcome rest) ~f:(fun rest ->
+          { body with proof_desc = Proof_let (pattern, value, rest) })
+  | Proof_seq (first, rest) ->
+      Result.map (delegated env ~operation ~outcome rest) ~f:(fun rest ->
+          { body with proof_desc = Proof_seq (first, rest) })
+  | Proof_value t -> begin
+      let at = t.term_loc in
+      match spine t [] with
+      | ( { term_desc = Tvar (Qdot (parent, { pid_str = "delegate"; _ }) as q); _ },
+          [ token; { term_desc = Tvar (Qid step); _ }; arguments ] )
+        when String.equal step.pid_str operation ->
+          begin match atomic_method env q with
+          | None -> Ok body
+          | Some (signature, _) ->
+              let term desc = S.mk_term desc at in
+              let var x = term (Tvar (Qid (S.mk_id ~loc:at x))) in
+              let method_ name = term (Tvar (Qdot (parent, S.mk_id ~loc:at name))) in
+              let apply f args =
+                List.fold args ~init:f ~f:(fun f a -> term (Tapply (f, a)))
+              in
+              let proof desc = { S.proof_desc = desc; proof_loc = body.proof_loc } in
+              let pid x = { S.pat_desc = Pid (S.mk_id ~loc:at x); pat_loc = at } in
+              let result = "delegated_result" and raised = "delegated_outcome" in
+              let commit =
+                proof (Proof_value (apply (method_ "commit") [ token; var result ]))
+              in
+              let completion =
+                if not outcome then commit
+                else if signature.au_raises then
+                  let constructor name argument =
+                    {
+                      S.pat_desc = Pconstr (Qid (S.mk_id ~loc:at name), argument);
+                      pat_loc = at;
+                    }
+                  in
+                  proof
+                    (Proof_match
+                       ( var raised,
+                         [
+                           (constructor "None" None, commit);
+                           ( constructor "Some" (Some (pid "delegated_exception")),
+                             proof
+                               (Proof_value
+                                  (apply (method_ "commit_raise")
+                                     [ token; var "delegated_exception" ])) );
+                         ] ))
+                else
+                  proof
+                    (Proof_seq
+                       ( proof
+                           (Proof_assert
+                              (term
+                                 (Tinfix
+                                    ( var raised,
+                                      S.mk_id ~fixity:Infix ~loc:at "===",
+                                      var "None" )))),
+                         commit ))
+              in
+              let invoked =
+                if outcome then
+                  { S.pat_desc = Ptuple [ pid result; pid raised ]; pat_loc = at }
+                else pid result
+              in
+              Ok
+                (proof
+                   (Proof_let
+                      ( pid "delegated_values",
+                        proof (Proof_value (apply (method_ "access") [ token ])),
+                        proof
+                          (Proof_let
+                             ( invoked,
+                               proof (Proof_value (apply (var operation) [ arguments ])),
+                               proof
+                                 (Proof_seq (completion, proof (Proof_value (var result))))
+                             )) )))
+          end
+      | _ -> Ok body
+    end
+  | _ -> Ok body
+
 (** A cut by [t]: it is proved, and the rest is verified from it and the values of
     variables alone. *)
 let cut env (t : S.term) =
@@ -1807,13 +2077,33 @@ let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
             let* body = State.of_result (Annotation.proof annotation) in
             let* env = scope_env ctx in
             let* env = outline_env env annotation.outline in
-            let+ statements =
-              proof_expression env [] (with_outline_lets annotation.outline body)
+            let* body =
+              State.of_result
+                (proof_with_update_arguments env
+                   ~bound:(imported_names annotation.outline)
+                   (with_outline_lets annotation.outline body))
             in
+            let+ statements = proof_expression env [] body in
             [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
         | _ ->
             let* statements = State.of_result (Annotation.ghost_stmts annotation) in
             let* env = scope_env ctx in
+            let* statements =
+              State.of_result
+                (Result.all
+                   (List.map statements ~f:(fun statement ->
+                        let term t = with_update_arguments env ~bound:[] t in
+                        match statement with
+                        | S.Fold t -> Result.map (term t) ~f:(fun t -> S.Fold t)
+                        | Unfold t -> Result.map (term t) ~f:(fun t -> S.Unfold t)
+                        | Assert t -> Result.map (term t) ~f:(fun t -> S.Assert t)
+                        | Cut t -> Result.map (term t) ~f:(fun t -> S.Cut t)
+                        | Ghost_call t -> Result.map (term t) ~f:(fun t -> S.Ghost_call t)
+                        | Fold_with (t, ws) ->
+                            Result.map (term t) ~f:(fun t -> S.Fold_with (t, ws))
+                        | Unfold_with (t, ws) ->
+                            Result.map (term t) ~f:(fun t -> S.Unfold_with (t, ws)))))
+            in
             State.all statements ~f:(proof_statement env))
   in
   List.concat blocks
@@ -1891,6 +2181,15 @@ let access_captures_outcome annotation ~outputs =
         | _ -> binding rest
         end
     | Proof_let (_, _, rest) | Proof_seq (_, rest) -> binding rest
+    | Proof_value term ->
+        (* A delegation commits with the outcome of the call. *)
+        begin match spine term [] with
+        | ( { term_desc = Tvar (Qdot (_, { pid_str = "delegate"; _ })); _ },
+            [ _; { term_desc = Tvar (Qid operation); _ }; _ ] )
+          when String.equal operation.pid_str scope.scope_operation.pid_str ->
+            outputs = 0
+        | _ -> false
+        end
     | _ -> false
   in
   Ok (binding scope.scope_body)
@@ -2203,6 +2502,20 @@ let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_t
       (Option.exists scope.scope_state ~f:(fun p ->
            List.mem (pat_names p) operation.pid_str ~equal:String.equal))
   in
+  let* body =
+    State.of_result
+      (delegated env ~operation:operation.pid_str
+         ~outcome:(not (List.is_empty output_types))
+         body)
+  in
+  let* body =
+    State.of_result
+      (proof_with_update_arguments env
+         ~bound:
+           (imported_names annotation.outline
+           @ Option.value_map scope.scope_state ~default:[] ~f:pat_names)
+         body)
+  in
   before env visible
     (if bracket then bracketed env ~operation:operation.pid_str body else body)
 
@@ -2224,5 +2537,11 @@ let return_proof ctx annotation ~result_type ~result =
       List.map ghost_returns ~f:(fun (_, raven, ty) ->
           { target_name = raven; target_type = ty })
     in
-    let+ statements = proof_expression env targets adapter.returns_body in
+    let* body =
+      State.of_result
+        (proof_with_update_arguments env
+           ~bound:(S.pat_names adapter.returns_result @ S.pat_names adapter.returns_state)
+           adapter.returns_body)
+    in
+    let+ statements = proof_expression env targets body in
     [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]

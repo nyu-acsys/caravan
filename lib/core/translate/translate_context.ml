@@ -1256,6 +1256,9 @@ type inputs = {
   program_parameters : (string * Types.type_expr) list;
       (** The current procedure's program parameters, by their Raven names, with their
           types: what a cut restates the type facts of, as the precondition gives them. *)
+  own_update_arguments : string list;
+      (** The current procedure's parameters, program ones then ghost ones, by their names
+          in its proof: the arguments of its own atomic update. *)
   execution_types : Types.type_expr list;
   execution_contract : bool;
       (** Entry-context bindings in preconditions, rather than spatial context ownership.
@@ -1307,6 +1310,7 @@ let declaration_inputs types ~shared ~env ~preds ~spec_funcs ~proof_support
     current_procedure = None;
     opened = [];
     program_parameters = [];
+    own_update_arguments = [];
     execution_types = [];
     execution_contract = false;
     mutex_execution = false;
