@@ -220,6 +220,11 @@ before the result. An explicit `fold` replaces the unchanged one, for a step tha
 changes the state; an explicit `unfold` leaves the invariant to the proof. Steps at
 calls of checked procedures open nothing, since the callee opens what it needs.
 
+A lemma can close what another opens: `lemma [@closes expose] restore ...` takes
+`expose`'s arguments followed by its results. A step that binds the results of an
+`expose` at its top level, and passes them to no `restore`, gets the `restore`
+before its result, and before the invariants the step opened are closed.
+
 In a long function, `cut p` summarizes the proof so far: Caravan proves `p` and
 verifies the rest of the function from `p` and the values of variables alone, which
 can make the rest much cheaper to check. It is ghost code, in an annotation

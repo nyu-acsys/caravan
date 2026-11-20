@@ -979,6 +979,13 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
           Proof_bindings.action_key scoped_proofs
             ~scope:(Proof_bindings.scope_for_location scoped_proofs id.S.pid_loc)
             id);
+      lemma_closers =
+        List.concat_map source.proof ~f:(function
+          | S.Proof_lemma { lemma_name; _ } ->
+              List.filter_map lemma_name.pid_attrs ~f:(fun attribute ->
+                  Option.map (String.chop_prefix attribute ~prefix:"closes ")
+                    ~f:(fun opener -> (String.strip opener, lemma_name.pid_str)))
+          | _ -> []);
       opaque_predicates =
         List.map decls.tasks ~f:(fun task -> task.Task_facades.key)
         @ Proof_bindings.opaque_keys scoped_proofs

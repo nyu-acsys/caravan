@@ -841,6 +841,9 @@ type proof_support = {
   proof_key : Env.t -> S.qualid -> string option;
   action_key : S.id -> string option;
   opaque_predicates : string list;
+  lemma_closers : (string * string) list;
+      (** The lemmas that close what others open, by the opening lemma: a step that opens
+          without closing is closed before its result. *)
 }
 
 let empty_proof_support =
@@ -865,6 +868,7 @@ let empty_proof_support =
     proof_key = (fun _ _ -> None);
     action_key = (fun _ -> None);
     opaque_predicates = [];
+    lemma_closers = [];
   }
 
 type declaration_context = {

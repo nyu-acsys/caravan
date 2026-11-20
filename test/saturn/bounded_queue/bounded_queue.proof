@@ -713,7 +713,7 @@ lemma expose_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
   expose_chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
     target
 
-lemma restore_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+lemma [@closes expose_at] restore_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
     (following : 'a node_info list) (state : 'a entry_state)
   opens {}
   requires (chain_without opened.nodes 0 opened.head.position queue.capacity opened.values
@@ -1248,7 +1248,6 @@ proof fix_tail [q : 'a t] [key : Ghost.t] [info : 'a node_info] tail new_tail
       (match following with [] -> (Link Null : 'a link) | next :: _ -> Link next.cell),
       state.released) in
     acquire_following Ghost.self info following state.released;
-    restore_at q current info following state;
     result);
   at (Atomic.compare_and_set tail old_tail new_tail) Ghost.release_scope (fun cas ->
     position_at q current info;
@@ -1282,7 +1281,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let result = read (state.capacity, state.capacity_all, state.capacity_eligible) in
     assert (0 <= result && result <= t.capacity - (info.position - current.head.position));
     issue_at key current (Head_seen current.head);
-    restore_at t current info following state;
     cut (is_queue t key && old_tail === info.cell && known key info &&
       sampled_head key current.head &&
       Counter.visible Ghost.self old_tail info.word && Capacity.visible Ghost.self old_tail &&
@@ -1444,7 +1442,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let (next_following, next_state) = expose_at t current next in
     Counter.observe next.cell next.incoming;
     Capacity.acquire next.cell next.incoming;
-    restore_at t current next next_following next_state;
     issue_at key current (Published next);
     (result, next)) in
   at (push_as t new_node (link_as_node (get_next old_tail)) mono) (fun invoke ->
@@ -1474,7 +1471,6 @@ proof result = atomic try_push [key : Ghost.t] t value
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
     issue_at key current (Published current.tail);
-    restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Bool) (fun invoke ->
     let token = Try_push.bind () in
@@ -1492,7 +1488,6 @@ proof result = atomic push_exn [key : Ghost.t] t value
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
     issue_at key current (Published current.tail);
-    restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Unit) (fun invoke ->
     let token = Push_exn.bind () in
@@ -1540,7 +1535,6 @@ proof result = atomic peek_as [key : Ghost.t] t poly
     let (following, state) = expose_at t current next in
     let result = read () in
     let event = Payload.observe next.cell (Ghost.raw result) in
-    restore_at t current next following state;
     (result, event)) in
   at (Atomic.get t.head) (fun read ->
     let next = successor in
@@ -1658,7 +1652,6 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     let event = Payload.observe successor.cell (Ghost.raw result) in
     Payload.reconcile successor.cell event (Ghost.raw result);
     assert (Ghost.raw result === successor.initial);
-    restore_at t current successor following state;
     result);
   at (node.value <- Obj.magic ()) (fun clear ->
     let (following, state) = expose_at t current successor in
@@ -1795,14 +1788,12 @@ proof result = atomic snapshot [key : Ghost.t] t
     let (following, state) = expose_at t current current.head in
     let result = read current.head.incoming in
     Counter.observe current.head.cell current.head.incoming;
-    restore_at t current current.head following state;
     issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let sampled_tail = at (let tail = fenceless_get t.tail) (fun read ->
     let (following, state) = expose_at t current current.tail in
     let result = read (current.tail.cell, current.tail.incoming) in
     Counter.observe current.tail.cell current.tail.incoming;
-    restore_at t current current.tail following state;
     issue_at key current (Published current.tail);
     (result, current.tail)) in
   let checkpoint = at (fenceless_get_next tail) (fun read ->

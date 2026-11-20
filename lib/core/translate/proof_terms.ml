@@ -1012,6 +1012,88 @@ let rec delegated env ~operation ~outcome (body : S.proof_expr) =
     end
   | _ -> Ok body
 
+(** [body] with what it opens by a lemma that another closes, and does not close itself,
+    closed before its result or its first cut: the closing lemma is called with the
+    opening one's arguments and results. *)
+let closed env (body : S.proof_expr) =
+  let closers = env.ctx.given.proof_support.lemma_closers in
+  let call (t : S.term) =
+    match spine t [] with
+    | { term_desc = Tvar (Qid f); _ }, args -> Some (f.pid_str, args)
+    | _ -> None
+  in
+  (* The names that a closing call in [p] is given. *)
+  let rec closing_names (p : S.proof_expr) =
+    let of_term (t : S.term) =
+      match call t with
+      | Some (f, args)
+        when List.exists closers ~f:(fun (_, closer) -> String.equal closer f) ->
+          List.filter_map args ~f:(fun (a : S.term) ->
+              match a.term_desc with Tvar (Qid x) -> Some x.pid_str | _ -> None)
+      | _ -> []
+    in
+    match p.proof_desc with
+    | Proof_value t -> of_term t
+    | Proof_assert _ | Proof_cut _ | Proof_fold _ | Proof_unfold _ -> []
+    | Proof_let (_, a, b) | Proof_seq (a, b) | Proof_if (_, a, b) ->
+        closing_names a @ closing_names b
+    | Proof_match (_, cases) -> List.concat_map cases ~f:(fun (_, p) -> closing_names p)
+  in
+  let closed_names = closing_names body in
+  (* The opens of [p]'s spine that nothing closes, as closing calls, innermost first. *)
+  let rec opens (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_let (pattern, { proof_desc = Proof_value value; _ }, rest) -> begin
+        let results =
+          match pattern.pat_desc with
+          | Pid x -> Some [ x ]
+          | Ptuple ps ->
+              Option.all
+                (List.map ps ~f:(fun (p : S.pat) ->
+                     match p.pat_desc with Pid x -> Some x | _ -> None))
+          | _ -> None
+        in
+        let opened =
+          match (call value, results) with
+          | Some (f, args), Some results ->
+              Option.bind (List.Assoc.find closers f ~equal:String.equal)
+                ~f:(fun closer ->
+                  if
+                    List.exists results ~f:(fun (x : S.id) ->
+                        List.mem closed_names x.pid_str ~equal:String.equal)
+                  then None
+                  else
+                    let at = value.term_loc in
+                    let var (x : S.id) = S.mk_term (Tvar (Qid x)) at in
+                    Some
+                      (List.fold
+                         (args @ List.map results ~f:var)
+                         ~init:(S.mk_term (Tvar (Qid (S.mk_id ~loc:at closer))) at)
+                         ~f:(fun f a -> S.mk_term (Tapply (f, a)) at)))
+          | _ -> None
+        in
+        opens rest @ Option.to_list opened
+      end
+    | Proof_let (_, _, rest) | Proof_seq (_, rest) -> opens rest
+    | _ -> []
+  in
+  let closes = opens body in
+  let proof ~at desc = { S.proof_desc = desc; proof_loc = at } in
+  let close_before (p : S.proof_expr) =
+    List.fold (List.rev closes) ~init:p ~f:(fun p close ->
+        proof ~at:p.proof_loc
+          (Proof_seq (proof ~at:close.S.term_loc (Proof_value close), p)))
+  in
+  let rec place (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_seq ({ proof_desc = Proof_cut _; _ }, _) | Proof_value _ -> close_before p
+    | Proof_let (pattern, value, rest) ->
+        { p with proof_desc = Proof_let (pattern, value, place rest) }
+    | Proof_seq (first, rest) -> { p with proof_desc = Proof_seq (first, place rest) }
+    | _ -> p
+  in
+  if List.is_empty closes then body else place body
+
 (** A cut by [t]: it is proved, and the rest is verified from it and the values of
     variables alone. *)
 let cut env (t : S.term) =
@@ -2516,6 +2598,7 @@ let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_t
            @ Option.value_map scope.scope_state ~default:[] ~f:pat_names)
          body)
   in
+  let body = closed env body in
   before env visible
     (if bracket then bracketed env ~operation:operation.pid_str body else body)
 

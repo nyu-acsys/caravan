@@ -691,7 +691,10 @@ proof_decl:
       let n = match attribute with
         | None -> n
         | Some "auto" -> add_attr n "auto"
-        | Some _ -> raise (Syntax_error (mk_loc $loc(attribute), "A lemma's attribute is [@auto]"))
+        | Some a when String.length a > 7 && String.sub a 0 7 = "closes " -> add_attr n a
+        | Some _ ->
+            raise (Syntax_error (mk_loc $loc(attribute),
+              "A lemma's attribute is [@auto] or [@closes opener]"))
       in
       Proof_lemma {
         lemma_name = n; lemma_params = ps;

@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Proof-outline steps at atomic accesses open and close the invariants of the function's `opens` clause.
 - `cut p` proves `p` and verifies the rest of a function from `p` and variables' values alone.
 - Atomic-update operations may omit the operation's own arguments, and `delegate` hands an update to a call.
+- A lemma declared `[@closes opener]` closes, at the end of a proof step, what `opener` opened there.
 
 ### Changed
 
