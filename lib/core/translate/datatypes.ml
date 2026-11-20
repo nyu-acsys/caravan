@@ -1201,8 +1201,11 @@ let is_mutex = Mutex_primitives.is_type
 
 let is_condition = Condition_primitives.is_type
 
+(** Whether [p] is the path of OCaml's [array]. *)
+let is_array (p : Path.t) = Path.same p Predef.path_array
+
 let is_reference p =
-  is_ref p || is_atomic p || is_domain p || is_mutex p || is_condition p
+  is_ref p || is_atomic p || is_array p || is_domain p || is_mutex p || is_condition p
 
 let is_reference_type path arguments =
   if is_mutex path || is_condition path then List.is_empty arguments

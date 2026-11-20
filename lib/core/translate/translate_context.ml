@@ -2212,6 +2212,17 @@ let stdlib_name (p : Path.t) =
       Some x
   | _ -> None
 
+(** The function [x] of OCaml's [Array] module that [p] names, if it does. *)
+let stdlib_array_function (p : Path.t) =
+  match p with
+  | Pdot (Pident owner, x)
+    when Ident.persistent owner && String.equal (Ident.name owner) "Stdlib__Array" ->
+      Some x
+  | Pdot (Pdot (Pident owner, "Array"), x)
+    when Ident.persistent owner && String.equal (Ident.name owner) "Stdlib" ->
+      Some x
+  | _ -> None
+
 let stdlib_list_fold_left = function
   | Path.Pdot (Pident owner, "fold_left") ->
       Ident.persistent owner && String.equal (Ident.name owner) "Stdlib__List"
@@ -2957,8 +2968,31 @@ let free_typed ?(lenient = false) env (terms : S.term list) ~at =
     |> List.dedup_and_sort ~compare:String.compare
   in
   (* The types of the values of fields that [t] owns; and of names passed to predicates. *)
+  let array_entry (t : S.term) =
+    (* [own (Array.cell a i) v], where [v] has the entry type of the array [a]. *)
+    match spine t [] with
+    | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+        [ location; { term_desc = Tvar (Qid { pid_str = v; _ }); _ } ] ) ->
+        begin match spine location [] with
+        | ( {
+              term_desc =
+                Tvar (Qdot (Qid { pid_str = "Array"; _ }, { pid_str = "cell"; _ }));
+              _;
+            },
+            [ { term_desc = Tvar (Qid { pid_str = a; _ }); _ }; _ ] ) ->
+            Option.bind (List.Assoc.find env.var_types a ~equal:String.equal)
+              ~f:(fun typ ->
+                match Types.get_desc (Ctype.expand_head env.ctx.given.env typ) with
+                | Tconstr (path, [ element ], _) when Datatypes.is_array path ->
+                    Some (v, element)
+                | _ -> None)
+        | _ -> None
+        end
+    | _ -> None
+  in
   let rec owned (t : S.term) =
     match (owned_location t, S.(t.term_desc)) with
+    | _ when Option.is_some (array_entry t) -> Option.to_list (array_entry t)
     | Some (x, label, v), _ ->
         Option.to_list
           (Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)

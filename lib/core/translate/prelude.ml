@@ -17,6 +17,13 @@ let value_int = "Ocaml$IntValue"
 let value_list = "Ocaml$ListValue"
 let value_option = "Ocaml$OptionValue"
 let value_tuple arity = "Ocaml$TupleValue$" ^ Int.to_string arity
+let array_loc = "array_loc"
+let array_length = "array_length"
+let array_contents = "array_contents"
+let array_make = "array_make"
+
+(** OCaml's [Sys.max_array_length] on 64-bit platforms. *)
+let max_array_length = (1 lsl 54) - 1
 
 (** The bounds of OCaml's machine [int]. *)
 let min_int = Stdlib.min_int
@@ -45,6 +52,73 @@ let runtime_binary ~loc op a b =
 let runtime_neg ~loc value =
   R.Expr.call ~loc (R.Name.make ~loc wrap) [ R.Expr.neg ~loc value ]
 
+(** The cells of arrays with entries of the family's carrier: each index of an array has a
+    cell of its own, and an array's length is fixed. *)
+let array_members =
+  let value name = R.Name.make ~loc ~path:[ "V" ] name in
+  let carrier = R.Type.named ~loc (value "Carrier") [] in
+  let local x = R.Name.make ~loc x in
+  let call f args = R.Expr.call ~loc (local f) args in
+  let typed x typ = R.Var.make ~loc (R.Ident.make ~loc x) typ in
+  let ref_ = R.Type.ref ~loc and int = R.Type.int ~loc in
+  let free member = R.Member.free (R.Member.callable member) in
+  let func name formals typ =
+    free
+      (R.Callable.func ~loc ~formals
+         ~returns:[ typed "r" typ ]
+         (R.Ident.make ~loc name) None)
+  in
+  let axiom name body =
+    free
+      (R.Callable.proc ~loc ~kind:Axiom ~auto:true
+         ~ensures:[ R.Spec.make body ]
+         (R.Ident.make ~loc name) None)
+  in
+  let a = var "a" and i = var "i" and n = var "n" in
+  let cell = call array_loc [ a; i ] in
+  let ( &&& ) p q = R.Expr.binary ~loc And p q in
+  let ( <== ) p q = R.Expr.binary ~loc Leq p q in
+  let ( <<< ) p q = R.Expr.binary ~loc Lt p q in
+  let zero = R.Expr.int ~loc 0 in
+  [
+    func array_loc [ typed "a" ref_; typed "i" int ] ref_;
+    func array_length [ typed "a" ref_ ] int;
+    func "array_base" [ typed "c" ref_ ] ref_;
+    func "array_index" [ typed "c" ref_ ] int;
+    axiom "array_cells"
+      (R.Expr.forall ~loc ~triggers:[ [ cell ] ]
+         [ typed "a" ref_; typed "i" int ]
+         (R.Expr.binary ~loc Eq (call "array_base" [ cell ]) a
+         &&& R.Expr.binary ~loc Eq (call "array_index" [ cell ]) i));
+    axiom "array_lengths"
+      (let length = call array_length [ a ] in
+       R.Expr.forall ~loc ~triggers:[ [ length ] ]
+         [ typed "a" ref_ ]
+         (zero <== length &&& (length <== R.Expr.int ~loc max_array_length)));
+    free
+      (R.Callable.proc ~loc
+         ~formals:[ typed "n" int; typed "d" carrier ]
+         ~returns:[ typed "a" ref_ ]
+         ~requires:
+           [
+             R.Spec.make (zero <== n &&& (n <== R.Expr.int ~loc max_array_length));
+             R.Spec.make (R.Expr.call ~loc (value "holds") [ var "d" ]);
+           ]
+         ~ensures:
+           [
+             R.Spec.make
+               (R.Expr.binary ~loc Eq (call array_length [ a ]) n
+               &&& R.Expr.forall ~loc ~triggers:[ [ cell ] ]
+                     [ typed "i" int ]
+                     (R.Expr.binary ~loc Impl
+                        (zero <== i &&& (i <<< n))
+                        (R.Expr.own ~loc
+                           [ R.Expr.field ~loc cell (local array_contents); var "d" ])));
+           ]
+         (R.Ident.make ~loc array_make)
+         None);
+  ]
+
 let cell_members =
   let value name = R.Name.make ~loc ~path:[ "V" ] name in
   let carrier = R.Type.named ~loc (value "Carrier") [] in
@@ -55,7 +129,7 @@ let cell_members =
     R.Member.module_ ~loc
       ~params:[ (R.Ident.make ~loc "V", R.Name.make ~loc value_interface) ]
       (R.Ident.make ~loc cell_family)
-      [ field "ref_contents"; field "atomic" ];
+      ([ field "ref_contents"; field "atomic"; field array_contents ] @ array_members);
   ]
 
 let value_signature =

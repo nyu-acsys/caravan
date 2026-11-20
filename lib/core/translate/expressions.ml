@@ -1242,6 +1242,8 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
   match (stdlib_name path, args) with
   | _ when Option.is_some (atomic_name path) ->
       atomic ctx e (Option.value_exn (atomic_name path)) args
+  | _ when Option.is_some (stdlib_array_function path) ->
+      array_operation ctx e (Option.value_exn (stdlib_array_function path)) args
   | Some "ignore", [ value ] ->
       let+ statements, _ = expr ctx value in
       (statements, unit_value ~loc:l)
@@ -1283,6 +1285,78 @@ and apply_ordinary ctx (e : Typedtree.expression) (path : Path.t) declaration oc
       let+ writing = State.ordinary_write ctx.given ~at ~field ~elt:int_type r v' in
       (stmts @ reading @ writing, unit_value ~loc:l)
   | _ -> apply_operator ctx e path declaration occurrence args
+
+(** The application of [Array.op] to [args], in [e]: the entries of an array are ordinary
+    cells, and an index out of its bounds is an error to prove absent. *)
+and array_operation ctx (e : Typedtree.expression) op (args : Typedtree.expression list) =
+  let at = e.exp_loc in
+  let l = loc at in
+  let element (t : Types.type_expr) =
+    match Datatypes.desc ctx.given.types t with
+    | Tconstr (_, [ elt ], _) -> State.return elt
+    | _ -> State.of_result (unsupported at "This array")
+  in
+  let member elt name =
+    let+ member = State.cell_field ctx.given ~at elt name in
+    qualified_name ~loc:l member
+  in
+  let length elt a =
+    let+ length = member elt Prelude.array_length in
+    R.Expr.call ~loc:l length [ a ]
+  in
+  let int n = R.Expr.int ~loc:l n in
+  let ( <== ) p q = R.Expr.binary ~loc:l Leq p q in
+  let ( <<< ) p q = R.Expr.binary ~loc:l Lt p q in
+  let ( &&& ) p q = R.Expr.binary ~loc:l And p q in
+  (* The cell of index [i] of [a], once [i] is checked to be within its bounds. *)
+  let cell (array : Typedtree.expression) (index : Typedtree.expression) =
+    let* elt = element array.exp_type in
+    let* i_stmts, i = expr ctx index in
+    let* a_stmts, a = expr ctx array in
+    let* length = length elt a in
+    let* in_bounds =
+      State.check ~at "This index may be out of the array's bounds"
+        (int 0 <== i &&& (i <<< length))
+    in
+    let* loc_ = member elt Prelude.array_loc in
+    let+ field = State.cell_field ctx.given ~at elt Prelude.array_contents in
+    (i_stmts @ a_stmts @ [ in_bounds ], R.Expr.call ~loc:l loc_ [ a; i ], elt, field)
+  in
+  match (op, args) with
+  | "length", [ array ] ->
+      let* elt = element array.exp_type in
+      let* stmts, a = expr ctx array in
+      let+ length = length elt a in
+      (stmts, length)
+  | ("get" | "unsafe_get"), [ array; index ] ->
+      let* stmts, receiver, _, field = cell array index in
+      let+ reading, value =
+        State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type receiver
+      in
+      (stmts @ reading, value)
+  | ("set" | "unsafe_set"), [ array; index; value ] ->
+      let* v_stmts, v = expr ctx value in
+      let* stmts, receiver, elt, field = cell array index in
+      let+ writing = State.ordinary_write ctx.given ~at ~field ~elt receiver v in
+      (v_stmts @ stmts @ writing, unit_value ~loc:l)
+  | "make", [ size; initial ] ->
+      let* () = State.require_memory_encoding ctx.given ~at "array allocation" in
+      let* elt = element e.exp_type in
+      let* v_stmts, v = expr ctx initial in
+      let* n_stmts, n = expr ctx size in
+      let* allowed =
+        State.check ~at "This array length may be negative or too large"
+          (int 0 <== n &&& (n <== int Prelude.max_array_length))
+      in
+      let* make = member elt Prelude.array_make in
+      let* x = State.fresh "array" in
+      State.return
+        ( v_stmts @ n_stmts @ [ allowed ]
+          @ R.Stmt.local ~loc:l ~typ:(R.Type.ref ~loc:l)
+              ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l make [ n; v ]))
+              (ident ~loc:l x),
+          R.Expr.var ~loc:l (name ~loc:l x) )
+  | _ -> State.of_result (unsupported at ("Array." ^ op))
 
 (** The application of [Atomic.op] to [args], in [e]. *)
 and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) =

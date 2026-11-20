@@ -9,14 +9,19 @@ compiler does not make an arbitrary library call verifiable.
 
 | Area | Supported | Important restrictions |
 | --- | --- | --- |
-| Values | `int`, `bool`, `unit`, tuples, lists, options, variants, immutable records. | No general support for strings, floats, arrays, or objects. |
+| Values | `int`, `bool`, `unit`, tuples, lists, options, variants, immutable records, arrays. | No general support for strings, floats, or objects. |
 | Control flow | `let`, `if`, pattern matching, sequencing, recursive functions, `while` and `for` loops. | Supply loop invariants when the inferred facts are insufficient; `variant` annotations on executable functions and loops are not yet supported. |
 | Functions | Named first-order functions, fully supplied labelled and optional arguments, local helpers and captures, recursion, and rank-one polymorphism. | No general partial applications, function-valued parameters, returned closures, or callbacks beyond inline `List.fold_left` functions; no independently generalized helper that also depends on enclosing type parameters. |
 | Data types | Parameterized variants and records, including mutable records and mutable inline constructor records, regular recursive types, and aliases. | Immutable inline constructor records and nonregular recursive data types are unsupported. |
-| Mutable state | References, mutable records, supported `Atomic` operations, and explicit frozen/relaxed field disciplines. | Default reads/writes require ownership; advanced modes require [visibility and journal proofs](./weak-memory). |
+| Mutable state | References, mutable records, arrays (`Array.make`, `length`, `get`, `set`), supported `Atomic` operations, and explicit frozen/relaxed field disciplines. | Default reads/writes require ownership; advanced modes require [visibility and journal proofs](./weak-memory). Array indices and lengths must be shown in bounds; array literals and the higher-order `Array` functions are unsupported. |
 | GADTs | Constant witness types, including Saturn's result-selection witnesses, and payload constructors indexed by sets of constant polymorphic-variant tags. | No arbitrary dependent payloads, existential payload types, or runtime polymorphic variants. |
 | Exceptions | Declared exceptions, supported handlers, and normal and exceptional contracts. | Contracts must account for exceptional outcomes; this is not a model of every runtime or system exception. |
 | Concurrency | Atomics, shared invariants, logically atomic contracts, explicit ghost resources, helping proofs, statically known polymorphic `Domain.spawn`/`Domain.join` tasks, native mutexes with ownership effects and task cleanup, and native conditions. | `Mutex.protect` is unsupported; blocking and deadlock freedom are not proved. |
+
+Each array index is a cell of its own, which contracts own through `Array.cell a i`, as
+in `own (Array.cell a i) v`; `Array.length a` is the array's fixed length. Ownership of
+many entries is quantified, as in
+`forall j : int. 0 <= j && j < Array.length a -> own (Array.cell a j) 0`.
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve

@@ -244,23 +244,43 @@ and is_list_term env t =
 
 (** The OCaml type of the values that the location [t] holds, where it is known. *)
 and location_type env (t : S.term) =
-  match ghost_projection env t with
-  | Some (field, owner) ->
-      Result.ok
-        (Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env
-           ~at:t.term_loc ~owner:(term_type env owner) ~value:None field)
-      |> Option.map ~f:(fun (_, field) -> field.Source.field_value)
+  match array_cell t with
+  | Some (array, _) -> Option.bind (term_type env array) ~f:(array_element env)
   | None -> (
-      match t.term_desc with
-      | Tfield
-          ({ term_desc = Tvar (Qid { pid_str = x; _ }); _ }, Qid { pid_str = label; _ })
-        ->
-          Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
-              field_type env.ctx ty label)
-      | Tvar (Qid { pid_str = x; _ }) ->
-          Option.bind (List.Assoc.find env.var_types x ~equal:String.equal) ~f:(fun ty ->
-              field_type env.ctx ty "")
-      | _ -> None)
+      match ghost_projection env t with
+      | Some (field, owner) ->
+          Result.ok
+            (Generic_fields.specialize ~types:env.data ~environment:env.ctx.given.env
+               ~at:t.term_loc ~owner:(term_type env owner) ~value:None field)
+          |> Option.map ~f:(fun (_, field) -> field.Source.field_value)
+      | None -> (
+          match t.term_desc with
+          | Tfield
+              ( { term_desc = Tvar (Qid { pid_str = x; _ }); _ },
+                Qid { pid_str = label; _ } ) ->
+              Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
+                ~f:(fun ty -> field_type env.ctx ty label)
+          | Tvar (Qid { pid_str = x; _ }) ->
+              Option.bind (List.Assoc.find env.var_types x ~equal:String.equal)
+                ~f:(fun ty -> field_type env.ctx ty "")
+          | _ -> None))
+
+(** The array and index of [t] if it is [Array.cell a i], the location of an entry. *)
+and array_cell (t : S.term) =
+  match spine t [] with
+  | ( {
+        term_desc = Tvar (Qdot (Qid { pid_str = "Array"; _ }, { pid_str = "cell"; _ }));
+        _;
+      },
+      [ array; index ] ) ->
+      Some (array, index)
+  | _ -> None
+
+(** The entry type of the array type [t]. *)
+and array_element env (t : Types.type_expr) =
+  match Types.get_desc (Ctype.expand_head env.ctx.given.env t) with
+  | Tconstr (path, [ element ], _) when Datatypes.is_array path -> Some element
+  | _ -> None
 
 and equality_term_type env (t : S.term) =
   match term_type env t with
@@ -2022,6 +2042,14 @@ and application env (t : S.term) =
                           (R.Expr.binary ~loc:l Subseteq lower release)))
           end
       end
+  | Tvar (Qdot (Qid { pid_str = "Array"; _ }, { pid_str = "length"; _ })), [ array ]
+    when Option.is_some (Option.bind (term_type env array) ~f:(array_element env)) ->
+      let element =
+        Option.value_exn (Option.bind (term_type env array) ~f:(array_element env))
+      in
+      let* length = State.cell_field env.ctx.given ~at element Prelude.array_length in
+      let+ array = formula env array in
+      R.Expr.call ~loc:l (qualified_name ~loc:l length) [ array ]
   | Tvar (Qid { pid_str = "([])"; _ }), [ s; i ] ->
       let* s = formula env s in
       let+ i = formula env i in
@@ -2356,8 +2384,22 @@ and location_with_release ?expected env (t : S.term) =
         | _ -> State.return ())
     | None -> State.return ()
   in
-  match ghost_projection env t with
-  | Some (field, owner) ->
+  match (array_cell t, ghost_projection env t) with
+  | Some (array, index), _ ->
+      let* element =
+        State.of_result
+          (Report.expect ~at "The array whose cell this is"
+             (Option.bind (term_type env array) ~f:(array_element env)))
+      in
+      let* cell = State.cell_field env.ctx.given ~at element Prelude.array_loc in
+      let* field = State.cell_field env.ctx.given ~at element Prelude.array_contents in
+      let* array = formula env array in
+      let+ index = formula env index in
+      ( R.Expr.field ~loc:l
+          (R.Expr.call ~loc:l (qualified_name ~loc:l cell) [ array; index ])
+          (qualified_name ~loc:l field),
+        None )
+  | None, Some (field, owner) ->
       let* field = instantiate_ghost_field env ~at ?expected field owner in
       let* () =
         match term_type env owner with
@@ -2379,7 +2421,7 @@ and location_with_release ?expected env (t : S.term) =
       in
       let+ owner = formula env owner in
       (R.Expr.field ~loc:l owner (qualified_name ~loc:l (ghost_field_name field)), None)
-  | None -> (
+  | None, None -> (
       let* () =
         match spine t [] with
         | ( { term_desc = Tvar (Qdot (Qid m, operation)); _ },

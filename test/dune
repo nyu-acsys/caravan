@@ -33,6 +33,8 @@
   ; stdlib
   (alias stdlib/list)
   (alias stdlib/sequences)
+  ; translate/arrays
+  (alias translate/arrays/arrays)
   ; translate/atomics
   (alias translate/atomics/action_steps_fail)
   (alias translate/atomics/atomic_contract_errors)
