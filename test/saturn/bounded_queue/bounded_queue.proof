@@ -676,21 +676,141 @@ lemma append_chain (nodes : 'a node_info list) (position : integer)
            tail_cells = Finset.union exposed.tail_cells (Finset.singleton fresh.cell)}
       end
 
+type 'a queue_view = {
+  nodes : 'a node_info list;
+  head : 'a node_info;
+  tail : 'a node_info;
+  values : 'a list;
+  cells : ('a, [ `Node ]) node finset;
+  waiting : Ghost.t finset;
+  watching : (Ghost.t, 'a node_info) map;
+}
+
+(* The chain lemmas at the chain of an opened queue state. *)
+lemma expose_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+  returns (following : 'a node_info list) (state : 'a entry_state)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    List.mem target opened.nodes)
+  ensures (chain_without opened.nodes 0 opened.head.position queue.capacity opened.values
+    opened.cells target following &&
+    entry target following opened.head.position queue.capacity state)
+  ensures (0 <= target.position && target.position < List.length opened.nodes)
+  ensures (following === [] -> target.position = List.length opened.nodes - 1)
+  ensures (match following with [] -> true | next :: _ ->
+    next.position = target.position + 1 && nonnull (Link next.cell : 'a link))
+  ensures (forall next : 'a node_info. List.mem next following -> List.mem next opened.nodes) =
+  expose_chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
+    target
+
+lemma restore_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+    (following : 'a node_info list) (state : 'a entry_state)
+  opens {}
+  requires (chain_without opened.nodes 0 opened.head.position queue.capacity opened.values
+    opened.cells target following &&
+    entry target following opened.head.position queue.capacity state)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells) =
+  restore_chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
+    target following state
+
+lemma position_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    List.mem target opened.nodes)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    0 <= target.position && target.position < List.length opened.nodes &&
+    represents target.word target.position target.turn) =
+  chain_position opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
+    target
+
+lemma length_at (queue : 'a t) (opened : 'a queue_view)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    List.length opened.values = (if opened.head.position < 0 then List.length opened.nodes
+      else if List.length opened.nodes <= opened.head.position + 1 then 0
+      else List.length opened.nodes - 1 - opened.head.position)) =
+  chain_length opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
+
+lemma excludes_at (queue : 'a t) (opened : 'a queue_view) (candidate : ('a, [ `Node ]) node)
+    (channel : 'a link Atomic.t) (link [@implicit] : 'a link)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    (match candidate with Node record -> own record.next channel) && own channel link)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    (match candidate with Node record -> own record.next channel) && own channel link &&
+    not (Finset.mem candidate opened.cells)) =
+  chain_excludes opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells candidate channel
+
+lemma append_at (queue : 'a t) (opened : 'a queue_view) (last : 'a node_info)
+    (state : 'a entry_state) (fresh : 'a node_info) (fresh_state : 'a entry_state) (value : 'a)
+  opens {}
+  requires (chain_without opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells last [] &&
+    entry last [fresh] opened.head.position queue.capacity state &&
+    entry fresh [] opened.head.position queue.capacity fresh_state)
+  requires (fresh.initial === Some value && fresh.position = last.position + 1 &&
+    opened.head.position < fresh.position && not (Finset.mem fresh.cell opened.cells))
+  requires (exists source_value : 'a. value === source_value)
+  ensures (chain (opened.nodes @ [fresh]) 0 opened.head.position queue.capacity
+    (opened.values @ [value]) (Finset.union opened.cells (Finset.singleton fresh.cell)))
+  ensures (exists source_values : 'a list. opened.values @ [value] === source_values) =
+  append_chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells last state fresh fresh_state value
+
+lemma no_values_at (queue : 'a t) (opened : 'a queue_view)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && List.length opened.nodes - 1 <= opened.head.position)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && opened.values === []) =
+  chain_no_values opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells
+
+lemma same_cell_at (queue : 'a t) (opened : 'a queue_view) (first : 'a node_info)
+    (second : 'a node_info)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    List.mem first opened.nodes && List.mem second opened.nodes && first.cell === second.cell)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && first === second) =
+  chain_same_cell opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells first second
+
+lemma same_position_at (queue : 'a t) (opened : 'a queue_view) (first : 'a node_info)
+    (second : 'a node_info)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    List.mem first opened.nodes && List.mem second opened.nodes && first.position = second.position)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && first === second) =
+  chain_same_position opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells first second
+
+lemma head_value_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && List.mem target opened.nodes &&
+    0 <= opened.head.position && target.position = opened.head.position + 1)
+  ensures (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells &&
+    exists item : 'a, rest : 'a list.
+      target.initial === Some item && opened.values === item :: rest) =
+  chain_head_value opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells target
+
+lemma retire_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
+  returns (updated : 'a list)
+  opens {}
+  requires (chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells && List.mem target opened.nodes &&
+    0 <= opened.head.position && target.position = opened.head.position + 1)
+  ensures (chain opened.nodes 0 target.position queue.capacity updated opened.cells &&
+    own ~fraction:Permission.half (Ghost.at cleanup target.cleanup) false)
+  ensures (exists item : 'a. target.initial === Some item && opened.values === item :: updated)
+  ensures (exists source_values : 'a list. updated === source_values) =
+  retire_chain opened.nodes 0 opened.head.position queue.capacity opened.values opened.cells target
+
 invariant is_queue (queue : 'a t) (key [@implicit] : Ghost.t) =
-  exists nodes : 'a node_info list, head : 'a node_info, tail : 'a node_info,
-    values : 'a list, cells : ('a, [ `Node ]) node finset,
-    waiting : Ghost.t finset, watching : (Ghost.t, 'a node_info) map.
+  exists s : 'a queue_view.
   0 <= queue.capacity && queue.capacity <= max_int && queue.head != queue.tail &&
-  nodes =/= [] && List.mem head nodes && List.mem tail nodes &&
-  0 <= head.position && head.position < List.length nodes &&
-  0 <= tail.position && tail.position < List.length nodes &&
-  List.length nodes - 1 - head.position <= queue.capacity &&
-  own ~release:head.incoming queue.head head.cell &&
-  own ~release:tail.incoming queue.tail tail.cell &&
-  chain nodes 0 head.position queue.capacity values cells &&
-  waiting_state queue key waiting watching nodes &&
-  own ~fraction:Permission.half (Ghost.at contents key) values &&
-  own (Ghost.at facts_auth key) (Fact_auth.auth (Facts.set (facts nodes head.position)))
+  s.nodes =/= [] && List.mem s.head s.nodes && List.mem s.tail s.nodes &&
+  0 <= s.head.position && s.head.position < List.length s.nodes &&
+  0 <= s.tail.position && s.tail.position < List.length s.nodes &&
+  List.length s.nodes - 1 - s.head.position <= queue.capacity &&
+  own ~release:s.head.incoming queue.head s.head.cell &&
+  own ~release:s.tail.incoming queue.tail s.tail.cell &&
+  chain s.nodes 0 s.head.position queue.capacity s.values s.cells &&
+  waiting_state queue key s.waiting s.watching s.nodes &&
+  own ~fraction:Permission.half (Ghost.at contents key) s.values &&
+  own (Ghost.at facts_auth key) (Fact_auth.auth (Facts.set (facts s.nodes s.head.position)))
 
 predicate [@inline] queue (queue : 'a t) (key : Ghost.t) (values : 'a list) =
   own ~fraction:Permission.half (Ghost.at contents key) values
@@ -1114,18 +1234,16 @@ proof fix_tail [q : 'a t] [key : Ghost.t] [info : 'a node_info] tail new_tail
     result);
   at (get_next new_tail) (fun read ->
     observe_fact key current.nodes current.head.position (Published info);
-    let (following, state) = expose_chain current.nodes 0 current.head.position q.capacity
-      current.values current.cells info in
+    let (following, state) = expose_at q current info in
     let result = read (state.channel,
       (match following with [] -> (Link Null : 'a link) | next :: _ -> Link next.cell),
       state.released) in
     acquire_following Ghost.self info following state.released;
-    restore_chain current.nodes 0 current.head.position q.capacity current.values current.cells
-      info following state;
+    restore_at q current info following state;
     result);
   at (Atomic.compare_and_set tail old_tail new_tail) Ghost.release_scope (fun cas ->
     observe_fact key current.nodes current.head.position (Published info);
-    chain_position current.nodes 0 current.head.position q.capacity current.values current.cells info;
+    position_at q current info;
     let result = cas info.incoming in
     fold is_queue q key {tail = (if result then info else current.tail)};
     result);
@@ -1153,13 +1271,11 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     Ghost.weaken_view Ghost.self info.incoming info.incoming;
     fold retained_view Ghost.self info.incoming;
     observe_fact key current.nodes current.head.position (Published info);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells info in
+    let (following, state) = expose_at t current info in
     let result = read (state.capacity, state.capacity_all, state.capacity_eligible) in
     assert (0 <= result && result <= t.capacity - (info.position - current.head.position));
     issue_fact key current.nodes current.head.position (Head_seen current.head);
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      info following state;
+    restore_at t current info following state;
     cut (is_queue t key && old_tail === info.cell && known key info &&
       sampled_head key current.head &&
       Counter.visible Ghost.self old_tail info.word && Capacity.visible Ghost.self old_tail &&
@@ -1176,18 +1292,16 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let (prophecy : bool Ghost.Prophecy.t), (terminal : bool) = Ghost.Prophecy.create () in
     let result = read current.head.incoming in
     observe_fact key current.nodes current.head.position (Published info);
-    chain_position current.nodes 0 current.head.position t.capacity current.values current.cells info;
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.head in
+    position_at t current info;
+    let (following, state) = expose_at t current current.head in
     Counter.observe current.head.cell current.head.incoming;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.head following state;
+    restore_at t current current.head following state;
     if info.position - current.head.position = t.capacity then begin
       counter_difference current.head.word info.word current.head.position info.position
         current.head.turn info.turn;
       assert (wrap_once (t.capacity - wrap_once (info.word - current.head.word)) = 0);
       if terminal then begin
-        chain_length current.nodes 0 current.head.position t.capacity current.values current.cells;
+        length_at t current;
         let values = Push.access token t new_node old_tail mono key info value
           candidate_capacity candidate_counter in
         assert (values === current.values && List.length values = t.capacity);
@@ -1205,16 +1319,14 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   at (set_capacity old_tail capacity) (fun write ->
     observe_fact key current.nodes current.head.position (Published info);
     observe_fact key current.nodes current.head.position (Head_seen sampled);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells info in
+    let (following, state) = expose_at t current info in
     certify_refresh t.capacity current.head.position sampled.position info.position info.word
       sampled.word info.turn sampled.turn capacity;
     let (result, event) = write (true, state.capacity, state.capacity_all, state.capacity_eligible) in
     let all = Set.union state.capacity_all (Set.singleton (event, capacity)) in
     let changed = {state with capacity = capacity; capacity_all = all;
       capacity_eligible = Set.union state.capacity_eligible (Set.singleton (event, capacity))} in
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      info following changed;
+    restore_at t current info following changed;
     result);
   at (push_as t new_node old_tail mono) (fun invoke ->
     let values = Push.access token t new_node old_tail mono key info value
@@ -1230,14 +1342,12 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   let successor = at ((get_next old_tail)[@occurrence 1]) (fun read ->
     observe_fact key current.nodes current.head.position (Published info);
     observe_fact key current.nodes current.head.position (Head_seen sampled);
-    chain_position current.nodes 0 current.head.position t.capacity current.values current.cells sampled;
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells info in
+    position_at t current sampled;
+    let (following, state) = expose_at t current info in
     let result = read (state.channel, first_link following,
       state.released) in
     acquire_following Ghost.self info following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      info following state;
+    restore_at t current info following state;
     Ghost.Prophecy.resolve prophecy (result === (Link Null : 'a link));
     let next = match following with
     | [] ->
@@ -1247,12 +1357,10 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
         info
     | next :: _ ->
         assert (not terminal);
-        let (next_following, next_state) = expose_chain current.nodes 0 current.head.position
-          t.capacity current.values current.cells next in
+        let (next_following, next_state) = expose_at t current next in
         Counter.observe next.cell next.incoming;
         Capacity.acquire next.cell next.incoming;
-        restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-          next next_following next_state;
+        restore_at t current next next_following next_state;
         issue_fact key current.nodes current.head.position (Published next);
         next in
     (result, next)) in
@@ -1288,13 +1396,11 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   let attempt = at (compare_and_set_next old_tail (Link Null) (Link new_node)) (fun cas ->
     observe_fact key current.nodes current.head.position (Published info);
     observe_fact key current.nodes current.head.position (Head_seen cached_head);
-    chain_length current.nodes 0 current.head.position t.capacity current.values current.cells;
+    length_at t current;
     let candidate = unfold allocated Ghost.self new_node (Some value)
       (capacity - 1) (wrap_once (info.word + 1)) Null in
-    chain_excludes current.nodes 0 current.head.position t.capacity current.values current.cells
-      new_node candidate.channel;
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells info in
+    excludes_at t current new_node candidate.channel;
+    let (following, state) = expose_at t current info in
     let counter_view = Counter.release_private new_node in
     let (payload_event, payload_all) = Payload.snapshot new_node in
     let (capacity_event, capacity_all) = Capacity.snapshot new_node in
@@ -1321,8 +1427,8 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
           payload_all = payload_all; payload_eligible = Set.singleton (payload_event, Some value);
           capacity = capacity - 1; capacity_all = capacity_all;
           capacity_eligible = Set.singleton (capacity_event, capacity - 1)} in
-        append_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-          info {state with released = Set.union state.released released} fresh fresh_state value;
+        append_at t current info {state with released = Set.union state.released released} fresh
+          fresh_state value;
         Ghost.write (Ghost.at contents key) (current.values @ [value]);
         begin match mono with
         | Bool -> Push.commit token t new_node old_tail mono key info value
@@ -1341,8 +1447,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
         Push.abort token t new_node old_tail mono key info value candidate_capacity candidate_counter;
         let next = match following with [] -> assert false | next :: _ -> next in
         issue_fact key current.nodes current.head.position (Published next);
-        restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-          info following state;
+        restore_at t current info following state;
         fold allocated Ghost.self new_node (Some value) (capacity - 1)
           (wrap_once (info.word + 1)) Null
           {channel = candidate.channel; payload_all = payload_all; capacity_all = capacity_all;
@@ -1356,21 +1461,17 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let remembered = match failed_next with None -> assert false | Some next -> next in
     observe_fact key current.nodes current.head.position (Published info);
     observe_fact key current.nodes current.head.position (Published remembered);
-    chain_position current.nodes 0 current.head.position t.capacity current.values current.cells remembered;
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells info in
+    position_at t current remembered;
+    let (following, state) = expose_at t current info in
     let next = match following with [] -> assert false | next :: _ -> next in
     let result = read (state.channel, Link next.cell, state.released) in
     unfold retained_view Ghost.self info.incoming;
     acquire_following Ghost.self info following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      info following state;
-    let (next_following, next_state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells next in
+    restore_at t current info following state;
+    let (next_following, next_state) = expose_at t current next in
     Counter.observe next.cell next.incoming;
     Capacity.acquire next.cell next.incoming;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      next next_following next_state;
+    restore_at t current next next_following next_state;
     issue_fact key current.nodes current.head.position (Published next);
     (result, next)) in
   at (push_as t new_node (link_as_node (get_next old_tail)) mono) (fun invoke ->
@@ -1388,7 +1489,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     let (fresh, _failed_next) = attempt in
     let result = cas fresh.incoming in
     observe_fact key current.nodes current.head.position (Published fresh);
-    chain_position current.nodes 0 current.head.position t.capacity current.values current.cells fresh;
+    position_at t current fresh;
     fold is_queue t key {tail = (if result then fresh else current.tail)};
     result);
   at (fix_tail t.tail new_node) (fun invoke ->
@@ -1406,13 +1507,11 @@ proof result = atomic try_push [key : Ghost.t] t value
     (if result then List.length values < t.capacity else List.length values = t.capacity)) =
   let info = at (Atomic.get t.tail) Ghost.acquire_scope (fun read ->
     let result = read current.tail.incoming in
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.tail in
+    let (following, state) = expose_at t current current.tail in
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
     issue_fact key current.nodes current.head.position (Published current.tail);
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.tail following state;
+    restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Bool) (fun invoke ->
     let token = Try_push.bind () in
@@ -1430,13 +1529,11 @@ proof result = atomic push_exn [key : Ghost.t] t value
   atomic raises Full -> (queue t key values && List.length values = t.capacity) =
   let info = at (Atomic.get t.tail) Ghost.acquire_scope (fun read ->
     let result = read current.tail.incoming in
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.tail in
+    let (following, state) = expose_at t current current.tail in
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
     issue_fact key current.nodes current.head.position (Published current.tail);
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.tail following state;
+    restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Unit) (fun invoke ->
     let token = Push_exn.bind () in
@@ -1467,17 +1564,15 @@ proof result = atomic peek_as [key : Ghost.t] t poly
   let successor = at (fenceless_get_next old_head) (fun read ->
     let values = Peek.access token t poly key in
     observe_fact key current.nodes current.head.position (Head_seen sampled);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells sampled in
+    let (following, state) = expose_at t current sampled in
     let result = read (state.channel,
       first_link following,
       state.released) in
     acquire_following Ghost.self sampled following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      sampled following state;
+    restore_at t current sampled following state;
     let next = match following with
     | [] ->
-        chain_no_values current.nodes 0 current.head.position t.capacity current.values current.cells;
+        no_values_at t current;
         begin match poly with
         | Option -> Peek.commit token t poly key None
         | Value -> Peek.commit_raise token t poly key Empty
@@ -1491,30 +1586,25 @@ proof result = atomic peek_as [key : Ghost.t] t poly
   let event = at (let value = r.value) (fun read ->
     let next = successor in
     observe_fact key current.nodes current.head.position (Published next);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells next in
+    let (following, state) = expose_at t current next in
     let result = read () in
     let event = Payload.observe next.cell (Ghost.raw result) in
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      next following state;
+    restore_at t current next following state;
     (result, event)) in
   at (Atomic.get t.head) (fun read ->
     let next = successor in
     let values = Peek.access token t poly key in
     observe_fact key current.nodes current.head.position (Head_seen sampled);
     observe_fact key current.nodes current.head.position (Published next);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells next in
+    let (following, state) = expose_at t current next in
     Payload.reconcile next.cell event (Ghost.raw value);
     let result = read () in
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      next following state;
+    restore_at t current next following state;
     if result === old_head then begin
-      chain_same_cell current.nodes 0 current.head.position t.capacity current.values current.cells
-        sampled current.head;
+      same_cell_at t current sampled current.head;
       assert (next.position > current.head.position);
       assert (Ghost.raw value === next.initial);
-      chain_head_value current.nodes 0 current.head.position t.capacity current.values current.cells next;
+      head_value_at t current next;
       let item = match current.values with [] -> assert false | item :: _ -> item in
       assert (Ghost.raw value === Some item);
       begin match poly with
@@ -1586,16 +1676,14 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
   let successor = at (fenceless_get_next old_head) (fun read ->
     let values = Pop.access token t backoff poly key in
     observe_fact key current.nodes current.head.position (Head_seen sampled);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells sampled in
+    let (following, state) = expose_at t current sampled in
     let result = read (state.channel, first_link following,
       state.released) in
     acquire_following Ghost.self sampled following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      sampled following state;
+    restore_at t current sampled following state;
     let next = match following with
     | [] ->
-        chain_no_values current.nodes 0 current.head.position t.capacity current.values current.cells;
+        no_values_at t current;
         begin match poly with
         | Option -> Pop.commit token t backoff poly key None
         | Value -> Pop.commit_raise token t backoff poly key Empty
@@ -1613,12 +1701,11 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     observe_fact key current.nodes current.head.position (Published successor);
     let result = cas successor.incoming in
     if result then begin
-      chain_same_cell current.nodes 0 current.head.position t.capacity current.values current.cells
-        sampled current.head;
-      chain_position current.nodes 0 current.head.position t.capacity current.values current.cells successor;
-      chain_head_value current.nodes 0 current.head.position t.capacity current.values current.cells successor;
+      same_cell_at t current sampled current.head;
+      position_at t current successor;
+      head_value_at t current successor;
       let item = match current.values with [] -> assert false | item :: _ -> item in
-      let updated = retire_chain current.nodes 0 current.head.position t.capacity current.values current.cells successor in
+      let updated = retire_at t current successor in
       Ghost.write (Ghost.at contents key) updated;
       begin match poly with
       | Option -> Pop.commit token t backoff poly key (Some item)
@@ -1636,20 +1723,17 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     result);
   at (let value = node.value) (fun read ->
     observe_fact key current.nodes current.head.position (Head_seen successor);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells successor in
+    let (following, state) = expose_at t current successor in
     assert (not state.cleared);
     let result = read () in
     let event = Payload.observe successor.cell (Ghost.raw result) in
     Payload.reconcile successor.cell event (Ghost.raw result);
     assert (Ghost.raw result === successor.initial);
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      successor following state;
+    restore_at t current successor following state;
     result);
   at (node.value <- Obj.magic ()) (fun clear ->
     observe_fact key current.nodes current.head.position (Head_seen successor);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells successor in
+    let (following, state) = expose_at t current successor in
     assert (not state.cleared);
     let result = clear () in
     let (event, writes) = Payload.snapshot successor.cell in
@@ -1657,8 +1741,7 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     let changed = {state with raw = None; payload_all = writes;
       payload_eligible = Set.union state.payload_eligible (Set.singleton (event, None));
       cleared = true} in
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      successor following changed;
+    restore_at t current successor following changed;
     result);
   at (pop_as t (Backoff.once backoff) poly) (fun invoke ->
     let values = Pop.access token t backoff poly key in
@@ -1730,20 +1813,18 @@ proof result = atomic is_empty [key : Ghost.t] t
   let token = Empty.bind () in
   let (sampled, reg) = at (let head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
     let values = Empty.access token t key in
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.head in
+    let (following, state) = expose_at t current current.head in
     let result = read current.head.incoming in
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.head following state;
+    restore_at t current current.head following state;
     issue_fact key current.nodes current.head.position (Head_seen current.head);
     let done_ = match following with
     | next :: _ ->
-        chain_position current.nodes 0 current.head.position t.capacity current.values current.cells next;
-        chain_head_value current.nodes 0 current.head.position t.capacity current.values current.cells next;
+        position_at t current next;
+        head_value_at t current next;
         Empty.commit token t key false;
         true
     | [] ->
-        chain_no_values current.nodes 0 current.head.position t.capacity current.values current.cells;
+        no_values_at t current;
         Empty.abort token t key;
         false in
     let reg = Ghost.alloc [
@@ -1761,13 +1842,11 @@ proof result = atomic is_empty [key : Ghost.t] t
     observe_fact key current.nodes current.head.position (Head_seen sampled);
     observe_registry key current.waiting reg;
     assert (Map.get current.watching reg === sampled);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells sampled in
+    let (following, state) = expose_at t current sampled in
     let result = read (state.channel, first_link following,
       state.released) in
     acquire_following Ghost.self sampled following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      sampled following state;
+    restore_at t current sampled following state;
     let done_ : bool = Ghost.read (Ghost.at waiting_done reg) in
     let (saved_token, stored_done, retired) =
       unfold waiting_registration reg t key {token; done_; retired} in
@@ -1778,10 +1857,10 @@ proof result = atomic is_empty [key : Ghost.t] t
       begin match following with
       | [] -> ()
       | next :: _ ->
-          chain_position current.nodes 0 current.head.position t.capacity current.values current.cells next;
+          position_at t current next;
           assert false
       end;
-      chain_no_values current.nodes 0 current.head.position t.capacity current.values current.cells;
+      no_values_at t current;
       let values = Empty.access saved_token t key in
       Empty.commit saved_token t key true
     end;
@@ -1808,45 +1887,37 @@ proof result = atomic snapshot [key : Ghost.t] t
   atomic ensures (queue t key values && (match result with head, tail -> snapshot_value Ghost.self head tail (List.length values))) =
   let token = Snapshot.bind () in
   let sampled = at (let head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.head in
+    let (following, state) = expose_at t current current.head in
     let result = read current.head.incoming in
     Counter.observe current.head.cell current.head.incoming;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.head following state;
+    restore_at t current current.head following state;
     issue_fact key current.nodes current.head.position (Head_seen current.head);
     (result, current.head)) in
   let sampled_tail = at (let tail = fenceless_get t.tail) (fun read ->
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells current.tail in
+    let (following, state) = expose_at t current current.tail in
     let result = read (current.tail.cell, current.tail.incoming) in
     Counter.observe current.tail.cell current.tail.incoming;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      current.tail following state;
+    restore_at t current current.tail following state;
     issue_fact key current.nodes current.head.position (Published current.tail);
     (result, current.tail)) in
   let checkpoint = at (fenceless_get_next tail) (fun read ->
     let (prophecy : bool Ghost.Prophecy.t), (success : bool) = Ghost.Prophecy.create () in
     observe_fact key current.nodes current.head.position (Head_seen sampled);
     observe_fact key current.nodes current.head.position (Published sampled_tail);
-    let (following, state) = expose_chain current.nodes 0 current.head.position t.capacity
-      current.values current.cells sampled_tail in
+    let (following, state) = expose_at t current sampled_tail in
     let result = read (state.channel, first_link following,
       state.released) in
     acquire_following Ghost.self sampled_tail following state.released;
-    restore_chain current.nodes 0 current.head.position t.capacity current.values current.cells
-      sampled_tail following state;
+    restore_at t current sampled_tail following state;
     let next = match following with
     | next :: _ ->
         issue_fact key current.nodes current.head.position (Published next);
         next
     | [] ->
         if success && current.head.cell === sampled.cell then begin
-          chain_same_cell current.nodes 0 current.head.position t.capacity current.values current.cells
-            sampled current.head;
-          chain_position current.nodes 0 current.head.position t.capacity current.values current.cells
-            sampled_tail;
-          chain_length current.nodes 0 current.head.position t.capacity current.values current.cells;
+          same_cell_at t current sampled current.head;
+          position_at t current sampled_tail;
+          length_at t current;
           assert (sampled_tail.position = List.length current.nodes - 1);
           counter_difference sampled.word sampled_tail.word sampled.position sampled_tail.position
             sampled.turn sampled_tail.turn;
@@ -1861,7 +1932,7 @@ proof result = atomic snapshot [key : Ghost.t] t
   at (Atomic.compare_and_set t.tail tail node) Ghost.release_scope (fun cas ->
     let (_prophecy, _success, _head, next) = checkpoint in
     observe_fact key current.nodes current.head.position (Published next);
-    chain_position current.nodes 0 current.head.position t.capacity current.values current.cells next;
+    position_at t current next;
     let result = cas next.incoming in
     fold is_queue t key {tail = (if result then next else current.tail)};
     result);
@@ -1877,10 +1948,8 @@ proof result = atomic snapshot [key : Ghost.t] t
     let result = read () in
     Ghost.Prophecy.resolve prophecy (result === head);
     if result === head then begin
-      chain_same_cell current.nodes 0 current.head.position t.capacity current.values current.cells
-        sampled current.head;
-      chain_same_position current.nodes 0 current.head.position t.capacity current.values current.cells
-        seen_head sampled;
+      same_cell_at t current sampled current.head;
+      same_position_at t current seen_head sampled;
       assert (success && seen_head.cell === sampled.cell)
     end else assert (not success);
     result);
