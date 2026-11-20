@@ -686,6 +686,16 @@ type 'a queue_view = {
   watching : (Ghost.t, 'a node_info) map;
 }
 
+(* A fact about an opened queue state, issued as a fragment. *)
+lemma issue_at (key : Ghost.t) (opened : 'a queue_view) (fact : 'a fact)
+  requires (own (Ghost.at facts_auth key)
+      (Fact_auth.auth (Facts.set (facts opened.nodes opened.head.position))) &&
+    holds opened.nodes opened.head.position fact)
+  ensures (own (Ghost.at facts_auth key)
+    (Fact_auth.auth_frag (Facts.set (facts opened.nodes opened.head.position))
+      (Facts.set (Set.singleton fact)))) =
+  issue_fact key opened.nodes opened.head.position fact
+
 (* The chain lemmas at the chain of an opened queue state. *)
 lemma expose_at (queue : 'a t) (opened : 'a queue_view) (target : 'a node_info)
   returns (following : 'a node_info list) (state : 'a entry_state)
@@ -1233,7 +1243,6 @@ proof fix_tail [q : 'a t] [key : Ghost.t] [info : 'a node_info] tail new_tail
     let result = read () in
     result);
   at (get_next new_tail) (fun read ->
-    observe_fact key current.nodes current.head.position (Published info);
     let (following, state) = expose_at q current info in
     let result = read (state.channel,
       (match following with [] -> (Link Null : 'a link) | next :: _ -> Link next.cell),
@@ -1242,7 +1251,6 @@ proof fix_tail [q : 'a t] [key : Ghost.t] [info : 'a node_info] tail new_tail
     restore_at q current info following state;
     result);
   at (Atomic.compare_and_set tail old_tail new_tail) Ghost.release_scope (fun cas ->
-    observe_fact key current.nodes current.head.position (Published info);
     position_at q current info;
     let result = cas info.incoming in
     fold is_queue q key {tail = (if result then info else current.tail)};
@@ -1270,11 +1278,10 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   let cached_head = at (let capacity = get_capacity old_tail) (fun read ->
     Ghost.weaken_view Ghost.self info.incoming info.incoming;
     fold retained_view Ghost.self info.incoming;
-    observe_fact key current.nodes current.head.position (Published info);
     let (following, state) = expose_at t current info in
     let result = read (state.capacity, state.capacity_all, state.capacity_eligible) in
     assert (0 <= result && result <= t.capacity - (info.position - current.head.position));
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     restore_at t current info following state;
     cut (is_queue t key && old_tail === info.cell && known key info &&
       sampled_head key current.head &&
@@ -1291,7 +1298,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   let validation = at (let old_head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
     let (prophecy : bool Ghost.Prophecy.t), (terminal : bool) = Ghost.Prophecy.create () in
     let result = read current.head.incoming in
-    observe_fact key current.nodes current.head.position (Published info);
     position_at t current info;
     let (following, state) = expose_at t current current.head in
     Counter.observe current.head.cell current.head.incoming;
@@ -1313,12 +1319,10 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
         end
       end else ()
     end else ();
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     (result, (current.head, prophecy, terminal))) in
   let (sampled, prophecy, terminal) = validation in
   at (set_capacity old_tail capacity) (fun write ->
-    observe_fact key current.nodes current.head.position (Published info);
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
     let (following, state) = expose_at t current info in
     certify_refresh t.capacity current.head.position sampled.position info.position info.word
       sampled.word info.turn sampled.turn capacity;
@@ -1340,8 +1344,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     end;
     result);
   let successor = at ((get_next old_tail)[@occurrence 1]) (fun read ->
-    observe_fact key current.nodes current.head.position (Published info);
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
     position_at t current sampled;
     let (following, state) = expose_at t current info in
     let result = read (state.channel, first_link following,
@@ -1361,7 +1363,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
         Counter.observe next.cell next.incoming;
         Capacity.acquire next.cell next.incoming;
         restore_at t current next next_following next_state;
-        issue_fact key current.nodes current.head.position (Published next);
+        issue_at key current (Published next);
         next in
     (result, next)) in
   at (push_as t new_node next mono) (fun invoke ->
@@ -1394,8 +1396,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
        capacity_all = candidate.capacity_all; cleanup_key = candidate.cleanup_key};
     result);
   let attempt = at (compare_and_set_next old_tail (Link Null) (Link new_node)) (fun cas ->
-    observe_fact key current.nodes current.head.position (Published info);
-    observe_fact key current.nodes current.head.position (Head_seen cached_head);
     length_at t current;
     let candidate = unfold allocated Ghost.self new_node (Some value)
       (capacity - 1) (wrap_once (info.word + 1)) Null in
@@ -1446,7 +1446,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
       end else begin
         Push.abort token t new_node old_tail mono key info value candidate_capacity candidate_counter;
         let next = match following with [] -> assert false | next :: _ -> next in
-        issue_fact key current.nodes current.head.position (Published next);
+        issue_at key current (Published next);
         restore_at t current info following state;
         fold allocated Ghost.self new_node (Some value) (capacity - 1)
           (wrap_once (info.word + 1)) Null
@@ -1459,8 +1459,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   let retry_info = at (get_next old_tail) (fun read ->
     let (_fresh, failed_next) = attempt in
     let remembered = match failed_next with None -> assert false | Some next -> next in
-    observe_fact key current.nodes current.head.position (Published info);
-    observe_fact key current.nodes current.head.position (Published remembered);
     position_at t current remembered;
     let (following, state) = expose_at t current info in
     let next = match following with [] -> assert false | next :: _ -> next in
@@ -1472,7 +1470,7 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
     Counter.observe next.cell next.incoming;
     Capacity.acquire next.cell next.incoming;
     restore_at t current next next_following next_state;
-    issue_fact key current.nodes current.head.position (Published next);
+    issue_at key current (Published next);
     (result, next)) in
   at (push_as t new_node (link_as_node (get_next old_tail)) mono) (fun invoke ->
     let values = Push.access token t new_node old_tail mono key info value
@@ -1488,7 +1486,6 @@ proof result = atomic push_as [key : Ghost.t] [info : 'a node_info] [value : 'a]
   at (Atomic.compare_and_set t.tail old_tail new_node) Ghost.release_scope (fun cas ->
     let (fresh, _failed_next) = attempt in
     let result = cas fresh.incoming in
-    observe_fact key current.nodes current.head.position (Published fresh);
     position_at t current fresh;
     fold is_queue t key {tail = (if result then fresh else current.tail)};
     result);
@@ -1510,7 +1507,7 @@ proof result = atomic try_push [key : Ghost.t] t value
     let (following, state) = expose_at t current current.tail in
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
-    issue_fact key current.nodes current.head.position (Published current.tail);
+    issue_at key current (Published current.tail);
     restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Bool) (fun invoke ->
@@ -1532,7 +1529,7 @@ proof result = atomic push_exn [key : Ghost.t] t value
     let (following, state) = expose_at t current current.tail in
     Counter.observe current.tail.cell current.tail.incoming;
     Capacity.acquire current.tail.cell current.tail.incoming;
-    issue_fact key current.nodes current.head.position (Published current.tail);
+    issue_at key current (Published current.tail);
     restore_at t current current.tail following state;
     (result, current.tail)) in
   at (push_as t new_node (Atomic.get t.tail) Unit) (fun invoke ->
@@ -1559,11 +1556,10 @@ proof result = atomic peek_as [key : Ghost.t] t poly
   let token = Peek.bind () in
   let sampled = at (let old_head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
     let result = read current.head.incoming in
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let successor = at (fenceless_get_next old_head) (fun read ->
     let values = Peek.access token t poly key in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
     let (following, state) = expose_at t current sampled in
     let result = read (state.channel,
       first_link following,
@@ -1579,13 +1575,12 @@ proof result = atomic peek_as [key : Ghost.t] t poly
         end;
         sampled
     | next :: _ ->
-        issue_fact key current.nodes current.head.position (Published next);
+        issue_at key current (Published next);
         Peek.abort token t poly key;
         next in
     (result, next)) in
   let event = at (let value = r.value) (fun read ->
     let next = successor in
-    observe_fact key current.nodes current.head.position (Published next);
     let (following, state) = expose_at t current next in
     let result = read () in
     let event = Payload.observe next.cell (Ghost.raw result) in
@@ -1594,8 +1589,6 @@ proof result = atomic peek_as [key : Ghost.t] t poly
   at (Atomic.get t.head) (fun read ->
     let next = successor in
     let values = Peek.access token t poly key in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
-    observe_fact key current.nodes current.head.position (Published next);
     let (following, state) = expose_at t current next in
     Payload.reconcile next.cell event (Ghost.raw value);
     let result = read () in
@@ -1671,11 +1664,10 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
   let token = Pop.bind () in
   let sampled = at (let old_head = Atomic.get t.head) Ghost.acquire_scope (fun read ->
     let result = read current.head.incoming in
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let successor = at (fenceless_get_next old_head) (fun read ->
     let values = Pop.access token t backoff poly key in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
     let (following, state) = expose_at t current sampled in
     let result = read (state.channel, first_link following,
       state.released) in
@@ -1691,14 +1683,12 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
         end;
         sampled
     | next :: _ ->
-        issue_fact key current.nodes current.head.position (Published next);
+        issue_at key current (Published next);
         Pop.abort token t backoff poly key;
         next in
     (result, next)) in
   at (Atomic.compare_and_set t.head old_head new_head) Ghost.release_scope (fun cas ->
     let values = Pop.access token t backoff poly key in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
-    observe_fact key current.nodes current.head.position (Published successor);
     let result = cas successor.incoming in
     if result then begin
       same_cell_at t current sampled current.head;
@@ -1722,7 +1712,6 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     end;
     result);
   at (let value = node.value) (fun read ->
-    observe_fact key current.nodes current.head.position (Head_seen successor);
     let (following, state) = expose_at t current successor in
     assert (not state.cleared);
     let result = read () in
@@ -1732,7 +1721,6 @@ proof result = atomic pop_as [key : Ghost.t] t backoff poly
     restore_at t current successor following state;
     result);
   at (node.value <- Obj.magic ()) (fun clear ->
-    observe_fact key current.nodes current.head.position (Head_seen successor);
     let (following, state) = expose_at t current successor in
     assert (not state.cleared);
     let result = clear () in
@@ -1816,7 +1804,7 @@ proof result = atomic is_empty [key : Ghost.t] t
     let (following, state) = expose_at t current current.head in
     let result = read current.head.incoming in
     restore_at t current current.head following state;
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     let done_ = match following with
     | next :: _ ->
         position_at t current next;
@@ -1839,7 +1827,6 @@ proof result = atomic is_empty [key : Ghost.t] t
       watching = Map.set current.watching reg current.head};
     (result, (current.head, reg))) in
   at (fenceless_get_next head) (fun read ->
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
     observe_registry key current.waiting reg;
     assert (Map.get current.watching reg === sampled);
     let (following, state) = expose_at t current sampled in
@@ -1891,19 +1878,17 @@ proof result = atomic snapshot [key : Ghost.t] t
     let result = read current.head.incoming in
     Counter.observe current.head.cell current.head.incoming;
     restore_at t current current.head following state;
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     (result, current.head)) in
   let sampled_tail = at (let tail = fenceless_get t.tail) (fun read ->
     let (following, state) = expose_at t current current.tail in
     let result = read (current.tail.cell, current.tail.incoming) in
     Counter.observe current.tail.cell current.tail.incoming;
     restore_at t current current.tail following state;
-    issue_fact key current.nodes current.head.position (Published current.tail);
+    issue_at key current (Published current.tail);
     (result, current.tail)) in
   let checkpoint = at (fenceless_get_next tail) (fun read ->
     let (prophecy : bool Ghost.Prophecy.t), (success : bool) = Ghost.Prophecy.create () in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
-    observe_fact key current.nodes current.head.position (Published sampled_tail);
     let (following, state) = expose_at t current sampled_tail in
     let result = read (state.channel, first_link following,
       state.released) in
@@ -1911,7 +1896,7 @@ proof result = atomic snapshot [key : Ghost.t] t
     restore_at t current sampled_tail following state;
     let next = match following with
     | next :: _ ->
-        issue_fact key current.nodes current.head.position (Published next);
+        issue_at key current (Published next);
         next
     | [] ->
         if success && current.head.cell === sampled.cell then begin
@@ -1927,11 +1912,10 @@ proof result = atomic snapshot [key : Ghost.t] t
           Snapshot.commit token t key (head, tail)
         end else ();
         sampled_tail in
-    issue_fact key current.nodes current.head.position (Head_seen current.head);
+    issue_at key current (Head_seen current.head);
     (result, (prophecy, success, current.head, next))) in
   at (Atomic.compare_and_set t.tail tail node) Ghost.release_scope (fun cas ->
     let (_prophecy, _success, _head, next) = checkpoint in
-    observe_fact key current.nodes current.head.position (Published next);
     position_at t current next;
     let result = cas next.incoming in
     fold is_queue t key {tail = (if result then next else current.tail)};
@@ -1943,8 +1927,6 @@ proof result = atomic snapshot [key : Ghost.t] t
     result);
   at (Atomic.get t.head) (fun read ->
     let (prophecy, success, seen_head, _next) = checkpoint in
-    observe_fact key current.nodes current.head.position (Head_seen sampled);
-    observe_fact key current.nodes current.head.position (Head_seen seen_head);
     let result = read () in
     Ghost.Prophecy.resolve prophecy (result === head);
     if result === head then begin
