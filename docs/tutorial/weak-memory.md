@@ -82,16 +82,21 @@ what lets Caravan reason about their values as in a sequential program. The
 [OCaml memory-model chapter](https://ocaml.org/manual/5.5/memorymodel.html)
 describes the guarantee and its limits.
 
-Ownership itself is not synchronization. Moving ownership of a field from one domain
-to another is only sound at an operation that really synchronizes the two domains,
-such as `Domain.spawn`, `Domain.join` or a mutex; the contracts of those operations
-are what transfer ownership. Holding a fraction of ownership does not act as a
-fence, and race freedom must hold over the whole execution, including the
-transitions into and out of the code that relies on it. Likewise, reading or writing
-a default field is not an atomic step, so a proof cannot open a shared invariant
-around it the way it can around an `Atomic` operation. Caravan rejects such an
-access with the error "Cannot take a non-atomic step while an invariant or atomic
-update is open."
+Reading or writing a default field is not an atomic step, so a proof cannot open a
+shared invariant around it the way it can around an `Atomic` operation. Caravan
+rejects such an access with the error "Cannot take a non-atomic step while an
+invariant or atomic update is open." A proof can still keep ownership of a field
+in an invariant and take part of it out before the access: after unfolding the
+invariant, it folds it back with part of the fraction it found, such as
+`Permission.halve share`, and keeps the rest for the read.
+
+This is sound because, in a program whose only racing accesses are atomic ones,
+a domain can rely on ownership in an invariant only after observing, through a
+chain of synchronizing operations, the domain that put it there. That chain orders
+the earlier writes to the field before the access. The argument fails once fields
+may race: a domain can then learn of a write through a racing read, without
+synchronizing with it. Programs with frozen or relaxed fields therefore track
+visibility explicitly, as the following sections describe.
 
 ## Publication and acquired visibility {#sec:publication-and-acquired-visibility}
 

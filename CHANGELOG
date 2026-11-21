@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `Permission.halve` lets a proof take part of a fraction out of an invariant before a field access.
 - One-shot `Ghost.Prophecy` predictions support linearizability proofs with future-dependent linearization points.
 - Standard-library `ignore` evaluates its argument while discarding its result.
 - Executable contracts support explicit invariant masks with `opens {…}`, using the same syntax as proof lemmas.

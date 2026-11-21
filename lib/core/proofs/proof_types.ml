@@ -275,7 +275,8 @@ let elaborate_proof_types ?(add_standard = true) ?(allow_interfaces = false)
         (signature env
            (Parse.interface
               (Lexing.from_string
-                 "module Permission : sig type t val half : t val full : t end")))
+                 "module Permission : sig type t val half : t val full : t val halve : t \
+                  -> t end")))
   in
   let previous_types, previous_resources, previous_fields, previous_aus, previous_tasks =
     previous

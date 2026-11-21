@@ -1,0 +1,11 @@
+invariant shared (job : job) (w : int) =
+  exists share : Permission.t. own ~fraction:share job.work w
+
+proof result = read job
+  requires shared job w
+  ensures result === w =
+  at (job.work) (fun read ->
+    let o = unfold shared job w in
+    fold shared job w { share = Permission.halve o.share };
+    let result = read () in
+    result)

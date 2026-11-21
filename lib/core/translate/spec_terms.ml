@@ -1514,6 +1514,10 @@ and application env (t : S.term) =
       let* prophecy = formula env prophecy in
       let+ value = formula env value in
       R.Prophecy.owns ~loc:l prophecy value
+  | Tvar (Qdot (Qid m, v)), [ share ]
+    when String.equal m.pid_str "Permission" && String.equal v.pid_str "halve" ->
+      let+ share = formula env share in
+      R.Expr.binary ~loc:l Div share (R.Expr.real ~loc:l 2.0)
   | Tvar (Qdot (Qid ghost, method_)), [ argument ]
     when String.equal ghost.pid_str "Ghost" && String.equal method_.pid_str "raw" ->
       let* value =

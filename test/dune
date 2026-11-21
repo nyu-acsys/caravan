@@ -240,6 +240,7 @@
   (alias translate/predicates/predicates_implicit)
   (alias translate/predicates/predicates_recursive_agreement)
   (alias translate/predicates/proof_errors)
+  (alias translate/predicates/shared_fractions)
   ; translate/proof_functors
   (alias translate/proof_functors/exports_signature)
   (alias translate/proof_functors/generic)
