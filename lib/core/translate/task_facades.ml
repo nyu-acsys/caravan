@@ -135,7 +135,7 @@ let collect ~family_plan ~operation_types ~procedure_name ~given ~resolve ~conte
       Fresh_names.restore snapshot;
       let* prepared, _ = prepared in
       let execution_bindings =
-        if Mutex_execution.enabled source.proof_resources then
+        if given.mutex_execution then
           Mutex_execution.entry_bindings
             ?trusted:given.proof_support.execution_context_path given.env
             ~implicit:(List.map prepared.implicit ~f:(fun (source, _, _, _) -> source))

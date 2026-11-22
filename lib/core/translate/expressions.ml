@@ -2204,8 +2204,11 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
   let* execution_statements, execution_arguments =
     if
       execution_enabled ctx.given
-      && List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
-          String.equal target f)
+      && (List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
+              String.equal target f)
+         || Option.exists
+              (List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal)
+              ~f:(fun signature -> signature.procedure_execution))
     then State.execution_arguments ctx ~at:e.exp_loc
     else State.return ([], [])
   in

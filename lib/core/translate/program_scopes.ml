@@ -13,6 +13,7 @@ type t = {
   linearizations : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
   source : Source.t;
+  mutex_execution : bool;
   implementation : Source.proof_resource -> string option;
   proof_implementation : Source.proof_resource -> string option;
   definition_target : Proof_bindings.binding -> string option;
@@ -370,6 +371,28 @@ let run (source : Source.t) : (t, error) Result.t =
     Specializations.run types ~helped:(helped source.proof) ~targets (funcs @ lifted)
   in
   let funcs = inherit_contracts funcs in
+  let trusted = Source.mutex_context_path source.env in
+  let needs_context environment contract =
+    Option.exists contract
+      ~f:
+        (Mutex_execution.contract_requires_context ?trusted
+           (Source.annotation_env source environment))
+  in
+  let* imported_contexts =
+    all libraries ~f:(fun library ->
+        all library.Library_modules.signature.signature_values ~f:(fun (_, value) ->
+            let site = value.Module_inventory.site in
+            let* contract =
+              contract_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                ~next:site.next
+            in
+            Ok (needs_context site.environment contract)))
+  in
+  let mutex_execution =
+    Mutex_execution.enabled source.proof_resources
+    || List.exists funcs ~f:(fun f -> needs_context f.environment f.contract)
+    || List.exists imported_contexts ~f:(List.exists ~f:Fn.id)
+  in
   let* access_proofs =
     access_annotations ~libraries
       ~checked:
@@ -665,6 +688,7 @@ let run (source : Source.t) : (t, error) Result.t =
       linearizations;
       initializations;
       source;
+      mutex_execution;
       implementation;
       proof_implementation;
       definition_target;

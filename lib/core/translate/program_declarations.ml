@@ -1082,6 +1082,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               procedure_raw = raw;
               procedure_physical_atomic = Callable_contract.physically_atomic f.contract;
               procedure_pure = is_pure f;
+              procedure_execution = false;
             } ))
   in
   let* imported_signatures =
@@ -1089,11 +1090,21 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let* contracts = library_contracts library in
         all contracts ~f:(fun (member, (contract, at)) ->
             let raw = Raw_contract.of_contract (Some contract) in
+            let value =
+              List.Assoc.find_exn library.signature.signature_values member
+                ~equal:String.equal
+            in
+            let execution =
+              Mutex_execution.contract_requires_context
+                ?trusted:(Source.mutex_context_path source.env)
+                (Source.annotation_env source value.site.environment)
+                contract
+            in
             if
               not
                 (Raw_contract.any raw
                 || Callable_contract.physically_atomic (Some contract)
-                || contract.pure)
+                || contract.pure || execution)
             then Ok None
             else
               let path = Path.Pdot (library.Library_modules.library_path, member) in
@@ -1124,6 +1135,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                        procedure_physical_atomic =
                          Callable_contract.physically_atomic (Some contract);
                        procedure_pure = contract.pure;
+                       procedure_execution = execution;
                      } ))))
   in
   let procedure_signatures =
@@ -1168,6 +1180,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 procedure_physical_atomic =
                   Callable_contract.physically_atomic operation.operation_contract;
                 procedure_pure = false;
+                procedure_execution = false;
               } ))
   in
   let procedure_signatures = procedure_signatures @ checked_signatures in
@@ -1233,8 +1246,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             (Datatypes.atomic_token ~path:au.Source.au_token_path
                ~procedure:(au_procedure au f) ~at:au.au_at
                ~context:
-                 (Execution_contract.context_layout
-                    ~mutex:(Mutex_execution.enabled source.proof_resources)
+                 (Execution_contract.context_layout ~mutex:scopes.mutex_execution
                     ~visibility:(Source.visibility_required source))
                ())
             au.au_token_paths
@@ -2154,6 +2166,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
              ~generic_predicates:task_generic_predicates ())
           with
           procedure_signatures;
+          mutex_execution = scopes.mutex_execution;
         })
       ~resolve ~context ~application_view source untyped_scoped_proofs
   in

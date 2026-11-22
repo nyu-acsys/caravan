@@ -697,6 +697,7 @@ type procedure_signature = {
   procedure_raw : Raw_contract.t;
   procedure_physical_atomic : bool;
   procedure_pure : bool;
+  procedure_execution : bool;
 }
 
 let map_procedure_types signature ~f =

@@ -196,6 +196,8 @@
   (alias translate/mutex/allocation)
   (alias translate/mutex/family_inference_errors)
   (alias translate/mutex/ownership)
+  ; translate/mutex_imports
+  (alias translate/mutex_imports/mutex_imports)
   ; translate/optional_arguments
   (alias translate/optional_arguments/optional_arguments)
   ; translate/physical_atomic

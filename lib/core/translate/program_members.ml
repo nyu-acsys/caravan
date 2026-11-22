@@ -48,7 +48,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
   } =
     scopes
   in
-  let mutex_execution = Mutex_execution.enabled scopes.source.proof_resources in
+  let mutex_execution = scopes.mutex_execution in
   let visibility_execution = Source.visibility_required scopes.source in
   let declaration_context =
     Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
@@ -381,6 +381,24 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 | _, Some contract when contract.pure ->
                     library_pure_members ctx ~at ~name:x ~args ~result contract
                 | _ ->
+                    let execution =
+                      Option.exists
+                        (List.Assoc.find procedure_signatures
+                           (lib.library_name ^ "." ^ x)
+                           ~equal:String.equal)
+                        ~f:(fun signature -> signature.procedure_execution)
+                    in
+                    let ctx =
+                      {
+                        ctx with
+                        given =
+                          {
+                            ctx.given with
+                            mutex_execution = execution;
+                            visibility_execution = execution && visibility_execution;
+                          };
+                      }
+                    in
                     let* opens =
                       State.of_result
                         (Contract_attributes.empty_opens

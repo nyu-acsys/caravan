@@ -1294,8 +1294,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                    {
                      au_key = key;
                      au_context =
-                       Execution_contract.context_layout
-                         ~mutex:(Mutex_execution.enabled source.proof_resources)
+                       Execution_contract.context_layout ~mutex:scopes.mutex_execution
                          ~visibility:(Source.visibility_required source);
                      au_generic;
                      au_owner = owner;

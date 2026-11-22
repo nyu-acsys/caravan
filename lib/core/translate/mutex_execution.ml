@@ -15,6 +15,15 @@ let has_context ?trusted environment terms =
     (List.concat_map terms ~f:(Translate_context.term_references []))
     ~f:(Source.is_mutex_context ?trusted environment)
 
+(** Context clauses require tracking even when the caller declares no mutex facade. *)
+let contract_requires_context ?trusted environment
+    (contract : Caravan_spec.Spec_ast.contract) =
+  has_context ?trusted environment
+    (contract.requires @ contract.ensures @ contract.atomic_requires
+   @ contract.atomic_ensures
+    @ List.filter_map contract.raises ~f:snd
+    @ List.map contract.atomic_raises ~f:snd)
+
 type witness = Owner | Held
 
 (** Implicit names that describe the existing execution context. *)

@@ -87,6 +87,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     linearizations;
     initializations;
     source;
+    mutex_execution = _;
     implementation;
     proof_implementation;
     definition_target;
@@ -2406,8 +2407,17 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
              else []
            else if state.tables.mutex_support then Mutex_contract.support ~loc:start ()
            else [])
-        @ (if visibility_execution && not mutex_protocol_support then
-             Execution_contract.support ~loc:start ~mutex:false ~visibility:true ()
+        @ (if
+             (visibility_execution || scopes.mutex_execution)
+             && not mutex_protocol_support
+           then
+             Execution_contract.support ~loc:start ~mutex:scopes.mutex_execution
+               ~visibility:visibility_execution ()
+           else [])
+        @ (if
+             scopes.mutex_execution && state.tables.mutex_support
+             && not mutex_protocol_support
+           then [ Mutex_contract.native_support ~loc:start () ]
            else [])
         @ (if state.tables.condition_support && not mutex_protocol_support then
              Condition_contract.support ~loc:start ()
