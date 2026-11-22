@@ -13,6 +13,9 @@ type outline = {
       (** The exports of earlier steps that the step uses, by key and pattern. *)
   lets : (Spec_ast.pat * Spec_ast.proof_expr) list;
       (** The outline's pure bindings that the step uses, in order. *)
+  body_imports : (string * Spec_ast.pat) list;
+      (** The exports of steps in a loop's body that the witnesses of its invariant use,
+          at the end of each iteration. *)
 }
 (** What a step of a proof outline shares with the other steps. *)
 

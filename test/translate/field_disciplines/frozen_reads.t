@@ -25,6 +25,7 @@ cannot discard a proof attached to an immutable projection or an atomic call.
   $ caravan --shh frozen_read_immutable_fail.ml > immutable.out 2>&1
   [1]
   $ grep -q 'Ghost.scope must follow an ordinary field access' immutable.out
+  [1]
   $ caravan --shh frozen_read_atomic_fail.ml > atomic.out 2>&1
   [1]
   $ grep -q 'This scope does not match the attached operation' atomic.out

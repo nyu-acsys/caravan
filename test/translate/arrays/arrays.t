@@ -19,3 +19,18 @@ fixed, and indices and lengths out of bounds are errors to prove absent.
   Verification Error: A precondition may not hold for this call.
   Related Location: This own predicate may not hold
   [1]
+
+Reads and writes of entries anchor proof scopes, which can lend a fraction of an
+invariant's ownership to a read.
+
+  $ caravan --shh anchors.ml
+  Verification successful.
+
+  $ caravan --shh anchors_fail.ml
+  [Error] File "anchors_fail.ml", line 1, columns 29-34:
+  1 | let read (a : int array) i = a.(i)
+                                   ^^^^^
+  Verification Error: A precondition may not hold for this call.
+  Related Location: This assertion may not hold
+  Related Location: This own predicate may not hold
+  [1]

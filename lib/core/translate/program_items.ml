@@ -633,6 +633,10 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
         Poly.equal label.lbl_mut Mutable && Poly.equal label.lbl_atomic Nonatomic
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
         Option.is_some (atomic_name path)
+        || Option.exists (stdlib_array_function path) ~f:(fun operation ->
+            List.mem
+              [ "get"; "set"; "unsafe_get"; "unsafe_set" ]
+              operation ~equal:String.equal)
         ||
         match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
         | Ok path ->
@@ -649,8 +653,8 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
   in
   attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
     ~description:
-      "Ghost.scope must follow an ordinary field access, an Atomic access or a checked \
-       procedure call"
+      "Ghost.scope must follow an ordinary field or array access, an Atomic access or a \
+       checked procedure call"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)

@@ -359,8 +359,11 @@ return_adapter_expr:
 loop_spec:
 | cs = loop_clause* EOF
     { let invariants = List.filter_map (function
-        | `Invariant t -> Some t
+        | `Invariant (t, _) -> Some t
         | `State_invariant _ | `Variant _ | `Raises _ -> None) cs in
+      let invariant_witnesses = List.concat_map (function
+        | `Invariant (_, ws) -> ws
+        | `State_invariant _ | `Variant _ | `Raises _ -> []) cs in
       let state_invariants = List.filter_map (function
         | `State_invariant invariant -> Some invariant
         | `Invariant _ | `Variant _ | `Raises _ -> None) cs in
@@ -370,7 +373,7 @@ loop_spec:
       let loop_raises = List.filter_map (function
         | `Raises clause -> Some clause
         | `Invariant _ | `State_invariant _ | `Variant _ -> None) cs in
-      { invariants; state_invariants; loop_variant; loop_raises } }
+      { invariants; state_invariants; loop_variant; loop_raises; invariant_witnesses } }
 ;
 
 predicate:
@@ -568,7 +571,7 @@ anchor_nonident_token:
 
 step_action:
 | scope_expression { (Wrapped_scope, mk_loc $loc) }
-| INVARIANT term { (Loop, mk_loc $loc) }
+| INVARIANT term loption(ghost_witnesses) { (Loop, mk_loc $loc) }
 | INVARIANT LEFTPAR FUN nonempty_list(pat_arg) ARROW term RIGHTPAR
     { (Loop, mk_loc $loc) }
 | COMMIT { (Linearize, mk_loc $loc) }
@@ -1008,7 +1011,7 @@ ghost_witnesses:
 ;
 
 loop_clause:
-| INVARIANT t = term { `Invariant t }
+| INVARIANT t = term ws = loption(ghost_witnesses) { `Invariant (t, ws) }
 | INVARIANT LEFTPAR FUN states = nonempty_list(pat_arg) ARROW t = term RIGHTPAR
     { `State_invariant (states, t) }
 | VARIANT t = term { `Variant t }

@@ -462,6 +462,18 @@ type binding =
 let binding_names = function
   | Export { pattern; _ } | Pure { pattern; _ } -> S.pat_names pattern
 
+(** The names that the witnesses of a loop step's invariants bind. *)
+let loop_witness_names text =
+  let text = Option.value (String.chop_prefix text ~prefix:"invariant") ~default:text in
+  match
+    Spec_parser.loop_spec Spec_lexer.token (Lexing.from_string ("invariant" ^ text))
+  with
+  | spec -> List.map spec.invariant_witnesses ~f:(fun (name, _) -> name.S.pid_str)
+  | exception _ -> []
+
+(** The key under which a loop step at [key] exports the witness [name]. *)
+let loop_witness_key key name = key ^ "." ^ name
+
 (** The bindings of [visible] that a step, at code with [regions] ending at [place], uses
     in [text], with those that the pure ones use; an export it uses must run whenever the
     step does. *)
@@ -505,6 +517,7 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
         List.filter_map (List.rev in_order) ~f:(function
           | Pure { pattern; value; _ } -> Some (pattern, value)
           | Export _ -> None);
+      body_imports = [];
     }
 
 (** [text], written at [origin] after a [prefix] that the outline does not write, as an
@@ -587,7 +600,9 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
     List.filter visible ~f:(fun b ->
         not (List.exists (binding_names b) ~f:(List.mem names ~equal:String.equal)))
   in
-  let* _, _, annotations =
+  (* The loops whose witnesses may use the exports of steps in their bodies. *)
+  let loops = ref [] in
+  let* _, final_visible, annotations =
     List.fold_result outline.outline_steps ~init:(-1, [], [])
       ~f:(fun (previous, visible, annotations) step ->
         match step with
@@ -595,12 +610,22 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let* code =
               anchor_place ~proof_text definition ~excluded ~previous anchor_loc
             in
-            let* place =
+            let* body =
               match action with
               | Loop ->
                   let* body = loop_body definition code ~at:anchor_loc in
-                  Ok body.pexp_loc.loc_start
-              | Linearize | Initializes | Scope | Wrapped_scope -> Ok (step_end code)
+                  loops :=
+                    ( action_loc,
+                      body,
+                      regions_of regions code,
+                      Printf.sprintf "%d" action_loc.loc_start.pos_cnum )
+                    :: !loops;
+                  Ok (Some body)
+              | Linearize | Initializes | Scope | Wrapped_scope -> Ok None
+            in
+            let place =
+              Option.value_map body ~default:(step_end code) ~f:(fun body ->
+                  body.pexp_loc.loc_start)
             in
             let prefix =
               match action with
@@ -636,6 +661,30 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
               | Some (key, pattern) ->
                   Export { key; pattern; code; code_regions = regions_of regions code }
                   :: shadow visible (S.pat_names pattern)
+            in
+            (* The names a loop invariant's witnesses bind are available in the loop's body,
+               with their values at the start of the iteration, and after the loop. *)
+            let visible =
+              match body with
+              | None -> visible
+              | Some body ->
+                  let names = loop_witness_names (slice proof_text action_loc) in
+                  List.fold names ~init:visible ~f:(fun visible name ->
+                      let pattern =
+                        {
+                          S.pat_desc = Pid (S.mk_id ~loc:action_loc name);
+                          pat_loc = action_loc;
+                        }
+                      in
+                      Export
+                        {
+                          key = loop_witness_key key name;
+                          pattern;
+                          code;
+                          code_regions =
+                            Option.value (List.tl (regions_of regions body)) ~default:[];
+                        }
+                      :: shadow visible [ name ])
             in
             let previous =
               match action with
@@ -674,6 +723,36 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             in
             Ok (previous, binding :: shadow visible (S.pat_names pattern), annotations)
         | Nested _ -> Ok (previous, visible, annotations))
+  in
+  let within (body : Parsetree.expression) (code : Parsetree.expression) =
+    code.pexp_loc.loc_start.pos_cnum >= body.pexp_loc.loc_start.pos_cnum
+    && code.pexp_loc.loc_end.pos_cnum <= body.pexp_loc.loc_end.pos_cnum
+  in
+  let* annotations =
+    Result.all
+    @@ List.map annotations ~f:(fun (annotation : Annotation.t) ->
+        match
+          ( annotation.outline,
+            List.find !loops ~f:(fun (origin, _, _, _) ->
+                Option.exists annotation.origin ~f:(fun o -> Poly.equal o.loc origin)) )
+        with
+        | Some outline, Some (origin, body, regions, key) ->
+            let visible =
+              List.filter final_visible ~f:(function
+                | Export { code; key = export; _ } ->
+                    within body code && not (String.is_prefix export ~prefix:(key ^ "."))
+                | Pure _ -> false)
+            in
+            let* late =
+              uses ~visible ~step_loc:origin ~regions
+                ~place:body.pexp_loc.loc_end.pos_cnum (slice proof_text origin)
+            in
+            Ok
+              {
+                annotation with
+                outline = Some { outline with body_imports = late.imports };
+              }
+        | _ -> Ok annotation)
   in
   let after = definition.at.loc_end in
   let manual =

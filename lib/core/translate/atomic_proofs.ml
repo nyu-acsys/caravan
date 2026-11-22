@@ -24,7 +24,13 @@ let loop_spec ?target ctx ~(after : Location.t) (body : Typedtree.expression) =
   with
   | [] ->
       Ok
-        ( { S.invariants = []; state_invariants = []; loop_variant = []; loop_raises = [] },
+        ( {
+            S.invariants = [];
+            state_invariants = [];
+            loop_variant = [];
+            loop_raises = [];
+            invariant_witnesses = [];
+          },
           None )
   | [ a ] -> Result.map (Annotation.loop_spec a) ~f:(fun spec -> (spec, Some a))
   | _ :: a :: _ -> error a.loc "A loop has at most one annotation"
@@ -70,6 +76,11 @@ let loop_outline_terms annotation terms =
          List.fold_right bindings ~init:term ~f:(fun (pattern, value) body ->
              S.mk_term (Tlet (pattern, value, body)) body.term_loc)))
 
+type loop_witnesses = {
+  entry : R.Stmt.t list;  (** Declares and chooses the witnessed names at loop entry. *)
+  witnesses : (string * string * Types.type_expr) list;
+      (** The witnessed names, with their Raven names and types. *)
+}
 (** The invariants of a loop at [at]: those of [spec], with the variables in scope there,
     the facts that hold throughout the function, and the value domains of variables in
     scope but a [for] loop's [counter], which goes one beyond. Names free in [spec]'s
@@ -77,6 +88,7 @@ let loop_outline_terms annotation terms =
     [relation], given the values these own, as [k] for [i.contents], may add a conjunct,
     as the value of the loop's condition. The invariants of [spec] hold under [guard] if
     given, as for a loop that may raise, when it has not. *)
+
 let rec loop_invariants ?(counter = "") ?(inputs = []) ?guard ?annotation ctx ~at
     (spec : S.loop_spec)
     ~(relation : ((string * string) * R.Expr.t) list -> R.Expr.t option State.t) =
@@ -148,6 +160,45 @@ let rec loop_invariants ?(counter = "") ?(inputs = []) ?guard ?annotation ctx ~a
             (Source.is_mutex_context
                ?trusted:ctx.given.proof_support.execution_context_path ctx.given.env))
   in
+  (* An existential conjunct binding a witnessed name binds it for the whole loop. *)
+  let witnessed_name x =
+    List.exists spec.invariant_witnesses ~f:(fun (w, _) -> String.equal w.S.pid_str x)
+  in
+  let* explicit, terms =
+    State.fold terms ~init:([], []) ~f:(fun (explicit, terms) term ->
+        match term.S.term_desc with
+        | Tquant (Texists, binders, [], body)
+          when List.exists binders ~f:(fun (x, _) -> witnessed_name x.S.pid_str) ->
+            let chosen, rest =
+              List.partition_tf binders ~f:(fun (x, _) -> witnessed_name x.S.pid_str)
+            in
+            let* chosen =
+              State.all chosen ~f:(fun (x, typ) ->
+                  let* typ =
+                    match typ with
+                    | Some typ -> State.return typ
+                    | None ->
+                        State.of_result
+                          (error x.pid_loc "A witnessed name needs a type annotation")
+                  in
+                  let* t =
+                    State.of_result (Source.ocaml_type ctx.given.env ~at:x.pid_loc typ)
+                  in
+                  let* typ = State.typ ctx ~at:x.pid_loc t in
+                  let+ raven = State.fresh x.pid_str in
+                  (x.pid_str, raven, t, typ, loc x.pid_loc))
+            in
+            let body =
+              if List.is_empty rest then body
+              else S.mk_term (Tquant (Texists, rest, [], body)) term.term_loc
+            in
+            State.return (explicit @ chosen, terms @ [ body ])
+        | _ -> State.return (explicit, terms @ [ term ]))
+  in
+  let env =
+    List.fold explicit ~init:env ~f:(fun env (x, raven, t, _, _) ->
+        { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+  in
   let* free = free_typed env terms ~at in
   let* () =
     State.of_result
@@ -213,18 +264,43 @@ let rec loop_invariants ?(counter = "") ?(inputs = []) ?guard ?annotation ctx ~a
     R.Spec.make
       (Option.value_map guard ~default:e ~f:(fun g -> R.Expr.binary ~loc:l Impl g e))
   in
-  let user =
-    match (free, invariants) with
-    | _, [] -> []
-    | [], _ -> List.map invariants ~f:guarded
-    | _, i :: is ->
+  let witnessed, bound =
+    List.partition_tf free ~f:(fun (x, _, _, _, _) -> witnessed_name x)
+  in
+  let witnessed = explicit @ witnessed in
+  let free = witnessed @ bound in
+  let quantified free =
+    match invariants with
+    | [] -> None
+    | i :: is ->
+        let conj = List.fold is ~init:i ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
         let vars =
           List.map free ~f:(fun (_, raven, _, typ, l) ->
               R.Var.make ~loc:l (ident ~loc:l raven) typ)
         in
-        let conj = List.fold is ~init:i ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
-        [ guarded (R.Expr.exists ~loc:l vars conj) ]
+        Some
+          (guarded (if List.is_empty vars then conj else R.Expr.exists ~loc:l vars conj))
   in
+  let user =
+    match (bound, invariants) with
+    | _, [] -> []
+    | [], _ -> List.map invariants ~f:guarded
+    | _, _ -> Option.to_list (quantified bound)
+  in
+  (* A witnessed name is a ghost variable of the loop: chosen among the values that
+     satisfy the invariants at entry, then given its witness after each iteration. *)
+  let entry =
+    match (witnessed, quantified free, quantified bound) with
+    | [], _, _ | _, None, _ | _, _, None -> []
+    | _, Some before, Some after ->
+        List.concat_map witnessed ~f:(fun (_, raven, _, typ, l) ->
+            R.Stmt.local ~loc:l ~ghost:true ~typ (ident ~loc:l raven))
+        @ [ R.Stmt.exhale ~loc:l before ]
+        @ List.map witnessed ~f:(fun (_, raven, _, _, l) ->
+            R.Stmt.havoc ~loc:l (name ~loc:l raven))
+        @ [ R.Stmt.inhale ~loc:l after ]
+  in
+  let witnesses = List.map witnessed ~f:(fun (x, raven, t, _, _) -> (x, raven, t)) in
   let ranges =
     List.filter_map scope ~f:(fun (_, (raven, t)) ->
         if String.equal raven counter then None
@@ -233,7 +309,57 @@ let rec loop_invariants ?(counter = "") ?(inputs = []) ?guard ?annotation ctx ~a
               if runtime raven then value_spec ctx ~loc:l t raven
               else range_spec ~loc:l t raven))
   in
-  ranges @ facts @ user @ List.map execution_invariants ~f:R.Spec.make
+  ( ranges @ facts @ user @ List.map execution_invariants ~f:R.Spec.make,
+    { entry; witnesses } )
+
+(** Makes the witnessed names available to the outline steps after the loop. *)
+and export_loop_witnesses ?annotation ~at (witnessed : loop_witnesses) =
+  let l = loc at in
+  match Option.bind annotation ~f:(fun annotation -> annotation.Annotation.origin) with
+  | None -> State.return ()
+  | Some origin ->
+      let key = Printf.sprintf "%d" origin.loc.loc_start.pos_cnum in
+      State.modify_carried (fun c ->
+          {
+            c with
+            outline_exports =
+              List.map witnessed.witnesses ~f:(fun (x, raven, t) ->
+                  ( Outline.loop_witness_key key x,
+                    (R.Expr.var ~loc:l (name ~loc:l raven), t) ))
+              @ c.outline_exports;
+          })
+
+(** The assignments of the witnesses of [spec] at the end of an iteration, where the
+    exports of the steps in the loop's body are available. *)
+and loop_witness_updates ?annotation ctx ~at (spec : S.loop_spec)
+    (witnessed : loop_witnesses) =
+  let open State.Syntax in
+  let l = loc at in
+  let* env = scope_env ctx in
+  let outline =
+    Option.bind annotation ~f:(fun annotation -> annotation.Annotation.outline)
+  in
+  let* env =
+    outline_env env
+      (Option.map outline ~f:(fun outline ->
+           { outline with Annotation.imports = outline.imports @ outline.body_imports }))
+  in
+  let env =
+    List.fold witnessed.witnesses ~init:env ~f:(fun env (x, raven, t) ->
+        { (bind env x (Raven raven)) with var_types = (x, t) :: env.var_types })
+  in
+  State.all spec.invariant_witnesses ~f:(fun (w, value) ->
+      match
+        List.find witnessed.witnesses ~f:(fun (x, _, _) -> String.equal x w.S.pid_str)
+      with
+      | None ->
+          State.of_result
+            (error w.pid_loc "This name is not bound by the loop's invariants")
+      | Some (_, raven, _) ->
+          let+ value = formula env value in
+          R.Stmt.assign ~loc:l
+            [ R.Expr.var ~loc:l (name ~loc:l raven) ]
+            (R.Stmt.expr_rhs value))
 
 (** The names that [t] owns the values of fields of variables as, as [k] for [i.contents]
     in [own i.contents k]: the variable, the field and the name. *)

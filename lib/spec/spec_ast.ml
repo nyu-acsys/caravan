@@ -138,6 +138,9 @@ type loop_spec = {
   loop_variant : term list;
   loop_raises : (pat * term option) list;
       (** What holds when the loop stops by raising an exception: [raises E x -> t]. *)
+  invariant_witnesses : (id * term) list;
+      (** The values that names the invariants bind take after each iteration:
+          [with { x = e }]. *)
 }
 (** The specification of a loop, written at the start of its body. *)
 

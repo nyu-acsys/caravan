@@ -732,31 +732,40 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
       let unraised c =
         Option.value_map guard ~default:c ~f:(fun g -> R.Expr.binary ~loc:l And c g)
       in
-      let* invariants = loop_invariants ?guard ?annotation ctx ~at spec ~relation in
+      let* invariants, witnessed =
+        loop_invariants ?guard ?annotation ctx ~at spec ~relation
+      in
       let invariants = invariants @ exceptional in
       let target = (x, l) in
+      let* () = export_loop_witnesses ?annotation ~at witnessed in
       let* body_stmts, reaching =
         in_loop raising (fun () ->
             let* body_stmts, _ = expr ctx body in
+            let* updates = loop_witness_updates ?annotation ctx ~at spec witnessed in
+            let body_stmts = body_stmts @ updates in
             if List.is_empty c_stmts then State.return body_stmts
             else
               let+ c_stmts', c' = expr ctx cond in
               body_stmts @ c_stmts' @ [ assign target c' ])
       in
-      let+ propagation =
+      let* propagation =
         match raising with
         | None -> State.return []
         | Some (_, outcome, typ, _, _) ->
             propagate ~at ~certain:false ~typ outcome reaching
       in
+      let+ () = export_loop_witnesses ?annotation ~at witnessed in
       if List.is_empty c_stmts then
-        ( decl @ [ R.Stmt.while_ ~loc:l ~invariants (unraised c) body_stmts ] @ propagation,
+        ( decl @ witnessed.entry
+          @ [ R.Stmt.while_ ~loc:l ~invariants (unraised c) body_stmts ]
+          @ propagation,
           unit_value ~loc:l )
       else
         ( c_stmts @ decl
           @ R.Stmt.local ~loc:l ~const:false ~typ:(R.Type.bool ~loc:l) (ident ~loc:l x)
+          @ [ assign target c ]
+          @ witnessed.entry
           @ [
-              assign target c;
               R.Stmt.while_ ~loc:l ~invariants
                 (unraised (R.Expr.var ~loc:l (name ~loc:l x)))
                 body_stmts;
@@ -787,7 +796,7 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
       let decl, exceptional =
         Option.value_map raising ~default:([], []) ~f:(fun (d, _, _, _, x) -> (d, x))
       in
-      let* invariants =
+      let* invariants, witnessed =
         loop_invariants ~counter:i ?guard ?annotation ctx ~at spec ~relation:(fun _ ->
             State.return None)
       in
@@ -805,21 +814,25 @@ and expr_body ~tail ~keep_scope ~raw (ctx : context) (e : Typedtree.expression) 
         | Upto -> bin And (bin Leq lo iv) (bin Or (bin Leq iv beyond) (bin Eq iv lo))
         | Downto -> bin And (bin Geq lo iv) (bin Or (bin Geq iv beyond) (bin Eq iv lo))
       in
+      let* () = export_loop_witnesses ?annotation ~at witnessed in
       let* body_stmts, reaching =
         in_loop raising (fun () ->
-            let+ body_stmts, _ = expr ctx body in
-            body_stmts @ [ assign (i, l) step ])
+            let* body_stmts, _ = expr ctx body in
+            let+ updates = loop_witness_updates ?annotation ctx ~at spec witnessed in
+            body_stmts @ updates @ [ assign (i, l) step ])
       in
-      let+ propagation =
+      let* propagation =
         match raising with
         | None -> State.return []
         | Some (_, outcome, typ, _, _) ->
             propagate ~at ~certain:false ~typ outcome reaching
       in
+      let+ () = export_loop_witnesses ?annotation ~at witnessed in
       let test = Option.value_map guard ~default:test ~f:(bin And test) in
       ( lo_stmts @ hi_stmts @ lo_def @ hi_def @ decl
         @ R.Stmt.local ~loc:l ~const:false ~typ:int ~init:(R.Stmt.expr_rhs lo)
             (ident ~loc:l i)
+        @ witnessed.entry
         @ [
             R.Stmt.while_ ~loc:l
               ~invariants:(R.Spec.make range :: lo_value :: hi_value :: invariants)
@@ -1331,14 +1344,22 @@ and array_operation ctx (e : Typedtree.expression) op (args : Typedtree.expressi
   | ("get" | "unsafe_get"), [ array; index ] ->
       let* stmts, receiver, _, field = cell array index in
       let+ reading, value =
-        State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type receiver
+        native_access ctx e (fun _ ->
+            let+ reading, value =
+              State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type receiver
+            in
+            (reading, value, [], []))
       in
       (stmts @ reading, value)
   | ("set" | "unsafe_set"), [ array; index; value ] ->
       let* v_stmts, v = expr ctx value in
       let* stmts, receiver, elt, field = cell array index in
-      let+ writing = State.ordinary_write ctx.given ~at ~field ~elt receiver v in
-      (v_stmts @ stmts @ writing, unit_value ~loc:l)
+      let+ writing, result =
+        native_access ctx e (fun _ ->
+            let+ writing = State.ordinary_write ctx.given ~at ~field ~elt receiver v in
+            (writing, unit_value ~loc:l, [], []))
+      in
+      (v_stmts @ stmts @ writing, result)
   | "make", [ size; initial ] ->
       let* () = State.require_memory_encoding ctx.given ~at "array allocation" in
       let* elt = element e.exp_type in
@@ -2397,7 +2418,13 @@ and fold_left ctx (e : Typedtree.expression) arguments =
     Option.value_map raising ~default:([], []) ~f:(fun (decl, _, _, _, terms) ->
         (decl, terms))
   in
-  let* invariants =
+  let* () =
+    match spec.invariant_witnesses with
+    | [] -> State.return ()
+    | (w, _) :: _ ->
+        State.of_result (unsupported w.pid_loc "A witness for a fold's invariant")
+  in
+  let* invariants, _ =
     loop_invariants
       ~inputs:
         [ (accumulator_value, initial.exp_type); (remaining_value, values.exp_type) ]

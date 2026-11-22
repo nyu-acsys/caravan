@@ -21,7 +21,9 @@ compiler does not make an arbitrary library call verifiable.
 Each array index is a cell of its own, which contracts own through `Array.cell a i`, as
 in `own (Array.cell a i) v`; `Array.length a` is the array's fixed length. Ownership of
 many entries is quantified, as in
-`forall j : int. 0 <= j && j < Array.length a -> own (Array.cell a j) 0`.
+`forall j : int. 0 <= j && j < Array.length a -> own (Array.cell a j) 0`. Reads and
+writes of entries, as `a.(i)` and `a.(i) <- v`, can anchor proof scopes like field
+accesses.
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve

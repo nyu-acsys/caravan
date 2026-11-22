@@ -290,6 +290,19 @@ at (increment cell) (fun step -> let result = step () in result)
 This form also works for `while` loops. The invariant holds at loop entry and
 after each iteration, including the final counter value beyond a `for` loop's
 bound. It can use exports from earlier outline steps and logical `let` bindings.
+
+Where the solver cannot find the value of an existential of the invariant, as for a
+ghost map that the loop extends, the invariant can name it after each iteration:
+
+```proof
+at (locks.(i) <- Mutex.create ()) invariant
+  (exists ms : (int, Mutex.t) map. ...) with { ms = Map.set ms i m }
+```
+
+`ms` in the witness is its value before the iteration, and the witness can use the
+exports of steps in the loop's body, here `m`. The steps in the loop's body can use
+`ms`, with its value at the start of the iteration, and so can the steps after the
+loop, with its final value.
 Its anchor remains available for a proof scope on the same body expression.
 
 Contracts can also declare ghost inputs and results. Calls pass these through

@@ -2,4 +2,5 @@
  (deps
   %{bin:caravan}
   (glob_files *.ml)
-  (glob_files *.mli)))
+  (glob_files *.mli)
+  (glob_files *.proof)))

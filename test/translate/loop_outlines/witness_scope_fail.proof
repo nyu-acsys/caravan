@@ -1,0 +1,14 @@
+proof fill a b
+  requires (own b.v w && forall j : int. 0 <= j && j < Array.length a ->
+    exists v : int. own (Array.cell a j) v) =
+  at (b.v <- 0) (fun write ->
+    assert (Map.get values 0 = 0);
+    let result = write () in
+    result);
+  at (a.(i) <- i) invariant
+    ((forall j : int. i <= j && j < Array.length a ->
+        exists v : int. own (Array.cell a j) v) &&
+     exists values : (int, int) map.
+       forall j : int. 0 <= j && j < i ->
+         own (Array.cell a j) (Map.get values j) && Map.get values j = j)
+    with { values = Map.set values i i }
