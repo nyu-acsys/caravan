@@ -1,0 +1,18 @@
+module Resource : Ghost.MutexResource with type t = int array * int = struct
+  type t = int array * int
+  predicate resource (key : t) =
+    match key with (counts, i) -> exists v : int. own (Array.cell counts i) v
+end
+
+module Guard = Ghost.Mutex (Resource)
+
+invariant locked (s : t) =
+  Array.length s.locks = Array.length s.counts &&
+  exists share : Permission.t, ms : (int, Mutex.t) map.
+    forall i : int. 0 <= i && i < Array.length s.locks ->
+      own ~fraction:share (Array.cell s.locks i) (Map.get ms i) &&
+      Guard.is_mutex (Map.get ms i) (s.counts, i)
+
+proof incr s i
+  requires (locked s && 0 <= i && i < Array.length s.counts)
+  ensures (locked s) = ()

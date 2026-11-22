@@ -34,3 +34,21 @@ invariant's ownership to a read.
   Related Location: This assertion may not hold
   Related Location: This own predicate may not hold
   [1]
+
+An array of mutexes guards a cell of another array per index. An invariant lends a
+fraction of the mutexes' cells to each read, and the loop that creates them names the
+map from indices to mutexes as its invariant's witness.
+
+  $ caravan --shh mutexes.ml
+  Verification successful.
+
+Entries guarded by their mutexes cannot be accessed without them.
+
+  $ caravan --shh mutexes_fail.ml
+  [Error] File "mutexes_fail.ml", line 3, columns 31-43:
+  3 | let incr s i = s.counts.(i) <- s.counts.(i) + 1
+                                     ^^^^^^^^^^^^
+  Verification Error: A precondition may not hold for this call.
+  Related Location: This assertion may not hold
+  Related Location: This own predicate may not hold
+  [1]

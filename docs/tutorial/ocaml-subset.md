@@ -23,7 +23,10 @@ in `own (Array.cell a i) v`; `Array.length a` is the array's fixed length. Owner
 many entries is quantified, as in
 `forall j : int. 0 <= j && j < Array.length a -> own (Array.cell a j) 0`. Reads and
 writes of entries, as `a.(i)` and `a.(i) <- v`, can anchor proof scopes like field
-accesses.
+accesses. Shared invariants can be quantified over entries too, as
+`forall j : int. 0 <= j && j < Array.length locks -> Guard.is_mutex (Map.get ms j) (counts, j)`
+for an array of mutexes each guarding one entry of `counts`; such a quantifier needs no
+proof that the mutexes differ.
 
 Generic functions are checked once with constraints on their type parameters,
 rather than by verifying each concrete call separately. Those constraints preserve
