@@ -1321,19 +1321,18 @@ and array_operation ctx (e : Typedtree.expression) op (args : Typedtree.expressi
   let ( <== ) p q = R.Expr.binary ~loc:l Leq p q in
   let ( <<< ) p q = R.Expr.binary ~loc:l Lt p q in
   let ( &&& ) p q = R.Expr.binary ~loc:l And p q in
-  (* The cell of index [i] of [a], once [i] is checked to be within its bounds. *)
-  let cell (array : Typedtree.expression) (index : Typedtree.expression) =
+  (* The array and index of [array.(index)], once the index is checked to be within its
+     bounds. *)
+  let entry (array : Typedtree.expression) (index : Typedtree.expression) =
     let* elt = element array.exp_type in
     let* i_stmts, i = expr ctx index in
     let* a_stmts, a = expr ctx array in
     let* length = length elt a in
-    let* in_bounds =
+    let+ in_bounds =
       State.check ~at "This index may be out of the array's bounds"
         (int 0 <== i &&& (i <<< length))
     in
-    let* loc_ = member elt Prelude.array_loc in
-    let+ field = State.cell_field ctx.given ~at elt Prelude.array_contents in
-    (i_stmts @ a_stmts @ [ in_bounds ], R.Expr.call ~loc:l loc_ [ a; i ], elt, field)
+    (i_stmts @ a_stmts @ [ in_bounds ], a, i, elt)
   in
   match (op, args) with
   | "length", [ array ] ->
@@ -1342,22 +1341,31 @@ and array_operation ctx (e : Typedtree.expression) op (args : Typedtree.expressi
       let+ length = length elt a in
       (stmts, length)
   | ("get" | "unsafe_get"), [ array; index ] ->
-      let* stmts, receiver, _, field = cell array index in
+      let* stmts, a, i, elt = entry array index in
+      let* read = member elt Prelude.array_read in
+      let* typ = State.typ ctx ~at e.exp_type in
       let+ reading, value =
         native_access ctx e (fun _ ->
-            let+ reading, value =
-              State.ordinary_read ctx.given ~at ~field ~elt:e.exp_type receiver
-            in
-            (reading, value, [], []))
+            let+ x = State.fresh "entry" in
+            ( R.Stmt.local ~loc:l ~typ
+                ~init:(R.Stmt.expr_rhs (R.Expr.call ~loc:l read [ a; i ]))
+                (ident ~loc:l x),
+              R.Expr.var ~loc:l (name ~loc:l x),
+              [],
+              [] ))
       in
       (stmts @ reading, value)
   | ("set" | "unsafe_set"), [ array; index; value ] ->
       let* v_stmts, v = expr ctx value in
-      let* stmts, receiver, elt, field = cell array index in
+      let* stmts, a, i, elt = entry array index in
+      let* write = member elt Prelude.array_write in
       let+ writing, result =
         native_access ctx e (fun _ ->
-            let+ writing = State.ordinary_write ctx.given ~at ~field ~elt receiver v in
-            (writing, unit_value ~loc:l, [], []))
+            State.return
+              ( [ R.Stmt.call ~loc:l (R.Expr.call ~loc:l write [ a; i; v ]) ],
+                unit_value ~loc:l,
+                [],
+                [] ))
       in
       (v_stmts @ stmts @ writing, result)
   | "make", [ size; initial ] ->

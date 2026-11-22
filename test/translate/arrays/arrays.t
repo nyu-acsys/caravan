@@ -31,7 +31,6 @@ invariant's ownership to a read.
   1 | let read (a : int array) i = a.(i)
                                    ^^^^^
   Verification Error: A precondition may not hold for this call.
-  Related Location: This assertion may not hold
   Related Location: This own predicate may not hold
   [1]
 
@@ -39,7 +38,7 @@ An array of mutexes guards a cell of another array per index. An invariant lends
 fraction of the mutexes' cells to each read, and the loop that creates them names the
 map from indices to mutexes as its invariant's witness.
 
-  $ caravan --shh --smt-timeout=30000 mutexes.ml
+  $ caravan --shh mutexes.ml
   Verification successful.
 
 Entries guarded by their mutexes cannot be accessed without them.
@@ -49,6 +48,5 @@ Entries guarded by their mutexes cannot be accessed without them.
   3 | let incr s i = s.counts.(i) <- s.counts.(i) + 1
                                      ^^^^^^^^^^^^
   Verification Error: A precondition may not hold for this call.
-  Related Location: This assertion may not hold
   Related Location: This own predicate may not hold
   [1]

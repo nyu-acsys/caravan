@@ -17,10 +17,15 @@ let value_int = "Ocaml$IntValue"
 let value_list = "Ocaml$ListValue"
 let value_option = "Ocaml$OptionValue"
 let value_tuple arity = "Ocaml$TupleValue$" ^ Int.to_string arity
-let array_loc = "array_loc"
 let array_length = "array_length"
-let array_contents = "array_contents"
+let array_entries = "array_entries"
+let array_entry = "array_entry"
 let array_make = "array_make"
+let array_read = "array_read"
+let array_write = "array_write"
+let array_carrier = "Array$Carrier"
+let array_entry_ra = "Array$Entry"
+let array_entries_ra = "Array$Entries"
 
 (** OCaml's [Sys.max_array_length] on 64-bit platforms. *)
 let max_array_length = (1 lsl 54) - 1
@@ -52,21 +57,32 @@ let runtime_binary ~loc op a b =
 let runtime_neg ~loc value =
   R.Expr.call ~loc (R.Name.make ~loc wrap) [ R.Expr.neg ~loc value ]
 
-(** The cells of arrays with entries of the family's carrier: each index of an array has a
-    cell of its own, and an array's length is fixed. *)
+(** The arrays with entries of the family's carrier: an array is a single location, whose
+    entries form a map of fractional values by index, so that the entries of distinct
+    arrays are separate locations and a range of entries is one resource. Its length is
+    fixed. *)
 let array_members =
   let value name = R.Name.make ~loc ~path:[ "V" ] name in
   let carrier = R.Type.named ~loc (value "Carrier") [] in
   let local x = R.Name.make ~loc x in
+  let qualified path x = R.Name.make ~loc ~path x in
   let call f args = R.Expr.call ~loc (local f) args in
+  let entry f args = R.Expr.call ~loc (qualified [ array_entry_ra ] f) args in
   let typed x typ = R.Var.make ~loc (R.Ident.make ~loc x) typ in
-  let ref_ = R.Type.ref ~loc and int = R.Type.int ~loc in
+  let ghost x typ =
+    R.Var.make ~loc ~ghost:true ~implicit:true (R.Ident.make ~loc x) typ
+  in
+  let ref_ = R.Type.ref ~loc and int = R.Type.int ~loc and real = R.Type.real ~loc in
+  let bool = R.Type.bool ~loc in
+  let entry_t = R.Type.named ~loc (qualified [ array_entry_ra ] "T") [] in
+  let entries_t = R.Type.named ~loc (qualified [ array_entries_ra ] "T") [] in
+  let own_t = R.Type.named ~loc (local "T") [] in
   let free member = R.Member.free (R.Member.callable member) in
-  let func name formals typ =
-    free
-      (R.Callable.func ~loc ~formals
-         ~returns:[ typed "r" typ ]
-         (R.Ident.make ~loc name) None)
+  let func ?body ?(inline = false) name formals ret typ =
+    R.Member.callable
+      (R.Callable.func ~loc ~inline ~formals
+         ~returns:[ typed ret typ ]
+         (R.Ident.make ~loc name) body)
   in
   let axiom name body =
     free
@@ -74,49 +90,128 @@ let array_members =
          ~ensures:[ R.Spec.make body ]
          (R.Ident.make ~loc name) None)
   in
-  let a = var "a" and i = var "i" and n = var "n" in
-  let cell = call array_loc [ a; i ] in
+  let proc name formals returns requires ensures =
+    free
+      (R.Callable.proc ~loc ~formals ~returns
+         ~requires:(List.map requires ~f:R.Spec.make)
+         ~ensures:(List.map ensures ~f:R.Spec.make)
+         (R.Ident.make ~loc name) None)
+  in
+  let a = var "a" and i = var "i" and n = var "n" and k = var "k" in
   let ( &&& ) p q = R.Expr.binary ~loc And p q in
   let ( <== ) p q = R.Expr.binary ~loc Leq p q in
   let ( <<< ) p q = R.Expr.binary ~loc Lt p q in
+  let ( === ) p q = R.Expr.binary ~loc Eq p q in
   let zero = R.Expr.int ~loc 0 in
+  let one = R.Expr.real ~loc 1.0 in
+  let key = typed "k" int in
+  let at m = R.Expr.index ~loc m k in
+  let pointwise f x y = R.Expr.compr ~loc key (entry f [ at x; at y ]) in
+  let chunk v q = entry "frac_chunk" [ v; q ] in
+  let none = R.Expr.var ~loc (qualified [ array_entry_ra ] "id") in
+  let entries = R.Expr.field ~loc a (local array_entries) in
+  let own_entries m = R.Expr.own ~loc [ entries; m ] in
+  let x = var "x" and y = var "y" and m = var "m" in
+  let carrier_type =
+    R.Member.module_ ~loc
+      ~implements:[ (R.Name.make ~loc ~path:[ "Library" ] "Type", []) ]
+      (R.Ident.make ~loc array_carrier)
+      [ R.Member.type_ ~loc ~rep:true (R.Ident.make ~loc "T") (Some carrier) ]
+  in
+  let entry_ra =
+    R.Member.instance ~loc
+      ~def:
+        ( R.Name.make ~loc ~path:[ "Library" ] "Frac",
+          [ R.Type.named ~loc (local array_carrier) [] ] )
+      (R.Ident.make ~loc array_entry_ra)
+      (R.Name.make ~loc ~path:[ "Library" ] "CancellativeResourceAlgebra")
+  in
+  let entries_ra =
+    R.Member.module_ ~loc
+      ~implements:[ (R.Name.make ~loc ~path:[ "Library" ] "ResourceAlgebra", []) ]
+      (R.Ident.make ~loc array_entries_ra)
+      [
+        R.Member.type_ ~loc ~rep:true (R.Ident.make ~loc "T")
+          (Some (R.Type.map ~loc int entry_t));
+        R.Member.value ~loc ~typ:own_t (R.Ident.make ~loc "id")
+          (Some (R.Expr.compr ~loc key none));
+        (* Each entry is valid and holds a value of the carrier. *)
+        func "valid"
+          [ typed "m" own_t ]
+          "ret" bool
+          ~body:
+            (R.Expr.forall ~loc
+               ~triggers:[ [ at m ] ]
+               [ key ]
+               (entry "valid" [ at m ]
+               &&& R.Expr.binary ~loc Impl
+                     (R.Expr.is_ ~loc (at m) (R.Ident.make ~loc "frac_chunk"))
+                     (R.Expr.call ~loc (value "holds")
+                        [ R.Expr.field ~loc (at m) (local "frac_proj1") ])));
+        func "comp"
+          [ typed "x" own_t; typed "y" own_t ]
+          "ret" own_t ~body:(pointwise "comp" x y);
+        func "frame"
+          [ typed "x" own_t; typed "y" own_t ]
+          "ret" own_t ~body:(pointwise "frame" x y);
+        func "fpuAllowed"
+          [ typed "x" own_t; typed "y" own_t ]
+          "ret" bool
+          ~body:
+            (call "valid" [ y ]
+            &&& R.Expr.forall ~loc
+                  ~triggers:[ [ at x ]; [ at y ] ]
+                  [ key ]
+                  (R.Expr.binary ~loc Or
+                     (entry "fpuAllowed" [ at x; at y ])
+                     (at x === at y)));
+      ]
+  in
+  let v = var "v" and q = var "q" in
   [
-    func array_loc [ typed "a" ref_; typed "i" int ] ref_;
-    func array_length [ typed "a" ref_ ] int;
-    func "array_base" [ typed "c" ref_ ] ref_;
-    func "array_index" [ typed "c" ref_ ] int;
-    axiom "array_cells"
-      (R.Expr.forall ~loc ~triggers:[ [ cell ] ]
-         [ typed "a" ref_; typed "i" int ]
-         (R.Expr.binary ~loc Eq (call "array_base" [ cell ]) a
-         &&& R.Expr.binary ~loc Eq (call "array_index" [ cell ]) i));
+    carrier_type;
+    entry_ra;
+    entries_ra;
+    R.Member.field ~loc
+      (R.Ident.make ~loc array_entries)
+      (R.Type.named ~loc (local array_entries_ra) []);
+    (* The entry at [i] with [v] and fraction [q]. *)
+    func ~inline:true array_entry
+      [ typed "i" int; typed "v" carrier; typed "q" real ]
+      "m" entries_t
+      ~body:(R.Expr.compr ~loc key (R.Expr.ite ~loc (k === i) (chunk v q) none));
+    R.Member.free (func array_length [ typed "a" ref_ ] "r" int);
     axiom "array_lengths"
       (let length = call array_length [ a ] in
        R.Expr.forall ~loc ~triggers:[ [ length ] ]
          [ typed "a" ref_ ]
          (zero <== length &&& (length <== R.Expr.int ~loc max_array_length)));
-    free
-      (R.Callable.proc ~loc
-         ~formals:[ typed "n" int; typed "d" carrier ]
-         ~returns:[ typed "a" ref_ ]
-         ~requires:
-           [
-             R.Spec.make (zero <== n &&& (n <== R.Expr.int ~loc max_array_length));
-             R.Spec.make (R.Expr.call ~loc (value "holds") [ var "d" ]);
-           ]
-         ~ensures:
-           [
-             R.Spec.make
-               (R.Expr.binary ~loc Eq (call array_length [ a ]) n
-               &&& R.Expr.forall ~loc ~triggers:[ [ cell ] ]
-                     [ typed "i" int ]
-                     (R.Expr.binary ~loc Impl
-                        (zero <== i &&& (i <<< n))
-                        (R.Expr.own ~loc
-                           [ R.Expr.field ~loc cell (local array_contents); var "d" ])));
-           ]
-         (R.Ident.make ~loc array_make)
-         None);
+    proc array_make
+      [ typed "n" int; typed "d" carrier ]
+      [ typed "a" ref_ ]
+      [
+        zero <== n &&& (n <== R.Expr.int ~loc max_array_length);
+        R.Expr.call ~loc (value "holds") [ var "d" ];
+      ]
+      [
+        call array_length [ a ] === n
+        &&& own_entries
+              (R.Expr.compr ~loc key
+                 (R.Expr.ite ~loc (zero <== k &&& (k <<< n)) (chunk (var "d") one) none));
+      ];
+    proc array_read
+      [ typed "a" ref_; typed "i" int; ghost "v" carrier; ghost "q" real ]
+      [ typed "r" carrier ]
+      [ own_entries (call array_entry [ i; v; q ]) ]
+      [ own_entries (call array_entry [ i; v; q ]) &&& (var "r" === v) ];
+    proc array_write
+      [ typed "a" ref_; typed "i" int; typed "w" carrier; ghost "v" carrier ]
+      []
+      [
+        own_entries (call array_entry [ i; v; one ]);
+        R.Expr.call ~loc (value "holds") [ var "w" ];
+      ]
+      [ own_entries (call array_entry [ i; var "w"; one ]) ];
   ]
 
 let cell_members =
@@ -129,7 +224,7 @@ let cell_members =
     R.Member.module_ ~loc
       ~params:[ (R.Ident.make ~loc "V", R.Name.make ~loc value_interface) ]
       (R.Ident.make ~loc cell_family)
-      ([ field "ref_contents"; field "atomic"; field array_contents ] @ array_members);
+      ([ field "ref_contents"; field "atomic" ] @ array_members);
   ]
 
 let value_signature =

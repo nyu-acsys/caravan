@@ -1155,40 +1155,67 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                     State.note_domain env.data typ))
       in
       let* triggers = State.all triggers ~f:(State.all ~f:(formula env)) in
-      let+ body = formula env body in
-      let variables =
-        List.concat_map bound ~f:(fun (_, _, binding) ->
-            match binding with
-            | `Variable v -> [ v ]
-            | `Record fields -> List.map fields ~f:snd)
+      let* ranges_of_cells =
+        match (q, bound) with
+        | Tforall, [ (j, t, `Variable (raven, _, jvar)) ]
+          when Ctype.is_equal env.ctx.given.env false [ t ] [ Predef.type_int ] ->
+            array_ranges env ~at j raven jvar body
+        | _ -> State.return None
       in
-      let vars = List.map variables ~f:(fun (_, _, v) -> v) in
-      (* Flattening a mathematical record preserves its original scalar domains. *)
-      let ranges =
-        List.concat_map bound ~f:(fun (_, parent_type, binding) ->
-            let admissible (x, typ, _) =
-              Datatypes.admissible ~loc:l env.data typ
-                (R.Expr.var ~loc:l (R.Name.make ~loc:l x))
-            in
-            match binding with
-            | `Variable variable -> Option.to_list (admissible variable)
-            | `Record fields when mathematical_record parent_type ->
-                List.filter_map fields ~f:(fun (_, (x, typ, _)) ->
-                    Option.map (range_spec ~loc:l typ x) ~f:(fun _ ->
-                        R.Expr.call ~loc:l
-                          (R.Name.make ~loc:l Prelude.in_range)
-                          [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
-            | `Record fields ->
-                List.filter_map fields ~f:(fun (_, variable) -> admissible variable))
+      let* body, cell_ranges, cell_maps =
+        match ranges_of_cells with
+        | None ->
+            let+ body = formula env body in
+            (Some body, [], [])
+        | Some (rest, chunks, maps) -> State.return (rest, chunks, maps)
       in
-      let guard = List.reduce ranges ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
-      begin match (q, guard) with
-      | Tforall, None -> R.Expr.forall ~loc:l ~triggers vars body
-      | Tforall, Some g ->
-          R.Expr.forall ~loc:l ~triggers vars (R.Expr.binary ~loc:l Impl g body)
-      | Texists, None -> R.Expr.exists ~loc:l ~triggers vars body
-      | Texists, Some g ->
-          R.Expr.exists ~loc:l ~triggers vars (R.Expr.binary ~loc:l And g body)
+      let+ () = State.return () in
+      let conjoin = List.reduce ~f:(R.Expr.binary ~loc:l And) in
+      let with_cells quantified =
+        let all = Option.to_list quantified @ cell_ranges in
+        let conjunction = Option.value (conjoin all) ~default:(R.Expr.bool ~loc:l true) in
+        if List.is_empty cell_maps then conjunction
+        else R.Expr.exists ~loc:l cell_maps conjunction
+      in
+      begin match body with
+      | None -> with_cells None
+      | Some body ->
+          with_cells @@ Option.some
+          @@
+          let variables =
+            List.concat_map bound ~f:(fun (_, _, binding) ->
+                match binding with
+                | `Variable v -> [ v ]
+                | `Record fields -> List.map fields ~f:snd)
+          in
+          let vars = List.map variables ~f:(fun (_, _, v) -> v) in
+          (* Flattening a mathematical record preserves its original scalar domains. *)
+          let ranges =
+            List.concat_map bound ~f:(fun (_, parent_type, binding) ->
+                let admissible (x, typ, _) =
+                  Datatypes.admissible ~loc:l env.data typ
+                    (R.Expr.var ~loc:l (R.Name.make ~loc:l x))
+                in
+                match binding with
+                | `Variable variable -> Option.to_list (admissible variable)
+                | `Record fields when mathematical_record parent_type ->
+                    List.filter_map fields ~f:(fun (_, (x, typ, _)) ->
+                        Option.map (range_spec ~loc:l typ x) ~f:(fun _ ->
+                            R.Expr.call ~loc:l
+                              (R.Name.make ~loc:l Prelude.in_range)
+                              [ R.Expr.var ~loc:l (R.Name.make ~loc:l x) ]))
+                | `Record fields ->
+                    List.filter_map fields ~f:(fun (_, variable) -> admissible variable))
+          in
+          let guard = List.reduce ranges ~f:(fun a b -> R.Expr.binary ~loc:l And a b) in
+          begin match (q, guard) with
+          | Tforall, None -> R.Expr.forall ~loc:l ~triggers vars body
+          | Tforall, Some g ->
+              R.Expr.forall ~loc:l ~triggers vars (R.Expr.binary ~loc:l Impl g body)
+          | Texists, None -> R.Expr.exists ~loc:l ~triggers vars body
+          | Texists, Some g ->
+              R.Expr.exists ~loc:l ~triggers vars (R.Expr.binary ~loc:l And g body)
+          end
       end
   | Tcomprehension ((id, ty), body) ->
       let* ty = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in
@@ -1352,6 +1379,142 @@ and collection_application ?expected env ~at (module_name, function_name) args =
         (error at
            (Printf.sprintf "Unknown logical collection operation or wrong arity: %s.%s"
               module_name function_name))
+
+(** For [forall j. g(j) -> ... && own (Array.cell a j) e(j) && ...] with [a] and the
+    fraction independent of [j], the ownership of each array as one range of its entries,
+    [own(a.entries, {j :: g(j) ? chunk(e(j), q) : id})], and the formula of the other
+    conjuncts if any. A conjunct [exists b. own (Array.cell a j) b && p(b)] reads [b] as
+    [m[j]] for a map [m] of the existentials returned. *)
+and array_ranges env ~at (j : string) (raven : string) (jvar : R.Var.t) (body : S.term) =
+  let l = loc at in
+  let rec guards (t : S.term) =
+    match spine (S.chain t) [] with
+    | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ g; rest ] ->
+        let gs, conclusion = guards rest in
+        (g :: gs, conclusion)
+    | _ -> ([], t)
+  in
+  let independent (t : S.term) = not (List.mem (term_names t) j ~equal:String.equal) in
+  let cell (t : S.term) =
+    match spine (S.chain t) [] with
+    | ( { term_desc = Tvar (Qid { pid_str = "own"; _ }); _ },
+        (location :: value :: ([] | [ _ ]) as args) ) ->
+        begin match array_cell location with
+        | Some (array, { S.term_desc = Tvar (Qid index); _ })
+          when String.equal index.pid_str j && independent array
+               && List.for_all (List.drop args 2) ~f:independent ->
+            Some (array, value, List.nth args 2)
+        | _ -> None
+        end
+    | _ -> None
+  in
+  let gs, conclusion = guards body in
+  let classified =
+    List.map (conjuncts conclusion) ~f:(fun t ->
+        match (cell t, t.term_desc) with
+        | Some c, _ -> `Cell c
+        | None, Tquant (Texists, [ (b, Some ty) ], [], inner) -> begin
+            let parts = conjuncts inner in
+            match
+              List.partition_tf parts ~f:(fun p ->
+                  match cell p with
+                  | Some (_, { S.term_desc = Tvar (Qid v); _ }, _) ->
+                      String.equal v.pid_str b.pid_str
+                  | _ -> false)
+            with
+            | [ owned ], others ->
+                begin match cell owned with
+                | Some (array, _, fraction) ->
+                    `Existential (b, ty, array, fraction, others)
+                | None -> `Other t
+                end
+            | _ -> `Other t
+          end
+        | None, _ -> `Other t)
+  in
+  if
+    not
+      (List.exists classified ~f:(function
+        | `Cell _ | `Existential _ -> true
+        | `Other _ -> false))
+  then State.return None
+  else
+    let* guard = State.all gs ~f:(formula env) in
+    let guard =
+      Option.value
+        (List.reduce guard ~f:(R.Expr.binary ~loc:l And))
+        ~default:(R.Expr.bool ~loc:l true)
+    in
+    let range env array value fraction =
+      let* element =
+        State.of_result
+          (Report.expect ~at "The array whose cells these are"
+             (Option.bind (term_type env array) ~f:(array_element env)))
+      in
+      let* entries = State.cell_field env.ctx.given ~at element Prelude.array_entries in
+      let* chunk =
+        State.cell_field env.ctx.given ~at element (Prelude.array_entry_ra ^ ".frac_chunk")
+      in
+      let* none =
+        State.cell_field env.ctx.given ~at element (Prelude.array_entry_ra ^ ".id")
+      in
+      let* a = formula env array in
+      let* q =
+        match fraction with
+        | Some q -> formula env q
+        | None -> State.return (R.Expr.real ~loc:l 1.0)
+      in
+      let+ v = value env in
+      R.Expr.own ~loc:l
+        [
+          R.Expr.field ~loc:l a (qualified_name ~loc:l entries);
+          R.Expr.compr ~loc:l jvar
+            (R.Expr.ite ~loc:l guard
+               (R.Expr.call ~loc:l (qualified_name ~loc:l chunk) [ v; q ])
+               (R.Expr.var ~loc:l (qualified_name ~loc:l none)));
+        ]
+    in
+    let* pieces =
+      State.all classified ~f:(function
+        | `Cell (array, value, fraction) ->
+            let+ chunk = range env array (fun env -> formula env value) fraction in
+            ([ chunk ], [], [])
+        | `Other t -> State.return ([], [ (env, t) ], [])
+        | `Existential (b, ty, array, fraction, others) ->
+            let* t = State.of_result (source_type env.ctx.given ~at:b.pid_loc ty) in
+            let* entry_type = State.typ env.ctx ~at:b.pid_loc t in
+            let* m = State.fresh (b.pid_str ^ "s") in
+            let mvar =
+              R.Var.make ~loc:l (ident ~loc:l m)
+                (R.Type.map ~loc:l (R.Type.int ~loc:l) entry_type)
+            in
+            let entry =
+              R.Expr.index ~loc:l
+                (R.Expr.var ~loc:l (name ~loc:l m))
+                (R.Expr.var ~loc:l (name ~loc:l raven))
+            in
+            let inner =
+              {
+                (bind env b.pid_str (Value entry)) with
+                var_types = (b.pid_str, t) :: env.var_types;
+              }
+            in
+            let+ chunk = range inner array (fun _ -> State.return entry) fraction in
+            ([ chunk ], List.map others ~f:(fun o -> (inner, o)), [ mvar ]))
+    in
+    let chunks = List.concat_map pieces ~f:(fun (c, _, _) -> c) in
+    let maps = List.concat_map pieces ~f:(fun (_, _, m) -> m) in
+    let* rest =
+      State.all
+        (List.concat_map pieces ~f:(fun (_, r, _) -> r))
+        ~f:(fun (env, t) -> formula env t)
+    in
+    let rest =
+      Option.map
+        (List.reduce rest ~f:(R.Expr.binary ~loc:l And))
+        ~f:(fun rest -> R.Expr.binary ~loc:l Impl guard rest)
+    in
+    State.return (Some (rest, chunks, maps))
 
 and expected_formula env (expected : Types.type_expr option) (t : S.term) =
   let* () =
@@ -1953,6 +2116,19 @@ and application env (t : S.term) =
         | Some _, Tfield (owner, _) -> State.map (formula env owner) ~f:Option.some
         | _ -> State.return None
       in
+      let* cell_entry =
+        match array_cell location with
+        | None -> State.return None
+        | Some (array, index) ->
+            let* element =
+              State.of_result
+                (Report.expect ~at "The array whose cell this is"
+                   (Option.bind (term_type env array) ~f:(array_element env)))
+            in
+            let* entry = State.cell_field env.ctx.given ~at element Prelude.array_entry in
+            let+ index = formula env index in
+            Some (entry, index)
+      in
       let* location, release_location = location_with_release ?expected env location in
       let* v = expected_formula env expected v in
       let* lower =
@@ -2004,7 +2180,20 @@ and application env (t : S.term) =
             [ fraction ]
         | _ -> State.return []
       in
-      let value_ownership = R.Expr.own ~loc:l ([ location; v ] @ fraction) in
+      let value_ownership =
+        match cell_entry with
+        | None -> R.Expr.own ~loc:l ([ location; v ] @ fraction)
+        | Some (entry, index) ->
+            (* The entry at the index of the array's map of entries. *)
+            let fraction =
+              match fraction with [ q ] -> q | _ -> R.Expr.real ~loc:l 1.0
+            in
+            R.Expr.own ~loc:l
+              [
+                location;
+                R.Expr.call ~loc:l (qualified_name ~loc:l entry) [ index; v; fraction ];
+              ]
+      in
       begin match (frozen, receiver) with
       | Some family, Some receiver ->
           let permission =
@@ -2395,14 +2584,9 @@ and location_with_release ?expected env (t : S.term) =
           (Report.expect ~at "The array whose cell this is"
              (Option.bind (term_type env array) ~f:(array_element env)))
       in
-      let* cell = State.cell_field env.ctx.given ~at element Prelude.array_loc in
-      let* field = State.cell_field env.ctx.given ~at element Prelude.array_contents in
-      let* array = formula env array in
-      let+ index = formula env index in
-      ( R.Expr.field ~loc:l
-          (R.Expr.call ~loc:l (qualified_name ~loc:l cell) [ array; index ])
-          (qualified_name ~loc:l field),
-        None )
+      let* field = State.cell_field env.ctx.given ~at element Prelude.array_entries in
+      let+ array = formula env array in
+      (R.Expr.field ~loc:l array (qualified_name ~loc:l field), None)
   | None, Some (field, owner) ->
       let* field = instantiate_ghost_field env ~at ?expected field owner in
       let* () =
