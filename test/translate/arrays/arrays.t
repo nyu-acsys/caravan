@@ -39,7 +39,7 @@ An array of mutexes guards a cell of another array per index. An invariant lends
 fraction of the mutexes' cells to each read, and the loop that creates them names the
 map from indices to mutexes as its invariant's witness.
 
-  $ caravan --shh mutexes.ml
+  $ caravan --shh --smt-timeout=30000 mutexes.ml
   Verification successful.
 
 Entries guarded by their mutexes cannot be accessed without them.
