@@ -362,7 +362,8 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
     ~(module_parameters :
        (Module_context.t
        * ((string * Ident.t list) * string * Types.type_expr list * int) list)
-       list) context ~projection (preds, spec_funcs, support) =
+       list) ?namespace context ~projection (preds, spec_funcs, support) =
+  let namespace = Option.value namespace ~default:context.Module_context.namespace in
   let project =
     if List.is_empty context.Module_context.parameters then Fn.id
     else Subst.type_expr projection
@@ -370,7 +371,7 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
   let target backend =
     match scoped_binding backend with
     | Some binding when Module_context.contains context binding ->
-        Module_context.member context backend
+        String.concat ~sep:"." (namespace @ [ backend ])
     | _ -> backend
   in
   let parameters = List.Assoc.find_exn module_parameters context ~equal:phys_equal in
@@ -398,6 +399,26 @@ let module_context ~(scoped_binding : string -> Proof_bindings.binding option)
     {
       support with
       predicate_views;
+      runtime_functions =
+        List.fold context.parameters ~init:support.runtime_functions
+          ~f:(fun functions parameter ->
+            let ids =
+              parameter.Generic_proofs.instance.parameter
+              :: Option.to_list parameter.original
+            in
+            List.fold parameter.generic.operations ~init:functions
+              ~f:(fun functions (member, stem) ->
+                List.fold ids ~init:functions ~f:(fun functions id ->
+                    let path = Path.Pdot (Path.Pident id, member) in
+                    match Path_bindings.find support.runtime_functions path with
+                    | None -> functions
+                    | Some _ ->
+                        Path_bindings.add functions path
+                          (Qualified_name.of_string
+                             (String.concat ~sep:"."
+                                (namespace
+                                @ [ parameter.generic.parameter; library_pure_name stem ]
+                                ))))));
       resources =
         List.map support.resources ~f:(fun resource ->
             let resource = Source.map_resource_types resource ~f:project in
@@ -625,8 +646,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
                 Generic_modules.worker_types group ~owner:context.namespace)
           else []
         in
-        let view_types = checked_raw_types (symbolic_types @ types) binding in
-        let* view_resources =
+        let* raw_resources =
           all binding.expected.signature_resources ~f:(fun (member, formal) ->
               let declaration = formal.Module_inventory.declaration in
               let* () =
@@ -642,6 +662,16 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
               let raw =
                 Compiler_types.map_group raw ~f:(Subst.type_expr formal.substitution)
               in
+              Ok (member, formal, raw))
+        in
+        let view_types =
+          checked_raw_types
+            ~dependencies:(List.concat_map raw_resources ~f:(fun (_, _, raw) -> raw))
+            (symbolic_types @ types) binding
+        in
+        let* view_resources =
+          all raw_resources ~f:(fun (member, formal, raw) ->
+              let declaration = formal.Module_inventory.declaration in
               let resource ~backend =
                 {
                   resource_paths =
@@ -950,6 +980,14 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t)
       runtime_functions =
         Path_bindings.of_list
           (imported_pure
+          @ List.concat_map decls.checked_operations ~f:(fun operation ->
+              if not (Option.exists operation.operation_contract ~f:(fun c -> c.S.pure))
+              then []
+              else
+                List.map operation.operation_paths ~f:(fun path ->
+                    ( path,
+                      Qualified_name.of_string
+                        (library_pure_name operation.operation_name) )))
           @ List.concat_map pure ~f:(fun f ->
               List.filter_map f.paths ~f:(fun path ->
                   match path with

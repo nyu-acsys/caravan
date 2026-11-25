@@ -5,6 +5,7 @@ end
 module Guard = Ghost.Mutex (Cell)
 
 proof result = make cell
+  opens {}
   requires (Ghost.Mutex.context owner held && own cell.contents value && 0 <= value)
   ensures (match result with mutex, condition ->
     Guard.is_mutex mutex cell && Guard.is_condition condition mutex && not (Finset.mem mutex held)) =
@@ -19,19 +20,23 @@ proof result = make cell
     condition)
 
 proof await mutex condition
+  opens {}
   requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held) &&
     Guard.is_mutex mutex cell && Guard.is_condition condition mutex)
   ensures (Guard.is_mutex mutex cell && Guard.is_condition condition mutex) = ()
 
 proof signal condition
+  opens {}
   requires (Guard.is_condition condition mutex)
   ensures (Guard.is_condition condition mutex) = ()
 
 proof broadcast condition
+  opens {}
   requires (Guard.is_condition condition mutex)
   ensures (Guard.is_condition condition mutex) = ()
 
 proof result = refresh mutex condition cell
+  opens {}
   requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held) &&
     Guard.is_mutex mutex cell && Guard.is_condition condition mutex)
   ensures (Guard.is_mutex mutex cell && Guard.is_condition condition mutex && 0 <= result) =

@@ -1,0 +1,4 @@
+type carrier = {value : int}
+
+lemma invalid_machine_bound
+  ensures forall packed : carrier. packed.value <= max_int = ()

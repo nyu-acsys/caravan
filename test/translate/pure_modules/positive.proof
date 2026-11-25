@@ -1,0 +1,11 @@
+module Make (Key : KEY) = struct
+  proof result = repeated x ensures result = ()
+  proof result = same x y ensures result === (x === y) = ()
+
+  lemma stable_model (key : Key.t)
+    ensures Key.hash key === Key.hash key = ()
+end
+
+module Forward (Key : KEY) = struct
+  proof result = repeated x ensures result = ()
+end

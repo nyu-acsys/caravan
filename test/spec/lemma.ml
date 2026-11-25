@@ -17,6 +17,10 @@ let parse_ghost_module source =
   let lexbuf = Lexing.from_string source in
   Spec_parser.ghost_module_declaration Spec_lexer.token lexbuf
 
+let parse_invariant_declaration source =
+  let lexbuf = Lexing.from_string source in
+  Spec_parser.invariant_declaration Spec_lexer.token lexbuf
+
 let rec proof_kinds expr =
   match expr.proof_desc with
   | Proof_value _ -> [ "value" ]
@@ -358,6 +362,58 @@ let () =
 let () =
   begin match
     parse_proof
+      "invariant [@parent Shared.Table.is_set s k'] tabled (s : t) (k' : int) (n : int) \
+       = true"
+  with
+  | [
+   Proof_invariant
+     {
+       inv_name = { pid_str = "tabled"; _ };
+       inv_ancestry =
+         Some
+           {
+             ancestry_kind = Parent;
+             ancestry_target =
+               Qdot
+                 ( Qdot (Qid { pid_str = "Shared"; _ }, { pid_str = "Table"; _ }),
+                   { pid_str = "is_set"; _ } );
+             ancestry_args = [ { pid_str = "s"; _ }; { pid_str = "k'"; _ } ];
+             _;
+           };
+       _;
+     };
+  ] ->
+      ()
+  | _ -> failwith "proof invariant parent was not parsed"
+  end;
+  begin match parse_proof "invariant [@parent root] child (x : int) = true" with
+  | [ Proof_invariant { inv_ancestry = Some { ancestry_args = []; _ }; _ } ] -> ()
+  | _ -> failwith "invariant ancestry with zero arguments was not parsed"
+  end;
+  List.iter
+    (fun (attribute, message) ->
+      match parse_proof ("invariant " ^ attribute ^ " child (x : int) = true") with
+      | exception Syntax_error (_, actual) when actual = message -> ()
+      | _ -> failwith ("expected an invariant ancestry syntax error for " ^ attribute))
+    [
+      ("[@inline]", "An invariant's attribute is [@parent ...] or [@within ...]");
+      ("[@parent]", "An invariant ancestry attribute needs a qualified invariant name");
+      ( "[@parent Shared..root]",
+        "An invariant ancestry attribute needs a qualified invariant name" );
+      ("[@parent root x.field]", "Invariant ancestry arguments must be parameter names");
+      ("[@within root x]", "Public within promises are not supported yet");
+    ];
+  begin match parse_invariant_declaration "invariant [@within root x] child (x : t)" with
+  | exception
+      Syntax_error (_, "Invariant ancestry is supported only on private proof definitions")
+    ->
+      ()
+  | _ -> failwith "unchecked interface ancestry was accepted"
+  end
+
+let () =
+  begin match
+    parse_proof
       {|lemma inferred = ()
       lemma closed opens {} = ()
       lemma opened (x : int) opens { cell x _; Other.state; } = ()|}
@@ -414,3 +470,16 @@ let () =
   match parse_proof "lemma l (x : int) ensures [x, x] === [] = ()" with
   | exception Syntax_error (_, "A list literal separates its elements with ;") -> ()
   | _ -> failwith "comma in a list literal was accepted"
+
+let () =
+  begin match parse_proof "lemma typed opens {cell (_ : int)} = ()" with
+  | [ Proof_lemma { lemma_opens = Some (_, [ entry ]); _ } ] ->
+      begin match entry.term_desc with
+      | Tapply (_, wildcard) -> assert (is_mask_wildcard wildcard)
+      | _ -> failwith "typed mask selector was not parsed"
+      end
+  | _ -> failwith "typed mask selector was not retained"
+  end;
+  match parse_proof "lemma invalid (x : int) opens {cell (_ : int) x} = ()" with
+  | exception Syntax_error (_, "Wildcards in an opens entry must be trailing") -> ()
+  | _ -> failwith "nontrailing typed wildcard was accepted"

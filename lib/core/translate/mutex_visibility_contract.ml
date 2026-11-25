@@ -86,7 +86,7 @@ let protocol ~loc () =
         (R.Callable.proc ~loc ~kind ~formals ~returns
            ~requires:(List.map requires ~f:R.Spec.make)
            ~ensures:(List.map ensures ~f:R.Spec.make)
-           (ident ~loc text) body)
+           ~opens:(loc, []) (ident ~loc text) body)
     in
     if trusted then R.Member.free member else member
   in

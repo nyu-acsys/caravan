@@ -97,6 +97,7 @@ let declarations ~loc ~(name : id) (element : predicate) : proof_decl list =
         pred_body = Some body;
         pred_persistent = false;
         pred_inline = false;
+        pred_ancestry = None;
       }
   in
   let seg_decl =

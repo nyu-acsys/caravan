@@ -136,10 +136,10 @@ let enrich_predicates ctx predicates =
   in
   Ok { ctx with given = { ctx.given with generic_predicates } }
 
-let operation_module ~abstract ?inherited ctx operation member =
+let operation_module ~abstract ?inherited ?(prefix = []) ctx operation member =
   let open State.Syntax in
   match operation.operation_worker with
-  | None -> State.return [ R.Member.callable member ]
+  | None -> State.return (prefix @ [ R.Member.callable member ])
   | Some worker ->
       let at = operation.operation_signature.site.item_loc in
       let l = loc at in
@@ -161,7 +161,7 @@ let operation_module ~abstract ?inherited ctx operation member =
         State.return
           [
             R.Member.module_ ~loc:l ~interface:true ~params (ident ~loc:l contract)
-              (support @ [ R.Member.callable member ]);
+              (support @ prefix @ [ R.Member.callable member ]);
             R.Member.instance ~loc:l (ident ~loc:l stem) (qualified_name ~loc:l contract);
           ]
       else
@@ -172,7 +172,7 @@ let operation_module ~abstract ?inherited ctx operation member =
                 (if Option.is_some inherited then [ (qualified_name ~loc:l contract, []) ]
                  else [])
               (ident ~loc:l stem)
-              (support @ [ R.Member.callable member ]);
+              (support @ prefix @ [ R.Member.callable member ]);
           ]
 
 let actual_operation_context ctx view operation ?native ~declaration ~worker ~target

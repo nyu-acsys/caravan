@@ -1466,6 +1466,34 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           then members
           else [])
     in
+    let resource_assets =
+      (* Callers select these original members by source resource backend. *)
+      let native =
+        List.filter_map native_resources ~f:(fun member ->
+            Option.bind
+              (List.find native_resource_members ~f:(fun (_, candidate) ->
+                   phys_equal member candidate))
+              ~f:(fun (backend, _) ->
+                Option.map
+                  (List.find source.proof_resources ~f:(fun resource ->
+                       String.equal backend resource.Source.resource_backend))
+                  ~f:(fun resource -> (resource, member))))
+      in
+      let declared resource =
+        Option.value
+          (List.find_mapi source.proof_scopes.declarations ~f:(fun index entry ->
+               Option.some_if
+                 (Poly.equal entry.Proof_scopes.name.pid_loc resource.Source.resource_at)
+                 index))
+          ~default:Int.max_value
+      in
+      (* Resource definitions and applications share their lexical module scope. *)
+      List.stable_sort
+        (definition_modules @ native @ public_resource_members)
+        ~compare:(fun (left, _) (right, _) ->
+          Int.compare (declared left) (declared right))
+      |> emitted_assets destination
+    in
     let stages =
       if library then [ `Function_workers; `Value_domains; `Primitives; `Late_members ]
       else
@@ -1474,9 +1502,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             [
               `Representations;
               `Early_values;
-              `Definitions;
-              `Native_resources;
-              `Public_resources;
+              `Resource_assets;
               `State_support;
               `Task_support;
               `Function_workers;
@@ -1498,9 +1524,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             [
               `Representations;
               `Early_values;
-              `Definitions;
-              `Native_resources;
-              `Public_resources;
+              `Resource_assets;
               `State_support;
               `Applications;
               `Workers_and_values;
@@ -1543,9 +1567,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           @ emitted_assets destination public_resource_members
       | `Representations -> representations
       | `Early_values -> early_support
-      | `Definitions -> emitted_assets destination definition_modules
-      | `Native_resources -> native_resources
-      | `Public_resources -> emitted_assets destination public_resource_members
+      | `Resource_assets -> resource_assets
       | `Applications -> applications
       | `Function_workers -> function_workers
       | `Workers_and_values ->

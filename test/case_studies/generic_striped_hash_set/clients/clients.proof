@@ -1,0 +1,11 @@
+proof integers ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()
+
+proof records ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()
+
+proof references ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()

@@ -86,9 +86,12 @@ let members ~loc ~implementation =
   in
   let conjunction left right = R.Expr.binary ~loc And left right in
   let body contents = if implementation then Some contents else None in
+  (* Visibility predicates own only ghost state: they depend on no invariant. *)
   let predicate text formals contents =
     R.Member.callable
-      (R.Callable.func ~loc ~kind:Pred ~formals (ident ~loc text) (body contents))
+      (R.Callable.func ~loc ~kind:Pred ~formals
+         ?depends:(Option.some_if (not implementation) (loc, []))
+         (ident ~loc text) (body contents))
   in
   let lemma text formals returns requires ensures contents =
     R.Member.callable

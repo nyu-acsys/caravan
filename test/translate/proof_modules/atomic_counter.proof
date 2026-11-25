@@ -1,0 +1,5 @@
+module Make (Element : ELEMENT) = struct
+  proof result = bump counter value
+    requires own counter 7
+    ensures own counter 7 && result === value = ()
+end

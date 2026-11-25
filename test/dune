@@ -196,6 +196,7 @@
   (alias translate/mutex/allocation)
   (alias translate/mutex/family_inference_errors)
   (alias translate/mutex/ownership)
+  (alias translate/mutex/nested_registration)
   ; translate/mutex_imports
   (alias translate/mutex_imports/mutex_imports)
   ; translate/optional_arguments
@@ -247,7 +248,15 @@
   (alias translate/proof_functors/exports_signature)
   (alias translate/proof_functors/generic)
   (alias translate/proof_functors/models)
+  (alias translate/proof_functors/result_signature_heap)
+  (alias translate/proof_functors/checked_exports)
+  (alias translate/proof_functors/checked_export_heap)
   ; translate/proof_modules
+  (alias translate/proof_modules/carrier_quantifiers)
+  (alias translate/proof_modules/atomic_counter)
+  (alias translate/proof_modules/invariant_regions)
+  (alias translate/proof_modules/invariant_regions_public)
+  (alias translate/proof_modules/constraint_scope)
   (alias translate/proof_modules/bindings)
   (alias translate/proof_modules/custom_ra)
   (alias translate/proof_modules/generic_au)
@@ -256,6 +265,7 @@
   (alias translate/proof_modules/library_ra)
   (alias translate/proof_modules/ra_view)
   (alias translate/proof_modules/resources)
+  (alias translate/proof_modules/resource_order)
   (alias translate/proof_modules/scoped_state_fail)
   (alias translate/proof_modules/state_expression_errors)
   (alias translate/proof_modules/zero_mixed)
@@ -263,6 +273,8 @@
   (alias translate/proof_type_aliases/aliases)
   ; translate/pure_imports
   (alias translate/pure_imports/client)
+  ; translate/pure_modules
+  (alias translate/pure_modules/pure_modules)
   ; translate/raw_payloads
   (alias translate/raw_payloads/access)
   ; translate/relaxed_fields

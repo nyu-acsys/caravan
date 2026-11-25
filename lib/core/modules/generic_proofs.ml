@@ -123,17 +123,23 @@ let parameter_types ?(world = false) plan ~owner =
           in
           formal_types @ ghost_types)
 
-let parameter_substitution plan target =
-  List.foldi plan.parameters ~init:Subst.identity ~f:(fun index substitution parameter ->
+let parameter_substitution ?(substitution = Subst.identity) plan target =
+  List.foldi plan.parameters ~init:substitution ~f:(fun index substitution parameter ->
       Option.value_map parameter.original ~default:substitution ~f:(fun original ->
           Subst.add_module original (target index parameter) substitution))
 
 let application_substitution plan (application : Module_inventory.specialization) =
-  match application.context with
-  | Some context -> Functor_context.substitution context
-  | None ->
-      parameter_substitution plan (fun index _ ->
-          (List.nth_exn application.parameters index).argument.actual_path)
+  let substitution =
+    Option.value_map application.context ~default:Subst.identity
+      ~f:Functor_context.substitution
+  in
+  (* Application metadata can retain the freshly typed parameter identities. *)
+  let substitution =
+    List.fold application.parameters ~init:substitution ~f:(fun substitution stage ->
+        Subst.add_module stage.parameter stage.argument.actual_path substitution)
+  in
+  parameter_substitution ~substitution plan (fun index _ ->
+      (List.nth_exn application.parameters index).argument.actual_path)
 
 let private_substitution plan (application : Module_inventory.specialization) =
   parameter_substitution plan (fun index _ ->

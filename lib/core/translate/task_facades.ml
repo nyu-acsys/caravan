@@ -665,7 +665,7 @@ let member ~given ~past_structures ~proc_name task =
   in
   let adapter =
     R.Member.callable
-      (R.Callable.proc ~loc:l ~formals:adapter_formals
+      (R.Callable.proc ~loc:l ~formals:adapter_formals ~opens:(l, [])
          ~returns:[ R.Var.make ~loc:l (ident ~loc:l handle_name) (R.Type.ref ~loc:l) ]
          ~requires:adapter_pre
          ~ensures:

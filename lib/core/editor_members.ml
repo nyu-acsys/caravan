@@ -119,7 +119,12 @@ let declaration_shape declaration =
             at :: List.map entries ~f:term) )
   | Proof_function { function_body; function_variant; _ } ->
       ("function", false, List.map (function_body :: function_variant) ~f:term)
-  | Proof_invariant { inv_body; _ } -> ("invariant", false, [ term inv_body ])
+  | Proof_invariant { inv_body; inv_ancestry; _ } ->
+      ( "invariant",
+        false,
+        term inv_body
+        :: List.map (Option.to_list inv_ancestry) ~f:(fun ancestry ->
+            ancestry.S.ancestry_loc) )
   | Proof_view { view_value; _ } -> ("view", false, [ term view_value ])
   | Proof_action { action_consumes; action_update; action_helps; _ } ->
       ( "action",

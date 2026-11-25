@@ -383,7 +383,14 @@ let plan ~inventory ?(proof_layout = fun _ -> false) ?(definitions = []) sources
   in
   let groups =
     List.fold
-      (List.filter sources ~f:(eligible ~inventory ~definition:false))
+      (List.filter sources ~f:(fun source ->
+           (* The declaration's worker already supplies its abstract heap layout. *)
+           let definition =
+             List.exists groups ~f:(fun group ->
+                 Option.is_some group.definition
+                 && same_stages group.representative source)
+           in
+           eligible ~inventory ~definition source))
       ~init:groups ~f:(add ~definition:false)
   in
   let owner source =
@@ -439,7 +446,15 @@ let interface (group : t) (application : application) =
   else
     match group.world with
     | None -> group.interface
-    | Some _ -> application.world ^ "." ^ (Qualified_name.of_string group.interface).name
+    | Some _ ->
+        (* Repeated applicative applications share their checked argument identity. *)
+        let application =
+          Option.value
+            (List.find group.applications ~f:(fun candidate ->
+                 Path.same candidate.source.identity application.source.identity))
+            ~default:application
+        in
+        application.world ^ "." ^ (Qualified_name.of_string group.interface).name
 
 let application_for_binding groups binding =
   List.find_map groups ~f:(fun group ->

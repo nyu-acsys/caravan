@@ -1,0 +1,20 @@
+module Make (Element : ELEMENT) = struct
+  invariant stored (cell : t) (original [@implicit] : t) = original === cell
+  proof keep = ()
+end
+
+
+module Native = struct
+  invariant stored (cell : t) = true
+  proof keep = ()
+  proof fresh = ()
+end
+
+module Container = struct
+  module Inner = struct
+    invariant stored (cell : t) (key [@implicit] : Key.t) = cell === key
+    proof keep = ()
+  end
+end
+
+proof use = ()

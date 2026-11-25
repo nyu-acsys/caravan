@@ -1141,7 +1141,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                in
                Subst.add_type id path substitution)))
   in
-  let substitutions ~at substitution signature view =
+  let substitutions ?owner ~at substitution signature view =
     let* substitution =
       List.fold_result signature.signature_types ~init:substitution
         ~f:(fun substitution (name, declaration) ->
@@ -1158,8 +1158,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           match member view.modules name with
           | None -> missing at name
           | Some view ->
+              let path =
+                Option.value_map owner ~default:view.identity ~f:(fun parent ->
+                    Some (Path.Pdot (parent, name)))
+              in
               Ok
-                (match (nested.signature_id, view.identity) with
+                (match (nested.signature_id, path) with
                 | Some id, Some path -> Subst.add_module id path substitution
                 | _ -> substitution))
     in
@@ -1189,6 +1193,31 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             | _ -> None)
         |> Option.join)
   in
+  let declared (site : site) =
+    Annotation.contract_after ~scope:site.scope ~item_loc:site.item_loc ~next:site.next
+      site.annotations
+  in
+  let checked_view ?actual_path ~site ~namespace ~paths ~application_identity
+      ~parameter_substitution expected actual =
+    let* actual_path =
+      match Option.first_some actual_path actual.identity with
+      | Some path -> Ok path
+      | None -> unavailable site.item_loc "A checked module without a static path"
+    in
+    let binding =
+      ref { actual_path; parameter_substitution; expected; site; namespace; paths }
+    in
+    check_fields ~defining:None ~at:site.item_loc ~environment:site.environment expected
+      (argument_field_type actual site.environment actual_path);
+    bindings := binding :: !bindings;
+    Ok
+      {
+        empty_module with
+        checked = Some binding;
+        identity = actual.identity;
+        application_identity;
+      }
+  in
   let rec constrain ~defining ~restricts_visibility ~boundary ~result_owner at
       substitution signature view =
     if Option.is_some view.checked then
@@ -1214,28 +1243,47 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       | [], [], [] -> Ok view
       end
     else
-      let* substitution = substitutions ~at substitution signature view in
+      let* substitution =
+        substitutions
+          ?owner:(if restricts_visibility then None else result_owner)
+          ~at substitution signature view
+      in
       check_fields ~defining ~at ~environment:source.env signature (field_type view);
-      constraints :=
-        {
-          owner = Option.first_some view.application_identity view.identity;
-          result_owner;
-          boundary;
-          signature;
-          substitution;
-          at;
-          restricts_visibility;
-        }
-        :: !constraints;
+      let* checked_export =
+        if restricts_visibility || Option.is_none result_owner then Ok false
+        else
+          List.map signature.signature_values ~f:(fun (name, _) ->
+              match member view.values name with
+              | None -> Ok false
+              | Some value ->
+                  let* contracts =
+                    List.map
+                      (!value.site :: List.map !value.signatures ~f:(fun s -> s.site))
+                      ~f:declared
+                    |> Result.all
+                  in
+                  Ok (List.exists contracts ~f:Option.is_some))
+          |> Result.all
+          |> Result.map ~f:(List.exists ~f:Fn.id)
+      in
+      (* Checked exports carry their resources independently of the implementation. *)
+      if not checked_export then
+        constraints :=
+          {
+            owner = Option.first_some view.application_identity view.identity;
+            result_owner;
+            boundary;
+            signature;
+            substitution;
+            at;
+            restricts_visibility;
+          }
+          :: !constraints;
       let* values =
         List.map signature.signature_values ~f:(fun (name, signature_value) ->
             match member view.values name with
             | None -> missing signature_value.site.item_loc name
             | Some value ->
-                let declared (site : site) =
-                  Annotation.contract_after ~scope:site.scope ~item_loc:site.item_loc
-                    ~next:site.next site.annotations
-                in
                 let* expected = declared signature_value.site in
                 let* own = declared !value.site in
                 let* previous =
@@ -1266,8 +1314,13 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                     site = { signature_value.site with environment };
                   }
                 in
-                value :=
-                  { !value with signatures = !value.signatures @ [ signature_value ] };
+                (* Existing declarations are the implementation of a checked export. *)
+                if
+                  (not checked_export)
+                  || (Option.is_none own && List.for_all previous ~f:Option.is_none)
+                then
+                  value :=
+                    { !value with signatures = !value.signatures @ [ signature_value ] };
                 Ok (name, value))
         |> Result.all
       in
@@ -1305,7 +1358,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 end)
         |> Result.all
       in
-      Ok
+      let constrained =
         {
           view with
           values;
@@ -1313,6 +1366,26 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           modules = nested_modules;
           modtypes = signature.signature_modtypes;
         }
+      in
+      if not checked_export then Ok constrained
+      else
+        let path = Option.value_exn result_owner in
+        let site =
+          {
+            environment = source.env;
+            scope = scope at;
+            annotations = [];
+            item_loc = at;
+            next = None;
+          }
+        in
+        let* checked =
+          checked_view ~actual_path:path ~site
+            ~namespace:(String.split (Path.name path) ~on:'.')
+            ~paths:[ path ] ~application_identity:view.application_identity
+            ~parameter_substitution:substitution signature view
+        in
+        Ok { constrained with checked = checked.checked }
   in
   let apply_signature ~defining ~restricts_visibility ~result_owner at signature view =
     constrain ~defining ~restricts_visibility ~boundary:result_owner ~result_owner at
@@ -1449,13 +1522,6 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 else
                   unavailable expression.mod_loc "Nested modules in a checked module view"
               in
-              let* actual_path =
-                match actual.identity with
-                | Some path -> Ok path
-                | None ->
-                    unavailable expression.mod_loc
-                      "A checked module without a static path"
-              in
               let site =
                 {
                   environment = expression.mod_env;
@@ -1465,28 +1531,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   next = None;
                 }
               in
-              let binding =
-                ref
-                  {
-                    actual_path;
-                    parameter_substitution = !parameter_substitution;
-                    expected;
-                    site;
-                    namespace;
-                    paths = [];
-                  }
-              in
-              check_fields ~defining:None ~at:expression.mod_loc
-                ~environment:expression.mod_env expected
-                (argument_field_type actual expression.mod_env actual_path);
-              bindings := binding :: !bindings;
-              Ok
-                {
-                  empty_module with
-                  checked = Some binding;
-                  identity = actual.identity;
-                  application_identity = identity;
-                }
+              checked_view ~site ~namespace ~paths:[] ~application_identity:identity
+                ~parameter_substitution:!parameter_substitution expected actual
           end
         else
           let* view =

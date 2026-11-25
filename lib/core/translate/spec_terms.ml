@@ -1104,9 +1104,11 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                   (error id.pid_loc "A bound variable needs a type, as in x: int")
             | Some ty -> begin
                 let* t = State.of_result (source_type env.ctx.given ~at:id.pid_loc ty) in
-                (* An existential record is one existential per field. *)
+                (* Logical records are products; mathematical universal binders need
+                   no constructor or projection terms. *)
                 match (q, logical_record env t) with
-                | Texists, Some (_, _, fields) ->
+                | (Texists | Tforall), Some (data, _, fields)
+                  when Poly.equal q Texists || data.mathematical ->
                     let+ fields =
                       State.all fields ~f:(fun (label, field_type) ->
                           let+ variable =
@@ -1198,6 +1200,9 @@ let rec formula (env : env) (t : S.term) : R.Expr.t State.t =
                 in
                 match binding with
                 | `Variable variable -> Option.to_list (admissible variable)
+                | `Record _ when Poly.equal q Tforall && mathematical_record parent_type
+                  ->
+                    []
                 | `Record fields when mathematical_record parent_type ->
                     List.filter_map fields ~f:(fun (_, (x, typ, _)) ->
                         Option.map (range_spec ~loc:l typ x) ~f:(fun _ ->

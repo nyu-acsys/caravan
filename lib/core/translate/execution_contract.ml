@@ -115,15 +115,19 @@ let support ~loc ~mutex ~visibility () =
         ~visibility:visibility_context
     in
     let finished = R.Expr.call ~loc (local ~loc "finished") [ self ] in
+    (* Execution contexts own only ghost state: their predicates depend on no invariant. *)
+    let depends body = Option.some_if (Option.is_none body) (loc, []) in
     let declaration text formals body =
-      R.Member.callable (R.Callable.func ~loc ~kind:Pred ~formals (ident ~loc text) body)
+      R.Member.callable
+        (R.Callable.func ~loc ~kind:Pred ~formals ?depends:(depends body)
+           (ident ~loc text) body)
     in
     let context_declaration body =
       R.Member.callable
         (R.Callable.func ~loc ~kind:Pred
            ~formals:[ reference "self" ]
            ~returns:[ held_set_parameter ~implicit:true "held_set" ]
-           (ident ~loc "context") body)
+           ?depends:(depends body) (ident ~loc "context") body)
     in
     let start body =
       R.Member.callable

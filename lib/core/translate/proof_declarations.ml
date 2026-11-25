@@ -489,6 +489,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
   let* ctx = State.of_result (Checked_workers.enrich_predicates ctx preds) in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
+  let* ancestry = invariant_ancestry env p.pred_ancestry in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
   let name = ident ~loc:l (Option.value declaration_name ~default:p.pred_name.pid_str) in
   match def with
@@ -496,8 +497,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars explicit) ~returns:(vars implicit)
-          name (Some body),
+      ( R.Callable.func ~loc:l ~kind:Inv ?ancestry ~formals:(vars explicit)
+          ~returns:(vars implicit) name (Some body),
         [] )
   | Body body ->
       let* body = quantified env body in
@@ -880,8 +881,8 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars explicit) ~returns:(vars implicit)
-          name (Some body),
+      ( R.Callable.func ~loc:l ~kind:Inv ?ancestry ~formals:(vars explicit)
+          ~returns:(vars implicit) name (Some body),
         List.filter_opt parts @ transitions )
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
@@ -968,7 +969,8 @@ let predicates (source : Source.t) inventory =
       | Proof_lemma _ | Proof_type _ | Proof_resource _ | Proof_field _ | Proof_function _
       | Proof_au _ | Proof_task _ | Proof_access_field _ ->
           Ok None
-      | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
+      | Proof_invariant
+          { inv_name; inv_params; inv_state = state, state_type; inv_body; inv_ancestry }
         ->
           let* params, definition =
             match state_type with
@@ -1012,6 +1014,7 @@ let predicates (source : Source.t) inventory =
                    pred_body = None;
                    pred_persistent = true;
                    pred_inline = false;
+                   pred_ancestry = inv_ancestry;
                  },
                  Some definition ))
       | Proof_view { view_name; view_params; view_value } ->
@@ -1028,6 +1031,7 @@ let predicates (source : Source.t) inventory =
                        pred_body = None;
                        pred_persistent = false;
                        pred_inline = false;
+                       pred_ancestry = None;
                      },
                      Some (View { value = view_value }) ))
           | Some (at, _, _, _) ->
@@ -1117,17 +1121,24 @@ let predicates (source : Source.t) inventory =
            else
              Printf.sprintf "The predicate %s must be defined as an ordinary predicate"
                (name p))
-    | None, (def_at, definition, _, def_types) :: _ ->
+    | None, (def_at, definition, _, _) :: _ ->
         let* declared_implicit = implicit_parameters p in
         let* defined_implicit = implicit_parameters definition in
-        if declared_implicit = defined_implicit then Ok ()
-        else
+        if declared_implicit <> defined_implicit then
           error def_at
             ~related:[ (at, "Its declaration") ]
             (Printf.sprintf
                "The predicate %s has different implicit parameters in its declaration \
                 and definition"
                (name p))
+        else
+          begin match definition.pred_ancestry with
+          | None -> Ok ()
+          | Some ancestry ->
+              error ancestry.ancestry_loc
+                ~related:[ (at, "Its interface declaration") ]
+                "Only a private invariant can declare a parent"
+          end
   in
   let definition (at, p, _, _) =
     match definitions (name p) with
@@ -1281,9 +1292,8 @@ let check_adapter_shape ~at (contract : S.contract option) =
         unsupported at "Explicit ghost inputs or outputs in a checked module binding"
       else if Procedures.raising_contract c then
         unsupported at "A raising operation in a checked module binding"
-      else if c.pure || Option.is_some c.continues || not (List.is_empty c.variant) then
-        unsupported at
-          "A pure, continuation, or variant contract in a checked module binding"
+      else if Option.is_some c.continues || not (List.is_empty c.variant) then
+        unsupported at "A continuation or variant contract in a checked module binding"
       else if c.atomic && List.is_empty (c.atomic_requires @ c.atomic_ensures) then
         unsupported at "An atomic module contract without atomic clauses"
       else Ok ()

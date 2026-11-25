@@ -29,10 +29,14 @@ let rec proof_references bound (expression : S.proof_expr) =
 
 let declaration_references = function
   | S.Proof_predicate predicate ->
-      Option.value_map predicate.pred_body ~default:[]
-        ~f:
-          (Translate_context.term_references
-             (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str)))
+      List.concat_map (Option.to_list predicate.pred_ancestry) ~f:(fun ancestry ->
+          Translate_context.term_references
+            (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str))
+            (S.ancestry_application ancestry))
+      @ Option.value_map predicate.pred_body ~default:[]
+          ~f:
+            (Translate_context.term_references
+               (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str)))
   | Proof_function { function_params; function_body; function_variant; _ } ->
       List.concat_map
         (function_body :: function_variant)
@@ -60,10 +64,14 @@ let declaration_references = function
         @ Option.value_map lemma_opens ~default:[] ~f:snd)
         ~f:(Translate_context.term_references bound)
       @ proof_references bound lemma_body
-  | Proof_invariant { inv_params; inv_state = state, _; inv_body; _ } ->
+  | Proof_invariant { inv_params; inv_state = state, _; inv_body; inv_ancestry; _ } ->
       Translate_context.term_references
         (state.pid_str :: List.map inv_params ~f:(fun (id, _) -> id.S.pid_str))
         inv_body
+      @ List.concat_map (Option.to_list inv_ancestry) ~f:(fun ancestry ->
+          Translate_context.term_references
+            (state.pid_str :: List.map inv_params ~f:(fun (id, _) -> id.S.pid_str))
+            (S.ancestry_application ancestry))
   | Proof_view { view_params; view_value; _ } ->
       Translate_context.term_references
         (List.map view_params ~f:(fun (id, _) -> id.S.pid_str))

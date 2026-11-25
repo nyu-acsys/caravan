@@ -1,0 +1,9 @@
+(copy_files ../instances/instances.mli)
+
+(library
+ (name caravan_case_study_generic_striped_hash_set_clients)
+ (modules clients)
+ (libraries caravan_case_study_generic_striped_hash_set_instances))
+
+(cram
+ (deps %{bin:caravan} instances.mli clients.ml clients.proof))

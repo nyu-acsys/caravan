@@ -37,7 +37,7 @@ if mode in {"alias", "value", "mismatch", "type"}:
     if mode == "mismatch":
         assert any("another one here" in "\n".join(e["message"])
                    for e in report["errors"])
-        assert any(e["kind"] == "RelatedLoc" and e["file"].endswith(".mli")
+        assert any(e["kind"] == "RelatedLoc" and e["file"].endswith("editor_contract_mismatch.ml")
                    for e in report["errors"])
 else:
     contracts = [a for a in annotations if a["kind"] == "InheritedContract"]

@@ -36,11 +36,7 @@ let mask_entry env (term : S.term) =
   let l = loc at in
   let head, arguments = spine term [] in
   let wildcard () = R.Expr.var ~loc:l (name ~loc:l "_") in
-  let source_wildcard term =
-    match term.S.term_desc with
-    | Tvar (Qid id) -> String.equal id.pid_str "_"
-    | _ -> false
-  in
+  let source_wildcard = S.is_mask_wildcard in
   let prefix types =
     if List.length arguments > List.length types then
       State.of_result (error at "Too many arguments in an opens entry")
@@ -77,8 +73,7 @@ let mask_entry env (term : S.term) =
               let+ family, receiver, _ =
                 frozen_selection ~expected env field term owner
               in
-              ( qualified_name ~loc:l (family ^ ".frozen"),
-                [ receiver; wildcard (); wildcard () ] )
+              (qualified_name ~loc:l (family ^ ".frozen"), [ receiver ])
           | _ ->
               State.of_result
                 (error at
@@ -97,6 +92,19 @@ let mask_entry env (term : S.term) =
                 Option.value_map instance ~default:types ~f:(fun (worker, parameters) ->
                     Generic_parameters.parameter_types worker parameters)
               in
+              let types =
+                if
+                  List.Assoc.mem env.ctx.given.shared.persistent key ~equal:String.equal
+                  || List.Assoc.mem env.ctx.given.shared.persistent target
+                       ~equal:String.equal
+                then
+                  List.take types
+                    (Option.value
+                       (List.Assoc.find env.ctx.given.proof_support.predicate_inputs key
+                          ~equal:String.equal)
+                       ~default:(List.length types))
+                else types
+              in
               let* target = predicate_target env ~at ~key ~target arguments in
               let+ arguments = prefix types in
               (qualified_name ~loc:l target, arguments)
@@ -113,6 +121,17 @@ let mask_entry env (term : S.term) =
           end
       end
   | _ -> State.of_result (error at "An opens entry must name a predicate or invariant")
+
+let invariant_ancestry env ancestry =
+  let open State.Syntax in
+  match ancestry with
+  | None -> State.return None
+  | Some ancestry ->
+      let+ target, arguments = mask_entry env (S.ancestry_application ancestry) in
+      Some
+        (match ancestry.ancestry_kind with
+        | S.Parent -> R.Callable.Parent (target, arguments)
+        | Within -> R.Callable.Within (target, arguments))
 
 let contract_opens env contract =
   let open State.Syntax in

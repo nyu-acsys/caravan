@@ -236,6 +236,24 @@ types are kept implicitly.
 The complete [segment-based queue](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue_lseg)
 illustrates this style, including helping and exceptional completion.
 
+A public invariant can contain private invariant assertions. Declare their
+permanent parent in the companion proof so the public opening permission covers
+those private invariants:
+
+```proof
+invariant is_cell (cell : int Atomic.t) = cell_value cell
+invariant [@parent is_cell cell] cell_value (cell : int Atomic.t) = own cell 0
+```
+
+An `opens {is_cell cell}` contract then permits opening `cell_value cell`,
+including while `is_cell cell` is open. Merely mentioning the child in the
+parent's definition does not grant that permission. Parent arguments must be
+explicit parameters of the child. Parent annotations currently apply only to
+private proof invariants; invariants declared in an interface remain roots.
+Public `within` annotations are not yet supported. A typed wildcard can select a
+polymorphic namespace without choosing an instance, for example
+`opens {Seq.persistent (_ : int Seq.t)}`.
+
 ## Carry ghost information without changing runtime code {#sec:carry-ghost-information-without-changing-runtime-code}
 
 An ordinary `Ghost.scope` wraps one runtime operation with proof code. Its local

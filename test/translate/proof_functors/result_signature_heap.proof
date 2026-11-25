@@ -1,0 +1,8 @@
+module Make (Element : ELEMENT) = struct
+  invariant stored (cell : t) = true
+  proof keep = ()
+end
+
+proof result = use cell
+  requires Instance.stored cell
+  ensures Again.stored result && result === cell = ()

@@ -1792,10 +1792,7 @@ and atomic ctx (e : Typedtree.expression) op (args : Typedtree.expression list) 
           let* x = State.fresh "tmp" in
           let n = R.Expr.int ~loc:l (if String.equal op "incr" then 1 else -1) in
           let* preparation, arguments = visibility_arguments ~write:true [ a; n ] in
-          let procedure =
-            if ctx.given.visibility_execution then qualified_name ~loc:l f
-            else name ~loc:l f
-          in
+          let procedure = qualified_name ~loc:l f in
           let init = R.Stmt.expr_rhs (R.Expr.call ~loc:l procedure arguments) in
           let* how = how `Commit in
           let* access = atomic_result ~typ:(R.Type.int ~loc:l) ~init ~published:true x in
@@ -2202,14 +2199,15 @@ and call_prepared ?actual_target ?universal ctx (e : Typedtree.expression) f oca
   (* A library's procedure is qualified by its module, as [Backoff.once]. *)
   let callee_name = qualified_name ~loc:l (Option.value actual_target ~default:f) in
   let* execution_statements, execution_arguments =
-    if
-      execution_enabled ctx.given
-      && (List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
+    let tracked =
+      match List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal with
+      | Some signature -> signature.procedure_execution
+      | None ->
+          List.exists ctx.given.functions.entries ~f:(fun (_, target) ->
               String.equal target f)
-         || Option.exists
-              (List.Assoc.find ctx.given.procedure_signatures f ~equal:String.equal)
-              ~f:(fun signature -> signature.procedure_execution))
-    then State.execution_arguments ctx ~at:e.exp_loc
+    in
+    if execution_enabled ctx.given && tracked then
+      State.execution_arguments ctx ~at:e.exp_loc
     else State.return ([], [])
   in
   let stmts = stmts @ execution_statements in

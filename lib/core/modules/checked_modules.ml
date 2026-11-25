@@ -9,7 +9,6 @@ type t = {
   interface : string;
   target : string option;
   members : (string * string) list;
-  grouped : bool;
 }
 
 type schema = { interface : string; members : (string * string) list }
@@ -41,7 +40,6 @@ let plan ?(schema = fun _ -> None) bindings =
             interface = view.interface;
             target = Some (Option.value view.target ~default:view.name);
             members = view.members;
-            grouped = false;
           }
       | None ->
           {
@@ -58,7 +56,6 @@ let plan ?(schema = fun _ -> None) bindings =
               | None ->
                   List.map binding.expected.signature_values ~f:(fun (member, _) ->
                       (member, Fresh_names.fresh ("checked_" ^ base ^ "_" ^ member))));
-            grouped = Option.is_some requested;
           }
     in
     view :: previous
@@ -68,12 +65,4 @@ let plan ?(schema = fun _ -> None) bindings =
         (not (List.is_empty binding.expected.signature_values))
         || Option.is_some (schema binding))
   in
-  let views = List.rev (List.fold bindings ~init:[] ~f:add) in
-  let targets =
-    Set.of_list (module String) (List.filter_map views ~f:(fun view -> view.target))
-  in
-  List.map views ~f:(fun view ->
-      {
-        view with
-        grouped = view.grouped || Option.is_some view.target || Set.mem targets view.name;
-      })
+  List.rev (List.fold bindings ~init:[] ~f:add)

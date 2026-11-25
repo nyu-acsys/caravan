@@ -1,0 +1,2 @@
+proof sequence_order_client ()
+  opens {Seq.persistent (_ : int Seq.t)} = ()

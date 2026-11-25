@@ -6,6 +6,7 @@ module Worker (A : Element) = struct
   module Guard = Ghost.Mutex (Resource)
 
   proof result = create value
+    opens {}
     ensures (match result with mutex, condition ->
       Guard.is_mutex mutex value && Guard.is_condition condition mutex) =
     at (Mutex.create ()) (fun create ->
@@ -19,6 +20,7 @@ module Worker (A : Element) = struct
       condition)
 
   proof result = work mutex condition value
+    opens {}
     requires (Ghost.Mutex.context self held &&
       not (Finset.mem mutex held) && Guard.is_mutex mutex value &&
       Guard.is_condition condition mutex)
@@ -27,10 +29,12 @@ module Worker (A : Element) = struct
   module Job = Ghost.Task (struct let operation = work end)
 
   proof domain = launch mutex condition value
+    opens {}
     requires (Guard.is_mutex mutex value && Guard.is_condition condition mutex)
     ensures (Job.handle domain mutex condition value) = ()
 
   proof result = finish domain mutex condition value
+    opens {}
     requires (Job.handle domain mutex condition value)
     ensures (Guard.is_mutex mutex value && Guard.is_condition condition mutex &&
       result === value) = ()

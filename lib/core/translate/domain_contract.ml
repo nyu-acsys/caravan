@@ -65,7 +65,7 @@ let runtime_support ~loc model =
       (R.Callable.proc ~loc ~formals ~returns
          ~requires:[ R.Spec.make requires ]
          ~ensures:[ R.Spec.make ensures ]
-         (ident ~loc text) None)
+         ~opens:(loc, []) (ident ~loc text) None)
   in
   R.Member.free
     (R.Member.module_ ~loc

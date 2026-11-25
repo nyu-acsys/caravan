@@ -1,0 +1,14 @@
+module Make (Element : ELEMENT) = struct
+  type carrier = {value : Element.t}
+
+  predicate full (values : Element.t finset) =
+    forall packed : carrier. Finset.mem packed.value values
+
+  lemma member (values : Element.t finset) (key : Element.t)
+    requires full values
+    ensures full values && Finset.mem key values =
+    unfold full values;
+    fold full values
+
+  proof result = keep value ensures result === value = ()
+end

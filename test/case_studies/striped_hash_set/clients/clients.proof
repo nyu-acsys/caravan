@@ -1,0 +1,8 @@
+proof exercise ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()
+
+
+proof empty_and_single_stripe ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()

@@ -16,19 +16,22 @@ let binding_name_location (binding : Typedtree.value_binding) =
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
 let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t) =
+  let predicate_signatures =
+    List.filter_map inventory.constraints ~f:(fun constraint_ ->
+        Option.some_if
+          (Option.is_some constraint_.Module_inventory.owner)
+          constraint_.signature)
+    @ List.map inventory.bindings ~f:(fun binding -> binding.Module_inventory.expected)
+  in
   let* signature_predicates =
-    all
-      (List.filter inventory.constraints ~f:(fun constraint_ ->
-           Option.is_some constraint_.Module_inventory.owner))
-      ~f:(fun constraint_ ->
-        all constraint_.Module_inventory.signature.signature_resources
-          ~f:(fun (name, resource) ->
+    all predicate_signatures ~f:(fun signature ->
+        all signature.Module_inventory.signature_resources ~f:(fun (name, resource) ->
             let environment = Source.annotation_env source resource.site.environment in
             let* parameters =
               Proof_bindings.parameter_types environment resource.declaration.pred_params
             in
             Ok
-              (List.map constraint_.signature.signature_values ~f:(fun (_, value) ->
+              (List.map signature.signature_values ~f:(fun (_, value) ->
                    let parameters =
                      Compiler_types.map_group parameters ~f:(fun typ ->
                          Subst.type_expr value.origin_projection
@@ -658,7 +661,7 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
-let pure_functions (funcs : func list) =
+let pure_functions ?(required = []) (funcs : func list) =
   let* () =
     Result.all_unit
       (List.map funcs ~f:(fun f ->
@@ -677,6 +680,8 @@ let pure_functions (funcs : func list) =
                          | Some (Path.Pdot _ as path)
                            when List.exists funcs ~f:(fun target ->
                                     (not (List.is_empty target.signature_sites))
+                                    && (not
+                                          (List.mem required target.id ~equal:Ident.same))
                                     && List.mem target.paths path ~equal:Path.same) ->
                              unsupported term.term_loc
                                "A specification call through a constrained module \
@@ -698,6 +703,7 @@ let pure_functions (funcs : func list) =
     List.filter funcs ~f:(fun f ->
         List.exists f.paths ~f:(fun path ->
             List.mem referenced_in_contracts path ~equal:Path.same)
+        || List.mem required f.id ~equal:Ident.same
         || Option.exists f.contract ~f:(fun (c : S.contract) -> c.pure))
   in
   let is_in set f = List.exists set ~f:(fun g -> Ident.same g.id f.id) in
@@ -718,6 +724,7 @@ let pure_functions (funcs : func list) =
           | Path.Pdot _
             when List.exists funcs ~f:(fun target ->
                      (not (List.is_empty target.signature_sites))
+                     && (not (List.mem required target.id ~equal:Ident.same))
                      && List.mem target.paths path ~equal:Path.same) ->
               unsupported at "A pure call through a constrained module signature"
           | _ -> Ok ()
@@ -1671,7 +1678,7 @@ let checked_type_substitution ?(substitution = Subst.identity) binding path =
         (Subst.module_path substitution (Path.Pdot (path, name)))
         substitution)
 
-let checked_raw_types types binding =
+let checked_raw_types ?(dependencies = []) types binding =
   let rec referenced_paths (seen, paths) typ =
     let id = Types.get_id typ in
     if Set.mem seen id then (seen, paths)
@@ -1683,10 +1690,13 @@ let checked_raw_types types binding =
       Btype.fold_type_expr referenced_paths (seen, paths) typ
   in
   let _, dependencies =
-    List.fold binding.Module_inventory.expected.signature_values
+    List.fold
+      (dependencies
+      @ List.map binding.Module_inventory.expected.signature_values
+          ~f:(fun (_, signature) ->
+            signature.Module_inventory.declaration.val_val.val_type))
       ~init:(Set.empty (module Int), [])
-      ~f:(fun state (_, signature) ->
-        referenced_paths state signature.declaration.val_val.val_type)
+      ~f:referenced_paths
   in
   let aliases =
     List.map binding.Module_inventory.expected.signature_ghost_modules
@@ -2105,10 +2115,8 @@ let contains_atomic_token types typ =
 (** The logical counterpart of an explicitly pure imported procedure. *)
 let library_pure_name name = name ^ "$pure"
 
-let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
-    (contract : S.contract) =
+let validate_pure_contract ctx ~(at : Location.t) ~args (contract : S.contract) =
   let open State.Syntax in
-  let l = loc at in
   let* () =
     if List.is_empty args then
       State.of_result (unsupported at "A pure contract on a non-function library value")
@@ -2145,6 +2153,37 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
         (unsupported at "A pure library function whose contract depends on heap resources")
     else State.return ()
   in
+  State.return ()
+
+let pure_contract_context ctx =
+  {
+    ctx with
+    given = { ctx.given with mutex_execution = false; visibility_execution = false };
+  }
+
+let pure_result_equality ~at ~target prepared =
+  let l = loc at in
+  if not prepared.prepared_returns_value then []
+  else
+    [
+      R.Spec.make
+        (R.Expr.binary ~loc:l Eq
+           (R.Expr.var ~loc:l (name ~loc:l "r"))
+           (R.Expr.call ~loc:l (qualified_name ~loc:l target) prepared.prepared_args));
+    ]
+
+let pure_logical_member ~at ~name ?body ?(inherit_contract = false) prepared result_type =
+  let l = loc at in
+  R.Callable.func ~loc:l ~formals:prepared.prepared_formals
+    ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
+    ~ensures:(if inherit_contract then [] else prepared.prepared_logical_ensures)
+    (ident ~loc:l name) body
+
+let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
+    (contract : S.contract) =
+  let open State.Syntax in
+  let ctx = pure_contract_context ctx in
+  let* () = validate_pure_contract ctx ~at ~args contract in
   let* prepared = prepare_callable ctx ~at ~args ~result (Some contract) in
   let* () =
     if List.is_empty prepared.prepared_implicit then State.return ()
@@ -2152,26 +2191,15 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
   in
   let logical_name = library_pure_name name in
   let* result_type = State.typ ctx ~at result in
-  let logical_returns = [ R.Var.make ~loc:l (ident ~loc:l "r") result_type ] in
-  let logical =
-    R.Callable.func ~loc:l ~formals:prepared.prepared_formals ~returns:logical_returns
-      ~ensures:prepared.prepared_logical_ensures (ident ~loc:l logical_name) None
-  in
-  let equality =
-    if is_unit result then []
-    else
-      [
-        R.Spec.make
-          (R.Expr.binary ~loc:l Eq
-             (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
-             (R.Expr.call ~loc:l
-                (Translate_context.name ~loc:l logical_name)
-                prepared.prepared_args));
-      ]
-  in
+  let logical = pure_logical_member ~at ~name:logical_name prepared result_type in
   let procedure =
     prepared_member ~at ~name None
-      { prepared with prepared_ensures = prepared.prepared_ensures @ equality }
+      {
+        prepared with
+        prepared_ensures =
+          prepared.prepared_ensures
+          @ pure_result_equality ~at ~target:logical_name prepared;
+      }
   in
   State.return [ logical; procedure ]
 

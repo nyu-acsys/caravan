@@ -1,0 +1,4 @@
+module Make (Key : KEY) = struct
+  lemma invalid_unrestricted_range (key : Key.t)
+    ensures 0 <= Key.hash key = ()
+end

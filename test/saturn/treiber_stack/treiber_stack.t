@@ -7,5 +7,7 @@ The same implementation and predicate worker serve integer and boolean clients.
   $ cp treiber_stack.ml treiber_stack.mli treiber_stack.proof clients/
   $ chmod u+w clients/treiber_stack.ml
   $ cat clients.ml >> clients/treiber_stack.ml
+  $ chmod u+w clients/treiber_stack.proof
+  $ cat clients.proof >> clients/treiber_stack.proof
   $ caravan --shh -I ../backoff clients/treiber_stack.ml
   Verification successful.

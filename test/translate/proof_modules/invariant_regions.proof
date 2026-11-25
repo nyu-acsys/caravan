@@ -1,0 +1,17 @@
+invariant root (cell : t) = leaf cell
+invariant [@parent root cell] leaf (cell : t) = own cell 0
+
+proof create =
+  on return begin
+    fold leaf result;
+    fold root result
+  end
+
+proof get =
+  at (Atomic.get cell) (fun read ->
+    unfold root cell;
+    unfold leaf cell;
+    let result = read () in
+    fold leaf cell;
+    fold root cell;
+    result)

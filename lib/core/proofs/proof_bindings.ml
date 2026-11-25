@@ -416,6 +416,25 @@ let view_declaration inventory scope name =
         (List.Assoc.find constraint_.Module_inventory.signature.signature_resources name
            ~equal:String.equal) ~f:(fun formal -> (constraint_, formal)))
 
+let interface_resource (inventory : Module_inventory.t) (scopes : Proof_scopes.t)
+    (scope : Proof_scopes.scope) name =
+  List.find_map scopes.scopes ~f:(fun ancestor ->
+      Option.bind (drop_prefix ancestor.namespace scope.namespace) ~f:(fun suffix ->
+          let declaration signature =
+            Option.bind (signature_member signature suffix) ~f:(fun signature ->
+                List.Assoc.find signature.signature_resources name ~equal:String.equal)
+          in
+          match
+            List.find_map (own_constraints inventory.constraints ancestor)
+              ~f:(fun constraint_ -> declaration constraint_.signature)
+          with
+          | Some _ as formal -> formal
+          | None ->
+              List.find_map inventory.bindings ~f:(fun binding ->
+                  if same_owner ancestor.owner (Some binding.actual_path) then
+                    declaration binding.expected
+                  else None)))
+
 let private_view_substitution (source : Source.t) inventory scope constraint_ =
   let application =
     List.find inventory.Module_inventory.specializations ~f:(fun application ->
@@ -515,7 +534,8 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
           Report.unsupported entry.name.pid_loc
             "A declaration-only predicate in a module proof"
       end
-  | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body } ->
+  | Proof_invariant
+      { inv_name; inv_params; inv_state = state, state_type; inv_body; inv_ancestry } ->
       let* state_definition =
         match state_type with
         | PTtyapp (name, arguments) ->
@@ -579,6 +599,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
           pred_body = None;
           pred_persistent = true;
           pred_inline = false;
+          pred_ancestry = inv_ancestry;
         }
       in
       Ok (Predicate (predicate, definition), predicate.pred_params)
@@ -606,6 +627,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
                 pred_body = None;
                 pred_persistent = false;
                 pred_inline = false;
+                pred_ancestry = None;
               }
             in
             Ok (Predicate (predicate, View view_value), predicate.pred_params)
@@ -759,6 +781,21 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
               end
         in
         let* kind, parameters = supported source inventory entry in
+        let* () =
+          match kind with
+          | Predicate ({ pred_ancestry = Some ancestry; _ }, _) ->
+              begin match
+                interface_resource inventory scopes scope entry.name.pid_str
+              with
+              | None -> Ok ()
+              | Some formal ->
+                  Error
+                    (Report.error Type ancestry.ancestry_loc
+                       ~related:[ (formal.site.item_loc, "Its interface declaration") ]
+                       "Only a private invariant can declare a parent")
+              end
+          | _ -> Ok ()
+        in
         let* () =
           match
             List.find inventory.values ~f:(fun value ->

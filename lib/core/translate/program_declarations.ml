@@ -778,18 +778,15 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let* contract = signature_contract signature in
             let* () =
               match contract with
-              | Some c when c.S.pure || Option.is_some c.continues ->
+              | Some c when Option.is_some c.S.continues ->
                   unsupported signature.site.item_loc
-                    "A pure or continuation contract in a checked module view"
+                    "A continuation contract in a checked module view"
               | _ -> Ok ()
             in
             let operation_member =
               List.Assoc.find_exn view.members member ~equal:String.equal
             in
-            let operation_name =
-              if view.grouped then view.name ^ "." ^ operation_member
-              else operation_member
-            in
+            let operation_name = view.name ^ "." ^ operation_member in
             let operation_paths =
               List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))
             in
@@ -799,9 +796,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 ~at:signature.site.item_loc signature.declaration.val_val.val_type
             in
             let* () =
-              if (not view.grouped) && not (List.is_empty scheme.variables) then
+              if
+                Option.exists contract ~f:(fun c -> c.S.pure)
+                && not (List.is_empty scheme.variables)
+              then
                 unsupported signature.site.item_loc
-                  "A polymorphic operation in a specialized checked module binding"
+                  "A polymorphic pure checked module operation"
               else Ok ()
             in
             let operation_worker =
@@ -835,7 +835,19 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   let checked_operations = List.concat checked_operations in
 
   (* The data types, and the sequences of specifications, which have no module. *)
-  let* inferred_pure = pure_functions funcs in
+  let required_pure =
+    List.filter_map funcs ~f:(fun f ->
+        Option.some_if
+          (List.exists checked_operations ~f:(fun operation ->
+               Option.exists operation.operation_contract ~f:(fun c -> c.S.pure)
+               && List.mem f.paths
+                    (Path.Pdot
+                       ( operation.operation_binding.actual_path,
+                         operation.operation_signature.declaration.val_name.txt ))
+                    ~equal:Path.same))
+          f.id)
+  in
+  let* inferred_pure = pure_functions ~required:required_pure funcs in
   let pure =
     inferred_pure
     @ List.filter funcs ~f:(fun f ->
@@ -1082,7 +1094,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               procedure_raw = raw;
               procedure_physical_atomic = Callable_contract.physically_atomic f.contract;
               procedure_pure = is_pure f;
-              procedure_execution = false;
+              procedure_execution =
+                scopes.mutex_execution || Source.visibility_required source;
             } ))
   in
   let* imported_signatures =
@@ -1147,7 +1160,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         if
           not
             (Raw_contract.any raw
-            || Callable_contract.physically_atomic operation.operation_contract)
+            || Callable_contract.physically_atomic operation.operation_contract
+            || Option.exists operation.operation_contract ~f:(fun c -> c.S.pure))
         then None
         else
           let scheme =
@@ -1179,8 +1193,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 procedure_raw = raw;
                 procedure_physical_atomic =
                   Callable_contract.physically_atomic operation.operation_contract;
-                procedure_pure = false;
-                procedure_execution = false;
+                procedure_pure =
+                  Option.exists operation.operation_contract ~f:(fun c -> c.S.pure);
+                procedure_execution =
+                  (not
+                     (Option.exists operation.operation_contract ~f:(fun c -> c.S.pure)))
+                  && (scopes.mutex_execution || Source.visibility_required source);
               } ))
   in
   let procedure_signatures = procedure_signatures @ checked_signatures in
@@ -1756,7 +1774,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 view with
                 types =
                   Compiler_types.map_group raw ~f:(fun typ ->
-                      Subst.type_expr projection (Subst.type_expr formal.substitution typ));
+                      view.project_type
+                        (Subst.type_expr projection
+                           (Subst.type_expr formal.substitution typ)));
               }
         | _ -> Ok view)
   in

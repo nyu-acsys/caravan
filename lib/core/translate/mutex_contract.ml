@@ -339,10 +339,11 @@ let protocol ~loc () =
   let conjunction expressions =
     List.fold_left (R.Expr.binary ~loc And) (R.Expr.bool ~loc true) expressions
   in
+  (* Native operations transfer opaque resources without opening registrations. *)
   let kernel ?(kind = R.Callable.Proc) text formals returns requires ensures =
     R.Member.free
       (R.Member.callable
-         (R.Callable.proc ~loc ~kind ~formals ~returns
+         (R.Callable.proc ~loc ~kind ~formals ~returns ~opens:(loc, [])
             ~requires:[ R.Spec.make (conjunction requires) ]
             ~ensures:[ R.Spec.make (conjunction ensures) ]
             (ident ~loc text) None))

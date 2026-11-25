@@ -5,6 +5,7 @@ end
 module Guard = Ghost.Mutex (Cell)
 
 proof put mutex cell
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell) =
@@ -18,11 +19,13 @@ proof put mutex cell
     result)
 
 proof repeat mutex cell
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell) = ()
 
 proof result = try_put mutex cell
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell) =
@@ -36,6 +39,7 @@ proof result = try_put mutex cell
     result)
 
 proof self_try mutex cell
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell) = ()
@@ -48,6 +52,7 @@ proof result = client () ensures (true) =
     mutex)
 
 proof held_loop mutex cell
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell) =

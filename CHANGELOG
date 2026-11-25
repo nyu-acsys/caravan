@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Private proof invariants support explicit parent annotations beneath an opaque public root.
+- Companion interfaces check exported module contracts and frozen invariant masks against existing native and instantiated functor contracts.
+- Pure function contracts are checked through module views and functor parameters, with logical counterparts usable in specifications.
+- Integer and generic striped hash-set case studies verify atomic set operations and resizing under all stripe locks.
 - `Permission.halve` lets a proof take part of a fraction out of an invariant before a field access.
 - One-shot `Ghost.Prophecy` predictions support linearizability proofs with future-dependent linearization points.
 - Standard-library `ignore` evaluates its argument while discarding its result.

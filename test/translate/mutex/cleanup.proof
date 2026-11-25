@@ -5,6 +5,7 @@ end
 module Guard = Ghost.Mutex (Cell)
 
 proof cleanup mutex cell fail
+  opens {}
   requires (Ghost.Mutex.context self held &&
     not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
   ensures (Guard.is_mutex mutex cell)

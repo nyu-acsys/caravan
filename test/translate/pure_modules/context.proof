@@ -1,0 +1,19 @@
+module Resource : Ghost.MutexResource with type t = unit = struct
+  type t = unit
+  predicate resource (key : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+module Make (Key : KEY) = struct
+  proof result = repeated x ensures result = ()
+end
+proof client ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()
+
+
+module Ordinary (Key : ORDINARY) = struct
+  proof result = use x ensures 0 <= result = ()
+end
+proof mixed_views ()
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()

@@ -887,6 +887,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
               (specification_bindings runtime_env root_env)
               parent.Proof_scopes.environment
           in
+          let constraint_environment = environment in
           let* local_env, _, all_resources, _, _, _ =
             Proof_types.elaborate_proof_types ~add_standard:false ~allow_interfaces:true
               ~family_parameters ~previous:([], resources, [], [], []) environment None
@@ -947,13 +948,13 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 in
                 let manifest =
                   if List.is_empty parameters then
-                    (Typetexp.transl_simple_type parent.environment ~closed:true
+                    (Typetexp.transl_simple_type constraint_environment ~closed:true
                        (core_type ~at:name.pid_loc typ))
                       .ctyp_type
                   else
                     let parameters, manifest =
-                      Proof_types.checked_constructor parent.environment ~at:name.pid_loc
-                        ~name:name.pid_str parameters typ
+                      Proof_types.checked_constructor constraint_environment
+                        ~at:name.pid_loc ~name:name.pid_str parameters typ
                     in
                     Option.value_exn
                       (Datatypes.instantiate_alias parameters resource.resource_parameters

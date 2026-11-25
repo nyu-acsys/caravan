@@ -91,6 +91,12 @@ and term_desc =
 
 and triggers = term list list
 
+let rec is_mask_wildcard term =
+  match term.term_desc with
+  | Tvar (Qid id) -> id.pid_str = "_"
+  | Tcast (term, _) -> is_mask_wildcard term
+  | _ -> false
+
 type header = { hd_name : id; hd_ret : labelled_arg list; hd_args : labelled_arg list }
 (** The header of a contract: [r = f x y], with ghost arguments in brackets. *)
 
@@ -144,6 +150,15 @@ type loop_spec = {
 }
 (** The specification of a loop, written at the start of its body. *)
 
+type ancestry_kind = Parent | Within
+
+type invariant_ancestry = {
+  ancestry_kind : ancestry_kind;
+  ancestry_target : qualid;
+  ancestry_args : id list;
+  ancestry_loc : Location.t;
+}
+
 type predicate = {
   pred_name : id;
   pred_params : (id * pty) list;
@@ -151,8 +166,16 @@ type predicate = {
   pred_persistent : bool;
       (** An invariant declaration, duplicable and distinct from ordinary predicates. *)
   pred_inline : bool;  (** [[@inline]]: its uses are its body, never folded. *)
+  pred_ancestry : invariant_ancestry option;
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
+
+let ancestry_application ancestry =
+  let term term_desc = { term_desc; term_loc = ancestry.ancestry_loc } in
+  List.fold_left
+    (fun head argument -> term (Tapply (head, term (Tvar (Qid argument)))))
+    (term (Tvar ancestry.ancestry_target))
+    ancestry.ancestry_args
 
 type state_field = {
   sf_name : id;
@@ -353,6 +376,7 @@ type proof_decl =
       inv_params : (id * pty) list;
       inv_state : id * pty;
       inv_body : term;
+      inv_ancestry : invariant_ancestry option;
     }
       (** The persistent predicate [inv_name], defined by the heap in terms of the state,
           [invariant is_stack (t : t) (s : state) = own t s.items]. *)

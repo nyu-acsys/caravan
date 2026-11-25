@@ -117,9 +117,11 @@ let members ~loc ~implementation =
   in
   storage
   @ [
+      (* A frozen field's invariant owns only the field's cells. *)
       R.Member.callable
         (R.Callable.func ~loc ~kind:Inv ~formals:[ address ]
            ~returns:[ implicit_value; ghost ~implicit:true "cut_point" reference ]
+           ?depends:(Option.some_if (not implementation) (loc, []))
            (ident "frozen")
            (if implementation then
               Some
@@ -357,7 +359,7 @@ let members ~loc ~implementation =
         [ context; frozen; seen; seen_view lower; binary In cut lower ]
         [ R.Stmt.call ~loc (call "visibility_weaken" [ owner; lower; singleton ]) ];
       procedure
-        ~opens:[ (name "frozen", [ location; value; cut ]) ]
+        ~opens:[ (name "frozen", [ location ]) ]
         "read_frozen"
         [ executing; address; implicit_value; ghost ~implicit:true "cut_point" reference ]
         [ formal "result" value_type ]
