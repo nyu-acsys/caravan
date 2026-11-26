@@ -781,18 +781,68 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
               end
         in
         let* kind, parameters = supported source inventory entry in
+        (* The private invariants of this module, through which a promise may be kept. *)
+        let intermediate name =
+          match interface_resource inventory scopes scope name with
+          | Some _ -> None
+          | None ->
+              List.find_map entries ~f:(fun other ->
+                  match other.Proof_scopes.declaration with
+                  | S.Proof_invariant { inv_name; inv_params; inv_state; inv_ancestry; _ }
+                    when same_owner other.scope.owner scope.owner
+                         && String.equal inv_name.pid_str name ->
+                      Some
+                        {
+                          S.pred_name = inv_name;
+                          pred_params = inv_params @ [ inv_state ];
+                          pred_body = None;
+                          pred_persistent = true;
+                          pred_inline = false;
+                          pred_ancestry = inv_ancestry;
+                        }
+                  | _ -> None)
+        in
         let* () =
           match kind with
-          | Predicate ({ pred_ancestry = Some ancestry; _ }, _) ->
+          | Predicate (definition, _) ->
               begin match
-                interface_resource inventory scopes scope entry.name.pid_str
+                ( definition.pred_ancestry,
+                  interface_resource inventory scopes scope entry.name.pid_str )
               with
-              | None -> Ok ()
-              | Some formal ->
+              | Some ancestry, Some { declaration = { pred_ancestry = None; _ }; site; _ }
+                ->
                   Error
                     (Report.error Type ancestry.ancestry_loc
-                       ~related:[ (formal.site.item_loc, "Its interface declaration") ]
-                       "Only a private invariant can be declared within another")
+                       ~related:[ (site.item_loc, "Its interface declaration") ]
+                       "An invariant that its interface does not declare within another \
+                        cannot be declared within one")
+              | None, Some { declaration = { pred_ancestry = Some promise; _ }; _ } ->
+                  Error
+                    (Report.error Type entry.name.pid_loc
+                       ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                       (Printf.sprintf
+                          "The interface declares %s within %s, but its definition \
+                           declares no ancestor"
+                          entry.name.pid_str
+                          (S.qualid_name promise.ancestry_target)))
+              | ( Some ancestry,
+                  Some
+                    {
+                      declaration = { pred_ancestry = Some promise; _ } as declaration;
+                      _;
+                    } )
+                when not
+                       (S.keeps_promise ~intermediate ~declaration ~child:definition
+                          ancestry promise) ->
+                  Error
+                    (Report.error Type ancestry.ancestry_loc
+                       ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                       (Printf.sprintf
+                          "The definition of %s does not lie within %s as its interface \
+                           declares, through invariants private to the implementation"
+                          entry.name.pid_str
+                          (S.qualid_name promise.ancestry_target)))
+              | _ -> Ok ()
               end
           | _ -> Ok ()
         in

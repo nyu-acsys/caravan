@@ -428,11 +428,13 @@ predicate:
 invariant_declaration:
 | INVARIANT ancestry = invariant_ancestry_attribute? n = lident ps = predicate_param+ EOF
     { (match ancestry with
-       | None -> ()
-       | Some ancestry -> raise (Syntax_error (ancestry.ancestry_loc,
-           "Invariant ancestry is supported only on private proof definitions")));
+       | Some { ancestry_target = Qdot _; ancestry_loc; _ } ->
+           raise (Syntax_error (ancestry_loc,
+             "An interface invariant can be declared only within an invariant of the \
+              same interface"))
+       | Some _ | None -> ());
       { pred_name = n; pred_params = ps; pred_body = None;
-        pred_persistent = true; pred_inline = false; pred_ancestry = None } }
+        pred_persistent = true; pred_inline = false; pred_ancestry = ancestry } }
 ;
 
 invariant_ancestry_attribute:

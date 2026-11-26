@@ -1098,6 +1098,14 @@ let predicates (source : Source.t) inventory =
     | Direct_invariant _ | Invariant _ -> true
     | Body _ | View _ -> false
   in
+  let public x = List.exists declared ~f:(fun (_, p, _, _) -> String.equal (name p) x) in
+  let intermediate x =
+    if public x then None
+    else
+      match definitions x with
+      | (_, definition, _, _) :: _ -> Some definition
+      | [] -> None
+  in
   let declaration (at, (p : S.predicate), def, types) =
     match (def, definitions (name p)) with
     | Some _, _ -> Ok ()
@@ -1132,12 +1140,32 @@ let predicates (source : Source.t) inventory =
                 and definition"
                (name p))
         else
-          begin match definition.pred_ancestry with
-          | None -> Ok ()
-          | Some ancestry ->
+          begin match (definition.pred_ancestry, p.pred_ancestry) with
+          | Some ancestry, None ->
               error ancestry.ancestry_loc
                 ~related:[ (at, "Its interface declaration") ]
-                "Only a private invariant can be declared within another"
+                "An invariant that its interface does not declare within another cannot \
+                 be declared within one"
+          | None, Some promise ->
+              error def_at
+                ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                (Printf.sprintf
+                   "The interface declares %s within %s, but its definition declares no \
+                    ancestor"
+                   (name p)
+                   (qualid_key promise.ancestry_target))
+          | Some ancestry, Some promise
+            when not
+                   (S.keeps_promise ~intermediate ~declaration:p ~child:definition
+                      ancestry promise) ->
+              error ancestry.ancestry_loc
+                ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                (Printf.sprintf
+                   "The definition of %s does not lie within %s as its interface \
+                    declares, through invariants private to the implementation"
+                   (name p)
+                   (qualid_key promise.ancestry_target))
+          | None, None | Some _, Some _ -> Ok ()
           end
   in
   let definition (at, p, _, _) =

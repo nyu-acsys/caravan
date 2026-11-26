@@ -29,6 +29,14 @@ type t = {
   task_members : (string * R.Member.t list * string list) list;
 }
 
+(* The ancestor that the interface declaration [p] promises, with its target's member
+   named by [stem]. The parser admits only targets of the same interface. *)
+let interface_within ~loc ~stem (p : S.predicate) =
+  Option.map p.pred_ancestry ~f:(fun ancestry ->
+      ( R.Name.make ~loc (stem (qualid_key ancestry.S.ancestry_target)),
+        List.map ancestry.ancestry_args ~f:(fun argument ->
+            R.Expr.var ~loc (R.Name.make ~loc argument.S.pid_str)) ))
+
 let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
     (proofs : Program_proofs.t) (shaped : Program_structures.t) state :
     (t * State.state, error) Result.t =
@@ -258,11 +266,12 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 List.split_n params (List.length params - implicit)
               in
               let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
+              let within = interface_within ~loc:l ~stem:Fn.id p in
               let member =
                 R.Member.free
                   (R.Member.callable
                      (R.Callable.func ~loc:l ~kind ~formals:(List.map explicit ~f:snd)
-                        ~returns:(List.map implicit ~f:snd)
+                        ~returns:(List.map implicit ~f:snd) ?within
                         (ident ~loc:l p.pred_name.pid_str)
                         None))
               in
@@ -1239,6 +1248,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                publication_members ))
   in
   let resource_members ~owner ~stem view ~aliases =
+    let member_stem = stem in
     let open State.Syntax in
     let+ members =
       State.all view.view_resources ~f:(fun (formal, resource) ->
@@ -1291,6 +1301,7 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 R.Var.make ~loc:l (ident ~loc:l id.pid_str) typ)
           in
           let formals, returns = List.split_n vars (List.length vars - implicit) in
+          let within = interface_within ~loc:l ~stem:member_stem p in
           let* target =
             if not aliases then State.return resource.resource_backend
             else
@@ -1323,7 +1334,8 @@ let run (scopes : Program_scopes.t) (decls : Program_declarations.t)
                 (qualified_name ~loc:l target)
             else
               let kind = if p.pred_persistent then R.Callable.Inv else R.Callable.Pred in
-              R.Callable.func ~loc:l ~kind ~formals ~returns (ident ~loc:l stem) None
+              R.Callable.func ~loc:l ~kind ~formals ~returns ?within (ident ~loc:l stem)
+                None
           in
           if not generic then State.return [ R.Member.callable member ]
           else

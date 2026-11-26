@@ -175,6 +175,50 @@ let ancestry_application ancestry =
     (term (Tvar ancestry.ancestry_target))
     ancestry.ancestry_args
 
+let rec qualid_name = function
+  | Qid id -> id.pid_str
+  | Qdot (q, id) -> qualid_name q ^ "." ^ id.pid_str
+
+(** Whether the definition [child], declared within [ancestry], lies within [promise],
+    which its interface [declaration] states. The chain may pass only through invariants
+    for which [intermediate] returns a definition: those private to the implementation.
+    Arguments compare by their positions among the parameters. *)
+let keeps_promise ~intermediate ~declaration ~child ancestry promise =
+  let positions p ancestry =
+    List.map
+      (fun argument ->
+        let rec find index = function
+          | [] -> None
+          | (parameter, _) :: rest ->
+              if String.equal parameter.pid_str argument.pid_str then Some index
+              else find (index + 1) rest
+        in
+        find 0 p.pred_params)
+      ancestry.ancestry_args
+  in
+  let promised = positions declaration promise in
+  let rec walk visited steps current ancestry =
+    let target = qualid_name ancestry.ancestry_target in
+    let arguments =
+      List.map
+        (fun position ->
+          Option.bind position (fun index -> Option.join (List.nth_opt steps index)))
+        (positions current ancestry)
+    in
+    if String.equal target (qualid_name promise.ancestry_target) then
+      List.equal (Option.equal Int.equal) arguments promised
+    else if List.mem target visited then false
+    else
+      match intermediate target with
+      | Some ({ pred_ancestry = Some next; _ } as definition)
+        when List.length arguments = List.length definition.pred_params ->
+          walk (target :: visited) arguments definition next
+      | Some _ | None -> false
+  in
+  walk [ child.pred_name.pid_str ]
+    (List.init (List.length child.pred_params) Option.some)
+    child ancestry
+
 type state_field = {
   sf_name : id;
   sf_type : pty;

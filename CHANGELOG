@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Private proof invariants can declare with `[@within …]` that they lie beneath an opaque public root.
+- Invariants can declare with `[@within …]` that they lie beneath another invariant, in proofs and interfaces.
 - Companion interfaces check exported module contracts and frozen invariant masks against existing native and instantiated functor contracts.
 - Pure function contracts are checked through module views and functor parameters, with logical counterparts usable in specifications.
 - Integer and generic striped hash-set case studies verify atomic set operations and resizing under all stripe locks.

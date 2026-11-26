@@ -248,9 +248,11 @@ invariant [@within is_cell cell] cell_value (cell : int Atomic.t) = own cell 0
 An `opens {is_cell cell}` contract then permits opening `cell_value cell`,
 including while `is_cell cell` is open. Merely mentioning the child in the
 parent's definition does not grant that permission. Parent arguments must be
-explicit parameters of the child. Parent annotations currently apply only to
-private proof invariants; invariants declared in an interface remain roots.
-Public `within` annotations are not yet supported. A typed wildcard can select a
+explicit parameters of the child. An interface can also declare that one of its
+invariants lies within another, as in `(*@ invariant [@within is_cell cell]
+cell_value (cell : int Atomic.t) *)`. Its definition keeps that promise by declaring
+its parent, possibly through invariants private to the implementation, and clients
+of the interface rely on it. A typed wildcard can select a
 polymorphic namespace without choosing an instance, for example
 `opens {Seq.persistent (_ : int Seq.t)}`.
 

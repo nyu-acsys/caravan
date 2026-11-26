@@ -403,11 +403,19 @@ let () =
       ("[@within root x.field]", "Invariant ancestry arguments must be parameter names");
     ];
   begin match parse_invariant_declaration "invariant [@within root x] child (x : t)" with
+  | { pred_ancestry = Some { ancestry_target = Qid { pid_str = "root"; _ }; _ }; _ } -> ()
+  | _ -> failwith "an interface invariant's ancestry was not parsed"
+  end;
+  begin match
+    parse_invariant_declaration "invariant [@within Other.root x] child (x : t)"
+  with
   | exception
-      Syntax_error (_, "Invariant ancestry is supported only on private proof definitions")
-    ->
+      Syntax_error
+        ( _,
+          "An interface invariant can be declared only within an invariant of the same \
+           interface" ) ->
       ()
-  | _ -> failwith "unchecked interface ancestry was accepted"
+  | _ -> failwith "an interface invariant within another interface was accepted"
   end
 
 let () =

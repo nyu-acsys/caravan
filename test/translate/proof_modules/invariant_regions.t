@@ -12,7 +12,7 @@ Nesting a child assertion alone does not grant permission to open its invariant.
   [1]
   $ grep -q 'Invariant leaf is not in the current mask' unrelated.out
 
-Public invariants remain roots until public ancestry schemas are supported.
+A public invariant can be declared within another only if its interface declares so.
 
   $ cp invariant_regions.ml public.ml
   $ cp invariant_regions.proof public.proof
@@ -20,4 +20,4 @@ Public invariants remain roots until public ancestry schemas are supported.
   $ printf '\n(*@ invariant leaf (cell : t) *)\n' >> public.mli
   $ caravan --shh public.ml > public.out 2>&1
   [1]
-  $ grep -q 'Only a private invariant can be declared within another' public.out
+  $ grep -q 'An invariant that its interface does not declare within another cannot be declared within one' public.out
