@@ -1,10 +1,11 @@
 # Generic striped hash set
 
-This functor generalizes the [integer-key hash set](../striped_hash_set) to an
-abstract key type. The original implementation and proof remain unchanged for
-comparison. Both versions implement membership, insertion, removal, and resizing
-under all stripe locks, following Herlihy and Shavit's *The Art of Multiprocessor
-Programming*, Section 13.2.2.
+This functor implements a hash set over an abstract key type, following the
+lock-striped design of Herlihy and Shavit's *The Art of Multiprocessor
+Programming*, Section 13.2.2: membership, insertion, removal, and resizing under
+all stripe locks. As in the book, insertion resizes the table when there are more
+than four elements per bucket. A fixed array of mutexes protects rows of bucket
+lists: a key's hash selects a stripe and then a bucket within that stripe's row.
 
 `Make (Key)` takes a module with a type `t`, a pure `equal` operation matching
 logical equality (`===`), and a pure `hash` operation returning a nonnegative
@@ -15,8 +16,11 @@ Reference keys can instead use identity equality and stable hashing.
 
 The public contracts appear on the functor's result signature in the `.ml` file;
 the companion `.proof` file mirrors the functor. The abstract contents are a
-`Key.t finset`. The proof uses the same stripe snapshots, table agreement,
-registration, and resize protocol as the integer version. Mathematical key
+`Key.t finset`. Each stripe lock holds half of a ghost snapshot of the
+keys in its row, and the contents predicate holds the other half; operations
+update both while holding the mutex and commit their logical step before unlocking.
+Resizing gathers every stripe's table-agreement fragment, publishes the rehashed
+table, and redistributes the fragments before unlocking. Mathematical key
 quantifiers range over the entire logical carrier through a proof-only record;
 they do not assume every carrier value is an executable OCaml value.
 
@@ -24,9 +28,9 @@ The constructor requires between 1 and 1,000 stripes. Set operations and resize
 require an empty incoming held-lock set. Resize requests have a positive expected
 capacity, and doubling is guarded against the maximum array length. The public
 resize contract preserves abstract contents and lock cleanup; it does not expose
-capacity growth. The heuristic counter has no exact cardinality specification.
-Automatic load-factor-based resizing, termination, fairness, and deadlock freedom
-are outside this case study's specification.
+capacity growth. The element counter that drives the resize policy has no exact
+cardinality specification. Termination, fairness, and deadlock freedom are
+outside this case study's specification.
 
 The clients instantiate the functor with signed integer keys, immutable record
 keys with colliding hashes, and reference keys whose contents can change while
@@ -51,19 +55,3 @@ Run the case-study regression with:
 ```bash
 dune build @test/case_studies/generic_striped_hash_set/runtest -j2
 ```
-
-For serial performance measurements of both versions with the same executable:
-
-```bash
-dune build bin/caravan.exe -j2
-python3 test/case_studies/generic_striped_hash_set/compare.py
-```
-
-The script performs one warmup and five interleaved measured runs per version,
-with verification caching disabled. It records source/executable hashes, outputs,
-emitted Raven sizes, and timing summaries under a new temporary directory.
-Emission measures source loading, OCaml typing, translation, and printing;
-end-to-end verification also includes Raven preprocessing and SMT solving.
-Their difference is not a measurement of solver time alone.
-
-See [the performance comparison](PERFORMANCE.md) for measured results and scope.

@@ -104,20 +104,6 @@ end = struct
     Mutex.unlock lock;
     result
 
-  let add s x =
-    let stripes = stripe_count s in
-    let hash = Key.hash x in
-    let stripe = hash mod stripes in
-    let lock = s.locks.(stripe) in
-    Mutex.lock lock;
-    let row = (Atomic.get s.table).(stripe) in
-    let bucket = bucket_index hash stripes (Array.length row) in
-    let added = not (mem x row.(bucket)) in
-    if added then row.(bucket) <- x :: row.(bucket);
-    Mutex.unlock lock;
-    if added then Atomic.incr s.size;
-    added
-
   let remove s x =
     let stripes = stripe_count s in
     let hash = Key.hash x in
@@ -175,4 +161,23 @@ end = struct
     for i = 0 to stripes - 1 do
       Mutex.unlock s.locks.(i)
     done
+
+  let add s x =
+    let stripes = stripe_count s in
+    let hash = Key.hash x in
+    let stripe = hash mod stripes in
+    let lock = s.locks.(stripe) in
+    Mutex.lock lock;
+    let row = (Atomic.get s.table).(stripe) in
+    let capacity = Array.length row in
+    let bucket = bucket_index hash stripes capacity in
+    let added = not (mem x row.(bucket)) in
+    if added then row.(bucket) <- x :: row.(bucket);
+    Mutex.unlock lock;
+    if added then begin
+      Atomic.incr s.size;
+      (* The load factor policy: more than four elements per bucket. *)
+      if Atomic.get s.size / stripes / capacity > 4 then resize s capacity
+    end;
+    added
 end

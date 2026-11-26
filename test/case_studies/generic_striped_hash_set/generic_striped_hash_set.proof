@@ -436,6 +436,11 @@ module Make (Key : KEY) = struct
       unfold counted s;
       let result = step () in
       fold counted s;
+      result);
+    at (Atomic.get s.size) (fun get ->
+      unfold counted s;
+      let result = get () in
+      fold counted s;
       result)
 
   proof remove =
