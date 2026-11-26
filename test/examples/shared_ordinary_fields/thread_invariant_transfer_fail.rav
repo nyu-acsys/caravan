@@ -3,7 +3,7 @@ proc unrelated_read_does_not_transfer(executing: Ref, writer: Ref,
   requires executing != writer && ThreadContext.context(executing, {})
     && ThreadCounters.published(channel, cell, 42, {})
     && view_mailbox(mail, writer, channel)
-  opens view_mailbox(mail, writer, channel), ThreadCounters.published
+  opens view_mailbox(mail), ThreadCounters.published
 {
   unfold view_mailbox(mail, writer, channel);
   ThreadContext.duplicate_seen(writer, {channel});

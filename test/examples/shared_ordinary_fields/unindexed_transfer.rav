@@ -13,7 +13,7 @@ proc unindexed_receiver(mail: Ref, cell: Ref, channel: Ref)
   returns (result: Int)
   requires unindexed_mailbox(mail, cell, channel)
   ensures unindexed_mailbox(mail, cell, channel) && result == 42
-  opens unindexed_mailbox(mail, cell, channel), Counters.published
+  opens unindexed_mailbox(mail), Counters.published
 {
   unfold unindexed_mailbox(mail, cell, channel);
   Counters.duplicate(cell, channel, 42);

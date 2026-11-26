@@ -19,7 +19,7 @@ proc already_visible_after_unrelated_read(executing: Ref, writer: Ref,
   ensures ThreadContext.context(executing, {channel})
     && ThreadCounters.published(channel, cell, 42, {})
     && view_mailbox(mail, writer, channel) && result == 42
-  opens view_mailbox(mail, writer, channel), ThreadCounters.published
+  opens view_mailbox(mail), ThreadCounters.published
 {
   unfold view_mailbox(mail, writer, channel);
   ThreadContext.duplicate_seen(writer, {channel});

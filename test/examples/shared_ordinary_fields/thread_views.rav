@@ -1,7 +1,7 @@
 // One execution view is shared by all field families.
 interface ThreadContextSpec {
-  pred context(owner: Ref, view: Set[Ref])
-  pred seen(owner: Ref, lower: Set[Ref])
+  pred context(owner: Ref, view: Set[Ref]) depends {}
+  pred seen(owner: Ref, lower: Set[Ref]) depends {}
   inv released(channel: Ref; payload: Ref, release: Set[Ref])
 
   proc create_thread() returns (owner: Ref)
