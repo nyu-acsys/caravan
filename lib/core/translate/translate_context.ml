@@ -2454,33 +2454,36 @@ let logical_key env q =
           (List.mem [ "pending"; "committed"; "raised" ] method_ ~equal:String.equal)
           (signature.au_key ^ "." ^ method_))
   in
-  match
-    Option.first_some atomic_key
-      (env.ctx.given.proof_support.proof_key env.ctx.given.env q)
-  with
+  let support = env.ctx.given.proof_support in
+  let member_key path (id : S.id) =
+    match Path_bindings.find support.predicate_views (Path.Pdot (path, id.pid_str)) with
+    | Some key -> Some key
+    | None ->
+        Option.map (Path_bindings.find support.library_paths path) ~f:(fun path ->
+            Qualified_name.to_string Qualified_name.{ path; name = id.pid_str })
+  in
+  let known key =
+    List.Assoc.mem env.ctx.given.preds key ~equal:String.equal
+    || List.Assoc.mem support.logical_functions key ~equal:String.equal
+    || List.Assoc.mem env.ctx.given.proof_lemmas key ~equal:String.equal
+    || List.Assoc.mem env.funcs key ~equal:String.equal
+  in
+  match Option.first_some atomic_key (support.proof_key env.ctx.given.env q) with
   | Some key -> key
   | None ->
       begin match q with
-      | S.Qid _ -> qualid_key q
-      | Qdot (parent, id) ->
-          let view =
-            Option.bind (Source.module_path env.ctx.given.env parent) ~f:(fun path ->
-                Path_bindings.find env.ctx.given.proof_support.predicate_views
-                  (Path.Pdot (path, id.pid_str)))
+      | S.Qid id ->
+          let opened =
+            List.find_map (Source.opened_modules env.ctx.given.env) ~f:(fun path ->
+                Option.bind (member_key path id) ~f:(fun key ->
+                    Option.some_if (known key) key))
           in
-          begin match view with
-          | Some key -> key
-          | None ->
-              begin match
-                Option.bind
-                  (Source.module_path env.ctx.given.env parent)
-                  ~f:(Path_bindings.find env.ctx.given.proof_support.library_paths)
-              with
-              | None -> qualid_key q
-              | Some path ->
-                  Qualified_name.to_string Qualified_name.{ path; name = id.pid_str }
-              end
-          end
+          Option.value opened ~default:(qualid_key q)
+      | Qdot (parent, id) ->
+          Option.value
+            (Option.bind (Source.module_path env.ctx.given.env parent) ~f:(fun path ->
+                 member_key path id))
+            ~default:(qualid_key q)
       end
 
 (** Resolves known layouts before expanding transparent compiler abbreviations. *)

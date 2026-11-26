@@ -1084,15 +1084,50 @@ let action_key t ~scope (id : S.id) =
           Some binding.backend
       | _ -> None)
 
+let member_application ?owners t ~scope path (id : S.id) =
+  List.find t.applications ~f:(fun view ->
+      Path.same view.path path
+      && String.equal view.source.entry.name.pid_str id.pid_str
+      && application_visible ?owners t ~scope view)
+
 let application ?owners t ~scope ~environment (q : S.qualid) =
   match q with
   | Qid _ -> None
   | Qdot (parent, id) ->
       Option.bind (Source.module_path environment parent) ~f:(fun path ->
-          List.find t.applications ~f:(fun view ->
-              Path.same view.path path
-              && String.equal view.source.entry.name.pid_str id.pid_str
-              && application_visible ?owners t ~scope view))
+          member_application ?owners t ~scope path id)
+
+(** The modules that [scope] includes, the latest first. *)
+let included_modules (scope : Proof_scopes.scope) =
+  List.rev_filter_map scope.structure.str_items ~f:(fun item ->
+      match item.str_desc with
+      | Tstr_include { incl_mod; _ } ->
+          Option.map (Module_inventory.included_path incl_mod) ~f:(fun path ->
+              Env.normalize_module_path None item.str_env path)
+      | _ -> None)
+
+(** The key of the member [id] of the module at [path], or of a module it includes. *)
+let rec member_key ?owners t ~scope path (id : S.id) =
+  match member_application ?owners t ~scope path id with
+  | Some view -> Some view.key
+  | None ->
+      let owner = canonical_owner t path in
+      let own =
+        List.find_map t.bindings ~f:(fun binding ->
+            if
+              term_binding binding && visible t ~scope binding
+              && same_owner binding.entry.scope.owner (Some owner)
+              && String.equal binding.entry.name.pid_str id.pid_str
+            then Some binding.public_key
+            else None)
+      in
+      Option.first_some own
+        (Option.bind (Proof_scopes.find_owner t.scopes (Some owner)) ~f:(fun owner ->
+             included_key ?owners t ~scope owner id))
+
+and included_key ?owners t ~scope owner id =
+  List.find_map (included_modules owner) ~f:(fun path ->
+      member_key ?owners t ~scope path id)
 
 let resolve ?owners t ~scope ~environment (q : S.qualid) =
   match q with
@@ -1101,7 +1136,24 @@ let resolve ?owners t ~scope ~environment (q : S.qualid) =
         List.find (private_bindings t ~scope) ~f:(fun binding ->
             term_binding binding && String.equal binding.entry.name.pid_str id.pid_str)
       in
-      Option.bind candidate ~f:(fun binding ->
+      begin match candidate with
+      | None ->
+          let enclosing =
+            Option.value_map scope ~default:[] ~f:(fun scope ->
+                List.filter t.scopes.scopes ~f:(fun enclosing ->
+                    Option.is_some
+                      (drop_prefix enclosing.Proof_scopes.namespace scope.namespace))
+                |> List.sort ~compare:(fun a b ->
+                    Int.compare
+                      (List.length b.Proof_scopes.namespace)
+                      (List.length a.Proof_scopes.namespace)))
+          in
+          Option.first_some
+            (List.find_map enclosing ~f:(fun owner ->
+                 included_key ?owners t ~scope owner id))
+            (List.find_map (Source.opened_modules environment) ~f:(fun path ->
+                 member_key ?owners t ~scope path id))
+      | Some binding ->
           let runtime =
             Option.bind (Source.value_path environment q) ~f:(fun path ->
                 List.find_map t.values ~f:(fun value ->
@@ -1119,18 +1171,8 @@ let resolve ?owners t ~scope ~environment (q : S.qualid) =
           in
           Some
             (Option.value_map runtime ~default:binding.backend ~f:(fun id ->
-                 "$runtime$" ^ Ident.unique_name id)))
-  | Qdot (parent, id) ->
-      begin match application ?owners t ~scope ~environment q with
-      | Some view -> Some view.key
-      | None ->
-          Option.bind (Source.module_path environment parent) ~f:(fun owner ->
-              let owner = canonical_owner t owner in
-              List.find_map t.bindings ~f:(fun binding ->
-                  if
-                    term_binding binding && visible t ~scope binding
-                    && same_owner binding.entry.scope.owner (Some owner)
-                    && String.equal binding.entry.name.pid_str id.pid_str
-                  then Some binding.public_key
-                  else None))
+                 "$runtime$" ^ Ident.unique_name id))
       end
+  | Qdot (parent, id) ->
+      Option.bind (Source.module_path environment parent) ~f:(fun path ->
+          member_key ?owners t ~scope path id)

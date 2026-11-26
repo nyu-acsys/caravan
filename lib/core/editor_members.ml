@@ -161,6 +161,7 @@ let runtime_modules ~parent typed =
   and module_binding parent namespace (binding : Typedtree.module_binding) =
     match binding.mb_name.txt with
     | None -> module_body parent namespace binding.mb_expr
+    | Some name when Includes.is_hidden name -> []
     | Some name ->
         let namespace = namespace @ [ name ] in
         let member =

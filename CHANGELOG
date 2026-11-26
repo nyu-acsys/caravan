@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Modules can `open` other modules and `include` modules, functor applications, and structures, with their proof predicates in scope.
 - Invariants can declare with `[@within …]` that they lie beneath another invariant, in proofs and interfaces.
 - Companion interfaces check exported module contracts and frozen invariant masks against existing native and instantiated functor contracts.
 - Pure function contracts are checked through module views and functor parameters, with logical counterparts usable in specifications.

@@ -1,0 +1,10 @@
+module Original = struct
+  predicate full (c : cell) = exists v : int. own c.value v
+end
+
+module Extended = struct
+  proof result = peek c
+    requires (full c)
+    ensures (full c) =
+    at (get c) (fun get -> unfold full c; let r = get () in fold full c; r)
+end

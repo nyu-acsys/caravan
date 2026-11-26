@@ -331,9 +331,11 @@ is a larger example using waits and notifications together.
 ## Modules and functors {#sec:modules-and-functors}
 
 Caravan supports ordinary and nested `module ... = struct ... end`, aliases,
-named signatures, `.mli` abstraction, and signature `include`. Export contracts in
-the signature; callers through an interface use those contracts, not private
-implementation definitions. Proof modules mirror source modules and may contain
+named signatures, `.mli` abstraction, `open`, and `include` of modules, functor
+applications, and structures. Export contracts in the signature; callers through an
+interface use those contracts, not private implementation definitions. A signature
+cannot restate the contract of an included function that has one. Opened and
+included modules also bring their proof modules' predicates and lemmas into scope. Proof modules mirror source modules and may contain
 logical types, predicates, invariants, lemmas, ghost fields, and resource-algebra
 instances.
 
@@ -359,7 +361,8 @@ Important remaining module restrictions include:
 
 - Recursive modules, local modules, and first-class modules. Higher-order and
   imported functors are not supported by the shared generic translation.
-- `open`, structure `include`, and module initialization expressions.
+- Module initialization expressions, `include` of imported modules, and `open` of
+  module expressions other than paths.
 - Anonymous functor arguments, nested parameter modules, and parameter-dependent
   heap representations in the generic translation.
 - Signature includes containing abstract proof modules; repeated callable

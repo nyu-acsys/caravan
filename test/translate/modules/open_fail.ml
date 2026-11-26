@@ -1,9 +1,7 @@
-module Original = struct
-  let identity (value : int) = value
-end
-
 module Opened = struct
-  open Original
+  open struct
+    let identity (value : int) = value
+  end
 
   let call value = identity value
 end

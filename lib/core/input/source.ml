@@ -770,7 +770,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
     Location.init lexbuf file;
     Location.input_name := file;
     Lexer.init ();
-    let parsed = Parse.implementation lexbuf in
+    let parsed = Includes.rewrite (Parse.implementation lexbuf) in
     let scope = Declaration_scope.of_lexbuf ~file lexbuf in
     let comments = Lexer.comments () in
     Env.set_current_unit
@@ -2263,6 +2263,34 @@ let module_path env q =
     let path, _ = Env.find_module_by_name (longident q) env in
     Some (Env.normalize_module_path None env path)
   with Stdlib.Not_found -> None
+
+(** The modules [env] opens, the latest first, without the initially opened [Stdlib]. *)
+let opened_modules env =
+  let rec opens acc : Env.summary -> Path.t list = function
+    | Env_empty -> List.rev acc
+    | Env_open (rest, path) ->
+        let acc =
+          match path with
+          | Pident id when String.equal (Ident.name id) "Stdlib" -> acc
+          | _ -> Env.normalize_module_path None env path :: acc
+        in
+        opens acc rest
+    | Env_value (rest, _, _)
+    | Env_type (rest, _, _)
+    | Env_extension (rest, _, _)
+    | Env_module (rest, _, _, _)
+    | Env_modtype (rest, _, _)
+    | Env_class (rest, _, _)
+    | Env_cltype (rest, _, _)
+    | Env_not_aliasable (rest, _)
+    | Env_constraints (rest, _)
+    | Env_copy_types rest
+    | Env_persistent (rest, _)
+    | Env_value_unbound (rest, _, _)
+    | Env_module_unbound (rest, _, _) ->
+        opens acc rest
+  in
+  opens [] (Env.summary env)
 
 (** The prefix of the constructor patterns that name an exception by its key, whatever the
     scope. *)

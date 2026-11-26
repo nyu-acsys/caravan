@@ -69,17 +69,24 @@
   [1]
 
   $ caravan --shh include_fail.ml
-  [Error] File "include_fail.ml", line 6, columns 2-18:
-  6 |   include Original
-        ^^^^^^^^^^^^^^^^
-  Unsupported Error: An include declaration is not supported yet.
+  [Error] File "include_fail.ml", line 2, columns 2-14:
+  2 |   include List
+        ^^^^^^^^^^^^
+  Unsupported Error: An include of a module without a local implementation is not supported yet.
+  [1]
+
+  $ caravan --shh include_contract_fail.ml
+  [Error] File "include_contract_fail.ml", line 8, columns 2-51:
+  8 |   (*@ result = identity value ensures result = 0 *)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Type Error: A signature cannot give another contract to an included function.
   [1]
 
   $ caravan --shh open_fail.ml
-  [Error] File "open_fail.ml", line 6, columns 2-15:
-  6 |   open Original
-        ^^^^^^^^^^^^^
-  Unsupported Error: An open declaration is not supported yet.
+  [Error] File "open_fail.ml", line 2, column 2 to line 4, column 5:
+  2 |   open struct
+        ^^^^^^^^^^^
+  Unsupported Error: An open of a module expression is not supported yet.
   [1]
 
   $ caravan --shh effectful_initialization_fail.ml

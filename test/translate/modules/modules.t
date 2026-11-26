@@ -16,6 +16,19 @@
   $ caravan --shh manual.ml
   Verification successful.
 
+  $ caravan --shh opens.ml
+  Verification successful.
+
+  $ caravan --shh includes.ml
+  Verification successful.
+
+  $ caravan --shh include_interface.ml
+  Verification successful.
+
+  $ caravan --shh --emit-rav includes.ml > includes.rav
+  $ raven --shh --typeonly includes.rav
+  Verification successful.
+
   $ caravan --shh --emit-rav qualified_pure.ml > emitted.rav
   $ raven --shh --typeonly emitted.rav
   Verification successful.

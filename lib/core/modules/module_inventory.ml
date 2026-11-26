@@ -242,6 +242,7 @@ type module_view = {
       (** Nominal module identity, independent of the checked operation view. *)
   alias_target : Path.t option;
   values : (string * value ref) list;
+  included : value ref list;  (** The values an include of another module binds. *)
   types : (string * type_definition ref) list;
   modules : (string * module_view) list;
   modtypes : (string * signature_view) list;
@@ -261,6 +262,13 @@ type signature_origin = {
   named : Typedtree.module_type_declaration;
   annotations : Annotation.t list;
 }
+
+(** The module an include of [expression] names, if it names one by its path. *)
+let rec included_path (expression : Typedtree.module_expr) =
+  match expression.mod_desc with
+  | Tmod_ident (path, _) -> Some path
+  | Tmod_constraint (expression, _, _, _) -> included_path expression
+  | _ -> None
 
 let rec direct_body (expression : Typedtree.module_expr) =
   match expression.mod_desc with
@@ -287,6 +295,7 @@ let empty_module =
     application_identity = None;
     alias_target = None;
     values = [];
+    included = [];
     types = [];
     modules = [];
     modtypes = [];
@@ -560,6 +569,46 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     List.iter view.modules ~f:(fun (name, nested) ->
         publish (Path.Pdot (path, name)) nested)
   in
+  (* An included module's members are its own, under the include's identifiers. *)
+  let include_module ~at view included signature =
+    List.fold_result signature ~init:view ~f:(fun view (item : Types.signature_item) ->
+        let found = function
+          | Some member -> Ok member
+          | None -> unavailable at "An include of a module without a local implementation"
+        in
+        match item with
+        | Sig_value (id, _, _) ->
+            let name = Ident.name id in
+            let* value = found (member included.values name) in
+            value := { !value with paths = add_path !value.paths (Path.Pident id) };
+            Ok
+              {
+                view with
+                values = bind view.values name value;
+                included = value :: view.included;
+              }
+        | Sig_type (id, _, _, _) ->
+            let name = Ident.name id in
+            begin match member included.types name with
+            | Some definition ->
+                definition :=
+                  { !definition with paths = add_path !definition.paths (Path.Pident id) };
+                Ok { view with types = bind view.types name definition }
+            | None -> Ok view
+            end
+        | Sig_module (id, _, _, _, _) ->
+            let name = Ident.name id in
+            let* nested = found (member included.modules name) in
+            publish (Path.Pident id) nested;
+            Ok { view with modules = bind view.modules name nested }
+        | Sig_modtype (id, _, _) ->
+            let name = Ident.name id in
+            let* signature = found (member included.modtypes name) in
+            register modtypes (Path.Pident id) signature;
+            Ok { view with modtypes = bind view.modtypes name signature }
+        | Sig_typext _ -> Ok view
+        | Sig_class _ | Sig_class_type _ -> unavailable at "An include of a class")
+  in
   let resolve_module at env path =
     match lookup modules path with
     | Some view -> Ok view
@@ -824,7 +873,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       }
                 end
             | Tsig_attribute _ -> Ok view
-            | Tsig_open _ -> unavailable item.sig_loc "An open in a module signature"
+            | Tsig_open { open_expr = _, _; _ } -> Ok view
             | Tsig_include declaration ->
                 let* included =
                   signature_type ~imported all_annotations declaration.incl_mod
@@ -1314,11 +1363,22 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                     site = { signature_value.site with environment };
                   }
                 in
-                (* Existing declarations are the implementation of a checked export. *)
-                if
-                  (not checked_export)
-                  || (Option.is_none own && List.for_all previous ~f:Option.is_none)
-                then
+                (* Existing declarations are the implementation of a checked export, as
+                   are those of an included module. *)
+                let implemented =
+                  Option.is_some own || List.exists previous ~f:Option.is_some
+                in
+                let included = List.mem view.included value ~equal:phys_equal in
+                let* () =
+                  match expected with
+                  | Some (_, annotation) when included && implemented ->
+                      Error
+                        (Report.error Type annotation.loc
+                           "A signature cannot give another contract to an included \
+                            function")
+                  | _ -> Ok ()
+                in
+                if not ((checked_export || included) && implemented) then
                   value :=
                     { !value with signatures = !value.signatures @ [ signature_value ] };
                 Ok (name, value))
@@ -2122,8 +2182,15 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       }
                 end
             | Tstr_attribute _ -> Ok view
-            | Tstr_open _ -> unavailable item.str_loc "An open declaration"
-            | Tstr_include _ -> unavailable item.str_loc "An include declaration"
+            | Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ } -> Ok view
+            | Tstr_open _ -> unavailable item.str_loc "An open of a module expression"
+            | Tstr_include { incl_mod; incl_type; _ } ->
+                begin match included_path incl_mod with
+                | None -> unavailable item.str_loc "An include of a module expression"
+                | Some path ->
+                    let* included = resolve_module item.str_loc environment path in
+                    include_module ~at:item.str_loc view included incl_type
+                end
             | Tstr_recmodule _ -> unavailable item.str_loc "Recursive module bindings"
             | Tstr_eval _ -> unavailable item.str_loc "A module initializer"
             | Tstr_primitive _ -> unavailable item.str_loc "An external value declaration"

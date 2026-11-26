@@ -197,7 +197,8 @@ let eligible ~inventory ?(definition = false) (source : Module_inventory.special
         && List.for_all body.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
             | Tstr_value _ | Tstr_attribute _ | Tstr_exception _ | Tstr_module _
-            | Tstr_modtype _ ->
+            | Tstr_modtype _
+            | Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ } ->
                 true
             | Tstr_type (_, declarations) ->
                 List.for_all declarations ~f:(fun declaration ->
