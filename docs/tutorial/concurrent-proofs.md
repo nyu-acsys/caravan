@@ -242,7 +242,7 @@ those private invariants:
 
 ```proof
 invariant is_cell (cell : int Atomic.t) = cell_value cell
-invariant [@parent is_cell cell] cell_value (cell : int Atomic.t) = own cell 0
+invariant [@within is_cell cell] cell_value (cell : int Atomic.t) = own cell 0
 ```
 
 An `opens {is_cell cell}` contract then permits opening `cell_value cell`,

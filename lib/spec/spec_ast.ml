@@ -150,14 +150,12 @@ type loop_spec = {
 }
 (** The specification of a loop, written at the start of its body. *)
 
-type ancestry_kind = Parent | Within
-
 type invariant_ancestry = {
-  ancestry_kind : ancestry_kind;
   ancestry_target : qualid;
   ancestry_args : id list;
   ancestry_loc : Location.t;
 }
+(** A private invariant's [[@within target args]] attribute, which declares its parent. *)
 
 type predicate = {
   pred_name : id;

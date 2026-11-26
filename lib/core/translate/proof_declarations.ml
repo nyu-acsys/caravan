@@ -497,7 +497,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      ( R.Callable.func ~loc:l ~kind:Inv ?ancestry ~formals:(vars explicit)
+      ( R.Callable.func ~loc:l ~kind:Inv ?within:ancestry ~formals:(vars explicit)
           ~returns:(vars implicit) name (Some body),
         [] )
   | Body body ->
@@ -881,7 +881,7 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       in
       let+ implicit = State.of_result (implicit_parameters p) in
       let explicit, implicit = List.split_n params (List.length params - implicit) in
-      ( R.Callable.func ~loc:l ~kind:Inv ?ancestry ~formals:(vars explicit)
+      ( R.Callable.func ~loc:l ~kind:Inv ?within:ancestry ~formals:(vars explicit)
           ~returns:(vars implicit) name (Some body),
         List.filter_opt parts @ transitions )
 
@@ -1137,7 +1137,7 @@ let predicates (source : Source.t) inventory =
           | Some ancestry ->
               error ancestry.ancestry_loc
                 ~related:[ (at, "Its interface declaration") ]
-                "Only a private invariant can declare a parent"
+                "Only a private invariant can be declared within another"
           end
   in
   let definition (at, p, _, _) =

@@ -49,18 +49,18 @@ module Make (Key : KEY) = struct
       own root current && Array.length current = l &&
       own (Ghost.at tables root) (Tables.auth (Counts.count_cons l current))
 
-  invariant [@parent is_set s] tabled (s : t) (l : int) =
+  invariant [@within is_set s] tabled (s : t) (l : int) =
     exists current : Key.t list array array.
       own s.table current && Array.length current = l &&
       own (Ghost.at tables s.table) (Tables.auth (Counts.count_cons l current))
 
-  invariant [@parent is_set s] locked (s : t) (keys : (int, Ghost.t) map) =
+  invariant [@within is_set s] locked (s : t) (keys : (int, Ghost.t) map) =
     exists share : Permission.t, ms : (int, Mutex.t) map.
       forall i : int [Map.get ms i]. 0 <= i && i < Array.length s.locks ->
         own ~fraction:share (Array.cell s.locks i) (Map.get ms i) &&
         Guard.is_mutex (Map.get ms i) (s.table, Array.length s.locks, i, Map.get keys i)
 
-  invariant [@parent is_set s] counted (s : t) = exists n : int. own s.size n
+  invariant [@within is_set s] counted (s : t) = exists n : int. own s.size n
 
   predicate [@inline] distinct (keys : (int, Ghost.t) map) (n : int) =
     forall i : int, j : int. 0 <= i && i < n && 0 <= j && j < n &&

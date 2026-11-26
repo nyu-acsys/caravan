@@ -36,11 +36,10 @@
       |> String.split_on_char ' '
       |> List.filter (fun word -> word <> "")
     in
-    let kind, payload =
+    let payload =
       match words with
-      | "parent" :: payload -> Parent, payload
-      | "within" :: payload -> Within, payload
-      | _ -> raise (Syntax_error (at, "An invariant's attribute is [@parent ...] or [@within ...]"))
+      | "within" :: payload -> payload
+      | _ -> raise (Syntax_error (at, "An invariant's attribute is [@within ...]"))
     in
     let id = mk_id ~loc:at in
     let invalid_target () =
@@ -63,8 +62,7 @@
         in
         if not (List.for_all (is_ident is_lower) args) then
           raise (Syntax_error (at, "Invariant ancestry arguments must be parameter names"));
-        { ancestry_kind = kind; ancestry_target = target;
-          ancestry_args = List.map id args; ancestry_loc = at }
+        { ancestry_target = target; ancestry_args = List.map id args; ancestry_loc = at }
 
   (* The terms in brackets, last first, each with the separator before it. Followed by
      a dot they are triggers, separated by [,] and [|]; otherwise a list's elements. *)
@@ -769,11 +767,7 @@ proof_decl:
 | TYPE NONREC ps = loption(type_parameters) n = lident EQUAL ty = typ
     { Proof_type { type_name = n; type_params = ps; type_kind = Alias ty; type_recursive = false } }
 | INVARIANT ancestry = invariant_ancestry_attribute? n = lident ps = predicate_param+ EQUAL t = term
-    { (match ancestry with
-       | Some { ancestry_kind = Within; ancestry_loc; _ } ->
-           raise (Syntax_error (ancestry_loc, "Public within promises are not supported yet"))
-       | Some { ancestry_kind = Parent; _ } | None -> ());
-      let ps = List.rev ps in
+    { let ps = List.rev ps in
       Proof_invariant { inv_name = n; inv_params = List.rev (List.tl ps);
                         inv_state = List.hd ps; inv_body = t; inv_ancestry = ancestry } }
 | VIEW n = lident ps = pred_param+ EQUAL t = term

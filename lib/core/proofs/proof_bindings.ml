@@ -792,7 +792,7 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
                   Error
                     (Report.error Type ancestry.ancestry_loc
                        ~related:[ (formal.site.item_loc, "Its interface declaration") ]
-                       "Only a private invariant can declare a parent")
+                       "Only a private invariant can be declared within another")
               end
           | _ -> Ok ()
         in

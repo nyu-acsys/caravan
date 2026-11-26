@@ -37,7 +37,7 @@ abstract Raven interface and checks forwarding adapters against its frozen
 contracts, with resource aliases connecting the implementation. The export check
 succeeds: `tabled`, `locked`, and `counted`
 are private children of the public `is_set` invariant, declared with
-`[@parent is_set s]`. The table invariant carries the immutable set record as
+`[@within is_set s]`. The table invariant carries the immutable set record as
 its stable owner; the constructor keeps its table resources in an ordinary
 predicate until that owner exists. Mutex registration is not opened by this
 proof. Helpers explicitly reserve the public root, or use `opens {}` when they

@@ -1,4 +1,4 @@
 module Cell = struct
   invariant root (cell : t) = leaf cell
-  invariant [@parent root cell] leaf (cell : t) = own cell 0
+  invariant [@within root cell] leaf (cell : t) = own cell 0
 end

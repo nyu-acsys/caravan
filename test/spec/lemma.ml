@@ -362,7 +362,7 @@ let () =
 let () =
   begin match
     parse_proof
-      "invariant [@parent Shared.Table.is_set s k'] tabled (s : t) (k' : int) (n : int) \
+      "invariant [@within Shared.Table.is_set s k'] tabled (s : t) (k' : int) (n : int) \
        = true"
   with
   | [
@@ -372,7 +372,6 @@ let () =
        inv_ancestry =
          Some
            {
-             ancestry_kind = Parent;
              ancestry_target =
                Qdot
                  ( Qdot (Qid { pid_str = "Shared"; _ }, { pid_str = "Table"; _ }),
@@ -386,7 +385,7 @@ let () =
       ()
   | _ -> failwith "proof invariant parent was not parsed"
   end;
-  begin match parse_proof "invariant [@parent root] child (x : int) = true" with
+  begin match parse_proof "invariant [@within root] child (x : int) = true" with
   | [ Proof_invariant { inv_ancestry = Some { ancestry_args = []; _ }; _ } ] -> ()
   | _ -> failwith "invariant ancestry with zero arguments was not parsed"
   end;
@@ -396,12 +395,12 @@ let () =
       | exception Syntax_error (_, actual) when actual = message -> ()
       | _ -> failwith ("expected an invariant ancestry syntax error for " ^ attribute))
     [
-      ("[@inline]", "An invariant's attribute is [@parent ...] or [@within ...]");
-      ("[@parent]", "An invariant ancestry attribute needs a qualified invariant name");
-      ( "[@parent Shared..root]",
+      ("[@inline]", "An invariant's attribute is [@within ...]");
+      ("[@parent root x]", "An invariant's attribute is [@within ...]");
+      ("[@within]", "An invariant ancestry attribute needs a qualified invariant name");
+      ( "[@within Shared..root]",
         "An invariant ancestry attribute needs a qualified invariant name" );
-      ("[@parent root x.field]", "Invariant ancestry arguments must be parameter names");
-      ("[@within root x]", "Public within promises are not supported yet");
+      ("[@within root x.field]", "Invariant ancestry arguments must be parameter names");
     ];
   begin match parse_invariant_declaration "invariant [@within root x] child (x : t)" with
   | exception

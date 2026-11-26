@@ -127,11 +127,9 @@ let invariant_ancestry env ancestry =
   match ancestry with
   | None -> State.return None
   | Some ancestry ->
+      (* Raven reads the clause as a parent in a module and a promise in an interface. *)
       let+ target, arguments = mask_entry env (S.ancestry_application ancestry) in
-      Some
-        (match ancestry.ancestry_kind with
-        | S.Parent -> R.Callable.Parent (target, arguments)
-        | Within -> R.Callable.Within (target, arguments))
+      Some (target, arguments)
 
 let contract_opens env contract =
   let open State.Syntax in
