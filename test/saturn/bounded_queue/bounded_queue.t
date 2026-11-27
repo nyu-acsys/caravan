@@ -44,7 +44,7 @@ exact emptiness, fullness, and length observations.
 The same combined client program verifies after serialization to native Raven.
 
   $ caravan --shh -I ../backoff --emit-rav clients.ml > clients.rav
-  $ raven --shh --cache-dir verification-cache clients.rav
+  $ raven --shh --smt-timeout=30000 --cache-dir verification-cache clients.rav
   Verification successful.
 
 The constructor does not turn a cleared word into an initialized payload.

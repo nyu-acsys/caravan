@@ -352,7 +352,11 @@ let rec remove_tree path =
   | Unix.S_CHR | Unix.S_BLK | Unix.S_LNK | Unix.S_FIFO | Unix.S_SOCK -> Unix.unlink path
 
 let describe ~root executable =
-  let query_dir = Stdlib.Filename.temp_dir ~perms:0o700 "caravan-dune-" "" in
+  (* Dune's RPC socket lives in the build directory, and socket paths are short. *)
+  let temp_dir =
+    if (not Stdlib.Sys.win32) && Stdlib.Sys.file_exists "/tmp" then Some "/tmp" else None
+  in
+  let query_dir = Stdlib.Filename.temp_dir ?temp_dir ~perms:0o700 "caravan-dune-" "" in
   Stdlib.Fun.protect
     ~finally:(fun () -> remove_tree query_dir)
     (fun () ->
