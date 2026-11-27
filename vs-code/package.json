@@ -3,7 +3,7 @@
   "displayName": "Caravan",
   "icon": "images/icon.png",
   "description": "Verification for multicore OCaml programs.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "nyu-acsys",
   "repository": { "type": "git", "url": "https://github.com/nyu-acsys/caravan.git", "directory": "vs-code" },
   "vsce": {
@@ -55,7 +55,7 @@
       "properties": {
         "caravan.executable": {"type": "string", "default": "", "scope": "resource", "description": "Override the managed or bundled Caravan with an executable or launcher program. Empty selects automatically. Runs without a shell."},
         "caravan.updateChannel": {"type": "string", "enum": ["stable", "tag", "bundled"], "default": "stable", "scope": "window", "description": "Follow stable Caravan releases, select a release tag, or use only the bundled toolchain. Updates are offered before downloading."},
-        "caravan.caravanVersion": {"type": "string", "default": "", "scope": "window", "description": "Caravan release tag for the tag channel, for example v0.1.0."},
+        "caravan.caravanVersion": {"type": "string", "default": "", "scope": "window", "description": "Caravan release tag for the tag channel, for example v0.2.0."},
         "caravan.checkForUpdates": {"type": "boolean", "default": true, "scope": "window", "description": "Check for a newer compatible toolchain on startup, at most once a day. Downloads require acceptance."},
         "caravan.arguments": {"type": "array", "items": {"type": "string"}, "default": [], "scope": "resource", "description": "Arguments before Caravan's verification flags and file path. For opam use executable opam and arguments [exec, --, caravan]."},
         "caravan.cwd": {"type": "string", "default": "", "scope": "resource", "description": "Working directory, relative to the containing workspace folder or absolute. Empty uses the workspace folder, or the file directory outside a workspace."},

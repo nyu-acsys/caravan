@@ -32,7 +32,7 @@ From the repository's `vs-code/` directory:
 $ npm ci
 $ npm test
 $ npx @vscode/vsce package --readme-path MARKETPLACE.md
-$ code --install-extension caravan-0.1.0.vsix
+$ code --install-extension caravan-0.2.0.vsix
 ```
 
 Use the filename produced by `vsce package` if the extension version has changed.

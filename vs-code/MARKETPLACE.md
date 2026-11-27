@@ -136,7 +136,7 @@ to the VS Code window:
   launcher program. Empty by default.
 * `caravan.updateChannel`: `stable` (follow compatible releases, the default),
   `tag` (select a release), or `bundled` (use the shipped toolchain).
-* `caravan.caravanVersion`: The release tag for the `tag` channel, e.g. `v0.1.0`.
+* `caravan.caravanVersion`: The release tag for the `tag` channel, e.g. `v0.2.0`.
 * `caravan.checkForUpdates`: Check on startup, at most once a day. Defaults to
   `true`; installing still requires accepting the offer.
 * `caravan.arguments`: Arguments to the launcher, before Caravan's verification
