@@ -66,6 +66,7 @@ let check ~mutex probe =
   in
   let result =
     R.verify ?select_member
+      ~options:{ R.default_options with smt_timeout = 30000 }
       (R.Program.make ~loc
          (Caravan_core.Prelude.value_signature
          :: (E.support ~loc ~mutex ~visibility:true () @ [ client probe ])))
