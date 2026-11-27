@@ -17,8 +17,8 @@ function styleOf(html, word) {
 
 test('proof keywords retain Caravan highlighting after OCaml declarations and inside scopes', () => {
   for (const [file, keywords] of [
-    ['automatic_cell.proof', ['invariant', 'view', 'action', 'linearizes', 'proof', 'initially', 'performs']],
-    ['manual_cell.proof', ['module', 'struct', 'let', 'proof', 'fun', 'unfold', 'fold']]
+    ['automatic_cell.mlp', ['invariant', 'view', 'action', 'linearizes', 'proof', 'initially', 'performs']],
+    ['manual_cell.mlp', ['module', 'struct', 'let', 'proof', 'fun', 'unfold', 'fold']]
   ]) {
     const code = readFileSync(new URL(`../examples/${file}`, import.meta.url), 'utf8')
     for (const language of ['proof', 'caravan-proof']) {

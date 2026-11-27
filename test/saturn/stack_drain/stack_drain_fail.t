@@ -14,7 +14,7 @@ Draining a nonempty stack cannot always return an empty list.
 The instantiated generic loop must retain the value returned by each pop.
 
   $ mkdir wrong_loop
-  $ cp stack_drain.mli stack_drain.proof stack_intf.mli treiber_stack.mli wrong_loop/
+  $ cp stack_drain.mli stack_drain.mlp stack_intf.mli treiber_stack.mli wrong_loop/
   $ sed 's/Some v -> v :: loop ()/Some v -> (match v :: loop () with [] -> [] | _ :: rest -> rest)/' stack_drain.ml > wrong_loop/stack_drain.ml
   $ ! caravan --shh --only Test.drain wrong_loop/stack_drain.ml > wrong_loop.out 2>&1
   $ grep -q 'Verification Error: A postcondition may not hold' wrong_loop.out
@@ -23,7 +23,7 @@ The instantiated generic loop must retain the value returned by each pop.
 Each domain must complete all ten pushes before returning its completion resources.
 
   $ mkdir short_worker
-  $ cp stack_drain.mli stack_drain.proof stack_intf.mli treiber_stack.mli short_worker/
+  $ cp stack_drain.mli stack_drain.mlp stack_intf.mli treiber_stack.mli short_worker/
   $ sed 's/for i = 0 to 9 do/for i = 0 to 8 do/' stack_drain.ml > short_worker/stack_drain.ml
   $ ! caravan --shh --only Test.work short_worker/stack_drain.ml > short_worker.out 2>&1
   $ grep -q 'Verification Error: A postcondition may not hold' short_worker.out
@@ -32,7 +32,7 @@ Each domain must complete all ten pushes before returning its completion resourc
 A join is required before its worker contribution can be recovered for draining.
 
   $ mkdir missing_join
-  $ cp stack_drain.mli stack_drain.proof stack_intf.mli treiber_stack.mli missing_join/
+  $ cp stack_drain.mli stack_drain.mlp stack_intf.mli treiber_stack.mli missing_join/
   $ sed '/    Domain.join domainB;/d' stack_drain.ml > missing_join/stack_drain.ml
   $ ! caravan --shh --only Test.test missing_join/stack_drain.ml > missing_join.out 2>&1
   $ grep -q 'Verification Error:' missing_join.out

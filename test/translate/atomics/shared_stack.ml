@@ -1,5 +1,5 @@
 (* Saturn's Treiber stack, of integers, without backoff, specified as shared in
-   shared_stack.mli and shared_stack.proof. *)
+   shared_stack.mli and shared_stack.mlp. *)
 
 type t = int list Atomic.t
 

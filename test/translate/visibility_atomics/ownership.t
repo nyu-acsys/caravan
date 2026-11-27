@@ -19,7 +19,7 @@ visibility is obtained from the protected resource.
 A resource implementation must prove its transfer law.
 
   $ cp mutex.ml bad_transfer.ml
-  $ sed '/Value.transfer source target cell 0;/d' mutex.proof > bad_transfer.proof
+  $ sed '/Value.transfer source target cell 0;/d' mutex.mlp > bad_transfer.mlp
   $ caravan --shh bad_transfer.ml > bad_transfer.out 2>&1
   [1]
   $ grep -q 'Verification Error:' bad_transfer.out

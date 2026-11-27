@@ -467,8 +467,12 @@ let resolve ~file : (t, Report.error) Result.t =
                   else [])
             in
             let proof_candidates =
-              List.map interfaces ~f:(fun interface ->
-                  Stdlib.Filename.remove_extension interface ^ ".proof")
+              List.concat_map interfaces ~f:(fun interface ->
+                  let stem = Stdlib.Filename.remove_extension interface in
+                  [
+                    stem ^ Source_core.proof_extension;
+                    stem ^ Source_core.legacy_proof_extension;
+                  ])
             in
             Ok
               {

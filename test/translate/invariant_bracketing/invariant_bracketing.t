@@ -7,10 +7,10 @@ unchanged one.
 
 A step at a call to a checked procedure opens nothing.
 
-  $ sed 's/(fun invoke -> let result = invoke () in result)/(fun invoke -> let result = invoke () in assert (0 <= current.value); result)/' counter.proof > call_fail.proof
+  $ sed 's/(fun invoke -> let result = invoke () in result)/(fun invoke -> let result = invoke () in assert (0 <= current.value); result)/' counter.mlp > call_fail.mlp
   $ cp counter.ml call_fail.ml
   $ caravan --shh --only get_twice call_fail.ml
-  [Error] File "call_fail.proof", line 31, columns 84-91:
+  [Error] File "call_fail.mlp", line 31, columns 84-91:
   31 |   at ((get c)[@occurrence 1]) (fun invoke -> let result = invoke () in assert (0 <= current.value); result)
                                                                                            ^^^^^^^
   Type Error: Unbound name current.
@@ -18,7 +18,7 @@ A step at a call to a checked procedure opens nothing.
 
 A namespace in the opens clause is no instance to open.
 
-  $ grep -v 'unfold counter c;\|    fold counter c;' counter.proof > namespace_fail.proof
+  $ grep -v 'unfold counter c;\|    fold counter c;' counter.mlp > namespace_fail.mlp
   $ cp counter.ml namespace_fail.ml
   $ caravan --shh --only get_namespace namespace_fail.ml
   [Error] File "namespace_fail.ml", line 5, columns 39-51:
@@ -33,7 +33,7 @@ A namespace in the opens clause is no instance to open.
   5 | let get_namespace (c : int Atomic.t) = Atomic.get c
       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
-  File "namespace_fail.proof", line 36, columns 24-35:
+  File "namespace_fail.mlp", line 36, columns 24-35:
   36 |   ensures (counter c && 0 <= result) =
                                ^^^^^^^^^^^
   Related Location: This assertion may not hold.

@@ -14,7 +14,7 @@ either declaration order.
 An incorrect equality implementation violates the requested interface.
 
   $ sed 's/let equal (x : int) y = x = y/let equal (x : int) (y : int) = false/' positive.ml > wrong_equal.ml
-  $ cp positive.proof wrong_equal.proof
+  $ cp positive.mlp wrong_equal.mlp
   $ caravan --shh wrong_equal.ml > wrong_equal.out 2>&1
   [1]
   $ grep -q "module argument does not establish this view's postcondition" wrong_equal.out
@@ -22,7 +22,7 @@ An incorrect equality implementation violates the requested interface.
 Negative hashes also violate the interface.
 
   $ sed 's/let hash (x : int) = if x >= 0 then x else 0/let hash (x : int) = -1/' positive.ml > wrong_hash.ml
-  $ cp positive.proof wrong_hash.proof
+  $ cp positive.mlp wrong_hash.mlp
   $ caravan --shh wrong_hash.ml > wrong_hash.out 2>&1
   [1]
   $ grep -q "module argument does not establish this view's postcondition" wrong_hash.out

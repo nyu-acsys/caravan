@@ -7,8 +7,8 @@
    (cat %{deps}))))
 
 (rule
- (target instances.proof)
- (deps ../generic_striped_hash_set.proof)
+ (target instances.mlp)
+ (deps ../generic_striped_hash_set.mlp)
  (action
   (with-stdout-to
    %{target}
@@ -20,4 +20,4 @@
  (modules instances))
 
 (cram
- (deps %{bin:caravan} instances.ml instances.mli instances.proof))
+ (deps %{bin:caravan} instances.ml instances.mli instances.mlp))

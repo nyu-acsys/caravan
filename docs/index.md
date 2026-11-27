@@ -48,7 +48,7 @@ about the operation's internal interleavings.
 ## Proofs with an OCaml shape
 
 Write specifications in `(*@ ... *)` comments. Function contracts may live next
-to an implementation or in its `.mli` interface. A companion `.proof` file can
+to an implementation or in its `.mli` interface. A companion `.mlp` file can
 contain predicates, invariants, lemmas, and proof steps attached to the code.
 The OCaml compiler continues to see ordinary OCaml source.
 

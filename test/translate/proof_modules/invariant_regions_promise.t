@@ -8,7 +8,7 @@ A definition without the promised ancestor is rejected.
 
   $ cp invariant_regions_promise.ml missing.ml
   $ cp invariant_regions_promise.mli missing.mli
-  $ sed 's/\[@within root cell\] //' invariant_regions_promise.proof > missing.proof
+  $ sed 's/\[@within root cell\] //' invariant_regions_promise.mlp > missing.mlp
   $ caravan --shh missing.ml > missing.out 2>&1
   [1]
   $ grep -q 'The interface declares leaf within root, but its definition declares no ancestor' missing.out
@@ -22,7 +22,7 @@ The promise may be kept through an invariant private to the implementation.
   >   -e 's/fold leaf result;/fold leaf result;\n    fold middle result;/' \
   >   -e 's/unfold root cell;/unfold root cell;\n    unfold middle cell;/' \
   >   -e 's/    fold leaf cell;/    fold leaf cell;\n    fold middle cell;/' \
-  >   invariant_regions_promise.proof > private.proof
+  >   invariant_regions_promise.mlp > private.mlp
   $ caravan --shh private.ml
   Verification successful.
 
@@ -30,7 +30,7 @@ A chain that reaches another invariant does not keep the promise.
 
   $ sed -e 's/\[@within root cell\] middle/[@within other cell] middle/' \
   >   -e 's/invariant root (cell : t) = middle cell/invariant root (cell : t) = middle cell\ninvariant other (cell : t) = true/' \
-  >   private.proof > elsewhere.proof
+  >   private.mlp > elsewhere.mlp
   $ cp private.ml elsewhere.ml
   $ cp private.mli elsewhere.mli
   $ caravan --shh elsewhere.ml > elsewhere.out 2>&1

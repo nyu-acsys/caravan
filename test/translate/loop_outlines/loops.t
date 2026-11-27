@@ -12,7 +12,7 @@ A loop invariant names the value of an existential after each iteration.
   Verification successful.
 
   $ caravan --shh witnesses_fail.ml
-  [Error] File "witnesses_fail.proof", line 11, columns 11-16:
+  [Error] File "witnesses_fail.mlp", line 11, columns 11-16:
   11 |     with { value = Map.set values i i }
                   ^^^^^
   Type Error: This name is not bound by the loop's invariants.
@@ -25,7 +25,7 @@ the start of the iteration, and after the loop, but not before it.
   Verification successful.
 
   $ caravan --shh witness_scope_fail.ml
-  [Error] File "witness_scope_fail.proof", line 5, columns 20-26:
+  [Error] File "witness_scope_fail.mlp", line 5, columns 20-26:
   5 |     assert (Map.get values 0 = 0);
                           ^^^^^^
   Type Error: Unbound value values.

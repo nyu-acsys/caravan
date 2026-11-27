@@ -19,13 +19,13 @@ Building an empty chain cannot establish the input contents.
   $ mkdir wrong_contents
   $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli wrong_contents/
   $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.ml > wrong_contents/michael_scott_queue_lseg.ml
-  $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.proof > wrong_contents/michael_scott_queue_lseg.proof
+  $ sed 's/build_next list/build_next []/' michael_scott_queue_lseg.mlp > wrong_contents/michael_scott_queue_lseg.mlp
   $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list wrong_contents/michael_scott_queue_lseg.ml
-  [Error] File "wrong_contents/michael_scott_queue_lseg.proof", line 1096, columns 12-47:
+  [Error] File "wrong_contents/michael_scott_queue_lseg.mlp", line 1096, columns 12-47:
   1096 |   on return initialize_built_queue q tail_ list
                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: A precondition may not hold for this call.
-  File "wrong_contents/michael_scott_queue_lseg.proof", line 542, columns 7-43:
+  File "wrong_contents/michael_scott_queue_lseg.mlp", line 542, columns 7-43:
   542 |     && segment root last values cells edges
                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: This predicate may not hold.
@@ -34,14 +34,14 @@ Building an empty chain cannot establish the input contents.
 The builder must return the owned terminal cell at the end of the chain.
 
   $ mkdir wrong_terminal
-  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli michael_scott_queue_lseg.proof wrong_terminal/
+  $ cp michael_scott_queue_lseg.mli michael_scott_queue_lseg_intf.mli michael_scott_queue_lseg.mlp wrong_terminal/
   $ sed 's/| \[\] -> tail_/| [] -> Atomic.make (Atomic.get tail_)/' michael_scott_queue_lseg.ml > wrong_terminal/michael_scott_queue_lseg.ml
   $ caravan --shh -I ../backoff --smt-timeout=30000 --only of_list.build_next wrong_terminal/michael_scott_queue_lseg.ml
-  [Error] File "wrong_terminal/michael_scott_queue_lseg.proof", line 1090, columns 19-68:
+  [Error] File "wrong_terminal/michael_scott_queue_lseg.mlp", line 1090, columns 19-68:
   1090 |       | [] -> fold segment result tail_ [] Finset.empty Finset.empty
                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: Failed to fold predicate. The body of the predicate may not hold at this point.
-  File "wrong_terminal/michael_scott_queue_lseg.proof", line 8, columns 14-28:
+  File "wrong_terminal/michael_scott_queue_lseg.mlp", line 8, columns 14-28:
   8 |       | [] -> first == limit && cells === Finset.empty && edges === Finset.empty
                     ^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.

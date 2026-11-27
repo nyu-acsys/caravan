@@ -10,5 +10,5 @@
   %{bin:raven}
   (glob_files *.ml)
   (glob_files *.mli)
-  (glob_files *.proof)
+  (glob_files *.mlp)
   (glob_files ../backoff/*.mli)))

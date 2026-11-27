@@ -12,7 +12,7 @@ The combined source example crosses max_int while retaining an old node.
 A successful successor must decrement its predecessor's capacity certificate.
 
   $ sed 's/Some { capacity = capacity - 1 }/Some { capacity = capacity }/' moving_capacity.ml > no_decrement.ml
-  $ cp moving_capacity.proof no_decrement.proof
+  $ cp moving_capacity.mlp no_decrement.mlp
   $ caravan --shh no_decrement.ml > no_decrement.out 2>&1
   [1]
   $ grep -q 'Verification Error:' no_decrement.out
@@ -22,7 +22,7 @@ A successful successor must decrement its predecessor's capacity certificate.
 Adding one to a refresh can overestimate the logical availability.
 
   $ sed 's/let available = limit - length in/let available = limit - length + 1 in/' moving_capacity.ml > overestimate.ml
-  $ cp moving_capacity.proof overestimate.proof
+  $ cp moving_capacity.mlp overestimate.mlp
   $ caravan --shh overestimate.ml > overestimate.out 2>&1
   [1]
   $ grep -q 'Verification Error:' overestimate.out
@@ -33,7 +33,7 @@ Source counters need not increase when their logical position increases.
 
   $ cp moving_capacity.ml monotone.ml
   $ sed '/proof result = successor /a\
-  > \  ensures (result > counter)' moving_capacity.proof > monotone.proof
+  > \  ensures (result > counter)' moving_capacity.mlp > monotone.mlp
   $ caravan --shh monotone.ml > monotone.out 2>&1
   [1]
   $ grep -q 'Verification Error:' monotone.out
@@ -46,7 +46,7 @@ tail, mathematical availability is max_int+1 but the source computes min_int.
 The baseline proves that its fullness test returns true; claiming otherwise fails.
 
   $ cp moving_capacity.ml false_full.ml
-  $ sed 's/proof result = stale_tail_full () ensures (result === true)/proof result = stale_tail_full () ensures (result === false)/' moving_capacity.proof > false_full.proof
+  $ sed 's/proof result = stale_tail_full () ensures (result === true)/proof result = stale_tail_full () ensures (result === false)/' moving_capacity.mlp > false_full.mlp
   $ caravan --shh false_full.ml > false_full.out 2>&1
   [1]
   $ grep -q 'A postcondition may not hold' false_full.out

@@ -76,12 +76,12 @@ test('native release installs and verifies Saturn with its relocated compiler an
         end: { line: readFileSync(source, 'utf8').split('\n').length, character: 0 } }, repository);
       assert.equal(hints.length, steps.length);
       assert.ok(hints.some(hint => hint.label[0].value === 'fold stack t []'));
-      assert.ok(hints.every(hint => hint.label[0].location.uri.endsWith('/treiber_stack.proof')));
+      assert.ok(hints.every(hint => hint.label[0].location.uri.endsWith('/treiber_stack.mlp')));
       const view = renderProofView(source, readFileSync(source, 'utf8'), { contracts, steps },
         file => { try { return readFileSync(file, 'utf8'); } catch { return undefined; } }, repository);
       assert.ok(view.text.includes('(*@ proof fold stack t [] *)'));
       assert.ok(view.text.includes('predicate stack'));
-      assert.ok(view.links.some(link => link.target.includes('/treiber_stack.proof#')));
+      assert.ok(view.links.some(link => link.target.includes('/treiber_stack.mlp#')));
       const phases = [];
       const snapshots = [];
       const verificationArgs = ['--lsp-mode', '--lsp-annotations', '--cache-dir',

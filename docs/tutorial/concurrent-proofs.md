@@ -20,7 +20,7 @@ lemmas. Omitting the clause keeps contract-based mask inference.
 
 For each example below, download its implementation, interface, and proof into
 one directory. Invoke Caravan on the `.ml` implementation; it loads the sibling
-`.mli` and `.proof` files automatically. Both examples are checked by the
+`.mli` and `.mlp` files automatically. Both examples are checked by the
 repository's regression suite.
 
 ## Actions and linearization points {#sec:actions-and-linearization-points}
@@ -115,9 +115,9 @@ by `set` or preserved by `read`. The client uses the `shared cell` invariant han
 but need not know the invariant's definition or the concrete resources it protects.
 
 The companion proof supplies the state interpretation and linearization points
-([automatic_cell.proof](../examples/automatic_cell.proof)):
+([automatic_cell.mlp](../examples/automatic_cell.mlp)):
 
-<<< ../examples/automatic_cell.proof{proof}
+<<< ../examples/automatic_cell.mlp{proof}
 
 With all three files saved together, verify the example with:
 
@@ -164,9 +164,9 @@ Interface ([manual_cell.mli](../examples/manual_cell.mli)):
 
 <<< ../examples/manual_cell.mli{caravan}
 
-Proof ([manual_cell.proof](../examples/manual_cell.proof)):
+Proof ([manual_cell.mlp](../examples/manual_cell.mlp)):
 
-<<< ../examples/manual_cell.proof{proof}
+<<< ../examples/manual_cell.mlp{proof}
 
 Verify this example with:
 
@@ -269,10 +269,10 @@ sequence receive the preceding scope's output; its type may change between scope
 Ordinary `Ghost.scope` annotations and unannotated accesses preserve that state.
 
 For example, download [ghost_scopes.ml](../examples/ghost_scopes.ml) and its
-[companion proof](../examples/ghost_scopes.proof). The proof defines a predicate
+[companion proof](../examples/ghost_scopes.mlp). The proof defines a predicate
 owning the cell:
 
-<<< ../examples/ghost_scopes.proof{proof}
+<<< ../examples/ghost_scopes.mlp{proof}
 
 The implementation saves the initial contents as ghost state, replaces the
 runtime contents, and checks the saved value afterward:
@@ -298,7 +298,7 @@ do not escape those regions. A loop also does not carry a changed ghost state
 from one iteration to the next. Use a loop invariant for iteration reasoning;
 `invariant (fun saved -> proposition)` can refer to the inherited ghost state.
 
-A loop invariant can stay in the `.proof` outline. Anchor its first body
+A loop invariant can stay in the `.mlp` outline. Anchor its first body
 expression and refer to the counter named in the OCaml source. For a loop
 `for i = 0 to 9 do increment cell done`, its outline can contain:
 

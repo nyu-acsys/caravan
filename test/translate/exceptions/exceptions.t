@@ -80,7 +80,7 @@ clauses describe. Clients catch it, or propagate it with its state.
   $ caravan --shh atomic_stack.ml
   Verification successful.
   $ mkdir clients
-  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.proof clients/
+  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.mlp clients/
   $ chmod u+w clients/atomic_stack.ml
   $ cat atomic_stack_clients.ml >> clients/atomic_stack.ml
   $ caravan --shh clients/atomic_stack.ml

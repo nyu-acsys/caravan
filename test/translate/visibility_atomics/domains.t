@@ -14,8 +14,8 @@ The same handoff supports combined execution components without transferring
 held locks to a child.
 
   $ cp domains.ml combined.ml
-  $ cat domains.proof > combined.proof
-  $ cat >> combined.proof <<'PROOF'
+  $ cat domains.mlp > combined.mlp
+  $ cat >> combined.mlp <<'PROOF'
   > module Resource : Ghost.MutexResource with type t = unit = struct
   >   type t = unit
   >   predicate resource (value : t) = true

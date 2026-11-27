@@ -55,7 +55,7 @@
  (name annotation_env)
  (modules annotation_env)
  (libraries base caravan_core compiler-libs.common)
- (deps annotation_env_fixture.ml annotation_env_fixture.proof))
+ (deps annotation_env_fixture.ml annotation_env_fixture.mlp))
 
 (test
  (name monotone_history)
@@ -136,13 +136,13 @@
  (libraries base caravan_core caravan_spec compiler-libs.common)
  (deps
   shared_fields_fixture.ml
-  shared_fields_fixture.proof
+  shared_fields_fixture.mlp
   shared_fields_alias_conflict_fixture.ml
-  shared_fields_alias_conflict_fixture.proof
+  shared_fields_alias_conflict_fixture.mlp
   shared_fields_alias_duplicate_fixture.ml
-  shared_fields_alias_duplicate_fixture.proof
+  shared_fields_alias_duplicate_fixture.mlp
   ../translate/field_disciplines/partial.ml
-  ../translate/field_disciplines/partial.proof))
+  ../translate/field_disciplines/partial.mlp))
 
 (test
  (name atomic_visibility_contract)

@@ -74,8 +74,9 @@ let contracts (scopes : Program_scopes.t) =
           let file = source_loc.loc_start.pos_fname in
           if
             String.equal func.loc.loc_start.pos_fname scopes.source.file
-            && List.exists [ ".mli"; ".proof" ] ~f:(fun suffix ->
-                String.is_suffix file ~suffix)
+            && List.exists
+                 [ ".mli"; Source.proof_extension; Source.legacy_proof_extension ]
+                 ~f:(fun suffix -> String.is_suffix file ~suffix)
           then
             match clauses annotation with
             | Error _ -> None

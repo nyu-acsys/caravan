@@ -18,7 +18,7 @@ elif mode == "enriched":
         "errors", "dependencies", "annotations", "members", "references", "symbols"
     }
     assert report["errors"] == []
-    assert {"editor_ok.ml", "editor_ok.mli", "editor_ok.proof"} <= set(report["dependencies"])
+    assert {"editor_ok.ml", "editor_ok.mli", "editor_ok.mlp"} <= set(report["dependencies"])
 elif mode == "failure":
     errors = report["errors"]
     assert any(error["kind"] == "Verification" for error in errors)

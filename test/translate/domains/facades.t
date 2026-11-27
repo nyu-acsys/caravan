@@ -22,7 +22,7 @@ The generated trusted contracts also verify after source emission and parsing.
 Aliasing a handle does not duplicate its completion resource.
 
   $ sed 's/ensures Job.handle result cell/ensures Job.handle result cell \&\& Job.handle domain cell/' task.ml > duplicate.ml
-  $ cp task.proof duplicate.proof
+  $ cp task.mlp duplicate.mlp
   $ caravan --shh duplicate.ml > duplicate.out 2>&1
   [1]
   $ grep 'Verification Error:' duplicate.out
@@ -31,7 +31,7 @@ Aliasing a handle does not duplicate its completion resource.
 A task body must establish its declared postcondition even before it is spawned.
 
   $ sed 's/cell := !cell + 1/cell := !cell + 2/' task.ml > wrong_worker.ml
-  $ cp task.proof wrong_worker.proof
+  $ cp task.mlp wrong_worker.mlp
   $ caravan --shh wrong_worker.ml > wrong_worker.out 2>&1
   [1]
   $ grep 'Verification Error:' wrong_worker.out

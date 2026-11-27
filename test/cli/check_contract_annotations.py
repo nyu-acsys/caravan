@@ -50,7 +50,7 @@ else:
         assert annotation["kind"] == "InheritedContract"
         assert annotation["file"].endswith(".ml")
         assert source_slice(annotation) == annotation["source"].split(".")[-1]
-        assert annotation["source_loc"]["file"].endswith((".mli", ".proof"))
+        assert annotation["source_loc"]["file"].endswith((".mli", ".mlp"))
         for clause in annotation["clauses"]:
             actual = source_slice(clause)
             words = clause["keyword"].split()

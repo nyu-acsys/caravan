@@ -29,7 +29,7 @@ The conversion only accepts lists.
 Reference element types remain distinct before Raven erases them.
 
   $ caravan --shh list_to_sequence_wrong_refs.ml
-  [Error] File "list_to_sequence_wrong_refs.proof", line 4, columns 17-35:
+  [Error] File "list_to_sequence_wrong_refs.mlp", line 4, columns 17-35:
   4 |   fold int_refs (to_sequence [cell])
                        ^^^^^^^^^^^^^^^^^^
   Type Error: This expression has type bool ref sequence

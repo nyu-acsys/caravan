@@ -8,7 +8,7 @@ An opaque export cannot silently inherit additional private invariant namespaces
 
   $ cp checked_export_heap.ml private_namespace.ml
   $ cp checked_export_heap.mli private_namespace.mli
-  $ sed 's/invariant stored (cell : t) = true/invariant hidden (cell : t) = true\n  invariant stored (cell : t) = hidden cell/' checked_export_heap.proof > private_namespace.proof
+  $ sed 's/invariant stored (cell : t) = true/invariant hidden (cell : t) = true\n  invariant stored (cell : t) = hidden cell/' checked_export_heap.mlp > private_namespace.mlp
   $ caravan --shh private_namespace.ml > private.out 2>&1
   [1]
   $ grep -q 'invariant native_hidden required by' private.out
@@ -19,7 +19,7 @@ An opaque export cannot silently inherit additional private invariant namespaces
 An exported invariant must retain the actual resource kind.
 
   $ cp checked_export_heap.ml incorrect_resource.ml
-  $ cp checked_export_heap.proof incorrect_resource.proof
+  $ cp checked_export_heap.mlp incorrect_resource.mlp
   $ sed '/^module Instance/,/^end/ s/invariant stored/predicate stored/' checked_export_heap.mli > incorrect_resource.mli
   $ caravan --shh incorrect_resource.ml > resource.out 2>&1
   [1]

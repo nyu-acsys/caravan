@@ -1,4 +1,4 @@
-(** Proof outlines: the proofs of functions in the [.proof] file, as steps at places in
+(** Proof outlines: the proofs of functions in the [.mlp] file, as steps at places in
     their code. Each step becomes the annotation it stands for, at its place. *)
 
 open Base
@@ -806,8 +806,7 @@ let annotations ~proof_text ~(structure : Parsetree.structure) ~annotations
     match (outlines, List.filter annotations ~f:proof) with
     | _ :: _, (first : Annotation.t) :: _ ->
         error first.loc
-          "A program whose proofs are outlines in its .proof file has no proof \
-           annotations"
+          "A program whose proofs are outlines in its .mlp file has no proof annotations"
     | _ -> Ok ()
   in
   let key (path, (o : S.outline)) =

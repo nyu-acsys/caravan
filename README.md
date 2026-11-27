@@ -15,7 +15,7 @@ OCaml to [Raven](https://github.com/nyu-acsys/raven) and reports verification re
 at the OCaml source.
 
 Specifications are comments in `.ml` or `.mli` files. Detailed proofs can live in
-companion `.proof` files, keeping the executable code unchanged. Caravan supports
+companion `.mlp` files, keeping the executable code unchanged. Caravan supports
 both automatic invariant reasoning and explicit ghost proofs.
 Its specification syntax is loosely inspired by
 [Gospel](https://github.com/ocaml-gospel/gospel), extending and modifying it to

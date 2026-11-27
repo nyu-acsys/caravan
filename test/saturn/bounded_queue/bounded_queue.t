@@ -23,8 +23,8 @@ exact emptiness, fullness, and length observations.
   > let forwarded () : int t = create ?capacity:(Some 0) ()
   > ML
   $ cat helper_clients.ml >> clients.ml
-  $ cat bounded_queue.proof > clients.proof
-  $ cat >> clients.proof <<'PROOF'
+  $ cat bounded_queue.mlp > clients.mlp
+  $ cat >> clients.mlp <<'PROOF'
   > proof result = dummy ()
   >   ensures (allocated Ghost.self result (None : bool option) 3 0 Null) = ()
   > 
@@ -37,7 +37,7 @@ exact emptiness, fullness, and length observations.
   > proof result = explicit () ensures (empty_queue Ghost.self result 3) = ()
   > proof result = forwarded () ensures (empty_queue Ghost.self result 0) = ()
   > PROOF
-  $ cat helper_clients.proof >> clients.proof
+  $ cat helper_clients.mlp >> clients.mlp
   $ caravan --shh -I ../backoff --cache-dir verification-cache clients.ml
   Verification successful.
 
@@ -49,7 +49,7 @@ The same combined client program verifies after serialization to native Raven.
 
 The constructor does not turn a cleared word into an initialized payload.
 
-  $ sed 's/(None : bool option)/(Some true : bool option)/' clients.proof > wrong.proof
+  $ sed 's/(None : bool option)/(Some true : bool option)/' clients.mlp > wrong.mlp
   $ cp clients.ml wrong.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only dummy wrong.ml > wrong.out 2>&1
   [1]
@@ -60,7 +60,7 @@ The constructor does not turn a cleared word into an initialized payload.
 Freezing a failed candidate prevents the counter rewrite required by a retry.
 
   $ sed '/let prior = Counter.release_private candidate in/a\
-  > \    Counter.freeze candidate;' clients.proof > frozen_candidate.proof
+  > \    Counter.freeze candidate;' clients.mlp > frozen_candidate.mlp
   $ cp clients.ml frozen_candidate.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only failed_retry frozen_candidate.ml > frozen.out 2>&1
   [1]
@@ -70,7 +70,7 @@ Freezing a failed candidate prevents the counter rewrite required by a retry.
 
 A relaxed cache read cannot promise the most recent value.
 
-  $ sed 's/Set.mem (event, result) eligible)/Set.mem (event, result) eligible \&\& result = current)/' bounded_queue.proof > latest.proof
+  $ sed 's/Set.mem (event, result) eligible)/Set.mem (event, result) eligible \&\& result = current)/' bounded_queue.mlp > latest.mlp
   $ cp bounded_queue.ml latest.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only get_capacity latest.ml > latest.out 2>&1
   [1]
@@ -80,7 +80,7 @@ A relaxed cache read cannot promise the most recent value.
 
 An arbitrary set of event identifiers is not visibility evidence.
 
-  $ sed -e "s/proof result = link_candidate value/proof result = link_candidate [forged : Ghost.t set] value/" -e '/proof result = link_candidate /,/proof result = failed_retry /s/Ghost.merge_views Ghost.self counter_view fields_view/Ghost.merge_views Ghost.self counter_view forged/' clients.proof > forged.proof
+  $ sed -e "s/proof result = link_candidate value/proof result = link_candidate [forged : Ghost.t set] value/" -e '/proof result = link_candidate /,/proof result = failed_retry /s/Ghost.merge_views Ghost.self counter_view fields_view/Ghost.merge_views Ghost.self counter_view forged/' clients.mlp > forged.mlp
   $ cp clients.ml forged.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only link_candidate forged.ml > forged.out 2>&1
   [1]
@@ -91,7 +91,7 @@ An arbitrary set of event identifiers is not visibility evidence.
 Null links are rejected by the checked conversion helper.
 
   $ cat bounded_queue.ml > null_link.ml
-  $ cp bounded_queue.proof null_link.proof
+  $ cp bounded_queue.mlp null_link.mlp
   $ cat >> null_link.ml <<'ML'
   > let bad_null () : (int, [ `Node ]) node = link_as_node (Link Null)
   > ML
@@ -103,7 +103,7 @@ Null links are rejected by the checked conversion helper.
 
 An empty queue cannot yield a payload through peek_opt.
 
-  $ sed 's/proof result = peek_empty () ensures (result === None)/proof result = peek_empty () ensures (result === Some true)/' clients.proof > wrong_peek.proof
+  $ sed 's/proof result = peek_empty () ensures (result === None)/proof result = peek_empty () ensures (result === Some true)/' clients.mlp > wrong_peek.mlp
   $ cp clients.ml wrong_peek.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only peek_empty wrong_peek.ml > peek.out 2>&1
   [1]
@@ -113,7 +113,7 @@ An empty queue cannot yield a payload through peek_opt.
 
 An empty queue cannot yield a payload through pop_opt.
 
-  $ sed 's/proof result = pop_empty () ensures (result === None)/proof result = pop_empty () ensures (result === Some true)/' clients.proof > wrong_pop.proof
+  $ sed 's/proof result = pop_empty () ensures (result === None)/proof result = pop_empty () ensures (result === Some true)/' clients.mlp > wrong_pop.mlp
   $ cp clients.ml wrong_pop.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only pop_empty wrong_pop.ml > pop.out 2>&1
   [1]
@@ -123,7 +123,7 @@ An empty queue cannot yield a payload through pop_opt.
 
 A freshly created queue must be reported empty.
 
-  $ sed 's/proof result = empty_query () ensures (result)/proof result = empty_query () ensures (not result)/' clients.proof > wrong_empty.proof
+  $ sed 's/proof result = empty_query () ensures (result)/proof result = empty_query () ensures (not result)/' clients.mlp > wrong_empty.mlp
   $ cp clients.ml wrong_empty.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only empty_query wrong_empty.ml > empty.out 2>&1
   [1]
@@ -133,7 +133,7 @@ A freshly created queue must be reported empty.
 
 Fullness is exact, including the transition back to nonfull after removal.
 
-  $ sed 's/not before \&\& during \&\& count = 1 \&\& not after/not before \&\& not during \&\& count = 1 \&\& not after/' clients.proof > wrong_full.proof
+  $ sed 's/not before \&\& during \&\& count = 1 \&\& not after/not before \&\& not during \&\& count = 1 \&\& not after/' clients.mlp > wrong_full.mlp
   $ cp clients.ml wrong_full.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only fullness_cycle wrong_full.ml > full.out 2>&1
   [1]

@@ -37,7 +37,7 @@ Partial logical applications are rejected by the source type checker.
 Sibling models are nominally distinct even when their constructors share names.
 
   $ cp logical_types.ml type_mismatch.ml
-  $ cp logical_types_mismatch.proof type_mismatch.proof
+  $ cp logical_types_mismatch.mlp type_mismatch.mlp
   $ caravan --shh type_mismatch.ml 2>&1 | grep -F 'has type Right.model but an expression was expected of type'
   Type Error: The value value has type Right.model but an expression was expected of type
 
@@ -52,7 +52,7 @@ A sealed outer module permits internal qualified proof calls and unfolds.
 The enclosing signature still hides these proof helpers from external clients.
 
   $ cp logical_sealed.ml logical_sealed_leak.ml
-  $ cat logical_sealed.proof > logical_sealed_leak.proof
-  $ printf '\nlemma leak (value : Outer.A.model) = ()\n' >> logical_sealed_leak.proof
+  $ cat logical_sealed.mlp > logical_sealed_leak.mlp
+  $ printf '\nlemma leak (value : Outer.A.model) = ()\n' >> logical_sealed_leak.mlp
   $ caravan --shh logical_sealed_leak.ml 2>&1 | grep -F 'Unbound type constructor Outer.A.model.'
   Type Error: Unbound type constructor Outer.A.model.

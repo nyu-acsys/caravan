@@ -23,20 +23,20 @@ const fail = text.includes('fail');
 const warning = text.includes('warning');
 const report = {errors:fail?[
  {...location,kind:'Verification',message:['Failed assertion']},
- {...location,file:file.replace(/\\.ml$/,'.proof'),start_col:2,end_col:text.includes('unicode')?6:4,kind:'RelatedLoc',message:['Related specification']}
+ {...location,file:file.replace(/\\.ml$/,'.mlp'),start_col:2,end_col:text.includes('unicode')?6:4,kind:'RelatedLoc',message:['Related specification']}
 ]:warning?[{...location,kind:'Warning',message:['Trusted specification']}]:[],
  dependencies:[file,path.join(path.dirname(file),'dependency.ml')],annotations:[],members:[],references:[],symbols:[]};
 if(text.includes('dune-dependency')) report.dependencies.push(path.join(path.dirname(file),'lib','dune'));
 if(text.includes('nodeps')) report.dependencies=[];
 if(process.argv.includes('--lsp-annotations-only')) {
- const origin = file.replace(/\\.ml$/, text.includes('proof-contract') ? '.proof' : '.mli');
+ const origin = file.replace(/\\.ml$/, text.includes('proof-contract') ? '.mlp' : '.mli');
  const originLocation = {...location,file:origin};
  report.errors=[];
  report.dependencies.push(origin,path.join(path.dirname(file),'metadata-only.ml'));
  if(text.includes('contract')) report.annotations=[{...location,kind:'InheritedContract',source:'Main.f',source_loc:originLocation,
   clauses:[{...originLocation,keyword:'requires',text:'  x > 0\\n  && true  '},{...originLocation,keyword:'ensures',text:'result > x'}]}];
  if(text.includes('proof-step')) {
-  const proof = file.replace(/\\.ml$/, '.proof');
+  const proof = file.replace(/\\.ml$/, '.mlp');
   report.dependencies.push(proof);
   report.annotations.push({...location,start_col:Buffer.byteLength(text),end_col:Buffer.byteLength(text),kind:'ProofStep',
    source_loc:{file:proof,start_line:1,start_col:0,end_line:1,end_col:6},text:'commit'});
@@ -124,7 +124,7 @@ async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = fal
 		throw new Error(`Timed out waiting for message: ${JSON.stringify(messages.slice(from))}; ${stderr}`);
 	};
 	const state = (value, from = 0, target = file) => wait(message => message.method === 'caravan/verificationState' && message.params.uri === uri(target) && message.params.state === value, from);
-	const open = async (target = file, version = 1) => notify('textDocument/didOpen', { textDocument: { uri: uri(target), languageId: target.endsWith('.proof') ? 'caravan-proof' : 'ocaml', version, text: await fs.readFile(target, 'utf8') } });
+	const open = async (target = file, version = 1) => notify('textDocument/didOpen', { textDocument: { uri: uri(target), languageId: target.endsWith('.mlp') ? 'caravan-proof' : 'ocaml', version, text: await fs.readFile(target, 'utf8') } });
 	t.after(async () => {
 		if (child.exitCode === null) {
 			try { await request('shutdown', null); notify('exit'); } catch { child.kill('SIGTERM'); }
@@ -141,7 +141,7 @@ async function fixture(t, initial = 'let x = 1', toolchain, refreshSupport = fal
 
 test('save and manual verification resolve companions, flags and related diagnostics', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'let x = fail');
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'proof');
 	await f.open();
 	await f.state('unchecked');
@@ -245,7 +245,7 @@ test('dirty buffers and dependency edits invalidate results and cancel stale run
 
 test('missing implementation, missing executable, malformed reports and stderr remain unavailable', { timeout: 15000 }, async t => {
 	const f = await fixture(t);
-	const proof = path.join(f.dir, 'missing.proof');
+	const proof = path.join(f.dir, 'missing.mlp');
 	await fs.writeFile(proof, 'proof');
 	await f.open(proof);
 	f.notify('caravan/verify', { uri: uri(proof) });
@@ -283,7 +283,7 @@ test('report schema rejects invalid positions and inconsistent success', () => {
 
 test('Raven UTF-8 byte columns become UTF-16 ranges in primary and related source files', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀fail unicode');
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'é😀proof');
 	await f.open();
 	await f.open(proof);
@@ -435,7 +435,7 @@ function report(file, first, second, failure = false) {
  const order=['unchecked','checked','verified','pending','skipped','timeout','failed'];
  const status=order.indexOf(first)>order.indexOf(second)?first:second;
  return {errors:failure?[{...loc(first==='failed'?2:3,6,12),kind:'Verification',message:['streamed failure']}]:[],
- dependencies:[file,file.replace(/\\.ml$/,'.proof')],annotations:[],references:[],symbols:[],
+ dependencies:[file,file.replace(/\\.ml$/,'.mlp')],annotations:[],references:[],symbols:[],
  members:[{...loc(1,7,11),id:'Work',name:'Work',kind:'module',extent:{...loc(1,0,3),end_line:4},
  group:true,status,own_status:'checked',own_checks:0,counts},leaf('first',2,first),leaf('second',3,second)]};
 }
@@ -516,7 +516,7 @@ test('verification streams member lenses and module summaries before the final r
 
 test('companion edits discard streaming results even when the implementation version is unchanged', { timeout: 15000 }, async t => {
 	const f = await streamingFixture(t);
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'original');
 	await f.open(proof);
 	f.notify('caravan/verify', { uri: uri(f.file) });
@@ -555,7 +555,7 @@ test('streamed failures and diagnostics remain visible while other members are p
 test('proof hints share discovery with hovers and views and invalidate without a source version change', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
 	f.settings.verifyOnSave = false;
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'commit');
 	await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'é😀contract');
 	await f.open();
@@ -592,7 +592,7 @@ test('proof hints share discovery with hovers and views and invalidate without a
 test('read-only proof views reuse discovery, preserve context, and reject dirty or invalid sources', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'é😀contract proof-step unicode', undefined, true);
 	f.settings.verifyOnSave = false;
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'commit');
 	await fs.writeFile(f.file.replace(/\.ml$/, '.mli'), 'é😀contract');
 	await f.open();
@@ -663,7 +663,7 @@ test('contract metadata has a separate worker from slow verification', { timeout
 test('companion edits, dependencies, configuration and toolchains invalidate contract hovers', { timeout: 15000 }, async t => {
 	const f = await fixture(t, 'proof-contract', undefined, true);
 	f.settings.verifyOnSave = false;
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	await fs.writeFile(proof, 'contract');
 	await f.open();
 	await f.open(proof);
@@ -690,7 +690,7 @@ test('companion edits, dependencies, configuration and toolchains invalidate con
 	assert.equal((await runs(f)).length, 6);
 	assert.ok(f.requests.some(message => message.method === 'workspace/codeLens/refresh'));
 	const contract = await hover(f);
-	assert.match(contract.contents.value, /main\.proof:1/);
+	assert.match(contract.contents.value, /main\.mlp:1/);
 	assert.equal((await runs(f)).length, 6);
 });
 
@@ -698,7 +698,7 @@ test('stale frontend metadata cannot reinstall hovers or proof hints after a com
 	const f = await fixture(t, 'contract proof-step metadata-slow');
 	const origin = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(origin, 'contract');
-	await fs.writeFile(f.file.replace(/\.ml$/, '.proof'), 'commit');
+	await fs.writeFile(f.file.replace(/\.ml$/, '.mlp'), 'commit');
 	await f.open();
 	await f.open(origin);
 	const first = lenses(f);
@@ -747,8 +747,8 @@ test('known contract annotations validate strictly while unknown annotations are
 
 test('proof-step reports validate and normalize implementation and original UTF-8 ranges', () => {
 	const location = { file: 'main.ml', start_line: 1, start_col: 6, end_line: 1, end_col: 6 };
-	const step = { ...location, kind: 'ProofStep', source_loc: { ...location, file: 'main.proof', end_col: 12 }, text: 'commit' };
-	const report = { errors: [], dependencies: ['main.ml', 'main.proof'], annotations: [step], members: [], references: [], symbols: [] };
+	const step = { ...location, kind: 'ProofStep', source_loc: { ...location, file: 'main.mlp', end_col: 12 }, text: 'commit' };
+	const report = { errors: [], dependencies: ['main.ml', 'main.mlp'], annotations: [step], members: [], references: [], symbols: [] };
 	const parsed = parseReport(JSON.stringify(report), 0);
 	assert.deepEqual(parsed.annotations, []);
 	const [normalized] = normalizeProofSteps(parsed, process.cwd(), () => 'é😀commit');
@@ -775,7 +775,7 @@ test('Raven views translate companions with configured paths without verifying o
 	const working = path.join(f.dir, 'working directory');
 	await fs.mkdir(working);
 	f.settings.cwd = working;
-	const proof = f.file.replace(/\.ml$/, '.proof');
+	const proof = f.file.replace(/\.ml$/, '.mlp');
 	const intf = f.file.replace(/\.ml$/, '.mli');
 	await fs.writeFile(proof, 'proof');
 	await fs.writeFile(intf, 'val x : int');

@@ -42,7 +42,7 @@ A separate example, [`raw_result.ml`](../examples/raw_result.ml), shows a result
 that is cleared after use, and a reader that loads the slot first and only afterwards
 checks whether the load was still valid.
 
-All examples use manual proofs in companion `.proof` files; the OCaml code contains
+All examples use manual proofs in companion `.mlp` files; the OCaml code contains
 no proof steps. Each version is a separate program because of a current restriction:
 once a program uses frozen or relaxed fields, Caravan rejects reads and writes of
 default mutable fields anywhere in that program. Immutable fields remain supported
@@ -64,7 +64,7 @@ preparing domain sets `work` and then hands the job to a worker:
 
 The contracts state which ownership each function needs and returns:
 
-<<< ../examples/owned_job.proof{proof}
+<<< ../examples/owned_job.mlp{proof}
 
 `Ghost.Task` attaches a contract to the function that the worker runs, here
 `inspect`. `Domain.spawn` transfers the resources that this contract requires to
@@ -157,7 +157,7 @@ known after allocation, such as the job's `total`:
 The proof creates a facade `Total` for the field, freezes the field when `create`
 returns, and reads it in `workload` through a frozen read:
 
-<<< ../examples/frozen_job.proof{proof}
+<<< ../examples/frozen_job.mlp{proof}
 
 `Ghost.Frozen` creates the facade for the field that `field` selects; it does not
 allocate a runtime cell. Before the field is frozen, writing it requires full
@@ -248,7 +248,7 @@ The proof therefore tracks two sets of writes: `all`, the full journal, and
 `eligible`, the writes that a domain that has acquired the publication can still
 observe:
 
-<<< ../examples/relaxed_job.proof{proof}
+<<< ../examples/relaxed_job.mlp{proof}
 
 While the job is private, its writes to `completed` happen in one domain, in a known
 order. `Progress.publish job` places a **publication cut** after the last of them.
@@ -319,7 +319,7 @@ type.
 The proof records the retirement before the slot is cleared, and connects the entry
 that the read observed to the atomic check of the flag that follows it:
 
-<<< ../examples/raw_result.proof{proof}
+<<< ../examples/raw_result.mlp{proof}
 
 `peek` loads the payload first and then reads the flag. If the load observed the
 clearing write, the retirement had already happened, so the flag was already `true`.
@@ -353,7 +353,7 @@ linearizability. Those properties still have to follow from the journal invarian
 the actual synchronization, and the operations' contracts.
 
 The source listings above link to the examples and their companion proofs. Save each
-`.ml` file beside its `.proof` file and run:
+`.ml` file beside its `.mlp` file and run:
 
 ```bash
 caravan owned_job.ml

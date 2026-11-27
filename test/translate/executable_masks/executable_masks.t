@@ -9,7 +9,7 @@ Executable masks bound nested invariant needs and survive imported and generic c
 
 An explicitly closed procedure cannot open its precondition invariant.
 
-  $ sed 's/opens { shared cell Ghost.self; Value.frozen }/opens {}/' closed.proof > closed_fail.proof
+  $ sed 's/opens { shared cell Ghost.self; Value.frozen }/opens {}/' closed.mlp > closed_fail.mlp
   $ cp closed.ml closed_fail.ml
   $ caravan --shh --only read_shared closed_fail.ml > closed_fail.out 2>&1
   [1]
@@ -29,7 +29,7 @@ An imported callee's mask is checked at the call, including adapter procedures.
 Module compliance cannot weaken the implementation's invariant footprint.
 
   $ sed '1,/opens { live cell }/s/opens { live cell }/opens {}/' generic.ml > generic_fail.ml
-  $ cp generic.proof generic_fail.proof
+  $ cp generic.mlp generic_fail.mlp
   $ caravan --shh generic_fail.ml > generic_fail.out 2>&1
   [1]
   $ grep -q 'Verification Error:' generic_fail.out

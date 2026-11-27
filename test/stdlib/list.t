@@ -22,7 +22,7 @@ A source filename cannot make an ordinary user proof a trusted library proof.
 
   $ mkdir -p caravan/stdlib
   $ cp path_collision.ml caravan/stdlib/list.ml
-  $ cp path_collision.proof caravan/stdlib/list.proof
+  $ cp path_collision.mlp caravan/stdlib/list.mlp
   $ caravan --shh caravan/stdlib/list.ml > collision.out 2>&1
   [1]
   $ grep -c 'A postcondition may not hold' collision.out

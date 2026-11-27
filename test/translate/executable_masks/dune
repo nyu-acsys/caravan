@@ -2,6 +2,6 @@
  (deps
   %{bin:caravan}
   (glob_files *.ml)
-  (glob_files *.proof)
+  (glob_files *.mlp)
   (glob_files imports/*.mli)
   (glob_files attribute_imports/*.mli)))

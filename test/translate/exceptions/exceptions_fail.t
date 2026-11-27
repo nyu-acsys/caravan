@@ -89,14 +89,14 @@ linearized: a second call after the first is rejected.
 
   $ mkdir early wrong twice
   $ cp atomic_stack.ml atomic_stack.mli early/
-  $ grep -v pop_exn atomic_stack.proof > early/atomic_stack.proof
+  $ grep -v pop_exn atomic_stack.mlp > early/atomic_stack.mlp
   $ caravan --shh early/atomic_stack.ml
   [Error] File "early/atomic_stack.ml", line 14, columns 10-21:
   14 |   | [] -> raise Empty
                  ^^^^^^^^^^^
   Type Error: This raise may leave the function before a step linearizes it, or after it linearized returning: annotate the step that linearizes it by raising, as (*@ returning [] -> commit *).
   [1]
-  $ cp atomic_stack.ml atomic_stack.proof wrong/
+  $ cp atomic_stack.ml atomic_stack.mlp wrong/
   $ sed 's/xs = \[\] && stack t \[\]/xs <> [] \&\& stack t []/' atomic_stack.mli > wrong/atomic_stack.mli
   $ caravan --shh wrong/atomic_stack.ml
   [Error] File "wrong/atomic_stack.ml", line 13, columns 8-20:
@@ -116,7 +116,7 @@ linearized: a second call after the first is rejected.
                                   ^^^^^^^^
   Related Location: This assertion may not hold.
   [1]
-  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.proof twice/
+  $ cp atomic_stack.ml atomic_stack.mli atomic_stack.mlp twice/
   $ chmod u+w twice/atomic_stack.ml twice/atomic_stack.mli
   $ cat atomic_stack_twice.ml >> twice/atomic_stack.ml
   $ cat atomic_stack_twice.mli >> twice/atomic_stack.mli

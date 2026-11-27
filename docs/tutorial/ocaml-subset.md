@@ -86,7 +86,7 @@ and 'a link = Link : ('a, [< `Null | `Node ]) node -> 'a link [@@unboxed]
 The type ``('a, [ `Node ]) node`` permits only `Node`, while `Link` can contain
 `Null` or `Node`. Constructor payloads retain their ordinary type parameters and
 ownership requirements. Constructor patterns may also appear directly in function
-parameters; verification checks that their arguments match. Constant-tag rows can also occur in `.proof` type
+parameters; verification checks that their arguments match. Constant-tag rows can also occur in `.mlp` type
 annotations, using ``[ `Node ]``, ``[> `Node ]``, or ``[< `Null | `Node ]``.
 These rows describe type indices; polymorphic-variant values are not supported.
 This does not provide general GADT reasoning about arbitrary type equations or
@@ -95,7 +95,7 @@ shared between an argument and result are not yet supported; independent produce
 rows and fixed constructor sets are supported.
 
 Checked `variant` annotations currently apply to logical functions and lemmas in
-`.proof` files. Executable functions and loops are verified for partial correctness,
+`.mlp` files. Executable functions and loops are verified for partial correctness,
 without proving termination.
 
 Assertions, loop invariants, and contracts carry proof obligations. For an exception
@@ -106,7 +106,7 @@ embedded in a proposition.
 
 ## Domain tasks {#sec:domain-tasks}
 
-Declare a facade in the companion `.proof` file for each operation to run in a
+Declare a facade in the companion `.mlp` file for each operation to run in a
 domain:
 
 ```proof
@@ -126,7 +126,7 @@ in captured arguments. For example, a task `work value` with contract
 client. Generic callers and functor bodies can use an existing task facade without
 adding type arguments to the proof syntax.
 
-Functors can also declare task facades in the matching `.proof` module. Repeat the
+Functors can also declare task facades in the matching `.mlp` module. Repeat the
 source functor's parameters in that module header, as for other proof declarations.
 The task contract is checked with the generic body, including when the functor is
 never applied. Repeated applicative applications share task identity; generative
@@ -181,7 +181,7 @@ ownership, and each worker receives its own ghost counter resource. Both joins
 return the completed worker resources, allowing the parent to recover the stack
 and drain twenty elements. Its runtime code follows Saturn's tutorial with integer
 worker IDs and a named loop counter; all implementation annotations are in the
-companion `.proof` file.
+companion `.mlp` file.
 
 ## Mutex critical sections {#sec:mutex-critical-sections}
 
@@ -423,7 +423,7 @@ other higher-order list operations need further higher-order support. General `l
 effect handlers, `Obj`, and first-class modules are outside the current subset.
 
 The bundled [standard-library interfaces](https://github.com/nyu-acsys/caravan/tree/main/lib/stdlib)
-state their precise contracts. Their `.proof` companions supply reusable checked
+state their precise contracts. Their `.mlp` companions supply reusable checked
 mathematical models and lemmas; clients do not reprove those facts. `Stdlib_model`
 provides their logical models only in specifications. The
 [next page](./semantics#sec:trusted-code-and-imports) describes what is trusted.

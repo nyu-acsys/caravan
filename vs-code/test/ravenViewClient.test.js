@@ -14,12 +14,12 @@ test('Raven views use a readonly provider, Raven file associations, and native c
   for (const source of [
     URI.from({ scheme: 'file', path: '/workspace/λ # contract.ml' }),
     URI.from({ scheme: 'file', path: '/workspace/λ # contract.mli' }),
-    URI.from({ scheme: 'file', path: '/C:/Users/Test #/λ.proof' }),
+    URI.from({ scheme: 'file', path: '/C:/Users/Test #/λ.mlp' }),
     URI.from({ scheme: 'file', authority: 'server', path: '/share/Test #/λ.mli' })
   ]) {
     await h.show({ uri: source, isDirty: false });
     const { document, options } = h.opened.at(-1);
-    const expected = source.with({ path: source.path.replace(/\.(ml|mli|proof)$/, '.ml') });
+    const expected = source.with({ path: source.path.replace(/\.(ml|mli|mlp|proof)$/, '.ml') });
     assert.equal(h.calls.at(-1).uri, expected.toString());
     assert.equal(URI.parse(document.uri.toString()).query, expected.toString());
     assert.equal(document.uri.path.endsWith('.rav'), true);
@@ -47,7 +47,7 @@ test('Raven view rejects dirty sources and refreshes from the generated editor',
     return answer;
   });
   t.after(() => h.disposable.dispose());
-  await h.show({ uri: URI.parse('file:///workspace/source.proof'), isDirty: true });
+  await h.show({ uri: URI.parse('file:///workspace/source.mlp'), isDirty: true });
   await h.show('untitled:source.ml');
   assert.equal(h.calls.length, 0);
   assert.match(h.messages[0], /Save the file/);

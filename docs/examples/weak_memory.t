@@ -12,7 +12,7 @@ The weak-memory tutorial examples are checked with their external proofs.
 The parent cannot read storage transferred to the worker before joining it.
 
   $ sed 's/  Domain.join worker/  let _ = inspect job in Domain.join worker/' owned_job.ml > early_read.ml
-  $ cp owned_job.proof early_read.proof
+  $ cp owned_job.mlp early_read.mlp
   $ caravan --shh early_read.ml > early_read.out 2>&1
   [1]
   $ grep -q 'Verification Error:' early_read.out
@@ -22,7 +22,7 @@ The parent cannot read storage transferred to the worker before joining it.
 A frozen read needs its field-specific scope.
 
   $ cp frozen_job.ml ordinary_read.ml
-  $ sed 's/Ghost.frozen_scope/Ghost.scope/g' frozen_job.proof > ordinary_read.proof
+  $ sed 's/Ghost.frozen_scope/Ghost.scope/g' frozen_job.mlp > ordinary_read.mlp
   $ caravan --shh ordinary_read.ml > ordinary_read.out 2>&1
   [1]
   $ grep -q 'Verification Error:' ordinary_read.out
@@ -31,7 +31,7 @@ A frozen read needs its field-specific scope.
 
 An unrestricted read does not inherit acquired publication guarantees.
 
-  $ sed 's/Ghost.published_scope/Ghost.scope/' relaxed_job.proof > unrestricted.proof
+  $ sed 's/Ghost.published_scope/Ghost.scope/' relaxed_job.mlp > unrestricted.mlp
   $ cp relaxed_job.ml unrestricted.ml
   $ caravan --shh unrestricted.ml > unrestricted.out 2>&1
   [1]

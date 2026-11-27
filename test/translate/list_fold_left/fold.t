@@ -33,11 +33,11 @@ Visibility weakening checks its subset premise and retains both seen views.
 The invariant must hold at fold entry.
 
   $ caravan --shh bad_invariant.ml
-  [Error] File "bad_invariant.proof", line 3, columns 44-59:
+  [Error] File "bad_invariant.mlp", line 3, columns 44-59:
   3 |     invariant (fun accumulator remaining -> accumulator = 1)
                                                   ^^^^^^^^^^^^^^^
   Verification Error: This loop invariant may not hold upon loop entry.
-  File "bad_invariant.proof", line 3, columns 44-59:
+  File "bad_invariant.mlp", line 3, columns 44-59:
   3 |     invariant (fun accumulator remaining -> accumulator = 1)
                                                   ^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.

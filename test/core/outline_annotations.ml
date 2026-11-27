@@ -38,7 +38,7 @@ let () =
   let structure = Parse.implementation (lexbuf "outline.ml" source) in
   let parsed =
     Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
-      (lexbuf "outline.proof" proof)
+      (lexbuf "outline.mlp" proof)
   in
   let annotations =
     get (C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed)
@@ -63,7 +63,7 @@ let () =
       in
       assert (String.equal (slice proof origin.loc) text);
       assert (String.equal annotation.text (prefix ^ text));
-      assert (String.equal origin.loc.loc_start.pos_fname "outline.proof");
+      assert (String.equal origin.loc.loc_start.pos_fname "outline.mlp");
       assert (
         origin.position.pos_cnum = origin.loc.loc_start.pos_cnum - String.length prefix);
       assert (Poly.equal (C.Annotation.lexbuf annotation).lex_curr_p origin.position);
@@ -94,7 +94,7 @@ let () =
   let structure = Parse.implementation (lexbuf "adapter.ml" source) in
   let parsed =
     Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
-      (lexbuf "adapter.proof" proof)
+      (lexbuf "adapter.mlp" proof)
   in
   let annotations =
     get (C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed)
@@ -106,7 +106,7 @@ let () =
   ignore (get (C.Annotation.returns adapter));
   let origin = Option.value_exn adapter.origin in
   assert (String.equal adapter.text (slice proof origin.loc));
-  assert (String.equal origin.loc.loc_start.pos_fname "adapter.proof");
+  assert (String.equal origin.loc.loc_start.pos_fname "adapter.mlp");
   let contract =
     List.find_exn annotations ~f:(fun annotation ->
         match C.Annotation.kind annotation with Contract -> true | _ -> false)
@@ -125,7 +125,7 @@ let () =
     let structure = Parse.implementation (lexbuf "nested.ml" source) in
     let parsed =
       Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
-        (lexbuf "nested.proof" proof)
+        (lexbuf "nested.mlp" proof)
     in
     C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed
   in
@@ -169,7 +169,7 @@ let () =
     in
     let parsed =
       Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
-        (lexbuf "twice.proof" proof)
+        (lexbuf "twice.mlp" proof)
     in
     C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed
   in
@@ -201,8 +201,7 @@ let () =
   in
   let structure = Parse.implementation (lexbuf "fold.ml" source) in
   let parsed =
-    Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token
-      (lexbuf "fold.proof" proof)
+    Caravan_spec.Spec_parser.proof Caravan_spec.Spec_lexer.token (lexbuf "fold.mlp" proof)
   in
   let annotations =
     get (C.Outline.annotations ~proof_text:proof ~structure ~annotations:[] parsed)

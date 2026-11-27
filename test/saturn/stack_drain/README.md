@@ -21,7 +21,7 @@ tracks both workers' contributions; joining their task handles recovers the
 resources needed to take the stack back out of the invariant before draining.
 Result order may vary with scheduling.
 
-All implementation annotations are in `stack_drain.proof`, including the worker
+All implementation annotations are in `stack_drain.mlp`, including the worker
 loop invariant, generic drain loop contract, task facade, and adapter proofs.
 Verification establishes partial correctness; it does not prove termination.
 

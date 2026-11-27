@@ -14,7 +14,7 @@ Resolving twice requires a resource that the first resolution consumed.
 
   $ cp one_shot.ml twice.ml
   $ sed '/Ghost.Prophecy.resolve prophecy result;/a\
-  > \    Ghost.Prophecy.resolve prophecy result;' one_shot.proof > twice.proof
+  > \    Ghost.Prophecy.resolve prophecy result;' one_shot.mlp > twice.mlp
   $ caravan --shh --only observe twice.ml > twice.out 2>&1
   [1]
   $ grep -q 'Verification Error:' twice.out
@@ -25,7 +25,7 @@ A predicted value is not known before resolution.
 
   $ cp one_shot.ml early.ml
   $ sed '/Ghost.Prophecy.resolve prophecy result;/i\
-  > \    assert (predicted);' one_shot.proof > early.proof
+  > \    assert (predicted);' one_shot.mlp > early.mlp
   $ caravan --shh --only observe early.ml > early.out 2>&1
   [1]
   $ grep -q 'Verification Error:' early.out
@@ -35,7 +35,7 @@ A predicted value is not known before resolution.
 Resolution must have the prophecy's payload type.
 
   $ cp one_shot.ml wrong_type.ml
-  $ sed 's/Ghost.Prophecy.resolve prophecy result;/Ghost.Prophecy.resolve prophecy 0;/' one_shot.proof > wrong_type.proof
+  $ sed 's/Ghost.Prophecy.resolve prophecy result;/Ghost.Prophecy.resolve prophecy 0;/' one_shot.mlp > wrong_type.mlp
   $ caravan --shh wrong_type.ml > wrong_type.out 2>&1
   [1]
   $ grep -q 'Type Error:' wrong_type.out
@@ -43,7 +43,7 @@ Resolution must have the prophecy's payload type.
 A prediction must be resolved before it can agree with an observed value.
 
   $ cp one_shot.ml unresolved.ml
-  $ sed '/Ghost.Prophecy.resolve prophecy result;/d' one_shot.proof > unresolved.proof
+  $ sed '/Ghost.Prophecy.resolve prophecy result;/d' one_shot.mlp > unresolved.mlp
   $ caravan --shh --only observe unresolved.ml > unresolved.out 2>&1
   [1]
   $ grep -q 'Verification Error:' unresolved.out

@@ -108,4 +108,4 @@ excludes this implementation too, and its source files use LF line endings.
 
 Moonpool examples follow the same per-data-structure layout under `moonpool/`.
 The Parker implementation retains its upstream bytes, checked by the source-parity
-regression, and its annotations live in a companion `.proof` file.
+regression, and its annotations live in a companion `.mlp` file.

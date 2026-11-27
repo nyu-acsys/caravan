@@ -37,6 +37,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Companion proof files use the extension `.mlp`; `.proof` files are still read, with a deprecation warning.
 - Proof-file contracts and lemmas accept unparenthesized clauses, matching interface annotations.
 - Executable integer arithmetic follows OCaml wraparound semantics, including intermediate results and pure functions.
 - Polymorphic module predicates can be instantiated at concrete types in predicate definitions.

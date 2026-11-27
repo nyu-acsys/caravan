@@ -12,13 +12,13 @@ Only an auto lemma's postconditions have triggers, and each trigger mentions eve
 parameter.
 
   $ caravan --shh manual_fail.ml
-  [Error] File "manual_fail.proof", line 8, columns 10-23:
+  [Error] File "manual_fail.mlp", line 8, columns 10-23:
   8 |   ensures [len values]. (len values >= 0)
                 ^^^^^^^^^^^^^
   Syntax Error: Only an auto lemma's postconditions have triggers.
   [1]
   $ caravan --shh partial_fail.ml
-  [Error] File "partial_fail.proof", line 9, columns 11-21:
+  [Error] File "partial_fail.mlp", line 9, columns 11-21:
   9 |   ensures [len values]. (len values <= bound) =
                  ^^^^^^^^^^
   Type Error: This trigger does not mention the parameter bound.

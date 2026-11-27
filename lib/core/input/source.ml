@@ -1,5 +1,5 @@
 (** An OCaml implementation, parsed and type-checked by the compiler's own front end, with
-    its interface and proof, if there are any: [f.mli] and [f.proof] next to [f.ml]. *)
+    its interface and proof, if there are any: [f.mli] and [f.mlp] next to [f.ml]. *)
 
 open Base
 include Source_core
@@ -225,6 +225,18 @@ let sibling file ext =
   let other = Stdlib.Filename.remove_extension file ^ ext in
   Option.some_if (Stdlib.Sys.file_exists other) other
 
+(** The companion proof file of [file]: its [.mlp] file, or else its legacy [.proof] file.
+*)
+let companion_proof file =
+  match (sibling file proof_extension, sibling file legacy_proof_extension) with
+  | Some current, Some legacy ->
+      Error
+        (Report.error Type (file_start legacy)
+           (Printf.sprintf "Both %s and %s exist; rename or remove %s" current legacy
+              legacy))
+  | Some proof, None | None, Some proof -> Ok (Some proof)
+  | None, None -> Ok None
+
 let lexbuf_of file =
   let lexbuf = Lexing.from_string (Stdio.In_channel.read_all file) in
   Location.init lexbuf file;
@@ -328,7 +340,9 @@ let standard_interfaces ?(check_proofs = false) env =
         match List.Assoc.find Stdlib_sources.proofs name ~equal:String.equal with
         | None -> Ok None
         | Some proof_text ->
-            let proof_file = "caravan/stdlib/" ^ String.uncapitalize name ^ ".proof" in
+            let proof_file =
+              "caravan/stdlib/" ^ String.uncapitalize name ^ proof_extension
+            in
             let* proof = parse_proof ~file:proof_file proof_text in
             let* () =
               match proof.outlines with
@@ -842,7 +856,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
           interface.interface_comments)
       @ List.concat_map libraries ~f:(fun library -> library.library.interface_comments)
     in
-    let proof_file = if check_standard_library then None else sibling file ".proof" in
+    let* proof_file = if check_standard_library then Ok None else companion_proof file in
     let proof =
       Option.value_map proof_file
         ~default:(Ok { S.declarations = []; outlines = [] })
@@ -1335,6 +1349,7 @@ let load ?(include_dirs = []) ?(discover_dependencies = true)
                 proof_scopes;
                 libraries;
                 project_dependencies = project.dependencies;
+                proof_file;
                 spec_bindings = specification_bindings runtime_env env;
               }))
   with exn -> (

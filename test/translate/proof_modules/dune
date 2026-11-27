@@ -8,4 +8,4 @@
   (glob_files ra_exports_lib/*.mli)
   (glob_files generic_au_lib/*.mli)
   (glob_files promise_lib/*.mli)
-  (glob_files *.proof)))
+  (glob_files *.mlp)))

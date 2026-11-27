@@ -6,5 +6,5 @@
   (glob_files *.mli)
   (glob_files imports/*.mli)
   (glob_files imports_variant/*.mli)
-  (glob_files *.proof)
+  (glob_files *.mlp)
   (glob_files *.rav.inc)))

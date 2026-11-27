@@ -15,6 +15,6 @@ handoff. The handoff joins the producer before popping. The tutorial's command-l
 harness, printing, and simultaneous producer/consumer execution are not included.
 
 Run `dune exec -- caravan test/ocaml5_tutorial/blocking_stack/blocking_stack.ml`
-from the repository root. All proof annotations are in `.mli` and `.proof` files.
+from the repository root. All proof annotations are in `.mli` and `.mlp` files.
 
 The upstream module is covered by [the tutorial's MIT license](../LICENSE).

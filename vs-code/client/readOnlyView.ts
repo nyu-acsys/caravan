@@ -104,15 +104,15 @@ export function registerReadOnlyViews<T extends ViewResult>(
     const active = vscode.window.activeTextEditor?.document;
     const document = active?.uri.scheme === options.scheme
       ? { uri: vscode.Uri.parse(active.uri.query, true), isDirty: false } : active;
-    if (!document || document.uri.scheme !== 'file' || !/\.(ml|mli|proof)$/.test(document.uri.path)) {
-      void vscode.window.showInformationMessage(`Open an OCaml .ml, .mli, or Caravan .proof file to show its ${options.name} view.`);
+    if (!document || document.uri.scheme !== 'file' || !/\.(ml|mli|mlp|proof)$/.test(document.uri.path)) {
+      void vscode.window.showInformationMessage(`Open an OCaml .ml, .mli, or Caravan .mlp file to show its ${options.name} view.`);
       return;
     }
     if (document.isDirty) {
       void vscode.window.showInformationMessage(`Save the file before opening the Caravan ${options.name} view.`);
       return;
     }
-    const source = document.uri.with({ path: document.uri.path.replace(/\.(ml|mli|proof)$/, '.ml'),
+    const source = document.uri.with({ path: document.uri.path.replace(/\.(ml|mli|mlp|proof)$/, '.ml'),
       query: '', fragment: '' });
     const uri = source.with({ scheme: options.scheme, path: source.path.replace(/\.ml$/, options.suffix),
       query: source.toString() });

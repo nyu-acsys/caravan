@@ -84,7 +84,7 @@ export function renderProofView(root: string, source: string, metadata: ProofMet
 	}
 	append(source.slice(cursor));
 	const stem = root.replace(/\.ml$/, '');
-	const companions = new Set([`${stem}.mli`, `${stem}.proof`,
+	const companions = new Set([`${stem}.mli`, `${stem}.mlp`, `${stem}.proof`,
 		...metadata.contracts.map(contract => contract.sourceLocation.file),
 		...metadata.steps.map(step => step.sourceLocation.file)]);
 	for (const file of companions) {

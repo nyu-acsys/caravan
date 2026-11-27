@@ -94,7 +94,7 @@ test('lenses filter files, deduplicate identities, and use source-ordered empty 
   const early = member('early', 'verified', { location: { file,
     start: { line: 1, character: 3 }, end: { line: 1, character: 7 } } });
   const late = member('late', 'pending');
-  const foreign = member('foreign', 'failed', { location: { ...late.location, file: path.resolve('other.proof') } });
+  const foreign = member('foreign', 'failed', { location: { ...late.location, file: path.resolve('other.mlp') } });
   const lenses = memberLenses([late, foreign, early, early], file, 'verifying');
   assert.deepEqual(lenses.map(lens => lens.command.title), ['✓ verified', '⋯ checking']);
   assert.deepEqual(lenses.map(lens => lens.range), [early, late].map(value => ({ start: value.location.start, end: value.location.start })));

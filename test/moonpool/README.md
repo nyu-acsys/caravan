@@ -2,7 +2,7 @@
 
 Upstream Moonpool implementations with Caravan specifications and proofs.
 Implementation files retain their upstream bytes; verification annotations live
-in companion `.proof` files.
+in companion `.mlp` files.
 
 - [Parker](parker/): a mutex/condition-based coalescing permit.
 

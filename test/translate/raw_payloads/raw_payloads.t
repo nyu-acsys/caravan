@@ -15,7 +15,7 @@ validation protocol checks a later atomic head observation before using a payloa
 Ignoring the validation result cannot justify returning the payload.
 
   $ sed 's/if Atomic.get head then None else Some value/if Atomic.get head then Some value else Some value/' validation.ml > unchecked.ml
-  $ cp validation.proof unchecked.proof
+  $ cp validation.mlp unchecked.mlp
   $ caravan --shh unchecked.ml > unchecked.out 2>&1
   [1]
   $ grep -q 'This speculative value may be cleared' unchecked.out
@@ -25,7 +25,7 @@ Ignoring the validation result cannot justify returning the payload.
 The proof needs the invariant connecting retirement to a head that cannot return.
 
   $ cp validation.ml aba.ml
-  $ sed 's/(Set.mem true phases -> moved)/true/' validation.proof > aba.proof
+  $ sed 's/(Set.mem true phases -> moved)/true/' validation.mlp > aba.mlp
   $ caravan --shh aba.ml > aba.out 2>&1
   [1]
   $ grep -q 'Verification Error:' aba.out
@@ -35,7 +35,7 @@ The proof needs the invariant connecting retirement to a head that cannot return
 Clearing before retirement does not preserve the invariant.
 
   $ sed 's/Atomic.set head true/Atomic.set head false/g' validation.ml > early.ml
-  $ sed 's/at (Atomic.set head true)/at (Atomic.set head false)/g' validation.proof > early.proof
+  $ sed 's/at (Atomic.set head true)/at (Atomic.set head false)/g' validation.mlp > early.mlp
   $ caravan --shh early.ml > early.out 2>&1
   [1]
   $ grep -q 'Verification Error:' early.out

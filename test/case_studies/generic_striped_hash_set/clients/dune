@@ -6,4 +6,4 @@
  (libraries caravan_case_study_generic_striped_hash_set_instances))
 
 (cram
- (deps %{bin:caravan} instances.mli clients.ml clients.proof))
+ (deps %{bin:caravan} instances.mli clients.ml clients.mlp))

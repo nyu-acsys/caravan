@@ -1,7 +1,7 @@
 AU tokens cannot be used at a different source type index.
 
   $ caravan --shh au_token_fail.ml
-  [Error] File "au_token_fail.proof", line 5, columns 11-36:
+  [Error] File "au_token_fail.mlp", line 5, columns 11-36:
   5 |   requires (Read.pending token cell) = ()
                  ^^^^^^^^^^^^^^^^^^^^^^^^^
   Unsupported Error: This polymorphic function occurrence or signature alias is not supported yet.

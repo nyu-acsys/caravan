@@ -46,7 +46,7 @@ failed_selection("outer")
 failed_selection("outer.helper")
 failed_selection("loop")
 proof = failed_selection("proved")
-assert any(error["file"].endswith("members.proof") for error in errors(proof)), proof
+assert any(error["file"].endswith("members.mlp") for error in errors(proof)), proof
 
 module = run("--only", "Work", exit=1)
 inventory = members(module)

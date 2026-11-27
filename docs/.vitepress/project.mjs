@@ -16,7 +16,7 @@ export default {
   root,
   sections: createSections({ root, chapters: tutorialChapters }),
   pagesBase: '/caravan/',
-  sourceExtensions: ['ml', 'mli', 'proof'],
+  sourceExtensions: ['ml', 'mli', 'mlp'],
   exampleSources: ['examples'],
   grammars: [
     { file: new URL('../../vs-code/syntaxes/spec.tmLanguage.json', import.meta.url), aliases: ['caravan-spec'] },

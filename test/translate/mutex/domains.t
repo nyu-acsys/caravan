@@ -44,18 +44,18 @@ Existing polymorphic, ghost-result and history tasks use the same lifecycle.
   $ caravan --shh domain_values.ml
   Verification successful.
   $ cp domain_poly.ml empty_entry.ml
-  $ sed 's/Ghost.Mutex.context self held/Ghost.Mutex.context self Finset.empty/g; s/not (Finset.mem mutex held)/true/g' domain_poly.proof > empty_entry.proof
+  $ sed 's/Ghost.Mutex.context self held/Ghost.Mutex.context self Finset.empty/g; s/not (Finset.mem mutex held)/true/g' domain_poly.mlp > empty_entry.mlp
   $ caravan --shh empty_entry.ml
   Verification successful.
   $ cp ../domains/ghost_explicit.ml ghost.ml
-  $ cat ../domains/ghost_explicit.proof unit_resource.proof > ghost.proof
+  $ cat ../domains/ghost_explicit.mlp unit_resource.mlp > ghost.mlp
   $ caravan --shh ghost.ml
   Verification successful.
   $ cp ../domains/ghost_explicit_raises.ml ghost_raises.ml
-  $ cat ../domains/ghost_explicit_raises.proof unit_resource.proof > ghost_raises.proof
+  $ cat ../domains/ghost_explicit_raises.mlp unit_resource.mlp > ghost_raises.mlp
   $ caravan --shh ghost_raises.ml
   Verification successful.
   $ cp ../domains/history.ml history.ml
-  $ cat ../domains/history.proof unit_resource.proof > history.proof
+  $ cat ../domains/history.mlp unit_resource.mlp > history.mlp
   $ caravan --shh history.ml
   Verification successful.

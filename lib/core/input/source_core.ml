@@ -132,7 +132,7 @@ type t = {
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   outline_annotations : Annotation.t list;
-      (** The annotations that the proof outlines of the [.proof] file stand for. *)
+      (** The annotations that the proof outlines of the [.mlp] file stand for. *)
   env : Env.t;
       (** The environment at the end of the file, for types in annotations, with the type
           [integer], [sequence], [finset], [set], and [map] of specifications. *)
@@ -158,7 +158,19 @@ type t = {
   libraries : library list;
   project_dependencies : string list;
   spec_bindings : Types.signature;
+  proof_file : string option;  (** The companion proof file, if there is one. *)
 }
+
+(** The start of [file], for diagnostics about the file as a whole. *)
+let file_start file =
+  let start = { Lexing.pos_fname = file; pos_lnum = 1; pos_bol = 0; pos_cnum = 0 } in
+  { Location.loc_start = start; loc_end = start; loc_ghost = false }
+
+(** The extension of companion proof files. *)
+let proof_extension = ".mlp"
+
+(** The extension of companion proof files before [.mlp], still accepted. *)
+let legacy_proof_extension = ".proof"
 
 let visibility_required source =
   Field_disciplines.shared source.field_disciplines

@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="caravan dune project ") as temporary:
     requires 0 <= value && value < 1000
     ensures result === value + 1 *)
 """,
-        "values/values.proof": "This implementation proof must not be imported.\n",
+        "values/values.mlp": "This implementation proof must not be imported.\n",
         "middle/dune": "(library (name middle) (wrapped false) (libraries values))\n",
         "middle/middle.ml": "let step value = Values.increment (Values.increment value)\n",
         "middle/middle.mli": """val step : int -> int

@@ -11,7 +11,7 @@ Publication facts are persistent agreement resources, with no invariant mask.
 Full state alone does not justify publication.
 
   $ cp publication.ml unowned.ml
-  $ sed 's/requires (Capacity.private_state Ghost.self cell current writes)/requires (Capacity.state cell current writes)/g' publication.proof > unowned.proof
+  $ sed 's/requires (Capacity.private_state Ghost.self cell current writes)/requires (Capacity.state cell current writes)/g' publication.mlp > unowned.mlp
   $ caravan --shh unowned.ml > unowned.out 2>&1
   [1]
   $ grep -q 'A precondition may not hold' unowned.out
@@ -22,7 +22,7 @@ An unrestricted read retains private observations, even when the caller has
 acquired visibility. The stronger postcondition requires the published read rule.
 
   $ cp publication.ml unrestricted_fail.ml
-  $ sed 's/at (cell.value) Ghost.published_scope/at (cell.value) Ghost.scope/g' publication.proof > unrestricted_fail.proof
+  $ sed 's/at (cell.value) Ghost.published_scope/at (cell.value) Ghost.scope/g' publication.mlp > unrestricted_fail.mlp
   $ caravan --shh unrestricted_fail.ml > unrestricted_fail.out 2>&1
   [1]
   $ grep -q 'Verification Error:' unrestricted_fail.out
@@ -33,7 +33,7 @@ Acquiring an unrelated atomic location does not authorize a published read.
 
   $ sed '/let receive (channel : int Atomic.t) cell =/a\
   > \  let other = Atomic.make 1 in' publication.ml | sed 's/Atomic.get channel/Atomic.get other/' > wrong_channel.ml
-  $ sed 's/at (Atomic.get channel)/at (Atomic.get other)/' publication.proof > wrong_channel.proof
+  $ sed 's/at (Atomic.get channel)/at (Atomic.get other)/' publication.mlp > wrong_channel.mlp
   $ caravan --shh wrong_channel.ml > wrong_channel.out 2>&1
   [1]
   $ grep -q 'A precondition may not hold' wrong_channel.out
@@ -56,7 +56,7 @@ leave the node private so its value can be rewritten before a retry.
 The publish_at_link source proof checks both paths and cut coverage.
 
   $ cp publication.ml premature.ml
-  $ sed 's/if linked then begin/if true then begin/g' publication.proof > premature.proof
+  $ sed 's/if linked then begin/if true then begin/g' publication.mlp > premature.mlp
   $ caravan --shh premature.ml > premature.out 2>&1
   [1]
   $ grep -q 'A precondition may not hold' premature.out

@@ -15,7 +15,7 @@ These contracts exclude equality or hashing that depends on mutable key contents
 Reference keys can instead use identity equality and stable hashing.
 
 The public contracts appear on the functor's result signature in the `.ml` file;
-the companion `.proof` file mirrors the functor. The abstract contents are a
+the companion `.mlp` file mirrors the functor. The abstract contents are a
 `Key.t finset`. Each stripe lock holds half of a ghost snapshot of the
 keys in its row, and the contents predicate holds the other half; operations
 update both while holding the mutex and commit their logical step before unlocking.

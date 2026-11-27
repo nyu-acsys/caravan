@@ -73,7 +73,7 @@ user guide explains executable overrides, opam launchers, and include paths.
 ## Read external annotations {#sec:read-external-annotations}
 
 Contracts exported to clients can be placed in a sibling `.mli` file. More
-detailed proofs can live in a sibling `.proof` file, including predicates,
+detailed proofs can live in a sibling `.mlp` file, including predicates,
 invariants, lemmas, and annotations attached to implementation steps. Caravan
 checks these companions together with the `.ml` implementation.
 

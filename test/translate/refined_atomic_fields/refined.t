@@ -11,7 +11,7 @@ The broader constructor set still admits Null.
 The broader constructor set does not establish the narrower constructor constraint.
 
   $ cp refined.ml wrong.ml
-  $ sed 's/ensures (result === Null)/ensures (result =\/= Null)/' refined.proof > wrong.proof
+  $ sed 's/ensures (result === Null)/ensures (result =\/= Null)/' refined.mlp > wrong.mlp
   $ caravan --shh wrong.ml > wrong.out 2>&1
   [1]
   $ grep -q 'Verification Error:' wrong.out

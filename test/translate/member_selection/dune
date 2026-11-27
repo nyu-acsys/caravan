@@ -3,5 +3,5 @@
   %{bin:caravan}
   (glob_files *.ml)
   (glob_files *.mli)
-  (glob_files *.proof)
+  (glob_files *.mlp)
   check_selection.py))

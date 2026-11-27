@@ -1,4 +1,4 @@
-(* A shared stack with bugs, against shared_stack_fail.mli and shared_stack_fail.proof. *)
+(* A shared stack with bugs, against shared_stack_fail.mli and shared_stack_fail.mlp. *)
 
 type t = int list Atomic.t
 

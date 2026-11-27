@@ -37,8 +37,8 @@ let explain (origins : Translate_context.origin list) (d : R.Diagnostic.t) :
 let blame ~explicit_proof_files (d : R.Diagnostic.t) : R.Diagnostic.t =
   let user_file =
     let file = (R.Loc.start d.loc).pos_fname in
-    List.exists [ ".ml"; ".mli"; ".proof" ] ~f:(fun suffix ->
-        String.is_suffix file ~suffix)
+    List.exists [ ".ml"; ".mli"; Source.proof_extension; Source.legacy_proof_extension ]
+      ~f:(fun suffix -> String.is_suffix file ~suffix)
   in
   let explicit_proof =
     List.mem explicit_proof_files (R.Loc.start d.loc).pos_fname ~equal:String.equal
@@ -84,7 +84,12 @@ type prepared = {
 
 let sibling_dependencies file =
   let base = Stdlib.Filename.remove_extension file in
-  [ file; base ^ ".mli"; base ^ ".proof" ]
+  [
+    file;
+    base ^ ".mli";
+    base ^ Source.proof_extension;
+    base ^ Source.legacy_proof_extension;
+  ]
 
 let source_dependencies (source : Source.t) =
   sibling_dependencies source.file
@@ -109,6 +114,18 @@ let prepare_scopes ~history (source, scopes, annotations, members) =
   let ( let* ) result f = Result.bind result ~f in
   let* program, origins, warnings =
     Translate.program_with_diagnostics ~history ~scopes source
+  in
+  let legacy_proof =
+    Option.filter source.proof_file
+      ~f:(String.is_suffix ~suffix:Source.legacy_proof_extension)
+  in
+  let warnings =
+    Option.value_map legacy_proof ~default:warnings ~f:(fun file ->
+        Report.warning (Source.file_start file)
+          (Printf.sprintf "The proof file extension %s is deprecated; rename it to %s"
+             Source.legacy_proof_extension
+             (Stdlib.Filename.remove_extension file ^ Source.proof_extension))
+        :: warnings)
   in
   let explicit_proof_files =
     List.filter_map source.proof_scopes.declarations ~f:(fun entry ->

@@ -32,7 +32,7 @@ Emitted functors and their task contracts also verify independently.
 Generative applications cannot exchange completion claims.
 
   $ sed 's/First.finish first/Second.finish first/' functor.ml > generative.ml
-  $ cp functor.proof generative.proof
+  $ cp functor.mlp generative.mlp
   $ caravan --shh generative.ml > generative.out 2>&1
   [1]
   $ grep 'Verification Error:' generative.out
@@ -41,7 +41,7 @@ Generative applications cannot exchange completion claims.
 Distinct named arguments stay distinct even with identical carrier types.
 
   $ sed 's/Again.finish first 7/Third.finish first 7/' functor_parameters.ml > distinct.ml
-  $ cp functor_parameters.proof distinct.proof
+  $ cp functor_parameters.mlp distinct.mlp
   $ caravan --shh distinct.ml > distinct.out 2>&1
   [1]
   $ grep 'Verification Error:' distinct.out
@@ -50,7 +50,7 @@ Distinct named arguments stay distinct even with identical carrier types.
 An unapplied functor's worker body is checked at its declaration.
 
   $ sed '/module First = Worker ()/,$d; s/let work () = 1/let work () = 2/' functor.ml > unapplied.ml
-  $ cp functor.proof unapplied.proof
+  $ cp functor.mlp unapplied.mlp
   $ caravan --shh unapplied.ml > unapplied.out 2>&1
   [1]
   $ grep 'Verification Error:' unapplied.out

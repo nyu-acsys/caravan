@@ -84,5 +84,5 @@ function supported(document: vscode.TextDocument): boolean {
   return document.uri.scheme === 'file' &&
     ((document.languageId === 'ocaml' && document.uri.path.endsWith('.ml')) ||
       (document.languageId === 'ocaml.interface' && document.uri.path.endsWith('.mli')) ||
-      (document.languageId === 'caravan-proof' && document.uri.path.endsWith('.proof')));
+      (document.languageId === 'caravan-proof' && /\.(mlp|proof)$/.test(document.uri.path)));
 }

@@ -9,4 +9,4 @@ public/logo.png
 public/logo-small.png
 public/**/*.ml
 public/**/*.mli
-public/**/*.proof
+public/**/*.mlp

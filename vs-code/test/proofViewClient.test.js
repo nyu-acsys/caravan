@@ -21,7 +21,7 @@ test('proof views use a readonly content provider, proof language, and a separat
   assert.equal(document.languageId, 'caravan-proof');
   assert.deepEqual(options, { viewColumn: -2, preview: true });
   const [link] = h.links.provideDocumentLinks(document);
-  assert.equal(link.target.toString(), URI.parse('file:///workspace/source.proof#L2,3').toString());
+  assert.equal(link.target.toString(), URI.parse('file:///workspace/source.mlp#L2,3').toString());
   assert.deepEqual(link.range.start, { line: 0, character: 0 });
   assert.deepEqual(link.range.end, { line: 0, character: 5 });
 });
@@ -32,11 +32,11 @@ test('native companion URIs roundtrip spaces, hashes, Unicode, drives, and netwo
   for (const source of [
     URI.from({ scheme: 'file', path: '/workspace/λ # contract.ml' }),
     URI.from({ scheme: 'file', path: '/workspace/λ # contract.mli' }),
-    URI.from({ scheme: 'file', path: '/workspace/λ # contract.proof' }),
-    URI.from({ scheme: 'file', path: '/C:/Users/Test #/λ.proof' }),
+    URI.from({ scheme: 'file', path: '/workspace/λ # contract.mlp' }),
+    URI.from({ scheme: 'file', path: '/C:/Users/Test #/λ.mlp' }),
     URI.from({ scheme: 'file', authority: 'server', path: '/share/Test #/λ.mli' })
   ]) {
-    const expected = source.with({ path: source.path.replace(/\.(ml|mli|proof)$/, '.ml') });
+    const expected = source.with({ path: source.path.replace(/\.(ml|mli|mlp|proof)$/, '.ml') });
     await h.show({ uri: source, isDirty: false });
     const virtual = h.opened.at(-1).document.uri;
     assert.equal(URI.parse(virtual.toString()).query, expected.toString());
@@ -52,7 +52,7 @@ test('unsupported and unsaved active documents explain how to open the saved-fil
   const h = setup();
   t.after(() => h.disposable.dispose());
   for (const source of ['untitled:test.ml', 'file:///workspace/readme.txt']) await h.show(source);
-  await h.show({ uri: URI.parse('file:///workspace/source.proof'), isDirty: true });
+  await h.show({ uri: URI.parse('file:///workspace/source.mlp'), isDirty: true });
   assert.equal(h.calls.length, 0);
   assert.equal(h.opened.length, 0);
   assert.match(h.messages[0], /Open an OCaml/);
@@ -71,7 +71,7 @@ test('showing an already-open proof view retries errors and refreshes its cached
   assert.match(document.text, /proof view unavailable/);
   assert.equal(h.calls.length, 1);
   answer = result('recovered proof');
-  await h.show('file:///workspace/source.proof');
+  await h.show('file:///workspace/source.mlp');
   await h.refreshed();
   assert.equal(h.opened[1].document, document);
   assert.equal(document.text, 'recovered proof');
@@ -137,7 +137,7 @@ test('invalidation cancels requests and late results cannot replace fresh conten
   h.refresh();
   assert.equal(h.calls[0].token.isCancellationRequested, true);
   assert.equal(await h.provider.provideTextDocumentContent(uri, token()), 'fresh proof');
-  old.resolve(result('old proof', 'file:///workspace/old.proof'));
+  old.resolve(result('old proof', 'file:///workspace/old.mlp'));
   await rejected;
   assert.equal(await h.provider.provideTextDocumentContent(uri, token()), 'fresh proof');
   assert.equal(h.links.provideDocumentLinks({ uri })[0].target.toString(), URI.parse(result().links[0].target).toString());

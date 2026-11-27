@@ -9,11 +9,11 @@
   %{bin:caravan}
   %{bin:raven}
   bounded_queue.ml
-  bounded_queue.proof
+  bounded_queue.mlp
   constructor_clients.ml
-  constructor_clients.proof
+  constructor_clients.mlp
   helper_clients.ml
-  helper_clients.proof
+  helper_clients.mlp
   wrap_prefix.ml
   wrap_harness.ml
   (glob_files ../backoff/*.mli)))

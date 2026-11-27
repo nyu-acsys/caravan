@@ -4,7 +4,9 @@
   %{bin:dune}
   (glob_files *.ml)
   (glob_files *.mli)
-  (glob_files *.proof)
+  (glob_files *.mlp)
+  ../translate/modules/opens.ml
+  ../translate/modules/opens.mlp
   check_editor_report.py
   check_member_status.py
   check_verification_cache.py

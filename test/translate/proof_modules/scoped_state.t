@@ -22,7 +22,7 @@ Past facts resolve the state in their own module.
 A past fact still requires its invariant, even when no view is mentioned.
 
   $ mkdir no_invariant
-  $ cp scoped_state_past.proof no_invariant/
+  $ cp scoped_state_past.mlp no_invariant/
   $ sed 's/requires live root/requires true/' scoped_state_past.ml > no_invariant/scoped_state_past.ml
   $ caravan --shh no_invariant/scoped_state_past.ml 2>&1 | grep -F 'which the precondition does not hold.'
   Type Error: A fact about an earlier state of left_live, which the precondition does not hold.

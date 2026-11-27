@@ -301,8 +301,8 @@ let rec pat_names (p : pat) =
   | Ptuple ps -> List.concat_map pat_names ps
   | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
 
-(** A step of a proof outline: ghost code at a place in a function, written in the
-    [.proof] file as [at (anchor) step] or [on return e]. *)
+(** A step of a proof outline: ghost code at a place in a function, written in the [.mlp]
+    file as [at (anchor) step] or [on return e]. *)
 type outline_step =
   | At of {
       anchor_loc : Location.t;
