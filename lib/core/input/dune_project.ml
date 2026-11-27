@@ -345,8 +345,11 @@ let rec remove_tree path =
         (fun name -> remove_tree (Stdlib.Filename.concat path name))
         (Stdlib.Sys.readdir path);
       Unix.rmdir path
-  | Unix.S_REG | Unix.S_CHR | Unix.S_BLK | Unix.S_LNK | Unix.S_FIFO | Unix.S_SOCK ->
+  | Unix.S_REG ->
+      (* Windows does not delete the read-only files Dune leaves in its build directory. *)
+      if Stdlib.Sys.win32 then Unix.chmod path 0o600;
       Unix.unlink path
+  | Unix.S_CHR | Unix.S_BLK | Unix.S_LNK | Unix.S_FIFO | Unix.S_SOCK -> Unix.unlink path
 
 let describe ~root executable =
   let query_dir = Stdlib.Filename.temp_dir ~perms:0o700 "caravan-dune-" "" in
