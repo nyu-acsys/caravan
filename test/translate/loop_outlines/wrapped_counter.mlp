@@ -1,0 +1,15 @@
+predicate counter (cell : int ref) (value : int) = own cell.contents value
+
+proof increment cell
+  requires (own cell.contents value && value < max_int)
+  ensures (own cell.contents (value + 1)) = ()
+
+proof count cell
+  requires (counter cell 0)
+  ensures (counter cell 10) =
+  at (increment cell) invariant (counter cell i);
+  at (increment cell) (fun step ->
+    unfold counter cell i;
+    let result = step () in
+    fold counter cell (i + 1);
+    result)

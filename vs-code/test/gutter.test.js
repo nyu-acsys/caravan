@@ -20,7 +20,7 @@ const diagnostic = (line, severity, message, relatedInformation = []) => ({
 
 test('gutter markers include cross-file related locations and choose the strongest marker per line', () => {
   const source = uri('file:///main.ml');
-  const proof = uri('file:///main.proof');
+  const proof = uri('file:///main.mlp');
   const related = { location: { uri: proof, range: range(3) }, message: 'Specification origin' };
   const entries = [
     [source, [diagnostic(1, 0, 'Failed assertion', [related]),
@@ -40,7 +40,7 @@ test('gutter markers include cross-file related locations and choose the stronge
 
 test('related locations receive a marker without a primary diagnostic in their file', () => {
   const source = uri('file:///main.ml');
-  const proof = uri('file:///main.proof');
+  const proof = uri('file:///main.mlp');
   const related = { location: { uri: proof, range: range(8) }, message: 'Inherited contract' };
   const result = gutterMarkers(proof, [[source, [diagnostic(2, 0, 'Failed', [related, related])]]]);
   assert.deepEqual([...result.related], [[8, ['Inherited contract']]]);

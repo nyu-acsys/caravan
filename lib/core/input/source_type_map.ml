@@ -192,9 +192,9 @@ let rec resource_schema (resource : proof_resource) =
         let+ value = declaration value in
         (name, id, value))
   and+ resource_operations =
-    list resource.resource_operations ~f:(fun (name, inputs, output) ->
+    list resource.resource_operations ~f:(fun (name, kind, inputs, output) ->
         let+ inputs = list inputs ~f:typ and+ output = typ output in
-        (name, inputs, output))
+        (name, kind, inputs, output))
   and+ resource_descriptor = descriptor resource.resource_descriptor
   and+ resource_aliases = list resource.resource_aliases ~f:descriptor
   and+ resource_public = option resource.resource_public ~f:resource_schema in

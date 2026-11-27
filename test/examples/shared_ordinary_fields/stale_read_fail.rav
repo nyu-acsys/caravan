@@ -1,0 +1,8 @@
+// Seeing a clear in the journal does not force the next read to choose it.
+proc latest_after_clear(initial: Int)
+{
+  val history := Example.Writes.create(Example.Raw.payload(initial));
+  Example.Writes.record(history, {Example.Raw.payload(initial)}, Example.Raw.discarded);
+  val raw := Example.Writes.sample(history, {Example.Raw.payload(initial), Example.Raw.discarded});
+  assert raw == Example.Raw.discarded;
+}

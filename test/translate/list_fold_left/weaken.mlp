@@ -1,0 +1,4 @@
+lemma weaken (owner : Ghost.t) (hi : Ghost.t set) (lo : Ghost.t set)
+  requires (Ghost.seen owner hi && Set.subset lo hi)
+  ensures (Ghost.seen owner hi && Ghost.seen owner lo) =
+  Ghost.weaken_view owner hi lo

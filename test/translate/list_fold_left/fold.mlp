@@ -1,0 +1,31 @@
+proof reset =
+  at (List.fold_left
+    (fun (current, marker) _value ->
+      Atomic.set current 0;
+      (current, marker))
+    (cell, ()) values)
+    invariant (fun (current, marker) remaining ->
+      current === cell && marker = () && own current 0)
+
+proof allocate =
+  at (List.fold_left
+    (fun _previous value -> Atomic.make value)
+    initial values)
+    invariant (fun accumulator remaining ->
+      exists previous : int. own accumulator previous);
+  at (Atomic.make value) (fun step -> let result = step () in result)
+
+proof saved =
+  at (Atomic.get cell) Ghost.State.scope (fun step () ->
+    let result = step () in (result, result));
+  at (List.fold_left
+    (fun current _value ->
+      let _ = Atomic.get current in
+      current)
+    cell values)
+    invariant (fun accumulator remaining saved ->
+      accumulator === cell && saved = value && own accumulator saved);
+  at (Atomic.get current) Ghost.State.scope (fun step known ->
+    let result = step () in
+    assert (result = known);
+    (result, known))

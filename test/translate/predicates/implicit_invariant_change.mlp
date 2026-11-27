@@ -1,0 +1,15 @@
+invariant shared (cell : int Atomic.t) (value [@implicit] : int) = own cell value
+
+proof result = create value ensures (shared result value) =
+  on return fold shared result value
+
+proof result = read [value : int] cell
+  requires (shared cell value) ensures (shared cell value && result = value) =
+  at (Atomic.get cell) (fun load ->
+    unfold shared cell value;
+    let result = load () in fold shared cell value; result)
+
+proof change cell requires (shared cell 0) ensures (shared cell 1) =
+  at (Atomic.set cell 1) (fun store ->
+    unfold shared cell 0;
+    let result = store () in fold shared cell 1; result)

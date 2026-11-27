@@ -1,0 +1,20 @@
+module Frozen = Ghost.Frozen (struct
+  let field (record : fields) = record.frozen
+end)
+
+module Resource : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = true
+end
+module Guard = Ghost.Mutex (Resource)
+
+proof checked value
+  requires (Ghost.Mutex.context self held)
+  ensures (Ghost.Mutex.context self held && result === value && value >= 0)
+  raises Negative -> (Ghost.Mutex.context self held && value < 0) = ()
+
+proof caught value ensures (result === (if value < 0 then 0 else value)) = ()
+
+proof repeat count
+  requires (Ghost.Mutex.context self held)
+  ensures (true) = ()

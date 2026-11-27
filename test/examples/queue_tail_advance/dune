@@ -20,15 +20,15 @@
 
 (copy_files ../../saturn/michael_scott_queue/*.mli)
 
-(copy_files ../../saturn/michael_scott_queue/*.proof)
+(copy_files ../../saturn/michael_scott_queue/*.mlp)
 
 (copy_files ../../saturn/michael_scott_queue_lseg/*.mli)
 
 (rule
- (target michael_scott_queue_lseg.proof)
+ (target michael_scott_queue_lseg.mlp)
  (deps
-  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.proof
-  segment_tail.proof)
+  ../../saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mlp
+  segment_tail.mlp)
  (action
   (with-stdout-to
    %{target}
@@ -40,9 +40,9 @@
   michael_scott_queue.ml
   michael_scott_queue.mli
   michael_scott_queue_intf.mli
-  michael_scott_queue.proof
+  michael_scott_queue.mlp
   michael_scott_queue_lseg.ml
   michael_scott_queue_lseg.mli
   michael_scott_queue_lseg_intf.mli
-  michael_scott_queue_lseg.proof
+  michael_scott_queue_lseg.mlp
   ../../saturn/backoff/backoff.mli))

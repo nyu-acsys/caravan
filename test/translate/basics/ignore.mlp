@@ -1,0 +1,3 @@
+proof write cell
+  requires (own cell true)
+  ensures (own cell false) = ()

@@ -1,0 +1,2 @@
+proof result = required token input ensures (true) = ()
+proof result = defaulted value token ensures (true) = ()

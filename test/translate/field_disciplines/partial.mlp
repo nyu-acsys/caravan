@@ -1,0 +1,7 @@
+module Original = Ghost.Frozen (struct
+  let field (record : Actual.t) = record.counter
+end)
+
+module Reexported = Ghost.Frozen (struct
+  let field (record : t) = record.counter
+end)

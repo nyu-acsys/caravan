@@ -31,7 +31,25 @@ type type_definition = {
   declaration : Typedtree.type_declaration;
   namespace : string list;
   paths : Path.t list;
+  field_substitution : Subst.t;
 }
+
+type field_type = {
+  path : Path.t;
+  declaration : Types.type_declaration;
+  substitution : Subst.t;
+  manifest_environment : Env.t option;
+}
+
+let field_type_of_definition (definition : type_definition) =
+  {
+    path = Path.Pident definition.declaration.typ_id;
+    declaration = definition.declaration.typ_type;
+    substitution = definition.field_substitution;
+    manifest_environment =
+      Option.map definition.declaration.typ_manifest ~f:(fun manifest ->
+          manifest.ctyp_env);
+  }
 
 type signature_resource = {
   declaration : Caravan_spec.Spec_ast.predicate;
@@ -53,6 +71,7 @@ type signature_module = {
 }
 
 and signature_view = {
+  signature_annotated : bool;
   signature_resources : (string * signature_resource) list;
   signature_ghost_modules : (string * signature_ghost_module) list;
   signature_values : (string * signature_value) list;
@@ -175,6 +194,8 @@ type t = {
   specializations : specialization list;
   definitions : specialization list;
   constraints : resource_constraint list;
+  field_disciplines : Field_disciplines.t list;
+  field_origins : (Field_disciplines.t * Field_disciplines.t) list;
   library_signatures : (Source.library * signature_view) list;
 }
 
@@ -195,6 +216,24 @@ let symbolic_binding inventory binding =
       && List.exists application.parameters ~f:(fun parameter ->
           same_binding parameter.argument binding))
 
+let field_origin inventory ~record_path ~position =
+  let rec declaration_path path =
+    match path with
+    | Path.Pextra_ty (parent, extra) -> Path.Pextra_ty (declaration_path parent, extra)
+    | _ ->
+        Option.value_map
+          (List.find inventory.types ~f:(fun definition ->
+               List.mem definition.paths path ~equal:Path.same))
+          ~default:path
+          ~f:(fun definition -> Path.Pident definition.declaration.typ_id)
+  in
+  let path = declaration_path record_path in
+  List.find_map inventory.field_origins ~f:(fun (alias, origin) ->
+      Option.some_if
+        (Path.same alias.Field_disciplines.record_path path
+        && Int.equal alias.position position)
+        origin)
+
 type module_view = {
   functor_definition : functor_definition option;
   checked : checked_binding ref option;
@@ -203,6 +242,7 @@ type module_view = {
       (** Nominal module identity, independent of the checked operation view. *)
   alias_target : Path.t option;
   values : (string * value ref) list;
+  included : value ref list;  (** The values an include of another module binds. *)
   types : (string * type_definition ref) list;
   modules : (string * module_view) list;
   modtypes : (string * signature_view) list;
@@ -223,6 +263,13 @@ type signature_origin = {
   annotations : Annotation.t list;
 }
 
+(** The module an include of [expression] names, if it names one by its path. *)
+let rec included_path (expression : Typedtree.module_expr) =
+  match expression.mod_desc with
+  | Tmod_ident (path, _) -> Some path
+  | Tmod_constraint (expression, _, _, _) -> included_path expression
+  | _ -> None
+
 let rec direct_body (expression : Typedtree.module_expr) =
   match expression.mod_desc with
   | Tmod_structure body -> Some body
@@ -231,6 +278,7 @@ let rec direct_body (expression : Typedtree.module_expr) =
 
 let empty_signature =
   {
+    signature_annotated = false;
     signature_resources = [];
     signature_ghost_modules = [];
     signature_values = [];
@@ -247,6 +295,7 @@ let empty_module =
     application_identity = None;
     alias_target = None;
     values = [];
+    included = [];
     types = [];
     modules = [];
     modtypes = [];
@@ -393,6 +442,7 @@ let merge_signature view included =
     List.fold right ~init:left ~f:(fun bindings (name, value) -> bind bindings name value)
   in
   {
+    signature_annotated = view.signature_annotated || included.signature_annotated;
     signature_values = merge view.signature_values (List.rev included.signature_values);
     signature_types = merge view.signature_types (List.rev included.signature_types);
     signature_resources = merge view.signature_resources included.signature_resources;
@@ -418,7 +468,7 @@ let scope location : Declaration_scope.t = { location }
 let build (source : Source.t) (structure : Typedtree.structure) :
     (t, Report.error) Result.t =
   let all_values = ref [] in
-  let all_types = ref [] in
+  let all_types : type_definition ref list ref = ref [] in
   let result_types : (Path.t * type_definition ref) list ref = ref [] in
   let aliases = ref [] in
   let bindings = ref [] in
@@ -432,6 +482,46 @@ let build (source : Source.t) (structure : Typedtree.structure) :
   let modtypes = ref [] in
   let imported_signatures = ref [] in
   let resolving_signatures = ref [] in
+  let field_checks = ref [] in
+  let check_field_disciplines = Source.visibility_required source in
+  let check_fields ~defining ~at ~environment signature actual =
+    if check_field_disciplines then
+      field_checks :=
+        ( defining,
+          at,
+          environment,
+          !parameter_substitution,
+          signature.signature_types,
+          actual )
+        :: !field_checks
+  in
+  let field_type view name =
+    Option.map (List.Assoc.find view.types name ~equal:String.equal) ~f:(fun definition ->
+        field_type_of_definition !definition)
+  in
+  let find_field_type environment path =
+    match
+      List.find !all_types ~f:(fun definition ->
+          Path.same path (Path.Pident !definition.declaration.typ_id)
+          || List.mem !definition.paths path ~equal:Path.same)
+    with
+    | Some definition -> Some (field_type_of_definition !definition)
+    | None -> (
+        try
+          Some
+            {
+              path;
+              declaration = Env.find_type path environment;
+              substitution = Subst.identity;
+              manifest_environment = None;
+            }
+        with Stdlib.Not_found -> None)
+  in
+  let argument_field_type view environment path name =
+    match field_type view name with
+    | Some _ as definition -> definition
+    | None -> find_field_type environment (Path.Pdot (path, name))
+  in
   let register registry path value =
     registry := (path, value) :: List.Assoc.remove !registry path ~equal:Path.same
   in
@@ -479,6 +569,46 @@ let build (source : Source.t) (structure : Typedtree.structure) :
     List.iter view.modules ~f:(fun (name, nested) ->
         publish (Path.Pdot (path, name)) nested)
   in
+  (* An included module's members are its own, under the include's identifiers. *)
+  let include_module ~at view included signature =
+    List.fold_result signature ~init:view ~f:(fun view (item : Types.signature_item) ->
+        let found = function
+          | Some member -> Ok member
+          | None -> unavailable at "An include of a module without a local implementation"
+        in
+        match item with
+        | Sig_value (id, _, _) ->
+            let name = Ident.name id in
+            let* value = found (member included.values name) in
+            value := { !value with paths = add_path !value.paths (Path.Pident id) };
+            Ok
+              {
+                view with
+                values = bind view.values name value;
+                included = value :: view.included;
+              }
+        | Sig_type (id, _, _, _) ->
+            let name = Ident.name id in
+            begin match member included.types name with
+            | Some definition ->
+                definition :=
+                  { !definition with paths = add_path !definition.paths (Path.Pident id) };
+                Ok { view with types = bind view.types name definition }
+            | None -> Ok view
+            end
+        | Sig_module (id, _, _, _, _) ->
+            let name = Ident.name id in
+            let* nested = found (member included.modules name) in
+            publish (Path.Pident id) nested;
+            Ok { view with modules = bind view.modules name nested }
+        | Sig_modtype (id, _, _) ->
+            let name = Ident.name id in
+            let* signature = found (member included.modtypes name) in
+            register modtypes (Path.Pident id) signature;
+            Ok { view with modtypes = bind view.modtypes name signature }
+        | Sig_typext _ -> Ok view
+        | Sig_class _ | Sig_class_type _ -> unavailable at "An include of a class")
+  in
   let resolve_module at env path =
     match lookup modules path with
     | Some view -> Ok view
@@ -494,7 +624,11 @@ let build (source : Source.t) (structure : Typedtree.structure) :
               | Pdot (parent, _) -> imported parent
               | Papply _ | Pextra_ty _ -> false
             in
-            if imported normalized then
+            if
+              imported normalized
+              || Mutex_primitives.is_module normalized
+              || Condition_primitives.is_module normalized
+            then
               begin try
                 let declaration = Env.find_module normalized env in
                 match Mtype.scrape env declaration.md_type with
@@ -739,7 +873,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       }
                 end
             | Tsig_attribute _ -> Ok view
-            | Tsig_open _ -> unavailable item.sig_loc "An open in a module signature"
+            | Tsig_open { open_expr = _, _; _ } -> Ok view
             | Tsig_include declaration ->
                 let* included =
                   signature_type ~imported all_annotations declaration.incl_mod
@@ -907,7 +1041,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       |> Result.all
     in
     items ghost_declarations
-      { empty_signature with signature_resources; signature_ghost_modules }
+      {
+        empty_signature with
+        signature_annotated = not (List.is_empty annotations);
+        signature_resources;
+        signature_ghost_modules;
+      }
       signature.sig_items
   in
   let signature_module_substitution substitution path signature =
@@ -940,6 +1079,63 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             signature_aliases Subst.identity path signature;
             Ok (library, signature))
     |> Result.all
+  in
+  let rec imported_fields owner (signature : signature_view) =
+    let* fields =
+      List.map signature.signature_types ~f:(fun (name, declaration) ->
+          match declaration.Typedtree.typ_kind with
+          | Ttype_record _ ->
+              let path = Path.Pdot (owner, name) in
+              let* origin_path, origin =
+                try
+                  let typ = Ctype.newconstr path declaration.typ_type.type_params in
+                  let path =
+                    match Types.get_desc (Ctype.expand_head source.env typ) with
+                    | Tconstr (path, _, _) -> path
+                    | _ -> path
+                  in
+                  Ok (path, Env.find_type path source.env)
+                with exn ->
+                  Error
+                    (Option.value (Report.of_exn exn)
+                       ~default:
+                         (Report.error Type declaration.typ_loc
+                            (Stdlib.Printexc.to_string exn)))
+              in
+              let* declared =
+                Field_disciplines.of_declaration path declaration.typ_type
+              in
+              let* origins = Field_disciplines.of_declaration origin_path origin in
+              List.map declared ~f:(fun field ->
+                  match List.find origins ~f:(Field_disciplines.same_slot field) with
+                  | None ->
+                      unavailable field.at
+                        "An imported record field without its declaration"
+                  | Some origin ->
+                      let* () =
+                        if Field_disciplines.shared [ field ] then
+                          Field_disciplines.check ~at:field.at ~expected:field
+                            ~actual:origin
+                        else Ok ()
+                      in
+                      Ok origin)
+              |> Result.all
+          | Ttype_abstract | Ttype_variant _ | Ttype_open | Ttype_external _ -> Ok [])
+      |> Result.all
+    in
+    let* nested =
+      List.map signature.signature_modules ~f:(fun (name, nested) ->
+          match nested.signature_alias with
+          | Some _ -> Ok []
+          | None -> imported_fields (Path.Pdot (owner, name)) nested.signature_body)
+      |> Result.all
+    in
+    Ok (List.concat fields @ List.concat nested)
+  in
+  let* imported_field_disciplines =
+    List.map library_signatures ~f:(fun (library, signature) ->
+        imported_fields (Path.Pident library.Source.library_id) signature)
+    |> Result.all |> Result.map ~f:List.concat
   in
   let actual_ghost_resource view name at =
     let rec owner_paths path =
@@ -994,7 +1190,7 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                in
                Subst.add_type id path substitution)))
   in
-  let substitutions ~at substitution signature view =
+  let substitutions ?owner ~at substitution signature view =
     let* substitution =
       List.fold_result signature.signature_types ~init:substitution
         ~f:(fun substitution (name, declaration) ->
@@ -1011,8 +1207,12 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           match member view.modules name with
           | None -> missing at name
           | Some view ->
+              let path =
+                Option.value_map owner ~default:view.identity ~f:(fun parent ->
+                    Some (Path.Pdot (parent, name)))
+              in
               Ok
-                (match (nested.signature_id, view.identity) with
+                (match (nested.signature_id, path) with
                 | Some id, Some path -> Subst.add_module id path substitution
                 | _ -> substitution))
     in
@@ -1026,9 +1226,55 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             Some (Path.Pident id)
         | _ -> None)
   in
-  let rec constrain ~restricts_visibility ~boundary ~result_owner at substitution
-      signature view =
+  let rec defining_structure (expression : Typedtree.module_expr) =
+    match expression.mod_desc with
+    | Tmod_structure structure -> Some structure
+    | Tmod_constraint (body, _, _, _) -> defining_structure body
+    | _ -> None
+  in
+  let nested_definition defining name =
+    Option.bind defining ~f:(fun (structure : Typedtree.structure) ->
+        List.find_map (List.rev structure.str_items) ~f:(fun item ->
+            match item.Typedtree.str_desc with
+            | Tstr_module { mb_name = { txt = Some member; _ }; mb_expr; _ }
+              when String.equal member name ->
+                Some (defining_structure mb_expr)
+            | _ -> None)
+        |> Option.join)
+  in
+  let declared (site : site) =
+    Annotation.contract_after ~scope:site.scope ~item_loc:site.item_loc ~next:site.next
+      site.annotations
+  in
+  let checked_view ?actual_path ~site ~namespace ~paths ~application_identity
+      ~parameter_substitution expected actual =
+    let* actual_path =
+      match Option.first_some actual_path actual.identity with
+      | Some path -> Ok path
+      | None -> unavailable site.item_loc "A checked module without a static path"
+    in
+    let binding =
+      ref { actual_path; parameter_substitution; expected; site; namespace; paths }
+    in
+    check_fields ~defining:None ~at:site.item_loc ~environment:site.environment expected
+      (argument_field_type actual site.environment actual_path);
+    bindings := binding :: !bindings;
+    Ok
+      {
+        empty_module with
+        checked = Some binding;
+        identity = actual.identity;
+        application_identity;
+      }
+  in
+  let rec constrain ~defining ~restricts_visibility ~boundary ~result_owner at
+      substitution signature view =
     if Option.is_some view.checked then
+      let () =
+        Option.iter view.identity ~f:(fun path ->
+            check_fields ~defining:None ~at ~environment:source.env signature
+              (argument_field_type view source.env path))
+      in
       begin match
         ( signature.signature_ghost_modules,
           signature.signature_resources,
@@ -1046,23 +1292,62 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       | [], [], [] -> Ok view
       end
     else
-      let* substitution = substitutions ~at substitution signature view in
-      constraints :=
-        {
-          owner = Option.first_some view.application_identity view.identity;
-          result_owner;
-          boundary;
-          signature;
-          substitution;
-          at;
-          restricts_visibility;
-        }
-        :: !constraints;
+      let* substitution =
+        substitutions
+          ?owner:(if restricts_visibility then None else result_owner)
+          ~at substitution signature view
+      in
+      check_fields ~defining ~at ~environment:source.env signature (field_type view);
+      let* checked_export =
+        if restricts_visibility || Option.is_none result_owner then Ok false
+        else
+          List.map signature.signature_values ~f:(fun (name, _) ->
+              match member view.values name with
+              | None -> Ok false
+              | Some value ->
+                  let* contracts =
+                    List.map
+                      (!value.site :: List.map !value.signatures ~f:(fun s -> s.site))
+                      ~f:declared
+                    |> Result.all
+                  in
+                  Ok (List.exists contracts ~f:Option.is_some))
+          |> Result.all
+          |> Result.map ~f:(List.exists ~f:Fn.id)
+      in
+      (* Checked exports carry their resources independently of the implementation. *)
+      if not checked_export then
+        constraints :=
+          {
+            owner = Option.first_some view.application_identity view.identity;
+            result_owner;
+            boundary;
+            signature;
+            substitution;
+            at;
+            restricts_visibility;
+          }
+          :: !constraints;
       let* values =
         List.map signature.signature_values ~f:(fun (name, signature_value) ->
             match member view.values name with
             | None -> missing signature_value.site.item_loc name
             | Some value ->
+                let* expected = declared signature_value.site in
+                let* own = declared !value.site in
+                let* previous =
+                  List.map !value.signatures ~f:(fun signature -> declared signature.site)
+                  |> Result.all
+                in
+                let* () =
+                  List.fold_result
+                    (Option.to_list own @ List.filter_opt previous)
+                    ~init:()
+                    ~f:(fun () (actual, annotation) ->
+                      Callable_contract.check ~at
+                        ~related:[ (annotation.loc, "Its other contract") ]
+                        ~expected:(Option.map expected ~f:fst) ~actual:(Some actual) ())
+                in
                 let declarations =
                   List.map signature.signature_ghost_modules ~f:(fun (_, ghost) ->
                       ghost.ghost_declaration)
@@ -1078,8 +1363,24 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                     site = { signature_value.site with environment };
                   }
                 in
-                value :=
-                  { !value with signatures = !value.signatures @ [ signature_value ] };
+                (* Existing declarations are the implementation of a checked export, as
+                   are those of an included module. *)
+                let implemented =
+                  Option.is_some own || List.exists previous ~f:Option.is_some
+                in
+                let included = List.mem view.included value ~equal:phys_equal in
+                let* () =
+                  match expected with
+                  | Some (_, annotation) when included && implemented ->
+                      Error
+                        (Report.error Type annotation.loc
+                           "A signature cannot give another contract to an included \
+                            function")
+                  | _ -> Ok ()
+                in
+                if not ((checked_export || included) && implemented) then
+                  value :=
+                    { !value with signatures = !value.signatures @ [ signature_value ] };
                 Ok (name, value))
         |> Result.all
       in
@@ -1108,14 +1409,16 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                           end
                     in
                     let* view =
-                      constrain ~restricts_visibility ~boundary ~result_owner at
-                        substitution signature.signature_body view
+                      constrain
+                        ~defining:(nested_definition defining name)
+                        ~restricts_visibility ~boundary ~result_owner at substitution
+                        signature.signature_body view
                     in
                     Ok (name, view)
                 end)
         |> Result.all
       in
-      Ok
+      let constrained =
         {
           view with
           values;
@@ -1123,10 +1426,30 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           modules = nested_modules;
           modtypes = signature.signature_modtypes;
         }
+      in
+      if not checked_export then Ok constrained
+      else
+        let path = Option.value_exn result_owner in
+        let site =
+          {
+            environment = source.env;
+            scope = scope at;
+            annotations = [];
+            item_loc = at;
+            next = None;
+          }
+        in
+        let* checked =
+          checked_view ~actual_path:path ~site
+            ~namespace:(String.split (Path.name path) ~on:'.')
+            ~paths:[ path ] ~application_identity:view.application_identity
+            ~parameter_substitution:substitution signature view
+        in
+        Ok { constrained with checked = checked.checked }
   in
-  let apply_signature ~restricts_visibility ~result_owner at signature view =
-    constrain ~restricts_visibility ~boundary:result_owner ~result_owner at Subst.identity
-      signature view
+  let apply_signature ~defining ~restricts_visibility ~result_owner at signature view =
+    constrain ~defining ~restricts_visibility ~boundary:result_owner ~result_owner at
+      Subst.identity signature view
   in
   let seal_application_identity path signature view =
     let rec identities substitution path signature =
@@ -1259,13 +1582,6 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 else
                   unavailable expression.mod_loc "Nested modules in a checked module view"
               in
-              let* actual_path =
-                match actual.identity with
-                | Some path -> Ok path
-                | None ->
-                    unavailable expression.mod_loc
-                      "A checked module without a static path"
-              in
               let site =
                 {
                   environment = expression.mod_env;
@@ -1275,25 +1591,8 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                   next = None;
                 }
               in
-              let binding =
-                ref
-                  {
-                    actual_path;
-                    parameter_substitution = !parameter_substitution;
-                    expected;
-                    site;
-                    namespace;
-                    paths = [];
-                  }
-              in
-              bindings := binding :: !bindings;
-              Ok
-                {
-                  empty_module with
-                  checked = Some binding;
-                  identity = actual.identity;
-                  application_identity = identity;
-                }
+              checked_view ~site ~namespace ~paths:[] ~application_identity:identity
+                ~parameter_substitution:!parameter_substitution expected actual
           end
         else
           let* view =
@@ -1303,8 +1602,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           | Tmodtype_explicit mty ->
               let* signature = signature_type ~imported:false annotations mty in
               let* view =
-                apply_signature ~restricts_visibility:true ~result_owner:identity
-                  mty.mty_loc signature view
+                apply_signature ~defining:(defining_structure body)
+                  ~restricts_visibility:true ~result_owner:identity mty.mty_loc signature
+                  view
               in
               Ok
                 (Option.value_map identity ~default:view ~f:(fun path ->
@@ -1396,6 +1696,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                           unavailable template.mod_loc "An anonymous functor parameter"
                     in
                     let path = Path.Pident parameter in
+                    check_fields ~defining:None ~at:template.mod_loc
+                      ~environment:body.mod_env expected
+                      (argument_field_type empty_module body.mod_env path);
                     let argument =
                       {
                         actual_path = path;
@@ -1622,6 +1925,9 @@ let build (source : Source.t) (structure : Typedtree.structure) :
           let* expected =
             signature_type ~imported:false definition.annotations parameter_type
           in
+          check_fields ~defining:None ~at:expression.mod_loc
+            ~environment:expression.mod_env expected
+            (argument_field_type actual expression.mod_env actual_path);
           let* substitution =
             ghost_substitutions ~implementation:false !parameter_substitution expected
               actual
@@ -1793,7 +2099,13 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                             definition
                         | None ->
                             let definition =
-                              ref { declaration; namespace; paths = [ path; key ] }
+                              ref
+                                {
+                                  declaration;
+                                  namespace;
+                                  paths = [ path; key ];
+                                  field_substitution = !parameter_substitution;
+                                }
                             in
                             register result_types key definition;
                             all_types := definition :: !all_types;
@@ -1870,8 +2182,15 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                       }
                 end
             | Tstr_attribute _ -> Ok view
-            | Tstr_open _ -> unavailable item.str_loc "An open declaration"
-            | Tstr_include _ -> unavailable item.str_loc "An include declaration"
+            | Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ } -> Ok view
+            | Tstr_open _ -> unavailable item.str_loc "An open of a module expression"
+            | Tstr_include { incl_mod; incl_type; _ } ->
+                begin match included_path incl_mod with
+                | None -> unavailable item.str_loc "An include of a module expression"
+                | Some path ->
+                    let* included = resolve_module item.str_loc environment path in
+                    include_module ~at:item.str_loc view included incl_type
+                end
             | Tstr_recmodule _ -> unavailable item.str_loc "Recursive module bindings"
             | Tstr_eval _ -> unavailable item.str_loc "A module initializer"
             | Tstr_primitive _ -> unavailable item.str_loc "An external value declaration"
@@ -1901,11 +2220,56 @@ let build (source : Source.t) (structure : Typedtree.structure) :
                 interface.scope typed
             in
             let* _ =
-              apply_signature ~restricts_visibility:false ~result_owner:None
-                interface.scope.location signature view
+              apply_signature ~defining:(Some structure) ~restricts_visibility:false
+                ~result_owner:None interface.scope.location signature view
             in
             Ok ()
         end
+  in
+  (* Companion predicates complete signatures without proof annotations. *)
+  let constraints =
+    let constraints = List.rev !constraints in
+    let companion =
+      List.filter constraints ~f:(fun constraint_ -> not constraint_.restricts_visibility)
+    in
+    let rec unannotated signature =
+      (not signature.signature_annotated)
+      && List.for_all signature.signature_modules ~f:(fun (_, nested) ->
+          unannotated nested.signature_body)
+      && List.for_all signature.signature_modtypes ~f:(fun (_, nested) ->
+          unannotated nested)
+    in
+    let rec overlay owner signature =
+      if not (unannotated signature) then signature
+      else
+        let resources =
+          List.find_map companion ~f:(fun constraint_ ->
+              Option.some_if (Option.equal Path.same owner constraint_.owner) constraint_)
+          |> Option.value_map ~default:signature.signature_resources
+               ~f:(fun constraint_ ->
+                 List.map constraint_.signature.signature_resources
+                   ~f:(fun (name, resource) ->
+                     ( name,
+                       {
+                         resource with
+                         substitution =
+                           Subst.compose resource.substitution constraint_.substitution;
+                       } )))
+        in
+        let modules =
+          List.map signature.signature_modules ~f:(fun (name, nested) ->
+              let owner =
+                Option.value_map owner ~default:(root_module_path name) ~f:(fun owner ->
+                    Some (Path.Pdot (owner, name)))
+              in
+              (name, { nested with signature_body = overlay owner nested.signature_body }))
+        in
+        { signature with signature_resources = resources; signature_modules = modules }
+    in
+    List.map constraints ~f:(fun constraint_ ->
+        if constraint_.restricts_visibility then
+          { constraint_ with signature = overlay constraint_.owner constraint_.signature }
+        else constraint_)
   in
   let definitions =
     let current_binding binding =
@@ -1926,6 +2290,162 @@ let build (source : Source.t) (structure : Typedtree.structure) :
             List.map definition.parameters ~f:(fun stage ->
                 { stage with argument = current_binding stage.argument });
         })
+  in
+  let field_aliases = ref [] in
+  let rec project_path substitutions seen path =
+    let projected =
+      List.fold substitutions ~init:path ~f:(fun path substitution ->
+          Subst.type_path substitution path)
+    in
+    if Path.same path projected || List.mem seen projected ~equal:Path.same then path
+    else project_path substitutions (path :: seen) projected
+  in
+  let rec field_layout environment substitutions seen
+      ({ path; declaration; substitution; manifest_environment } : field_type) =
+    let open Types in
+    let substitutions = substitution :: substitutions in
+    let* declared = Field_disciplines.of_declaration path declaration in
+    match Option.map declaration.type_manifest ~f:get_desc with
+    | Some (Tconstr (origin, _, _)) ->
+        let origin = project_path substitutions [] origin in
+        let seen = path :: seen in
+        let definition =
+          if List.mem seen origin ~equal:Path.same then None
+          else
+            match find_field_type environment origin with
+            | Some _ as definition -> definition
+            | None ->
+                Option.bind manifest_environment ~f:(fun environment ->
+                    find_field_type environment origin)
+        in
+        begin match definition with
+        | None ->
+            begin match declared with
+            | [] -> Ok []
+            | field :: _ ->
+                Report.unsupported field.at
+                  "A record alias with an unresolved field origin"
+            end
+        | Some definition ->
+            let* inherited = field_layout environment substitutions seen definition in
+            List.iter declared ~f:(fun field ->
+                Option.iter
+                  (List.find inherited ~f:(Field_disciplines.same_slot field))
+                  ~f:(fun origin -> field_aliases := (field, origin) :: !field_aliases));
+            Ok inherited
+        end
+    | _ -> Ok declared
+  in
+  let* comparisons =
+    List.rev !field_checks
+    |> List.map ~f:(fun (defining, at, environment, substitution, declarations, actual) ->
+        List.map declarations
+          ~f:(fun (name, (declaration : Typedtree.type_declaration)) ->
+            let* expected =
+              field_layout environment [ substitution ] []
+                {
+                  path = Path.Pident declaration.typ_id;
+                  declaration = declaration.typ_type;
+                  substitution = Subst.identity;
+                  manifest_environment =
+                    Option.map declaration.typ_manifest ~f:(fun manifest ->
+                        manifest.ctyp_env);
+                }
+            in
+            match expected with
+            | [] -> Ok []
+            | _ ->
+                let* definition =
+                  match actual name with
+                  | Some definition -> Ok definition
+                  | None -> missing at name
+                in
+                let can_define =
+                  match definition with
+                  | {
+                   path = Path.Pident id;
+                   declaration = { type_manifest = None; _ };
+                   _;
+                  } ->
+                      Option.exists defining ~f:(fun structure ->
+                          List.Assoc.mem
+                            (Source.source_type_ids structure)
+                            id ~equal:Ident.same)
+                  | _ -> false
+                in
+                let* actual = field_layout environment [ substitution ] [] definition in
+                let* fields =
+                  List.map expected ~f:(fun expected ->
+                      match
+                        List.find actual ~f:(fun actual ->
+                            Field_disciplines.same_slot expected actual)
+                      with
+                      | Some actual ->
+                          Ok
+                            ( can_define,
+                              at,
+                              Option.is_some declaration.typ_type.type_manifest,
+                              expected,
+                              actual )
+                      | None -> missing at expected.label)
+                  |> Result.all
+                in
+                Ok fields)
+        |> Result.all)
+    |> Result.all
+    |> Result.map ~f:(fun checks -> List.concat_map checks ~f:List.concat)
+  in
+  let* () =
+    if not check_field_disciplines then Ok ()
+    else
+      List.fold_result !all_types ~init:() ~f:(fun () definition ->
+          let declaration = !definition.declaration in
+          match (declaration.typ_manifest, declaration.typ_kind) with
+          | Some manifest, (Ttype_record _ | Ttype_variant _) ->
+              Result.map
+                (field_layout manifest.ctyp_env [] []
+                   (field_type_of_definition !definition))
+                ~f:(fun _ -> ())
+          | _ -> Ok ())
+  in
+  let projections =
+    List.filter_map comparisons ~f:(fun (can_define, _, inherited, expected, actual) ->
+        if
+          (not inherited)
+          && Poly.equal actual.kind Field_disciplines.Ordinary
+          && Field_disciplines.shared [ expected ]
+          && can_define
+        then Some (actual.label_id, expected)
+        else None)
+  in
+  let projected (field : Field_disciplines.t) =
+    match List.Assoc.find projections field.label_id ~equal:Ident.same with
+    | None -> field
+    | Some declaration ->
+        { field with kind = declaration.kind; raw = declaration.raw; at = declaration.at }
+  in
+  let effective (field : Field_disciplines.t) =
+    match
+      List.find !field_aliases ~f:(fun (alias, _) ->
+          Ident.same alias.Field_disciplines.label_id field.label_id)
+    with
+    | None -> projected field
+    | Some (_, origin) ->
+        let origin = projected origin in
+        { field with kind = origin.kind; raw = origin.raw; at = origin.at }
+  in
+  let* () =
+    List.fold_result !field_aliases ~init:() ~f:(fun () (expected, actual) ->
+        if Field_disciplines.shared [ expected ] then
+          Field_disciplines.check ~at:expected.at ~expected ~actual:(projected actual)
+        else Ok ())
+  in
+  let* () =
+    List.fold_result comparisons ~init:()
+      ~f:(fun () (_, at, inherited, expected, actual) ->
+        Field_disciplines.check ~at
+          ~expected:(if inherited then effective expected else expected)
+          ~actual:(effective actual))
   in
   Ok
     {
@@ -1973,7 +2493,17 @@ let build (source : Source.t) (structure : Typedtree.structure) :
       types = List.rev_map !all_types ~f:(fun definition -> !definition);
       aliases = List.rev !aliases;
       bindings = List.rev_map !bindings ~f:(fun binding -> !binding);
-      constraints = List.rev !constraints;
+      constraints;
+      field_disciplines =
+        List.map (source.field_disciplines @ imported_field_disciplines) ~f:effective
+        |> List.stable_dedup ~compare:(fun left right ->
+            let order =
+              Path.compare left.Field_disciplines.record_path
+                right.Field_disciplines.record_path
+            in
+            if order = 0 then Int.compare left.position right.position else order);
+      field_origins =
+        List.map !field_aliases ~f:(fun (alias, origin) -> (alias, projected origin));
       library_signatures;
       specializations =
         List.rev_map !specializations

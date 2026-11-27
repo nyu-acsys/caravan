@@ -13,7 +13,8 @@
   ../saturn/backoff/backoff.mli
   ../translate/libraries/include_dirs/backoff.mli
   ../saturn/treiber_stack/treiber_stack.ml
-  ../saturn/treiber_stack/treiber_stack.mli))
+  ../saturn/treiber_stack/treiber_stack.mli
+  ../saturn/stack_drain/stack_drain.ml))
 
 (test
  (name diagnostics)
@@ -23,6 +24,11 @@
 (test
  (name function_types)
  (modules function_types)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name worker_groups)
+ (modules worker_groups)
  (libraries base caravan_core compiler-libs.common))
 
 (test
@@ -49,7 +55,7 @@
  (name annotation_env)
  (modules annotation_env)
  (libraries base caravan_core compiler-libs.common)
- (deps annotation_env_fixture.ml annotation_env_fixture.proof))
+ (deps annotation_env_fixture.ml annotation_env_fixture.mlp))
 
 (test
  (name monotone_history)
@@ -76,6 +82,9 @@
  (modules source_parity)
  (libraries base stdio compiler-libs.common)
  (deps
+  ../saturn/bounded_queue/bounded_queue.ml
+  ../moonpool/parker/parker_.ml
+  ../ocaml5_tutorial/blocking_stack/blocking_stack.ml
   ../saturn/michael_scott_queue/michael_scott_queue.ml
   ../saturn/michael_scott_queue/michael_scott_queue.mli
   ../saturn/michael_scott_queue/michael_scott_queue_intf.mli
@@ -105,3 +114,67 @@
   caravan_spec
   compiler-libs.common
   raven-ivl.api))
+
+(test
+ (name domain_contract)
+ (modules domain_contract)
+ (libraries caravan_core raven-ivl.api))
+
+(test
+ (name visibility_contract)
+ (modules visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name domain_visibility_contract)
+ (modules domain_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name shared_field_selectors)
+ (modules shared_field_selectors)
+ (libraries base caravan_core caravan_spec compiler-libs.common)
+ (deps
+  shared_fields_fixture.ml
+  shared_fields_fixture.mlp
+  shared_fields_alias_conflict_fixture.ml
+  shared_fields_alias_conflict_fixture.mlp
+  shared_fields_alias_duplicate_fixture.ml
+  shared_fields_alias_duplicate_fixture.mlp
+  ../translate/field_disciplines/partial.ml
+  ../translate/field_disciplines/partial.mlp))
+
+(test
+ (name atomic_visibility_contract)
+ (modules atomic_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name frozen_visibility_contract)
+ (modules frozen_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name field_disciplines)
+ (modules field_disciplines)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name mutex_visibility_contract)
+ (modules mutex_visibility_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name generic_parameters)
+ (modules generic_parameters)
+ (libraries base caravan_core compiler-libs.common))
+
+(test
+ (name relaxed_fields_contract)
+ (modules relaxed_fields_contract)
+ (libraries base caravan_core raven-ivl.api))
+
+(test
+ (name raw_contract)
+ (modules raw_contract)
+ (libraries base caravan_core caravan_spec compiler-libs.common))

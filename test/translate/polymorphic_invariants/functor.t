@@ -15,7 +15,7 @@ The native generic payload remains rigid under a concrete cast.
 
   $ mkdir bad_cast
   $ cp functor.ml bad_cast/
-  $ sed 's/value = value }/value = (value : bool) }/' functor.proof > bad_cast/functor.proof
+  $ sed 's/value = value }/value = (value : bool) }/' functor.mlp > bad_cast/functor.mlp
   $ caravan --shh bad_cast/functor.ml > bad_cast.out 2>&1
   [1]
   $ grep -Eq 'Type Error:|Unsupported Error: This polymorphic function occurrence or signature alias is not supported yet' bad_cast.out

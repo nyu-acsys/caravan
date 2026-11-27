@@ -1,0 +1,8 @@
+module Box = struct
+  predicate visible (value : t) = true
+  predicate hidden (value : t) = true
+end
+
+proof client value = ()
+
+lemma leak (value : Box.t) requires (Box.hidden value) = ()

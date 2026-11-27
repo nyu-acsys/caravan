@@ -1,0 +1,2 @@
+module First = Ghost.Relaxed (struct let field (cell : cell) = cell.first end)
+module Second = Ghost.Relaxed (struct let field (cell : cell) = cell.second end)

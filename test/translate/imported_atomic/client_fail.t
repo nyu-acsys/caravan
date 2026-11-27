@@ -51,7 +51,7 @@ Ordinary preconditions cannot be borrowed from an open invariant across the call
 Predicate declarations must match ordinary predicate definitions.
 
   $ caravan --shh invariant_mismatch.ml
-  [Error] File "invariant_mismatch.proof", line 1, columns 10-14:
+  [Error] File "invariant_mismatch.mlp", line 1, columns 10-14:
   1 | invariant held (cell : t) = own cell.contents 0
                 ^^^^
   Type Error: The predicate held must be defined as an ordinary predicate.

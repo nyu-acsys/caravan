@@ -50,6 +50,7 @@
         "atomic", ATOMIC;
         "begin", BEGIN;
         "commit", COMMIT;
+        "cut", CUT;
         "rec", REC;
         "fold", FOLD;
         "fun", FUN;
@@ -57,6 +58,7 @@
         "initially", INITIALLY;
         "invariant", INVARIANT;
         "let", LET;
+        "list_segment", LIST_SEGMENT;
         "lemma", LEMMA;
         "match", MATCH;
         "mod", OP3 "mod";
@@ -64,6 +66,7 @@
         "not", NOT;
         "of", OF;
         "old", OLD;
+        "opens", OPENS;
         "performs", PERFORMS;
         "predicate", PREDICATE;
         "proof", PROOF;
@@ -75,6 +78,7 @@
         "struct", STRUCT;
         "then", THEN;
         "type", TYPE;
+        "nonrec", NONREC;
         "true", TRUE;
         "unfold", UNFOLD;
         "variant", VARIANT;
@@ -192,6 +196,10 @@ let op_char_34   = op_char_3 | op_char_4
 let op_char_pref = ['!' '?']
 
 rule token = parse
+  | "~writer"
+      { WRITER }
+  | "~release"
+      { RELEASE }
   | "~fraction"
       { FRACTION }
   | "Set.of_predicate"
@@ -270,6 +278,8 @@ rule token = parse
       { QUOTE_LIDENT id }
   | "`" (lident as id) "`"
       { BACKQUOTE_LIDENT id }
+  | "`" ((lident | uident) as id)
+      { POLY_TAG id }
   | '_'
       { UNDERSCORE }
   | lident as id

@@ -1,0 +1,15 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+
+invariant slot (target : cell) (spare : cell) =
+  exists occupied : bool. if occupied then own spare.value 0 else own target.value 42
+
+proof result = overwrite channel target spare
+  requires (slot target spare && own spare.value 0 && own channel 0)
+  ensures (slot target spare && own ~writer:Ghost.self target.value 1 &&
+    own channel 0 && result === 1) =
+  at (Atomic.get channel) (fun load ->
+    let occupied = unfold slot target spare {occupied} in
+    let result = load () in
+    assert (own target.value 42);
+    fold slot target spare {occupied = true};
+    result)

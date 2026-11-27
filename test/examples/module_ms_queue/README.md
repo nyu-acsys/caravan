@@ -8,7 +8,7 @@ that alias.
 Dune wraps the implementation, interface contracts, and companion proof directly
 from `test/saturn/michael_scott_queue`. The implementation and proof bodies need
 no additional annotations. The generated `module_queue.ml` and
-`module_queue.proof` exercise scoped state records, views, actions, histories,
+`module_queue.mlp` exercise scoped state records, views, actions, histories,
 helping, recursive builder predicates, and auxiliary lemmas together. The canonical
 Saturn sources remain separate.
 

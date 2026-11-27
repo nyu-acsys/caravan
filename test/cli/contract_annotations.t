@@ -14,7 +14,7 @@ Proof headers point into the original proof file, despite their implementation a
 CRLF proof headers preserve their multiline source text and byte ranges.
 
   $ cp editor_proof_contract.ml editor_proof_crlf.ml
-  $ python3 -c 'from pathlib import Path; source = Path("editor_proof_contract.proof").read_bytes(); Path("editor_proof_crlf.proof").write_bytes(source.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))'
+  $ python3 -c 'from pathlib import Path; source = Path("editor_proof_contract.mlp").read_bytes(); Path("editor_proof_crlf.mlp").write_bytes(source.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))'
   $ caravan --lsp-mode --lsp-annotations --lsp-annotations-only editor_proof_crlf.ml > proof_crlf.json
   $ python3 check_contract_annotations.py proof proof_crlf.json
 

@@ -1,0 +1,2 @@
+proof result = proved token ensures (result === 1) =
+  on return assert false

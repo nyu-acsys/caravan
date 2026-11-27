@@ -1,0 +1,76 @@
+module Total = Ghost.Frozen (struct let field (job : job) = job.total end)
+module Progress = Ghost.Relaxed (struct let field (job : job) = job.completed end)
+
+invariant progress (job : job) (limit : int) =
+  exists current : int, all : (Ghost.t * int) set, eligible : (Ghost.t * int) set.
+    Progress.shared_state job current all eligible &&
+    (forall event : Ghost.t, value : int.
+      Set.mem (event, value) all -> -1 <= value && value <= limit) &&
+    (forall event : Ghost.t, value : int.
+      Set.mem (event, value) eligible -> 0 <= value && value <= limit)
+
+proof result = create id total
+  requires total >= 0
+  ensures Total.visible Ghost.self result total && progress result total &&
+    Progress.visible Ghost.self result =
+  on return begin
+    Total.freeze job;
+    let (event, all) = Progress.snapshot job in
+    let _cut = Progress.publish job in
+    fold progress job total {current = 0; all = all; eligible = Set.singleton (event, 0)}
+  end
+
+proof result = workload job
+  requires Total.visible Ghost.self job total
+  ensures Total.visible Ghost.self job total && result === total =
+  at (job.total) Ghost.frozen_scope (fun read -> let result = read () in result)
+
+proof result = sample [limit : int] job
+  requires progress job limit && Progress.visible Ghost.self job
+  ensures progress job limit && Progress.visible Ghost.self job &&
+    0 <= result && result <= limit =
+  at (job.completed) Ghost.published_scope (fun read ->
+    let (current, all, eligible) = unfold progress job limit {current; all; eligible} in
+    let result = read () in
+    let event = Progress.observe job result in
+    assert (Set.mem (event, result) eligible);
+    assert (0 <= result && result <= limit);
+    fold progress job limit {current = current; all = all; eligible = eligible};
+    result)
+
+proof result = sample_unrestricted [limit : int] job
+  requires progress job limit
+  ensures progress job limit && -1 <= result && result <= limit =
+  at (job.completed) (fun read ->
+    let (current, all, eligible) = unfold progress job limit {current; all; eligible} in
+    let result = read () in
+    let event = Progress.observe job result in
+    assert (Set.mem (event, result) all);
+    assert (-1 <= result && result <= limit);
+    fold progress job limit {current = current; all = all; eligible = eligible};
+    result)
+
+proof set_completed [limit : int] job value
+  requires progress job limit && 0 <= value && value <= limit
+  ensures progress job limit =
+  at (job.completed <- value) (fun store ->
+    let (current, all, eligible) = unfold progress job limit {current; all; eligible} in
+    let result = store () in
+    let (event, updated) = Progress.snapshot job in
+    fold progress job limit {current = value; all = updated;
+      eligible = Set.union eligible (Set.singleton (event, value))};
+    result)
+
+proof finish job
+  opens {Total.frozen job; progress job limit}
+  requires Total.visible Ghost.self job limit && progress job limit && limit >= 0
+  ensures Total.visible Ghost.self job limit && progress job limit =
+  at (set_completed job total) (fun store -> let result = store limit in result)
+
+module Worker = Ghost.Task (struct let operation = finish end)
+
+proof result = client total
+  opens {Total.frozen; progress}
+  requires total >= 0
+  ensures 0 <= result && result <= total =
+  at (sample job) (fun read -> let result = read total in result)

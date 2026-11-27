@@ -1,0 +1,26 @@
+invariant shared (cell : ('a, [ `Node ]) node Atomic.t) =
+  exists stored : ('a, [ `Node ]) node. own cell stored
+
+proof result = create value ensures (shared result) =
+  on return fold shared result {stored = value}
+
+proof result = access cell replacement mode
+  requires (shared cell)
+  ensures (shared cell) =
+  at (Atomic.get cell) (fun read ->
+    let stored = unfold shared cell {stored} in
+    let result = read () in
+    fold shared cell {stored = stored};
+    result);
+  at (Atomic.compare_and_set cell previous replacement) (fun cas ->
+    let stored = unfold shared cell {stored} in
+    let result = cas () in
+    fold shared cell {stored = (if result then replacement else stored)};
+    result)
+
+proof result = broad_get cell
+  requires (own cell value)
+  ensures (own cell value && result === value) = ()
+
+proof result = null_client () ensures (result === Null) = ()
+proof client value = ()

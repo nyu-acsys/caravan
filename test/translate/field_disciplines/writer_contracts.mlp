@@ -1,0 +1,17 @@
+predicate owned_by (cell : cell) (value : int) (writer : Ghost.t) =
+  own ~writer:writer cell.value value
+
+lemma pack (cell : cell) (value : int) (writer : Ghost.t)
+  requires (own ~writer:writer cell.value value)
+  ensures (owned_by cell value writer) =
+  fold owned_by cell value writer
+
+lemma unpack (cell : cell) (value : int) (writer : Ghost.t)
+  requires (owned_by cell value writer)
+  ensures (own ~writer:writer cell.value value) =
+  unfold owned_by cell value writer
+
+lemma forget (cell : cell) (value : int) (writer : Ghost.t)
+  requires (owned_by cell value writer)
+  ensures (own cell.value value) =
+  unfold owned_by cell value writer

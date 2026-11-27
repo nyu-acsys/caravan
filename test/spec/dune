@@ -5,3 +5,27 @@
 (test
  (name lemma)
  (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name rows)
+ (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name shared_fields)
+ (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name own_labels)
+ (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name raw_headers)
+ (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name executable_opens)
+ (libraries caravan_spec compiler-libs.common))
+
+(test
+ (name proof_clauses)
+ (libraries caravan_spec compiler-libs.common))

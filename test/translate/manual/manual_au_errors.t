@@ -2,7 +2,7 @@
   [Error] File "manual_au_double_open_fail.ml", line 5, columns 20-42:
   5 |     let duplicate = Read.access token cell in
                           ^^^^^^^^^^^^^^^^^^^^^^
-  Verification Error: Atomic token token is already open.
+  Verification Error: Cannot open atomic token token while another atomic update is still open; commit or abort it first.
   [1]
   $ caravan --shh manual_au_double_commit_fail.ml
   [Error] File "manual_au_double_commit_fail.ml", line 9, columns 4-33:

@@ -1,0 +1,1 @@
+proof compare condition mutex requires (condition === mutex) ensures (true) = ()

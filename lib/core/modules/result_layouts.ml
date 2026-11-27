@@ -32,13 +32,16 @@ let plan types groups =
                                (group.representative.identity, declaration.typ_name.txt))
                         in
                         let fields =
-                          Option.value_map representative ~default:[] ~f:(fun d ->
-                              Option.value d.Datatypes.heap ~default:[])
+                          Option.value_map representative ~default:[]
+                            ~f:Datatypes.all_fields
                         in
                         { group; application; declaration; concrete; fields })
                 | _ -> None)))
 
-let same_type a b = Option.equal Ident.same a.Datatypes.id b.Datatypes.id
+let same_type a b =
+  match (a.Datatypes.id, b.Datatypes.id) with
+  | Some left, Some right -> Ident.same left right
+  | None, _ | _, None -> false
 
 let owner layouts entry =
   (List.find_exn layouts ~f:(fun other -> same_type entry.concrete other.concrete))
@@ -51,6 +54,20 @@ let descriptor entry ~owner =
   Result.map source ~f:(fun source ->
       let module_name = data_name entry in
       let module_path = owner @ [ module_name ] in
+      let field (field : Datatypes.field) =
+        let canonical =
+          List.find_exn entry.fields ~f:(fun candidate ->
+              String.equal candidate.Datatypes.label field.label
+              && Option.equal String.equal candidate.constructor field.constructor)
+        in
+        {
+          field with
+          raven_field = String.concat ~sep:"." (owner @ [ canonical.raven_field ]);
+        }
+      in
+      let inline_record (record : Datatypes.inline_record) =
+        { record with record_fields = List.map record.record_fields ~f:field }
+      in
       {
         source with
         module_name;
@@ -59,19 +76,14 @@ let descriptor entry ~owner =
         backend_type =
           Option.some_if (Option.is_none source.heap)
             Qualified_name.{ path = module_path; name = "T" };
-        heap =
-          Option.map source.heap
-            ~f:
-              (List.map ~f:(fun (field : Datatypes.field) ->
-                   let canonical =
-                     List.find_exn entry.fields ~f:(fun candidate ->
-                         String.equal candidate.Datatypes.label field.label)
-                   in
-                   {
-                     field with
-                     raven_field =
-                       String.concat ~sep:"." (owner @ [ canonical.raven_field ]);
-                   }));
+        heap = Option.map source.heap ~f:(List.map ~f:field);
+        ctors =
+          List.map source.ctors ~f:(fun constructor ->
+              {
+                constructor with
+                Datatypes.inline_record =
+                  Option.map constructor.inline_record ~f:inline_record;
+              });
       })
 
 let concrete layouts types =
@@ -82,32 +94,20 @@ let concrete layouts types =
           Result.bind
             (descriptor entry ~owner:(String.split (owner layouts entry).layout ~on:'.'))
             ~f:(fun representation ->
-              let rebind typ =
-                match
-                  Datatypes.instantiate_alias representation.parameters data.parameters
-                    typ
-                with
-                | Some typ -> Ok typ
-                | None ->
-                    Report.unsupported data.at
-                      "A datatype layout with incompatible parameters"
-              in
-              let ctors =
-                List.map representation.ctors ~f:(fun ctor ->
-                    Result.map
-                      (Result.all (List.map ctor.args ~f:rebind))
-                      ~f:(fun args -> { ctor with args }))
-                |> Result.all
-              in
-              Result.map ctors ~f:(fun ctors ->
-                  {
-                    data with
-                    module_path = representation.module_path;
-                    cell_namespace = representation.cell_namespace;
-                    backend_type = representation.backend_type;
-                    ctors;
-                    heap = representation.heap;
-                  })))
+              match Datatypes.instantiate representation data.parameters with
+              | None ->
+                  Report.unsupported data.at
+                    "A datatype layout with incompatible parameters"
+              | Some representation ->
+                  Ok
+                    {
+                      data with
+                      module_path = representation.module_path;
+                      cell_namespace = representation.cell_namespace;
+                      backend_type = representation.backend_type;
+                      ctors = representation.ctors;
+                      heap = representation.heap;
+                    }))
   |> Result.all
 
 let symbolic layouts group ~owner =
@@ -156,4 +156,4 @@ let type_dependencies ?(additional = fun _ -> []) layouts types =
 let dependencies ?additional layouts types data =
   let collect = type_dependencies ?additional layouts types in
   List.concat_map data.Datatypes.ctors ~f:(fun c -> List.concat_map c.args ~f:collect)
-  @ List.concat_map (Option.value data.heap ~default:[]) ~f:(fun f -> collect f.typ)
+  @ List.concat_map (Datatypes.all_fields data) ~f:(fun field -> collect field.typ)

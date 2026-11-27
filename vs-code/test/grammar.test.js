@@ -54,7 +54,7 @@ const lacks = (line, text, scope) => assert.ok(!scopes(line, text).includes(scop
 
 test('all and only specification lexer keywords receive categorized Caravan scopes', async () => {
   const source = fs.readFileSync(path.join(root, '../lib/spec/spec_lexer.mll'), 'utf8').split('(* to translate')[0];
-  const words = [...source.matchAll(/"([a-z]+)",\s*(?:[A-Z]|OP)/g)].map(match => match[1]);
+  const words = [...source.matchAll(/"([a-z_]+)",\s*(?:[A-Z]|OP)/g)].map(match => match[1]);
   assert.ok(words.length > 40);
   const g = await grammar('source.caravan.proof');
   for (const word of words) {

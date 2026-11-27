@@ -4,7 +4,7 @@ import type { Hover, MarkupContent } from 'vscode-languageserver/node';
 import type { NormalizedContract, Position, SourceLocation } from './report';
 
 function externalContract(contract: NormalizedContract, root: string): boolean {
-	return contract.location.file === root && /\.(mli|proof)$/.test(contract.sourceLocation.file);
+	return contract.location.file === root && /\.(mli|mlp|proof)$/.test(contract.sourceLocation.file);
 }
 
 export function sourceExcerpt(location: SourceLocation, readText: (file: string) => string | undefined): string | undefined {

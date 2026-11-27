@@ -1,0 +1,10 @@
+(library
+ (name caravan_case_study_generic_striped_hash_set)
+ (wrapped false)
+ (modules generic_striped_hash_set))
+
+(cram
+ (deps
+  %{bin:caravan}
+  (glob_files *.ml)
+  (glob_files *.mlp)))

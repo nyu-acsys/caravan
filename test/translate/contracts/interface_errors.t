@@ -17,7 +17,7 @@ Interfaces and proofs that do not fit their implementation; each file has its ow
   Related Location: Its contract in the interface.
   [1]
   $ caravan --shh interface_error_3.ml
-  [Error] File "interface_error_3.proof", line 1, columns 10-17:
+  [Error] File "interface_error_3.mlp", line 1, columns 10-17:
   1 | predicate is_lock (l : t) (b : int) = own l true && b = 0
                 ^^^^^^^
   Type Error: The predicate is_lock is defined with other parameter types than it is declared with.
@@ -27,7 +27,7 @@ Interfaces and proofs that do not fit their implementation; each file has its ow
   Related Location: Its declaration.
   [1]
   $ caravan --shh interface_error_4.ml
-  [Error] File "interface_error_4.proof", line 1, columns 10-17:
+  [Error] File "interface_error_4.mlp", line 1, columns 10-17:
   1 | predicate is_lock (l : t) (b : bool) = own l b
                 ^^^^^^^
   Type Error: The predicate is_lock is defined twice.
@@ -37,7 +37,7 @@ Interfaces and proofs that do not fit their implementation; each file has its ow
   Related Location: Its first definition.
   [1]
   $ caravan --shh interface_error_5.ml
-  [Error] File "interface_error_5.proof", line 1, columns 37-40:
+  [Error] File "interface_error_5.mlp", line 1, columns 37-40:
   1 | predicate is_lock (l : t) (b : bool) own l b
                                            ^^^
   Syntax Error: Syntax error.

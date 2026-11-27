@@ -1,0 +1,104 @@
+// A mutable atomic reference retains prior synchronization cuts when overwritten.
+interface ViewAtomicSpec {
+  inv cell(location: Ref; lower: Set[Ref])
+
+  proc create(executing: Ref, payload: Ref, ghost view: Set[Ref])
+    returns (location: Ref, ghost cut_ref: Ref)
+    requires ThreadContext.context(executing, view)
+    ensures ThreadContext.context(executing, view ++ {cut_ref}) && cell(location, view)
+    opens {}
+
+  atomic proc get(executing: Ref, location: Ref, ghost view: Set[Ref], ghost lower: Set[Ref])
+    returns (payload: Ref, ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, view) && cell(location, lower)
+    ensures ThreadContext.context(executing, final_view) && cell(location, lower)
+      && view subseteq final_view && lower subseteq final_view
+    opens cell(location, _), ThreadContext.released
+
+  atomic proc set(executing: Ref, location: Ref, payload: Ref,
+      ghost view: Set[Ref], ghost lower: Set[Ref])
+    returns (ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, view) && cell(location, lower)
+    ensures ThreadContext.context(executing, final_view) && cell(location, lower)
+      && view subseteq final_view && lower subseteq final_view
+    opens cell(location, _), ThreadContext.released
+}
+
+module ViewAtomic :> ViewAtomicSpec {
+  field version: Ref
+
+  inv cell(location: Ref; lower: Set[Ref]) {
+    exists cut_ref: Ref, payload: Ref, release: Set[Ref] ::
+      own(location.version, cut_ref, 1.0) && ThreadContext.released(cut_ref, payload, release)
+      && lower subseteq release
+  }
+
+  proc create(executing: Ref, payload: Ref, ghost view: Set[Ref])
+    returns (location: Ref, ghost cut_ref: Ref)
+    requires ThreadContext.context(executing, view)
+    ensures ThreadContext.context(executing, view ++ {cut_ref}) && cell(location, view)
+    opens {}
+  {
+    var initial: Ref;
+    initial := ThreadContext.publish(executing, payload, view);
+    cut_ref := initial;
+    location := new(version: initial);
+    fold cell(location, view);
+  }
+
+  atomic proc get(executing: Ref, location: Ref, ghost view: Set[Ref], ghost lower: Set[Ref])
+    returns (payload: Ref, ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, view) && cell(location, lower)
+    ensures ThreadContext.context(executing, final_view) && cell(location, lower)
+      && view subseteq final_view && lower subseteq final_view
+    opens cell(location, _), ThreadContext.released
+  {
+    ghost var stored: Ref;
+    ghost var release: Set[Ref];
+    unfold cell(location, lower)[stored := payload, release := release];
+    val cut_ref := location.version;
+    payload := ThreadContext.acquire(executing, cut_ref, stored, view, release);
+    final_view := view ++ release ++ {cut_ref};
+    fold cell(location, lower);
+  }
+
+  atomic proc set(executing: Ref, location: Ref, payload: Ref,
+      ghost view: Set[Ref], ghost lower: Set[Ref])
+    returns (ghost final_view: Set[Ref])
+    requires ThreadContext.context(executing, view) && cell(location, lower)
+    ensures ThreadContext.context(executing, final_view) && cell(location, lower)
+      && view subseteq final_view && lower subseteq final_view
+    opens cell(location, _), ThreadContext.released
+  {
+    ghost var stored: Ref;
+    ghost var release: Set[Ref];
+    unfold cell(location, lower)[stored := payload, release := release];
+    val previous := location.version;
+    val old_payload := ThreadContext.acquire(executing, previous, stored, view, release);
+    val next := ThreadContext.publish(executing, payload, view ++ release ++ {previous});
+    location.version := next;
+    final_view := view ++ release ++ {previous, next};
+    fold cell(location, lower);
+  }
+}
+
+// An intervening overwrite preserves the first publisher's integer-field cut.
+proc overwrite_preserves_publication()
+  opens ThreadCounters.published, ViewAtomic.cell, ThreadContext.released
+{
+  val writer := ThreadContext.create_thread();
+  val overwriter := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val payload := ThreadCounters.create(42);
+  val published := ThreadCounters.publish(writer, payload, {}, 42);
+  var location: Ref;
+  ghost var initial_cut: Ref;
+  location, initial_cut := ViewAtomic.create(writer, payload, {published});
+  ghost var overwrite_view: Set[Ref];
+  overwrite_view := ViewAtomic.set(overwriter, location, null, {}, {published});
+  var observed: Ref;
+  ghost var acquired_view: Set[Ref];
+  observed, acquired_view := ViewAtomic.get(reader, location, {}, {published});
+  val value := ThreadCounters.read_frozen(reader, payload, published, acquired_view, 42, {});
+  assert value == 42;
+}

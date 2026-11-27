@@ -59,13 +59,30 @@ let has_layout source =
       | Ttype_variant _ | Ttype_record _ -> true
       | _ -> false)
 
-let eligible ?(definition = false) (source : Module_inventory.specialization) =
-  let abstract_types =
+let eligible ~inventory ?(definition = false) (source : Module_inventory.specialization) =
+  let parameter_types =
     List.for_all source.parameters
       ~f:(fun (stage : Module_inventory.parameter_instance) ->
         List.for_all stage.argument.expected.signature_types ~f:(fun (_, declaration) ->
             match declaration.Typedtree.typ_kind with
             | Ttype_abstract -> true
+            | Ttype_record _ ->
+                Option.exists
+                  (Result.ok
+                     (Field_disciplines.of_declaration (Path.Pident declaration.typ_id)
+                        declaration.typ_type))
+                  ~f:
+                    (List.exists ~f:(fun field ->
+                         let origin =
+                           Module_inventory.field_origin inventory
+                             ~record_path:field.Field_disciplines.record_path
+                             ~position:field.position
+                         in
+                         not
+                           (Poly.equal
+                              (Option.value_map origin ~default:field.kind
+                                 ~f:(fun origin -> origin.Field_disciplines.kind))
+                              Field_disciplines.Ordinary)))
             | _ -> false))
   in
   let body =
@@ -134,6 +151,25 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
           | _ -> false
         in
         let expr (iterator : Tast_iterator.iterator) (expression : Typedtree.expression) =
+          (match expression.exp_desc with
+          | Texp_apply
+              ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Typedtree.Arg callback) ])
+            -> (
+              let operation =
+                Signature_contract.compiler ~at:expression.exp_loc (fun () ->
+                    Env.normalize_value_path (Some expression.exp_loc) expression.exp_env
+                      path
+                    |> Domain_primitives.operation)
+              in
+              match (operation, callback.exp_desc) with
+              | Ok (Some Spawn), Texp_function _ ->
+                  function_roots := callback :: !function_roots
+              | _ -> ())
+          | Texp_apply (_, [ (_, Typedtree.Arg callback); _; _ ])
+            when Option.is_some (Translate_context.inline_list_fold_left_body expression)
+            ->
+              function_roots := callback :: !function_roots
+          | _ -> ());
           if heap_type ~env:expression.exp_env expression.exp_type then
             heap_access := true;
           begin match expression.exp_desc with
@@ -161,28 +197,16 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
         && List.for_all body.str_items ~f:(fun item ->
             match item.Typedtree.str_desc with
             | Tstr_value _ | Tstr_attribute _ | Tstr_exception _ | Tstr_module _
-            | Tstr_modtype _ ->
+            | Tstr_modtype _
+            | Tstr_open { open_expr = { mod_desc = Tmod_ident _; _ }; _ } ->
                 true
             | Tstr_type (_, declarations) ->
                 List.for_all declarations ~f:(fun declaration ->
                     match declaration.Typedtree.typ_kind with
                     | Ttype_abstract -> Option.is_some declaration.typ_manifest
-                    | Ttype_variant _ when Datatypes.is_witness_declaration declaration ->
-                        true
-                    | Ttype_variant constructors ->
-                        List.is_empty declaration.typ_params
-                        || List.for_all constructors ~f:(fun constructor ->
-                            Option.is_none constructor.Typedtree.cd_res
-                            &&
-                            match constructor.cd_args with
-                            | Cstr_tuple _ -> true
-                            | Cstr_record _ -> false)
-                    | Ttype_record fields ->
-                        List.is_empty declaration.typ_params
-                        || List.for_all fields ~f:(fun field ->
-                            match field.Typedtree.ld_mutable with
-                            | Immutable -> true
-                            | Mutable -> false)
+                    | Ttype_variant _ ->
+                        Result.is_ok (Datatypes.of_declaration declaration)
+                    | Ttype_record _ -> true
                     | _ -> false)
             | _ -> false)
     | None -> false
@@ -192,9 +216,9 @@ let eligible ?(definition = false) (source : Module_inventory.specialization) =
     List.for_all source.members ~f:(fun (_, id) ->
         List.exists source.body_members ~f:(fun (_, member) -> Ident.same id member))
   in
-  functions && abstract_types && body
+  functions && parameter_types && body
 
-let plan ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
+let plan ~inventory ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
   let make_application source =
     {
       source;
@@ -355,12 +379,19 @@ let plan ?(proof_layout = fun _ -> false) ?(definitions = []) sources =
   in
   let groups =
     List.fold
-      (List.filter definitions ~f:(eligible ~definition:true))
+      (List.filter definitions ~f:(eligible ~inventory ~definition:true))
       ~init:[] ~f:(add ~definition:true)
   in
   let groups =
     List.fold
-      (List.filter sources ~f:(eligible ~definition:false))
+      (List.filter sources ~f:(fun source ->
+           (* The declaration's worker already supplies its abstract heap layout. *)
+           let definition =
+             List.exists groups ~f:(fun group ->
+                 Option.is_some group.definition
+                 && same_stages group.representative source)
+           in
+           eligible ~inventory ~definition source))
       ~init:groups ~f:(add ~definition:false)
   in
   let owner source =
@@ -416,7 +447,15 @@ let interface (group : t) (application : application) =
   else
     match group.world with
     | None -> group.interface
-    | Some _ -> application.world ^ "." ^ (Qualified_name.of_string group.interface).name
+    | Some _ ->
+        (* Repeated applicative applications share their checked argument identity. *)
+        let application =
+          Option.value
+            (List.find group.applications ~f:(fun candidate ->
+                 Path.same candidate.source.identity application.source.identity))
+            ~default:application
+        in
+        application.world ^ "." ^ (Qualified_name.of_string group.interface).name
 
 let application_for_binding groups binding =
   List.find_map groups ~f:(fun group ->
@@ -458,9 +497,16 @@ let types group ~owner =
             (List.map group.representative.argument.paths ~f:(fun path ->
                  Path.Pdot (path, source)))
         in
-        match declaration.Typedtree.typ_manifest with
-        | Some _ -> descriptor
-        | None when not (List.is_empty descriptor.parameters) ->
+        match (declaration.Typedtree.typ_kind, declaration.typ_manifest) with
+        | Ttype_record _, _ ->
+            {
+              descriptor with
+              heap = Some [];
+              backend_type = None;
+              value_constraint = None;
+            }
+        | _, Some _ -> descriptor
+        | _, None when not (List.is_empty descriptor.parameters) ->
             let scope =
               if Option.equal String.equal (List.last owner) (Some group.parameter) then
                 String.split group.name ~on:'.'
@@ -482,7 +528,7 @@ let types group ~owner =
               value_constraint = None;
               domain_scope = Some scope;
             }
-        | None ->
+        | _, None ->
             let domain_scope =
               if Option.equal String.equal (List.last owner) (Some group.parameter) then
                 String.split group.name ~on:'.'

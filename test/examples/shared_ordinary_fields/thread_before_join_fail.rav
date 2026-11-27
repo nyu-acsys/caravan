@@ -1,0 +1,9 @@
+proc child_visibility_before_join(parent: Ref, handle: Ref, child: Ref,
+    cell: Ref, channel: Ref)
+  requires ThreadContext.context(parent, {}) && FlagForkJoin.completion(handle, child)
+    && FlagForkJoin.ticket(handle) && parent != child
+    && ThreadFlags.published(channel, cell, true, {})
+  opens ThreadFlags.published
+{
+  val result := ThreadFlags.read_frozen(parent, cell, channel, {channel}, true, {});
+}

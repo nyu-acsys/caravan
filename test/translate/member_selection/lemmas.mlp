@@ -1,0 +1,2 @@
+lemma good ensures (true) = ()
+lemma bad ensures (false) = ()

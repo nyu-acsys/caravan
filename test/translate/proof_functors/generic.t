@@ -32,19 +32,19 @@ An incorrect generic lemma is rejected.
   $ cp generic.ml wrong_lemma.ml
   $ caravan --shh wrong_lemma.ml 2>&1 | grep -c 'Verification Error: A postcondition may not hold at this return point.'
   2
-  $ caravan --shh wrong_lemma.ml 2>&1 | grep -c '\[Error\] File "wrong_lemma.proof"'
+  $ caravan --shh wrong_lemma.ml 2>&1 | grep -c '\[Error\] File "wrong_lemma.mlp"'
   1
 
 The runtime result must satisfy the generic contract.
 
-  $ cp generic.proof bad_body.proof
+  $ cp generic.mlp bad_body.mlp
   $ caravan --shh bad_body.ml 2>&1 | grep -c 'Verification Error: A postcondition may not hold at this return point.'
   1
 
 A later argument with a stronger read precondition cannot satisfy the template.
 
   $ sed 's/Actual.Second/Actual.Strong/g' generic.ml > later_argument_fail.ml
-  $ cp generic.proof later_argument_fail.proof
+  $ cp generic.mlp later_argument_fail.mlp
   $ caravan --shh later_argument_fail.ml 2>&1 | grep -c "Verification Error: The module argument's precondition is not provided by this view."
   1
 

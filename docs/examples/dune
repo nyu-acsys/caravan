@@ -6,11 +6,15 @@
   automatic_cell
   manual_cell
   proof_syntax
-  ghost_scopes))
+  ghost_scopes
+  owned_job
+  frozen_job
+  relaxed_job
+  raw_result))
 
 (cram
  (deps
   %{bin:caravan}
   (glob_files *.ml)
   (glob_files *.mli)
-  (glob_files *.proof)))
+  (glob_files *.mlp)))

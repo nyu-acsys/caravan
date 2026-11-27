@@ -1,0 +1,7 @@
+module Native = struct
+  proof result = choose left right ensures (result === left) = ()
+end
+module Make (Select : Select) = struct
+  proof result = choose left right ensures (result === left) = ()
+end
+proof client () = ()

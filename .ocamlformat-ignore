@@ -1,10 +1,20 @@
-# Preserve upstream formatting in the Saturn sources.
+# Preserve upstream formatting in the case-study sources.
 test/saturn/michael_scott_queue/michael_scott_queue.ml
 test/saturn/michael_scott_queue/michael_scott_queue.mli
 test/saturn/michael_scott_queue/michael_scott_queue_intf.mli
 test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.ml
 test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg.mli
 test/saturn/michael_scott_queue_lseg/michael_scott_queue_lseg_intf.mli
+test/saturn/bounded_queue/bounded_queue.ml
 test/saturn/treiber_stack/treiber_stack.ml
 test/saturn/stack_drain/stack_drain.ml
 test/saturn/treiber_stack/treiber_stack.mli
+test/moonpool/parker/parker_.ml
+test/ocaml5_tutorial/blocking_stack/blocking_stack.ml
+
+# Filename-directive regressions exercise syntax unsupported by ocamlformat.
+test/translate/member_selection/directives.ml
+test/translate/member_selection/directive_loop.ml
+
+# Preserve the nested access selected by an inline annotation.
+test/translate/outlines/nested_operand_comments.ml

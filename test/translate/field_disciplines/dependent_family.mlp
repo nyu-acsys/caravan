@@ -1,0 +1,3 @@
+module Field = Ghost.Frozen (struct
+  let field (record : Left.t) = record.value
+end)

@@ -6,8 +6,4 @@
   %{bin:raven}
   treiber_stack.mli
   (glob_files *.ml)
-  (glob_files *.proof)
-  ../../saturn/treiber_stack/treiber_stack.ml
-  ../../saturn/treiber_stack/treiber_stack.mli
-  ../../saturn/treiber_stack/treiber_stack.proof
-  ../../saturn/backoff/backoff.mli))
+  (glob_files *.mlp)))

@@ -1,0 +1,23 @@
+predicate cell (c : int Atomic.t) (v : int) = own c v
+invariant counter (c : int Atomic.t) = exists v : int. cell c v && 0 <= v
+
+lemma take (c : int Atomic.t) (v : int)
+  returns (w : int)
+  requires (cell c v)
+  ensures (own c w && w = v) =
+  unfold cell c v;
+  v
+
+lemma [@closes take] put (c : int Atomic.t) (v : int) (w : int)
+  requires (own c w)
+  ensures (cell c w) =
+  fold cell c w
+
+proof result = get c
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c && 0 <= result) =
+  at (Atomic.get c) (fun read ->
+    let w = take c current.v in
+    let result = read () in
+    result)

@@ -27,6 +27,7 @@ type kind =
   | Resource of Source.proof_resource
   | Field of Source.proof_field
   | Atomic of Source.proof_au
+  | Task of Source.proof_task
 
 type binding = {
   entry : Proof_scopes.entry;
@@ -151,7 +152,7 @@ let exported inventory source scope name kind =
   if Option.is_some template || Option.is_some scope.Proof_scopes.definition then false
   else
     match kind with
-    | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
+    | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ ->
         List.is_empty relevant
     | Predicate _ ->
         List.for_all relevant ~f:(fun (ancestor, constraint_) ->
@@ -174,6 +175,26 @@ let remaining_constraints t ~scope binding =
                (drop_prefix boundary.Proof_scopes.namespace caller.Proof_scopes.namespace))))
 
 let visible t ~scope binding =
+  let definition_visible =
+    match binding.entry.scope.definition with
+    | None -> true
+    | Some _ ->
+        Option.exists scope ~f:(fun caller ->
+            Option.is_some
+              (drop_prefix binding.entry.scope.namespace caller.Proof_scopes.namespace))
+        || begin match binding.entry.scope.public_type with
+        | Some (Types.Mty_signature members) ->
+            List.exists members ~f:(fun member ->
+                match (binding.kind, member) with
+                | ( (Function _ | Predicate _ | Lemma _ | Field _ | Action _),
+                    Types.Sig_value (id, _, _) )
+                | (Resource _ | Atomic _ | Task _), Sig_module (id, _, _, _, _)
+                | State _, Sig_type (id, _, _, _) ->
+                    String.equal (Ident.name id) binding.entry.name.pid_str
+                | _ -> false)
+        | Some (Mty_ident _ | Mty_functor _ | Mty_alias _) | None -> false
+        end
+  in
   let inside_template =
     match functor_ancestor t.scopes binding.entry.scope with
     | None -> true
@@ -182,10 +203,10 @@ let visible t ~scope binding =
             Option.is_some (drop_prefix owner.namespace scope.Proof_scopes.namespace))
   in
   let relevant = remaining_constraints t ~scope binding in
-  inside_template
+  inside_template && definition_visible
   &&
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ ->
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ ->
       List.is_empty relevant
   | Predicate _ ->
       List.for_all relevant ~f:(fun (ancestor, constraint_) ->
@@ -198,7 +219,7 @@ let visible t ~scope binding =
 
 let opaque_at t ~scope binding =
   match binding.kind with
-  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ -> false
+  | Lemma _ | Function _ | State _ | Action _ | Field _ | Atomic _ | Task _ -> false
   | Resource _ -> not (List.is_empty (remaining_constraints t ~scope binding))
   | Predicate _ -> not (List.is_empty (remaining_constraints t ~scope binding))
 
@@ -212,7 +233,8 @@ let opaque_keys t =
   List.filter_map t.bindings ~f:(fun binding ->
       match binding.kind with
       | Predicate _ -> Option.some_if (opaque t binding) binding.public_key
-      | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _ ->
+      | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _
+      | Task _ ->
           None)
 
 let rec signature_type_projection substitution owner signature =
@@ -308,6 +330,7 @@ let check_state_parameters ~at ~parameters ~arguments fields =
                  (Printf.sprintf "The state type parameter '%s is not declared" id.pid_str))
       | PTtyapp (_, arguments) -> Result.all_unit (List.map arguments ~f:check)
       | PTtuple elements -> Result.all_unit (List.map elements ~f:check)
+      | PTtyany | PTvariant _ -> Ok ()
       | PTarrow (argument, result) ->
           let* () = check argument in
           check result
@@ -392,6 +415,25 @@ let view_declaration inventory scope name =
       Option.map
         (List.Assoc.find constraint_.Module_inventory.signature.signature_resources name
            ~equal:String.equal) ~f:(fun formal -> (constraint_, formal)))
+
+let interface_resource (inventory : Module_inventory.t) (scopes : Proof_scopes.t)
+    (scope : Proof_scopes.scope) name =
+  List.find_map scopes.scopes ~f:(fun ancestor ->
+      Option.bind (drop_prefix ancestor.namespace scope.namespace) ~f:(fun suffix ->
+          let declaration signature =
+            Option.bind (signature_member signature suffix) ~f:(fun signature ->
+                List.Assoc.find signature.signature_resources name ~equal:String.equal)
+          in
+          match
+            List.find_map (own_constraints inventory.constraints ancestor)
+              ~f:(fun constraint_ -> declaration constraint_.signature)
+          with
+          | Some _ as formal -> formal
+          | None ->
+              List.find_map inventory.bindings ~f:(fun binding ->
+                  if same_owner ancestor.owner (Some binding.actual_path) then
+                    declaration binding.expected
+                  else None)))
 
 let private_view_substitution (source : Source.t) inventory scope constraint_ =
   let application =
@@ -492,7 +534,8 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
           Report.unsupported entry.name.pid_loc
             "A declaration-only predicate in a module proof"
       end
-  | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body } ->
+  | Proof_invariant
+      { inv_name; inv_params; inv_state = state, state_type; inv_body; inv_ancestry } ->
       let* state_definition =
         match state_type with
         | PTtyapp (name, arguments) ->
@@ -556,6 +599,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
           pred_body = None;
           pred_persistent = true;
           pred_inline = false;
+          pred_ancestry = inv_ancestry;
         }
       in
       Ok (Predicate (predicate, definition), predicate.pred_params)
@@ -583,6 +627,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
                 pred_body = None;
                 pred_persistent = false;
                 pred_inline = false;
+                pred_ancestry = None;
               }
             in
             Ok (Predicate (predicate, View view_value), predicate.pred_params)
@@ -617,6 +662,16 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
             (Report.error Type entry.name.pid_loc
                "Missing elaborated ghost field declaration")
       end
+  | Proof_task _ ->
+      begin match
+        List.find source.proof_tasks ~f:(fun task ->
+            Option.is_none task.task_application
+            && Poly.equal task.task_at entry.name.pid_loc)
+      with
+      | Some task -> Ok (Task task, [])
+      | None ->
+          Error (Report.error Type entry.name.pid_loc "Missing elaborated task facade")
+      end
   | Proof_au _ ->
       begin match
         List.find source.proof_aus ~f:(fun au ->
@@ -626,7 +681,7 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
       | None ->
           Error (Report.error Type entry.name.pid_loc "Missing elaborated AU facade")
       end
-  | Proof_module _ | Proof_type _ ->
+  | Proof_module _ | Proof_type _ | Proof_access_field _ ->
       Report.unsupported entry.name.pid_loc
         (Printf.sprintf "A %s declaration in a module proof"
            (match entry.declaration with
@@ -634,7 +689,9 @@ let supported (source : Source.t) (inventory : Module_inventory.t) entry =
            | Proof_definition _ -> "definition"
            | Proof_resource _ -> "resource"
            | Proof_au _ -> "atomic update"
+           | Proof_task _ -> "domain task"
            | Proof_field _ -> "field"
+           | Proof_access_field _ -> "shared field"
            | Proof_function _ -> "function"
            | Proof_state _ -> "state"
            | Proof_view _ -> "view"
@@ -670,10 +727,17 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
     List.fold source.proof_aus ~init:projection ~f:(fun projection au ->
         Subst.add_module au.Source.au_id au.au_path projection)
   in
+  let projection =
+    List.fold source.proof_tasks ~init:projection ~f:(fun projection task ->
+        Subst.add_module task.Source.task_id task.task_path projection)
+  in
   let entries =
     List.filter scopes.declarations ~f:(fun entry ->
         Option.is_some entry.Proof_scopes.scope.owner
-        && match entry.declaration with S.Proof_type _ -> false | _ -> true)
+        &&
+        match entry.declaration with
+        | S.Proof_type _ | Proof_access_field _ -> false
+        | _ -> true)
   in
   let* () =
     List.fold_result entries ~init:[] ~f:(fun previous entry ->
@@ -705,8 +769,8 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
               | ( _,
                   ( S.Proof_predicate _ | Proof_invariant _ | Proof_lemma _
                   | Proof_function _ | Proof_resource _ | Proof_definition _
-                  | Proof_field _ | Proof_au _ | Proof_state _ | Proof_view _
-                  | Proof_action _ ) )
+                  | Proof_field _ | Proof_au _ | Proof_task _ | Proof_state _
+                  | Proof_view _ | Proof_action _ ) )
                 when same_owner ancestor.owner scope.owner
                      || Option.is_some scope.definition
                         && same_owner ancestor.owner scope.parent ->
@@ -717,6 +781,71 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
               end
         in
         let* kind, parameters = supported source inventory entry in
+        (* The private invariants of this module, through which a promise may be kept. *)
+        let intermediate name =
+          match interface_resource inventory scopes scope name with
+          | Some _ -> None
+          | None ->
+              List.find_map entries ~f:(fun other ->
+                  match other.Proof_scopes.declaration with
+                  | S.Proof_invariant { inv_name; inv_params; inv_state; inv_ancestry; _ }
+                    when same_owner other.scope.owner scope.owner
+                         && String.equal inv_name.pid_str name ->
+                      Some
+                        {
+                          S.pred_name = inv_name;
+                          pred_params = inv_params @ [ inv_state ];
+                          pred_body = None;
+                          pred_persistent = true;
+                          pred_inline = false;
+                          pred_ancestry = inv_ancestry;
+                        }
+                  | _ -> None)
+        in
+        let* () =
+          match kind with
+          | Predicate (definition, _) ->
+              begin match
+                ( definition.pred_ancestry,
+                  interface_resource inventory scopes scope entry.name.pid_str )
+              with
+              | Some ancestry, Some { declaration = { pred_ancestry = None; _ }; site; _ }
+                ->
+                  Error
+                    (Report.error Type ancestry.ancestry_loc
+                       ~related:[ (site.item_loc, "Its interface declaration") ]
+                       "An invariant that its interface does not declare within another \
+                        cannot be declared within one")
+              | None, Some { declaration = { pred_ancestry = Some promise; _ }; _ } ->
+                  Error
+                    (Report.error Type entry.name.pid_loc
+                       ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                       (Printf.sprintf
+                          "The interface declares %s within %s, but its definition \
+                           declares no ancestor"
+                          entry.name.pid_str
+                          (S.qualid_name promise.ancestry_target)))
+              | ( Some ancestry,
+                  Some
+                    {
+                      declaration = { pred_ancestry = Some promise; _ } as declaration;
+                      _;
+                    } )
+                when not
+                       (S.keeps_promise ~intermediate ~declaration ~child:definition
+                          ancestry promise) ->
+                  Error
+                    (Report.error Type ancestry.ancestry_loc
+                       ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                       (Printf.sprintf
+                          "The definition of %s does not lie within %s as its interface \
+                           declares, through invariants private to the implementation"
+                          entry.name.pid_str
+                          (S.qualid_name promise.ancestry_target)))
+              | _ -> Ok ()
+              end
+          | _ -> Ok ()
+        in
         let* () =
           match
             List.find inventory.values ~f:(fun value ->
@@ -783,7 +912,7 @@ let build (source : Source.t) (inventory : Module_inventory.t) =
           let declared =
             match kind with
             | Lemma _ | Function _ | State _ | Action _ | Resource _ | Field _ | Atomic _
-              ->
+            | Task _ ->
                 None
             | Predicate _ ->
                 relevant_constraints inventory.constraints source.proof_scopes scope
@@ -955,15 +1084,50 @@ let action_key t ~scope (id : S.id) =
           Some binding.backend
       | _ -> None)
 
+let member_application ?owners t ~scope path (id : S.id) =
+  List.find t.applications ~f:(fun view ->
+      Path.same view.path path
+      && String.equal view.source.entry.name.pid_str id.pid_str
+      && application_visible ?owners t ~scope view)
+
 let application ?owners t ~scope ~environment (q : S.qualid) =
   match q with
   | Qid _ -> None
   | Qdot (parent, id) ->
       Option.bind (Source.module_path environment parent) ~f:(fun path ->
-          List.find t.applications ~f:(fun view ->
-              Path.same view.path path
-              && String.equal view.source.entry.name.pid_str id.pid_str
-              && application_visible ?owners t ~scope view))
+          member_application ?owners t ~scope path id)
+
+(** The modules that [scope] includes, the latest first. *)
+let included_modules (scope : Proof_scopes.scope) =
+  List.rev_filter_map scope.structure.str_items ~f:(fun item ->
+      match item.str_desc with
+      | Tstr_include { incl_mod; _ } ->
+          Option.map (Module_inventory.included_path incl_mod) ~f:(fun path ->
+              Env.normalize_module_path None item.str_env path)
+      | _ -> None)
+
+(** The key of the member [id] of the module at [path], or of a module it includes. *)
+let rec member_key ?owners t ~scope path (id : S.id) =
+  match member_application ?owners t ~scope path id with
+  | Some view -> Some view.key
+  | None ->
+      let owner = canonical_owner t path in
+      let own =
+        List.find_map t.bindings ~f:(fun binding ->
+            if
+              term_binding binding && visible t ~scope binding
+              && same_owner binding.entry.scope.owner (Some owner)
+              && String.equal binding.entry.name.pid_str id.pid_str
+            then Some binding.public_key
+            else None)
+      in
+      Option.first_some own
+        (Option.bind (Proof_scopes.find_owner t.scopes (Some owner)) ~f:(fun owner ->
+             included_key ?owners t ~scope owner id))
+
+and included_key ?owners t ~scope owner id =
+  List.find_map (included_modules owner) ~f:(fun path ->
+      member_key ?owners t ~scope path id)
 
 let resolve ?owners t ~scope ~environment (q : S.qualid) =
   match q with
@@ -972,7 +1136,24 @@ let resolve ?owners t ~scope ~environment (q : S.qualid) =
         List.find (private_bindings t ~scope) ~f:(fun binding ->
             term_binding binding && String.equal binding.entry.name.pid_str id.pid_str)
       in
-      Option.bind candidate ~f:(fun binding ->
+      begin match candidate with
+      | None ->
+          let enclosing =
+            Option.value_map scope ~default:[] ~f:(fun scope ->
+                List.filter t.scopes.scopes ~f:(fun enclosing ->
+                    Option.is_some
+                      (drop_prefix enclosing.Proof_scopes.namespace scope.namespace))
+                |> List.sort ~compare:(fun a b ->
+                    Int.compare
+                      (List.length b.Proof_scopes.namespace)
+                      (List.length a.Proof_scopes.namespace)))
+          in
+          Option.first_some
+            (List.find_map enclosing ~f:(fun owner ->
+                 included_key ?owners t ~scope owner id))
+            (List.find_map (Source.opened_modules environment) ~f:(fun path ->
+                 member_key ?owners t ~scope path id))
+      | Some binding ->
           let runtime =
             Option.bind (Source.value_path environment q) ~f:(fun path ->
                 List.find_map t.values ~f:(fun value ->
@@ -990,18 +1171,8 @@ let resolve ?owners t ~scope ~environment (q : S.qualid) =
           in
           Some
             (Option.value_map runtime ~default:binding.backend ~f:(fun id ->
-                 "$runtime$" ^ Ident.unique_name id)))
-  | Qdot (parent, id) ->
-      begin match application ?owners t ~scope ~environment q with
-      | Some view -> Some view.key
-      | None ->
-          Option.bind (Source.module_path environment parent) ~f:(fun owner ->
-              let owner = canonical_owner t owner in
-              List.find_map t.bindings ~f:(fun binding ->
-                  if
-                    term_binding binding && visible t ~scope binding
-                    && same_owner binding.entry.scope.owner (Some owner)
-                    && String.equal binding.entry.name.pid_str id.pid_str
-                  then Some binding.public_key
-                  else None))
+                 "$runtime$" ^ Ident.unique_name id))
       end
+  | Qdot (parent, id) ->
+      Option.bind (Source.module_path environment parent) ~f:(fun path ->
+          member_key ?owners t ~scope path id)

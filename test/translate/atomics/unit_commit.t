@@ -10,7 +10,7 @@ annotation attached to its enclosing atomic operation.
 A commit at a unit expression cannot change the abstract contents.
 
   $ mkdir changed
-  $ cp unit_commit.ml unit_commit.proof changed/
+  $ cp unit_commit.ml unit_commit.mlp changed/
   $ sed 's/atomic ensures cell c before/atomic ensures cell c 1/' unit_commit.mli > changed/unit_commit.mli
   $ caravan --shh changed/unit_commit.ml > changed.out 2>&1
   [1]

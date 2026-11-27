@@ -11,7 +11,7 @@ valid controls. Diagnostics are checked without normalizing solver timeouts.
   12 | let forbidden_update c = if Atomic.compare_and_set c 0 2 then () else ()
                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Verification Error: This step may change the state of is_counter in a way that no action allows; if it performs one, say so, as (*@ performs a *).
-  File "action_steps_fail.proof", line 3, columns 10-20:
+  File "action_steps_fail.mlp", line 3, columns 10-20:
   3 | invariant is_counter (c : t) (s : state) =
                 ^^^^^^^^^^
   Related Location: The invariant.

@@ -1,0 +1,9 @@
+proc join_same_handle_twice(parent: Ref, handle: Ref, child: Ref)
+  requires ThreadContext.context(parent, {}) && FlagForkJoin.completion(handle, child)
+    && FlagForkJoin.ticket(handle) && parent != child
+{
+  var result: FlagTask.Result;
+  ghost var final_view: Set[Ref];
+  result, final_view := FlagForkJoin.join(parent, handle, child, {});
+  result, final_view := FlagForkJoin.join(parent, handle, child, final_view);
+}

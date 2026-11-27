@@ -1,0 +1,11 @@
+module Integer = Ghost.Frozen (struct
+  let field (record : int box) = record.value
+end)
+
+module IntegerAlias = Ghost.Frozen (struct
+  let field (record : int alias) = record.value
+end)
+
+module Boolean = Ghost.Frozen (struct
+  let field (record : bool box) = record.value
+end)

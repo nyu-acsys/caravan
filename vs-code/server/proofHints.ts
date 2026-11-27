@@ -20,7 +20,7 @@ export function proofHints(steps: NormalizedProofStep[], root: string, range: Ra
 	const hints: InlayHint[] = [];
 	for (const step of steps) {
 		const position = step.location.start;
-		if (step.location.file !== root || !step.sourceLocation.file.endsWith('.proof')
+		if (step.location.file !== root || !/\.(mlp|proof)$/.test(step.sourceLocation.file)
 			|| before(position, range.start) || before(range.end, position)) continue;
 		const key = JSON.stringify([step.location, step.sourceLocation, step.text]);
 		if (seen.has(key)) continue;

@@ -1,0 +1,229 @@
+module Capacity = Ghost.Relaxed (struct let field (cache : cache) = cache.capacity end)
+module Heads = SetRA (struct type t = int end)
+module Authority = Auth (Heads)
+let history : (cache, Authority.t) Ghost.field = Ghost.field ()
+
+predicate [@inline] seen (cache : cache) (value : int) =
+  own (Ghost.at history cache) (Authority.frag (Heads.set (Set.singleton value)))
+
+invariant shared (head : int Atomic.t) (cache : cache) (limit : int) (tail : int) =
+  exists current_head : int, current : int, writes : (Ghost.t * int) set,
+    known : int set.
+  0 <= current_head && current_head <= tail && tail - current_head <= limit &&
+  own head current_head && Capacity.state cache current writes &&
+  own (Ghost.at history cache) (Authority.auth (Heads.set known)) &&
+  Set.mem current_head known &&
+  (forall previous : int. Set.mem previous known -> 0 <= previous && previous <= current_head) &&
+  (forall event : Ghost.t, value : int. Set.mem (event, value) writes ->
+    0 <= value && value <= limit - (tail - current_head))
+
+lemma remember (cache : cache) (known : int set) (value : int)
+  requires (own (Ghost.at history cache) (Authority.auth (Heads.set known)) && Set.mem value known)
+  ensures (own (Ghost.at history cache) (Authority.auth (Heads.set known)) && seen cache value) =
+  Ghost.fpu (Ghost.at history cache)
+    (Authority.auth (Heads.set known))
+    (Authority.auth_frag (Heads.set known) (Heads.set (Set.singleton value)))
+
+lemma reconcile (cache : cache) (known : int set) (value : int)
+  requires (own (Ghost.at history cache) (Authority.auth (Heads.set known)) && seen cache value)
+  ensures (own (Ghost.at history cache) (Authority.auth (Heads.set known)) && seen cache value &&
+    Set.mem value known) = ()
+
+lemma extend (cache : cache) (known : int set) (value : int)
+  requires (own (Ghost.at history cache) (Authority.auth (Heads.set known)))
+  ensures (own (Ghost.at history cache)
+    (Authority.auth (Heads.set (Set.union known (Set.singleton value))))) =
+  Ghost.fpu (Ghost.at history cache)
+    (Authority.auth (Heads.set known)) (Authority.full (Heads.set known));
+  Ghost.fpu (Ghost.at history cache)
+    (Authority.full (Heads.set known))
+    (Authority.full (Heads.set (Set.union known (Set.singleton value))))
+
+proof result = create limit tail initial_head
+  requires (0 < limit && 0 <= initial_head && initial_head <= tail && tail - initial_head <= limit)
+  ensures (match result with head, cache -> shared head cache limit tail) =
+  at ({ capacity = 0 })
+    initializes [Ghost.init history (Authority.auth (Heads.set (Set.singleton initial_head)))];
+  on return begin
+    let (event, writes) = Capacity.snapshot cache in
+    fold shared head cache limit tail {current_head = initial_head; current = 0;
+      writes = writes; known = Set.singleton initial_head}
+  end
+
+proof result = read head cache limit tail
+  requires (shared head cache limit tail)
+  ensures (shared head cache limit tail && exists snapshot : int.
+    seen cache snapshot && 0 <= snapshot && snapshot <= tail &&
+    0 <= result && result <= limit - (tail - snapshot)) =
+  at (cache.capacity) (fun load ->
+    let (current_head, current, writes, known) =
+      unfold shared head cache limit tail {current_head; current; writes; known} in
+    let result = load () in
+    let event = Capacity.observe cache result in
+    Capacity.reconcile cache event result;
+    remember cache known current_head;
+    fold shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; known = known};
+    result)
+
+proof refresh head cache limit tail
+  requires (shared head cache limit tail)
+  ensures (shared head cache limit tail) =
+  at (Atomic.get head) (fun load ->
+    let (current_head, current, writes, known) =
+      unfold shared head cache limit tail {current_head; current; writes; known} in
+    let result = load () in
+    remember cache known result;
+    fold shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; known = known};
+    result);
+  at (cache.capacity <- available) (fun store ->
+    let (current_head, current, writes, known) =
+      unfold shared head cache limit tail {current_head; current; writes; known} in
+    reconcile cache known observed_head;
+    let result = store () in
+    let event = Capacity.observe cache available in
+    let updated = Set.union writes (Set.singleton (event, available)) in
+    fold shared head cache limit tail {current_head = current_head; current = available;
+      writes = updated; known = known};
+    result)
+
+proof result = advance head cache limit tail
+  requires (shared head cache limit tail)
+  ensures (shared head cache limit tail) =
+  at (Atomic.get head) (fun load ->
+    let (current_head, current, writes, known) =
+      unfold shared head cache limit tail {current_head; current; writes; known} in
+    let result = load () in
+    fold shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; known = known};
+    result);
+  at (Atomic.compare_and_set head previous (previous + 1)) (fun cas ->
+    let (current_head, current, writes, known) =
+      unfold shared head cache limit tail {current_head; current; writes; known} in
+    let result = cas () in
+    if result then begin
+      let updated = Set.union known (Set.singleton (previous + 1)) in
+      extend cache known (previous + 1);
+      fold shared head cache limit tail {current_head = previous + 1; current = current;
+        writes = writes; known = updated}
+    end else
+      fold shared head cache limit tail {current_head = current_head; current = current;
+        writes = writes; known = known};
+    result)
+
+proof result = next_capacity head cache limit tail
+  requires (shared head cache limit tail)
+  ensures (shared head cache limit tail && match result with
+    | None -> true
+    | Some remaining -> exists snapshot : int. seen cache snapshot &&
+        0 <= snapshot && snapshot <= tail && 0 <= remaining && remaining <= limit - ((tail + 1) - snapshot) &&
+        tail - snapshot < limit) = ()
+
+proof result = exercise ()
+  ensures (match result with None -> true | Some remaining -> 0 <= remaining && remaining < 4) = ()
+
+proof result = stale_positive () ensures (result === 0 || result === 2) = ()
+
+proof result = zero_refresh () ensures (result === 3) = ()
+
+invariant published_shared (head : int Atomic.t) (cache : cache) (limit : int) (tail : int) =
+  exists current_head : int, current : int, writes : (Ghost.t * int) set, eligible : (Ghost.t * int) set,
+    known : int set.
+  0 <= current_head && current_head <= tail && tail - current_head <= limit &&
+  own head current_head && Capacity.shared_state cache current writes eligible &&
+  own (Ghost.at history cache) (Authority.auth (Heads.set known)) &&
+  Set.mem current_head known &&
+  (forall previous : int. Set.mem previous known -> 0 <= previous && previous <= current_head) &&
+  (forall event : Ghost.t, value : int. Set.mem (event, value) eligible ->
+    0 <= value && value <= limit - (tail - current_head))
+
+
+proof result = published_create limit tail initial_head
+  requires (0 < limit && 0 <= initial_head && initial_head <= tail && tail - initial_head <= limit)
+  ensures (match result with head, cache ->
+    published_shared head cache limit tail && Capacity.visible Ghost.self cache) =
+  at ({ capacity = -1 })
+    initializes [Ghost.init history (Authority.auth (Heads.set (Set.singleton initial_head)))];
+  on return begin
+    let (event, writes) = Capacity.snapshot cache in
+    assert (exists private_event : Ghost.t. Set.mem (private_event, -1) writes);
+    let _cut = Capacity.publish cache in
+    fold published_shared head cache limit tail {current_head = initial_head; current = 0;
+      writes = writes; eligible = Set.singleton (event, 0); known = Set.singleton initial_head}
+  end
+
+proof result = published_read head cache limit tail
+  requires (published_shared head cache limit tail && Capacity.visible Ghost.self cache)
+  ensures (Capacity.visible Ghost.self cache && published_shared head cache limit tail && exists snapshot : int.
+    seen cache snapshot && 0 <= snapshot && snapshot <= tail &&
+    0 <= result && result <= limit - (tail - snapshot)) =
+  at (cache.capacity) Ghost.published_scope (fun load ->
+    let (current_head, current, writes, eligible, known) =
+      unfold published_shared head cache limit tail {current_head; current; writes; eligible; known} in
+    let result = load () in
+    let event = Capacity.observe cache result in
+    Capacity.reconcile cache event result;
+    remember cache known current_head;
+    fold published_shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; eligible = eligible; known = known};
+    result)
+
+proof published_refresh head cache limit tail
+  requires (published_shared head cache limit tail)
+  ensures (published_shared head cache limit tail) =
+  at (Atomic.get head) (fun load ->
+    let (current_head, current, writes, eligible, known) =
+      unfold published_shared head cache limit tail {current_head; current; writes; eligible; known} in
+    let result = load () in
+    remember cache known result;
+    fold published_shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; eligible = eligible; known = known};
+    result);
+  at (cache.capacity <- available) (fun store ->
+    let (current_head, current, writes, eligible, known) =
+      unfold published_shared head cache limit tail {current_head; current; writes; eligible; known} in
+    reconcile cache known observed_head;
+    let result = store () in
+    let event = Capacity.observe cache available in
+    let updated = Set.union writes (Set.singleton (event, available)) in
+    let updated_eligible = Set.union eligible (Set.singleton (event, available)) in
+    fold published_shared head cache limit tail {current_head = current_head; current = available;
+      writes = updated; eligible = updated_eligible; known = known};
+    result)
+
+proof result = published_advance head cache limit tail
+  requires (published_shared head cache limit tail)
+  ensures (published_shared head cache limit tail) =
+  at (Atomic.get head) (fun load ->
+    let (current_head, current, writes, eligible, known) =
+      unfold published_shared head cache limit tail {current_head; current; writes; eligible; known} in
+    let result = load () in
+    fold published_shared head cache limit tail {current_head = current_head; current = current;
+      writes = writes; eligible = eligible; known = known};
+    result);
+  at (Atomic.compare_and_set head previous (previous + 1)) (fun cas ->
+    let (current_head, current, writes, eligible, known) =
+      unfold published_shared head cache limit tail {current_head; current; writes; eligible; known} in
+    let result = cas () in
+    if result then begin
+      let updated = Set.union known (Set.singleton (previous + 1)) in
+      extend cache known (previous + 1);
+      fold published_shared head cache limit tail {current_head = previous + 1; current = current;
+        writes = writes; eligible = eligible; known = updated}
+    end else
+      fold published_shared head cache limit tail {current_head = current_head; current = current;
+        writes = writes; eligible = eligible; known = known};
+    result)
+
+proof result = published_next_capacity head cache limit tail
+  requires (published_shared head cache limit tail && Capacity.visible Ghost.self cache)
+  ensures (Capacity.visible Ghost.self cache && published_shared head cache limit tail && match result with
+    | None -> true
+    | Some remaining -> exists snapshot : int. seen cache snapshot &&
+        0 <= snapshot && snapshot <= tail && 0 <= remaining && remaining <= limit - ((tail + 1) - snapshot) &&
+        tail - snapshot < limit) = ()
+
+
+proof result = published_exercise ()
+  ensures (match result with None -> true | Some remaining -> 0 <= remaining && remaining < 4) = ()

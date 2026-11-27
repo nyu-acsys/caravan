@@ -1,7 +1,4 @@
-Verify the monomorphic functor client against the stack's checked interface.
-
-  $ caravan --shh -I ../../saturn/backoff ../../saturn/treiber_stack/treiber_stack.ml
-  Verification successful.
+Verify the monomorphic functor client against the imported abstract Treiber stack contract.
 
   $ caravan --shh functor_stack_drain.ml
   Verification successful.

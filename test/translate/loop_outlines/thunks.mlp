@@ -1,0 +1,7 @@
+module Job = Ghost.Task (struct let operation = work end)
+
+proof result = work value ensures (result === value) = ()
+
+proof result = run () ensures (result = 3) =
+  at (Domain.spawn (fun () -> work 1)) (fun step -> let result = step () in result);
+  at (Domain.spawn (fun () -> work 2)) (fun step -> let result = step () in result)

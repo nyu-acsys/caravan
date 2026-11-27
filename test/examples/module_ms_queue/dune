@@ -18,8 +18,8 @@
     (cat client.ml)))))
 
 (rule
- (target module_queue.proof)
- (deps ../../saturn/michael_scott_queue/michael_scott_queue.proof)
+ (target module_queue.mlp)
+ (deps ../../saturn/michael_scott_queue/michael_scott_queue.mlp)
  (action
   (with-stdout-to
    %{target}
@@ -45,7 +45,7 @@
   %{bin:raven}
   michael_scott_queue_intf.mli
   module_queue.ml
-  module_queue.proof
+  module_queue.mlp
   queue_api.mli
   client.ml
   ../../saturn/backoff/backoff.mli))

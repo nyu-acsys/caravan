@@ -1,0 +1,29 @@
+// The signal has no release carrying the payload's publication cut.
+field view_signal: Bool
+ghost field view_sender: Ref
+ghost field view_channel: Ref
+
+inv view_mailbox(mail: Ref; writer: Ref, channel: Ref) {
+  own(mail.view_signal, false, 1.0)
+    && own(mail.view_sender, writer, 1.0) && own(mail.view_channel, channel, 1.0)
+    && ThreadContext.seen(writer, {channel})
+}
+
+// Duplicable writer evidence may be shared; it is not renamed for the recipient.
+proc already_visible_after_unrelated_read(executing: Ref, writer: Ref,
+    mail: Ref, cell: Ref, channel: Ref)
+  returns (result: Int)
+  requires ThreadContext.context(executing, {channel})
+    && ThreadCounters.published(channel, cell, 42, {})
+    && view_mailbox(mail, writer, channel)
+  ensures ThreadContext.context(executing, {channel})
+    && ThreadCounters.published(channel, cell, 42, {})
+    && view_mailbox(mail, writer, channel) && result == 42
+  opens view_mailbox(mail), ThreadCounters.published
+{
+  unfold view_mailbox(mail, writer, channel);
+  ThreadContext.duplicate_seen(writer, {channel});
+  val signal := mail.view_signal;
+  fold view_mailbox(mail, writer, channel);
+  result := ThreadCounters.read_frozen(executing, cell, channel, {channel}, 42, {});
+}

@@ -48,7 +48,7 @@ let () =
   let root = { source.proof_scopes.root with environment = env; structure = typed } in
   let user =
     get
-      (C.Source.parse_proof ~file:"zero_client.proof"
+      (C.Source.parse_proof ~file:"zero_client.mlp"
          "lemma client_zero (ignored : unit)\n\
           ensures (Stdlib_model.List.zero () === 0) = ()\n")
   in

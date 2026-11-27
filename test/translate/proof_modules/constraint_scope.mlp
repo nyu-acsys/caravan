@@ -1,0 +1,10 @@
+module Make (Element : ELEMENT) = struct
+  module Resource : Ghost.MutexResource
+      with type t = Element.t * Ghost.t = struct
+    type t = Element.t * Ghost.t
+    predicate resource (pair : t) = true
+  end
+  module Guard = Ghost.Mutex (Resource)
+
+  proof result = keep value ensures result === value = ()
+end

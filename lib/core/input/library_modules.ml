@@ -54,14 +54,14 @@ let environment (source : Source.t) library =
   let* environment = open_module library.library_path lexical in
   model_environment source library environment
 
-(** Source declarations retain the compiler variables of parameterized abstract types. *)
-let abstract_types library =
+(** Imported declarations retain their compiler identities and parameter schemes. *)
+let type_declarations library =
   List.map library.signature.signature_types ~f:(fun (_, declaration) ->
       match (declaration.Typedtree.typ_kind, declaration.typ_manifest) with
-      | Ttype_abstract, None -> Ok declaration
+      | Ttype_abstract, _ | Ttype_record _, _ -> Ok declaration
       | _ ->
           Report.unsupported declaration.typ_loc
-            "A library type other than an abstract type")
+            "A library type other than an abstract type, alias, or record")
   |> Result.all
 
 let value source library (value : Module_inventory.signature_value) =

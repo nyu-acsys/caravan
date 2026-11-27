@@ -1,0 +1,5 @@
+lemma retarget_snapshot(writer: Ref, executing: Ref, channel: Ref)
+  requires writer != executing && ThreadContext.seen(writer, {channel})
+  ensures ThreadContext.seen(executing, {channel})
+{
+}

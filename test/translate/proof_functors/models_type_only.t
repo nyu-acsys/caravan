@@ -9,8 +9,8 @@ A generic proof type is instantiated even when its template has no proof terms.
 The two applications retain distinct ghost model types.
 
   $ cp models_type_only.ml models_type_only_cross.ml
-  $ cat models_type_only.proof > models_type_only_cross.proof
-  $ printf '\nlemma incompatible (cell : Second.t) =\n  let (value : First.model) = Second.Item cell in ()\n' >> models_type_only_cross.proof
+  $ cat models_type_only.mlp > models_type_only_cross.mlp
+  $ printf '\nlemma incompatible (cell : Second.t) =\n  let (value : First.model) = Second.Item cell in ()\n' >> models_type_only_cross.mlp
   $ ! caravan --shh models_type_only_cross.ml > models_type_only_cross.out 2>&1
   $ grep -q 'Type Error:' models_type_only_cross.out
 
@@ -22,7 +22,7 @@ An unapplied template checks its model in its generic declaration.
   >   let identity (value : Arg.t) = value
   > end
   > ML
-  $ cat > unapplied_model.proof <<'PROOF'
+  $ cat > unapplied_model.mlp <<'PROOF'
   > module Make (Arg : ARG) = struct
   >   type model = Empty
   > end

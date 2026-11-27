@@ -1,0 +1,149 @@
+let modulus (token : unit) : integer = max_int - min_int + 1
+
+let correction (value : integer) : integer =
+  if value > max_int then 1 else if value < min_int then -1 else 0
+
+let wrap_once (value : integer) : integer = value - correction value * modulus ()
+
+predicate [@inline] represents (word : int) (position : integer) (turn : integer) =
+  min_int <= word && word <= max_int && position = word + turn * modulus ()
+
+lemma positive_representative (word : int) (position : integer) (turn : integer)
+  requires (represents word position turn && 0 <= position && 0 < word)
+  ensures (word <= position) = ()
+
+proof result = successor [position : integer] [turn : integer] counter
+  requires (represents counter position turn)
+  ensures (represents result (position + 1) (turn + correction (counter + 1))) = ()
+
+proof result = refresh [tail_position : integer] [head_position : integer]
+    [tail_turn : integer] [head_turn : integer] limit tail_counter head_counter
+  requires (0 <= limit && represents tail_counter tail_position tail_turn &&
+    represents head_counter head_position head_turn && tail_position - head_position <= limit)
+  ensures (result = wrap_once (limit - wrap_once (tail_counter - head_counter)))
+  ensures (result > 0 -> result <= limit - (tail_position - head_position)) =
+  on return begin
+    let difference_turn = tail_turn - head_turn + correction (tail_counter - head_counter) in
+    let result_turn = correction (limit - wrap_once (tail_counter - head_counter)) - difference_turn in
+    if result > 0 then
+      positive_representative result (limit - (tail_position - head_position)) result_turn
+    else ()
+  end
+
+proof result = decrement capacity
+  requires (0 < capacity)
+  ensures (0 <= result && result = capacity - 1) = ()
+
+proof result = crossing () ensures (result = 3) =
+  at (successor max_int) (fun step -> let result = step (max_int, 0) in result);
+  at (refresh 4 tail head) (fun step -> let result = step (max_int + 1, max_int, 1, 0) in result)
+
+proof result = stale_tail_full () ensures (result === true) =
+  at (successor tail) (fun step -> let result = step (max_int, 0) in result);
+  at (refresh max_int tail head) (fun step ->
+    let result = step (max_int, max_int + 1, 0, 1) in result)
+
+module Capacity = Ghost.Relaxed (struct let field (cache : cache) = cache.capacity end)
+
+predicate [@inline] certified (limit : int) (head : integer) (position : integer)
+    (writes : (Ghost.t * int) set) =
+  forall event : Ghost.t, value : int. Set.mem (event, value) writes ->
+    0 <= value && value <= limit - (position - head)
+
+lemma advance_head (limit : int) (head : integer) (next_head : integer)
+    (position : integer) (writes : (Ghost.t * int) set)
+  requires (head <= next_head && certified limit head position writes)
+  ensures (certified limit next_head position writes) = ()
+
+lemma link_successor (limit : int) (head : integer) (tail : integer)
+    (capacity : int)
+  requires (0 <= tail - head && tail - head <= limit &&
+    0 < capacity && capacity <= limit - (tail - head))
+  ensures (0 <= tail + 1 - head && tail + 1 - head <= limit &&
+    0 <= capacity - 1 && capacity - 1 <= limit - ((tail + 1) - head)) = ()
+
+predicate cache_at (cache : cache) (limit : int) (head : integer) (position : integer) =
+  exists current : int, writes : (Ghost.t * int) set.
+    Capacity.state cache current writes && certified limit head position writes
+
+proof result = make_cache [limit : int] [head : integer] [position : integer] capacity
+  requires (0 <= capacity && capacity <= limit - (position - head))
+  ensures (cache_at result limit head position) =
+  on return begin
+    let (event, writes) = Capacity.snapshot result in
+    fold cache_at result limit head position {current = capacity; writes = writes}
+  end
+
+proof result = read_cache [limit : int] [head : integer] [position : integer] cache
+  requires (cache_at cache limit head position)
+  ensures (cache_at cache limit head position &&
+    0 <= result && result <= limit - (position - head)) =
+  at (cache.capacity) (fun load ->
+    let (current, writes) = unfold cache_at cache limit head position {current; writes} in
+    let result = load () in
+    let event = Capacity.observe cache result in
+    Capacity.reconcile cache event result;
+    fold cache_at cache limit head position {current = current; writes = writes};
+    result)
+
+proof refresh_cache [head : integer] [position : integer] [sampled_head : integer]
+    [tail_turn : integer] [head_turn : integer] cache limit tail_counter head_counter
+  requires (cache_at cache limit head position &&
+    0 <= limit && sampled_head <= head && position - sampled_head <= limit &&
+    represents tail_counter position tail_turn && represents head_counter sampled_head head_turn)
+  ensures (cache_at cache limit head position) =
+  at (cache.capacity <- available) (fun store ->
+    let (current, writes) = unfold cache_at cache limit head position {current; writes} in
+    let difference_turn = tail_turn - head_turn + correction (tail_counter - head_counter) in
+    let result_turn = correction (limit - wrap_once (tail_counter - head_counter)) - difference_turn in
+    positive_representative available (limit - (position - sampled_head)) result_turn;
+    let result = store () in
+    let (event, updated) = Capacity.snapshot cache in
+    fold cache_at cache limit head position {current = available; writes = updated};
+    result)
+
+lemma advance_cache (cache : cache) (limit : int) (head : integer) (next_head : integer)
+    (position : integer)
+  requires (cache_at cache limit head position && head <= next_head)
+  ensures (cache_at cache limit next_head position) =
+  let (current, writes) = unfold cache_at cache limit head position {current; writes} in
+  advance_head limit head next_head position writes;
+  fold cache_at cache limit next_head position {current = current; writes = writes}
+
+proof result = successor_cache [limit : int] [head : integer] [position : integer] cache
+  requires (cache_at cache limit head position)
+  ensures (cache_at cache limit head position && match result with
+    | None -> true
+    | Some next -> cache_at next limit head (position + 1)) =
+  at (cache.capacity) (fun load ->
+    let (current, writes) = unfold cache_at cache limit head position {current; writes} in
+    let result = load () in
+    let event = Capacity.observe cache result in
+    Capacity.reconcile cache event result;
+    fold cache_at cache limit head position {current = current; writes = writes};
+    result);
+  on return begin
+    match result with
+    | None -> ()
+    | Some next ->
+        let (event, writes) = Capacity.snapshot next in
+        fold cache_at next limit head (position + 1) {current = capacity - 1; writes = writes}
+  end
+
+proof result = moving_tail ()
+  ensures (match result with None -> true | Some (old_capacity, new_capacity) ->
+    0 <= old_capacity && old_capacity <= 5 && 0 <= new_capacity && new_capacity <= 4) =
+  at (successor max_int) (fun step -> let result = step (max_int, 0) in result);
+  at (make_cache 1) (fun step -> let result = step (4, max_int - 3, max_int) in result);
+  at (successor_cache cache) (fun step ->
+    let result = step (4, max_int - 3, max_int) in
+    advance_cache cache 4 (max_int - 3) (max_int + 1) max_int;
+    begin match result with
+    | None -> ()
+    | Some next -> advance_cache next 4 (max_int - 3) (max_int + 1) (max_int + 1)
+    end;
+    result);
+  at (refresh_cache cache 4 max_int counter) (fun step ->
+    let result = step (max_int + 1, max_int, max_int + 1, 0, 1) in result);
+  at (read_cache cache) (fun step -> let result = step (4, max_int + 1, max_int) in result);
+  at (read_cache next) (fun step -> let result = step (4, max_int + 1, max_int + 1) in result)

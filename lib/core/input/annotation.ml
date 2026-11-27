@@ -5,12 +5,17 @@ open Base
 open Caravan_spec
 
 type outline = {
+  target : Location.t option;
+      (** The source expression explicitly selected by an outline scope. *)
   export : (string * Spec_ast.pat) option;
       (** The key under which the step keeps the value it exports, and its pattern. *)
   imports : (string * Spec_ast.pat) list;
       (** The exports of earlier steps that the step uses, by key and pattern. *)
   lets : (Spec_ast.pat * Spec_ast.proof_expr) list;
       (** The outline's pure bindings that the step uses, in order. *)
+  body_imports : (string * Spec_ast.pat) list;
+      (** The exports of steps in a loop's body that the witnesses of its invariant use,
+          at the end of each iteration. *)
 }
 (** What a step of a proof outline shares with the other steps. *)
 
@@ -81,8 +86,13 @@ let kind (annotation : t) =
   | ("invariant" | "variant") :: _ -> Loop
   | "predicate" :: _ -> Predicate
   | "module" :: _ -> Ghost_module
-  | ("fold" | "unfold" | "assert" | "lemma") :: _ -> Ghost
-  | ("Ghost.scope" | "Ghost.State.scope") :: _ -> Scope
+  | ("fold" | "unfold" | "assert" | "cut" | "lemma") :: _ -> Ghost
+  | ( "Ghost.scope" | "Ghost.State.scope" | "Ghost.frozen_scope"
+    | "Ghost.State.frozen_scope" | "Ghost.published_scope" | "Ghost.State.published_scope"
+    | "Ghost.release_scope" | "Ghost.acquire_scope" | "Ghost.State.release_scope"
+    | "Ghost.State.acquire_scope" )
+    :: _ ->
+      Scope
   | "Ghost.returns" :: _ -> Returns
   | "proof" :: _ -> Proof
   | [ "manual" ] -> Manual
@@ -151,6 +161,23 @@ let loop_spec (annotation : t) : (Spec_ast.loop_spec, Report.error) Result.t =
     by its clauses. The lexer and the parser report errors by raising. *)
 let contract (annotation : t) : (Spec_ast.contract, Report.error) Result.t =
   let lexbuf = lexbuf annotation in
-  try Ok (Spec_parser.contract Spec_lexer.token lexbuf) with
+  try
+    let contract = Spec_parser.contract Spec_lexer.token lexbuf in
+    Result.map (Callable_contract.validate (Some contract)) ~f:(fun () -> contract)
+  with
   | Spec_lexer.Error (loc, message) -> Error (Report.error Syntax loc message)
   | Spec_parser.Error -> Error (Report.error Syntax (lexeme_loc lexbuf) "Syntax error")
+  | Spec_ast.Syntax_error (loc, message) -> Error (Report.error Syntax loc message)
+
+(** The unique contract following a declaration in its lexical scope. *)
+let contract_after ?scope ~item_loc ~next annotations =
+  let follows (annotation : t) =
+    Declaration_scope.following ?scope ~item_loc ~next annotation.loc
+    && Poly.equal (kind annotation) Contract
+  in
+  match List.filter annotations ~f:follows with
+  | [] -> Ok None
+  | [ annotation ] ->
+      Result.map (contract annotation) ~f:(fun contract -> Some (contract, annotation))
+  | _ :: annotation :: _ ->
+      Error (Report.error Type annotation.loc "A function has at most one contract")

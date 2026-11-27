@@ -107,8 +107,9 @@ let resource_generics ~types ~inputs ~workers predicates =
       match Generic_predicates.find ~target workers target with
       | Some worker ->
           let* worker =
-            Generic_parameters.rebind ~expand:(Datatypes.expand types) ~at:worker.loc
-              worker parameters
+            Generic_parameters.rebind ~expand:(Datatypes.expand types)
+              ~project:(Datatypes.representation_arguments types)
+              ~at:worker.loc worker parameters
           in
           Ok ({ worker with key } :: workers)
       | None ->
@@ -118,8 +119,10 @@ let resource_generics ~types ~inputs ~workers predicates =
               ~default:(List.length parameters)
           in
           let* worker =
-            Generic_predicates.discover ~expand:(Datatypes.expand types) ~key
-              ~name:(resource_worker_name target) ~at:Location.none ~explicit parameters
+            Generic_predicates.discover ~expand:(Datatypes.expand types)
+              ~project:(Datatypes.representation_arguments types)
+              ~key ~name:(resource_worker_name target) ~at:Location.none ~explicit
+              parameters
           in
           if List.is_empty worker.variables then Ok workers
           else
@@ -133,10 +136,10 @@ let enrich_predicates ctx predicates =
   in
   Ok { ctx with given = { ctx.given with generic_predicates } }
 
-let operation_module ~abstract ?inherited ctx operation member =
+let operation_module ~abstract ?inherited ?(prefix = []) ctx operation member =
   let open State.Syntax in
   match operation.operation_worker with
-  | None -> State.return [ R.Member.callable member ]
+  | None -> State.return (prefix @ [ R.Member.callable member ])
   | Some worker ->
       let at = operation.operation_signature.site.item_loc in
       let l = loc at in
@@ -158,7 +161,7 @@ let operation_module ~abstract ?inherited ctx operation member =
         State.return
           [
             R.Member.module_ ~loc:l ~interface:true ~params (ident ~loc:l contract)
-              (support @ [ R.Member.callable member ]);
+              (support @ prefix @ [ R.Member.callable member ]);
             R.Member.instance ~loc:l (ident ~loc:l stem) (qualified_name ~loc:l contract);
           ]
       else
@@ -169,7 +172,7 @@ let operation_module ~abstract ?inherited ctx operation member =
                 (if Option.is_some inherited then [ (qualified_name ~loc:l contract, []) ]
                  else [])
               (ident ~loc:l stem)
-              (support @ [ R.Member.callable member ]);
+              (support @ prefix @ [ R.Member.callable member ]);
           ]
 
 let actual_operation_context ctx view operation ?native ~declaration ~worker ~target
@@ -187,19 +190,25 @@ let actual_operation_context ctx view operation ?native ~declaration ~worker ~ta
       let all_types = ctx.given.types @ actual_ctx.given.types in
       let expand = Datatypes.expand all_types in
       let* scheme =
-        State.of_result (Polymorphic_functions.discover ~expand ~at declaration)
+        State.of_result
+          (Polymorphic_functions.discover ~expand
+             ~project:(Datatypes.representation_arguments all_types)
+             ~at declaration)
       in
       let* arguments =
         State.of_result
-          (Polymorphic_functions.instantiate ~expand ~at scheme ~declaration ~occurrence)
+          (Polymorphic_functions.instantiate ~expand
+             ~project:(Datatypes.representation_arguments all_types)
+             ~at scheme ~declaration ~occurrence)
       in
       let* worker_arguments =
         match worker with
         | None -> State.return []
         | Some worker ->
             State.of_result
-              (Polymorphic_functions.instantiate_worker ~expand ~at worker ~declaration
-                 ~occurrence)
+              (Polymorphic_functions.instantiate_worker ~expand
+                 ~project:(Datatypes.representation_arguments all_types)
+                 ~at worker ~declaration ~occurrence)
       in
       let variables =
         scheme.variables
@@ -239,7 +248,7 @@ let actual_operation_context ctx view operation ?native ~declaration ~worker ~ta
         | None ->
             begin match Types.get_desc typ with
             | Tvar _ | Tunivar _ -> typ
-            | desc -> Ctype.newty (Btype.copy_type_desc project desc)
+            | desc -> Ctype.newty (Compiler_types.map_desc project desc)
             end
       in
       let actual_ctx =

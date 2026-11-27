@@ -16,19 +16,22 @@ let binding_name_location (binding : Typedtree.value_binding) =
 (** The data types and functions of [structure], in order, with the contracts of the
     functions in [annotations], or in [interface], by their names. *)
 let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t) =
+  let predicate_signatures =
+    List.filter_map inventory.constraints ~f:(fun constraint_ ->
+        Option.some_if
+          (Option.is_some constraint_.Module_inventory.owner)
+          constraint_.signature)
+    @ List.map inventory.bindings ~f:(fun binding -> binding.Module_inventory.expected)
+  in
   let* signature_predicates =
-    all
-      (List.filter inventory.constraints ~f:(fun constraint_ ->
-           Option.is_some constraint_.Module_inventory.owner))
-      ~f:(fun constraint_ ->
-        all constraint_.Module_inventory.signature.signature_resources
-          ~f:(fun (name, resource) ->
+    all predicate_signatures ~f:(fun signature ->
+        all signature.Module_inventory.signature_resources ~f:(fun (name, resource) ->
             let environment = Source.annotation_env source resource.site.environment in
             let* parameters =
               Proof_bindings.parameter_types environment resource.declaration.pred_params
             in
             Ok
-              (List.map constraint_.signature.signature_values ~f:(fun (_, value) ->
+              (List.map signature.signature_values ~f:(fun (_, value) ->
                    let parameters =
                      Compiler_types.map_group parameters ~f:(fun typ ->
                          Subst.type_expr value.origin_projection
@@ -75,6 +78,8 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
         let vb = entry.binding in
         match (vb.vb_pat.pat_desc, function_parts vb.vb_expr) with
         | Tpat_var (id, _, _), Some (params, body) ->
+            let* params, body = Optional_parameters.lower params body in
+            let* () = Datatypes.validate_indices data ~at:vb.vb_loc vb.vb_pat.pat_type in
             let site = entry.site in
             let* own =
               contract_with_origin_after ~scope:site.scope site.annotations
@@ -114,6 +119,20 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                   Ok (Option.map contract ~f:(fun contract -> (contract, site.item_loc))))
             in
             let supplied = List.filter_opt supplied in
+            let* () =
+              match own with
+              | None -> Ok ()
+              | Some (actual, annotation) ->
+                  List.fold_result entry.signatures ~init:() ~f:(fun () signature ->
+                      let site = signature.Module_inventory.site in
+                      let* expected =
+                        Annotation.contract_after ~scope:site.scope
+                          ~item_loc:site.item_loc ~next:site.next site.annotations
+                      in
+                      Callable_contract.check ~at:site.item_loc
+                        ~related:[ (annotation.loc, "The implementation contract") ]
+                        ~expected:(Option.map expected ~f:fst) ~actual:(Some actual) ())
+            in
             let* contract =
               match (own, supplied) with
               | Some _, (_, at) :: _ ->
@@ -241,6 +260,18 @@ let items ?(libraries = []) (source : Source.t) (inventory : Module_inventory.t)
                       "A function value alias that does not refer to an earlier \
                        translated function"
                 | Some target ->
+                    let* () =
+                      List.fold_result
+                        (List.zip_exn entry.signatures (List.tl_exn contracts))
+                        ~init:()
+                        ~f:(fun
+                            ()
+                            ((signature : Module_inventory.signature_value), expected)
+                          ->
+                          Callable_contract.check ~at:signature.site.item_loc
+                            ~related:[ (target.loc, "The aliased operation") ]
+                            ~expected ~actual:target.contract ())
+                    in
                     let paths =
                       List.fold entry.paths ~init:target.paths ~f:(fun paths path ->
                           if List.mem paths path ~equal:Path.same then paths
@@ -330,6 +361,7 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
     ~f:(fun
         ((vb : Typedtree.value_binding), id, params, body, (rest : Typedtree.expression))
       ->
+      let* params, body = Optional_parameters.lower params body in
       let* contract =
         contract_with_origin_after annotations ~item_loc:vb.vb_loc
           ~next:(Some rest.exp_loc)
@@ -412,7 +444,12 @@ let local_functions ~source (outer : func) (annotations : Annotation.t list) =
             in
             let header =
               {
-                S.hd_name = S.mk_id ~loc:vb.vb_loc (Ident.name id);
+                S.hd_name =
+                  S.mk_id ~loc:vb.vb_loc
+                    ~attrs:
+                      (Option.value_map c.header ~default:[] ~f:(fun h ->
+                           h.hd_name.pid_attrs))
+                    (Ident.name id);
                 hd_ret =
                   Option.value_map c.header ~default:[ S.Lwild ] ~f:(fun h -> h.hd_ret);
                 hd_args =
@@ -505,16 +542,28 @@ let attached_annotations ?(all_expressions = false) ?(innermost = false)
   iterator.structure iterator typed;
   let* attached =
     all attached ~f:(fun (anchor, annotation) ->
+        let target =
+          Option.bind annotation.Annotation.outline ~f:(fun outline -> outline.target)
+        in
         let candidates =
           List.filter !expressions ~f:(fun (e, _) ->
-              (anchor = step_end e
-              &&
-              match e.exp_desc with
-              | Texp_apply (callee, _) -> anchor >= callee.exp_loc.loc_end.pos_cnum
-              | _ -> true)
-              || anchor = e.exp_loc.loc_end.pos_cnum
-              || List.exists e.exp_extra ~f:(fun (_, at, _) ->
-                  anchor = at.loc_end.pos_cnum))
+              match target with
+              | Some target ->
+                  let matches (at : Location.t) =
+                    at.loc_start.pos_cnum = target.loc_start.pos_cnum
+                    && at.loc_end.pos_cnum = target.loc_end.pos_cnum
+                  in
+                  matches e.exp_loc
+                  || List.exists e.exp_extra ~f:(fun (_, at, _) -> matches at)
+              | None ->
+                  (anchor = step_end e
+                  &&
+                  match e.exp_desc with
+                  | Texp_apply (callee, _) -> anchor >= callee.exp_loc.loc_end.pos_cnum
+                  | _ -> true)
+                  || anchor = e.exp_loc.loc_end.pos_cnum
+                  || List.exists e.exp_extra ~f:(fun (_, at, _) ->
+                      anchor = at.loc_end.pos_cnum))
         in
         match
           List.min_elt candidates ~compare:(fun (a, _) (b, _) ->
@@ -579,27 +628,47 @@ let access_annotations ~libraries ?(checked = []) source typed annotations ~func
   let libraries = library_calls libraries in
   let is_target (e : Typedtree.expression) =
     match e.exp_desc with
+    | Texp_field (_, _, label) ->
+        Poly.equal label.lbl_atomic Nonatomic
+        && Array.exists label.lbl_all ~f:(fun field ->
+            Poly.equal field.Data_types.lbl_mut Mutable)
+    | Texp_setfield (_, _, label, _) ->
+        Poly.equal label.lbl_mut Mutable && Poly.equal label.lbl_atomic Nonatomic
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, _) -> (
-        Option.exists (atomic_name path) ~f:(fun op ->
-            not (String.is_prefix op ~prefix:"make"))
+        Option.is_some (atomic_name path)
+        || Option.exists (stdlib_array_function path) ~f:(fun operation ->
+            List.mem
+              [ "get"; "set"; "unsafe_get"; "unsafe_set" ]
+              operation ~equal:String.equal)
         ||
         match Source.normalize_value_path e.exp_env ~at:e.exp_loc path with
-        | Ok path -> Path_bindings.mem functions path || Path_bindings.mem libraries path
+        | Ok path ->
+            Path_bindings.mem functions path
+            || Path_bindings.mem libraries path
+            || Option.exists (Domain_primitives.operation path) ~f:(function
+                | Spawn | Join -> true)
+            || Option.exists (Mutex_primitives.operation path) ~f:(function
+              | Create | Lock | Unlock | Try_lock -> true
+              | Protect -> false)
+            || Option.is_some (Condition_primitives.operation path)
         | Error _ -> false)
     | _ -> false
   in
   attached_annotations source typed annotations ~kind:Annotation.Scope ~is_target
-    ~description:"Ghost.scope must follow an Atomic access or a checked procedure call"
+    ~description:
+      "Ghost.scope must follow an ordinary field or array access, an Atomic access or a \
+       checked procedure call"
 
 (** The functions of [funcs] that must be pure: those that contracts call or say are
     [pure], and the functions these call. *)
-let pure_functions (funcs : func list) =
+let pure_functions ?(required = []) (funcs : func list) =
   let* () =
     Result.all_unit
       (List.map funcs ~f:(fun f ->
            let clauses =
              Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
-                 c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures @ c.variant)
+                 c.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures @ c.variant
+                 @ Option.value_map c.opens ~default:[] ~f:snd)
            in
            Result.all_unit
              (List.map clauses ~f:(fun term ->
@@ -611,6 +680,8 @@ let pure_functions (funcs : func list) =
                          | Some (Path.Pdot _ as path)
                            when List.exists funcs ~f:(fun target ->
                                     (not (List.is_empty target.signature_sites))
+                                    && (not
+                                          (List.mem required target.id ~equal:Ident.same))
                                     && List.mem target.paths path ~equal:Path.same) ->
                              unsupported term.term_loc
                                "A specification call through a constrained module \
@@ -621,7 +692,8 @@ let pure_functions (funcs : func list) =
     List.concat_map funcs ~f:(fun f ->
         Option.value_map f.contract ~default:[] ~f:(fun (c : S.contract) ->
             List.concat_map
-              (c.requires @ c.ensures @ c.variant)
+              (c.requires @ c.ensures @ c.variant
+              @ Option.value_map c.opens ~default:[] ~f:snd)
               ~f:(fun t ->
                 List.filter_map
                   (term_references (contract_bound_names f) t)
@@ -631,6 +703,7 @@ let pure_functions (funcs : func list) =
     List.filter funcs ~f:(fun f ->
         List.exists f.paths ~f:(fun path ->
             List.mem referenced_in_contracts path ~equal:Path.same)
+        || List.mem required f.id ~equal:Ident.same
         || Option.exists f.contract ~f:(fun (c : S.contract) -> c.pure))
   in
   let is_in set f = List.exists set ~f:(fun g -> Ident.same g.id f.id) in
@@ -651,6 +724,7 @@ let pure_functions (funcs : func list) =
           | Path.Pdot _
             when List.exists funcs ~f:(fun target ->
                      (not (List.is_empty target.signature_sites))
+                     && (not (List.mem required target.id ~equal:Ident.same))
                      && List.mem target.paths path ~equal:Path.same) ->
               unsupported at "A pure call through a constrained module signature"
           | _ -> Ok ()
@@ -689,7 +763,7 @@ type definition =
     [forall i. g -> own s.cells.(i) v]: the index, the guard, the field and the value. *)
 let chain_of ~state (t : S.term) =
   match t.term_desc with
-  | Tquant (Tforall, [ (i, _) ], body) ->
+  | Tquant (Tforall, [ (i, _) ], [], body) ->
       begin match spine (S.chain body) [] with
       | { term_desc = Tvar (Qid { pid_str = "->"; _ }); _ }, [ guard; owned ] ->
           begin match spine owned [] with
@@ -768,7 +842,7 @@ let invariant_parts types (st : structure) body =
                       :: existential field :: mentioned);
                   part_owns = contents field;
                 }
-          | _, Tquant (Tforall, _, _) when mentions_own t ->
+          | _, Tquant (Tforall, _, _, _) when mentions_own t ->
               Some
                 {
                   part_pred = member_name st ("part_" ^ Int.to_string n);
@@ -1604,7 +1678,7 @@ let checked_type_substitution ?(substitution = Subst.identity) binding path =
         (Subst.module_path substitution (Path.Pdot (path, name)))
         substitution)
 
-let checked_raw_types types binding =
+let checked_raw_types ?(dependencies = []) types binding =
   let rec referenced_paths (seen, paths) typ =
     let id = Types.get_id typ in
     if Set.mem seen id then (seen, paths)
@@ -1616,10 +1690,13 @@ let checked_raw_types types binding =
       Btype.fold_type_expr referenced_paths (seen, paths) typ
   in
   let _, dependencies =
-    List.fold binding.Module_inventory.expected.signature_values
+    List.fold
+      (dependencies
+      @ List.map binding.Module_inventory.expected.signature_values
+          ~f:(fun (_, signature) ->
+            signature.Module_inventory.declaration.val_val.val_type))
       ~init:(Set.empty (module Int), [])
-      ~f:(fun state (_, signature) ->
-        referenced_paths state signature.declaration.val_val.val_type)
+      ~f:referenced_paths
   in
   let aliases =
     List.map binding.Module_inventory.expected.signature_ghost_modules
@@ -1652,11 +1729,16 @@ let signature_contract (signature : Module_inventory.signature_value) =
     ~next:site.next
 
 type prepared_callable = {
+  prepared_physical_atomic : bool;
+  prepared_opens : (R.Loc.t * (R.Name.t * R.Expr.t list) list) option;
   prepared_formals : R.Var.t list;
   prepared_args : R.Expr.t list;
+  prepared_execution : Execution_context.boundary;
+  prepared_execution_aliases : (string * Mutex_execution.witness) list;
   prepared_implicit : (string * string * Types.type_expr * R.Type.t * R.Loc.t) list;
   prepared_roles : (bool * bool) list;
   prepared_returns : R.Var.t list;
+  prepared_returns_value : bool;
   prepared_requires : R.Spec.t list;
   prepared_ensures : R.Spec.t list;
   prepared_logical_ensures : R.Spec.t list;
@@ -1667,8 +1749,17 @@ type prepared_callable = {
 
 let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~result
     (contract : S.contract option) =
+  let ctx = { ctx with given = { ctx.given with execution_types = result :: args } } in
   let l = loc at in
   let header = Option.bind contract ~f:(fun c -> c.header) in
+  let raw = Raw_contract.of_header header in
+  let ctx =
+    {
+      ctx with
+      given = { ctx.given with raw_flow = ctx.given.raw_flow || Raw_contract.any raw };
+    }
+  in
+  let stored_result = if raw.result then Predef.type_option result else result in
   let header_names =
     match header with
     | None -> Ok ("result", List.map args ~f:(fun _ -> None))
@@ -1693,19 +1784,44 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
                (List.length names) (List.length args))
   in
   let open State.Syntax in
+  let* () = State.of_result (Callable_contract.validate contract) in
+  let* () =
+    State.of_result
+      (match contract with
+      | Some contract when Raw_contract.any raw && (contract.pure || contract.atomic) ->
+          unsupported at "Raw binders in pure or logically atomic contracts"
+      | _ -> Ok ())
+  in
+  let* () =
+    if Raw_contract.any raw && Option.is_some raising then
+      State.of_result (unsupported at "Raw binders on procedures that may raise")
+    else State.return ()
+  in
+  let* () =
+    State.of_result
+      (Datatypes.validate_callable_indices ctx.given.types ~at ~args ~result)
+  in
   let* () =
     State.modify (fun (s : State.state) ->
         { s with names = { s.names with used = Set.add s.names.used "r" } })
   in
-  let* result_typ = State.typ ctx ~at result in
-  let* () = State.note_domain ctx.given.types result in
+  let* ctx, execution = Execution_context.prepare_boundary ctx ~at contract in
+  let* result_typ = State.typ ctx ~at stored_result in
+  let* () =
+    State.note_domain ctx.given.types
+      (if raw.result then stored_result else Datatypes.result_type ctx.given.types result)
+  in
   let* result_name, names = State.of_result header_names in
   let* params =
-    State.all (List.zip_exn names args) ~f:(fun (n, t) ->
+    State.all
+      (List.mapi (List.zip_exn names args) ~f:(fun index argument -> (index, argument)))
+      ~f:(fun (index, (n, t)) ->
+        let marked = Raw_contract.argument raw index in
+        let stored = if marked then Predef.type_option t else t in
         let* raven = State.fresh (Option.value n ~default:"x") in
-        let* typ = State.typ ctx ~at t in
-        let+ () = State.note_domain ctx.given.types t in
-        (n, raven, t, R.Var.make ~loc:l (ident ~loc:l raven) typ))
+        let* typ = State.typ ctx ~at stored in
+        let+ () = State.note_domain ctx.given.types stored in
+        (n, raven, t, marked, R.Var.make ~loc:l (ident ~loc:l raven) typ))
   in
   (* A function that may raise, as [raising] says, returns its outcome last. *)
   let* outcome =
@@ -1717,27 +1833,39 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
         Some (set, raised, typ)
   in
   let returns =
-    (if is_unit result then [] else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ])
+    (if is_unit result && not raw.result then []
+     else [ R.Var.make ~loc:l (ident ~loc:l "r") result_typ ])
     @ Option.value_map outcome ~default:[] ~f:(fun (_, raised, typ) ->
         [ R.Var.make ~loc:l (ident ~loc:l raised) typ ])
   in
   let named =
-    (result_name, "r", result)
-    :: List.filter_map params ~f:(fun (n, raven, t, _) ->
-        Option.map n ~f:(fun n -> (n, raven, t)))
+    (result_name, "r", result, raw.result)
+    :: List.filter_map params ~f:(fun (n, raven, t, marked, _) ->
+        Option.map n ~f:(fun n -> (n, raven, t, marked)))
+  in
+  let* bindings =
+    State.all named ~f:(fun (n, raven, _, marked) ->
+        if not marked then State.return (n, Raven raven)
+        else
+          let carrier = R.Expr.var ~loc:l (name ~loc:l raven) in
+          let value = State.raw_project ~loc:l carrier in
+          let+ () = State.register_raw value carrier in
+          (n, Value value))
   in
   let env =
     {
       ctx;
-      var_types = List.map named ~f:(fun (n, _, t) -> (n, t));
+      var_types = List.map named ~f:(fun (n, _, t, _) -> (n, t));
       logical_definition = false;
       data = ctx.given.types;
       funcs = ctx.given.spec_funcs;
-      vars = List.map named ~f:(fun (n, raven, _) -> (n, Raven raven));
+      vars = bindings;
     }
   in
   let env =
-    if is_unit result then bind env result_name (Value (unit_value ~loc:l)) else env
+    if is_unit result && not raw.result then
+      bind env result_name (Value (unit_value ~loc:l))
+    else env
   in
   let env =
     Option.value_map outcome ~default:env ~f:(fun (_, raised, _) ->
@@ -1786,7 +1914,9 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
       Signature_contract.terms ~expected:Predef.type_bool ~logical_types:ctx.given.types
         ~predicates ~environment:ctx.given.env ~variables:env.var_types clauses
   in
-  let* logical_requires = State.all requires ~f:(formula env) in
+  let* logical_requires =
+    State.all requires ~f:(formula (Execution_context.entry_environment env))
+  in
   let clauses ?atomic terms =
     State.all terms ~f:(fun t ->
         State.map (formula env t) ~f:(fun e -> R.Spec.make ?atomic e))
@@ -1799,7 +1929,11 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
       @ Option.value_map outcome ~default:[] ~f:(fun (set, _, _) ->
           Exceptions.raises_postconditions ctx.given.types ~at raises set))
   in
-  let+ atomic_ensures =
+  let* execution_ensures =
+    Execution_context.exit_resources env execution ~at ~raising:(Option.is_some outcome)
+      contract
+  in
+  let* atomic_ensures =
     contract_postconditions env ~at ~atomic:true
       (on_return (Option.value_map contract ~default:[] ~f:(fun c -> c.atomic_ensures))
       @ Option.value_map outcome ~default:[] ~f:(fun _ ->
@@ -1807,18 +1941,21 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
             (List.map atomic_raises ~f:(fun (p, t) -> (p, Some t)))
             (State.Raises [])))
   in
+  let+ opens = contract_opens env contract in
   let ensures = List.map logical_ensures ~f:R.Spec.make in
   let input_domains =
-    List.filter_map params ~f:(fun (_, raven, typ, _) ->
-        Datatypes.admissible ~loc:l ctx.given.types typ
+    List.filter_map params ~f:(fun (_, raven, typ, marked, _) ->
+        Datatypes.admissible ~loc:l ctx.given.types
+          (if marked then Predef.type_option typ else typ)
           (R.Expr.var ~loc:l (Translate_context.name ~loc:l raven)))
   in
   let in_range = List.map input_domains ~f:R.Spec.make in
+  let result_domain =
+    let value = R.Expr.var ~loc:l (Translate_context.name ~loc:l "r") in
+    if raw.result then Datatypes.admissible ~loc:l ctx.given.types stored_result value
+    else Datatypes.result_admissible ~loc:l ctx.given.types result value
+  in
   let prepared_logical_ensures =
-    let result_domain =
-      Datatypes.admissible ~loc:l ctx.given.types result
-        (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
-    in
     List.map
       (Option.to_list result_domain @ logical_ensures)
       ~f:(fun post ->
@@ -1828,13 +1965,10 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
   in
   let result_in_range =
     match outcome with
-    | None -> Option.to_list (value_spec ctx ~loc:l result "r")
+    | None -> List.map (Option.to_list result_domain) ~f:R.Spec.make
     | Some (_, raised, typ) ->
         Option.to_list
-          (Option.map
-             (Datatypes.admissible ~loc:l ctx.given.types result
-                (R.Expr.var ~loc:l (name ~loc:l "r")))
-             ~f:(fun admissible ->
+          (Option.map result_domain ~f:(fun admissible ->
                R.Spec.make
                  (R.Expr.binary ~loc:l Impl
                     (R.Expr.binary ~loc:l Eq
@@ -1843,35 +1977,49 @@ let prepare_callable ?(validate = false) ?raising ctx ~(at : Location.t) ~args ~
                     admissible)))
   in
   {
+    prepared_physical_atomic = Callable_contract.physically_atomic contract;
+    prepared_opens = opens;
     prepared_formals =
-      List.map params ~f:(fun (_, _, _, v) -> v)
+      List.map params ~f:(fun (_, _, _, _, v) -> v)
+      @ execution.formals
       @ List.map implicit ~f:(fun (_, raven, _, typ, _) ->
           R.Var.make ~loc:l ~ghost:true ~implicit:true (ident ~loc:l raven) typ);
     prepared_args =
-      List.map params ~f:(fun (_, raven, _, _) -> R.Expr.var ~loc:l (name ~loc:l raven));
+      List.map params ~f:(fun (_, raven, _, _, _) ->
+          R.Expr.var ~loc:l (name ~loc:l raven));
+    prepared_execution = execution;
+    prepared_execution_aliases =
+      (if List.is_empty execution.formals then []
+       else
+         Mutex_execution.entry_bindings
+           ?trusted:ctx.given.proof_support.execution_context_path ctx.given.env
+           ~implicit:(List.map implicit ~f:(fun (source, _, _, _, _) -> source))
+           contract);
     prepared_implicit = implicit;
     prepared_roles = roles;
     prepared_returns = returns;
-    prepared_requires = in_range @ requires @ atomic_requires;
-    prepared_ensures = result_in_range @ ensures @ atomic_ensures;
+    prepared_returns_value = (not (is_unit result)) || raw.result;
+    prepared_requires =
+      in_range @ requires @ atomic_requires @ List.map execution.resources ~f:R.Spec.make;
+    prepared_ensures =
+      result_in_range @ ensures @ atomic_ensures
+      @ List.map execution_ensures ~f:R.Spec.make;
     prepared_logical_ensures;
-    prepared_pre_formulas = input_domains @ logical_requires;
+    prepared_pre_formulas = input_domains @ logical_requires @ execution.resources;
     prepared_post_formulas =
-      Option.to_list
-        (Datatypes.admissible ~loc:l ctx.given.types result
-           (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r")))
-      @ logical_ensures;
+      Option.to_list result_domain @ logical_ensures @ execution_ensures;
   }
 
 let prepared_member ?opens ~at ~name body prepared =
-  R.Callable.proc ~loc:(loc at) ?opens ~formals:prepared.prepared_formals
-    ~returns:prepared.prepared_returns ~requires:prepared.prepared_requires
-    ~ensures:prepared.prepared_ensures
+  let opens = Option.first_some opens prepared.prepared_opens in
+  R.Callable.proc ~loc:(loc at) ~atomic:prepared.prepared_physical_atomic ?opens
+    ~formals:prepared.prepared_formals ~returns:prepared.prepared_returns
+    ~requires:prepared.prepared_requires ~ensures:prepared.prepared_ensures
     (ident ~loc:(loc at) name)
     body
 
 (** A checked call with direct argument and result forwarding. *)
-let forwarding_body ~at ~self ~target ~result ~atomic prepared =
+let forwarding_body ?actual ~at ~self ~target ~result ~atomic prepared =
   let open State.Syntax in
   let l = loc at in
   let var x = R.Expr.var ~loc:l (name ~loc:l x) in
@@ -1886,16 +2034,47 @@ let forwarding_body ~at ~self ~target ~result ~atomic prepared =
     if atomic then List.map opened ~f:snd
     else List.map prepared.prepared_implicit ~f:(fun (_, x, _, _, _) -> var x)
   in
+  let actual = Option.value actual ~default:prepared in
+  let* execution_stmts, execution_args =
+    if List.is_empty actual.prepared_execution.formals then State.return ([], [])
+    else Execution_context.call_arguments ~at prepared.prepared_execution
+  in
+  let available =
+    List.filter_map (List.zip_exn prepared.prepared_implicit implicit_args)
+      ~f:(fun ((source, _, _, _, _), value) ->
+        Option.some_if
+          (not
+             (List.Assoc.mem prepared.prepared_execution_aliases source
+                ~equal:String.equal))
+          value)
+  in
+  let* implicit_args, _ =
+    State.fold actual.prepared_implicit ~init:([], available)
+      ~f:(fun (values, available) (source, _, _, _, _) ->
+        match
+          ( List.Assoc.find actual.prepared_execution_aliases source ~equal:String.equal,
+            execution_args,
+            available )
+        with
+        | Some Mutex_execution.Owner, owner :: _, _ ->
+            State.return (owner :: values, available)
+        | Some Held, [ _; held ], _ -> State.return (held :: values, available)
+        | None, _, value :: rest -> State.return (value :: values, rest)
+        | _ ->
+            State.of_result
+              (error at "The forwarded operation has incompatible context arguments"))
+  in
+  let implicit_args = List.rev implicit_args in
   let call =
     R.Expr.call ~loc:l
       (qualified_name ~loc:l target)
-      (prepared.prepared_args @ implicit_args)
+      (prepared.prepared_args @ execution_args @ implicit_args)
   in
   let call_statement =
-    if is_unit result then R.Stmt.call ~loc:l call
+    if not prepared.prepared_returns_value then R.Stmt.call ~loc:l call
     else R.Stmt.assign ~loc:l [ var "r" ] (R.Stmt.expr_rhs call)
   in
-  if not atomic then State.return [ call_statement ]
+  if not atomic then State.return (execution_stmts @ [ call_statement ])
   else
     let+ token = State.fresh "token" in
     let bind =
@@ -1915,7 +2094,8 @@ let forwarding_body ~at ~self ~target ~result ~atomic prepared =
         (R.Expr.call ~loc:l (name ~loc:l "commitAU")
            [ var token; (if is_unit result then unit_value ~loc:l else var "r") ])
     in
-    bind @ List.concat_map opened ~f:fst @ [ opening; call_statement; commit ]
+    execution_stmts @ bind @ List.concat_map opened ~f:fst
+    @ [ opening; call_statement; commit ]
 
 let contains_atomic_token types typ =
   let rec contains seen typ =
@@ -1935,10 +2115,8 @@ let contains_atomic_token types typ =
 (** The logical counterpart of an explicitly pure imported procedure. *)
 let library_pure_name name = name ^ "$pure"
 
-let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
-    (contract : S.contract) =
+let validate_pure_contract ctx ~(at : Location.t) ~args (contract : S.contract) =
   let open State.Syntax in
-  let l = loc at in
   let* () =
     if List.is_empty args then
       State.of_result (unsupported at "A pure contract on a non-function library value")
@@ -1975,6 +2153,37 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
         (unsupported at "A pure library function whose contract depends on heap resources")
     else State.return ()
   in
+  State.return ()
+
+let pure_contract_context ctx =
+  {
+    ctx with
+    given = { ctx.given with mutex_execution = false; visibility_execution = false };
+  }
+
+let pure_result_equality ~at ~target prepared =
+  let l = loc at in
+  if not prepared.prepared_returns_value then []
+  else
+    [
+      R.Spec.make
+        (R.Expr.binary ~loc:l Eq
+           (R.Expr.var ~loc:l (name ~loc:l "r"))
+           (R.Expr.call ~loc:l (qualified_name ~loc:l target) prepared.prepared_args));
+    ]
+
+let pure_logical_member ~at ~name ?body ?(inherit_contract = false) prepared result_type =
+  let l = loc at in
+  R.Callable.func ~loc:l ~formals:prepared.prepared_formals
+    ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
+    ~ensures:(if inherit_contract then [] else prepared.prepared_logical_ensures)
+    (ident ~loc:l name) body
+
+let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
+    (contract : S.contract) =
+  let open State.Syntax in
+  let ctx = pure_contract_context ctx in
+  let* () = validate_pure_contract ctx ~at ~args contract in
   let* prepared = prepare_callable ctx ~at ~args ~result (Some contract) in
   let* () =
     if List.is_empty prepared.prepared_implicit then State.return ()
@@ -1982,54 +2191,52 @@ let library_pure_members ctx ~(at : Location.t) ~name ~args ~result
   in
   let logical_name = library_pure_name name in
   let* result_type = State.typ ctx ~at result in
-  let logical_returns = [ R.Var.make ~loc:l (ident ~loc:l "r") result_type ] in
-  let logical =
-    R.Callable.func ~loc:l ~formals:prepared.prepared_formals ~returns:logical_returns
-      ~ensures:prepared.prepared_logical_ensures (ident ~loc:l logical_name) None
-  in
-  let equality =
-    if is_unit result then []
-    else
-      [
-        R.Spec.make
-          (R.Expr.binary ~loc:l Eq
-             (R.Expr.var ~loc:l (Translate_context.name ~loc:l "r"))
-             (R.Expr.call ~loc:l
-                (Translate_context.name ~loc:l logical_name)
-                prepared.prepared_args));
-      ]
-  in
+  let logical = pure_logical_member ~at ~name:logical_name prepared result_type in
   let procedure =
     prepared_member ~at ~name None
-      { prepared with prepared_ensures = prepared.prepared_ensures @ equality }
+      {
+        prepared with
+        prepared_ensures =
+          prepared.prepared_ensures
+          @ pure_result_equality ~at ~target:logical_name prepared;
+      }
   in
   State.return [ logical; procedure ]
 
 (** An assumed library value or procedure, using the shared contract preparation. *)
 let library_function ?raising ?opens ctx ~(at : Location.t) ~name ~args ~result contract =
+  let open State.Syntax in
+  let* () =
+    State.of_result
+      (Datatypes.validate_callable_indices ctx.given.types ~at ~args ~result)
+  in
   match (args, contract) with
   | [], None ->
       let open State.Syntax in
-      let* () = State.note_domain ctx.given.types result in
+      let* () =
+        State.note_domain ctx.given.types (Datatypes.result_type ctx.given.types result)
+      in
       let+ result_type = State.typ ctx ~at result in
       let l = loc at in
       R.Callable.func ~loc:l
         ~returns:[ R.Var.make ~loc:l (ident ~loc:l "r") result_type ]
-        ~ensures:(Option.to_list (value_spec ctx ~loc:l result "r"))
+        ~ensures:(Option.to_list (result_spec ctx ~loc:l result "r"))
         (ident ~loc:l name) None
   | [], Some _ ->
       State.of_result
         (unsupported at "A contract of a library's value other than a function")
   | _ ->
-      State.map
-        (prepare_callable ?raising ctx ~at ~args ~result contract)
-        ~f:(prepared_member ?opens ~at ~name None)
+      let* prepared = prepare_callable ?raising ctx ~at ~args ~result contract in
+      let+ opens = State.of_result (merge_opens ~at prepared.prepared_opens opens) in
+      prepared_member ?opens ~at ~name None prepared
 
 (** Stable import facts neither consume ownership nor inspect mutable state. *)
 let stable_library_contract ctx ~at ~persistent ~description (contract : S.contract) =
   let* () =
     if
       contract.S.atomic || contract.pure
+      || Callable_contract.physically_atomic (Some contract)
+      || Option.is_some contract.opens
       || (not
             (List.is_empty contract.requires
             && List.is_empty contract.atomic_requires

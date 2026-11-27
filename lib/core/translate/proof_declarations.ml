@@ -304,7 +304,7 @@ let check_lemma_recursion ?(resolve = fun _ q -> qualid_key q) declarations =
     | Proof_match (_, cases) ->
         List.concat_map cases ~f:(fun (pattern, body) ->
             calls at (pat_names pattern @ bound) body)
-    | Proof_fold _ | Proof_unfold _ | Proof_assert _ -> []
+    | Proof_fold _ | Proof_unfold _ | Proof_assert _ | Proof_cut _ -> []
   in
   let graph =
     List.filter_map declarations ~f:(function
@@ -349,6 +349,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         lemma_requires;
         lemma_ensures;
         lemma_variant;
+        lemma_opens;
         lemma_body;
       } ->
       let open State.Syntax in
@@ -365,6 +366,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
           | Some worker ->
               Result.map
                 (Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                   ~project:(Datatypes.representation_arguments types)
                    ~at:lemma_name.pid_loc worker
                    (signature.lemma_inputs @ signature.lemma_outputs))
                 ~f:Option.some)
@@ -436,8 +438,20 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
             R.Spec.make value)
       in
       let* requires = specs lemma_requires in
-      let* ensures = specs lemma_ensures in
+      let* ensures =
+        State.all lemma_ensures ~f:(fun (triggers, t) ->
+            let* triggers = State.all triggers ~f:(State.all ~f:(formula env)) in
+            let+ value = formula env t in
+            R.Spec.make ~triggers value)
+      in
       let* decreases = State.all lemma_variant ~f:(formula env) in
+      let* opens =
+        match lemma_opens with
+        | None -> State.return None
+        | Some (at, entries) ->
+            let+ entries = State.all entries ~f:(mask_entry env) in
+            Some (loc at, entries)
+      in
       let body_env =
         {
           env with
@@ -454,7 +468,7 @@ let proof_lemma types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_lemmas ~proof
         ~auto:(List.mem lemma_name.pid_attrs "auto" ~equal:String.equal)
         ~formals:(List.map inputs ~f:(fun (_, _, _, v) -> v))
         ~returns:(List.map outputs ~f:(fun (_, _, _, v) -> v))
-        ~requires ~ensures ~decreases
+        ~requires ~ensures ~decreases ?opens
         (ident ~loc:l (Option.value member_name ~default:lemma_name.pid_str))
         (Some body)
   | _ -> State.of_result (error Location.none "Expected a lemma declaration")
@@ -472,14 +486,20 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
   State.in_procedure
   @@
   let open State.Syntax in
+  let* ctx = State.of_result (Checked_workers.enrich_predicates ctx preds) in
   let l = loc at in
   let* params, env = pred_params ctx ~at p param_types in
+  let* ancestry = invariant_ancestry env p.pred_ancestry in
   let vars = List.map ~f:(fun (_, _, _, v) -> v) in
   let name = ident ~loc:l (Option.value declaration_name ~default:p.pred_name.pid_str) in
   match def with
   | Direct_invariant body ->
-      let+ body = quantified env body in
-      (R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body), [])
+      let* body = quantified env body in
+      let+ implicit = State.of_result (implicit_parameters p) in
+      let explicit, implicit = List.split_n params (List.length params - implicit) in
+      ( R.Callable.func ~loc:l ~kind:Inv ?within:ancestry ~formals:(vars explicit)
+          ~returns:(vars implicit) name (Some body),
+        [] )
   | Body body ->
       let* body = quantified env body in
       let+ implicit = State.of_result (implicit_parameters p) in
@@ -859,9 +879,11 @@ let predicate types ~shared ~ocaml_env ~preds ~spec_funcs ~proof_support ?declar
       let body =
         match existentials with [] -> body | _ -> R.Expr.exists ~loc:l existentials body
       in
-      State.return
-        ( R.Callable.func ~loc:l ~kind:Inv ~formals:(vars params) name (Some body),
-          List.filter_opt parts @ transitions )
+      let+ implicit = State.of_result (implicit_parameters p) in
+      let explicit, implicit = List.split_n params (List.length params - implicit) in
+      ( R.Callable.func ~loc:l ~kind:Inv ?within:ancestry ~formals:(vars explicit)
+          ~returns:(vars implicit) name (Some body),
+        List.filter_opt parts @ transitions )
 
 (** The predicates of [source], declared in its interface, its proof or its annotations,
     with where they are declared, their definitions, and their parameters' types. A
@@ -945,14 +967,22 @@ let predicates (source : Source.t) inventory =
           Ok (Some (p.pred_name.pid_loc, p, Option.map p.pred_body ~f:(fun b -> Body b)))
       | Proof_module _ | Proof_definition _ | Proof_state _ | Proof_action _
       | Proof_lemma _ | Proof_type _ | Proof_resource _ | Proof_field _ | Proof_function _
-      | Proof_au _ ->
+      | Proof_au _ | Proof_task _ | Proof_access_field _ ->
           Ok None
-      | Proof_invariant { inv_name; inv_params; inv_state = state, state_type; inv_body }
+      | Proof_invariant
+          { inv_name; inv_params; inv_state = state, state_type; inv_body; inv_ancestry }
         ->
           let* params, definition =
             match state_type with
             | PTtyapp (Qid t, state_arguments)
               when List.Assoc.mem states t.pid_str ~equal:String.equal ->
+                let* () =
+                  if List.mem state.pid_attrs "implicit" ~equal:String.equal then
+                    error state.pid_loc
+                      "An invariant state record is already hidden; mark its ordinary \
+                       parameters implicit instead"
+                  else Ok ()
+                in
                 let state_parameters, fields =
                   List.Assoc.find_exn states t.pid_str ~equal:String.equal
                 in
@@ -984,6 +1014,7 @@ let predicates (source : Source.t) inventory =
                    pred_body = None;
                    pred_persistent = true;
                    pred_inline = false;
+                   pred_ancestry = inv_ancestry;
                  },
                  Some definition ))
       | Proof_view { view_name; view_params; view_value } ->
@@ -1000,6 +1031,7 @@ let predicates (source : Source.t) inventory =
                        pred_body = None;
                        pred_persistent = false;
                        pred_inline = false;
+                       pred_ancestry = None;
                      },
                      Some (View { value = view_value }) ))
           | Some (at, _, _, _) ->
@@ -1066,6 +1098,14 @@ let predicates (source : Source.t) inventory =
     | Direct_invariant _ | Invariant _ -> true
     | Body _ | View _ -> false
   in
+  let public x = List.exists declared ~f:(fun (_, p, _, _) -> String.equal (name p) x) in
+  let intermediate x =
+    if public x then None
+    else
+      match definitions x with
+      | (_, definition, _, _) :: _ -> Some definition
+      | [] -> None
+  in
   let declaration (at, (p : S.predicate), def, types) =
     match (def, definitions (name p)) with
     | Some _, _ -> Ok ()
@@ -1089,17 +1129,44 @@ let predicates (source : Source.t) inventory =
            else
              Printf.sprintf "The predicate %s must be defined as an ordinary predicate"
                (name p))
-    | None, (def_at, definition, _, def_types) :: _ ->
+    | None, (def_at, definition, _, _) :: _ ->
         let* declared_implicit = implicit_parameters p in
         let* defined_implicit = implicit_parameters definition in
-        if declared_implicit = defined_implicit then Ok ()
-        else
+        if declared_implicit <> defined_implicit then
           error def_at
             ~related:[ (at, "Its declaration") ]
             (Printf.sprintf
                "The predicate %s has different implicit parameters in its declaration \
                 and definition"
                (name p))
+        else
+          begin match (definition.pred_ancestry, p.pred_ancestry) with
+          | Some ancestry, None ->
+              error ancestry.ancestry_loc
+                ~related:[ (at, "Its interface declaration") ]
+                "An invariant that its interface does not declare within another cannot \
+                 be declared within one"
+          | None, Some promise ->
+              error def_at
+                ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                (Printf.sprintf
+                   "The interface declares %s within %s, but its definition declares no \
+                    ancestor"
+                   (name p)
+                   (qualid_key promise.ancestry_target))
+          | Some ancestry, Some promise
+            when not
+                   (S.keeps_promise ~intermediate ~declaration:p ~child:definition
+                      ancestry promise) ->
+              error ancestry.ancestry_loc
+                ~related:[ (promise.ancestry_loc, "Its interface declaration") ]
+                (Printf.sprintf
+                   "The definition of %s does not lie within %s as its interface \
+                    declares, through invariants private to the implementation"
+                   (name p)
+                   (qualid_key promise.ancestry_target))
+          | None, None | Some _, Some _ -> Ok ()
+          end
   in
   let definition (at, p, _, _) =
     match definitions (name p) with
@@ -1253,9 +1320,8 @@ let check_adapter_shape ~at (contract : S.contract option) =
         unsupported at "Explicit ghost inputs or outputs in a checked module binding"
       else if Procedures.raising_contract c then
         unsupported at "A raising operation in a checked module binding"
-      else if c.pure || Option.is_some c.continues || not (List.is_empty c.variant) then
-        unsupported at
-          "A pure, continuation, or variant contract in a checked module binding"
+      else if Option.is_some c.continues || not (List.is_empty c.variant) then
+        unsupported at "A continuation or variant contract in a checked module binding"
       else if c.atomic && List.is_empty (c.atomic_requires @ c.atomic_ensures) then
         unsupported at "An atomic module contract without atomic clauses"
       else Ok ()
@@ -1300,12 +1366,6 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
   in
   let specializations = List.map inventory.Module_inventory.specializations ~f:prepare in
   let definitions = List.map inventory.definitions ~f:prepare in
-  let groups =
-    Generic_modules.plan ~definitions
-      ~proof_layout:(Generic_proofs.has_models source)
-      specializations
-  in
-  let annotations = Source.annotations source in
   let rec field_term (term : S.term) =
     match S.past_membership term with
     | Some (element, _, _) -> field_term element
@@ -1315,8 +1375,11 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
         | Tapply (a, b) | Tinfix (a, _, b) | Tlet (_, a, b) ->
             field_term a || field_term b
         | Tif (a, b, c) -> field_term a || field_term b || field_term c
-        | Tquant (_, _, t) | Tcomprehension (_, t) | Tattr (_, t) | Tcast (t, _) | Told t
-          ->
+        | Tquant (_, _, _, t)
+        | Tcomprehension (_, t)
+        | Tattr (_, t)
+        | Tcast (t, _)
+        | Told t ->
             field_term t
         | Tmatch (t, cases) ->
             field_term t || List.exists cases ~f:(fun (_, t) -> field_term t)
@@ -1331,6 +1394,26 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
         List.exists
           (c.S.requires @ c.ensures @ c.atomic_requires @ c.atomic_ensures)
           ~f:field_term
+  in
+  let annotations = Source.annotations source in
+  let record_parameters (specialization : Module_inventory.specialization) =
+    List.exists specialization.parameters ~f:(fun parameter ->
+        List.exists parameter.Module_inventory.argument.expected.signature_types
+          ~f:(fun (_, declaration) ->
+            match declaration.Typedtree.typ_kind with
+            | Ttype_record _ -> true
+            | _ -> false))
+  in
+  let field_layout (specialization : Module_inventory.specialization) =
+    Generic_proofs.has_models source specialization
+    || record_parameters specialization
+       && List.exists specialization.body_members ~f:(fun (_, id) ->
+           List.exists functions ~f:(fun function_ ->
+               Ident.same function_.id id && field_contract function_.contract))
+  in
+  let groups =
+    Generic_modules.plan ~inventory ~definitions ~proof_layout:field_layout
+      specializations
   in
   let* groups =
     all groups ~f:(fun group ->
@@ -1398,7 +1481,7 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
               && at.loc_end.pos_cnum <= body.loc_end.pos_cnum
               &&
               match Annotation.kind annotation with
-              | Contract | Manual | Scope | Ghost | Returns | Proof | Initially
+              | Contract | Loop | Manual | Scope | Ghost | Returns | Proof | Initially
               | Initializes | Linearization ->
                   false
               | _ -> true)
@@ -1419,7 +1502,8 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
                   in
                   List.for_all instance.argument.expected.signature_types
                     ~f:(fun (_, declaration) ->
-                      Option.is_some declaration.Typedtree.typ_manifest
+                      Generic_type_families.transparent declaration
+                      || Option.is_some declaration.Typedtree.typ_manifest
                       ||
                       if Generic_type_families.arity declaration > 0 then
                         let concrete, t =
@@ -1448,7 +1532,8 @@ let generic_modules ?(universal = []) (source : Source.t) ~types ~functions inve
              (supported_functions
              && (Option.is_some group.definition || representation_stable)
              && (not explicit_proofs)
-             && (not (List.exists parameter_contracts ~f:field_contract))
+             && (record_parameters group.representative
+                || not (List.exists parameter_contracts ~f:field_contract))
              && List.for_all (List.concat modes) ~f:Fn.id)
              group))
   in
@@ -1492,11 +1577,14 @@ let scoped_predicate (binding : Proof_bindings.binding) =
         | View value -> View { value }
       in
       Some (p.pred_name.pid_loc, p, definition, binding.private_types)
-  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ -> None
+  | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _
+    ->
+      None
 
 let scoped_lemma (binding : Proof_bindings.binding) =
   match binding.kind with
-  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+  | Predicate _ | Function _ | Resource _ | Field _ | Atomic _ | Task _ | State _
+  | Action _ ->
       None
   | Lemma (S.Proof_lemma lemma) ->
       Some
@@ -1513,8 +1601,8 @@ let scoped_function (binding : Proof_bindings.binding) =
              declaration with
              function_name = { declaration.function_name with pid_str = binding.backend };
            })
-  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
-  | Action _ ->
+  | Predicate _ | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _
+  | State _ | Action _ ->
       None
 
 let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
@@ -1562,8 +1650,8 @@ let check_scoped_resources ~types source inventory (proofs : Proof_bindings.t) =
                     let* actual =
                       match binding.kind with
                       | Predicate (p, _) -> Ok p
-                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | State _
-                      | Action _ ->
+                      | Lemma _ | Function _ | Resource _ | Field _ | Atomic _ | Task _
+                      | State _ | Action _ ->
                           error binding.entry.name.pid_loc
                             "A module resource must be defined as a predicate or \
                              invariant"

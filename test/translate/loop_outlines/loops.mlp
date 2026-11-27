@@ -1,0 +1,42 @@
+proof increment cell
+  requires (own cell.contents value && value < max_int)
+  ensures (own cell.contents (value + 1)) = ()
+
+proof result = read cell
+  requires (own cell.contents value)
+  ensures (own cell.contents value && result = value) = ()
+
+proof result = count cell
+  requires (own cell.contents 0)
+  ensures (own cell.contents 10 && result = 10) =
+  let limit = 10 in
+  at (increment cell) invariant (own cell.contents i && i <= limit);
+  at (increment cell) (fun step -> let result = step () in result)
+
+proof result = descending cell
+  requires (own cell.contents 0)
+  ensures (own cell.contents 10 && result = 10) =
+  at (increment cell) invariant (own cell.contents (9 - i))
+
+proof result = until_ten cell
+  requires (own cell.contents 0)
+  ensures (own cell.contents 10 && result = 10) =
+  at (increment cell) invariant (own cell.contents value && 0 <= value <= 10)
+
+proof result = exported cell
+  requires (own cell.contents 0)
+  ensures (own cell.contents 10 && result = 10) =
+  let initial = at (let start = read cell) (fun step ->
+    let result = step () in (result, result)) in
+  at (increment cell) invariant (own cell.contents (initial + i) && initial = 0)
+
+module Repeat (A : Element) = struct
+  proof result = count cell
+    requires (own cell.contents 0)
+    ensures (own cell.contents 10 && result = 10) =
+    at (increment cell) invariant (own cell.contents i)
+end
+
+proof result = generic cell
+  requires (own cell.contents 0)
+  ensures (own cell.contents 10 && result = 10) = ()

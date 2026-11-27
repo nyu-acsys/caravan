@@ -1,0 +1,6 @@
+proof duplicate_acquire mutex
+  requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held)) = ()
+
+proof missing_release mutex
+  requires (Ghost.Mutex.context owner held && not (Finset.mem mutex held))
+  ensures (Ghost.Mutex.context owner held) = ()

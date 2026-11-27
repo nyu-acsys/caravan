@@ -1,0 +1,8 @@
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.mlp)
+  (glob_files imports/*.mli)))

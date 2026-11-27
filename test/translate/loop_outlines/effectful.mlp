@@ -1,0 +1,3 @@
+proof loop cell =
+  let bound = assert true; 10 in
+  at (incr cell) invariant (bound = 10)

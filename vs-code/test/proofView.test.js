@@ -11,7 +11,7 @@ const location = (file, line, start, end = start) => ({ file,
 const source = '(* 🙂 *)\r\nlet create () = Atomic.make []\r\n';
 const contractText = '(*@ t = create () ensures stack t [] *)';
 const contractFile = root.replace(/\.ml$/, '.mli');
-const proofFile = root.replace(/\.ml$/, '.proof');
+const proofFile = root.replace(/\.ml$/, '.mlp');
 const companions = new Map([[contractFile, `val create : unit -> t\n${contractText}\n`],
   [proofFile, 'predicate stack t xs = own t xs\nproof create = on return fold stack t []\n']]);
 const contract = { source: 'create', location: location(root, 1, 4, 10),
@@ -34,7 +34,7 @@ test('proof view interleaves authoritative attachments, retains context, and map
   for (const link of rendered.links) {
     assert.equal(link.range.start.line, link.range.end.line);
     const label = lines[link.range.start.line].slice(link.range.start.character, link.range.end.character);
-    assert.match(label, /^"queue\.(ml|mli|proof):\d+"$/);
+    assert.match(label, /^"queue\.(ml|mli|mlp|proof):\d+"$/);
     assert.equal(URI.parse(link.target).scheme, 'file');
   }
   assert.ok(rendered.links.some(link => URI.parse(link.target).fragment === 'L2,26'));

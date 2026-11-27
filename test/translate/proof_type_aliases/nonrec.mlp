@@ -1,0 +1,8 @@
+module Resource : Ghost.MutexResource with type t = t = struct
+  type nonrec t = t
+  predicate resource (cell : t) = exists value : int. own cell.contents value
+end
+
+proof result = keep cell
+  requires (Resource.resource cell)
+  ensures (Resource.resource result && result === cell) = ()

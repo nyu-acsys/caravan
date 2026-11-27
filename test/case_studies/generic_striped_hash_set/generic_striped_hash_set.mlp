@@ -1,0 +1,967 @@
+module Make (Key : KEY) = struct
+  (* Model relations quantify over the full carrier, beyond executable key values. *)
+  type carrier_key = { key : Key.t }
+
+  module Counts = CountAgree (struct type t = Key.t list array array end)
+  module Tables = Auth (Counts)
+  let tables : (Key.t list array array Atomic.t, Tables.t) Ghost.field = Ghost.field ()
+  let saved : (Ghost.t, Key.t finset) Ghost.field = Ghost.field ()
+  let members : (Key.t list array array Atomic.t, Key.t finset) Ghost.field = Ghost.field ()
+
+  module Registrations = Agree (struct type t = (int, Ghost.t) map end)
+  module Registration_auth = Auth (Registrations)
+  let registry : (Key.t list array array Atomic.t, Registration_auth.t) Ghost.field = Ghost.field ()
+
+  predicate [@inline] registered (s : t) (keys : (int, Ghost.t) map) =
+    own (Ghost.at registry s.table) (Registration_auth.frag (Registrations.agree keys))
+
+  lemma registry_agree (s : t) (first : (int, Ghost.t) map) (second : (int, Ghost.t) map)
+    requires registered s first && registered s second
+    ensures registered s first && registered s second && first === second = ()
+
+  predicate represents (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) =
+    stripes > 0 && capacity > 0 &&
+    (forall packed : carrier_key. let value = packed.key in Finset.mem value values -> Key.hash value >= 0 && (Key.hash value) mod stripes = stripe) &&
+    (forall k : integer, packed : carrier_key. let value = packed.key in 0 <= k && k < capacity ->
+      List.mem value (Map.get buckets k) ===
+        (Finset.mem value values && (Key.hash value) / stripes mod capacity = k))
+
+  module Stripe : Ghost.MutexResource
+      with type t = Key.t list array array Atomic.t * int * int * Ghost.t = struct
+    type t = Key.t list array array Atomic.t * int * int * Ghost.t
+    predicate resource (key : t) =
+      match key with (root, stripes, i, registration) ->
+        exists current : Key.t list array array, row : Key.t list array,
+            values : Key.t finset, buckets : (int, Key.t list) map.
+          own (Ghost.at tables root) (Tables.frag (Counts.count_cons 1 current)) &&
+          own (Array.cell current i) row &&
+          own ~fraction:Permission.half (Ghost.at saved registration) values &&
+          0 < Array.length row && represents stripes i (Array.length row) buckets values &&
+          (forall k : int. 0 <= k && k < Array.length row ->
+             own (Array.cell row k) (Map.get buckets k))
+  end
+
+  module Guard = Ghost.Mutex (Stripe)
+
+  predicate table_state (root : Key.t list array array Atomic.t) (l : int) =
+    exists current : Key.t list array array.
+      own root current && Array.length current = l &&
+      own (Ghost.at tables root) (Tables.auth (Counts.count_cons l current))
+
+  invariant [@within is_set s] tabled (s : t) (l : int) =
+    exists current : Key.t list array array.
+      own s.table current && Array.length current = l &&
+      own (Ghost.at tables s.table) (Tables.auth (Counts.count_cons l current))
+
+  invariant [@within is_set s] locked (s : t) (keys : (int, Ghost.t) map) =
+    exists share : Permission.t, ms : (int, Mutex.t) map.
+      forall i : int [Map.get ms i]. 0 <= i && i < Array.length s.locks ->
+        own ~fraction:share (Array.cell s.locks i) (Map.get ms i) &&
+        Guard.is_mutex (Map.get ms i) (s.table, Array.length s.locks, i, Map.get keys i)
+
+  invariant [@within is_set s] counted (s : t) = exists n : int. own s.size n
+
+  predicate [@inline] distinct (keys : (int, Ghost.t) map) (n : int) =
+    forall i : int, j : int. 0 <= i && i < n && 0 <= j && j < n &&
+      Map.get keys i === Map.get keys j -> i = j
+
+  invariant is_set (s : t) =
+    exists keys : (int, Ghost.t) map.
+      own (Ghost.at registry s.table) (Registration_auth.auth (Registrations.agree keys)) &&
+      0 < Array.length s.locks && distinct keys (Array.length s.locks) && locked s keys &&
+      tabled s (Array.length s.locks) && counted s
+
+  lemma expose_set (s : t) returns (keys : (int, Ghost.t) map)
+    opens {is_set s}
+    requires is_set s
+    ensures is_set s && registered s keys &&
+      0 < Array.length s.locks && distinct keys (Array.length s.locks) &&
+      locked s keys && tabled s (Array.length s.locks) && counted s =
+    let keys = unfold is_set s {keys} in
+    Ghost.fpu (Ghost.at registry s.table)
+      (Registration_auth.auth (Registrations.agree keys))
+      (Registration_auth.auth_frag (Registrations.agree keys) (Registrations.agree keys));
+    fold is_set s {keys = keys};
+    keys
+
+  proof result = stripe_count s
+    opens {is_set s}
+    requires is_set s
+    ensures is_set s && result > 0 && result === Array.length s.locks =
+    on return begin let _ = expose_set s in () end
+
+  proof result = bucket_index hash stripes capacity
+    requires 0 <= hash && 0 < stripes && 0 < capacity
+    ensures 0 <= result && result < capacity && result === hash / stripes mod capacity = ()
+
+  lemma represents_add (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) (k : int) (x : Key.t)
+    requires (represents stripes stripe capacity buckets values)
+    requires (0 <= Key.hash x && (Key.hash x) mod stripes = stripe && (Key.hash x) / stripes mod capacity = k &&
+      0 <= k && k < capacity)
+    ensures (represents stripes stripe capacity
+      (Map.set buckets k (x :: Map.get buckets k))
+      (Finset.union values (Finset.singleton x))) =
+    unfold represents stripes stripe capacity buckets values;
+    fold represents stripes stripe capacity
+      (Map.set buckets k (x :: Map.get buckets k)) (Finset.union values (Finset.singleton x))
+
+  lemma represents_remove (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) (k : int) (x : Key.t)
+      (replacement : Key.t list)
+    requires (represents stripes stripe capacity buckets values)
+    requires (0 <= Key.hash x && (Key.hash x) mod stripes = stripe && (Key.hash x) / stripes mod capacity = k &&
+      0 <= k && k < capacity)
+    requires (forall packed : carrier_key. let value = packed.key in
+      List.mem value replacement === (not (value === x) && List.mem value (Map.get buckets k)))
+    ensures (represents stripes stripe capacity
+      (Map.set buckets k replacement) (Finset.diff values (Finset.singleton x))) =
+    unfold represents stripes stripe capacity buckets values;
+    fold represents stripes stripe capacity
+      (Map.set buckets k replacement) (Finset.diff values (Finset.singleton x))
+
+  lemma represents_insert_if (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) (k : int) (x : Key.t)
+      (changed : bool) (selected : Key.t list)
+    requires represents stripes stripe capacity buckets values &&
+      0 <= Key.hash x && (Key.hash x) mod stripes === stripe && (Key.hash x) / stripes mod capacity === k &&
+      0 <= k && k < capacity && changed === not (Finset.mem x values) &&
+      (changed -> selected === x :: Map.get buckets k)
+    ensures represents stripes stripe capacity
+      (if changed then Map.set buckets k selected else buckets)
+      (Finset.union values (Finset.singleton x)) =
+    if changed then represents_add stripes stripe capacity buckets values k x
+    else assert (Finset.union values (Finset.singleton x) === values)
+
+  lemma represents_remove_if (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) (k : int) (x : Key.t)
+      (changed : bool) (selected : Key.t list)
+    requires represents stripes stripe capacity buckets values &&
+      0 <= Key.hash x && (Key.hash x) mod stripes === stripe && (Key.hash x) / stripes mod capacity === k &&
+      0 <= k && k < capacity && changed === Finset.mem x values &&
+      (changed -> (forall packed : carrier_key. let value = packed.key in
+        List.mem value selected === (not (value === x) && List.mem value (Map.get buckets k))))
+    ensures represents stripes stripe capacity
+      (if changed then Map.set buckets k selected else buckets)
+      (Finset.diff values (Finset.singleton x)) =
+    if changed then represents_remove stripes stripe capacity buckets values k x selected
+    else assert (Finset.diff values (Finset.singleton x) === values)
+
+  predicate partitions (stripes : int) (shards : (int, Key.t finset) map)
+      (values : Key.t finset) =
+    (forall packed : carrier_key. let value = packed.key in Finset.mem value values -> Key.hash value >= 0) &&
+    (forall i : integer, packed : carrier_key. let value = packed.key in 0 <= i && i < stripes ->
+      Finset.mem value (Map.get shards i) === (Finset.mem value values && (Key.hash value) mod stripes = i))
+
+  lemma partitions_add (stripes : int) (shards : (int, Key.t finset) map)
+      (values : Key.t finset) (stripe : int) (x : Key.t)
+    requires (partitions stripes shards values)
+    requires (0 <= Key.hash x && (Key.hash x) mod stripes = stripe && 0 <= stripe && stripe < stripes)
+    ensures (partitions stripes
+      (Map.set shards stripe (Finset.union (Map.get shards stripe) (Finset.singleton x)))
+      (Finset.union values (Finset.singleton x))) =
+    unfold partitions stripes shards values;
+    fold partitions stripes
+      (Map.set shards stripe (Finset.union (Map.get shards stripe) (Finset.singleton x)))
+      (Finset.union values (Finset.singleton x))
+
+  lemma partitions_remove (stripes : int) (shards : (int, Key.t finset) map)
+      (values : Key.t finset) (stripe : int) (x : Key.t)
+    requires (partitions stripes shards values)
+    requires (0 <= Key.hash x && (Key.hash x) mod stripes = stripe && 0 <= stripe && stripe < stripes)
+    ensures (partitions stripes
+      (Map.set shards stripe (Finset.diff (Map.get shards stripe) (Finset.singleton x)))
+      (Finset.diff values (Finset.singleton x))) =
+    unfold partitions stripes shards values;
+    fold partitions stripes
+      (Map.set shards stripe (Finset.diff (Map.get shards stripe) (Finset.singleton x)))
+      (Finset.diff values (Finset.singleton x))
+
+  predicate contents (s : t) (values [@implicit] : Key.t finset) =
+    own (Ghost.at members s.table) values &&
+    exists keys : (int, Ghost.t) map, shards : (int, Key.t finset) map.
+      registered s keys && distinct keys (Array.length s.locks) &&
+      (forall i : int. 0 <= i && i < Array.length s.locks ->
+        own ~fraction:Permission.half (Ghost.at saved (Map.get keys i)) (Map.get shards i)) &&
+      partitions (Array.length s.locks) shards values
+
+  proof result = mem x bucket ensures result === List.mem x bucket = ()
+
+  proof result = without x bucket
+    ensures forall packed : carrier_key. let value = packed.key in
+      List.mem value result === (not (value === x) && List.mem value bucket) = ()
+
+  let shares (first : int) (stripes : int) (table : Key.t list array array) : Counts.t =
+    if first < stripes then Counts.count_cons (stripes - first) table else Counts.id
+
+  proof create =
+    at (Atomic.make rows)
+      initializes [Ghost.init tables (Tables.full (Counts.count_cons stripes rows));
+        Ghost.init members (Finset.empty : Key.t finset);
+        Ghost.init registry (Registration_auth.full Registrations.id)];
+    at ((Mutex.create ()) [@occurrence 1]) (fun create ->
+      fold table_state table stripes;
+      let result = create () in
+      result);
+    at (rows.(i) <- Array.make 1 []) invariant
+      (Ghost.Mutex.context owner held && Array.length locks = stripes &&
+       Array.length rows = stripes && table_state table stripes &&
+       own (Ghost.at tables table) (Tables.frag (shares i stripes rows)) &&
+       (forall j : int. i <= j && j < stripes -> exists m : Mutex.t. own (Array.cell locks j) m) &&
+       (forall j : int. i <= j && j < stripes ->
+          exists r : Key.t list array. own (Array.cell rows j) r) &&
+       exists ms : (int, Mutex.t) map, keys : (int, Ghost.t) map.
+         distinct keys i &&
+         (forall j : int. 0 <= j && j < i ->
+           own ~fraction:Permission.half (Ghost.at saved (Map.get keys j)) Finset.empty) &&
+         forall j : int. 0 <= j && j < i ->
+           own (Array.cell locks j) (Map.get ms j) && Guard.is_mutex (Map.get ms j) (table, stripes, j, Map.get keys j))
+      with { ms = Map.set ms i m; keys = Map.set keys i registration };
+    let (m, registration) = at ((Mutex.create ()) [@occurrence 2]) (fun create ->
+      let m = create () in
+      let registration = Ghost.alloc [Ghost.init saved (Finset.empty : Key.t finset)] in
+      assert (forall j : int. 0 <= j && j < i -> not (Map.get keys j === registration));
+      fold represents stripes i 1 (Map.const [] : (int, Key.t list) map) Finset.empty;
+      fold Stripe.resource (table, stripes, i, registration)
+        {current = rows; values = Finset.empty; buckets = (Map.const [] : (int, Key.t list) map)};
+      Guard.initialize m (table, stripes, i, registration);
+      (m, (m, registration))) in
+    on return begin
+      Ghost.fpu (Ghost.at registry result.table)
+        (Registration_auth.full Registrations.id)
+        (Registration_auth.full (Registrations.agree keys));
+      Ghost.fpu (Ghost.at registry result.table)
+        (Registration_auth.full (Registrations.agree keys))
+        (Registration_auth.auth_frag (Registrations.agree keys) (Registrations.agree keys));
+      unfold table_state result.table stripes;
+      fold tabled result stripes;
+      fold counted result;
+      fold locked result keys {share = Permission.full; ms = ms};
+      assert (distinct keys stripes);
+      fold partitions stripes (Map.const Finset.empty : (int, Key.t finset) map) Finset.empty;
+      fold contents result Finset.empty
+        {keys = keys; shards = (Map.const Finset.empty : (int, Key.t finset) map)};
+      fold is_set result {keys = keys}
+    end
+
+  type stripe_snapshot = {
+    current : Key.t list array array;
+    row : Key.t list array;
+    values : Key.t finset;
+    buckets : (int, Key.t list) map;
+  }
+
+  lemma open_stripe (root : Key.t list array array Atomic.t) (stripes : int)
+      (i : int) (registration : Ghost.t) returns (state : stripe_snapshot)
+    requires Stripe.resource (root, stripes, i, registration)
+    ensures own (Ghost.at tables root) (Tables.frag (Counts.count_cons 1 state.current)) &&
+      own (Array.cell state.current i) state.row &&
+      own ~fraction:Permission.half (Ghost.at saved registration) state.values &&
+      0 < Array.length state.row &&
+      represents stripes i (Array.length state.row) state.buckets state.values &&
+      (forall k : int. 0 <= k && k < Array.length state.row ->
+        own (Array.cell state.row k) (Map.get state.buckets k)) =
+    let (current, row, values, buckets) =
+      unfold Stripe.resource (root, stripes, i, registration) {current; row; values; buckets} in
+    {current; row; values; buckets}
+
+  lemma bucket_snapshot (row : Key.t list array) (index : int)
+      (bucket [@implicit] : Key.t list) returns (value : Key.t list)
+    requires own (Array.cell row index) bucket
+    ensures own (Array.cell row index) bucket && value === bucket = bucket
+
+  lemma agree_snapshot (key : Ghost.t) (first : Key.t finset) (second : Key.t finset)
+    requires own ~fraction:Permission.half (Ghost.at saved key) first &&
+      own ~fraction:Permission.half (Ghost.at saved key) second
+    ensures own ~fraction:Permission.half (Ghost.at saved key) first &&
+      own ~fraction:Permission.half (Ghost.at saved key) second && first === second = ()
+
+  lemma represents_lookup (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset) (x : Key.t)
+    requires represents stripes stripe capacity buckets values &&
+      0 <= Key.hash x && (Key.hash x) mod stripes === stripe
+    ensures represents stripes stripe capacity buckets values &&
+      List.mem x (Map.get buckets ((Key.hash x) / stripes mod capacity)) === Finset.mem x values =
+    unfold represents stripes stripe capacity buckets values;
+    assert (List.mem x (Map.get buckets ((Key.hash x) / stripes mod capacity)) === Finset.mem x values);
+    fold represents stripes stripe capacity buckets values
+
+  lemma partitions_lookup (stripes : int) (shards : (int, Key.t finset) map)
+      (before : Key.t finset) (stripe : int) (x : Key.t)
+    requires partitions stripes shards before && 0 <= stripe && stripe < stripes &&
+      0 <= Key.hash x && (Key.hash x) mod stripes === stripe
+    ensures partitions stripes shards before &&
+      Finset.mem x (Map.get shards stripe) === Finset.mem x before =
+    unfold partitions stripes shards before;
+    assert (Finset.mem x (Map.get shards stripe) === Finset.mem x before);
+    fold partitions stripes shards before
+
+  lemma read_model (s : t) (keys : (int, Ghost.t) map) (before : Key.t finset)
+      (stripe : int) (local : Key.t finset) (x : Key.t) returns (present : bool)
+    requires registered s keys && contents s before &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe)) local &&
+      0 <= Key.hash x && (Key.hash x) mod Array.length s.locks === stripe &&
+      0 <= stripe && stripe < Array.length s.locks
+    ensures registered s keys && contents s before &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe)) local &&
+      present === Finset.mem x before && present === Finset.mem x local =
+    let (registered_keys, shards) = unfold contents s before {keys; shards} in
+    registry_agree s keys registered_keys;
+    agree_snapshot (Map.get keys stripe) (Map.get shards stripe) local;
+    partitions_lookup (Array.length s.locks) shards before stripe x;
+    assert (Finset.mem x local === Finset.mem x before);
+    let present = Finset.mem x local in
+    fold contents s before {keys = keys; shards = shards};
+    present
+
+  lemma insert_model (s : t) (keys : (int, Ghost.t) map) (before : Key.t finset)
+      (stripe : int) (local : Key.t finset) (x : Key.t) returns (present : bool)
+    requires registered s keys && contents s before &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe)) local &&
+      0 <= Key.hash x && (Key.hash x) mod Array.length s.locks === stripe &&
+      0 <= stripe && stripe < Array.length s.locks
+    ensures registered s keys && contents s (Finset.union before (Finset.singleton x)) &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe))
+        (Finset.union local (Finset.singleton x)) &&
+      present === Finset.mem x before && present === Finset.mem x local =
+    let (registered_keys, shards) = unfold contents s before {keys; shards} in
+    registry_agree s keys registered_keys;
+    agree_snapshot (Map.get keys stripe) (Map.get shards stripe) local;
+    partitions_lookup (Array.length s.locks) shards before stripe x;
+    let present = Finset.mem x local in
+    partitions_add (Array.length s.locks) shards before stripe x;
+    Ghost.write (Ghost.at saved (Map.get keys stripe)) (Finset.union local (Finset.singleton x));
+    Ghost.write (Ghost.at members s.table) (Finset.union before (Finset.singleton x));
+    fold contents s (Finset.union before (Finset.singleton x))
+      {keys = keys; shards = Map.set shards stripe (Finset.union local (Finset.singleton x))};
+    present
+
+  lemma remove_model (s : t) (keys : (int, Ghost.t) map) (before : Key.t finset)
+      (stripe : int) (local : Key.t finset) (x : Key.t) returns (present : bool)
+    requires registered s keys && contents s before &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe)) local &&
+      0 <= Key.hash x && (Key.hash x) mod Array.length s.locks === stripe &&
+      0 <= stripe && stripe < Array.length s.locks
+    ensures registered s keys && contents s (Finset.diff before (Finset.singleton x)) &&
+      own ~fraction:Permission.half (Ghost.at saved (Map.get keys stripe))
+        (Finset.diff local (Finset.singleton x)) &&
+      present === Finset.mem x before && present === Finset.mem x local =
+    let (registered_keys, shards) = unfold contents s before {keys; shards} in
+    registry_agree s keys registered_keys;
+    agree_snapshot (Map.get keys stripe) (Map.get shards stripe) local;
+    partitions_lookup (Array.length s.locks) shards before stripe x;
+    let present = Finset.mem x local in
+    partitions_remove (Array.length s.locks) shards before stripe x;
+    Ghost.write (Ghost.at saved (Map.get keys stripe)) (Finset.diff local (Finset.singleton x));
+    Ghost.write (Ghost.at members s.table) (Finset.diff before (Finset.singleton x));
+    fold contents s (Finset.diff before (Finset.singleton x))
+      {keys = keys; shards = Map.set shards stripe (Finset.diff local (Finset.singleton x))};
+    present
+
+  module Contains = Ghost.AU (struct let operation = contains end)
+  module Add = Ghost.AU (struct let operation = add end)
+  module Remove = Ghost.AU (struct let operation = remove end)
+
+  proof contains =
+    let keys = at (stripe_count s) (fun count ->
+      let keys = expose_set s in
+      let result = count () in
+      (result, keys)) in
+    at (s.locks.(stripe)) (fun read ->
+      let o = unfold locked s keys in
+      fold locked s keys {o with share = Permission.halve o.share};
+      let result = read () in result);
+    let state = at (Mutex.lock lock) (fun acquire ->
+      let result = acquire () in
+      let state = open_stripe s.table (Array.length s.locks) stripe (Map.get keys stripe) in
+      (result, state)) in
+    at (Atomic.get s.table) (fun get ->
+      unfold tabled s (Array.length s.locks);
+      let result = get () in
+      assert (result === state.current);
+      fold tabled s (Array.length s.locks);
+      result);
+    at (Mutex.unlock lock) (fun unlock ->
+      assert (row === state.row);
+      represents_lookup (Array.length s.locks) stripe (Array.length state.row)
+        state.buckets state.values x;
+      assert (result === Finset.mem x state.values);
+      let token = Contains.bind () in
+      let (before, _, _) = Contains.access token s x in
+      let present = read_model s keys before stripe state.values x in
+      assert (result === present);
+      Contains.commit token s x result;
+      fold Stripe.resource (s.table, Array.length s.locks, stripe, Map.get keys stripe)
+        {current = state.current; row = state.row; values = state.values; buckets = state.buckets};
+      let result = unlock () in result)
+
+  proof add =
+    let keys = at (stripe_count s) (fun count ->
+      let keys = expose_set s in
+      let result = count () in
+      (result, keys)) in
+    at (s.locks.(stripe)) (fun read ->
+      let o = unfold locked s keys in
+      fold locked s keys {o with share = Permission.halve o.share};
+      let result = read () in result);
+    let state = at (Mutex.lock lock) (fun acquire ->
+      let result = acquire () in
+      let state = open_stripe s.table (Array.length s.locks) stripe (Map.get keys stripe) in
+      (result, state)) in
+    at (Atomic.get s.table) (fun get ->
+      unfold tabled s (Array.length s.locks);
+      let result = get () in
+      assert (result === state.current);
+      fold tabled s (Array.length s.locks);
+      result);
+    at (Mutex.unlock lock) (fun unlock ->
+      assert (row === state.row);
+      represents_lookup (Array.length s.locks) stripe (Array.length state.row)
+        state.buckets state.values x;
+      let selected = bucket_snapshot row bucket in
+      let updated = if added then Map.set state.buckets bucket selected else state.buckets in
+      represents_insert_if (Array.length s.locks) stripe (Array.length state.row)
+        state.buckets state.values bucket x added selected;
+      let token = Add.bind () in
+      let (before, _, _) = Add.access token s x in
+      let present = insert_model s keys before stripe state.values x in
+      assert (added === not present);
+      Add.commit token s x added;
+      fold Stripe.resource (s.table, Array.length s.locks, stripe, Map.get keys stripe)
+        {current = state.current; row = state.row;
+         values = Finset.union state.values (Finset.singleton x); buckets = updated};
+      let result = unlock () in result);
+    at (Atomic.incr s.size) (fun step ->
+      unfold counted s;
+      let result = step () in
+      fold counted s;
+      result);
+    at (Atomic.get s.size) (fun get ->
+      unfold counted s;
+      let result = get () in
+      fold counted s;
+      result)
+
+  proof remove =
+    let keys = at (stripe_count s) (fun count ->
+      let keys = expose_set s in
+      let result = count () in
+      (result, keys)) in
+    at (s.locks.(stripe)) (fun read ->
+      let o = unfold locked s keys in
+      fold locked s keys {o with share = Permission.halve o.share};
+      let result = read () in result);
+    let state = at (Mutex.lock lock) (fun acquire ->
+      let result = acquire () in
+      let state = open_stripe s.table (Array.length s.locks) stripe (Map.get keys stripe) in
+      (result, state)) in
+    at (Atomic.get s.table) (fun get ->
+      unfold tabled s (Array.length s.locks);
+      let result = get () in
+      assert (result === state.current);
+      fold tabled s (Array.length s.locks);
+      result);
+    at (Mutex.unlock lock) (fun unlock ->
+      assert (row === state.row);
+      represents_lookup (Array.length s.locks) stripe (Array.length state.row)
+        state.buckets state.values x;
+      let selected = bucket_snapshot row bucket in
+      let updated = if removed then Map.set state.buckets bucket selected else state.buckets in
+      represents_remove_if (Array.length s.locks) stripe (Array.length state.row)
+        state.buckets state.values bucket x removed selected;
+      let token = Remove.bind () in
+      let (before, _, _) = Remove.access token s x in
+      let present = remove_model s keys before stripe state.values x in
+      assert (removed === present);
+      Remove.commit token s x removed;
+      fold Stripe.resource (s.table, Array.length s.locks, stripe, Map.get keys stripe)
+        {current = state.current; row = state.row;
+         values = Finset.diff state.values (Finset.singleton x); buckets = updated};
+      let result = unlock () in result);
+    at (Atomic.decr s.size) (fun step ->
+      unfold counted s;
+      let result = step () in
+      fold counted s;
+      result)
+
+  let rec list_set (items : Key.t list) : Key.t finset
+    variant items =
+    match items with
+    | [] -> Finset.empty
+    | x :: rest -> Finset.union (Finset.singleton x) (list_set rest)
+
+  lemma list_set_membership (items : Key.t list)
+    ensures forall packed : carrier_key. let value = packed.key in
+      Finset.mem value (list_set items) === List.mem value items
+    variant items =
+    match items with
+    | [] -> ()
+    | _ :: rest -> list_set_membership rest
+
+  let rec scatter (buckets : (int, Key.t list) map) (capacity : int)
+      (stripes : int) (items : Key.t list) : (int, Key.t list) map
+    variant items =
+    match items with
+    | [] -> buckets
+    | x :: rest ->
+        let target = (Key.hash x) / stripes mod capacity in
+        scatter (Map.set buckets target (x :: Map.get buckets target)) capacity stripes rest
+
+  lemma scatter_cons (buckets : (int, Key.t list) map) (capacity : int)
+      (stripes : int) (x : Key.t) (rest : Key.t list)
+    ensures scatter buckets capacity stripes (x :: rest) ===
+      scatter (Map.set buckets ((Key.hash x) / stripes mod capacity)
+        (x :: Map.get buckets ((Key.hash x) / stripes mod capacity))) capacity stripes rest = ()
+
+  lemma scatter_represents (buckets : (int, Key.t list) map) (capacity : int)
+      (stripes : int) (stripe : int) (values : Key.t finset) (items : Key.t list)
+    requires represents stripes stripe capacity buckets values
+    requires (forall packed : carrier_key. let value = packed.key in List.mem value items ->
+      0 <= Key.hash value && (Key.hash value) mod stripes = stripe)
+    ensures represents stripes stripe capacity (scatter buckets capacity stripes items)
+      (Finset.union values (list_set items))
+    variant items =
+    match items with
+    | [] -> ()
+    | x :: rest ->
+        assert (List.mem x items);
+        unfold represents stripes stripe capacity buckets values;
+        fold represents stripes stripe capacity buckets values;
+        let target = (Key.hash x) / stripes mod capacity in
+        represents_add stripes stripe capacity buckets values target x;
+        assert (forall packed : carrier_key. (let value = packed.key in List.mem value rest -> List.mem value items));
+        scatter_represents (Map.set buckets target (x :: Map.get buckets target))
+          capacity stripes stripe (Finset.union values (Finset.singleton x)) rest;
+        assert (Finset.union (Finset.union values (Finset.singleton x)) (list_set rest) ===
+          Finset.union values (list_set items))
+
+  let rec collected (buckets : (int, Key.t list) map) (stop : integer) : Key.t finset
+    variant (if stop > 0 then stop else 0) =
+    if stop <= 0 then Finset.empty
+    else Finset.union (collected buckets (stop - 1))
+      (list_set (Map.get buckets (stop - 1)))
+
+  lemma collected_covers_bucket (buckets : (int, Key.t list) map) (stop : integer)
+      (index : integer) (value : Key.t)
+    requires 0 <= index && index < stop && List.mem value (Map.get buckets index)
+    ensures Finset.mem value (collected buckets stop)
+    variant stop =
+    if index = stop - 1 then list_set_membership (Map.get buckets index)
+    else collected_covers_bucket buckets (stop - 1) index value
+
+  lemma [@auto] collected_covers (buckets : (int, Key.t list) map) (stop : integer)
+      (index : integer) (value : Key.t)
+    requires 0 <= index && index < stop && List.mem value (Map.get buckets index)
+    ensures [List.mem value (Map.get buckets index), collected buckets stop].
+      Finset.mem value (collected buckets stop) =
+    collected_covers_bucket buckets stop index value
+
+  lemma collected_subset (buckets : (int, Key.t list) map) (stop : integer)
+      (bound : Key.t finset)
+    requires 0 <= stop &&
+      (forall index : integer, packed : carrier_key [List.mem packed.key (Map.get buckets index)]. let value = packed.key in
+        0 <= index && index < stop && List.mem value (Map.get buckets index) ->
+          Finset.mem value bound)
+    ensures forall packed : carrier_key [Finset.mem packed.key (collected buckets stop)]. let value = packed.key in
+      Finset.mem value (collected buckets stop) -> Finset.mem value bound
+    variant stop =
+    if stop > 0 then begin
+      collected_subset buckets (stop - 1) bound;
+      list_set_membership (Map.get buckets (stop - 1))
+    end else ()
+
+  lemma representation_facts (stripes : int) (stripe : int) (capacity : int)
+      (buckets : (int, Key.t list) map) (values : Key.t finset)
+    requires represents stripes stripe capacity buckets values
+    ensures represents stripes stripe capacity buckets values && stripes > 0 && capacity > 0 &&
+      (forall packed : carrier_key. let value = packed.key in Finset.mem value values -> Key.hash value >= 0 && (Key.hash value) mod stripes = stripe) &&
+      (forall k : integer, packed : carrier_key [List.mem packed.key (Map.get buckets k)]. let value = packed.key in
+        0 <= k && k < capacity -> List.mem value (Map.get buckets k) ===
+          (Finset.mem value values && (Key.hash value) / stripes mod capacity = k)) =
+    unfold represents stripes stripe capacity buckets values;
+    fold represents stripes stripe capacity buckets values
+
+  lemma collected_complete (buckets : (int, Key.t list) map) (capacity : int)
+      (stripes : int) (stripe : int) (values : Key.t finset)
+    requires represents stripes stripe capacity buckets values
+    ensures represents stripes stripe capacity buckets values &&
+      collected buckets capacity === values =
+    representation_facts stripes stripe capacity buckets values;
+    collected_subset buckets capacity values;
+    assert (forall packed : carrier_key [Finset.mem packed.key values]. (let value = packed.key in Finset.mem value values ->
+      0 <= (Key.hash value) / stripes mod capacity && (Key.hash value) / stripes mod capacity < capacity &&
+      List.mem value (Map.get buckets ((Key.hash value) / stripes mod capacity))));
+    assert (forall packed : carrier_key [Finset.mem packed.key values]. (let value = packed.key in Finset.mem value values ->
+      Finset.mem value (collected buckets capacity)));
+    assert (collected buckets capacity === values)
+
+  lemma collected_bucket_bounds (buckets : (int, Key.t list) map) (capacity : int)
+      (stripes : int) (stripe : int) (values : Key.t finset) (index : int)
+    requires represents stripes stripe capacity buckets values && 0 <= index && index < capacity
+    ensures represents stripes stripe capacity buckets values &&
+      (forall packed : carrier_key. let value = packed.key in List.mem value (Map.get buckets index) ->
+        0 <= Key.hash value && (Key.hash value) mod stripes = stripe) =
+    unfold represents stripes stripe capacity buckets values;
+    fold represents stripes stripe capacity buckets values
+
+  let rec nonnegative_hashes (items : Key.t list) : bool
+    variant items =
+    match items with [] -> true | x :: rest -> 0 <= Key.hash x && nonnegative_hashes rest
+
+  lemma nonnegative_hashes_membership (items : Key.t list)
+    requires (forall packed : carrier_key. let value = packed.key in List.mem value items -> 0 <= Key.hash value)
+    ensures nonnegative_hashes items
+    variant items =
+    match items with
+    | [] -> ()
+    | x :: rest ->
+        assert (List.mem x items);
+        assert (forall packed : carrier_key. (let value = packed.key in List.mem value rest -> List.mem value items));
+        nonnegative_hashes_membership rest
+
+  proof rehash [buckets : (int, Key.t list) map] row capacity stripes bucket
+    requires 0 < stripes && 0 < capacity && Array.length row === capacity &&
+      nonnegative_hashes bucket &&
+      (forall k : int. 0 <= k && k < capacity ->
+        own (Array.cell row k) (Map.get buckets k))
+    ensures forall k : int. 0 <= k && k < capacity ->
+      own (Array.cell row k) (Map.get (scatter buckets capacity stripes bucket) k) =
+    at (rehash row capacity stripes rest) (fun invoke ->
+      scatter_cons buckets capacity stripes x rest;
+      let result = invoke (Map.set buckets target (x :: Map.get buckets target)) in
+      result)
+
+  proof result = empty_row [stripes : int] [stripe : integer] capacity
+    requires 0 < stripes && 0 < capacity && capacity <= 18014398509481983
+    ensures Array.length result === capacity &&
+      represents stripes stripe capacity (Map.const [] : (int, Key.t list) map) Finset.empty &&
+      (forall k : int. 0 <= k && k < capacity -> own (Array.cell result k) []) =
+    on return fold represents stripes stripe capacity (Map.const [] : (int, Key.t list) map) Finset.empty
+
+  let rec redistributed (original : (int, Key.t list) map) (stop : integer)
+      (capacity : int) (stripes : int) : (int, Key.t list) map
+    variant (if stop > 0 then stop else 0) =
+    if stop <= 0 then (Map.const [] : (int, Key.t list) map)
+    else scatter (redistributed original (stop - 1) capacity stripes) capacity stripes
+      (Map.get original (stop - 1))
+
+  proof result = rebuild [stripe : integer] [values : Key.t finset]
+      [old_buckets : (int, Key.t list) map] old_row capacity stripes
+    requires 0 < capacity && capacity <= 18014398509481983 && 0 < stripes &&
+      represents stripes stripe (Array.length old_row) old_buckets values &&
+      (forall k : int. 0 <= k && k < Array.length old_row ->
+        own (Array.cell old_row k) (Map.get old_buckets k))
+    ensures Array.length result === capacity &&
+      represents stripes stripe (Array.length old_row) old_buckets values &&
+      (forall k : int. 0 <= k && k < Array.length old_row ->
+        own (Array.cell old_row k) (Map.get old_buckets k)) &&
+      represents stripes stripe capacity
+        (redistributed old_buckets (Array.length old_row) capacity stripes) values &&
+      (forall k : int. 0 <= k && k < capacity ->
+        own (Array.cell result k)
+          (Map.get (redistributed old_buckets (Array.length old_row) capacity stripes) k)) =
+    at (empty_row capacity) (fun create ->
+      let result = create (stripes, stripe) in result);
+    at (rehash row capacity stripes old_row.(k)) invariant
+      (0 <= k && k <= Array.length old_row && Array.length row === capacity &&
+       0 < capacity && 0 < stripes &&
+       represents stripes stripe (Array.length old_row) old_buckets values &&
+       (forall j : int. 0 <= j && j < Array.length old_row ->
+         own (Array.cell old_row j) (Map.get old_buckets j)) &&
+       represents stripes stripe capacity (redistributed old_buckets k capacity stripes)
+         (collected old_buckets k) &&
+       (forall j : int. 0 <= j && j < capacity -> own (Array.cell row j)
+         (Map.get (redistributed old_buckets k capacity stripes) j)));
+    at (rehash row capacity stripes old_row.(k)) (fun invoke ->
+      collected_bucket_bounds old_buckets (Array.length old_row) stripes stripe values k;
+      let buckets = redistributed old_buckets k capacity stripes in
+      let selected = Map.get old_buckets k in
+      nonnegative_hashes_membership selected;
+      let result = invoke buckets in
+      scatter_represents buckets capacity stripes stripe (collected old_buckets k) selected;
+      assert (collected old_buckets (k + 1) ===
+        Finset.union (collected old_buckets k) (list_set selected));
+      assert (redistributed old_buckets (k + 1) capacity stripes ===
+        scatter buckets capacity stripes selected);
+      result);
+    on return collected_complete old_buckets (Array.length old_row) stripes stripe values
+
+  type lock_snapshot = {share : Permission.t; mutexes : (int, Mutex.t) map}
+
+  lemma mutex_indices (root : Key.t list array array Atomic.t) (stripes : int)
+      (first : int) (second : int) (first_key : Ghost.t) (second_key : Ghost.t)
+      (left : Mutex.t) (right : Mutex.t)
+    opens {}
+    requires Guard.is_mutex left (root, stripes, first, first_key) &&
+      Guard.is_mutex right (root, stripes, second, second_key)
+    ensures first === second || not (left === right) =
+    if left === right then
+      assert ((root, stripes, first, first_key) === (root, stripes, second, second_key))
+    else ()
+
+  lemma mutex_fresh_prefix (root : Key.t list array array Atomic.t) (stripes : int)
+      (keys : (int, Ghost.t) map) (mutexes : (int, Mutex.t) map)
+      (stop : integer) (index : integer)
+    opens {}
+    requires 0 <= stop && stop <= index && index < stripes &&
+      (forall j : integer [Map.get keys j]. 0 <= j && j < stripes ->
+        Guard.is_mutex (Map.get mutexes j) (root, stripes, j, Map.get keys j))
+    ensures forall j : integer. 0 <= j && j < stop ->
+      not (Map.get mutexes j === Map.get mutexes index)
+    variant stop =
+    if stop > 0 then begin
+      mutex_indices root stripes (stop - 1) index (Map.get keys (stop - 1))
+        (Map.get keys index) (Map.get mutexes (stop - 1)) (Map.get mutexes index);
+      mutex_fresh_prefix root stripes keys mutexes (stop - 1) index
+    end else ()
+
+  lemma mutexes_distinct (root : Key.t list array array Atomic.t) (stripes : int)
+      (keys : (int, Ghost.t) map) (mutexes : (int, Mutex.t) map) (stop : integer)
+    opens {}
+    requires 0 <= stop && stop <= stripes &&
+      (forall j : integer [Map.get keys j]. 0 <= j && j < stripes ->
+        Guard.is_mutex (Map.get mutexes j) (root, stripes, j, Map.get keys j))
+    ensures forall i : integer, j : integer. 0 <= i && i < stop && 0 <= j && j < stop &&
+      Map.get mutexes i === Map.get mutexes j -> i === j
+    variant stop =
+    if stop > 0 then begin
+      mutex_fresh_prefix root stripes keys mutexes (stop - 1) (stop - 1);
+      mutexes_distinct root stripes keys mutexes (stop - 1)
+    end else ()
+
+  lemma borrow_locks (s : t) (keys : (int, Ghost.t) map)
+    returns (snapshot : lock_snapshot)
+    opens {locked s keys}
+    requires locked s keys
+    ensures locked s keys &&
+      (forall i : int [Map.get snapshot.mutexes i]. 0 <= i && i < Array.length s.locks ->
+        own ~fraction:snapshot.share (Array.cell s.locks i) (Map.get snapshot.mutexes i) &&
+        Guard.is_mutex (Map.get snapshot.mutexes i)
+          (s.table, Array.length s.locks, i, Map.get keys i)) =
+    let o = unfold locked s keys in
+    let share = Permission.halve o.share in
+    fold locked s keys {o with share = share};
+    {share = share; mutexes = o.ms}
+
+  let prefix (count : int) (current : Key.t list array array) : Counts.t =
+    if count > 0 then Counts.count_cons count current else Counts.id
+
+  lemma join_fragment (root : Key.t list array array Atomic.t) (count : int)
+      (first : Key.t list array array) (second : Key.t list array array)
+    requires 0 <= count &&
+      own (Ghost.at tables root) (Tables.frag (prefix count first)) &&
+      own (Ghost.at tables root) (Tables.frag (Counts.count_cons 1 second))
+    ensures own (Ghost.at tables root) (Tables.frag (prefix (count + 1) second)) &&
+      (count > 0 -> first === second) = ()
+
+  lemma split_fragment (root : Key.t list array array Atomic.t) (count : int)
+      (current : Key.t list array array)
+    requires 0 < count && own (Ghost.at tables root) (Tables.frag (prefix count current))
+    ensures own (Ghost.at tables root) (Tables.frag (Counts.count_cons 1 current)) &&
+      own (Ghost.at tables root) (Tables.frag (prefix (count - 1) current)) = ()
+
+  predicate row_storage (current : Key.t list array array) (stripes : int) (stripe : int)
+      (registration : Ghost.t) (state : stripe_snapshot) =
+    state.current === current && own (Array.cell current stripe) state.row &&
+    own ~fraction:Permission.half (Ghost.at saved registration) state.values &&
+    0 < Array.length state.row &&
+    represents stripes stripe (Array.length state.row) state.buckets state.values &&
+    (forall k : int. 0 <= k && k < Array.length state.row ->
+      own (Array.cell state.row k) (Map.get state.buckets k))
+
+  lemma unpack_tail (root : Key.t list array array Atomic.t) (stripes : int) (first : int)
+      (keys : (int, Ghost.t) map) (seed : stripe_snapshot)
+    returns (states : (int, stripe_snapshot) map)
+    requires 0 < first && first <= stripes &&
+      own (Ghost.at tables root) (Tables.frag (prefix first seed.current)) &&
+      (forall j : integer [Map.get keys j]. first <= j && j < stripes ->
+        Stripe.resource (root, stripes, j, Map.get keys j))
+    ensures own (Ghost.at tables root) (Tables.frag (prefix stripes seed.current)) &&
+      (forall j : integer [Map.get keys j]. first <= j && j < stripes ->
+        row_storage seed.current stripes j (Map.get keys j) (Map.get states j))
+    variant (stripes - first) =
+    if first < stripes then begin
+      let state = open_stripe root stripes first (Map.get keys first) in
+      join_fragment root first seed.current state.current;
+      assert (state.current === seed.current);
+      fold row_storage seed.current stripes first (Map.get keys first) state;
+      let states = unpack_tail root stripes (first + 1) keys seed in
+      Map.set states first state
+    end else Map.const seed
+
+  lemma pack_rows (root : Key.t list array array Atomic.t) (stripes : int) (first : int)
+      (keys : (int, Ghost.t) map) (current : Key.t list array array)
+      (states : (int, stripe_snapshot) map)
+    requires 0 <= first && first <= stripes &&
+      own (Ghost.at tables root) (Tables.frag (prefix (stripes - first) current)) &&
+      (forall j : integer [Map.get keys j]. first <= j && j < stripes ->
+        row_storage current stripes j (Map.get keys j) (Map.get states j))
+    ensures forall j : integer [Map.get keys j]. first <= j && j < stripes ->
+      Stripe.resource (root, stripes, j, Map.get keys j)
+    variant (stripes - first) =
+    if first < stripes then begin
+      split_fragment root (stripes - first) current;
+      let state = Map.get states first in
+      unfold row_storage current stripes first (Map.get keys first) state;
+      fold Stripe.resource (root, stripes, first, Map.get keys first)
+        {current = current; row = state.row; values = state.values; buckets = state.buckets};
+      pack_rows root stripes (first + 1) keys current states
+    end else ()
+
+  type table_snapshot = {current_table : Key.t list array array; rows : (int, stripe_snapshot) map}
+
+  proof resize_locked [keys : (int, Ghost.t) map] s old_capacity
+    opens {is_set s}
+    requires is_set s && 0 < old_capacity && 0 < Array.length s.locks &&
+      tabled s (Array.length s.locks) &&
+      (forall i : int. 0 <= i && i < Array.length s.locks ->
+        Stripe.resource (s.table, Array.length s.locks, i, Map.get keys i))
+    ensures is_set s && tabled s (Array.length s.locks) &&
+      (forall i : int. 0 <= i && i < Array.length s.locks ->
+        Stripe.resource (s.table, Array.length s.locks, i, Map.get keys i)) =
+    let snapshot = at (Atomic.get s.table) (fun read ->
+      let first = open_stripe s.table stripes 0 (Map.get keys 0) in
+      fold row_storage first.current stripes 0 (Map.get keys 0) first;
+      let states = unpack_tail s.table stripes 1 keys first in
+      unfold tabled s stripes;
+      let result = read () in
+      assert (result === first.current);
+      fold tabled s stripes;
+      (result, {current_table = first.current; rows = Map.set states 0 first})) in
+    at (old_table.(0)) (fun read ->
+      unfold row_storage old_table stripes 0 (Map.get keys 0) (Map.get snapshot.rows 0);
+      let result = read () in
+      fold row_storage old_table stripes 0 (Map.get keys 0) (Map.get snapshot.rows 0);
+      result);
+    at (let row = rebuild old_table.(i) capacity stripes) invariant
+      (0 <= i && i <= stripes && 0 < stripes && capacity > 0 &&
+       capacity <= 18014398509481983 && Array.length table === stripes &&
+       Array.length old_table === stripes &&
+       own (Ghost.at tables s.table) (Tables.frag (prefix stripes old_table)) &&
+       (forall j : int. i <= j && j < stripes ->
+         row_storage old_table stripes j (Map.get keys j) (Map.get snapshot.rows j) &&
+         exists r : Key.t list array. own (Array.cell table j) r) &&
+       exists rebuilt : (int, stripe_snapshot) map.
+         forall j : int. 0 <= j && j < i ->
+           row_storage table stripes j (Map.get keys j) (Map.get rebuilt j))
+      with {rebuilt = Map.set rebuilt i fresh};
+    let state = at (old_table.(i)) (fun read ->
+      let state = Map.get snapshot.rows i in
+      unfold row_storage old_table stripes i (Map.get keys i) state;
+      let result = read () in (result, state)) in
+    let fresh = at (rebuild old_table.(i) capacity stripes) (fun invoke ->
+      let result = invoke (i, state.values, state.buckets) in
+      (result, {current = table; row = result; values = state.values;
+        buckets = redistributed state.buckets (Array.length state.row) capacity stripes})) in
+    at (table.(i) <- row) (fun write ->
+      let result = write () in
+      fold row_storage table stripes i (Map.get keys i) fresh;
+      result);
+    at (Atomic.set s.table table) (fun publish ->
+      unfold tabled s stripes;
+      Ghost.fpu (Ghost.at tables s.table)
+        (Tables.full (Counts.count_cons stripes old_table))
+        (Tables.full (Counts.count_cons stripes table));
+      let result = publish () in
+      fold tabled s stripes {current = table};
+      pack_rows s.table stripes 0 keys table rebuilt;
+      result);
+    on return begin
+      if growing then () else pack_rows s.table stripes 0 keys old_table snapshot.rows
+    end
+
+  let rec held_prefix (mutexes : (int, Mutex.t) map) (stop : integer) : Mutex.t finset
+    variant (if stop > 0 then stop else 0) =
+    if stop <= 0 then Finset.empty
+    else Finset.union (held_prefix mutexes (stop - 1))
+      (Finset.singleton (Map.get mutexes (stop - 1)))
+
+  lemma held_prefix_fresh (mutexes : (int, Mutex.t) map) (stop : integer)
+      (index : integer) (count : integer)
+    requires 0 <= stop && stop <= index && index < count &&
+      (forall i : integer, j : integer [Map.get mutexes i, Map.get mutexes j].
+        0 <= i && i < count && 0 <= j && j < count &&
+        Map.get mutexes i === Map.get mutexes j -> i === j)
+    ensures not (Finset.mem (Map.get mutexes index) (held_prefix mutexes stop))
+    variant stop =
+    if stop > 0 then begin
+      held_prefix_fresh mutexes (stop - 1) index count;
+      assert (not (Map.get mutexes index === Map.get mutexes (stop - 1)))
+    end else ()
+
+  lemma held_prefix_contains (mutexes : (int, Mutex.t) map) (stop : integer) (index : integer)
+    requires 0 <= index && index < stop
+    ensures Finset.mem (Map.get mutexes index) (held_prefix mutexes stop)
+    variant stop =
+    if index = stop - 1 then () else held_prefix_contains mutexes (stop - 1) index
+
+  predicate held_tokens (mutexes : (int, Mutex.t) map) (owner : Ghost.t)
+      (first : int) (last : int) =
+    if first < last then Guard.held (Map.get mutexes first) owner &&
+      held_tokens mutexes owner (first + 1) last
+    else true
+
+  lemma append_held (mutexes : (int, Mutex.t) map) (owner : Ghost.t)
+      (first : int) (last : int)
+    requires first <= last && held_tokens mutexes owner first last &&
+      Guard.held (Map.get mutexes last) owner
+    ensures held_tokens mutexes owner first (last + 1)
+    variant (last - first) =
+    if first < last then begin
+      unfold held_tokens mutexes owner first last;
+      append_held mutexes owner (first + 1) last;
+      fold held_tokens mutexes owner first (last + 1)
+    end else begin
+      fold held_tokens mutexes owner (last + 1) (last + 1);
+      fold held_tokens mutexes owner first (last + 1)
+    end
+
+  proof resize =
+    let (keys, locks) = at (stripe_count s) (fun count ->
+      let keys = expose_set s in
+      let locks = borrow_locks s keys in
+      mutexes_distinct s.table (Array.length s.locks) keys locks.mutexes (Array.length s.locks);
+      fold held_tokens locks.mutexes owner 0 0;
+      let result = count () in (result, (keys, locks))) in
+    at (Mutex.lock s.locks.(i)) invariant
+      (0 <= i && i <= stripes && 0 < stripes && stripes === Array.length s.locks &&
+       tabled s stripes && is_set s &&
+       Ghost.Mutex.context owner (held_prefix locks.mutexes i) &&
+       (forall j : int [Map.get locks.mutexes j]. 0 <= j && j < stripes ->
+         own ~fraction:locks.share (Array.cell s.locks j) (Map.get locks.mutexes j) &&
+         Guard.is_mutex (Map.get locks.mutexes j) (s.table, stripes, j, Map.get keys j)) &&
+       (forall j : int, k : int. 0 <= j && j < stripes && 0 <= k && k < stripes &&
+         Map.get locks.mutexes j === Map.get locks.mutexes k -> j === k) &&
+       held_tokens locks.mutexes owner 0 i &&
+       (forall j : int. 0 <= j && j < i ->
+         Stripe.resource (s.table, stripes, j, Map.get keys j)));
+    at (Mutex.lock s.locks.(i)) (fun acquire ->
+      held_prefix_fresh locks.mutexes i i stripes;
+      assert (not (Finset.mem (Map.get locks.mutexes i) (held_prefix locks.mutexes i)));
+      let result = acquire () in
+      append_held locks.mutexes owner 0 i;
+      result);
+    at (resize_locked s old_capacity) (fun invoke ->
+      let result = invoke keys in result);
+    at (Mutex.unlock s.locks.(i)) invariant
+      (0 <= i && i <= stripes && 0 < stripes && stripes === Array.length s.locks &&
+       is_set s &&
+       Ghost.Mutex.context owner (Finset.diff (held_prefix locks.mutexes stripes)
+         (held_prefix locks.mutexes i)) &&
+       (forall j : int [Map.get locks.mutexes j]. 0 <= j && j < stripes ->
+         own ~fraction:locks.share (Array.cell s.locks j) (Map.get locks.mutexes j) &&
+         Guard.is_mutex (Map.get locks.mutexes j) (s.table, stripes, j, Map.get keys j)) &&
+       (forall j : int, k : int. 0 <= j && j < stripes && 0 <= k && k < stripes &&
+         Map.get locks.mutexes j === Map.get locks.mutexes k -> j === k) &&
+       held_tokens locks.mutexes owner i stripes &&
+       (forall j : int. i <= j && j < stripes ->
+         Stripe.resource (s.table, stripes, j, Map.get keys j)));
+    at (Mutex.unlock s.locks.(i)) (fun release ->
+      unfold held_tokens locks.mutexes owner i stripes;
+      held_prefix_contains locks.mutexes stripes i;
+      held_prefix_fresh locks.mutexes i i stripes;
+      assert (Finset.mem (Map.get locks.mutexes i) (held_prefix locks.mutexes stripes));
+      assert (not (Finset.mem (Map.get locks.mutexes i) (held_prefix locks.mutexes i)));
+      let result = release () in result)
+end

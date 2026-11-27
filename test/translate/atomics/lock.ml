@@ -1,4 +1,4 @@
-(* The spin lock specified in lock.mli; its predicate is defined in lock.proof. *)
+(* The spin lock specified in lock.mli; its predicate is defined in lock.mlp. *)
 
 type t = bool Atomic.t
 

@@ -39,8 +39,8 @@ Binding is restricted to the facade's operation.
 
 Raven continues to check token lifecycle errors after qualified lookup.
 
-  $ caravan --shh scoped_au_double_open.ml 2>&1 | grep -F 'Verification Error: Atomic token token is already open.'
-  Verification Error: Atomic token token is already open.
+  $ caravan --shh scoped_au_double_open.ml 2>&1 | grep -F 'Verification Error: Cannot open atomic token token while another atomic update is still open; commit or abort it first.'
+  Verification Error: Cannot open atomic token token while another atomic update is still open; commit or abort it first.
 
 A checked contract view cannot be silently replaced by the underlying procedure.
 

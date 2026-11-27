@@ -3,9 +3,20 @@ module L = Checked_signatures
 
 let ( let* ) = Result.( >>= )
 
+let canonical_path = function
+  | [ "Ghost"; "MutexResource" ] -> [ Mutex_contract.resource_interface ]
+  | [ "Ghost"; "TransferableResource" ] ->
+      [ Mutex_visibility_contract.resource_interface ]
+  | [ "Ghost"; "Mutex" ] -> [ Mutex_contract.protocol_name ]
+  | path -> path
+
+let mutex_signatures = Mutex_contract.source_signatures
+
 let signatures at =
   match L.standard_library () with
-  | Ok signatures -> Ok signatures
+  | Ok signatures ->
+      Ok
+        (signatures @ mutex_signatures () @ Mutex_visibility_contract.source_signatures ())
   | Error diagnostics ->
       let message =
         match diagnostics with
@@ -22,6 +33,7 @@ let path_of_qualid (qualid : Caravan_spec.Spec_ast.qualid) =
   collect [] qualid
 
 let find signatures path =
+  let path = canonical_path path in
   List.find signatures ~f:(fun (signature : L.module_signature) ->
       List.equal String.equal signature.path path
       || List.equal String.equal signature.path ("Library" :: path))
@@ -42,6 +54,20 @@ let is_resource_algebra signatures signature =
   List.exists (interface_paths signatures signature) ~f:(fun path ->
       List.equal String.equal path [ "Library"; "ResourceAlgebra" ]
       || List.equal String.equal path [ "ResourceAlgebra" ])
+
+let is_protected_resource signatures signature =
+  List.exists (interface_paths signatures signature) ~f:(fun path ->
+      List.equal String.equal path [ Mutex_contract.resource_interface ]
+      || List.equal String.equal path [ Mutex_visibility_contract.resource_interface ])
+
+let is_mutex_protocol (signature : L.module_signature) =
+  List.equal String.equal signature.path [ Mutex_contract.protocol_name ]
+  || List.equal String.equal signature.path [ Mutex_visibility_contract.protocol_name ]
+
+let is_resource_interface signatures signature =
+  signature.L.interface
+  && (is_resource_algebra signatures signature
+     || is_protected_resource signatures signature)
 
 let members signatures (signature : L.module_signature) ~get ~name =
   let rec collect visited (signature : L.module_signature) =
@@ -65,6 +91,29 @@ let member_types signatures signature =
 let member_constants signatures signature =
   members signatures signature ~get:(fun member -> member.L.constants) ~name:fst
 
+let member_callables signatures signature =
+  members signatures signature
+    ~get:(fun member -> member.L.callables)
+    ~name:(fun callable -> callable.L.operation.name)
+
+let operation_kind signatures signature name =
+  Option.value_map
+    (List.find (member_callables signatures signature) ~f:(fun callable ->
+         String.equal callable.L.operation.name name))
+    ~default:Raven_api.Ast.Callable.Func
+    ~f:(fun callable -> callable.kind)
+
+let logical_predicate_operation (callable : L.callable) =
+  match callable.kind with
+  | Raven_api.Ast.Callable.Pred | Invariant ->
+      Some
+        {
+          callable.operation with
+          inputs = callable.operation.inputs @ callable.operation.outputs;
+          outputs = [ ("result", L.Bool) ];
+        }
+  | Func | Proc | Lemma -> None
+
 let member_operations signatures (signature : L.module_signature) =
   let types = member_types signatures signature in
   let constructors =
@@ -75,7 +124,17 @@ let member_operations signatures (signature : L.module_signature) =
       ~get:(fun member -> member.L.operations)
       ~name:(fun operation -> operation.L.name)
   in
-  let operations = constructors @ inherited in
+  let ghost_operations =
+    if is_protected_resource signatures signature || is_mutex_protocol signature then
+      List.filter_map (member_callables signatures signature) ~f:(fun callable ->
+          match callable.L.kind with
+          | Raven_api.Ast.Callable.Pred | Invariant ->
+              logical_predicate_operation callable
+          | Lemma -> Some callable.operation
+          | Func | Proc -> None)
+    else []
+  in
+  let operations = constructors @ inherited @ ghost_operations in
   List.fold operations ~init:[] ~f:(fun seen operation ->
       if
         List.exists seen ~f:(fun (earlier : L.operation) ->
@@ -95,6 +154,36 @@ let accepts_type_argument signatures path =
       | _ -> false)
   | None -> false
 
+let native_type ~at module_name =
+  Ast_helper.Typ.constr ~loc:at
+    {
+      txt =
+        Longident.Ldot
+          ( {
+              txt =
+                Longident.Ldot
+                  ( { txt = Longident.Lident "Stdlib"; loc = at },
+                    { txt = module_name; loc = at } );
+              loc = at;
+            },
+            { txt = "t"; loc = at } );
+      loc = at;
+    }
+    []
+
+let mutex_type ~at = native_type ~at "Mutex"
+let condition_type ~at = native_type ~at "Condition"
+
+let owner_type ~at =
+  Ast_helper.Typ.constr ~loc:at
+    {
+      txt =
+        Longident.Ldot
+          ({ txt = Longident.Lident "Ghost"; loc = at }, { txt = "t"; loc = at });
+      loc = at;
+    }
+    []
+
 let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
     ~substitutions typ =
   let named ?(arguments = []) name =
@@ -105,6 +194,7 @@ let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
     | L.Bool -> Ok (named "bool")
     | Int -> Ok (named "int")
     | Real -> Ok (named "float")
+    | Ref when is_mutex_protocol signature -> Ok (mutex_type ~at)
     | Ref -> unsupported "A Raven Ref type cannot be exposed to OCaml"
     | Tuple [] -> Ok (named "unit")
     | Tuple [ one ] -> convert one
@@ -133,6 +223,8 @@ let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
              { txt = Longident.Lident "map"; loc = at }
              [ key; value ])
     | Other name -> unsupported ("Unsupported Raven library type " ^ name)
+    | Named ([ path ], []) when String.equal path Condition_contract.type_name ->
+        Ok (condition_type ~at)
     | Named (path, args) ->
         let owner =
           signature.path :: signature.implements
@@ -148,6 +240,7 @@ let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
             unsupported ("Parameterized Raven library type " ^ String.concat ~sep:"." path)
         in
         begin match path with
+        | [ "T" ] when is_mutex_protocol signature -> Ok (mutex_type ~at)
         | [ "T" ] -> Ok (named ~arguments:family_arguments "t")
         | [ parameter; "T" ] | [ parameter ] ->
             begin match List.Assoc.find substitutions parameter ~equal:String.equal with
@@ -171,7 +264,18 @@ let ocaml_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
 let operation_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
     ~substitutions (operation : L.operation) =
   let convert = ocaml_type ~family_arguments ~at ~signature ~substitutions in
-  let* inputs = Result.all (List.map operation.inputs ~f:(fun (_, typ) -> convert typ)) in
+  let* inputs =
+    Result.all
+      (List.map operation.inputs ~f:(fun (name, typ) ->
+           if
+             (is_mutex_protocol signature
+             || List.equal String.equal signature.path
+                  [ Mutex_visibility_contract.resource_interface ])
+             && List.mem [ "self"; "source"; "target" ] name ~equal:String.equal
+             && Poly.equal typ L.Ref
+           then Ok (owner_type ~at)
+           else convert typ))
+  in
   let* outputs =
     Result.all (List.map operation.outputs ~f:(fun (_, typ) -> convert typ))
   in
@@ -185,3 +289,10 @@ let operation_type ?(family_arguments = []) ~at ~(signature : L.module_signature
   Ok
     (List.fold_right inputs ~init:result ~f:(fun input result ->
          Ast_helper.Typ.arrow ~loc:at Nolabel input result))
+
+let callable_type ?(family_arguments = []) ~at ~(signature : L.module_signature)
+    ~substitutions (callable : L.callable) =
+  let operation =
+    Option.value (logical_predicate_operation callable) ~default:callable.operation
+  in
+  operation_type ~family_arguments ~at ~signature ~substitutions operation

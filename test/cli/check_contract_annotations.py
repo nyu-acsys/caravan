@@ -37,7 +37,7 @@ if mode in {"alias", "value", "mismatch", "type"}:
     if mode == "mismatch":
         assert any("another one here" in "\n".join(e["message"])
                    for e in report["errors"])
-        assert any(e["kind"] == "RelatedLoc" and e["file"].endswith(".mli")
+        assert any(e["kind"] == "RelatedLoc" and e["file"].endswith("editor_contract_mismatch.ml")
                    for e in report["errors"])
 else:
     contracts = [a for a in annotations if a["kind"] == "InheritedContract"]
@@ -50,7 +50,7 @@ else:
         assert annotation["kind"] == "InheritedContract"
         assert annotation["file"].endswith(".ml")
         assert source_slice(annotation) == annotation["source"].split(".")[-1]
-        assert annotation["source_loc"]["file"].endswith((".mli", ".proof"))
+        assert annotation["source_loc"]["file"].endswith((".mli", ".mlp"))
         for clause in annotation["clauses"]:
             actual = source_slice(clause)
             words = clause["keyword"].split()

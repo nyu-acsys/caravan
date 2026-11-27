@@ -30,7 +30,7 @@ for step in steps:
     }
     assert source_slice(step) == ""
     assert step["file"].endswith(".ml")
-    assert step["source_loc"]["file"].endswith(".proof")
+    assert step["source_loc"]["file"].endswith(".mlp")
     original = source_slice(step["source_loc"])
     prefix = "Ghost.scope " if original.startswith("(fun") else (
         "" if original == "commit" else "proof "

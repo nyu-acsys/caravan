@@ -1,0 +1,2 @@
+predicate [@inline] contents (node : ('a, [ `Node ]) node) (value [@implicit] : 'a) =
+  match node with Node record -> own record.value value

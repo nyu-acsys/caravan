@@ -1,0 +1,3 @@
+proof stop =
+  at (List.fold_left (fun () value -> if value then raise Stop else ()) () values)
+    invariant (fun () remaining -> true)

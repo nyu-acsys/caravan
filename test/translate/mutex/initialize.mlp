@@ -1,0 +1,20 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = exists n : int. own cell.contents n && 0 <= n
+end
+
+module Guard = Ghost.Mutex (Cell)
+
+proof mutex = make cell
+  requires (Cell.resource cell)
+  ensures (Guard.is_mutex mutex cell) =
+  at (Mutex.create ()) (fun create ->
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex)
+
+proof mutex = client () ensures (true) =
+  at (make cell) (fun make ->
+    fold Cell.resource cell;
+    let mutex = make () in
+    mutex)

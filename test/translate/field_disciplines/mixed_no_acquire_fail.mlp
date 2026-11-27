@@ -1,0 +1,5 @@
+module Count = Ghost.Frozen (struct let field (cell : cell) = cell.count end)
+proof result = read cell target
+  requires (own cell.next channel && Count.frozen target value)
+  ensures (own cell.next channel && Count.frozen target value && result === value) =
+  at (target.count) Ghost.frozen_scope (fun read -> let result = read () in result)

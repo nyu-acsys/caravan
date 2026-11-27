@@ -1,0 +1,9 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = own cell.contents 0
+  lemma private_helper ensures (true) = ()
+end
+
+module Alias = Cell
+
+lemma leak = Alias.private_helper

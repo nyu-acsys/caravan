@@ -1,0 +1,53 @@
+module Resource : Ghost.MutexResource with type t = int array * int = struct
+  type t = int array * int
+  predicate resource (key : t) =
+    match key with (counts, i) -> exists v : int. own (Array.cell counts i) v
+end
+
+module Guard = Ghost.Mutex (Resource)
+
+invariant locked (s : t) =
+  Array.length s.locks = Array.length s.counts &&
+  exists share : Permission.t, ms : (int, Mutex.t) map.
+    forall i : int. 0 <= i && i < Array.length s.locks ->
+      own ~fraction:share (Array.cell s.locks i) (Map.get ms i) &&
+      Guard.is_mutex (Map.get ms i) (s.counts, i)
+
+proof incr s i
+  requires (locked s && 0 <= i && i < Array.length s.locks &&
+    Ghost.Mutex.context owner held && held = Finset.empty)
+  ensures (Ghost.Mutex.context owner held) =
+  at (s.locks.(i)) (fun read ->
+    let o = unfold locked s in
+    fold locked s { o with share = Permission.halve o.share };
+    let result = read () in
+    result);
+  at (Mutex.lock m) (fun lock ->
+    let result = lock () in
+    unfold Resource.resource (s.counts, i);
+    result);
+  at (Mutex.unlock m) (fun unlock ->
+    fold Resource.resource (s.counts, i);
+    let result = unlock () in
+    result)
+
+proof result = create n
+  requires (0 <= n && n <= 1000 && Ghost.Mutex.context owner held)
+  ensures (locked result && Array.length result.locks = n &&
+    Ghost.Mutex.context owner held) =
+  at (locks.(i) <- Mutex.create ()) invariant
+    (Ghost.Mutex.context owner held && Array.length locks = n && Array.length counts = n &&
+     (forall j : int. i <= j && j < n ->
+        (exists m : Mutex.t. own (Array.cell locks j) m) && own (Array.cell counts j) 0) &&
+     exists ms : (int, Mutex.t) map.
+       (forall j : int. 0 <= j && j < i ->
+          own (Array.cell locks j) (Map.get ms j) && Guard.is_mutex (Map.get ms j) (counts, j)))
+    with { ms = Map.set ms i m };
+  let m = at ((Mutex.create ()) [@occurrence 2]) (fun create ->
+    let m = create () in
+    fold Resource.resource (counts, i);
+    Guard.initialize m (counts, i);
+    (m, m)) in
+  on return begin
+    fold locked result { share = Permission.full; ms = ms }
+  end

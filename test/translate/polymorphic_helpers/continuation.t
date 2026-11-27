@@ -10,7 +10,7 @@ The checked helper shares the owner's worker and dictionaries.
 An OCaml-valid call at an unrelated payload type cannot use the restricted contract.
 
   $ mkdir invalid_continuation
-  $ cp continuation.mli continuation.proof invalid_continuation/
+  $ cp continuation.mli continuation.mlp invalid_continuation/
   $ sed 's/helper q value/helper (Atomic.make 0) 0/' continuation.ml > invalid_continuation/continuation.ml
   $ caravan --shh invalid_continuation/continuation.ml > invalid.out 2>&1
   [1]

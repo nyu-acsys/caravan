@@ -1,4 +1,4 @@
-# 5. Semantics and verification limits
+# 6. Semantics and verification limits
 
 A proof establishes properties of Caravan's runtime model under the function's
 precondition and its dependency contracts. The following distinctions matter when
@@ -6,22 +6,25 @@ reading those properties as claims about OCaml programs.
 
 ## Integers {#sec:integers}
 
-Runtime `int` values have OCaml machine bounds. Ordinary executable arithmetic
-must not overflow: Caravan generates obligations for operations such as `+`, `-`,
-`*`, division, and unary negation. Division also requires a nonzero divisor.
-OCaml itself can wrap on overflow; Caravan currently rejects such ordinary
-arithmetic rather than using wraparound to prove its contract.
+Runtime `int` values have OCaml machine bounds. Executable addition, subtraction,
+multiplication, division, and negation use OCaml's signed wraparound semantics.
+Every intermediate arithmetic result wraps, including in executable pure
+functions, reference increments/decrements, and atomic arithmetic. Division and
+remainder still require a nonzero divisor.
 
 Specification arithmetic is mathematical. In `ensures result === value + 1`, the
 addition does not wrap. Quantifiers over `int` range over bounded source integers;
 the specification-only type `integer` ranges over all mathematical integers.
 Logical datatypes and mathematical collections are not automatically restricted
 to runtime-representable values just because a field has type `int`. At boundaries
-back to executable code, source-value constraints must hold.
+back to executable code, source-value constraints must hold. Define unbounded
+measures as logical functions returning `integer`; a pure OCaml implementation
+used in a contract retains its executable arithmetic semantics.
 
-The atomic arithmetic operations `Atomic.fetch_and_add`, `Atomic.incr`, and
-`Atomic.decr` are modeled with wrapping behavior. Do not transfer a no-overflow
-fact from ordinary addition to these operations.
+For example, executable `max_int + 1` evaluates to `min_int`, whereas the same
+expression in a specification denotes the mathematical integer above `max_int`.
+A postcondition such as `result === value + 1` therefore needs a precondition
+excluding overflow, or separate cases describing its wrapped result.
 
 ## Equality and physical identity {#sec:equality-and-physical-identity}
 
@@ -52,6 +55,13 @@ variants, or lists, in both code and specifications. Tests against nullary
 constructors such as `xs = []` remain supported. Use identity to compare references,
 and explicit owned reads to compare their contents.
 
+Mutable inline constructor records retain the identity of their allocated block.
+Physical equality and CAS are exact for a variant whose constructors are nullary
+or mutable inline records. An unboxed wrapper such as the `Link` type in the
+[coverage guide](./ocaml-subset#sec:expressions-types-and-effects) preserves that
+identity without another allocation. An ordinary boxed constructor containing a
+reference does not inherit the reference's exact identity model.
+
 OCaml's physical comparison and `Atomic.compare_and_set` compare boxed immutable
 values, such as nonempty lists, by physical identity. Structurally equal values
 need not be the same allocation, so structural equality does not guarantee CAS
@@ -75,12 +85,17 @@ does not establish progress or allocation-sensitive ABA arguments.
 
 ## Memory access and evaluation {#sec:memory-access-and-evaluation}
 
-Ownership makes ordinary reference and mutable-record accesses race-free.
+By default, ownership makes ordinary reference and mutable-record accesses race-free.
 A positive fraction permits reads; full ownership permits writes. These accesses
 use non-atomic contracts, so a proof cannot open a shared invariant around an
 ordinary access as if it were atomic. Use `Atomic` operations where shared accesses
 need atomicity. Caravan relies on OCaml's race-free/atomic execution model; it does
 not justify racy ordinary reads or writes by assuming every field access is atomic.
+
+The [weak-memory chapter](./weak-memory) describes advanced field disciplines and
+release/acquire proofs. Their explicit annotations and visibility obligations
+change how those accesses are verified; the default ownership rules above do not
+by themselves justify such accesses or establish publication between domains.
 
 The translator evaluates ordinary application arguments right to left and preserves
 short-circuit behavior of `&&` and `||`. OCaml does not promise a general argument
@@ -102,8 +117,9 @@ and lemmas separately require decreasing variants.
 
 Exceptions named by normal and atomic exceptional contracts are part of the proof.
 Do not read successful verification as a claim about all environmental failures,
-including allocation failure or asynchronous runtime behavior. The verifier also
-does not check an unmodeled domain-spawning harness.
+including allocation failure or asynchronous runtime behavior. The domain model
+assumes successful creation; it does not model `Domain.spawn` resource-exhaustion
+failures, domain-local storage, or domain-exit hooks.
 
 Manual ghost proofs are checked, not trusted shortcuts. Their operations erase
 from execution, and access scopes must preserve the attached runtime operation.
@@ -124,6 +140,9 @@ that establishes types, not imported behavioral contracts.
 - Bundled standard-library behavioral contracts are trusted. Their mathematical
   models and auxiliary lemmas are checked by `caravan --check-stdlib` and by the
   regression suite.
+- Domain fork/join ownership transfer uses a trusted parameterized Raven interface.
+  The task implementation is still verified against the operation contract;
+  declaring a task facade does not make that implementation trusted.
 - An imported `pure` operation promises purity, determinism, and termination when
   its precondition holds, as well as its contract. A specification call denotes a
   total mathematical extension; outside the precondition or source domain its
@@ -147,8 +166,17 @@ Run `caravan --help` for the complete command-line interface. Common options are
 | `--no-dune` | Disable automatic Dune dependency discovery. |
 | `--smt-timeout MS` | Set the timeout per solver query; the default is 10000 ms. |
 | `--cache-dir DIR` | Reuse successful checks with unchanged proof dependencies. |
+| `--only NAME` | Check one source member or module and its attached proof obligations. |
 | `--emit-rav` | Inspect the generated Raven program instead of verifying it. |
 | `--check-stdlib` | Check bundled mathematical models and lemmas. |
+
+For focused verification, `caravan --only of_list queue.ml` checks `of_list`,
+its local helpers, and attached proof steps. Qualified names select nested members,
+such as `of_list.build_next`; a module name selects its descendants. Enclosing
+module and file checks still run, and the entire input is parsed, typed, and
+translated. Other implementations are assumed through their contracts, so use a
+full run to validate the whole program. Omitted members appear as skipped in
+machine-readable results, even if their previous results are cached.
 
 A solver timeout means the obligation was not proved within the budget; it does
 not establish a counterexample. Cached results are reused only when Raven's proof

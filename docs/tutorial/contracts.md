@@ -18,9 +18,9 @@ arguments and its result. `requires` states what callers must establish; `ensure
 states what the implementation must return. `===` is pure logical equality: it
 compares immutable structure recursively and heap references by identity, without
 reading their mutable contents. `=/=` is its negation.
-The upper bound ensures the executable addition cannot overflow, while the
-postcondition uses mathematical arithmetic. Removing the precondition makes the
-proof fail at the addition; see [integer semantics](./semantics#sec:integers).
+The upper bound ensures the wrapped executable addition agrees with mathematical
+addition, while the postcondition uses mathematical arithmetic. Removing the
+precondition makes the postcondition fail; see [integer semantics](./semantics#sec:integers).
 
 The next function in the same file updates an ordinary OCaml reference:
 
@@ -62,7 +62,10 @@ Caravan reads three sibling files together:
 | --- | --- |
 | `example.ml` | Executable OCaml, optionally with inline annotations. |
 | `example.mli` | Public OCaml interface and contracts visible to clients. |
-| `example.proof` | Predicates, invariants, lemmas, ghost declarations, and proof outlines. |
+| `example.mlp` | Predicates, invariants, lemmas, ghost declarations, and proof outlines. |
+
+Caravan still reads a proof file with the older extension `.proof` when there is no `.mlp`
+file, with a warning to rename it.
 
 For a small example, keep the implementation free of annotations in
 [`proof_syntax.ml`](../examples/proof_syntax.ml):
@@ -79,20 +82,24 @@ The interface declares `stored` without revealing its definition. Callers receiv
 that predicate and establishes it at the return point:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{1,4}-->
+<!--@include: ../examples/proof_syntax.mlp{1,4}-->
 ```
 
 These declarations go directly in
-[`proof_syntax.proof`](../examples/proof_syntax.proof), without annotation comments.
+[`proof_syntax.mlp`](../examples/proof_syntax.mlp), without annotation comments.
+As in `.mli` annotations, `requires`, `ensures`, and exceptional clauses do not
+need enclosing parentheses. In a `.mlp` contract or lemma, bare `=` starts the
+proof body: group structural equality as `(x = y)` where it would otherwise meet
+that boundary. Equality written with `===` needs no such grouping.
 The predicate body says what `stored` owns. `fold` packages the freshly allocated
 field's ownership into that predicate. `proof make = on return ...` attaches this
 step to the constructor's return, without changing its runtime body.
 
 Run `caravan proof_syntax.ml` to check the implementation, interface, and proof
-together. The remaining examples on this page belong to that same `.proof` file
+together. The remaining examples on this page belong to that same `.mlp` file
 and are checked as part of the run.
 
-The `.mli` and `.proof` are optional. When an interface exists, Caravan uses
+The `.mli` and `.mlp` are optional. When an interface exists, Caravan uses
 OCaml's signature-inclusion checker to check the implementation against it.
 Private functions are also verified unless explicitly marked `trusted`.
 
@@ -100,6 +107,19 @@ Outlines can also select an access with `at (expression)`, as in the next chapte
 Matching ignores formatting and parentheses; ambiguous matches are rejected.
 Outlines for local helpers nest inside the enclosing function's outline, and
 source modules have corresponding `module ... = struct ... end` proof blocks.
+An outline can also supply ghost results through a return adapter. For example,
+if `let identity (value : int) = value` has this companion contract and proof:
+
+```proof
+proof result, [copy : int] = identity value
+  ensures result === value && copy === value =
+  on return Ghost.returns (fun result () -> result)
+```
+
+`result` is the runtime result; the adapter returns the ghost result `copy`.
+Multiple ghost results use a tuple. The adapter's second argument is the current
+proof state (`()` when there is none).
+
 Alternatively, proof annotations can follow their expressions in the `.ml`.
 Both forms use the same verifier; a companion proof is not an unchecked assumption.
 
@@ -109,7 +129,7 @@ A proof file can define pure logical functions using OCaml-style expressions.
 This function computes a list's length as an unbounded mathematical `integer`:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{6,10}-->
+<!--@include: ../examples/proof_syntax.mlp{6,10}-->
 ```
 
 `variant values` gives the decreasing measure for recursion: each call uses the
@@ -119,7 +139,7 @@ new executable OCaml function.
 A lemma states and proves a reusable fact about that function:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{12,17}-->
+<!--@include: ../examples/proof_syntax.mlp{12,17}-->
 ```
 
 A lemma has typed parameters, contract clauses, and an expression body after `=`.
@@ -128,11 +148,25 @@ supplies the fact about the tail. Raven checks both the postcondition and the
 variant decrease. Runtime recursion does not thereby acquire a termination proof.
 Lemma bodies can also use `let`, `if`, `assert`, and other lemma calls.
 
+A lemma marked `[@auto]` needs no call: the solver applies it wherever a term
+matching its trigger occurs. The brackets before a postcondition give its
+triggers:
+
+```proof
+<!--@include: ../examples/proof_syntax.mlp{58,60}-->
+```
+
+Each trigger must mention every parameter. Without triggers, the solver chooses
+its own, which can make it apply a lemma too often and slow down verification.
+Quantifiers take triggers the same way, as in
+`forall x y [f x y | g x, h y]. p`: `|` separates alternative triggers, and a
+trigger of several terms, separated by `,`, matches only when all of them occur.
+
 Trailing parameters marked `[@implicit]` may be inferred from owned resources.
 This applies to ordinary predicates and to lemma parameters:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{19,30}-->
+<!--@include: ../examples/proof_syntax.mlp{19,30}-->
 ```
 
 The call `retain cell` infers `value = 7` from the owned predicate. Writing
@@ -144,7 +178,7 @@ Existential values hidden inside a predicate can be exposed and named with
 `unfold`, then supplied to `fold` as named witnesses:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{32,39}-->
+<!--@include: ../examples/proof_syntax.mlp{32,39}-->
 ```
 
 `{value}` selects the existential to bind as `observed`; its type is inferred.
@@ -156,12 +190,35 @@ Logical collections use types such as `'a finset` and `'a sequence`, with
 operations available only in specifications and proofs:
 
 ```proof
-<!--@include: ../examples/proof_syntax.proof{41,43}-->
+<!--@include: ../examples/proof_syntax.mlp{41,43}-->
 ```
 
 `Finset.singleton` creates a singleton set. `to_sequence` converts a list
 to a mathematical sequence while preserving order and length. Logical collections
 also include `'a set` and `('k, 'v) map`; use `integer` for unbounded indices.
+
+A list whose elements each own separate resources is described by a list segment
+over an element predicate. The predicate takes the element's position, as an
+`integer`, the element, and the list after it, then any parameters of its own:
+
+```proof
+<!--@include: ../examples/proof_syntax.mlp{45,48}-->
+```
+
+`list_segment counters over counter_at` declares `counters_seg cells position`,
+which holds `counter_at` for each element of `cells`, numbered from `position`, and
+`counters_hole cells position index`, the same without the element at `index`.
+`counters_located cells position index cell` says that `cell` is that element, and
+`counters_suffix cells position index` is the list after it. The lemmas
+`counters_expose` and `counters_restore` take the element's predicate out of the
+segment and put it back:
+
+```proof
+<!--@include: ../examples/proof_syntax.mlp{50,56}-->
+```
+
+The element predicate's own parameters follow the position in the segment
+predicates, and precede the index in the lemmas.
 
 More elaborate proofs can use resource-algebra modules, ghost fields, and
 frame-preserving updates. The

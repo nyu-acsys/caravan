@@ -1,0 +1,3 @@
+module Worker = struct
+  module Job = Ghost.Task (struct let operation = run end)
+end

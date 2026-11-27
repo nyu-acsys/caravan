@@ -1,0 +1,55 @@
+let rec reverse (values : 'a list) : 'a list
+  variant values =
+  match values with
+  | [] -> []
+  | head :: tail -> reverse tail @ [head]
+
+lemma append_empty (values : 'a list)
+  ensures (values @ [] === values)
+  variant values =
+  match values with
+  | [] -> ()
+  | _ :: tail -> append_empty tail
+
+lemma append_assoc (first : 'a list) (second : 'a list) (third : 'a list)
+  ensures ((first @ second) @ third === first @ (second @ third))
+  variant first =
+  match first with
+  | [] -> ()
+  | _ :: tail -> append_assoc tail second third
+
+lemma reverse_append (first : 'a list) (second : 'a list)
+  ensures (reverse (first @ second) === reverse second @ reverse first)
+  variant first =
+  match first with
+  | [] -> append_empty (reverse second)
+  | head :: tail ->
+      reverse_append tail second;
+      append_assoc (reverse second) (reverse tail) [head]
+
+lemma [@auto] reverse_involution (values : 'a list)
+  ensures [reverse (reverse values)]. reverse (reverse values) === values
+  variant values =
+  match values with
+  | [] -> ()
+  | head :: tail ->
+      reverse_involution tail;
+      reverse_append (reverse tail) [head]
+
+lemma append_singleton (values : 'a list) (value : 'a)
+  ensures (List.length (values @ [value]) = List.length values + 1)
+  ensures (List.mem value (values @ [value]))
+  ensures (forall item : 'a. List.mem item values -> List.mem item (values @ [value]))
+  variant values =
+  match values with
+  | [] -> ()
+  | _ :: tail -> append_singleton tail value
+
+lemma reverse_length (values : 'a list)
+  ensures (List.length (reverse values) = List.length values)
+  variant values =
+  match values with
+  | [] -> ()
+  | head :: tail ->
+      reverse_length tail;
+      append_singleton (reverse tail) head

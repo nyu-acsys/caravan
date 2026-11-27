@@ -18,10 +18,13 @@ let sources =
     ("treiber_stack/treiber_stack.mli", "8fce1984f67b2eb286143e8ebf3ea2fd");
   ]
 
-let strip_annotations text =
+let strip_annotations ?(implementation = false) text =
   let lexbuf = Lexing.from_string text in
   Lexer.init ();
-  let signature = Parse.interface lexbuf in
+  let parsed =
+    if implementation then `Structure (Parse.implementation lexbuf)
+    else `Signature (Parse.interface lexbuf)
+  in
   let annotations =
     List.filter_map (Lexer.comments ()) ~f:(fun (_, (loc : Location.t)) ->
         Option.some_if
@@ -37,7 +40,10 @@ let strip_annotations text =
     else Ast_iterator.default_iterator.attribute iterator attribute
   in
   let iterator = { Ast_iterator.default_iterator with attribute } in
-  iterator.signature iterator signature;
+  begin match parsed with
+  | `Structure structure -> iterator.structure iterator structure
+  | `Signature signature -> iterator.signature iterator signature
+  end;
   let length = String.length text in
   let rec line_start offset =
     if offset = 0 || Char.equal text.[offset - 1] '\n' then offset
@@ -58,7 +64,15 @@ let strip_annotations text =
         let first = line_start start and last = line_end stop in
         if whitespace first start && whitespace stop last then
           (first, if last < length then last + 1 else last)
-        else (start, stop))
+        else
+          let rec preceding_space start =
+            if
+              start > first
+              && (Char.equal text.[start - 1] ' ' || Char.equal text.[start - 1] '\t')
+            then preceding_space (start - 1)
+            else start
+          in
+          (preceding_space start, stop))
     |> List.sort ~compare:(fun (left, _) (right, _) -> Int.compare left right)
   in
   let buffer = Buffer.create length in
@@ -78,7 +92,55 @@ let normalize_module_name name source =
     | None -> source
   else source
 
+let check_digest name expected source =
+  let actual = Stdlib.Digest.(to_hex (string source)) in
+  if not (String.equal expected actual) then
+    failwith
+      ("Upstream source parity failed for " ^ name ^ ": expected " ^ expected ^ ", got "
+     ^ actual)
+
+(* The barrier-free tutorial functor, with integer IDs and a named loop counter. *)
+let stack_drain_body source =
+  let after marker source =
+    match String.substr_index source ~pattern:marker with
+    | Some index -> String.drop_prefix source (index + String.length marker)
+    | None -> failwith ("Missing stack-drain source marker " ^ marker)
+  in
+  let body = after "module Test (Stack : S) = struct\n" source in
+  let body =
+    match String.substr_index body ~pattern:"\nend\n" with
+    | Some index -> String.prefix body index
+    | None -> failwith "Missing stack-drain functor end"
+  in
+  List.fold
+    [
+      ("(id : int)", "(id : string)");
+      ("for i = 0 to 9 do", "for _ = 0 to 9 do");
+      ("work 1 st", "work \"A\" st");
+      ("work 2 st", "work \"B\" st");
+    ]
+    ~init:body
+    ~f:(fun body (pattern, with_) -> String.substr_replace_all body ~pattern ~with_)
+
+let tutorial_stack_body source =
+  match String.substr_index source ~pattern:"\nlet integer_lifo () =" with
+  | Some index -> String.rstrip (String.prefix source index) ^ "\n"
+  | None -> failwith "Missing tutorial blocking-stack client marker"
+
+(* Safe header and extracted body with local bounded-queue correctness fixes. *)
 let () =
+  check_digest "bounded_queue/bounded_queue.ml (extraction with queue fixes)"
+    "9e867819560361b05d910b38ef76d7f8"
+    (strip_annotations ~implementation:true
+       (Stdio.In_channel.read_all "../saturn/bounded_queue/bounded_queue.ml"))
+
+let () =
+  check_digest "ocaml5_tutorial/blocking_stack/blocking_stack.ml (upstream module)"
+    "070ac004a55414d787bb243d24ca243f"
+    (tutorial_stack_body
+       (Stdio.In_channel.read_all "../ocaml5_tutorial/blocking_stack/blocking_stack.ml"));
+  check_digest "moonpool/parker/parker_.ml" "0fe9b8df83e4820de11a2d4ba25176d0"
+    (Stdio.In_channel.read_all "../moonpool/parker/parker_.ml");
   List.iter sources ~f:(fun (name, expected) ->
       let path = "../saturn/" ^ name in
       let source = Stdio.In_channel.read_all path in
@@ -86,8 +148,7 @@ let () =
         if String.is_suffix name ~suffix:".ml" then source else strip_annotations source
       in
       let source = normalize_module_name name source in
-      let actual = Stdlib.Digest.(to_hex (string source)) in
-      if not (String.equal expected actual) then
-        failwith
-          ("Upstream source parity failed for " ^ name ^ ": expected " ^ expected
-         ^ ", got " ^ actual))
+      check_digest name expected source);
+  check_digest "stack_drain/stack_drain.ml (tutorial functor)"
+    "eb5cb2cf56e88545ebc55dc986cf436a"
+    (stack_drain_body (Stdio.In_channel.read_all "../saturn/stack_drain/stack_drain.ml"))

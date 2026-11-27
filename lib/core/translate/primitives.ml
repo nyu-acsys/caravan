@@ -25,13 +25,14 @@ let bin op a b = R.Expr.binary ~loc op a b
 let call f args = R.Expr.call ~loc (R.Name.make ~loc f) args
 let assign xs v = R.Stmt.assign ~loc (List.map xs ~f:var) (R.Stmt.expr_rhs v)
 
-type ordinary_op = Read | Write
+type ordinary_op = Read | Read_immutable | Write
 
 let ordinary_name ~field = function
   | Read -> field ^ "_ordinary_read"
+  | Read_immutable -> field ^ "_immutable_read"
   | Write -> field ^ "_ordinary_write"
 
-(** An ordinary field access is a call so it cannot be used as an atomic step. *)
+(** Mutable accesses are non-atomic; initialization-only reads permit invariant access. *)
 let ordinary_proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~int op :
     R.Member.t =
   let admissibility =
@@ -47,7 +48,7 @@ let ordinary_proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~int
   let own value fraction = R.Expr.own ~loc [ content; value; fraction ] in
   let formals, returns, requires, ensures, body =
     match op with
-    | Read ->
+    | Read | Read_immutable ->
         (* Separate clauses keep ownership transfers adjacent for fusion. *)
         let q = var "q" in
         ( [ formal "x" (R.Type.ref ~loc); ghost "v" typ; ghost "q" (R.Type.real ~loc) ],
@@ -70,7 +71,9 @@ let ordinary_proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~int
           [ R.Stmt.assign ~loc [ content ] (R.Stmt.expr_rhs new_val) ] )
   in
   R.Member.callable
-    (R.Callable.proc ~loc ~formals ~returns ~requires ~ensures
+    (R.Callable.proc ~loc
+       ~atomic:(Poly.equal op Read_immutable)
+       ~formals ~returns ~requires ~ensures
        (ident (Option.value declaration_name ~default:(ordinary_name ~field op)))
        (Some body))
 
@@ -162,3 +165,69 @@ let proc ?declaration_name ?admissibility ~field ~(typ : R.Type.t) ~exact ~int o
        ~ensures:[ R.Spec.make post ]
        (ident (Option.value declaration_name ~default:(name ~field op)))
        (Some update))
+
+(** Integer RMWs compose metadata-aware accesses inside one physical atomic block. *)
+let visibility_fetch_add ~declaration_name ~family =
+  let integer = R.Type.int ~loc in
+  let reference = R.Type.ref ~loc in
+  let view = Visibility_contract.view_type ~loc in
+  let formal text typ = R.Var.make ~loc (ident text) typ in
+  let ghost ?(implicit = false) text typ =
+    R.Var.make ~loc ~ghost:true ~implicit (ident text) typ
+  in
+  let owner = var "owner" and prior = var "prior" and x = var "x" in
+  let release = var "released" and published = var "published" in
+  let method_ text args =
+    R.Expr.call ~loc
+      (Qualified_name.raven ~loc (Qualified_name.of_string (family ^ "." ^ text)))
+      args
+  in
+  let own value release =
+    method_ "ownership" [ x; value; R.Expr.real ~loc 1.0; release ]
+  in
+  let seen lower =
+    Visibility_contract.seen ~loc ~module_name:Execution_contract.module_name owner lower
+  in
+  let context = Execution_contract.visibility_context ~loc owner in
+  let sum value = call Prelude.wrap [ bin Plus value (var "n") ] in
+  R.Member.callable
+    (R.Callable.proc ~loc ~atomic:true
+       ~formals:
+         [
+           ghost "owner" reference;
+           ghost "prior" view;
+           formal "x" reference;
+           formal "n" integer;
+           ghost ~implicit:true "v" integer;
+           ghost ~implicit:true "released" view;
+         ]
+       ~returns:[ formal "r" integer; ghost ~implicit:true "published" view ]
+       ~requires:
+         (List.map
+            [
+              context;
+              seen prior;
+              own (var "v") release;
+              call Prelude.in_range [ var "n" ];
+            ]
+            ~f:R.Spec.make)
+       ~ensures:
+         (List.map
+            [
+              context;
+              own (sum (var "v")) published;
+              bin Eq (var "r") (var "v");
+              seen prior;
+              seen release;
+              seen published;
+              bin Subseteq prior published;
+              bin Subseteq release published;
+            ]
+            ~f:R.Spec.make)
+       ~opens:(loc, []) (ident declaration_name)
+       (Some
+          [
+            R.Stmt.assign ~loc [ var "r" ] (R.Stmt.expr_rhs (method_ "get" [ owner; x ]));
+            R.Stmt.assign ~loc [ published ]
+              (R.Stmt.expr_rhs (method_ "set" [ owner; prior; x; sum (var "r") ]));
+          ]))

@@ -1,0 +1,94 @@
+// Mathematical positions isolate the cache protocol from machine-int wraparound.
+module CacheEvent: Library.Type {
+  rep type T = data {
+    case write(value: Int, after_publication: Bool, observed_head: Int)
+  }
+}
+
+module CacheWrites = PastWrites[CacheEvent]
+
+// The context identifies the publication cut for this history and executor.
+// This abstract read rule still requires a source-memory refinement argument.
+atomic proc sample_cache(history: Ref, executing: Ref, channel: Ref,
+    ghost events: Set[CacheEvent], ghost view: Set[Ref], ghost release: Set[Ref])
+  returns (event: CacheEvent)
+  requires ThreadContext.context(executing, view)
+    && ThreadContext.released(channel, history, release)
+    && CacheWrites.authority(history, events)
+    && (exists candidate: CacheEvent :: candidate in events
+      && (channel in view ==> candidate.after_publication))
+  ensures ThreadContext.context(executing, view)
+    && ThreadContext.released(channel, history, release)
+    && CacheWrites.authority(history, events)
+    && CacheWrites.observation(history, event)
+    && (channel in view ==> event.after_publication)
+{
+  havoc event;
+  assume event in events && (channel in view ==> event.after_publication);
+  CacheWrites.remember(history, events, event);
+}
+
+// Any certified bound stays conservative while the head advances.
+lemma advance_cache_bound(limit: Int, tail: Int, old_head: Int,
+    current_head: Int, cached: Int)
+  requires old_head <= current_head && 0 <= cached
+    && cached <= limit - (tail - old_head)
+  ensures 0 <= cached && cached <= limit - (tail - current_head)
+    && (0 < cached ==> tail - current_head < limit
+      && 0 <= cached - 1 && cached - 1 <= limit - ((tail + 1) - current_head))
+{
+}
+
+// A cache refresh based on an earlier head remains a lower bound as head advances.
+proc stale_positive_cache(limit: Int, tail: Int, refresh_head: Int, current_head: Int)
+  requires 0 < limit && tail - limit < refresh_head && refresh_head <= current_head
+    && current_head <= tail
+  opens ThreadContext.released
+{
+  val refreshed := limit - (tail - refresh_head);
+  val private_write := CacheEvent.write(limit + 1, false, 0);
+  val published_zero := CacheEvent.write(0, true, tail - limit);
+  val refreshed_write := CacheEvent.write(refreshed, true, refresh_head);
+  val history := CacheWrites.create(private_write);
+  CacheWrites.record(history, {private_write}, published_zero);
+  val events := {private_write, published_zero, refreshed_write};
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val channel := ThreadContext.publish(writer, history, {});
+  CacheWrites.record(history, {private_write, published_zero}, refreshed_write);
+  val acquired := ThreadContext.acquire(reader, channel, history, {}, {});
+  val observed := sample_cache(history, reader, channel, events, {channel}, {});
+  CacheWrites.reconcile(history, events, observed);
+  assert (observed.observed_head <= current_head && 0 <= observed.value
+    && observed.value <= limit - (tail - observed.observed_head));
+  advance_cache_bound(limit, tail, observed.observed_head, current_head, observed.value);
+  assert 0 <= observed.value && observed.value <= limit - (tail - current_head);
+  if (0 < observed.value) {
+    // A positive cache admits a push even if it is not the latest cache write.
+    assert tail - current_head < limit;
+    assert observed.value - 1 <= limit - ((tail + 1) - current_head);
+  }
+}
+
+// A zero cache is only a request to refresh; it does not prove that the queue is full.
+proc zero_cache_refresh()
+  opens ThreadContext.released
+{
+  val initial := CacheEvent.write(0, true, 4);
+  val refreshed := CacheEvent.write(3, true, 7);
+  val history := CacheWrites.create(initial);
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val channel := ThreadContext.publish(writer, history, {});
+  CacheWrites.record(history, {initial}, refreshed);
+  val acquired := ThreadContext.acquire(reader, channel, history, {}, {});
+  val observed := sample_cache(history, reader, channel, {initial, refreshed}, {channel}, {});
+  CacheWrites.reconcile(history, {initial, refreshed}, observed);
+  if (observed.value == 0) {
+    val limit := 4;
+    val tail := 8;
+    val acquired_head := 7;
+    val available := limit - (tail - acquired_head);
+    assert 0 < available;
+  }
+}

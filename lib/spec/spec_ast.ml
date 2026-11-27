@@ -33,11 +33,15 @@ type ghost_module = { ghost_module_name : id; ghost_module_interface : qualid }
 
 let rec qualid_loc = function Qid id -> id.pid_loc | Qdot (_, id) -> id.pid_loc
 
+type row_bound = Closed_row | Lower_row | Upper_row
+
 type pty =
+  | PTtyany
   | PTtyvar of id
   | PTtyapp of qualid * pty list
   | PTtuple of pty list
   | PTarrow of pty * pty
+  | PTvariant of row_bound * id list
 
 type labelled_arg = Lwild | Lunit of Location.t | Lvar of id | Lghost of id * pty
 type binder = id * pty option
@@ -72,7 +76,9 @@ and term_desc =
   | Tinfix of term * id * term
       (** A chain of infix operations, as [e1 < e2 < e3], until [chain] desugars it. *)
   | Tif of term * term * term
-  | Tquant of quant * binder list * term
+  | Tquant of quant * binder list * triggers * term
+      (** [forall x y [t1, t2 | t3]. body], with alternative triggers of one or more
+          terms. *)
   | Tcomprehension of (id * pty) * term
   | Tattr of string * term
   | Tlet of pat * term * term
@@ -82,6 +88,14 @@ and term_desc =
   | Trecord of term option * (id * term) list
       (** A record, [{ f = e; ... }], or one updating another, [{ r with f = e; ... }]. *)
   | Told of term
+
+and triggers = term list list
+
+let rec is_mask_wildcard term =
+  match term.term_desc with
+  | Tvar (Qid id) -> id.pid_str = "_"
+  | Tcast (term, _) -> is_mask_wildcard term
+  | _ -> false
 
 type header = { hd_name : id; hd_ret : labelled_arg list; hd_args : labelled_arg list }
 (** The header of a contract: [r = f x y], with ghost arguments in brackets. *)
@@ -100,6 +114,8 @@ type contract = {
       (** What holds atomically when the function linearizes by raising an exception:
           [atomic raises E -> t]. *)
   variant : term list;
+  opens : (Location.t * term list) option;
+      (** [None] infers the footprint; an explicit empty clause keeps it closed. *)
   pure : bool;
   continues : id option;
       (** The function whose atomic update a local function continues, [continues push]:
@@ -117,18 +133,29 @@ let empty_contract =
     raises = [];
     atomic_raises = [];
     variant = [];
+    opens = None;
     pure = false;
     continues = None;
   }
 
 type loop_spec = {
   invariants : term list;
-  state_invariants : (pat * term) list;
+  state_invariants : (pat list * term) list;
   loop_variant : term list;
   loop_raises : (pat * term option) list;
       (** What holds when the loop stops by raising an exception: [raises E x -> t]. *)
+  invariant_witnesses : (id * term) list;
+      (** The values that names the invariants bind take after each iteration:
+          [with { x = e }]. *)
 }
 (** The specification of a loop, written at the start of its body. *)
+
+type invariant_ancestry = {
+  ancestry_target : qualid;
+  ancestry_args : id list;
+  ancestry_loc : Location.t;
+}
+(** A private invariant's [[@within target args]] attribute, which declares its parent. *)
 
 type predicate = {
   pred_name : id;
@@ -137,8 +164,60 @@ type predicate = {
   pred_persistent : bool;
       (** An invariant declaration, duplicable and distinct from ordinary predicates. *)
   pred_inline : bool;  (** [[@inline]]: its uses are its body, never folded. *)
+  pred_ancestry : invariant_ancestry option;
 }
 (** A predicate, [predicate p (x : t) ... = body]. *)
+
+let ancestry_application ancestry =
+  let term term_desc = { term_desc; term_loc = ancestry.ancestry_loc } in
+  List.fold_left
+    (fun head argument -> term (Tapply (head, term (Tvar (Qid argument)))))
+    (term (Tvar ancestry.ancestry_target))
+    ancestry.ancestry_args
+
+let rec qualid_name = function
+  | Qid id -> id.pid_str
+  | Qdot (q, id) -> qualid_name q ^ "." ^ id.pid_str
+
+(** Whether the definition [child], declared within [ancestry], lies within [promise],
+    which its interface [declaration] states. The chain may pass only through invariants
+    for which [intermediate] returns a definition: those private to the implementation.
+    Arguments compare by their positions among the parameters. *)
+let keeps_promise ~intermediate ~declaration ~child ancestry promise =
+  let positions p ancestry =
+    List.map
+      (fun argument ->
+        let rec find index = function
+          | [] -> None
+          | (parameter, _) :: rest ->
+              if String.equal parameter.pid_str argument.pid_str then Some index
+              else find (index + 1) rest
+        in
+        find 0 p.pred_params)
+      ancestry.ancestry_args
+  in
+  let promised = positions declaration promise in
+  let rec walk visited steps current ancestry =
+    let target = qualid_name ancestry.ancestry_target in
+    let arguments =
+      List.map
+        (fun position ->
+          Option.bind position (fun index -> Option.join (List.nth_opt steps index)))
+        (positions current ancestry)
+    in
+    if String.equal target (qualid_name promise.ancestry_target) then
+      List.equal (Option.equal Int.equal) arguments promised
+    else if List.mem target visited then false
+    else
+      match intermediate target with
+      | Some ({ pred_ancestry = Some next; _ } as definition)
+        when List.length arguments = List.length definition.pred_params ->
+          walk (target :: visited) arguments definition next
+      | Some _ | None -> false
+  in
+  walk [ child.pred_name.pid_str ]
+    (List.init (List.length child.pred_params) Option.some)
+    child ancestry
 
 type state_field = {
   sf_name : id;
@@ -154,6 +233,8 @@ type ghost_stmt =
   | Fold of term
   | Unfold of term
   | Assert of term
+  | Cut of term
+      (** Proves its assertion, and verifies the rest from that assertion alone. *)
   | Fold_with of term * (id * term) list
   | Unfold_with of term * (id * term) list
   | Ghost_call of term
@@ -167,6 +248,7 @@ and proof_desc =
   | Proof_if of term * proof_expr * proof_expr
   | Proof_match of term * (pat * proof_expr) list
   | Proof_assert of term
+  | Proof_cut of term
   | Proof_fold of term * (id * term) list
   | Proof_unfold of term * id list
 
@@ -174,7 +256,15 @@ type initialization =
   | Initial_record of (id * term) list
   | Initial_let of pat * proof_expr * initialization
 
+type scope_mode =
+  | General_scope
+  | Frozen_scope
+  | Published_scope
+  | Release_scope
+  | Acquire_scope
+
 type access_scope = {
+  scope_mode : scope_mode;
   scope_operation : id;
   scope_state : pat option;
   scope_body : proof_expr;
@@ -194,11 +284,14 @@ type proof_module_parameter =
   | Proof_named_parameter of id * qualid
   | Proof_unit_parameter of Location.t
 
+type access_kind = Frozen | Relaxed
+
 (** The definition of a proof's type. *)
 type type_kind =
   | Variant of (id * pty list) list
   | Record of (id * pty) list
       (** A logical record, [type piece = { before : int list; next : node }]. *)
+  | Alias of pty
 
 (** The names that [p] binds. *)
 let rec pat_names (p : pat) =
@@ -208,11 +301,10 @@ let rec pat_names (p : pat) =
   | Ptuple ps -> List.concat_map pat_names ps
   | Pcast (p, _) | Pconstr (_, Some p) -> pat_names p
 
-(** A step of a proof outline: ghost code at a place in a function, written in the
-    [.proof] file as [at (anchor) step] or [on return e]. *)
+(** A step of a proof outline: ghost code at a place in a function, written in the [.mlp]
+    file as [at (anchor) step] or [on return e]. *)
 type outline_step =
   | At of {
-      anchor : term;  (** The code it follows, by its own names. *)
       anchor_loc : Location.t;
       action : step_action;
       action_loc : Location.t;
@@ -223,7 +315,8 @@ type outline_step =
   | Let of { pattern : pat; value : proof_expr }
       (** [let p = e in ...]: pure ghost code for the later steps, which run it where they
           use it. *)
-  | On_return of { return_loc : Location.t }  (** Ghost code when the function returns. *)
+  | On_return of { return_loc : Location.t; return_adapter : bool }
+      (** Ghost code when the function returns. *)
   | Initially of { initialization_loc : Location.t }
       (** The constructor's initial shared state. *)
   | Nested of outline  (** The outline of a local function. *)
@@ -232,7 +325,9 @@ type outline_step =
 and step_action =
   | Linearize  (** [commit], [returning p -> commit] or [performs a]. *)
   | Scope  (** A proof around the access or call, [(fun step -> e)]. *)
+  | Wrapped_scope  (** An explicit Ghost wrapper around an access or call. *)
   | Initializes  (** The ghost fields of an allocation, [initializes [...]]. *)
+  | Loop  (** An invariant at the first expression of a loop body. *)
 
 and outline = {
   outline_name : id;
@@ -265,18 +360,31 @@ type proof_decl =
   | Proof_definition of {
       module_name : id;
       module_interface : qualid;
+      module_constraints : (id list * id * pty) list;
       module_declarations : proof_decl list;
       module_outlines : outline list;
       module_loc : Location.t;
     }
   | Proof_predicate of predicate
-  | Proof_type of { type_name : id; type_params : id list; type_kind : type_kind }
+  | Proof_type of {
+      type_name : id;
+      type_params : id list;
+      type_kind : type_kind;
+      type_recursive : bool;
+    }
   | Proof_resource of {
       resource_name : id;
       resource_functor : qualid;
       resource_arguments : proof_module_argument list;
     }
   | Proof_au of { au_name : id; au_operation : qualid }
+  | Proof_task of { task_name : id; task_operation : qualid }
+  | Proof_access_field of {
+      access_name : id;
+      access_kind : access_kind;
+      access_owner : pat * pty;
+      access_selector : term;
+    }
   | Proof_field of { field_name : id; field_type : pty }
   | Proof_function of {
       function_name : id;
@@ -291,8 +399,11 @@ type proof_decl =
       lemma_params : (id * pty) list;
       lemma_returns : (id * pty) list;
       lemma_requires : term list;
-      lemma_ensures : term list;
+      lemma_ensures : (triggers * term) list;
+          (** Postconditions with their triggers, which only an auto lemma's have:
+              [ensures [t]. p]. *)
       lemma_variant : term list;
+      lemma_opens : (Location.t * term list) option;
       lemma_body : proof_expr;
     }
   | Proof_state of {
@@ -307,6 +418,7 @@ type proof_decl =
       inv_params : (id * pty) list;
       inv_state : id * pty;
       inv_body : term;
+      inv_ancestry : invariant_ancestry option;
     }
       (** The persistent predicate [inv_name], defined by the heap in terms of the state,
           [invariant is_stack (t : t) (s : state) = own t s.items]. *)
@@ -352,6 +464,10 @@ let mk_term t l = { term_desc = t; term_loc = l }
 
 (** The terms of a record: what it updates, if anything, then its field values. *)
 let record_terms base fields = Option.to_list base @ List.map snd fields
+
+(** The terms of postconditions with triggers, the triggers' included. *)
+let postcondition_terms ensures =
+  List.concat_map (fun (triggers, t) -> t :: List.concat triggers) ensures
 
 (** The application of the operator [op] to [args]. *)
 let mk_op_apply op args =

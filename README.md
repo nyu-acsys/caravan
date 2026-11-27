@@ -15,7 +15,7 @@ OCaml to [Raven](https://github.com/nyu-acsys/raven) and reports verification re
 at the OCaml source.
 
 Specifications are comments in `.ml` or `.mli` files. Detailed proofs can live in
-companion `.proof` files, keeping the executable code unchanged. Caravan supports
+companion `.mlp` files, keeping the executable code unchanged. Caravan supports
 both automatic invariant reasoning and explicit ghost proofs.
 Its specification syntax is loosely inspired by
 [Gospel](https://github.com/ocaml-gospel/gospel), extending and modifying it to
@@ -29,8 +29,12 @@ let increment value = value + 1
 ```
 
 Caravan is under active development. It supports a first-order subset of OCaml 5,
-including polymorphic functions, algebraic data types, records, modules and
-functors, mutable state, atomics, exceptions, and constant GADT witnesses.
+including polymorphic functions with labelled and optional arguments, algebraic
+data types, records, arrays, modules and functors with `open` and `include`,
+mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
+tasks, native mutexes and condition variables, exceptions, and GADTs with constant
+witnesses or constructor-set indices. Explicit frozen and relaxed field disciplines
+support [weak-memory reasoning](https://nyu-acsys.github.io/caravan/tutorial/weak-memory).
 See the [tutorial](https://nyu-acsys.github.io/caravan/tutorial/) for examples,
 [language coverage](https://nyu-acsys.github.io/caravan/tutorial/ocaml-subset), and
 [semantic conventions](https://nyu-acsys.github.io/caravan/tutorial/semantics).
@@ -58,9 +62,17 @@ underlying separation logic.
 The [Saturn case studies](test/saturn) include:
 
 - A [polymorphic Treiber stack](test/saturn/treiber_stack) and
-  [stack-drain clients](test/saturn/stack_drain).
+  [parallel stack-drain clients](test/saturn/stack_drain) using domains.
 - A [Michael–Scott queue with automatic history reasoning](test/saturn/michael_scott_queue).
 - The same queue with an [explicit segment proof](test/saturn/michael_scott_queue_lseg).
+- A [bounded queue](test/saturn/bounded_queue) with wrapping position counters and
+  snapshot helping.
+
+The [Moonpool Parker](test/moonpool/parker) uses a mutex and condition variable to
+implement a coalescing permit. The [OCaml 5 tutorial blocking stack](test/ocaml5_tutorial/blocking_stack)
+adds polymorphic LIFO contracts over mutex-protected mutable state. The
+[generic striped hash set](test/case_studies/generic_striped_hash_set) is a functor
+over its key type with lock-striped buckets and resizing.
 
 Smaller [verification examples](test/examples) illustrate individual proof patterns.
 See [test organization](test/README.md) for the full collection.
@@ -72,7 +84,7 @@ Caravan requires OCaml 5.5 and Raven's `raven-ivl.api` library. From a source ch
 ```bash
 opam switch create caravan 5.5.0
 eval $(opam env --switch=caravan)
-opam pin add raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
+opam pin add raven-ivl.1.7.0 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
 opam install . --deps-only --with-test
 dune build
 ```
@@ -82,6 +94,8 @@ Run `dune exec -- caravan example.ml` to use the local build.
 The [build guide](https://nyu-acsys.github.io/caravan/tutorial/#sec:build-from-source)
 also describes using a sibling Raven checkout.
 
-Run the regression tests with `dune runtest -j2` and check formatting with
-`dune build @fmt -j2`. See [extension development](vs-code/README.md) and
+Run the quick regression suite with `dune build @quick -j2`, the comprehensive suite
+with `dune runtest -j2`, and formatting checks with `dune build @fmt -j2`.
+See [test coverage](test/README.md#running-the-suites),
+[extension development](vs-code/README.md), and
 [site development](docs/README.md) for their separate build instructions.

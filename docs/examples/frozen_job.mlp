@@ -1,0 +1,48 @@
+module Total = Ghost.Frozen (struct let field (job : job) = job.total end)
+
+invariant identity (job : job) (id : int) = own job.id id
+
+proof result = create id total
+  ensures identity result id && Total.visible Ghost.self result total =
+  on return begin
+    Total.freeze job;
+    fold identity job id
+  end
+
+proof result = identifier job
+  requires identity job id
+  ensures identity job id && result === id =
+  at (job.id) (fun read ->
+    unfold identity job id;
+    let result = read () in
+    fold identity job id;
+    result)
+
+proof result = workload job
+  requires Total.visible Ghost.self job total
+  ensures Total.visible Ghost.self job total && result === total =
+  at (job.total) Ghost.frozen_scope (fun read -> let result = read () in result)
+
+module Reader = Ghost.Task (struct let operation = workload end)
+
+proof result = client total ensures result === total = ()
+
+proof channel, [published : Ghost.t set] = publish [total : int] job
+  requires Total.visible Ghost.self job total
+  ensures Total.visible Ghost.self job total && Total.covered published job total &&
+    own ~release:published channel 1 =
+  at (Atomic.make 1) Ghost.State.release_scope (fun make () ->
+    let published = Total.release job in
+    let channel = make published in
+    (channel, published));
+  on return Ghost.returns (fun channel published -> published)
+
+proof result = receive [total : int] [published : Ghost.t set] channel job
+  requires Total.covered published job total && own ~release:published channel 1
+  ensures Total.visible Ghost.self job total && own ~release:published channel 1 &&
+    result === total =
+  at (Atomic.get channel) Ghost.acquire_scope (fun acquire ->
+    let result = acquire published in
+    Total.observe job published;
+    result);
+  at (job.total) Ghost.frozen_scope (fun read -> let result = read () in result)

@@ -11,7 +11,7 @@ let safe_incr x = x + 1
     requires x < 4611686018427387903
     ensures r = x + 1 *)
 
-(* These fail: each may overflow, and div may divide by zero. *)
+(* Arithmetic wraps; division still requires a nonzero divisor. *)
 
 let incr x = x + 1
 let div x y = x / y

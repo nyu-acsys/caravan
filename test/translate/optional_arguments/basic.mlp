@@ -1,0 +1,16 @@
+proof result = supplied value token ensures (result === value) = ()
+proof result = choose value token
+  ensures (result === (match value with None -> 42 | Some v -> v)) = ()
+proof result = forward value token
+  ensures (result === (match value with None -> 42 | Some v -> v)) = ()
+proof result = fallback first value token
+  ensures (result === (match value with None -> first | Some v -> v)) = ()
+proof result = chained first second token
+  requires (match (first, second) with (Some v, None) -> v < max_int | _ -> true)
+  ensures (result === ((match first with None -> 1 | Some v -> v),
+    (match second with Some v -> v | None -> (match first with None -> 2 | Some v -> v + 1)))) = ()
+proof result = pair pair token
+  ensures (result === (match pair with None -> (1, 2) | Some p -> p)) = ()
+proof result = maximum () ensures (result = max_int) = ()
+proof result = minimum () ensures (result = min_int) = ()
+proof client () = ()

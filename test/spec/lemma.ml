@@ -17,6 +17,10 @@ let parse_ghost_module source =
   let lexbuf = Lexing.from_string source in
   Spec_parser.ghost_module_declaration Spec_lexer.token lexbuf
 
+let parse_invariant_declaration source =
+  let lexbuf = Lexing.from_string source in
+  Spec_parser.invariant_declaration Spec_lexer.token lexbuf
+
 let rec proof_kinds expr =
   match expr.proof_desc with
   | Proof_value _ -> [ "value" ]
@@ -26,6 +30,7 @@ let rec proof_kinds expr =
   | Proof_match (_, cases) ->
       "match" :: List.concat_map (fun (_, body) -> proof_kinds body) cases
   | Proof_assert _ -> [ "assert" ]
+  | Proof_cut _ -> [ "cut" ]
   | Proof_fold (_, witnesses) ->
       [ (if witnesses = [] then "fold" else "fold with witnesses") ]
   | Proof_unfold (_, names) -> [ (if names = [] then "unfold" else "unfold with names") ]
@@ -311,8 +316,27 @@ let () =
     | exception Spec_parser.Error -> ()
     | exception Spec_ast.Syntax_error _ -> ()
   in
+  begin match
+    parse_proof
+      {|module Job = Ghost.Task (struct let operation = Worker.run end)
+        module Update = Ghost.AU (struct let operation = update end)|}
+  with
+  | [
+   Proof_task { task_name; task_operation = Qdot (Qid worker, operation) };
+   Proof_au { au_name; au_operation = Qid update };
+  ] ->
+      assert (task_name.pid_str = "Job");
+      assert (worker.pid_str = "Worker");
+      assert (operation.pid_str = "run");
+      assert (au_name.pid_str = "Update");
+      assert (update.pid_str = "update")
+  | _ -> failwith "operation facades were not parsed"
+  end;
   List.iter rejected
     [
+      "module Job = Ghost.Task (struct let worker = run end)";
+      "module Job = Other.Task (struct let operation = run end)";
+      "module Update = Ghost.AU (struct let worker = update end)";
       "module Facts = SetRA (struct type element = int end)";
       "let facts : (int, Authority.t) Ghost.field = Other.field ()";
       "let facts : int = Ghost.field ()";
@@ -321,3 +345,148 @@ let () =
       "let facts_of (x : int) : int set = Set.of_predicate (fun f -> f = x)";
       "lemma arbitrary_lambda = fun (x : int) -> x";
     ]
+
+let () =
+  let loop source = Spec_parser.loop_spec Spec_lexer.token (Lexing.from_string source) in
+  let state = loop "invariant (fun saved -> saved = 0)" in
+  assert (List.length state.state_invariants = 1);
+  assert (state.invariants = []);
+  let ordinary = loop "invariant true" in
+  assert (ordinary.state_invariants = []);
+  assert (List.length ordinary.invariants = 1);
+  let fold = loop "invariant (fun (sum, count) remaining -> count >= 0)" in
+  assert (List.length (fst (List.hd fold.state_invariants)) = 2);
+  let saved = loop "invariant (fun accumulator remaining saved -> saved = 0)" in
+  assert (List.length (fst (List.hd saved.state_invariants)) = 3)
+
+let () =
+  begin match
+    parse_proof
+      "invariant [@within Shared.Table.is_set s k'] tabled (s : t) (k' : int) (n : int) \
+       = true"
+  with
+  | [
+   Proof_invariant
+     {
+       inv_name = { pid_str = "tabled"; _ };
+       inv_ancestry =
+         Some
+           {
+             ancestry_target =
+               Qdot
+                 ( Qdot (Qid { pid_str = "Shared"; _ }, { pid_str = "Table"; _ }),
+                   { pid_str = "is_set"; _ } );
+             ancestry_args = [ { pid_str = "s"; _ }; { pid_str = "k'"; _ } ];
+             _;
+           };
+       _;
+     };
+  ] ->
+      ()
+  | _ -> failwith "proof invariant parent was not parsed"
+  end;
+  begin match parse_proof "invariant [@within root] child (x : int) = true" with
+  | [ Proof_invariant { inv_ancestry = Some { ancestry_args = []; _ }; _ } ] -> ()
+  | _ -> failwith "invariant ancestry with zero arguments was not parsed"
+  end;
+  List.iter
+    (fun (attribute, message) ->
+      match parse_proof ("invariant " ^ attribute ^ " child (x : int) = true") with
+      | exception Syntax_error (_, actual) when actual = message -> ()
+      | _ -> failwith ("expected an invariant ancestry syntax error for " ^ attribute))
+    [
+      ("[@inline]", "An invariant's attribute is [@within ...]");
+      ("[@parent root x]", "An invariant's attribute is [@within ...]");
+      ("[@within]", "An invariant ancestry attribute needs a qualified invariant name");
+      ( "[@within Shared..root]",
+        "An invariant ancestry attribute needs a qualified invariant name" );
+      ("[@within root x.field]", "Invariant ancestry arguments must be parameter names");
+    ];
+  begin match parse_invariant_declaration "invariant [@within root x] child (x : t)" with
+  | { pred_ancestry = Some { ancestry_target = Qid { pid_str = "root"; _ }; _ }; _ } -> ()
+  | _ -> failwith "an interface invariant's ancestry was not parsed"
+  end;
+  begin match
+    parse_invariant_declaration "invariant [@within Other.root x] child (x : t)"
+  with
+  | exception
+      Syntax_error
+        ( _,
+          "An interface invariant can be declared only within an invariant of the same \
+           interface" ) ->
+      ()
+  | _ -> failwith "an interface invariant within another interface was accepted"
+  end
+
+let () =
+  begin match
+    parse_proof
+      {|lemma inferred = ()
+      lemma closed opens {} = ()
+      lemma opened (x : int) opens { cell x _; Other.state; } = ()|}
+  with
+  | [ Proof_lemma inferred; Proof_lemma closed; Proof_lemma opened ] ->
+      assert (inferred.lemma_opens = None);
+      begin match closed.lemma_opens with
+      | Some (_, []) -> ()
+      | _ -> failwith "empty opens clause was not retained"
+      end;
+      begin match opened.lemma_opens with
+      | Some (_, [ _; _ ]) -> ()
+      | _ -> failwith "opens entries were not retained"
+      end
+  | _ -> failwith "unexpected opens declarations"
+  end;
+  begin match parse_proof "lemma repeated opens {} opens {} = ()" with
+  | exception Syntax_error (_, "A lemma has at most one opens clause") -> ()
+  | _ -> failwith "repeated opens clauses were accepted"
+  end
+
+let () =
+  begin match parse_proof "lemma invalid opens { cell _ x } = ()" with
+  | exception Syntax_error (_, "Wildcards in an opens entry must be trailing") -> ()
+  | _ -> failwith "nontrailing opens wildcard was accepted"
+  end
+
+(* An auto lemma's postcondition carries alternative triggers, each of one or more terms. *)
+let () =
+  match
+    parse_proof
+      "lemma [@auto] l (x : int) ensures [f x | g x, h x]. (f x = g x) ensures (h x = 0) \
+       = ()"
+  with
+  | [ Proof_lemma { lemma_ensures = [ ([ [ _ ]; [ _; _ ] ], _); ([], _) ]; _ } ] -> ()
+  | _ -> failwith "lemma triggers were not parsed"
+
+(* Brackets are triggers only before a dot, wherever whitespace falls; otherwise a list. *)
+let () =
+  begin match
+    parse_proof "lemma [@auto] l (x : int list) ensures [f x] . f x === x = ()"
+  with
+  | [ Proof_lemma { lemma_ensures = [ ([ [ _ ] ], _) ]; _ } ] -> ()
+  | _ -> failwith "spaced lemma trigger was not parsed"
+  end;
+  begin match parse_proof "lemma l (x : int list) ensures [x; x] === x @ x = ()" with
+  | [ Proof_lemma { lemma_ensures = [ ([], _) ]; _ } ] -> ()
+  | _ -> failwith "postcondition starting with a list literal was not parsed"
+  end;
+  begin match parse_proof "lemma [@auto] l (x : int) ensures [f x; g x]. f x = ()" with
+  | exception Syntax_error (_, "Triggers are separated by , and alternatives by |") -> ()
+  | _ -> failwith "semicolon between triggers was accepted"
+  end;
+  match parse_proof "lemma l (x : int) ensures [x, x] === [] = ()" with
+  | exception Syntax_error (_, "A list literal separates its elements with ;") -> ()
+  | _ -> failwith "comma in a list literal was accepted"
+
+let () =
+  begin match parse_proof "lemma typed opens {cell (_ : int)} = ()" with
+  | [ Proof_lemma { lemma_opens = Some (_, [ entry ]); _ } ] ->
+      begin match entry.term_desc with
+      | Tapply (_, wildcard) -> assert (is_mask_wildcard wildcard)
+      | _ -> failwith "typed mask selector was not parsed"
+      end
+  | _ -> failwith "typed mask selector was not retained"
+  end;
+  match parse_proof "lemma invalid (x : int) opens {cell (_ : int) x} = ()" with
+  | exception Syntax_error (_, "Wildcards in an opens entry must be trailing") -> ()
+  | _ -> failwith "nontrailing typed wildcard was accepted"

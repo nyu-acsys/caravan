@@ -42,8 +42,9 @@ let predicate_parameters ?(expand = Fn.id) ~lookup ~bound terms =
           collect bound term
       | Tif (condition, yes, no) ->
           List.concat_map [ condition; yes; no ] ~f:(collect bound)
-      | Tquant (_, binders, body) ->
-          collect (List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound) body
+      | Tquant (_, binders, triggers, body) ->
+          let bound = List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound in
+          List.concat_map (body :: List.concat triggers) ~f:(collect bound)
       | Tcomprehension ((id, _), body) -> collect (id.pid_str :: bound) body
       | Tlet (pattern, rhs, body) ->
           collect bound rhs @ collect (Source.logical_pattern_names pattern @ bound) body

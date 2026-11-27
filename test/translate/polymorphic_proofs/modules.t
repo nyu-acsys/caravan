@@ -19,7 +19,7 @@ Module-qualified predicates retain the relation between their location and paylo
 
   $ mkdir bad_cells
   $ cp modules.ml bad_cells/
-  $ sed 's/ensures (cell location value)/ensures (cell location true)/' modules.proof > bad_cells/modules.proof
+  $ sed 's/ensures (cell location value)/ensures (cell location true)/' modules.mlp > bad_cells/modules.mlp
   $ caravan --shh bad_cells/modules.ml > bad_cells.out 2>&1
   [1]
   $ grep -Eq 'Type Error:|Unsupported Error: This polymorphic function occurrence or signature alias is not supported yet' bad_cells.out

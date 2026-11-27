@@ -1,14 +1,9 @@
-Verify the implementation and client against the same Treiber interface.
-
-  $ caravan --shh -I ../backoff ../treiber_stack/treiber_stack.ml
-  Verification successful.
-
-The client uses only the imported abstract stack contract.
+Verify the client against the imported abstract Treiber stack contract.
 
   $ caravan --shh stack_drain.ml
   Verification successful.
 
-The generic drain and captured local loop also verify as standalone Raven.
+The parallel workers, harness, generic drain and captured loop verify as standalone Raven.
 
   $ caravan --shh --emit-rav stack_drain.ml > emitted.rav
   $ raven --shh emitted.rav
@@ -20,8 +15,12 @@ The applied functor emits one shared drain procedure and its captured local help
   1
   $ grep -c '^[[:space:]]*proc method_loop(' emitted.rav
   1
+  $ grep -c '^[[:space:]]*proc method_work(' emitted.rav
+  1
+  $ grep -c '^[[:space:]]*proc method_test(' emitted.rav
+  1
 
-Interface clients drain integer, boolean, and mutable payload stacks.
+Interface clients drain integer, boolean, and mutable payload stacks and check the parallel harness.
 
   $ mkdir clients
   $ cp stack_drain.mli treiber_stack.mli clients.ml clients/

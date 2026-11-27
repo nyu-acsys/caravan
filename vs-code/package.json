@@ -44,7 +44,7 @@
       {"command": "caravan.showVerifierVersion", "title": "Caravan: Show Verifier Version"},
       {"command": "caravan.useBundledVerifier", "title": "Caravan: Use Bundled Verifier"}
     ],
-    "languages": [{"id": "caravan-proof", "aliases": ["Caravan Proof"], "extensions": [".proof"], "configuration": "./language-configuration.json"}],
+    "languages": [{"id": "caravan-proof", "aliases": ["Caravan Proof"], "extensions": [".mlp", ".proof"], "configuration": "./language-configuration.json"}],
     "grammars": [
       {"language": "caravan-proof", "scopeName": "source.caravan.proof", "path": "./syntaxes/proof.tmLanguage.json"},
       {"scopeName": "source.caravan.spec", "path": "./syntaxes/spec.tmLanguage.json"},

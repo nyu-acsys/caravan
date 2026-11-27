@@ -1,0 +1,1 @@
+module Value = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)

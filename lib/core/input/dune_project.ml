@@ -345,11 +345,18 @@ let rec remove_tree path =
         (fun name -> remove_tree (Stdlib.Filename.concat path name))
         (Stdlib.Sys.readdir path);
       Unix.rmdir path
-  | Unix.S_REG | Unix.S_CHR | Unix.S_BLK | Unix.S_LNK | Unix.S_FIFO | Unix.S_SOCK ->
+  | Unix.S_REG ->
+      (* Windows does not delete the read-only files Dune leaves in its build directory. *)
+      if Stdlib.Sys.win32 then Unix.chmod path 0o600;
       Unix.unlink path
+  | Unix.S_CHR | Unix.S_BLK | Unix.S_LNK | Unix.S_FIFO | Unix.S_SOCK -> Unix.unlink path
 
 let describe ~root executable =
-  let query_dir = Stdlib.Filename.temp_dir ~perms:0o700 "caravan-dune-" "" in
+  (* Dune's RPC socket lives in the build directory, and socket paths are short. *)
+  let temp_dir =
+    if (not Stdlib.Sys.win32) && Stdlib.Sys.file_exists "/tmp" then Some "/tmp" else None
+  in
+  let query_dir = Stdlib.Filename.temp_dir ?temp_dir ~perms:0o700 "caravan-dune-" "" in
   Stdlib.Fun.protect
     ~finally:(fun () -> remove_tree query_dir)
     (fun () ->
@@ -460,8 +467,12 @@ let resolve ~file : (t, Report.error) Result.t =
                   else [])
             in
             let proof_candidates =
-              List.map interfaces ~f:(fun interface ->
-                  Stdlib.Filename.remove_extension interface ^ ".proof")
+              List.concat_map interfaces ~f:(fun interface ->
+                  let stem = Stdlib.Filename.remove_extension interface in
+                  [
+                    stem ^ Source_core.proof_extension;
+                    stem ^ Source_core.legacy_proof_extension;
+                  ])
             in
             Ok
               {

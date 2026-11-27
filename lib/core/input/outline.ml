@@ -1,4 +1,4 @@
-(** Proof outlines: the proofs of functions in the [.proof] file, as steps at places in
+(** Proof outlines: the proofs of functions in the [.mlp] file, as steps at places in
     their code. Each step becomes the annotation it stands for, at its place. *)
 
 open Base
@@ -14,6 +14,7 @@ type definition = {
   cases : bool;  (** Written with [function], whose argument a contract names. *)
   path : string list;  (** The modules it is in. *)
   body : Parsetree.expression;
+  defaults : Parsetree.expression list;
   at : Location.t;
 }
 (** A function of the program: its name, parameter names, and body. *)
@@ -45,10 +46,33 @@ let rec function_of (e : Parsetree.expression) =
   | Pexp_newtype (_, e) | Pexp_constraint (e, _) -> function_of e
   | _ -> ([], false, e)
 
+(** Defaults outside the extracted body are separate conditional proof regions. *)
+let rec defaults_of (expression : Parsetree.expression) =
+  match expression.pexp_desc with
+  | Pexp_function (parameters, _, Pfunction_body body) ->
+      List.filter_map parameters ~f:(fun parameter ->
+          match parameter.Parsetree.pparam_desc with
+          | Pparam_val (_, default, _) -> default
+          | Pparam_newtype _ -> None)
+      @ defaults_of body
+  | Pexp_newtype (_, expression) | Pexp_constraint (expression, _) ->
+      defaults_of expression
+  | _ -> []
+
+let code_roots definition = definition.defaults @ [ definition.body ]
+
 let definition ~path (binding : Parsetree.value_binding) =
   Option.map (pattern_name binding.pvb_pat) ~f:(fun name ->
       let parameters, cases, body = function_of binding.pvb_expr in
-      { name; parameters; cases; path; body; at = binding.pvb_loc })
+      {
+        name;
+        parameters;
+        cases;
+        path;
+        body;
+        defaults = defaults_of binding.pvb_expr;
+        at = binding.pvb_loc;
+      })
 
 (** The functions that [structure] defines, in its modules and functors too. *)
 let rec definitions ?(path = []) (structure : Parsetree.structure) =
@@ -122,8 +146,41 @@ let rec matches (a : Parsetree.expression) (e : Parsetree.expression) =
         List.length a = List.length e
         && List.for_all2_exn a e ~f:(fun (la, a) (le, e) ->
             Poly.equal la le && matches a e)
+    | Pexp_record (a, abase), Pexp_record (e, ebase) ->
+        Option.equal matches abase ebase
+        && List.equal
+             (fun (la, a) (le, e) ->
+               Poly.equal
+                 (Longident.flatten la.Location.txt)
+                 (Longident.flatten le.Location.txt)
+               && matches a e)
+             a e
+    | ( Pexp_function (left, _, Pfunction_body left_body),
+        Pexp_function (right, _, Pfunction_body right_body) ) ->
+        let same_parameter (left : Parsetree.function_param)
+            (right : Parsetree.function_param) =
+          match (left.pparam_desc, right.pparam_desc) with
+          | ( Pparam_val (left_label, left_default, left_pattern),
+              Pparam_val (right_label, right_default, right_pattern) ) ->
+              Poly.equal left_label right_label
+              && Option.equal matches left_default right_default
+              && String.equal
+                   (Stdlib.Format.asprintf "%a" Pprintast.pattern left_pattern)
+                   (Stdlib.Format.asprintf "%a" Pprintast.pattern right_pattern)
+          | Pparam_newtype left, Pparam_newtype right -> String.equal left.txt right.txt
+          | _ -> false
+        in
+        List.equal same_parameter left right
+        && (matches left_body right_body
+           || String.equal
+                (Stdlib.Format.asprintf "%a" Pprintast.expression left_body)
+                (Stdlib.Format.asprintf "%a" Pprintast.expression right_body))
     | Pexp_field (a, fa), Pexp_field (e, fe) ->
         Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt) && matches a e
+    | Pexp_setfield (a, fa, va), Pexp_setfield (e, fe, ve) ->
+        Poly.equal (Longident.flatten fa.txt) (Longident.flatten fe.txt)
+        && matches a e && matches va ve
+    | Pexp_sequence (a, b), Pexp_sequence (e, f) -> matches a e && matches b f
     | Pexp_constraint (a, _), _ -> matches a e
     | _, Pexp_constraint (e, _) -> matches a e
     | _ -> false
@@ -200,7 +257,7 @@ let step_end (e : Parsetree.expression) =
     subexpressions, by location: branches, loop bodies, functions, and right operands of
     [&&] and [||]. An expression runs whenever another does if its regions are among the
     other's. *)
-let regions (body : Parsetree.expression) =
+let regions ?(inside = []) (body : Parsetree.expression) =
   let found = ref [] in
   let rec visit regions (e : Parsetree.expression) =
     found :=
@@ -229,14 +286,31 @@ let regions (body : Parsetree.expression) =
           [ (_, a); (_, b) ] ) ->
         visit regions a;
         visit (region 1) b
-    | Pexp_function _ | Pexp_lazy _ -> children (region 0) e
+    | Pexp_function (parameters, _, _) ->
+        let defaults =
+          List.filter_map parameters ~f:(fun parameter ->
+              match parameter.Parsetree.pparam_desc with
+              | Pparam_val (_, default, _) -> default
+              | Pparam_newtype _ -> None)
+        in
+        children ~defaults (region 0) e
+    | Pexp_lazy _ -> children (region 0) e
     | _ -> children regions e
-  and children regions e =
-    let expr _ e = visit regions e in
+  and children ?(defaults = []) regions e =
+    let expr _ e =
+      let regions =
+        if
+          List.exists defaults ~f:(fun default ->
+              Poly.equal default.Parsetree.pexp_loc e.Parsetree.pexp_loc)
+        then (e.pexp_loc.loc_start.pos_cnum, 1) :: regions
+        else regions
+      in
+      visit regions e
+    in
     let iterator = { Ast_iterator.default_iterator with expr } in
     Ast_iterator.default_iterator.expr iterator e
   in
-  visit [] body;
+  visit inside body;
   !found
 
 let regions_of regions (e : Parsetree.expression) =
@@ -265,14 +339,40 @@ let within (outer : Location.t) (inner : Location.t) =
   outer.loc_start.pos_cnum <= inner.loc_start.pos_cnum
   && inner.loc_end.pos_cnum <= outer.loc_end.pos_cnum
 
+(** An OCaml attribute selects one of several identical source expressions. *)
+let anchor_occurrence (anchor : Parsetree.expression) =
+  let attributes =
+    List.filter anchor.pexp_attributes ~f:(fun attribute ->
+        String.equal attribute.Parsetree.attr_name.txt "occurrence")
+  in
+  match attributes with
+  | [] -> Ok None
+  | [ attribute ] ->
+      begin match attribute.attr_payload with
+      | PStr
+          [ { pstr_desc = Pstr_eval ({ pexp_desc = Pexp_constant constant; _ }, _); _ } ]
+        ->
+          begin match constant.pconst_desc with
+          | Pconst_integer (text, None) ->
+              begin match Int.of_string_opt text with
+              | Some index when index > 0 -> Ok (Some index)
+              | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+              end
+          | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+          end
+      | _ -> error attribute.attr_loc "An anchor occurrence is a positive integer"
+      end
+  | _ -> error anchor.pexp_loc "An anchor has at most one occurrence attribute"
+
 (** The code of the step's anchor in [definition]'s body, after [previous], outside the
     local functions with outlines of their own, [excluded]. *)
 let anchor_place ~proof_text definition ~excluded ~previous (anchor_loc : Location.t) =
   let* name, anchor = anchor_expression ~proof_text anchor_loc in
+  let* occurrence = anchor_occurrence anchor in
   let code =
     match name with
-    | None -> subexpressions definition.body
-    | Some name -> bound_to name definition.body
+    | None -> List.concat_map (code_roots definition) ~f:subexpressions
+    | Some name -> List.concat_map (code_roots definition) ~f:(bound_to name)
   in
   let candidates =
     List.filter code ~f:(fun e ->
@@ -280,17 +380,34 @@ let anchor_place ~proof_text definition ~excluded ~previous (anchor_loc : Locati
         && (not (List.exists excluded ~f:(fun at -> within at e.pexp_loc)))
         && matches anchor e)
   in
-  match candidates with
-  | [ e ] -> Ok e
-  | [] ->
-      error anchor_loc
-        (Printf.sprintf "This anchor matches no code of %s after the previous step"
-           definition.name)
-  | candidates ->
-      error anchor_loc
-        (Printf.sprintf "This anchor matches %d places of %s, at %s"
-           (List.length candidates) definition.name
-           (String.concat ~sep:", " (List.map candidates ~f:(fun e -> place e.pexp_loc))))
+  let candidates =
+    List.sort candidates ~compare:(fun left right ->
+        Int.compare left.Parsetree.pexp_loc.loc_start.pos_cnum
+          right.Parsetree.pexp_loc.loc_start.pos_cnum)
+  in
+  match occurrence with
+  | Some index ->
+      begin match List.nth candidates (index - 1) with
+      | Some expression -> Ok expression
+      | None ->
+          error anchor_loc
+            (Printf.sprintf
+               "This anchor has %d remaining matches, so occurrence %d does not exist"
+               (List.length candidates) index)
+      end
+  | None -> (
+      match candidates with
+      | [ e ] -> Ok e
+      | [] ->
+          error anchor_loc
+            (Printf.sprintf "This anchor matches no code of %s after the previous step"
+               definition.name)
+      | candidates ->
+          error anchor_loc
+            (Printf.sprintf "This anchor matches %d places of %s, at %s"
+               (List.length candidates) definition.name
+               (String.concat ~sep:", "
+                  (List.map candidates ~f:(fun e -> place e.pexp_loc)))))
 
 (** The function that [outline] proves: the one of its name, or, if several have it, the
     one whose parameters its header names. A header's contract may rename the parameters
@@ -345,6 +462,18 @@ type binding =
 let binding_names = function
   | Export { pattern; _ } | Pure { pattern; _ } -> S.pat_names pattern
 
+(** The names that the witnesses of a loop step's invariants bind. *)
+let loop_witness_names text =
+  let text = Option.value (String.chop_prefix text ~prefix:"invariant") ~default:text in
+  match
+    Spec_parser.loop_spec Spec_lexer.token (Lexing.from_string ("invariant" ^ text))
+  with
+  | spec -> List.map spec.invariant_witnesses ~f:(fun (name, _) -> name.S.pid_str)
+  | exception _ -> []
+
+(** The key under which a loop step at [key] exports the witness [name]. *)
+let loop_witness_key key name = key ^ "." ^ name
+
 (** The bindings of [visible] that a step, at code with [regions] ending at [place], uses
     in [text], with those that the pure ones use; an export it uses must run whenever the
     step does. *)
@@ -364,7 +493,8 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
         match b with
         | Export { code; code_regions; pattern; _ }
           when not
-                 (List.is_prefix regions ~prefix:code_regions ~equal:Poly.equal
+                 (List.is_prefix (List.rev regions) ~prefix:(List.rev code_regions)
+                    ~equal:Poly.equal
                  && (step_end code).pos_cnum <= place) ->
             error step_loc
               (Printf.sprintf
@@ -377,6 +507,7 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
   let in_order = List.filter visible ~f:(fun b -> List.mem used b ~equal:phys_equal) in
   Ok
     {
+      Annotation.target = None;
       Annotation.export = None;
       imports =
         List.filter_map in_order ~f:(function
@@ -386,6 +517,7 @@ let uses ~(visible : binding list) ~step_loc ~regions ~place text =
         List.filter_map (List.rev in_order) ~f:(function
           | Pure { pattern; value; _ } -> Some (pattern, value)
           | Export _ -> None);
+      body_imports = [];
     }
 
 (** [text], written at [origin] after a [prefix] that the outline does not write, as an
@@ -404,12 +536,50 @@ let synthesized ?(prefix = "") ?outline ~proof_text ~(origin : Location.t) posit
     outline;
   }
 
+(** The loop whose first executed expression is [code]. *)
+let loop_body definition (code : Parsetree.expression) ~at =
+  let rec first (expression : Parsetree.expression) =
+    match expression.pexp_desc with
+    | Pexp_sequence (before, _) | Pexp_constraint (before, _) -> first before
+    | Pexp_let (_, [ binding ], _) -> first binding.pvb_expr
+    | _ -> expression
+  in
+  let bodies =
+    List.filter_map
+      (List.concat_map (code_roots definition) ~f:subexpressions)
+      ~f:(fun expression ->
+        match expression.pexp_desc with
+        | (Pexp_while (_, body) | Pexp_for (_, _, _, _, body))
+          when Poly.equal (first body).pexp_loc code.pexp_loc ->
+            Some body
+        | Pexp_apply
+            ( {
+                pexp_desc =
+                  Pexp_ident
+                    { txt = Lident "fold_left" | Ldot (_, { txt = "fold_left"; _ }); _ };
+                _;
+              },
+              [ (_, callback); _; _ ] ) ->
+            begin match callback.pexp_desc with
+            | Pexp_function (_, _, Pfunction_body body)
+              when Poly.equal expression.pexp_loc code.pexp_loc
+                   || Poly.equal (first body).pexp_loc code.pexp_loc ->
+                Some body
+            | _ -> None
+            end
+        | _ -> None)
+  in
+  match bodies with
+  | [ body ] -> Ok body
+  | [] -> error at "A loop invariant anchors the first expression of its loop body"
+  | _ -> error at "This loop invariant anchor selects more than one loop"
+
 (** The annotations that [outline]'s steps stand for: each step's at its place, and its
     contract and whether its proof is manual after the function. Steps other than
     linearizations make it manual. *)
 let rec outline_annotations ~proof_text definitions (outline : S.outline) =
   let* definition = definition_of definitions outline in
-  let locals = local_definitions definition.body in
+  let locals = List.concat_map (code_roots definition) ~f:local_definitions in
   let nested =
     List.filter_map outline.outline_steps ~f:(function S.Nested o -> Some o | _ -> None)
   in
@@ -421,12 +591,18 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
       (List.map nested ~f:(fun o ->
            Result.map (definition_of locals o) ~f:(fun d -> d.at)))
   in
-  let regions = regions definition.body in
+  let regions =
+    regions definition.body
+    @ List.concat_map definition.defaults ~f:(fun default ->
+        regions ~inside:[ (default.pexp_loc.loc_start.pos_cnum, 0) ] default)
+  in
   let shadow visible names =
     List.filter visible ~f:(fun b ->
         not (List.exists (binding_names b) ~f:(List.mem names ~equal:String.equal)))
   in
-  let* _, _, annotations =
+  (* The loops whose witnesses may use the exports of steps in their bodies. *)
+  let loops = ref [] in
+  let* _, final_visible, annotations =
     List.fold_result outline.outline_steps ~init:(-1, [], [])
       ~f:(fun (previous, visible, annotations) step ->
         match step with
@@ -434,9 +610,28 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let* code =
               anchor_place ~proof_text definition ~excluded ~previous anchor_loc
             in
-            let place = step_end code in
+            let* body =
+              match action with
+              | Loop ->
+                  let* body = loop_body definition code ~at:anchor_loc in
+                  loops :=
+                    ( action_loc,
+                      body,
+                      regions_of regions code,
+                      Printf.sprintf "%d" action_loc.loc_start.pos_cnum )
+                    :: !loops;
+                  Ok (Some body)
+              | Linearize | Initializes | Scope | Wrapped_scope -> Ok None
+            in
+            let place =
+              Option.value_map body ~default:(step_end code) ~f:(fun body ->
+                  body.pexp_loc.loc_start)
+            in
             let prefix =
-              match action with Linearize | Initializes -> "" | Scope -> "Ghost.scope "
+              match action with
+              | Linearize | Initializes | Loop -> ""
+              | Scope -> "Ghost.scope "
+              | Wrapped_scope -> ""
             in
             let* context =
               uses ~visible ~step_loc:action_loc ~regions:(regions_of regions code)
@@ -446,13 +641,19 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             let* export =
               match (export, action) with
               | None, _ -> Ok None
-              | Some pattern, Scope -> Ok (Some (key, pattern))
+              | Some pattern, (Scope | Wrapped_scope) -> Ok (Some (key, pattern))
               | Some pattern, _ ->
                   error pattern.pat_loc "Only a scope (fun step -> e) exports a value"
             in
             let annotation =
-              synthesized ~prefix ~outline:{ context with export } ~proof_text
-                ~origin:action_loc place
+              let target =
+                match action with
+                | Scope | Wrapped_scope | Loop -> Some code.pexp_loc
+                | Linearize | Initializes -> None
+              in
+              synthesized ~prefix
+                ~outline:{ context with target; export }
+                ~proof_text ~origin:action_loc place
             in
             let visible =
               match export with
@@ -461,15 +662,45 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
                   Export { key; pattern; code; code_regions = regions_of regions code }
                   :: shadow visible (S.pat_names pattern)
             in
-            Ok (place.pos_cnum, visible, annotation :: annotations)
-        | On_return { return_loc } ->
+            (* The names a loop invariant's witnesses bind are available in the loop's body,
+               with their values at the start of the iteration, and after the loop. *)
+            let visible =
+              match body with
+              | None -> visible
+              | Some body ->
+                  let names = loop_witness_names (slice proof_text action_loc) in
+                  List.fold names ~init:visible ~f:(fun visible name ->
+                      let pattern =
+                        {
+                          S.pat_desc = Pid (S.mk_id ~loc:action_loc name);
+                          pat_loc = action_loc;
+                        }
+                      in
+                      Export
+                        {
+                          key = loop_witness_key key name;
+                          pattern;
+                          code;
+                          code_regions =
+                            Option.value (List.tl (regions_of regions body)) ~default:[];
+                        }
+                      :: shadow visible [ name ])
+            in
+            let previous =
+              match action with
+              | Loop -> previous
+              | Linearize | Initializes | Scope | Wrapped_scope -> place.pos_cnum
+            in
+            Ok (previous, visible, annotation :: annotations)
+        | On_return { return_loc; return_adapter } ->
             let place = definition.body.pexp_loc.loc_end in
             let* outline =
               uses ~visible ~step_loc:return_loc ~regions:[] ~place:place.pos_cnum
                 (slice proof_text return_loc)
             in
+            let prefix = if return_adapter then "" else "proof " in
             let annotation =
-              synthesized ~prefix:"proof " ~outline ~proof_text ~origin:return_loc place
+              synthesized ~prefix ~outline ~proof_text ~origin:return_loc place
             in
             Ok (previous, visible, annotation :: annotations)
         | Initially { initialization_loc } ->
@@ -493,11 +724,41 @@ let rec outline_annotations ~proof_text definitions (outline : S.outline) =
             Ok (previous, binding :: shadow visible (S.pat_names pattern), annotations)
         | Nested _ -> Ok (previous, visible, annotations))
   in
+  let within (body : Parsetree.expression) (code : Parsetree.expression) =
+    code.pexp_loc.loc_start.pos_cnum >= body.pexp_loc.loc_start.pos_cnum
+    && code.pexp_loc.loc_end.pos_cnum <= body.pexp_loc.loc_end.pos_cnum
+  in
+  let* annotations =
+    Result.all
+    @@ List.map annotations ~f:(fun (annotation : Annotation.t) ->
+        match
+          ( annotation.outline,
+            List.find !loops ~f:(fun (origin, _, _, _) ->
+                Option.exists annotation.origin ~f:(fun o -> Poly.equal o.loc origin)) )
+        with
+        | Some outline, Some (origin, body, regions, key) ->
+            let visible =
+              List.filter final_visible ~f:(function
+                | Export { code; key = export; _ } ->
+                    within body code && not (String.is_prefix export ~prefix:(key ^ "."))
+                | Pure _ -> false)
+            in
+            let* late =
+              uses ~visible ~step_loc:origin ~regions
+                ~place:body.pexp_loc.loc_end.pos_cnum (slice proof_text origin)
+            in
+            Ok
+              {
+                annotation with
+                outline = Some { outline with body_imports = late.imports };
+              }
+        | _ -> Ok annotation)
+  in
   let after = definition.at.loc_end in
   let manual =
     if
       List.exists outline.outline_steps ~f:(function
-        | S.At { action = Linearize; _ } | Let _ | Nested _ | Initially _ -> false
+        | S.At { action = Linearize | Loop; _ } | Let _ | Nested _ | Initially _ -> false
         | At _ | On_return _ -> true)
     then
       [
@@ -545,8 +806,7 @@ let annotations ~proof_text ~(structure : Parsetree.structure) ~annotations
     match (outlines, List.filter annotations ~f:proof) with
     | _ :: _, (first : Annotation.t) :: _ ->
         error first.loc
-          "A program whose proofs are outlines in its .proof file has no proof \
-           annotations"
+          "A program whose proofs are outlines in its .mlp file has no proof annotations"
     | _ -> Ok ()
   in
   let key (path, (o : S.outline)) =

@@ -1,0 +1,23 @@
+(rule
+ (target instances.ml)
+ (deps ../generic_striped_hash_set.ml instances.ml.inc)
+ (action
+  (with-stdout-to
+   %{target}
+   (cat %{deps}))))
+
+(rule
+ (target instances.mlp)
+ (deps ../generic_striped_hash_set.mlp)
+ (action
+  (with-stdout-to
+   %{target}
+   (cat %{deps}))))
+
+(library
+ (name caravan_case_study_generic_striped_hash_set_instances)
+ (wrapped false)
+ (modules instances))
+
+(cram
+ (deps %{bin:caravan} instances.ml instances.mli instances.mlp))

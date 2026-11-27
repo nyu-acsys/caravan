@@ -1,0 +1,5 @@
+module Value = Ghost.Relaxed (struct let field (cell : Relaxed_cell.t) = cell.counter end)
+proof result = read cell
+  requires (Value.state cell current writes)
+  ensures (Value.state cell current writes && exists event : Ghost.t.
+    Value.observed cell event result && Set.mem (event, result) writes) = ()

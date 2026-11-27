@@ -73,7 +73,7 @@ user guide explains executable overrides, opam launchers, and include paths.
 ## Read external annotations {#sec:read-external-annotations}
 
 Contracts exported to clients can be placed in a sibling `.mli` file. More
-detailed proofs can live in a sibling `.proof` file, including predicates,
+detailed proofs can live in a sibling `.mlp` file, including predicates,
 invariants, lemmas, and annotations attached to implementation steps. Caravan
 checks these companions together with the `.ml` implementation.
 
@@ -91,7 +91,7 @@ git clone https://github.com/nyu-acsys/caravan.git
 cd caravan
 opam switch create caravan 5.5.0
 eval $(opam env --switch=caravan)
-opam pin add raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
+opam pin add raven-ivl.1.7.0 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
 opam install . --deps-only --with-test
 dune build
 ```
@@ -117,6 +117,7 @@ Use a Raven revision compatible with the one in `RAVEN_REVISION`. The full
 cover further configuration.
 
 Continue with [contracts and ownership](./contracts), then compare
-[automatic and manual concurrent proofs](./concurrent-proofs). The remaining
-chapters describe [OCaml coverage](./ocaml-subset) and
-[semantic conventions](./semantics).
+[automatic and manual concurrent proofs](./concurrent-proofs). Continue with
+[weak memory](./weak-memory) for advanced shared-field disciplines and
+release/acquire proofs. The remaining chapters describe
+[OCaml coverage](./ocaml-subset) and [semantic conventions](./semantics).

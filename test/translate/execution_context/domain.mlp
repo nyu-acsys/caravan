@@ -1,0 +1,11 @@
+module Frozen = Ghost.Frozen (struct
+  let field (record : fields) = record.frozen
+end)
+
+module Work = Ghost.Task (struct
+  let operation = work
+end)
+
+module Relaxed = Ghost.Relaxed (struct
+  let field (record : fields) = record.relaxed
+end)

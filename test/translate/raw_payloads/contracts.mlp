@@ -1,0 +1,62 @@
+module Payload = Ghost.Relaxed (struct let field (cell : 'a cell) = cell.value end)
+proof result = make_node (value [@raw])
+  ensures (exists event : Ghost.t.
+    Payload.state result (Ghost.raw value) (Set.singleton (event, Ghost.raw value))) = ()
+proof (result [@raw]) = forward (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value) = ()
+proof (result [@raw]) = choose flag (first [@raw]) (second [@raw])
+  ensures (Ghost.raw result === (if flag then Ghost.raw first else Ghost.raw second)) = ()
+proof (result [@raw]) = select flag (first [@raw]) (second [@raw])
+  ensures (Ghost.raw result === (if flag then Ghost.raw first else Ghost.raw second)) = ()
+proof (result [@raw]) = nested flag (first [@raw]) (second [@raw])
+  ensures (Ghost.raw result === (if flag then Ghost.raw first else Ghost.raw second)) = ()
+proof (result [@raw]) = load cell
+  requires (Payload.state cell current writes)
+  ensures (Payload.state cell current writes && exists event : Ghost.t.
+    Payload.observed cell event (Ghost.raw result) && Set.mem (event, Ghost.raw result) writes) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+proof result = create_dummy ()
+  ensures (exists writes : (Ghost.t * bool option) set. Payload.state result (None : bool option) writes) = ()
+proof result = initialize value
+  ensures (exists event : Ghost.t. Payload.state result (Some value) (Set.singleton (event, Some value))) = ()
+proof result = transport cell
+  requires (Payload.state cell current writes)
+  ensures (Payload.state cell current writes && exists stored : 'a option, new_writes : (Ghost.t * 'a option) set.
+    Payload.state result stored new_writes && exists event : Ghost.t. Payload.observed cell event stored && Set.mem (event, stored) writes) = ()
+proof (result [@raw]) = unit_forward (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value) = ()
+proof unit_client () = ()
+proof (result [@raw]) = unit_prefix () (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value) = ()
+proof result = aliases ()
+  ensures (match result with first, second ->
+    (exists writes : (Ghost.t * bool option) set. Payload.state first (None : bool option) writes) &&
+    (exists writes : (Ghost.t * int option) set. Payload.state second (None : int option) writes)) = ()
+proof (result [@raw]) = choose_dummy flag
+  ensures (Ghost.raw result === (if flag then (None : bool option) else Some true)) = ()
+proof (result [@raw]) = optional_unit flag (value [@raw])
+  ensures (Ghost.raw result === (if flag then Ghost.raw value else Some ())) = ()
+proof (result [@raw]) = alias_dummy () ensures (Ghost.raw result === (None : bool option)) = ()
+proof (result [@raw]) = prefix_dummy () ensures (Ghost.raw result === (None : bool option)) = ()
+proof result [@raw], [echo : bool] = with_ghost (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value && echo) =
+  on return Ghost.returns (fun result () -> true)
+proof (result [@raw]) = scoped_forward (value [@raw])
+  ensures (Ghost.raw result === Ghost.raw value) =
+  at (with_ghost value) (fun step ->
+    let (result, echo) = step () in
+    assert (echo && Ghost.raw result === Ghost.raw value);
+    result)
+
+proof result = wrapped ()
+  ensures (exists writes : (Ghost.t * bool option) set. Payload.state result (None : bool option) writes) = ()
+
+proof result = sequenced ()
+  ensures (exists writes : (Ghost.t * bool option) set. Payload.state result (None : bool option) writes) = ()
+
+proof result = opened ()
+  ensures (exists writes : (Ghost.t * bool option) set. Payload.state result (None : bool option) writes) = ()

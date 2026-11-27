@@ -15,6 +15,8 @@ type t = {
   proof_assets :
     Proof_scopes.scope option -> Source.proof_resource list * Source.proof_field list;
   layouts : Result_layouts.t list;
+  frozen_fields : Frozen_fields.t;
+  frozen_parameters : Frozen_parameters.t;
   checked_modules : Checked_modules.t list;
   checked_operations : Program_items.checked_operation list;
   pure : Procedures.func list;
@@ -24,6 +26,7 @@ type t = {
   runtime_destinations : Module_context.destination list;
   procedure_signatures : (Base.string * Translate_context.procedure_signature) list;
   atomic_operations : (Source.proof_au * Procedures.func) list;
+  tasks : Task_facades.t list;
   token_types : Datatypes.t list;
   generic_models : Datatypes.t list;
   resource_types : Datatypes.t list;
@@ -162,6 +165,7 @@ let specialize_continuations (scopes : Program_scopes.t) =
             let* local =
               Polymorphic_functions.discover ~excluded:[ outer.scheme_type ]
                 ~expand:(Datatypes.expand scopes.types)
+                ~project:(Datatypes.representation_arguments scopes.types)
                 ~at:f.loc f.scheme_type
             in
             if List.is_empty local.variables then Ok f
@@ -169,6 +173,7 @@ let specialize_continuations (scopes : Program_scopes.t) =
               let* source_scheme =
                 Polymorphic_functions.discover ~additional:(parameter_types f)
                   ~expand:(Datatypes.expand scopes.types)
+                  ~project:(Datatypes.representation_arguments scopes.types)
                   ~at:f.loc f.scheme_type
               in
               let* _, _, _, specialization =
@@ -264,17 +269,7 @@ let function_types polymorphic_functions f types =
               ~parameter:("A" ^ Int.to_string index)
               ~at:worker.loc
           in
-          (* A locally abstract type stands for the variable of its name. *)
-          match Types.get_desc variable with
-          | Tunivar (Some name) ->
-              begin match
-                Env.find_type_by_name (Longident.Lident name) f.body.exp_env
-              with
-              | Pident id, _ -> { data with id = Some id }
-              | _ -> data
-              | exception Stdlib.Not_found -> data
-              end
-          | _ -> data)
+          Datatypes.bind_local_variable f.body.exp_env data)
       @ types
 
 let predicate_destination ~generic_predicates ~declaration_context key =
@@ -783,29 +778,30 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let* contract = signature_contract signature in
             let* () =
               match contract with
-              | Some c when c.S.pure || Option.is_some c.continues ->
+              | Some c when Option.is_some c.S.continues ->
                   unsupported signature.site.item_loc
-                    "A pure or continuation contract in a checked module view"
+                    "A continuation contract in a checked module view"
               | _ -> Ok ()
             in
             let operation_member =
               List.Assoc.find_exn view.members member ~equal:String.equal
             in
-            let operation_name =
-              if view.grouped then view.name ^ "." ^ operation_member
-              else operation_member
-            in
+            let operation_name = view.name ^ "." ^ operation_member in
             let operation_paths =
               List.map binding.paths ~f:(fun path -> Path.Pdot (path, member))
             in
             let* scheme =
-              Polymorphic_functions.discover ~at:signature.site.item_loc
-                signature.declaration.val_val.val_type
+              Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:signature.site.item_loc signature.declaration.val_val.val_type
             in
             let* () =
-              if (not view.grouped) && not (List.is_empty scheme.variables) then
+              if
+                Option.exists contract ~f:(fun c -> c.S.pure)
+                && not (List.is_empty scheme.variables)
+              then
                 unsupported signature.site.item_loc
-                  "A polymorphic operation in a specialized checked module binding"
+                  "A polymorphic pure checked module operation"
               else Ok ()
             in
             let operation_worker =
@@ -839,7 +835,19 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   let checked_operations = List.concat checked_operations in
 
   (* The data types, and the sequences of specifications, which have no module. *)
-  let* inferred_pure = pure_functions funcs in
+  let required_pure =
+    List.filter_map funcs ~f:(fun f ->
+        Option.some_if
+          (List.exists checked_operations ~f:(fun operation ->
+               Option.exists operation.operation_contract ~f:(fun c -> c.S.pure)
+               && List.mem f.paths
+                    (Path.Pdot
+                       ( operation.operation_binding.actual_path,
+                         operation.operation_signature.declaration.val_name.txt ))
+                    ~equal:Path.same))
+          f.id)
+  in
+  let* inferred_pure = pure_functions ~required:required_pure funcs in
   let pure =
     inferred_pure
     @ List.filter funcs ~f:(fun f ->
@@ -900,6 +908,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           in
           let* scheme =
             Polymorphic_functions.discover ~excluded ~expand:(Datatypes.expand types)
+              ~project:(Datatypes.representation_arguments types)
               ~at:f.loc f.scheme_type
           in
           let share_parent =
@@ -910,7 +919,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           else
             let* scheme =
               Polymorphic_functions.discover ~additional:(parameter_types f)
-                ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+                ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:f.loc f.scheme_type
             in
             let parent =
               Option.bind f.lexical_owner ~f:(fun owner ->
@@ -928,6 +939,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               | Some source ->
                   let* arguments =
                     Polymorphic_functions.instantiate ~expand:(Datatypes.expand types)
+                      ~project:(Datatypes.representation_arguments types)
                       ~at:f.loc source ~declaration:source.typ ~occurrence:f.scheme_type
                   in
                   Ok (Some Polymorphic_functions.{ source; arguments })
@@ -1041,6 +1053,12 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
   in
   let* procedure_signatures =
     all funcs ~f:(fun f ->
+        let raw = Raw_contract.of_contract f.contract in
+        let* () =
+          if Raw_contract.any raw && is_pure f then
+            unsupported f.loc "Raw boundaries of a pure function"
+          else Ok ()
+        in
         let outputs = ghost_results f in
         let* () =
           match outputs with
@@ -1052,7 +1070,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         in
         let* scheme =
           Polymorphic_functions.discover ~additional:(parameter_types f)
-            ~expand:(Datatypes.expand types) ~at:f.loc f.scheme_type
+            ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~at:f.loc f.scheme_type
         in
         let procedure_parameters =
           Option.value_map (function_worker polymorphic_functions f)
@@ -1070,36 +1090,146 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
               procedure_inputs;
               procedure_outputs;
               procedure_result = f.body.exp_type;
-              procedure_returns_value = not (is_unit f.body.exp_type);
+              procedure_returns_value = raw.result || not (is_unit f.body.exp_type);
+              procedure_raw = raw;
+              procedure_physical_atomic = Callable_contract.physically_atomic f.contract;
+              procedure_pure = is_pure f;
+              procedure_execution =
+                scopes.mutex_execution || Source.visibility_required source;
             } ))
   in
+  let* imported_signatures =
+    all libraries ~f:(fun library ->
+        let* contracts = library_contracts library in
+        all contracts ~f:(fun (member, (contract, at)) ->
+            let raw = Raw_contract.of_contract (Some contract) in
+            let value =
+              List.Assoc.find_exn library.signature.signature_values member
+                ~equal:String.equal
+            in
+            let execution =
+              Mutex_execution.contract_requires_context
+                ?trusted:(Source.mutex_context_path source.env)
+                (Source.annotation_env source value.site.environment)
+                contract
+            in
+            if
+              not
+                (Raw_contract.any raw
+                || Callable_contract.physically_atomic (Some contract)
+                || contract.pure || execution)
+            then Ok None
+            else
+              let path = Path.Pdot (library.Library_modules.library_path, member) in
+              let declaration = Env.find_value path source.env in
+              let* scheme =
+                Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                  ~project:(Datatypes.representation_arguments types)
+                  ~at declaration.val_type
+              in
+              let rec result typ =
+                match Types.get_desc typ with
+                | Tarrow (_, _, result_type, _) | Tpoly (result_type, []) ->
+                    result result_type
+                | _ -> typ
+              in
+              let result = result declaration.val_type in
+              Ok
+                (Some
+                   ( library.library_name ^ "." ^ member,
+                     {
+                       procedure_parameters = scheme.variables;
+                       procedure_variables = [];
+                       procedure_inputs = [];
+                       procedure_outputs = [];
+                       procedure_result = result;
+                       procedure_returns_value = raw.result || not (is_unit result);
+                       procedure_raw = raw;
+                       procedure_physical_atomic =
+                         Callable_contract.physically_atomic (Some contract);
+                       procedure_pure = contract.pure;
+                       procedure_execution = execution;
+                     } ))))
+  in
+  let procedure_signatures =
+    procedure_signatures @ List.filter_opt (List.concat imported_signatures)
+  in
+  let checked_signatures =
+    List.filter_map checked_operations ~f:(fun operation ->
+        let raw = Raw_contract.of_contract operation.operation_contract in
+        if
+          not
+            (Raw_contract.any raw
+            || Callable_contract.physically_atomic operation.operation_contract
+            || Option.exists operation.operation_contract ~f:(fun c -> c.S.pure))
+        then None
+        else
+          let scheme =
+            Option.map operation.operation_worker ~f:(fun worker ->
+                worker.Polymorphic_functions.scheme)
+          in
+          let typ =
+            Option.value_map scheme
+              ~default:operation.operation_signature.declaration.val_val.val_type
+              ~f:(fun scheme -> scheme.Polymorphic_functions.typ)
+          in
+          let rec result typ =
+            match Types.get_desc typ with
+            | Tarrow (_, _, result_type, _) | Tpoly (result_type, []) ->
+                result result_type
+            | _ -> typ
+          in
+          let result = result typ in
+          Some
+            ( operation.operation_name,
+              {
+                procedure_parameters =
+                  Option.value_map scheme ~default:[] ~f:(fun scheme -> scheme.variables);
+                procedure_variables = [];
+                procedure_inputs = [];
+                procedure_outputs = [];
+                procedure_result = result;
+                procedure_returns_value = raw.result || not (is_unit result);
+                procedure_raw = raw;
+                procedure_physical_atomic =
+                  Callable_contract.physically_atomic operation.operation_contract;
+                procedure_pure =
+                  Option.exists operation.operation_contract ~f:(fun c -> c.S.pure);
+                procedure_execution =
+                  (not
+                     (Option.exists operation.operation_contract ~f:(fun c -> c.S.pure)))
+                  && (scopes.mutex_execution || Source.visibility_required source);
+              } ))
+  in
+  let procedure_signatures = procedure_signatures @ checked_signatures in
   let procedure_signatures = with_body_names procedure_signatures in
   let au_plan = au_plan ~asset_context in
   let au_procedure =
     au_procedure ~polymorphic_functions ~procedures ~generics ~generic_procedures
       ~asset_context
   in
-  let applied_atomic_operation (au : Source.proof_au) =
+  let applied_facade_operation application ~matches ~operation =
     let ( let* ) value f = Option.bind value ~f in
-    let* identity, template = au.au_application in
+    let* identity, template = application in
     let* binding =
       List.find untyped_scoped_proofs.bindings ~f:(fun binding ->
-          match binding.Proof_bindings.kind with
-          | Atomic original -> Ident.same original.au_id template
-          | _ -> false)
+          matches template binding.Proof_bindings.kind)
     in
     let* plan = Generic_proofs.owner generic_proofs (Some binding.entry.scope) in
-    let* operation =
-      match binding.kind with
-      | Atomic original -> Some original.au_operation_path
-      | _ -> None
-    in
+    let* operation = operation binding.kind in
     let* application =
       List.find plan.group.applications ~f:(fun application ->
           Path.same application.source.identity identity)
     in
     let* id = Generic_proofs.function_id plan ~instance:application.source operation in
     List.find funcs ~f:(fun f -> Ident.same f.id id)
+  in
+  let applied_atomic_operation (au : Source.proof_au) =
+    applied_facade_operation au.au_application
+      ~matches:(fun template -> function
+        | Atomic original -> Ident.same original.au_id template | _ -> false)
+      ~operation:(function
+        | Atomic original -> Some original.au_operation_path | _ -> None)
   in
   let* atomic_operations =
     all source.proof_aus ~f:(fun (au : Source.proof_au) ->
@@ -1132,7 +1262,11 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let data =
           Datatypes.with_paths
             (Datatypes.atomic_token ~path:au.Source.au_token_path
-               ~procedure:(au_procedure au f) ~at:au.au_at)
+               ~procedure:(au_procedure au f) ~at:au.au_at
+               ~context:
+                 (Execution_contract.context_layout ~mutex:scopes.mutex_execution
+                    ~visibility:(Source.visibility_required source))
+               ())
             au.au_token_paths
         in
         let groups =
@@ -1146,7 +1280,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         | None -> Ok { data with parameters = au.au_parameters }
         | Some worker ->
             let* argument_projection =
-              Specializations.argument_projection ~at:f.loc scopes.specialized worker
+              Specializations.argument_projection ~types ~at:f.loc scopes.specialized
+                worker
             in
             let scope =
               match (au.au_application, Generic_modules.member generics f.id) with
@@ -1268,6 +1403,13 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           (List.exists dependent_models ~f:(fun model ->
                String.equal (Generic_models.name model) (Generic_models.name data))))
   in
+  let frozen_fields =
+    Frozen_fields.plan ~source ~inventory:scopes.inventory ~types ~layouts
+  in
+  let* frozen_parameters =
+    Frozen_parameters.plan ~fields:frozen_fields ~inventory:scopes.inventory ~types
+      generics
+  in
   let data_types =
     List.filter data_types ~f:(fun data ->
         not
@@ -1285,8 +1427,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
     all
       (List.filter_mapi data_types ~f:(fun i (d : Datatypes.t) ->
            Option.some_if
-             (Option.is_none d.heap && Option.is_none d.alias
-             && not (Result_layouts.contains layouts d))
+             (Datatypes.needs_module d && not (Result_layouts.contains layouts d))
              (List.take data_types i, d)))
       ~f:(fun (before, d) ->
         let* member =
@@ -1359,20 +1500,17 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let* member =
           match (resource.resource_definition, resource.resource_alias_of) with
           | true, _ ->
-              let* () =
-                if Option.is_none worker then Ok ()
-                else unsupported at "A parameterized proof-defined resource algebra"
-              in
               let* backend =
                 match implementation resource with
                 | Some backend -> Ok backend
                 | None -> error at "Missing resource algebra implementation"
               in
               let interface =
-                qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
+                qualified_name ~loc:l (Generic_assets.interface_name resource)
               in
               Ok
-                (R.Member.alias ~loc:l ~typ:interface ~sealed:true
+                (R.Member.alias ~loc:l ~typ:interface
+                   ~sealed:(not (Generic_assets.transparent_protected_resource resource))
                    (ident ~loc:l (Qualified_name.of_string resource.resource_backend).name)
                    (qualified_name ~loc:l backend))
           | false, Some path ->
@@ -1636,7 +1774,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 view with
                 types =
                   Compiler_types.map_group raw ~f:(fun typ ->
-                      Subst.type_expr projection (Subst.type_expr formal.substitution typ));
+                      view.project_type
+                        (Subst.type_expr projection
+                           (Subst.type_expr formal.substitution typ)));
               }
         | _ -> Ok view)
   in
@@ -1664,7 +1804,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         in
         let* implicit = implicit_parameters predicate in
         let* worker =
-          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key ~at
+          Generic_predicates.discover ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~key ~name:key ~at
             ~explicit:(List.length parameters - implicit)
             parameters
         in
@@ -1724,6 +1866,44 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
           | View _ -> Ok None)
   in
   let generic_predicates = List.filter_opt generic_predicates in
+  let* generic_predicates =
+    all generic_predicates ~f:(fun worker ->
+        let resource =
+          Option.bind
+            (List.find scoped_proofs.bindings ~f:(fun binding ->
+                 String.equal binding.Proof_bindings.backend worker.Generic_parameters.key))
+            ~f:(fun binding ->
+              Option.bind (Program_scopes.definition_resource ~source binding.entry.scope)
+                ~f:(fun resource ->
+                  Option.map
+                    (List.find resource.Source.resource_operations
+                       ~f:(fun (name, _, _, _) ->
+                         String.equal name binding.entry.name.pid_str))
+                    ~f:(fun operation -> (resource, operation))))
+        in
+        match resource with
+        | Some (resource, (_, _, inputs, _))
+          when Generic_assets.transparent_protected_resource resource
+               && not (List.is_empty resource.resource_parameters) ->
+            let* arguments =
+              Generic_parameters.instantiate ~environment:resource.resource_environment
+                ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:resource.resource_at worker
+                (List.map inputs ~f:Option.some)
+            in
+            let correspondence = List.zip_exn worker.variables arguments in
+            let* variables =
+              all resource.resource_parameters ~f:(fun parameter ->
+                  Report.expect ~at:resource.resource_at
+                    "A predicate type parameter for each protected resource family \
+                     parameter"
+                    (List.find_map correspondence ~f:(fun (variable, argument) ->
+                         Option.some_if (Types.eq_type argument parameter) variable)))
+            in
+            Ok { worker with variables }
+        | _ -> Ok worker)
+  in
   let scope_of =
     Program_scopes.declaration_scope ~unapplied_proofs:scopes.unapplied_proofs
   in
@@ -1746,12 +1926,14 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 in
                 let* scheme =
                   Generic_parameters.discover ~expand:(Datatypes.expand types)
+                    ~project:(Datatypes.representation_arguments types)
                     ~key:predicate.pred_name.pid_str ~name:predicate.pred_name.pid_str ~at
                     ~explicit:(List.length inputs) parameters
                 in
                 let* arguments =
                   Generic_parameters.instantiate ~environment
                     ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+                    ~project:(Datatypes.representation_arguments types)
                     ~at scheme
                     (List.map inputs ~f:Option.some @ [ None ])
                 in
@@ -1807,8 +1989,9 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
         let key = lib.Library_modules.source_name ^ "." ^ predicate.S.pred_name.pid_str in
         let* implicit = implicit_parameters predicate in
         let* worker =
-          Generic_predicates.discover ~expand:(Datatypes.expand types) ~key ~name:key
-            ~at:predicate.pred_name.pid_loc
+          Generic_predicates.discover ~expand:(Datatypes.expand types)
+            ~project:(Datatypes.representation_arguments types)
+            ~key ~name:key ~at:predicate.pred_name.pid_loc
             ~explicit:(List.length parameters - implicit)
             parameters
         in
@@ -1824,9 +2007,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                }))
   in
   let generic_predicates = generic_predicates @ List.filter_opt imported_predicates in
-  let generic_predicate_workers = generic_predicates in
-  let* application_predicates =
-    all scoped_proofs.applications ~f:(fun view ->
+  let project_predicate_applications generic_predicates applications =
+    all applications ~f:(fun view ->
         match
           Generic_parameters.find generic_predicates view.Proof_bindings.source.backend
         with
@@ -1837,6 +2019,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             in
             let* worker =
               Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:view.source.entry.name.pid_loc worker parameters
             in
             let name =
@@ -1845,6 +2028,201 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
                 @ [ (Qualified_name.of_string worker.name).name ])
             in
             Ok (Some { worker with key = view.key; name }))
+  in
+  let needs_task_context = not (List.is_empty source.proof_tasks) in
+  let* task_application_predicates =
+    if not needs_task_context then Ok []
+    else
+      project_predicate_applications generic_predicates
+        (List.filter scoped_proofs.applications ~f:(fun view ->
+             match view.Proof_bindings.source.kind with Predicate _ -> true | _ -> false))
+  in
+  let task_generic_predicates =
+    generic_predicates @ List.filter_opt task_application_predicates
+  in
+  let* task_imported_pure =
+    if not needs_task_context then Ok []
+    else
+      all libraries ~f:(fun library ->
+          let* contracts = library_contracts library in
+          Ok
+            (List.filter_map contracts ~f:(fun (name, (contract, _)) ->
+                 Option.some_if contract.S.pure
+                   ( Path.Pdot (library.library_path, name),
+                     Qualified_name.of_string
+                       (library.library_name ^ "." ^ library_pure_name name) ))))
+      |> Result.map ~f:List.concat
+  in
+  let task_runtime_functions =
+    Path_bindings.of_list
+      (task_imported_pure
+      @ List.concat_map pure ~f:(fun f ->
+          List.filter_map f.paths ~f:(fun path ->
+              match path with
+              | Path.Pdot _ when not (List.is_empty f.signature_sites) -> None
+              | _ -> Some (path, pure_reference ~generics f))))
+  in
+  let* tasks =
+    let application_view (task : Source.proof_task) =
+      Option.bind task.task_application ~f:(fun (_, template) ->
+          List.find untyped_scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Task original ->
+                  Ident.same original.task_id template
+                  && Path.same task.task_path (Path.Pdot (view.path, task.task_name))
+              | _ -> false))
+    in
+    let context task =
+      match application_view task with
+      | Some view -> asset_context view.source.entry.scope.owner
+      | None -> asset_context task.Source.task_scope
+    in
+    let resolve (task : Source.proof_task) =
+      match task.task_application with
+      | Some _ ->
+          Option.first_some
+            (List.find funcs ~f:(fun f ->
+                 List.mem f.paths task.task_operation_path ~equal:Path.same))
+            (applied_facade_operation task.task_application
+               ~matches:(fun template -> function
+                 | Task original -> Ident.same original.task_id template | _ -> false)
+               ~operation:(function
+                 | Task original -> Some original.task_operation_path | _ -> None))
+      | None -> (
+          match (context task).worker with
+          | Some plan ->
+              Option.bind (Generic_proofs.function_id plan task.task_operation_path)
+                ~f:(fun id -> List.find funcs ~f:(fun f -> Ident.same f.id id))
+          | None ->
+              List.find funcs ~f:(fun f ->
+                  List.mem f.paths task.task_operation_path ~equal:Path.same))
+    in
+    Task_facades.collect ~family_plan
+      ~operation_types:(fun f -> function_types polymorphic_functions f types)
+      ~procedure_name:proc_name
+      ~given:(fun f ->
+        let env = Source.annotation_env ~at:f.loc source f.environment in
+        let scope = Proof_bindings.scope_for_location scoped_proofs f.loc in
+        let visible = Proof_bindings.visible scoped_proofs ~scope in
+        let preds =
+          List.filter_map scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Predicate _ when binding.exported || visible binding ->
+                  Some (binding.public_key, (binding.backend, binding.public_types))
+              | _ -> None)
+          @ List.filter_map scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Predicate _ -> Some (view.key, (view.backend, view.types))
+              | _ -> None)
+          @ List.map predicates ~f:(fun (_, p, _, ts) ->
+              (p.S.pred_name.pid_str, (p.pred_name.pid_str, ts)))
+          @ List.map library_preds ~f:(fun (lib, p, ts) ->
+              ( lib.Library_modules.source_name ^ "." ^ p.S.pred_name.pid_str,
+                (lib.library_name ^ "." ^ p.pred_name.pid_str, ts) ))
+        in
+        let spec_funcs =
+          List.filter_map source.proof ~f:(function
+            | S.Proof_function declaration ->
+                Some (declaration.function_name.pid_str, declaration.function_name.pid_str)
+            | _ -> None)
+          @ List.concat_map scoped_proofs.bindings ~f:(fun binding ->
+              match binding.kind with
+              | Function _ when binding.exported || visible binding ->
+                  let local = binding.entry.name in
+                  let local_name =
+                    Option.to_list
+                      (Option.bind
+                         (Proof_bindings.resolve scoped_proofs ~scope ~environment:env
+                            (S.Qid local)) ~f:(fun key ->
+                           Option.some_if
+                             (String.equal key binding.backend
+                             || String.equal key binding.public_key)
+                             (local.pid_str, binding.backend)))
+                  in
+                  (binding.backend, binding.backend)
+                  :: (binding.public_key, binding.backend)
+                  :: local_name
+              | _ -> [])
+          @ List.filter_map scoped_proofs.applications ~f:(fun view ->
+              match view.source.kind with
+              | Function _ -> Some (view.key, view.backend)
+              | _ -> None)
+        in
+        let proof_support =
+          {
+            empty_proof_support with
+            visibility_enabled = Source.visibility_required source;
+            access_fields = source.proof_access_fields;
+            field_encoding =
+              (if Source.visibility_required source then
+                 Field_encodings.resolve ~fields:frozen_fields
+                   ~parameters:frozen_parameters ~inventory:scopes.inventory
+                   ~disciplines:
+                     (source.field_disciplines @ source.signature_field_disciplines)
+               else empty_proof_support.field_encoding);
+            execution_context_path = Source.mutex_context_path source.env;
+            runtime_functions = task_runtime_functions;
+            predicate_views =
+              Path_bindings.of_list
+                (List.filter_map scoped_proofs.applications ~f:(fun view ->
+                     match view.source.kind with
+                     | Predicate _ ->
+                         Some
+                           ( Path.Pdot (view.path, view.source.entry.name.pid_str),
+                             view.key )
+                     | _ -> None));
+            resources = all_resources;
+            ghost_fields = source.proof_fields;
+            proof_key =
+              (fun environment q ->
+                Proof_bindings.resolve scoped_proofs ~scope ~environment q);
+            canonical_path = Proof_bindings.canonical_owner scoped_proofs;
+          }
+        in
+        {
+          (declaration_inputs
+             (function_types polymorphic_functions f types)
+             ~shared:no_shared ~env ~preds ~spec_funcs ~proof_support
+             ~generic_predicates:task_generic_predicates ())
+          with
+          procedure_signatures;
+          mutex_execution = scopes.mutex_execution;
+        })
+      ~resolve ~context ~application_view source untyped_scoped_proofs
+  in
+  let task_workers =
+    List.filter_map tasks ~f:(fun task ->
+        Option.some_if task.Task_facades.emit task.worker)
+  in
+  let generic_predicate_workers = generic_predicates @ task_workers in
+  let* public_predicate_instances =
+    all scoped_proofs.bindings ~f:(fun binding ->
+        match
+          ( binding.Proof_bindings.kind,
+            Generic_parameters.find generic_predicates binding.backend,
+            Program_scopes.definition_resource ~source binding.entry.scope )
+        with
+        | Predicate _, Some worker, Some _ ->
+            let* worker =
+              Generic_parameters.rebind ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
+                ~at:binding.entry.name.pid_loc worker binding.public_types
+            in
+            Ok (Some { worker with key = binding.public_key })
+        | _ -> Ok None)
+  in
+  let generic_predicates =
+    generic_predicates @ List.filter_opt public_predicate_instances
+  in
+  let generic_predicates =
+    generic_predicates
+    @ List.filter_map tasks ~f:(fun task ->
+        Option.some_if
+          (not (List.is_empty task.Task_facades.worker.variables))
+          task.worker)
+  in
+  let* application_predicates =
+    project_predicate_applications generic_predicates scoped_proofs.applications
   in
   let generic_predicates = generic_predicates @ List.filter_opt application_predicates in
   let* imported_functions =
@@ -1855,6 +2233,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
             let declaration = Env.find_value path source.env in
             let* scheme =
               Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+                ~project:(Datatypes.representation_arguments types)
                 ~at:value.val_loc declaration.val_type
             in
             if List.is_empty scheme.variables then Ok None
@@ -1885,6 +2264,8 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
       private_ra_types;
       proof_assets;
       layouts;
+      frozen_fields;
+      frozen_parameters;
       checked_modules;
       checked_operations;
       pure;
@@ -1894,6 +2275,7 @@ let run ?(family_plan = Generic_family_plan.empty) (scopes : Program_scopes.t) :
       runtime_destinations;
       procedure_signatures;
       atomic_operations;
+      tasks;
       token_types;
       generic_models;
       resource_types;

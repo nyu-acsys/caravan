@@ -10,7 +10,7 @@ the queue invariant is preserved, and a caller's FIFO-view resource is framed.
 
 `history_tail.ml` uses the history/sequence invariant and automatic access proofs.
 `segment_tail.ml` uses the List/segment invariant, with explicit access proofs in its
-outline, `segment_tail.proof`. Both include the empty-cell branch and the
+outline, `segment_tail.mlp`. Both include the empty-cell branch and the
 successful/failed CAS branches.
 
 Dune appends each operation to its corresponding queue implementation and copies

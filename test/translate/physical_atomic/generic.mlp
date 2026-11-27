@@ -1,0 +1,1 @@
+invariant shared (cell : int Atomic.t) = own cell 6

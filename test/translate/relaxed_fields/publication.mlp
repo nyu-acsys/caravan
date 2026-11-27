@@ -1,0 +1,93 @@
+module Capacity = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)
+
+proof result = allocate value
+  ensures (exists event : Ghost.t.
+    Capacity.private_state Ghost.self result value (Set.singleton (event, value))) = ()
+
+proof prepare cell value
+  requires (Capacity.private_state Ghost.self cell current writes)
+  ensures (exists event : Ghost.t.
+    Capacity.private_state Ghost.self cell value (Set.union writes (Set.singleton (event, value))) &&
+    Capacity.observed cell event value) = ()
+
+proof result = seal cell
+  requires (Capacity.private_state Ghost.self cell current writes)
+  ensures (exists event : Ghost.t.
+    Capacity.shared_state result current writes (Set.singleton (event, current)) &&
+    Capacity.visible Ghost.self result) =
+  on return begin
+    let (_event, _writes) = Capacity.snapshot cell in
+    let _cut = Capacity.publish cell in
+    ()
+  end
+
+proof result = sample cell
+  requires (Capacity.shared_state cell current writes eligible && Capacity.visible Ghost.self cell)
+  ensures (Capacity.shared_state cell current writes eligible && Capacity.visible Ghost.self cell &&
+    exists event : Ghost.t. Capacity.observed cell event result && Set.mem (event, result) eligible) =
+  at (cell.value) Ghost.published_scope (fun read -> let result = read () in result)
+
+proof result = unrestricted cell
+  requires (Capacity.shared_state cell current writes eligible)
+  ensures (Capacity.shared_state cell current writes eligible &&
+    exists event : Ghost.t. Capacity.observed cell event result && Set.mem (event, result) writes) = ()
+
+proof channel, [published : Ghost.t set] = make_channel cell
+  requires (Capacity.visible Ghost.self cell)
+  ensures (Capacity.visible Ghost.self cell && Capacity.covered published cell &&
+    own ~release:published channel 1) =
+  at (Atomic.make 1) Ghost.State.release_scope (fun create () ->
+    let lower = Capacity.release cell in
+    let channel = create lower in
+    (channel, lower));
+  on return Ghost.returns (fun channel published -> published)
+
+proof result = receive [published : Ghost.t set] channel cell
+  requires (Capacity.shared_state cell current writes eligible && Capacity.covered published cell &&
+    own ~release:published channel 1)
+  ensures (Capacity.shared_state cell current writes eligible && Capacity.visible Ghost.self cell &&
+    own ~release:published channel 1 && exists event : Ghost.t.
+    Capacity.observed cell event result && Set.mem (event, result) eligible) =
+  at (Atomic.get channel) Ghost.acquire_scope (fun acquire ->
+    let flag = acquire published in
+    Capacity.acquire cell published;
+    flag);
+  at (cell.value) Ghost.published_scope (fun read -> let result = read () in result)
+
+proof result = client () ensures (result === 0) =
+  let published = at (let channel = make_channel cell) (fun create ->
+    let (channel, published) = create () in
+    (channel, published)) in
+  at (receive channel cell) (fun invoke -> let result = invoke published in result)
+
+lemma forward_visibility (source : Ghost.t) (target : Ghost.t) (cell : cell)
+  requires (Ghost.handoff source target && Capacity.visible source cell)
+  ensures (Ghost.handoff source target && Capacity.visible source cell && Capacity.visible target cell) =
+  Capacity.transfer source target cell
+
+proof result = maintain_private cell
+  requires (Capacity.private_state Ghost.self cell current writes)
+  ensures (Capacity.private_state Ghost.self result current writes) =
+  on return Capacity.adopt cell
+
+proof result = publish_at_link initial
+  requires (initial = 0 || initial = 1)
+  ensures (result === (if initial = 0 then 0 else 2)) =
+  at (Atomic.compare_and_set channel 0 1) Ghost.release_scope (fun cas ->
+    let (event, _all) = Capacity.snapshot cell in
+    let linked = cas (Set.singleton event) in
+    if linked then begin
+      let _cut = Capacity.publish cell in
+      assert (Capacity.covered (Set.singleton event) cell)
+    end else ();
+    linked);
+  at (let first_value = cell.value) Ghost.published_scope (fun read -> let result = read () in result);
+  at (Atomic.compare_and_set channel 1 2) Ghost.release_scope (fun cas ->
+    let (event, _all) = Capacity.snapshot cell in
+    let linked = cas (Set.singleton event) in
+    if linked then begin
+      let _cut = Capacity.publish cell in
+      assert (Capacity.covered (Set.singleton event) cell)
+    end else ();
+    linked);
+  at (let second_value = cell.value) Ghost.published_scope (fun read -> let result = read () in result)

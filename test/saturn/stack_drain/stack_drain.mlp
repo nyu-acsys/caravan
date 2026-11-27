@@ -1,0 +1,126 @@
+module Test (Stack : S) = struct
+  let left_count : (Ghost.t, int) Ghost.field = Ghost.field ()
+  let right_count : (Ghost.t, int) Ghost.field = Ghost.field ()
+  let enabled : (Ghost.t, bool) Ghost.field = Ghost.field ()
+
+  predicate progress (registration : Ghost.t) (id : int) (count : int) =
+    if id = 1 then
+      own ~fraction:Permission.half (Ghost.at left_count registration) count
+    else
+      own ~fraction:Permission.half (Ghost.at right_count registration) count
+
+  invariant running (st : int Stack.t) (registration : Ghost.t) =
+    exists items : int list, left : int, right : int, active : bool.
+      own ~fraction:Permission.half (Ghost.at left_count registration) left
+      && own ~fraction:Permission.half (Ghost.at right_count registration) right
+      && own ~fraction:Permission.half (Ghost.at enabled registration) active
+      && 0 <= left && left <= 10 && 0 <= right && right <= 10
+      && (if active then Stack.stack st items && List.length items = left + right
+          else left = 10 && right = 10)
+
+  module Work = Ghost.Task (struct let operation = work end)
+
+  proof work [registration : Ghost.t] id st
+    requires (running st registration && (id = 1 || id = 2)
+      && progress registration id 0)
+    ensures (running st registration && progress registration id 10) =
+    at (Stack.push st id) invariant (running st registration && progress registration id i && (id = 1 || id = 2));
+    at (Stack.push st id) (fun invoke ->
+      unfold progress registration id i;
+      let (items, left, right, active) =
+        unfold running st registration {items; left; right; active} in
+      assert (active);
+      let result = invoke () in
+      if id = 1 then begin
+        Ghost.write (Ghost.at left_count registration) (left + 1);
+        fold running st registration
+          {items = id :: items; left = left + 1; right = right; active = true}
+      end else begin
+        Ghost.write (Ghost.at right_count registration) (right + 1);
+        fold running st registration
+          {items = id :: items; left = left; right = right + 1; active = true}
+      end;
+      fold progress registration id (i + 1);
+      result)
+
+  proof result = test ()
+    ensures (match result with count, content -> count = 20 && count = List.length content) =
+    let registration = at (let st = Stack.create ()) (fun invoke ->
+      let st = invoke () in
+      let registration = Ghost.alloc [
+        Ghost.init left_count 0;
+        Ghost.init right_count 0;
+        Ghost.init enabled true
+      ] in
+      fold running st registration {items = []; left = 0; right = 0; active = true};
+      fold progress registration 1 0;
+      fold progress registration 2 0;
+      (st, registration)) in
+    at (Domain.spawn (fun () -> work 1 st)) (fun invoke ->
+      let domain = invoke registration in domain);
+    at (Domain.spawn (fun () -> work 2 st)) (fun invoke ->
+      let domain = invoke registration in domain);
+    at (let content = drain st) (fun invoke ->
+      unfold progress registration 1 10;
+      unfold progress registration 2 10;
+      let (items, left, right, active) =
+        unfold running st registration {items; left; right; active} in
+      assert (active && left = 10 && right = 10);
+      Ghost.write (Ghost.at enabled registration) false;
+      fold running st registration {items = []; left = 10; right = 10; active = false};
+      let content = invoke () in
+      assert (List.length content = 20);
+      content)
+
+  proof result = drain st
+    requires (Stack.stack st xs)
+    ensures (Stack.stack st [] && result === xs) =
+    proof result = loop ()
+      requires (Stack.stack st xs)
+      ensures (Stack.stack st [] && result === xs) = begin () end
+end
+
+module Saturn_stack = struct
+  predicate stack (st : 'a t) (xs [@implicit] : 'a list) =
+    Treiber_stack.stack st xs
+
+  module Push = Ghost.AU (struct let operation = push end)
+  module Pop = Ghost.AU (struct let operation = pop end)
+
+  proof result = create ()
+    ensures (stack result []) =
+    on return fold stack result []
+
+  proof result = atomic push st value
+    atomic requires (stack st xs)
+    atomic ensures (stack st (value :: xs) && result === ()) =
+    at (Treiber_stack.push st value) (fun invoke ->
+      let token = Push.bind () in
+      let xs = Push.access token st value in
+      unfold stack st xs;
+      let result = invoke () in
+      fold stack st (value :: xs);
+      Push.commit token st value ();
+      result)
+
+  proof result = atomic pop st
+    atomic requires (stack st xs)
+    atomic ensures (match xs with
+      | [] -> result === None && stack st []
+      | value :: rest -> result === Some value && stack st rest) =
+    at (Treiber_stack.pop_opt st) (fun invoke ->
+      let token = Pop.bind () in
+      let xs = Pop.access token st in
+      unfold stack st xs;
+      let result = invoke () in
+      fold stack st (match xs with [] -> [] | _ :: rest -> rest);
+      Pop.commit token st result;
+      result)
+end
+
+proof drain =
+  at (Client.drain stack) (fun invoke ->
+    fold Saturn_stack.stack stack xs;
+    let result = invoke () in
+    unfold Saturn_stack.stack stack [];
+    result)

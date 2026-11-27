@@ -6,7 +6,9 @@ module R = Raven_api
 let arity declaration = List.length declaration.Typedtree.typ_params
 
 let transparent declaration =
-  arity declaration > 0 && Option.is_some declaration.Typedtree.typ_manifest
+  match declaration.Typedtree.typ_kind with
+  | Ttype_record _ -> true
+  | _ -> arity declaration > 0 && Option.is_some declaration.typ_manifest
 
 let interface_name count =
   Fresh_names.for_key

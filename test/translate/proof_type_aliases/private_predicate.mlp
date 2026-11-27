@@ -1,0 +1,7 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = own cell.contents 0
+  predicate secret (value : int) = value = 0
+end
+
+proof unused () requires (Cell.secret 0) = ()

@@ -1,0 +1,19 @@
+module Left_int = Ghost.Frozen (struct
+  let field (record : int Left.t) = record.value
+end)
+
+module Right_int = Ghost.Frozen (struct
+  let field (record : int Right.t) = record.value
+end)
+
+module Left_bool = Ghost.Frozen (struct
+  let field (record : bool Left.t) = record.value
+end)
+
+module First_int = Ghost.Frozen (struct
+  let field (record : First.t) = record.value
+end)
+
+module Second_int = Ghost.Frozen (struct
+  let field (record : Second.t) = record.value
+end)

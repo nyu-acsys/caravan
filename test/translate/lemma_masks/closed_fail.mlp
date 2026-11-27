@@ -1,0 +1,5 @@
+invariant live (cell : int Atomic.t) = exists value : int. own cell value
+lemma refresh (cell : int Atomic.t)
+  requires (live cell) ensures (live cell) opens {} =
+  unfold live cell;
+  fold live cell

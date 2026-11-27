@@ -183,6 +183,7 @@ let datatype ?(library = []) (structure : Typedtree.structure) =
         raven;
         fields = List.mapi args ~f:(fun i _ -> Printf.sprintf "%s_%d" raven i);
         args;
+        inline_record = None;
       }
     in
     Ok
@@ -263,6 +264,8 @@ type use =
   | Reraise of uses * Location.t
       (** A raise of what a handler caught, from its protected part's uses. *)
   | Call of Path.t * Location.t * witness_argument option
+  | Effect of Translate_context.State_monad.raise_set
+      (** The exceptions of a runtime operation. *)
   | Handled of { protected : uses; handled : string list; catch_all : bool; cases : uses }
   | Witness_cases of (string list option * uses) list
       (** A match on the function's witness: its cases, each with the constructors it
@@ -281,10 +284,16 @@ let rec matched_constructors (p : Typedtree.pattern) =
   | _ -> None
 
 (** The raises and calls of [body], outside the local functions it defines; [witness] is
-    the function's witness parameter, whose matches record their cases. *)
-let uses ~key ?witness (body : Typedtree.expression) =
+    the function's witness parameter, whose matches record their cases.
+    [application_raises] supplies the exceptions of runtime applications. *)
+let uses ~key ?witness ?(application_raises = fun _ -> None) (body : Typedtree.expression)
+    =
   let rec scan caught loops (e : Typedtree.expression) : uses =
     let sub = scan caught loops in
+    let effects () =
+      Option.to_list
+        (Option.map (application_raises e) ~f:(fun set -> (Effect set, loops > 0)))
+    in
     match (e.exp_desc, raised_argument e) with
     | Texp_match ({ exp_desc = Texp_ident (Pident id, _, _); _ }, cases, [], _), None
       when Option.exists witness ~f:(Ident.same id) ->
@@ -353,6 +362,11 @@ let uses ~key ?witness (body : Typedtree.expression) =
         :: List.concat_map split ~f:(fun ((value, _), rhs) ->
             if Option.is_some value then sub rhs else [])
     | (Texp_while _ | Texp_for _), None -> children (scan caught (loops + 1)) e
+    | Texp_apply _, None
+      when Option.is_some (Translate_context.inline_list_fold_left_body e) ->
+        children sub e
+        @ scan caught (loops + 1)
+            (Option.value_exn (Translate_context.inline_list_fold_left_body e))
     | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, args), None ->
         let witness_argument =
           List.find_map args ~f:(fun (_, arg) ->
@@ -365,7 +379,9 @@ let uses ~key ?witness (body : Typedtree.expression) =
                   Some Forwarded
               | _ -> None)
         in
-        (Call (path, e.exp_loc, witness_argument), loops > 0) :: children sub e
+        (Call (path, e.exp_loc, witness_argument), loops > 0)
+        :: (effects () @ children sub e)
+    | Texp_apply _, None -> effects () @ children sub e
     | _ -> children sub e
   and children f (e : Typedtree.expression) =
     let found = ref [] in
@@ -414,6 +430,7 @@ let rec raised ?constructor ~callee (uses : uses) =
         | Raise (Some name, _) -> Raises [ name ]
         | Raise (None, _) -> Raises_any
         | Reraise (protected, _) -> raised protected
+        | Effect set -> set
         | Call (path, _, witness_argument) ->
             (* A call passing the caller's witness raises what the callee does for the
                same constructor. *)
@@ -452,7 +469,8 @@ let intersection left right =
     contract raises what its [raises] clauses say; one without raises what its body raises
     and its calls may raise. Also, per witness constructor, what each function with a
     witness parameter raises when called with it. *)
-let raise_sets ?(library = []) ~key procedures ~resolve =
+let raise_sets ?(library = []) ?(application_raises = fun _ _ -> None) ~key procedures
+    ~resolve =
   let module S = Translate_context.State_monad in
   let bodies =
     List.map procedures ~f:(fun (name, contract, body, witness, resolve) ->
@@ -460,7 +478,8 @@ let raise_sets ?(library = []) ~key procedures ~resolve =
           Option.map
             (contract : Caravan_spec.Spec_ast.contract option)
             ~f:(declared_raises ~resolve),
-          uses ~key ?witness:(Option.map witness ~f:fst) body,
+          uses ~key ?witness:(Option.map witness ~f:fst)
+            ~application_raises:(application_raises name) body,
           Option.map witness ~f:snd ))
   in
   let same left right =

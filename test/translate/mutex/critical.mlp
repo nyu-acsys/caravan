@@ -1,0 +1,69 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = exists n : int. own cell.contents n && 0 <= n
+end
+module Guard = Ghost.Mutex (Cell)
+
+proof put mutex cell
+  opens {}
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) =
+  at (Mutex.lock mutex) (fun lock ->
+    let result = lock () in
+    unfold Cell.resource cell;
+    result);
+  at (Mutex.unlock mutex) (fun unlock ->
+    fold Cell.resource cell;
+    let result = unlock () in
+    result)
+
+proof repeat mutex cell
+  opens {}
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) = ()
+
+proof result = try_put mutex cell
+  opens {}
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) =
+  at (Mutex.try_lock mutex) (fun try_lock ->
+    let success = try_lock () in
+    if success then unfold Cell.resource cell else ();
+    success);
+  at (Mutex.unlock mutex) (fun unlock ->
+    fold Cell.resource cell;
+    let result = unlock () in
+    result)
+
+proof self_try mutex cell
+  opens {}
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) = ()
+
+proof result = client () ensures (true) =
+  at (Mutex.create ()) (fun create ->
+    fold Cell.resource cell;
+    let mutex = create () in
+    Guard.initialize mutex cell;
+    mutex)
+
+proof held_loop mutex cell
+  opens {}
+  requires (Ghost.Mutex.context self held &&
+    not (Finset.mem mutex held) && Guard.is_mutex mutex cell)
+  ensures (Guard.is_mutex mutex cell) =
+  at (Mutex.lock mutex) (fun lock ->
+    let result = lock () in
+    unfold Cell.resource cell;
+    result);
+  at (cell := 1) invariant
+    (own cell.contents n && 0 <= n &&
+      Ghost.Mutex.context self (Finset.union held (Finset.singleton mutex)));
+  at (Mutex.unlock mutex) (fun unlock ->
+    fold Cell.resource cell;
+    let result = unlock () in
+    result)

@@ -1,0 +1,6 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = own cell.contents 0
+end
+
+module Guard = Ghost.Mutex (Cell)

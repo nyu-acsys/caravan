@@ -1,0 +1,16 @@
+module Make (Element : ELEMENT) = struct
+  module Counts = CountAgree (struct type t = Element.t end)
+  module Authority = Auth (Counts)
+  let slot : (Ghost.t, Authority.t) Ghost.field = Ghost.field ()
+
+  module Protected : Ghost.MutexResource with type t = Ghost.t = struct
+    type t = Ghost.t
+    predicate resource (cell : t) =
+      exists value : Element.t.
+        own (Ghost.at slot cell) (Authority.full (Counts.count_cons 1 value))
+  end
+
+  module Guard = Ghost.Mutex (Protected)
+
+  proof result = keep value ensures result === value = ()
+end

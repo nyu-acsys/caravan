@@ -1,0 +1,147 @@
+// Acquired readonly values model synchronization; OCaml refinement is separate.
+interface PublishedFieldSpec[E: Library.Type] {
+  pred private_cell(cell: Ref, value: E)
+  inv published(channel: Ref, value: E)
+  pred acquired(cell: Ref, channel: Ref, value: E)
+
+  proc create(initial: E) returns (cell: Ref)
+    ensures private_cell(cell, initial)
+    opens {}
+
+  proc write_private(cell: Ref, value: E, ghost previous: E)
+    requires private_cell(cell, previous)
+    ensures private_cell(cell, value)
+    opens {}
+
+  proc publish(cell: Ref, ghost value: E) returns (channel: Ref)
+    requires private_cell(cell, value)
+    ensures published(channel, value) && acquired(cell, channel, value)
+    opens {}
+
+  atomic proc acquire(channel: Ref, ghost value: E) returns (cell: Ref)
+    requires published(channel, value)
+    ensures published(channel, value) && acquired(cell, channel, value)
+    opens published(channel, value)
+
+  atomic proc read_frozen(cell: Ref, channel: Ref, ghost value: E)
+    returns (result: E)
+    requires acquired(cell, channel, value)
+    ensures acquired(cell, channel, value) && result == value
+    opens published(channel, value)
+
+  lemma duplicate(cell: Ref, channel: Ref, value: E)
+    requires acquired(cell, channel, value)
+    ensures acquired(cell, channel, value) && acquired(cell, channel, value)
+    opens {}
+}
+
+module PublishedField[E: Library.Type] :> PublishedFieldSpec[E] {
+  field current: E
+  field pointer: Ref
+
+  module Identity : Library.Type {
+    rep type T = (Ref, E)
+  }
+  module Witness = Library.Agree[Identity]
+  ghost field witness: Witness
+
+  pred private_cell(cell: Ref, value: E) {
+    own(cell.current, value, 1.0)
+  }
+
+  inv published(channel: Ref, value: E) {
+    exists cell: Ref :: own(channel.pointer, cell, 1.0)
+      && own(cell.current, value, 1.0)
+      && own(channel.witness, Witness.agree((cell, value)))
+  }
+
+  pred acquired(cell: Ref, channel: Ref, value: E) {
+    published(channel, value)
+      && own(channel.witness, Witness.agree((cell, value)))
+  }
+
+  proc create(initial: E) returns (cell: Ref)
+    ensures private_cell(cell, initial)
+    opens {}
+  {
+    cell := new(current: initial);
+    fold private_cell(cell, initial);
+  }
+
+  proc write_private(cell: Ref, value: E, ghost previous: E)
+    requires private_cell(cell, previous)
+    ensures private_cell(cell, value)
+    opens {}
+  {
+    unfold private_cell(cell, previous);
+    cell.current := value;
+    fold private_cell(cell, value);
+  }
+
+  proc publish(cell: Ref, ghost value: E) returns (channel: Ref)
+    requires private_cell(cell, value)
+    ensures published(channel, value) && acquired(cell, channel, value)
+    opens {}
+  {
+    unfold private_cell(cell, value);
+    channel := new(pointer: cell, witness: Witness.agree((cell, value)));
+    fold published(channel, value);
+    fold acquired(cell, channel, value);
+  }
+
+  atomic proc acquire(channel: Ref, ghost value: E) returns (cell: Ref)
+    requires published(channel, value)
+    ensures published(channel, value) && acquired(cell, channel, value)
+    opens published(channel, value)
+  {
+    unfold published(channel, value);
+    cell := channel.pointer;
+    fold published(channel, value);
+    fold acquired(cell, channel, value);
+  }
+
+  atomic proc read_frozen(cell: Ref, channel: Ref, ghost value: E)
+    returns (result: E)
+    requires acquired(cell, channel, value)
+    ensures acquired(cell, channel, value) && result == value
+    opens published(channel, value)
+  {
+    unfold acquired(cell, channel, value);
+    ghost var stored: Ref;
+    unfold published(channel, value)[stored := cell];
+    assert cell == stored;
+    result := cell.current;
+    fold published(channel, value)[cell := stored];
+    fold acquired(cell, channel, value);
+  }
+
+  lemma duplicate(cell: Ref, channel: Ref, value: E)
+    requires acquired(cell, channel, value)
+    ensures acquired(cell, channel, value) && acquired(cell, channel, value)
+    opens {}
+  {
+    unfold acquired(cell, channel, value);
+    fold acquired(cell, channel, value);
+    fold acquired(cell, channel, value);
+  }
+}
+
+module Counters = PublishedField[Int]
+
+proc published_counter()
+  opens Counters.published
+{
+  val cell := Counters.create(0);
+  Counters.write_private(cell, 1, 0);
+  Counters.write_private(cell, 42, 1);
+  val channel := Counters.publish(cell, 42);
+  val known := Counters.read_frozen(cell, channel, 42);
+  assert known == 42;
+  val observed := Counters.acquire(channel, 42);
+  Counters.duplicate(observed, channel, 42);
+  val result := Counters.read_frozen(observed, channel, 42);
+  val repeated := Counters.read_frozen(observed, channel, 42);
+  assert result == repeated;
+  assert result == 42;
+  assert result != 0 && result != 1;
+}

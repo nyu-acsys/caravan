@@ -22,6 +22,58 @@ let callable_location = function
   | Runtime_worker worker -> worker.Polymorphic_functions.loc
   | Proof_worker worker -> worker.Generic_parameters.loc
 
+let definition_operation resource (binding : Proof_bindings.binding) =
+  List.find resource.Source.resource_operations ~f:(fun (name, _, _, _) ->
+      String.equal name binding.entry.name.pid_str)
+
+let definition_predicate_alias ~types ~resources (resource : Source.proof_resource) family
+    (binding : Proof_bindings.binding) predicate =
+  let open State.Syntax in
+  let at = binding.entry.name.pid_loc in
+  let l = loc at in
+  let local_resources =
+    List.filter resources ~f:(fun candidate ->
+        Option.is_none candidate.Source.resource_application
+        && Option.equal Path.same candidate.resource_scope resource.resource_scope)
+  in
+  let types =
+    Generic_parameters.types family (Generic_assets.types local_resources types)
+  in
+  let ctx =
+    Proof_declarations.spec_context types ~shared:no_shared
+      ~ocaml_env:resource.resource_environment ~preds:[] ~spec_funcs:[]
+      ~primitive_namespace:(String.split family.name ~on:'.')
+      ()
+  in
+  match (binding.kind, definition_operation resource binding) with
+  | Predicate (declaration, _), Some (_, _, inputs, _) ->
+      let* arguments =
+        State.of_result
+          (Generic_parameters.instantiate ~environment:resource.resource_environment
+             ~opaque:(Datatypes.is_opaque types) ~expand:(Datatypes.expand types)
+             ~project:(Datatypes.representation_arguments types)
+             ~at predicate
+             (List.map inputs ~f:Option.some))
+      in
+      let parameters = Generic_parameters.parameter_types predicate arguments in
+      let* vars =
+        State.all (List.zip_exn declaration.pred_params parameters)
+          ~f:(fun ((id, _), typ) ->
+            let+ typ = State.typ ctx ~at:id.S.pid_loc typ in
+            R.Var.make ~loc:l (ident ~loc:l id.pid_str) typ)
+      in
+      let formals, returns = List.split_n vars predicate.explicit in
+      let* instance = State.value_instance ctx ~at ~target:predicate.name ~arguments in
+      let target = instance ^ "." ^ Generic_parameters.member predicate in
+      let+ () = State.note_call ctx.given target in
+      R.Member.callable
+        (R.Callable.resource_alias ~loc:l
+           ~kind:(if declaration.pred_persistent then Invariant else Predicate)
+           ~formals ~returns
+           (ident ~loc:l binding.entry.name.pid_str)
+           (qualified_name ~loc:l target))
+  | _ -> State.of_result (error at "Missing resource predicate implementation")
+
 (** The Raven program translating [source], with its histories encoded in [history], and
     the origins of its proof obligations. *)
 let program_with_diagnostics ?(history = History.default) ?scopes (source : Source.t) :
@@ -35,6 +87,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     linearizations;
     initializations;
     source;
+    mutex_execution = _;
     implementation;
     proof_implementation;
     definition_target;
@@ -69,6 +122,50 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   let complete (decls, proofs, state) =
     let* shaped = Program_structures.run ~history scopes decls proofs in
     let* translated, state = Program_members.run scopes decls proofs shaped state in
+    let* (), state =
+      State.run_from state
+        (State.map
+           (State.all decls.source.proof_resources ~f:(fun resource ->
+                match Generic_assets.resource_worker resource with
+                | Some family when not resource.Source.resource_definition ->
+                    let local_resources =
+                      List.filter decls.all_resources ~f:(fun candidate ->
+                          Option.is_none candidate.Source.resource_application
+                          && Option.equal Path.same candidate.resource_scope
+                               resource.resource_scope)
+                    in
+                    let resources = local_resources @ decls.all_resources in
+                    let types =
+                      Generic_parameters.types family
+                        (Generic_assets.types local_resources decls.types)
+                    in
+                    State.map
+                      (State.all
+                         (Generic_assets.argument_types resources resource)
+                         ~f:(State.note_domain types))
+                      ~f:(fun _ -> ())
+                | Some family
+                  when resource.Source.resource_definition
+                       && Option.is_none resource.resource_application ->
+                    State.map
+                      (State.all decls.scoped_proofs.bindings ~f:(fun binding ->
+                           match
+                             ( definition_resource binding.entry.scope,
+                               definition_operation resource binding,
+                               Generic_parameters.find decls.generic_predicates
+                                 binding.backend )
+                           with
+                           | Some owner, Some _, Some predicate
+                             when Ident.same owner.resource_id resource.resource_id ->
+                               State.map
+                                 (definition_predicate_alias ~types:decls.types
+                                    ~resources:decls.all_resources resource family binding
+                                    predicate) ~f:(fun _ -> ())
+                           | _ -> State.return ()))
+                      ~f:(fun _ -> ())
+                | _ -> State.return ()))
+           ~f:(fun _ -> ()))
+    in
     Ok (decls, proofs, shaped, translated, state)
   in
   (* Every worker's functor, as [rename] assigns it, and the workers. *)
@@ -80,7 +177,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             (not (List.is_empty field.Source.field_parameters))
             (Generic_fields.worker field))
     in
-    let proofs = decls.generic_predicates @ proofs.generic_callables in
+    let proofs =
+      decls.generic_predicates @ proofs.generic_callables
+      @ List.filter_map decls.tasks ~f:(fun task ->
+          Option.some_if task.Task_facades.emit task.worker)
+    in
     let workers =
       List.map decls.polymorphic_functions ~f:(fun worker ->
           {
@@ -195,6 +296,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     private_ra_types;
     proof_assets;
     layouts;
+    frozen_fields;
+    frozen_parameters;
     checked_modules;
     checked_operations;
     pure;
@@ -227,6 +330,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     polymorphic_functions;
     generic_predicates;
     generic_predicate_workers;
+    tasks = _;
   } =
     decls
   in
@@ -295,6 +399,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     logical_members;
     pure_funcs;
     procs;
+    task_members;
   } =
     translated
   in
@@ -313,8 +418,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   in
   let emitted_predicates destination =
     List.concat_map predicate_members ~f:(fun (key, (member, parts)) ->
-        if Module_context.same_destination destination (predicate_destination key) then
-          member :: parts
+        if
+          Module_context.same_destination destination (predicate_destination key)
+          && (Option.is_some (Generic_parameters.find generic_predicates key)
+             || Option.is_none (Option.bind (scoped_binding key) ~f:definition_target))
+        then member :: parts
         else [])
   in
   let proof_member key member =
@@ -342,51 +450,235 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   in
   (* A proof member's callables: a predicate's come with its parts'. *)
   let members_named backend =
-    List.filter_map proof_members ~f:(fun (name, member) ->
-        Option.some_if (String.equal name backend) member)
+    if
+      Option.is_some (Generic_parameters.find generic_predicates backend)
+      || Option.is_some (Generic_parameters.find generic_callables backend)
+    then []
+    else
+      List.filter_map proof_members ~f:(fun (name, member) ->
+          Option.some_if (String.equal name backend) member)
   in
-  let* definition_modules =
-    all
-      (List.filter source.proof_resources ~f:(fun resource ->
-           resource.Source.resource_definition
-           && Option.is_none resource.resource_application))
-      ~f:(fun resource ->
-        let at = resource.resource_at in
-        let l = loc at in
-        let* backend, representation =
-          match (implementation resource, resource.resource_representation) with
-          | Some backend, Some representation -> Ok (backend, representation)
-          | _ -> error at "Missing resource algebra representation"
+  let resource_lemma_parameters resource worker =
+    let at = resource.Source.resource_at in
+    let environment = resource.resource_environment in
+    let types = Generic_assets.types all_resources types in
+    let* parameters =
+      Generic_assets.infer_protected_arguments ~types ~environment ~at all_resources
+        resource worker.Generic_parameters.parameters
+    in
+    let* arguments =
+      Generic_parameters.instantiate ~environment ~opaque:(Datatypes.is_opaque types)
+        ~expand:(Datatypes.expand types)
+        ~project:(Datatypes.representation_arguments types)
+        ~at { worker with parameters }
+        (List.map resource.resource_parameters ~f:Option.some)
+    in
+    Ok (Generic_parameters.parameter_types worker arguments)
+  in
+  let definition_lemma_implementation (resource : Source.proof_resource) family
+      ~implementation (binding : Proof_bindings.binding) =
+    let open State.Syntax in
+    let at = binding.entry.name.pid_loc in
+    let types =
+      Generic_parameters.types family (Generic_assets.types all_resources types)
+    in
+    match
+      List.find lemma_declarations ~f:(fun declaration ->
+          String.equal (Proof_scopes.name declaration).pid_str binding.backend)
+    with
+    | Some (S.Proof_lemma _ as proof) ->
+        let scope = Some binding.entry.scope in
+        let lemmas = lemma_context scope in
+        let* related =
+          State.all scoped_proofs.bindings ~f:(fun candidate ->
+              match
+                ( candidate.Proof_bindings.kind,
+                  definition_resource candidate.entry.scope,
+                  Generic_parameters.find generic_callables candidate.backend )
+              with
+              | Lemma (S.Proof_lemma lemma), Some owner, Some generic
+                when Ident.same owner.resource_id resource.resource_id ->
+                  let* parameters =
+                    State.of_result (resource_lemma_parameters resource generic)
+                  in
+                  let inputs, outputs =
+                    List.split_n parameters (List.length lemma.lemma_params)
+                  in
+                  let+ signature =
+                    State.of_result
+                      (Report.expect ~at "The resource lemma signature"
+                         (List.Assoc.find lemmas candidate.backend ~equal:String.equal))
+                  in
+                  Some
+                    ( candidate.backend,
+                      {
+                        signature with
+                        lemma_generic = None;
+                        lemma_raven = implementation ^ "." ^ candidate.entry.name.pid_str;
+                        lemma_inputs = inputs;
+                        lemma_outputs = outputs;
+                      } )
+              | _ -> State.return None)
         in
-        let* representation = Datatypes.typ types ~at representation in
-        let carrier =
-          R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "T") (Some representation)
+        let lemmas = List.filter_opt related @ lemmas in
+        let preds, spec_funcs, proof_support =
+          Program_proofs.proof_context proof_env scope preds spec_funcs proof_support
         in
-        let members =
-          List.concat_map source.proof_scopes.declarations ~f:(fun entry ->
-              Option.value_map ~default:[]
-                (List.find scoped_proofs.bindings ~f:(fun binding ->
+        let+ member =
+          Proof_declarations.proof_lemma types ~shared:no_shared
+            ~ocaml_env:binding.environment ~preds ~spec_funcs ~proof_support
+            ~generic_predicates
+            ~primitive_namespace:(String.split family.name ~on:'.')
+            ~proof_lemmas:lemmas ~predicate_bodies:[]
+            ~member_name:binding.entry.name.pid_str proof
+        in
+        [ R.Member.callable member ]
+    | _ -> State.of_result (error at "Missing resource lemma implementation")
+  in
+  let* definition_modules, state =
+    State.run_from state
+      (State.all
+         (List.filter source.proof_resources ~f:(fun resource ->
+              resource.Source.resource_definition
+              && Option.is_none resource.resource_application))
+         ~f:(fun resource ->
+           let open State.Syntax in
+           let at = resource.resource_at in
+           let l = loc at in
+           let* backend, representation =
+             State.of_result
+               (match (implementation resource, resource.resource_representation) with
+               | Some backend, Some representation -> Ok (backend, representation)
+               | _ -> error at "Missing resource algebra representation")
+           in
+           let family = Generic_assets.resource_worker resource in
+           let types =
+             Option.value_map family ~default:types ~f:(fun worker ->
+                 Generic_parameters.types worker types)
+           in
+           let* representation =
+             State.of_result (Datatypes.typ types ~at representation)
+           in
+           let carrier =
+             R.Member.type_ ~loc:l ~rep:true (ident ~loc:l "T") (Some representation)
+           in
+           let bindings =
+             List.filter_map source.proof_scopes.declarations ~f:(fun entry ->
+                 List.find scoped_proofs.bindings ~f:(fun binding ->
                      Ident.same binding.entry.id entry.id
-                     && (match binding.kind with Function _ -> true | _ -> false)
+                     && (match binding.kind with
+                       | Function _ ->
+                           Option.is_none family
+                           || Program_scopes.resource_has_required_lemma resource
+                       | Predicate _
+                         when Program_scopes.resource_has_required_lemma resource ->
+                           true
+                       | Predicate _ ->
+                           List.exists resource.resource_operations
+                             ~f:(fun (name, kind, _, _) ->
+                               String.equal name binding.entry.name.pid_str
+                               &&
+                               match kind with
+                               | R.Ast.Callable.Pred | Invariant -> true
+                               | _ -> false)
+                       | Lemma _ when Program_scopes.resource_has_required_lemma resource
+                         ->
+                           true
+                       | Lemma _ ->
+                           List.exists resource.resource_operations
+                             ~f:(fun (name, kind, _, _) ->
+                               String.equal name binding.entry.name.pid_str
+                               && Poly.equal kind R.Ast.Callable.Lemma)
+                       | _ -> false)
                      && Option.exists (definition_resource binding.entry.scope)
                           ~f:(fun owner ->
                             Ident.same owner.resource_id resource.resource_id)))
-                ~f:(fun binding -> members_named binding.backend))
-        in
-        let interface =
-          qualified_name ~loc:l (String.concat ~sep:"." resource.resource_functor)
-        in
-        Ok
-          ( resource,
-            R.Member.module_ ~loc:l
-              ~implements:[ (interface, []) ]
-              (ident ~loc:l backend) (carrier :: members) ))
+           in
+           let* members =
+             State.map
+               (State.all bindings ~f:(fun binding ->
+                    match
+                      (family, Generic_parameters.find generic_predicates binding.backend)
+                    with
+                    | Some family, Some predicate
+                      when Option.is_some (definition_operation resource binding) ->
+                        State.map
+                          (definition_predicate_alias ~types ~resources:all_resources
+                             resource family binding predicate) ~f:(fun member ->
+                            [ member ])
+                    | Some family, None ->
+                        begin match
+                          ( binding.kind,
+                            Generic_parameters.find generic_callables binding.backend )
+                        with
+                        | Lemma _, Some _
+                          when Program_scopes.resource_has_required_lemma resource ->
+                            definition_lemma_implementation resource family
+                              ~implementation:backend binding
+                        | _ -> State.return (members_named binding.backend)
+                        end
+                    | _ -> State.return (members_named binding.backend)))
+               ~f:List.concat
+           in
+           let interface_name = Generic_assets.interface_name resource in
+           let interface = qualified_name ~loc:l interface_name in
+           let refined =
+             if Option.is_none resource.resource_descriptor.alias then []
+             else
+               [
+                 ( resource,
+                   R.Member.module_ ~loc:l ~interface:true
+                     ~implements:
+                       [
+                         ( qualified_name ~loc:l
+                             (String.concat ~sep:"." resource.resource_functor),
+                           [] );
+                       ]
+                     (ident ~loc:l (Qualified_name.of_string interface_name).name)
+                     [ carrier ] );
+               ]
+           in
+           State.return
+             (refined
+             @ [
+                 ( resource,
+                   R.Member.module_ ~loc:l
+                     ~implements:[ (interface, []) ]
+                     (ident ~loc:l backend)
+                     ((if List.is_empty refined then [ carrier ] else []) @ members) );
+               ])))
+  in
+  let definition_modules = List.concat definition_modules in
+  let definition_helper_modules =
+    List.filter_map source.proof_resources ~f:(fun resource ->
+        if
+          (not resource.Source.resource_definition)
+          || Option.is_some resource.resource_application
+          || List.is_empty resource.resource_parameters
+          || Program_scopes.resource_has_required_lemma resource
+        then None
+        else
+          Option.bind (implementation resource) ~f:(fun backend ->
+              let members =
+                List.concat_map scoped_proofs.bindings ~f:(fun binding ->
+                    match (binding.kind, definition_resource binding.entry.scope) with
+                    | Function _, Some owner
+                      when Ident.same owner.resource_id resource.resource_id ->
+                        members_named binding.backend
+                    | _ -> [])
+              in
+              let l = loc resource.resource_at in
+              Option.some_if
+                (not (List.is_empty members))
+                ( resource,
+                  R.Member.module_ ~loc:l (ident ~loc:l (backend ^ "$Helpers")) members )))
   in
   let definition_proof_modules =
     List.filter_map source.proof_resources ~f:(fun resource ->
         if
           (not resource.resource_definition)
           || Option.is_some resource.resource_application
+          || Program_scopes.resource_has_required_lemma resource
         then None
         else
           Option.bind (proof_implementation resource) ~f:(fun backend ->
@@ -396,7 +688,21 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       (List.find scoped_proofs.bindings ~f:(fun binding ->
                            Ident.same binding.entry.id entry.id
                            && (match binding.kind with
-                             | Predicate _ | Lemma _ -> true
+                             | Predicate _ ->
+                                 not
+                                   (List.exists resource.resource_operations
+                                      ~f:(fun (name, kind, _, _) ->
+                                        String.equal name binding.entry.name.pid_str
+                                        &&
+                                        match kind with
+                                        | R.Ast.Callable.Pred | Invariant -> true
+                                        | _ -> false))
+                             | Lemma _ ->
+                                 not
+                                   (List.exists resource.resource_operations
+                                      ~f:(fun (name, kind, _, _) ->
+                                        String.equal name binding.entry.name.pid_str
+                                        && Poly.equal kind R.Ast.Callable.Lemma))
                              | _ -> false)
                            && Option.exists (definition_resource binding.entry.scope)
                                 ~f:(fun owner ->
@@ -420,10 +726,24 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     List.filter_map members ~f:(fun (name, member) ->
         Option.some_if
           (Module_context.same_destination (proof_destination name) destination
-          && Option.is_none (Option.bind (scoped_binding name) ~f:definition_target))
+          && (Option.is_some (Generic_parameters.find generic_callables name)
+             || Option.is_none (Option.bind (scoped_binding name) ~f:definition_target)))
           member)
   in
   let emitted_assets destination members =
+    List.filter_map members ~f:(fun (resource, member) ->
+        Option.some_if
+          (match Generic_assets.resource_worker resource with
+          | Some worker ->
+              List.equal String.equal
+                (Module_context.namespace destination)
+                (String.split worker.name ~on:'.')
+          | None ->
+              Module_context.emits_owner module_contexts ~destination
+                resource.Source.resource_scope)
+          member)
+  in
+  let emitted_owner_assets destination members =
     List.filter_map members ~f:(fun (resource, member) ->
         Option.some_if
           (Module_context.emits_owner module_contexts ~destination
@@ -603,8 +923,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   in
   let field_domain_types =
     List.concat_map types ~f:(fun data ->
-        List.map (Option.value data.Datatypes.heap ~default:[]) ~f:(fun field ->
-            field.Datatypes.typ))
+        List.filter_map (Datatypes.all_fields data) ~f:(fun field ->
+            Option.some_if (not field.Datatypes.generic) field.typ))
   in
   let* argument_domains =
     all generics ~f:(fun group ->
@@ -627,7 +947,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         |> Result.map ~f:(fun groups -> List.concat (List.concat groups)))
     |> Result.map ~f:List.concat
   in
-  let argument_domains = argument_domains @ state.tables.dictionaries in
+  let argument_domains =
+    argument_domains @ state.tables.dictionaries
+    @ List.map frozen_fields.families ~f:(fun family ->
+        { domain_types = types; domain_type = family.Frozen_fields.payload })
+  in
   let layout_domain_requests =
     List.concat_map types ~f:(fun data ->
         if
@@ -970,16 +1294,77 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   let namespaces =
     List.map support_domains ~f:(fun (name, _) -> (Qualified_name.of_string name).path)
     @ List.map support_instances ~f:(fun instance -> instance.instance_namespace)
+    @ List.map callable_workers ~f:(fun worker ->
+        (Qualified_name.of_string (callable_name worker)).path)
     |> List.dedup_and_sort ~compare:(List.compare String.compare)
   in
   let domain_dependencies = Generic_support.domain_dependencies domain_requests in
-  let* support_members =
+  let module_worker_namespaces =
+    List.filter_map scopes.module_contexts.contexts ~f:(fun context ->
+        match context.Module_context.destination with
+        | Worker _ -> Some context.namespace
+        | Flat | Function_worker _ | Proof_worker _ -> None)
+  in
+  let late_support_names =
+    List.concat_map all_resources ~f:(fun resource ->
+        [ resource.Source.resource_backend ]
+        @ Option.to_list (implementation resource)
+        @ Option.value_map (Generic_assets.resource_worker resource) ~default:[]
+            ~f:(fun worker -> [ worker.name ]))
+    @ List.map callable_workers ~f:callable_name
+    @ List.map checked_modules ~f:(fun view -> view.Checked_modules.name)
+    @ List.concat_map generics ~f:(fun group ->
+        List.concat_map group.Generic_modules.applications ~f:(fun app ->
+            [ app.name; app.world; app.layout ]))
+  in
+  let below name prefix =
+    String.equal name prefix || String.is_prefix name ~prefix:(prefix ^ ".")
+  in
+  let* support_plans =
     all namespaces ~f:(fun namespace ->
-        let* members =
-          Generic_support.order ~namespace ~at:Location.none ~domains:support_domains
+        let nodes =
+          Generic_support.nodes ~namespace ~at:Location.none ~domains:support_domains
             ~domain_dependencies ~instances:support_instances
         in
-        Ok (namespace, members))
+        let* ordered = Generic_support.order_nodes ~at:Location.none nodes in
+        let owner = String.concat ~sep:"." namespace in
+        let late_support_names =
+          List.filter late_support_names ~f:(fun name -> not (below owner name))
+        in
+        let early, _ =
+          List.fold ordered
+            ~init:(Set.empty (module String), late_support_names)
+            ~f:(fun (early, late) node ->
+              if
+                List.exists node.Generic_support.dependencies ~f:(fun dep ->
+                    List.exists late ~f:(below dep))
+              then (early, node.name :: late)
+              else (Set.add early node.name, late))
+        in
+        let workers =
+          List.filter_map callable_workers ~f:(fun worker ->
+              Option.some_if
+                (List.mem module_worker_namespaces namespace
+                   ~equal:(List.equal String.equal)
+                && List.equal String.equal namespace
+                     (Qualified_name.of_string (callable_name worker)).path)
+                Generic_support.
+                  {
+                    name = callable_name worker;
+                    member = `Worker worker;
+                    dependencies =
+                      targets worker
+                      @ List.concat_map task_members ~f:(fun (owner, _, dependencies) ->
+                          if String.equal owner (callable_name worker) then dependencies
+                          else []);
+                  })
+        in
+        let* combined =
+          Generic_support.order_nodes ~at:Location.none
+            (workers
+            @ List.map nodes ~f:(fun node -> { node with member = `Value node.member }))
+        in
+        Ok (namespace, ordered, combined, early))
   in
   let rec emit_context_members ?namespace ?(library = false) destination ~at
       ~representations ~native_resources ~applications ~late_members =
@@ -1026,10 +1411,35 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
              || List.is_empty (Map.find_exn worker_dependencies (callable_name worker))))
       |> List.map ~f:(emit_callable_worker destination)
     in
+    let definition_scope =
+      (not library)
+      && (match destination with
+        | Module_context.Flat | Worker _ -> true
+        | Function_worker _ | Proof_worker _ -> false)
+      && not (List.is_empty (emitted_assets destination definition_modules))
+    in
+    let plan =
+      List.find support_plans ~f:(fun (owner, _, _, _) ->
+          List.equal String.equal namespace owner)
+    in
+    let early_names =
+      if definition_scope then
+        Option.value_map plan
+          ~default:(Set.empty (module String))
+          ~f:(fun (_, _, _, early) -> early)
+      else Set.empty (module String)
+    in
+    let early_support =
+      Option.value_map plan ~default:[] ~f:(fun (_, nodes, _, _) ->
+          List.filter_map nodes ~f:(fun node ->
+              Option.some_if (Set.mem early_names node.Generic_support.name) node.member))
+    in
     let support =
-      Option.value
-        (List.Assoc.find support_members namespace ~equal:(List.equal String.equal))
-        ~default:[]
+      Option.value_map plan ~default:[] ~f:(fun (_, nodes, _, _) ->
+          List.filter_map nodes ~f:(fun node ->
+              Option.some_if
+                (not (Set.mem early_names node.Generic_support.name))
+                node.member))
     in
     let token_members =
       List.concat_map token_types ~f:(fun data ->
@@ -1037,7 +1447,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           | Some family, Some procedure
             when List.equal String.equal namespace (String.split family.worker ~on:'.') ->
               let carrier =
-                R.Type.atomic_token ~loc:at (qualified_name ~loc:at procedure)
+                Datatypes.atomic_carrier ~loc:at ~context:data.atomic_context procedure
               in
               [
                 R.Member.type_ ~loc:at (ident ~loc:at family.member) (Some carrier);
@@ -1056,6 +1466,34 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
           then members
           else [])
     in
+    let resource_assets =
+      (* Callers select these original members by source resource backend. *)
+      let native =
+        List.filter_map native_resources ~f:(fun member ->
+            Option.bind
+              (List.find native_resource_members ~f:(fun (_, candidate) ->
+                   phys_equal member candidate))
+              ~f:(fun (backend, _) ->
+                Option.map
+                  (List.find source.proof_resources ~f:(fun resource ->
+                       String.equal backend resource.Source.resource_backend))
+                  ~f:(fun resource -> (resource, member))))
+      in
+      let declared resource =
+        Option.value
+          (List.find_mapi source.proof_scopes.declarations ~f:(fun index entry ->
+               Option.some_if
+                 (Poly.equal entry.Proof_scopes.name.pid_loc resource.Source.resource_at)
+                 index))
+          ~default:Int.max_value
+      in
+      (* Resource definitions and applications share their lexical module scope. *)
+      List.stable_sort
+        (definition_modules @ native @ public_resource_members)
+        ~compare:(fun (left, _) (right, _) ->
+          Int.compare (declared left) (declared right))
+      |> emitted_assets destination
+    in
     let stages =
       if library then [ `Function_workers; `Value_domains; `Primitives; `Late_members ]
       else
@@ -1063,9 +1501,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         | Module_context.Flat ->
             [
               `Representations;
-              `Definitions;
-              `Native_resources;
-              `Public_resources;
+              `Early_values;
+              `Resource_assets;
+              `State_support;
+              `Task_support;
               `Function_workers;
               `Applications;
               `Value_domains;
@@ -1084,12 +1523,11 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         | Module_context.Worker _ ->
             [
               `Representations;
-              `Definitions;
-              `Native_resources;
-              `Public_resources;
+              `Early_values;
+              `Resource_assets;
+              `State_support;
               `Applications;
-              `Function_workers;
-              `Value_domains;
+              `Workers_and_values;
               `Primitives;
               `Pure_functions;
               `Fields;
@@ -1105,6 +1543,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         | Module_context.Function_worker _ | Module_context.Proof_worker _ ->
             [
               `Token_types;
+              `State_support;
               `Function_workers;
               `Value_domains;
               `Family_assets;
@@ -1112,6 +1551,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               `Fields;
               `View_fields;
               `State;
+              `Task_contracts;
               `Predicates;
               `Logical_functions;
               `Lemmas;
@@ -1121,20 +1561,39 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
     in
     List.concat_map stages ~f:(function
       | `Token_types -> token_members
-      | `Family_assets -> family_resources
+      | `Family_assets ->
+          emitted_assets destination definition_modules
+          @ family_resources
+          @ emitted_assets destination public_resource_members
       | `Representations -> representations
-      | `Definitions -> emitted_assets destination definition_modules
-      | `Native_resources -> native_resources
-      | `Public_resources -> emitted_assets destination public_resource_members
+      | `Early_values -> early_support
+      | `Resource_assets -> resource_assets
       | `Applications -> applications
       | `Function_workers -> function_workers
+      | `Workers_and_values ->
+          Option.value
+            (List.find_map support_plans ~f:(fun (owner, _, members, _) ->
+                 Option.some_if
+                   (List.equal String.equal namespace owner)
+                   (List.filter_map members ~f:(fun node ->
+                        Option.some_if
+                          (not (Set.mem early_names node.Generic_support.name))
+                          node.member))))
+            ~default:[]
+          |> List.concat_map ~f:(function
+            | `Value member -> [ member ]
+            | `Worker worker -> [ emit_callable_worker destination worker ])
+          |> fun members -> members @ defaults
       | `Value_domains -> support @ defaults
       | `View_fields -> ghost_fields
       | `Fields -> emitted_fields destination explicit_fields
-      | `Proof_definitions -> emitted_assets destination definition_proof_modules
+      | `Proof_definitions ->
+          emitted_owner_assets destination
+            (definition_helper_modules @ definition_proof_modules)
+      (* Task contracts in nested workers can mention these history types. *)
+      | `State_support -> state_members destination structure_member_lists
       | `State ->
-          state_members destination structure_member_lists
-          @ state_members destination pending_member_lists
+          state_members destination pending_member_lists
           @ state_members destination action_check_lists
       | `Late_members -> late_members
       | `Primitives -> primitive_members
@@ -1149,6 +1608,13 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               R.Member.callable member)
       | `Lemmas -> emitted_proofs destination proof_lemma_members
       | `Logical_functions -> emitted_proofs destination logical_members
+      | `Task_support ->
+          if List.is_empty decls.tasks then []
+          else Domain_contract.support ~loc:at Task_facades.model
+      | `Task_contracts ->
+          List.concat_map task_members ~f:(fun (owner, members, _) ->
+              if String.equal owner (String.concat ~sep:"." namespace) then members
+              else [])
       | `Procedures -> (
           List.map (owned destination procs) ~f:procedure_member
           @
@@ -1241,7 +1707,10 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         let* ra_data =
           all
             (List.filter_map private_ra_types ~f:(fun (plan, data) ->
-                 Option.some_if (phys_equal plan.Generic_proofs.group group) data))
+                 Option.some_if
+                   (phys_equal plan.Generic_proofs.group group
+                   && Datatypes.needs_module data)
+                   data))
             ~f:(Datatypes.member types)
         in
         let destination = Module_context.Worker group in
@@ -1307,7 +1776,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             in
             let* data_members =
               all
-                (List.filter layout_types ~f:(fun d -> Option.is_none d.Datatypes.heap))
+                (List.filter layout_types ~f:Datatypes.needs_module)
                 ~f:(Datatypes.member environment)
             in
             let* family_parts =
@@ -1320,14 +1789,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
             let* fields =
               all
                 (List.concat_map layout_types ~f:(fun d ->
-                     List.map (Option.value d.Datatypes.heap ~default:[]) ~f:(fun field ->
-                         (d, field))))
+                     List.map (Datatypes.all_fields d) ~f:(fun field -> (d, field))))
                 ~f:(fun (d, field) ->
-                  let* typ =
-                    Datatypes.typ environment ~at:d.Datatypes.at field.Datatypes.typ
-                  in
-                  let leaf = (Qualified_name.of_string field.raven_field).name in
-                  Ok (Datatypes.field_member environment ~loc:l leaf typ field.typ))
+                  Datatypes.record_field_member environment ~at:d.Datatypes.at field)
             in
             let projection =
               Option.value_map proof_plan ~default:Subst.identity
@@ -1398,8 +1862,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                                Ctype.newconstr (Path.Pident id) []))
                     in
                     own
-                    @ List.map (Option.value data.heap ~default:[]) ~f:(fun field ->
-                        field.Datatypes.typ))
+                    @ List.filter_map (Datatypes.all_fields data) ~f:(fun field ->
+                        Option.some_if (not field.Datatypes.generic) field.typ))
                 @ cell_payloads
               in
               let requests =
@@ -1417,8 +1881,28 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               let* members =
                 Datatypes.domain_members ~dictionaries:true cell_environment requested
               in
+              let refinements =
+                List.concat_map (state.tables.domains @ state.tables.dictionaries)
+                  ~f:(fun request ->
+                    Datatypes.requested_refinements request.domain_types
+                      [ request.domain_type ])
+                |> List.filter_map ~f:(fun (data, allowed) ->
+                    let paths =
+                      data.Datatypes.paths
+                      @ Option.to_list (Option.map data.id ~f:(fun id -> Path.Pident id))
+                    in
+                    Option.bind
+                      (List.find_map paths ~f:(Datatypes.find cell_environment))
+                      ~f:(fun data ->
+                        Option.some_if
+                          (List.exists layout_types ~f:(fun layout ->
+                               Option.equal (List.equal String.equal)
+                                 data.Datatypes.module_path layout.Datatypes.module_path))
+                          (let name = Datatypes.refinement_factory_name data allowed in
+                           (name, Datatypes.refinement_factory data allowed name))))
+              in
               Ok
-                ( members,
+                ( Datatypes.unique_domain_members (refinements @ members),
                   Datatypes.value_templates ~dictionaries:true cell_environment requested
                 )
             in
@@ -1426,7 +1910,8 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
               List.filter_map layout_domain_members ~f:(fun (name, member) ->
                   Option.some_if
                     (List.equal String.equal (Qualified_name.of_string name).path
-                       [ world; "Shape" ])
+                       [ world; "Shape" ]
+                    && not (List.Assoc.mem family_members name ~equal:String.equal))
                     member)
             in
             let world_domains =
@@ -1452,12 +1937,14 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       (List.equal String.equal (Qualified_name.of_string name).path
                          [ world; "Shape" ])
                       member)
-                @ layout_domains @ fields)
+                @ layout_domains @ fields
+                @ Frozen_fields.layout_members frozen_fields group ~abstract:true)
             in
             let factory =
               R.Member.unit_factory ~loc:l
                 ~implements:[ (q (world ^ ".Shape"), []) ]
-                (ident ~loc:l "Fresh") []
+                (ident ~loc:l "Fresh")
+                (Frozen_fields.layout_members frozen_fields group ~abstract:false)
             in
             let applicative_factory =
               R.Member.module_ ~loc:l
@@ -1466,7 +1953,7 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                        (ident ~loc:l stage.parameter, q stage.interface)))
                 ~implements:[ (q (world ^ ".Shape"), []) ]
                 (ident ~loc:l "Applied_layout")
-                []
+                (Frozen_fields.layout_members frozen_fields group ~abstract:false)
             in
             Ok
               ( (fun applications ->
@@ -1475,7 +1962,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                       (List.map (Generic_modules.type_slots group) ~f:(fun stem ->
                            ( ident ~loc:l stem,
                              qualified_name ~loc:l
-                               (Generic_modules.type_slot_interface group stem) )))
+                               (Generic_modules.type_slot_interface group stem) ))
+                      @ Frozen_parameters.world_parameters frozen_parameters group ~loc:l
+                      )
                     (ident ~loc:l world)
                     (world_domains @ interface @ [ shape; factory ]
                     @ (if
@@ -1596,8 +2085,14 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
                             |> Result.map ~f:(fun carriers -> ordinary @ carriers)))
                     |> Result.map ~f:List.concat
                   in
+                  let* frozen_arguments =
+                    Frozen_parameters.world_arguments frozen_parameters
+                      ~fields:frozen_fields ~inventory ~types ~contexts:module_contexts
+                      group application ~loc:l
+                  in
+                  let arguments = arguments @ frozen_arguments in
                   let selected =
-                    if List.is_empty (Generic_modules.type_slots group) then
+                    if List.is_empty arguments then
                       R.Member.alias ~loc:l
                         (ident ~loc:l (Qualified_name.of_string application.world).name)
                         (q world)
@@ -1865,7 +2360,9 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
   let native_modules = List.concat (List.rev native_blocks) in
   let pending_declarations, pending_domains, pending_workers, pending_fields = pending in
 
-  let file_start = { Lexing.dummy_pos with pos_fname = source.file } in
+  let file_start =
+    { Lexing.pos_fname = source.file; pos_lnum = 1; pos_bol = 0; pos_cnum = 0 }
+  in
   let start = R.Loc.make file_start file_start in
   let root_members =
     emit_context_members Module_context.Flat ~at:start ~representations:[]
@@ -1874,6 +2371,25 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         (List.concat_map
            (pending_declarations @ pending_domains @ pending_workers @ pending_fields)
            ~f:snd)
+  in
+  let visibility_execution = Source.visibility_required source in
+  let transferable_resource_support =
+    List.exists source.proof_resources ~f:(fun resource ->
+        List.equal String.equal resource.Source.resource_functor
+          [ Mutex_visibility_contract.protocol_name ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_visibility_contract.resource_interface ])
+  in
+  let mutex_protocol_support =
+    List.exists source.proof_resources ~f:(fun resource ->
+        List.equal String.equal resource.Source.resource_functor
+          [ Mutex_contract.protocol_name ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_contract.resource_interface ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_visibility_contract.protocol_name ]
+        || List.equal String.equal resource.resource_functor
+             [ Mutex_visibility_contract.resource_interface ])
   in
   Ok
     ( R.Program.make ~loc:start
@@ -1904,10 +2420,44 @@ let program_with_diagnostics ?(history = History.default) ?scopes (source : Sour
         @ (if List.exists structure_member_lists ~f:(fun (st, _) -> has_history st) then
              History.program_members history
            else [])
+        @ (if mutex_protocol_support then
+             Mutex_contract.complete_support ~visibility:visibility_execution ~loc:start
+               ()
+             @
+             if transferable_resource_support then
+               Mutex_visibility_contract.support ~loc:start ()
+             else []
+           else if state.tables.mutex_support then Mutex_contract.support ~loc:start ()
+           else [])
+        @ (if
+             (visibility_execution || scopes.mutex_execution)
+             && not mutex_protocol_support
+           then
+             Execution_contract.support ~loc:start ~mutex:scopes.mutex_execution
+               ~visibility:visibility_execution ()
+           else [])
+        @ (if
+             scopes.mutex_execution && state.tables.mutex_support
+             && not mutex_protocol_support
+           then [ Mutex_contract.native_support ~loc:start () ]
+           else [])
+        @ (if state.tables.condition_support && not mutex_protocol_support then
+             Condition_contract.support ~loc:start ()
+           else [])
+        @ (if
+             List.exists (source.field_disciplines @ source.signature_field_disciplines)
+               ~f:(fun field ->
+                 Poly.equal field.Field_disciplines.kind Field_disciplines.Relaxed)
+             || List.exists source.proof_access_fields ~f:(fun field ->
+                 Poly.equal field.Access_fields.kind S.Relaxed)
+           then Relaxed_fields_contract.support ~loc:start ()
+           else [])
+        @ Frozen_fields.declarations frozen_fields
         @ imported_resource_members @ modules @ value_factories
         @ List.filter_map shared_exception_members ~f:(fun (_, members) ->
             Option.map members ~f:fst)
-        @ ready_domains @ ready_cells @ fields @ library_modules @ root_members),
+        @ ready_domains @ ready_cells @ fields @ library_modules @ root_members
+        @ Frozen_fields.instances frozen_fields),
       state.origins,
       List.rev state.warnings )
 

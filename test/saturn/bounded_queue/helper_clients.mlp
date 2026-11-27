@@ -1,0 +1,259 @@
+proof result = initialize_node value ensures (result = 7) =
+  at (set_counter node 7) (fun write ->
+    unfold allocated Ghost.self node (Some value) 0 0 Null;
+    let result = write 0 in
+    Counter.freeze node;
+    result);
+  at (set_capacity node 3) (fun write ->
+    let (_event, writes) = Capacity.snapshot node in
+    let (result, _written) = write (false, 0, writes, Set.empty) in result);
+  at (get_counter node) (fun read -> let result = read () in result)
+
+proof result = stale_capacity value
+  ensures (match result with first, second -> first = 3 && (second = 2 || second = 3)) =
+  let initial = at (set_capacity node 3) (fun write ->
+    unfold allocated Ghost.self node (Some value) 0 0 Null;
+    let (_event, writes) = Capacity.snapshot node in
+    let (result, _written) = write (false, 0, writes, Set.empty) in
+    let (event, all) = Capacity.snapshot node in
+    let _cut = Capacity.publish node in
+    (result, (event, all))) in
+  at (let first = get_capacity node) (fun read ->
+    let (event, all) = initial in
+    let result = read (3, all, Set.singleton (event, 3)) in result);
+  let changed = at (set_capacity node 2) (fun write ->
+    let (event, all) = initial in
+    let (result, written) = write (true, 3, all, Set.singleton (event, 3)) in
+    (result, (written, Set.union all (Set.singleton (written, 2))))) in
+  at (let second = get_capacity node) (fun read ->
+    let (initial_event, _initial_all) = initial in
+    let (event, all) = changed in
+    let result = read (2, all, Set.union (Set.singleton (initial_event, 3))
+      (Set.singleton (event, 2))) in result)
+
+proof result = link_candidate value
+  ensures (match result with None -> true | Some (counter, actual, expected) ->
+    counter = 1 && actual === expected) =
+  let first_channel = at (let first = make_node ~value ~capacity:1 ~counter:0 Null) (fun make ->
+    let first = make () in
+    let channel = unfold allocated Ghost.self first (Some value) 1 0 Null {channel} in
+    (first, channel)) in
+  let prior = at (let linked = compare_and_set_next first (Link Null) (Link second)) (fun cas ->
+    unfold allocated Ghost.self second (Some value) 0 1 Null;
+    let counter_view = Counter.release_private second in
+    let (payload_event, _payload_all) = Payload.snapshot second in
+    let (capacity_event, _capacity_all) = Capacity.snapshot second in
+    let fields_view = Ghost.merge_views Ghost.self (Set.singleton payload_event) (Set.singleton capacity_event) in
+    let released = Ghost.merge_views Ghost.self counter_view fields_view in
+    let result = cas (first_channel, Link Null, Set.empty, released) in
+    (result, released)) in
+  at (fenceless_get_next first) (fun read ->
+    Counter.freeze second;
+    let _payload_cut = Payload.publish second in
+    let _capacity_cut = Capacity.publish second in
+    let result = read (first_channel, Link second, prior) in
+    Counter.observe second prior;
+    Capacity.acquire second prior;
+    Payload.acquire second prior;
+    result);
+  at (get_counter actual) (fun read -> let result = read () in result);
+  at (set_counter second 2) (fun write -> let result = write 1 in result)
+
+proof result = failed_retry value
+  ensures (match result with linked, candidate -> not linked &&
+    allocated Ghost.self candidate (Some value) 0 2 Null) =
+  let first_channel = at (let first = make_node ~value ~capacity:1 ~counter:0 successor) (fun make ->
+    let first = make () in
+    let channel = unfold allocated Ghost.self first (Some value) 1 0 successor {channel} in
+    (first, channel)) in
+  let cleanup_key = at (let linked = compare_and_set_next first (Link Null) (Link candidate)) (fun cas ->
+    let candidate_state = unfold allocated Ghost.self candidate (Some value) 0 1 Null in
+    let prior = Counter.release_private candidate in
+    let result = cas (first_channel, Link successor, Set.empty, prior) in
+    (result, candidate_state.cleanup_key)) in
+  at (set_counter candidate 2) (fun write ->
+    let result = write 1 in
+    fold allocated Ghost.self candidate (Some value) 0 2 Null {cleanup_key = cleanup_key};
+    result)
+
+proof help_current_tail [key : Ghost.t] queue
+  requires (is_queue queue key)
+  ensures (is_queue queue key) =
+  at (let node = Atomic.get queue.tail) Ghost.State.acquire_scope (fun read () ->
+    let current = unfold is_queue queue key in
+    let result = read current.tail.incoming in
+    issue_fact key current.nodes current.head.position (Published current.tail);
+    fold is_queue queue key;
+    (result, current.tail));
+  at (fix_tail queue.tail node) Ghost.State.scope (fun invoke info ->
+    let result = invoke (queue, key, info) in
+    (result, ()))
+
+proof result = push_once value
+  opens {Counter.frozen}
+  ensures (match result with q, pushed -> exists key : Ghost.t.
+    q.capacity = 2 && is_queue q key && queue q key (if pushed then [value] else [])) =
+  at (try_push queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = push_or_raise value
+  opens {Counter.frozen}
+  ensures (exists key : Ghost.t. result.capacity = 2 && is_queue result key && queue result key [value])
+  raises Full -> (true) =
+  at (push_exn queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = peek_empty () ensures (result === None) =
+  at (peek_opt queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = peek_empty_exn () ensures (false) raises Empty -> (true) =
+  at (peek_exn queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = push_peek value
+  opens {Counter.frozen}
+  ensures (match result with pushed, observed ->
+    observed === (if pushed then Some value else None)) =
+  let key = at (try_push queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (peek_opt queue) (fun invoke -> let result = invoke key in result)
+
+proof result = push_peek_exn value
+  opens {Counter.frozen}
+  ensures (result === value)
+  raises Empty -> (false)
+  raises Full -> (true) =
+  let key = at (push_exn queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (peek_exn queue) (fun invoke -> let result = invoke key in result)
+
+proof result = pop_empty () ensures (result === None) =
+  at (pop_opt queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = pop_empty_exn () ensures (false) raises Empty -> (true) =
+  at (pop_exn queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in result)
+
+proof result = push_pop value
+  opens {Counter.frozen}
+  ensures (match result with pushed, observed ->
+    observed === (if pushed then Some value else None)) =
+  let key = at (try_push queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (pop_opt queue) (fun invoke -> let result = invoke key in result)
+
+proof result = push_pop_exn value
+  opens {Counter.frozen}
+  ensures (result === value)
+  raises Empty -> (false)
+  raises Full -> (true) =
+  let key = at (push_exn queue value) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (pop_exn queue) (fun invoke -> let result = invoke key in result)
+
+proof result = fifo_reuse first second
+  opens {Counter.frozen}
+  ensures (match result with removed, observed, reused, empty ->
+    removed === first && observed === second && reused === first && empty === None)
+  raises Empty -> (false)
+  raises Full -> (true) =
+  let key = at (push_exn queue first) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 2 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (push_exn queue second) (fun invoke -> let result = invoke key in result);
+  at (let removed = pop_exn queue) (fun invoke -> let result = invoke key in result);
+  at (peek_exn queue) (fun invoke -> let result = invoke key in result);
+  at (drop_exn queue) (fun invoke -> let result = invoke key in result);
+  at (push_exn queue again) (fun invoke -> let result = invoke key in result);
+  at (let reused = pop_exn queue) (fun invoke -> let result = invoke key in result);
+  at (pop_opt queue) (fun invoke -> let result = invoke key in result)
+
+proof result = empty_query () ensures (result) =
+  at (is_empty queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 1 in
+    let result = invoke empty.key in result)
+
+proof result = query_cycle value
+  opens {Counter.frozen}
+  ensures (match result with before, during, after, removed ->
+    before && not during && after && removed === value)
+  raises Full -> (true)
+  raises Empty -> (false) =
+  let key = at (let before = is_empty queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 1 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (push_exn queue value) (fun invoke -> let result = invoke key in result);
+  at (let during = is_empty queue) (fun invoke -> let result = invoke key in result);
+  at (pop_exn queue) (fun invoke -> let result = invoke key in result);
+  at (let after = is_empty queue) (fun invoke -> let result = invoke key in result)
+
+proof result = fullness_cycle value
+  opens {Counter.frozen}
+  ensures (match result with before, during, count, after, removed ->
+    not before && during && count = 1 && not after && removed === value)
+  raises Full -> (true)
+  raises Empty -> (false) =
+  let key = at (let before = is_full queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 1 in
+    let result = invoke empty.key in (result, empty.key)) in
+  at (push_exn queue value) (fun invoke -> let result = invoke key in result);
+  at (let during = is_full queue) (fun invoke -> let result = invoke key in result);
+  at (length queue) (fun invoke -> let result = invoke key in result);
+  at (pop_exn queue) (fun invoke -> let result = invoke key in result);
+  at (let after = is_full queue) (fun invoke -> let result = invoke key in result)
+
+proof result = zero_capacity_full ()
+  opens {Counter.frozen}
+  ensures (result) =
+  at (is_full queue) (fun invoke ->
+    let empty = unfold empty_queue Ghost.self queue 0 in
+    let result = invoke empty.key in result)
+
+module Push_contract_clients = struct
+  proof result = push_available value
+    opens {Counter.frozen}
+    ensures (match result with accepted, observed -> accepted && observed === Some value) =
+    let key = at (try_push queue value) (fun invoke ->
+      let empty = unfold empty_queue Ghost.self queue 1 in
+      let result = invoke empty.key in (result, empty.key)) in
+    at (peek_opt queue) (fun invoke -> let result = invoke key in result)
+
+  proof result = push_full value
+    opens {Counter.frozen}
+    ensures (not result)
+    raises Full -> (false) =
+    let key = at (push_exn queue value) (fun invoke ->
+      let empty = unfold empty_queue Ghost.self queue 1 in
+      let result = invoke empty.key in (result, empty.key)) in
+    at (try_push queue value) (fun invoke -> let result = invoke key in result)
+
+  proof push_exn_zero value
+    opens {Counter.frozen}
+    ensures (false)
+    raises Full -> (true) =
+    at (push_exn queue value) (fun invoke ->
+      let empty = unfold empty_queue Ghost.self queue 0 in
+      let result = invoke empty.key in result)
+
+  proof result = push_reuse value
+    opens {Counter.frozen}
+    ensures (match result with first, removed, second ->
+      first && removed === Some value && second) =
+    let key = at (let first = try_push queue value) (fun invoke ->
+      let empty = unfold empty_queue Ghost.self queue 1 in
+      let result = invoke empty.key in (result, empty.key)) in
+    at (pop_opt queue) (fun invoke -> let result = invoke key in result);
+    at (let second = try_push queue value) (fun invoke -> let result = invoke key in result)
+end

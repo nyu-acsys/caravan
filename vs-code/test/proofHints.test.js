@@ -9,7 +9,7 @@ const workspace = path.dirname(root);
 const range = { start: { line: 0, character: 0 }, end: { line: 20, character: 0 } };
 const step = (text, line = 3, character = 8) => ({ text,
   location: { file: root, start: { line, character }, end: { line, character } },
-  sourceLocation: { file: path.resolve('proof [source].proof'),
+  sourceLocation: { file: path.resolve('proof [source].mlp'),
     start: { line: 7, character: 4 }, end: { line: 8, character: 12 } } });
 
 test('proof hints show short directives and link exact original proof ranges', () => {
@@ -22,7 +22,7 @@ test('proof hints show short directives and link exact original proof ranges', (
     range: { start: original.sourceLocation.start, end: original.sourceLocation.end }
   });
   assert.equal(hint.tooltip.kind, 'markdown');
-  assert.ok(hint.tooltip.value.includes('Proof step from [proof \\[source\\].proof:8]'));
+  assert.ok(hint.tooltip.value.includes('Proof step from [proof \\[source\\].mlp:8]'));
   assert.ok(hint.tooltip.value.includes('```caravan-proof\nproof fold stack t []\n```'));
 });
 

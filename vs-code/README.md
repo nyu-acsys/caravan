@@ -61,7 +61,7 @@ $ code --extensionDevelopmentPath="$PWD" /path/to/ocaml/workspace
 ```
 
 Install OCaml Platform in the development host and configure Caravan there.
-Check `.ml` and `.mli` annotations, `.proof` highlighting, manual verification,
+Check `.ml` and `.mli` annotations, `.mlp` highlighting, manual verification,
 verification after save, edits during verification, and a missing executable.
 
 ### Selecting a development toolchain

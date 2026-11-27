@@ -1,0 +1,16 @@
+proof ordered =
+  at ((Atomic.get left)[@occurrence 1]) Ghost.State.scope (fun step known ->
+    let result = step () in
+    assert (known = 2);
+    (result, result));
+  at (Atomic.get middle) Ghost.State.scope (fun step known ->
+    let result = step () in
+    assert (known = 3);
+    (result, result));
+  at (Atomic.get right) Ghost.State.scope (fun step () ->
+    let result = step () in
+    (result, result));
+  at (Atomic.get left) Ghost.State.scope (fun step known ->
+    let result = step () in
+    assert (known = 1);
+    (result, known))

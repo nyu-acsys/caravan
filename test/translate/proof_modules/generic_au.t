@@ -25,7 +25,7 @@ An AU token can only be bound in its operation, including generic workers.
 The generic worker still enforces the AU lifecycle.
 
   $ ! caravan --shh generic_au_double_open.ml > generic_au_double_open.out 2>&1
-  $ grep -q 'Verification Error: Atomic token .* is already open.' generic_au_double_open.out
+  $ grep -q 'Verification Error: Cannot open atomic token .* while another atomic update is still open; commit or abort it first.' generic_au_double_open.out
 
 A sealed functor verifies its private AU proof and hides the facade from callers.
 

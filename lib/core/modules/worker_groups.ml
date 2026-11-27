@@ -50,7 +50,8 @@ let shareable user target arguments =
   | _ -> false
 
 (** The uses between nodes, by user, with weight 0 when user and target may share a
-    functor. [applications] maps the applications of generic modules to those modules. *)
+    functor. Enclosing modules supply lexical scope without a dependency. [applications]
+    maps the applications of generic modules to those modules. *)
 let weighted_uses ~applications nodes uses =
   let resolve name =
     List.find_map applications ~f:(fun (application, generic) ->
@@ -63,6 +64,13 @@ let weighted_uses ~applications nodes uses =
     ~init:(Map.empty (module String))
     ~f:(fun edges use ->
       match (owner nodes use.namespace, owner nodes (resolve use.target)) with
+      | Some user, Some (Generic_module target)
+        when List.is_prefix
+               (path (node_name user))
+               ~prefix:(path target) ~equal:String.equal
+             && List.is_prefix (path use.target) ~prefix:(path target) ~equal:String.equal
+        ->
+          edges
       | Some user, Some target when not (String.equal (node_name user) (node_name target))
         ->
           let weight =

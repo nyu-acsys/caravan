@@ -1,0 +1,7 @@
+module Payload = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)
+proof result = misuse cell
+  requires (Payload.state cell current writes) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    assert (result === true || result === false);
+    result)

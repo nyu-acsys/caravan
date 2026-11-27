@@ -1,0 +1,8 @@
+proc write_after_publication()
+  opens Counters.published
+{
+  val cell := Counters.create(0);
+  val channel := Counters.publish(cell, 0);
+  val observed := Counters.acquire(channel, 0);
+  Counters.write_private(observed, 1, 0);
+}

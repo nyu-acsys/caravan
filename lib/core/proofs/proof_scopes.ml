@@ -30,7 +30,9 @@ let name = function
   | Proof_type { type_name; _ } -> type_name
   | Proof_resource { resource_name; _ } -> resource_name
   | Proof_au { au_name; _ } -> au_name
+  | Proof_task { task_name; _ } -> task_name
   | Proof_field { field_name; _ } -> field_name
+  | Proof_access_field { access_name; _ } -> access_name
   | Proof_function { function_name; _ } -> function_name
   | Proof_lemma { lemma_name; _ } -> lemma_name
   | Proof_state { state_name; _ } -> state_name
@@ -285,9 +287,17 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
                 Ok (state, scope, scopes, entries)
             end
         | S.Proof_definition
-            { module_name; module_interface; module_declarations; module_loc; _ } ->
+            {
+              module_name;
+              module_interface;
+              module_constraints;
+              module_declarations;
+              module_loc;
+              _;
+            } ->
             let* state, scope =
               prepare_definition state scope module_name module_interface
+                module_constraints
             in
             let scopes = replace_scope scope scopes in
             let* nested =
@@ -326,7 +336,7 @@ let resolve_prepared ?(location = Location.none) ~environment ~state ~prepare_de
 let resolve ?location ~environment structure declarations =
   Result.map
     (resolve_prepared ?location ~environment ~state:()
-       ~prepare_definition:(fun () scope _ _ -> Ok ((), scope))
+       ~prepare_definition:(fun () scope _ _ _ -> Ok ((), scope))
        structure declarations)
     ~f:snd
 

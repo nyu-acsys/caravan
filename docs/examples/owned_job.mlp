@@ -1,0 +1,14 @@
+proof result = create id work
+  ensures own result.id id && own result.work work = ()
+
+proof prepare job work
+  requires own job.work previous
+  ensures own job.work work = ()
+
+proof result = inspect job
+  requires own job.work work
+  ensures own job.work work && result === work = ()
+
+module Reader = Ghost.Task (struct let operation = inspect end)
+
+proof result = client () ensures result === 42 = ()

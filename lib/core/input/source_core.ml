@@ -53,7 +53,9 @@ type proof_resource = {
   resource_type_members : (string * Ident.t * Types.type_declaration) list;
   resource_type : Types.type_expr;
   resource_id : Ident.t;
-  resource_operations : (string * Types.type_expr list * Types.type_expr) list;
+  resource_operations :
+    (string * Raven_api.Ast.Callable.call_kind * Types.type_expr list * Types.type_expr)
+    list;
   resource_constants : string list;
   resource_descriptor : Datatypes.t;
   resource_aliases : Datatypes.t list;
@@ -109,6 +111,20 @@ let au_has_path au path =
     | Path.Pdot (owner, "token") -> Path.same path owner
     | Pident _ | Pdot _ | Papply _ | Pextra_ty _ -> false)
 
+type proof_task = {
+  task_name : string;
+  task_scope : Path.t option;
+  task_id : Ident.t;
+  task_path : Path.t;
+  task_environment : Env.t;
+  task_operation : S.qualid;
+  task_operation_path : Path.t;
+  task_operation_type : Types.type_expr;
+  task_parameters : Types.type_expr list;
+  task_at : Location.t;
+  task_application : (Path.t * Ident.t) option;
+}
+
 type t = {
   file : string;
   text : string;
@@ -116,7 +132,7 @@ type t = {
   typed : Typedtree.structure;
   comments : (string * Location.t) list;  (** With their text, without delimiters. *)
   outline_annotations : Annotation.t list;
-      (** The annotations that the proof outlines of the [.proof] file stand for. *)
+      (** The annotations that the proof outlines of the [.mlp] file stand for. *)
   env : Env.t;
       (** The environment at the end of the file, for types in annotations, with the type
           [integer], [sequence], [finset], [set], and [map] of specifications. *)
@@ -127,7 +143,11 @@ type t = {
   proof_resources : proof_resource list;
   signature_resources : (Location.t * proof_resource) list;
   proof_fields : proof_field list;
+  field_disciplines : Field_disciplines.t list;
+  signature_field_disciplines : Field_disciplines.t list;
+  proof_access_fields : Access_fields.t list;
   proof_aus : proof_au list;
+  proof_tasks : proof_task list;
   proof_applications : Functor_context.application list;
   pending : Path.t;
       (** The type ['k pending] of specifications: calls of an operation waiting to be
@@ -138,7 +158,29 @@ type t = {
   libraries : library list;
   project_dependencies : string list;
   spec_bindings : Types.signature;
+  proof_file : string option;  (** The companion proof file, if there is one. *)
 }
+
+(** The start of [file], for diagnostics about the file as a whole. *)
+let file_start file =
+  let start = { Lexing.pos_fname = file; pos_lnum = 1; pos_bol = 0; pos_cnum = 0 } in
+  { Location.loc_start = start; loc_end = start; loc_ghost = false }
+
+(** The extension of companion proof files. *)
+let proof_extension = ".mlp"
+
+(** The extension of companion proof files before [.mlp], still accepted. *)
+let legacy_proof_extension = ".proof"
+
+let visibility_required source =
+  Field_disciplines.shared source.field_disciplines
+  || Field_disciplines.shared source.signature_field_disciplines
+  || (not (List.is_empty source.proof_access_fields))
+  || List.exists source.proof_resources ~f:(fun resource ->
+      List.equal String.equal resource.resource_functor
+        [ Mutex_visibility_contract.resource_interface ]
+      || List.equal String.equal resource.resource_functor
+           [ Mutex_visibility_contract.protocol_name ])
 
 let library_proof_for_owner source owner =
   Option.bind owner ~f:(fun owner ->
@@ -292,6 +334,7 @@ let rec longident : S.qualid -> Longident.t = function
 
 let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
   match t with
+  | PTtyany -> Ast_helper.Typ.any ~loc:at ()
   | PTtyvar id -> Ast_helper.Typ.var ~loc:id.pid_loc id.pid_str
   | PTtyapp (q, args) ->
       let loc = S.qualid_loc q in
@@ -302,6 +345,20 @@ let rec core_type ~(at : Location.t) (t : S.pty) : Parsetree.core_type =
       Ast_helper.Typ.tuple ~loc:at (List.map ts ~f:(fun t -> (None, core_type ~at t)))
   | PTarrow (a, b) ->
       Ast_helper.Typ.arrow ~loc:at Nolabel (core_type ~at a) (core_type ~at b)
+  | PTvariant (bound, tags) ->
+      let fields =
+        List.map tags ~f:(fun tag ->
+            Ast_helper.Rf.tag ~loc:tag.pid_loc
+              { txt = tag.pid_str; loc = tag.pid_loc }
+              true [])
+      in
+      let closed, present =
+        match bound with
+        | Closed_row -> (Asttypes.Closed, None)
+        | Lower_row -> (Open, None)
+        | Upper_row -> (Closed, Some [])
+      in
+      Ast_helper.Typ.variant ~loc:at fields closed present
 
 let find_type_by_name env name =
   try Some (Env.find_type_by_name (Lident name) env) with Stdlib.Not_found -> None

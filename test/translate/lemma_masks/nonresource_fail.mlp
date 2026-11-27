@@ -1,0 +1,2 @@
+let condition (value : int) : bool = true
+lemma closed opens { condition 0 } = ()

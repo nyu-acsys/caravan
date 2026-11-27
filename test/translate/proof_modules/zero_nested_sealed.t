@@ -15,7 +15,7 @@ The inner signature hides the helper in source and proof code.
   $ grep -q 'Unbound module World.Inner' zero_nested_sealed_hidden_source.out
 
   $ cp zero_nested_sealed.ml zero_nested_sealed_hidden_proof.ml
-  $ cat zero_nested_sealed.proof > zero_nested_sealed_hidden_proof.proof
-  $ printf '\nlemma leak (value : World.Inner.Helper.model) = ()\n' >> zero_nested_sealed_hidden_proof.proof
+  $ cat zero_nested_sealed.mlp > zero_nested_sealed_hidden_proof.mlp
+  $ printf '\nlemma leak (value : World.Inner.Helper.model) = ()\n' >> zero_nested_sealed_hidden_proof.mlp
   $ ! caravan --shh zero_nested_sealed_hidden_proof.ml > zero_nested_sealed_hidden_proof.out 2>&1
   $ grep -q 'Unbound module World.Inner' zero_nested_sealed_hidden_proof.out

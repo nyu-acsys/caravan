@@ -1,0 +1,23 @@
+invariant shared (a : int array) =
+  exists share : Permission.t.
+    forall j : int. 0 <= j && j < Array.length a -> own ~fraction:share (Array.cell a j) 0
+
+predicate slot (a : int array) (i : int) (v : int) = own (Array.cell a i) v
+
+proof result = read a i
+  requires (shared a && 0 <= i && i < Array.length a)
+  ensures (result = 0) =
+  at (a.(i)) (fun read ->
+    let o = unfold shared a in
+    fold shared a { share = o.share };
+    let result = read () in
+    result)
+
+proof reset a i
+  requires (slot a i v && 0 <= i && i < Array.length a)
+  ensures (slot a i 0) =
+  at (a.(i) <- 0) (fun write ->
+    unfold slot a i v;
+    let result = write () in
+    fold slot a i 0;
+    result)

@@ -54,15 +54,15 @@ function fileOf(uri: string): string | undefined {
 	const parsed = URI.parse(uri);
 	return parsed.scheme === 'file' ? path.resolve(parsed.fsPath) : undefined;
 }
-function rootOf(file: string): string { return file.replace(/\.(mli|proof)$/, '.ml'); }
-function relevant(file: string): boolean { return /\.(ml|mli|proof)$/.test(file); }
+function rootOf(file: string): string { return file.replace(/\.(mli|mlp|proof)$/, '.ml'); }
+function relevant(file: string): boolean { return /\.(ml|mli|mlp|proof)$/.test(file); }
 function projectFile(file: string): boolean {
 	const name = path.basename(file);
 	return name === 'dune' || name === 'dune-project' || name === 'dune-workspace' || name.startsWith('dune-workspace.');
 }
 function siblings(file: string): string[] {
 	const stem = file.replace(/\.ml$/, '');
-	return [file, `${stem}.mli`, `${stem}.proof`];
+	return [file, `${stem}.mli`, `${stem}.mlp`, `${stem}.proof`];
 }
 function ownerOf(root: string): Owner {
 	let owner = owners.get(root);

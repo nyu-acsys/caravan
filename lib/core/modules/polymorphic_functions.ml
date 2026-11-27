@@ -26,6 +26,7 @@ type t = {
 }
 
 let same_variable left right = Int.equal (Types.get_id left) (Types.get_id right)
+let source_arguments _ arguments = arguments
 
 let order_by workers ~name ~location ~dependencies =
   let rec place available emitted pending =
@@ -66,7 +67,9 @@ let all_variables typ =
   let _, variables = visit (Set.empty (module Int), []) typ in
   List.rev variables
 
-let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
+(** Projection selects dictionary-bearing arguments without changing source schemes. *)
+let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id)
+    ?(project = source_arguments) ~at typ =
   let excluded = List.concat_map excluded ~f:all_variables in
   let unsupported () =
     Report.unsupported at "Higher-order or explicitly polymorphic function types"
@@ -85,8 +88,8 @@ let discover ?(excluded = []) ?(additional = []) ?(expand = Fn.id) ~at typ =
           in
           Ok (seen, if quantified then typ :: variables else variables)
       | Tunivar _ -> Ok (seen, typ :: variables)
-      | Tconstr (_, arguments, _) ->
-          List.fold_result arguments ~init:(seen, variables) ~f:value
+      | Tconstr (path, arguments, _) ->
+          List.fold_result (project path arguments) ~init:(seen, variables) ~f:value
       | Ttuple components ->
           List.fold_result components ~init:(seen, variables)
             ~f:(fun state (_, component) -> value state component)
@@ -116,8 +119,8 @@ let rec monomorphic ~expand typ =
   let typ = expand typ in
   match Types.get_desc typ with Tpoly (body, _) -> monomorphic ~expand body | _ -> typ
 
-(** Whether [left] and [right] are the same type, structurally after [expand]. *)
-let same_type ?(expand = Fn.id) left right =
+(** Whether types agree after expansion and projection of represented arguments. *)
+let same_type ?(expand = Fn.id) ?(project = source_arguments) left right =
   let mono = monomorphic ~expand in
   let rec equal seen left right =
     let left = mono left and right = mono right in
@@ -127,7 +130,7 @@ let same_type ?(expand = Fn.id) left right =
       let seen = pair :: seen in
       match (Types.get_desc left, Types.get_desc right) with
       | Tconstr (p, xs, _), Tconstr (q, ys, _) ->
-          Path.same p q && List.equal (equal seen) xs ys
+          Path.same p q && List.equal (equal seen) (project p xs) (project q ys)
       | Ttuple xs, Ttuple ys ->
           List.equal (Option.equal String.equal) (List.map xs ~f:fst) (List.map ys ~f:fst)
           && List.equal (equal seen) (List.map xs ~f:snd) (List.map ys ~f:snd)
@@ -137,15 +140,16 @@ let same_type ?(expand = Fn.id) left right =
   in
   equal [] left right
 
-let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
+let instantiate ?(expand = Fn.id) ?(project = source_arguments) ~at scheme ~declaration
+    ~occurrence =
   let mismatch () =
     Report.unsupported at "This polymorphic function occurrence or signature alias"
   in
   let mono = monomorphic ~expand in
-  let equal = same_type ~expand in
-  let* declared = discover ~expand ~at declaration in
-  let* _ = discover ~expand ~at occurrence in
-  let* native = discover ~expand ~at scheme.typ in
+  let equal = same_type ~expand ~project in
+  let* declared = discover ~expand ~project ~at declaration in
+  let* _ = discover ~expand ~project ~at occurrence in
+  let* native = discover ~expand ~project ~at scheme.typ in
   let inferred =
     List.filter native.variables ~f:(fun variable ->
         List.mem scheme.variables variable ~equal:same_variable)
@@ -177,7 +181,8 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
                 List.equal (Option.equal String.equal) (List.map xs ~f:fst)
                   (List.map ys ~f:fst)
                 && List.equal (aligned seen) (List.map xs ~f:snd) (List.map ys ~f:snd)
-            | Tconstr (_, xs, _), Tconstr (_, ys, _) -> List.equal (aligned seen) xs ys
+            | Tconstr (p, xs, _), Tconstr (q, ys, _) ->
+                List.equal (aligned seen) (project p xs) (project q ys)
             | _ -> false)
     in
     if not (aligned [] scheme.typ declaration) then mismatch ()
@@ -201,7 +206,7 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
             let seen = pair :: seen in
             begin match (Types.get_desc declaration, Types.get_desc occurrence) with
             | Tconstr (p, xs, _), Tconstr (q, ys, _) when Path.same p q ->
-                match_list seen bindings xs ys
+                match_list seen bindings (project p xs) (project q ys)
             | Ttuple xs, Ttuple ys
               when List.equal (Option.equal String.equal) (List.map xs ~f:fst)
                      (List.map ys ~f:fst) ->
@@ -236,19 +241,20 @@ let instantiate ?(expand = Fn.id) ~at scheme ~declaration ~occurrence =
 
 (** Continuation contracts may select an instance of an OCaml-generalized helper. Every
     occurrence must satisfy that instance before selecting its worker. *)
-let instantiate_worker ?(expand = Fn.id) ~at worker ~declaration ~occurrence =
+let instantiate_worker ?(expand = Fn.id) ?(project = source_arguments) ~at worker
+    ~declaration ~occurrence =
   match worker.restriction with
-  | None -> instantiate ~expand ~at worker.scheme ~declaration ~occurrence
+  | None -> instantiate ~expand ~project ~at worker.scheme ~declaration ~occurrence
   | Some restriction ->
       let* arguments =
-        instantiate ~expand ~at restriction.source ~declaration ~occurrence
+        instantiate ~expand ~project ~at restriction.source ~declaration ~occurrence
       in
       let* substitute =
         Report.expect ~at "A type argument for each variable of the helper's instance"
           (Datatypes.substitution restriction.source.variables arguments)
       in
       let restricted = List.map restriction.arguments ~f:substitute in
-      if not (List.equal (same_type ~expand) arguments restricted) then
+      if not (List.equal (same_type ~expand ~project) arguments restricted) then
         Error
           (Report.error Report.Type at
              "This call does not satisfy the helper's continuation type instance")

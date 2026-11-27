@@ -2,13 +2,13 @@
   Verification successful.
 
   $ caravan --shh collections_fail.ml
-  [Error] File "collections_fail.proof", line 1, columns 13-13:
+  [Error] File "collections_fail.mlp", line 1, columns 13-13:
   1 | lemma removed (s : int finset) (x : int)
                    ^
   Verification Error: A postcondition may not hold at this return point.
-  File "collections_fail.proof", line 2, columns 11-60:
+  File "collections_fail.mlp", line 2, columns 10-61:
   2 |   ensures (Finset.mem x (Finset.diff s (Finset.singleton x))) = ()
-                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   Related Location: This assertion may not hold.
   [1]
 
@@ -19,14 +19,14 @@ shadow source types or constructors.
   Verification successful.
 
   $ caravan --shh proof_type_shadow.ml
-  [Error] File "proof_type_shadow.proof", line 1, columns 5-9:
+  [Error] File "proof_type_shadow.mlp", line 1, columns 5-9:
   1 | type item = Other of int
            ^^^^
   Type Error: The proof type item is already declared.
   [1]
 
   $ caravan --shh proof_constructor_shadow.ml
-  [Error] File "proof_constructor_shadow.proof", line 1, columns 18-22:
+  [Error] File "proof_constructor_shadow.mlp", line 1, columns 18-22:
   1 | type ghost_item = Item of int
                         ^^^^
   Type Error: The proof constructor Item is already declared.

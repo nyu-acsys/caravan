@@ -30,7 +30,7 @@ const token = () => new CancellationTokenSource().token;
 const range = (startLine = 0, startCharacter = 0, endLine = 0, endCharacter = 5) => ({
   start: { line: startLine, character: startCharacter }, end: { line: endLine, character: endCharacter }
 });
-const result = (text = 'proof text', target = 'file:///workspace/source.proof#L2,3') => ({
+const result = (text = 'proof text', target = 'file:///workspace/source.mlp#L2,3') => ({
   text, links: [{ range: range(), target }]
 });
 const deferred = () => {

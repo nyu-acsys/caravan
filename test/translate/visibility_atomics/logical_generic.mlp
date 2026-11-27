@@ -1,0 +1,28 @@
+predicate contents (cell : int Atomic.t) (value [@implicit] : int) = own cell value
+
+module Make (X : INPUT) = struct
+  module Read = Ghost.AU (struct let operation = read end)
+
+  lemma preserve_pending (token : Read.token) (cell : int Atomic.t)
+    requires (Read.pending token cell)
+    ensures (Read.pending token cell) = ()
+
+  lemma preserve_committed (token : Read.token) (cell : int Atomic.t) (result : int)
+    requires (Read.committed token cell result)
+    ensures (Read.committed token cell result) = ()
+end
+
+lemma alias_pending (token : One.Read.token) (cell : int Atomic.t)
+  requires (One.Read.pending token cell)
+  ensures (Alias.Read.pending token cell) =
+  One.preserve_pending token cell
+
+lemma alias_committed (token : One.Read.token) (cell : int Atomic.t) (result : int)
+  requires (One.Read.committed token cell result)
+  ensures (Alias.Read.committed token cell result) =
+  Alias.preserve_committed token cell result
+
+lemma repeated_helper (token : Again.Read.token) (cell : int Atomic.t)
+  requires (One.Read.pending token cell)
+  ensures (Again.Read.pending token cell) =
+  Again.preserve_pending token cell

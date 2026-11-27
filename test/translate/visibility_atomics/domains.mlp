@@ -1,0 +1,12 @@
+module Value = Ghost.Frozen (struct
+  let field (cell : cell) = cell.value
+end)
+
+module Job = Ghost.Task (struct let operation = read end)
+module Factory = Ghost.Task (struct let operation = create end)
+module Failure = Ghost.Task (struct let operation = fail end)
+
+module PairJob = Ghost.Task (struct let operation = read_pair end)
+module NestedJob = Ghost.Task (struct let operation = nested end)
+predicate contents (channel : int Atomic.t) (value [@implicit] : int) = own channel value
+module OpaqueJob = Ghost.Task (struct let operation = opaque_read end)

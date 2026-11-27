@@ -6,7 +6,7 @@ mode, path = sys.argv[1:]
 report = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 if mode == "manifest":
     assert set(report) == {"version", "lsp_protocol", "min_z3", "ocaml_version", "raven_api_version"}
-    assert report["version"] == "0.1.0"
+    assert report["version"] == "0.2.0"
     assert report["lsp_protocol"] == 1
     assert report["min_z3"] == "4.13.0"
     assert report["ocaml_version"].startswith("5.5.")
@@ -18,7 +18,7 @@ elif mode == "enriched":
         "errors", "dependencies", "annotations", "members", "references", "symbols"
     }
     assert report["errors"] == []
-    assert {"editor_ok.ml", "editor_ok.mli", "editor_ok.proof"} <= set(report["dependencies"])
+    assert {"editor_ok.ml", "editor_ok.mli", "editor_ok.mlp"} <= set(report["dependencies"])
 elif mode == "failure":
     errors = report["errors"]
     assert any(error["kind"] == "Verification" for error in errors)

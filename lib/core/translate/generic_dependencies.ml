@@ -8,12 +8,14 @@ type t = { families : Generic_families.t }
 let contract_terms (contract : S.contract) =
   contract.requires @ contract.ensures @ contract.atomic_requires
   @ contract.atomic_ensures @ contract.variant
+  @ Option.value_map contract.opens ~default:[] ~f:snd
 
 let rec proof_references bound (expression : S.proof_expr) =
   let term = Translate_context.term_references bound in
   let proof = proof_references bound in
   match expression.proof_desc with
-  | Proof_value value | Proof_assert value | Proof_unfold (value, _) -> term value
+  | Proof_value value | Proof_assert value | Proof_cut value | Proof_unfold (value, _) ->
+      term value
   | Proof_fold (value, witnesses) ->
       term value @ List.concat_map witnesses ~f:(fun (_, value) -> term value)
   | Proof_let (pattern, value, body) ->
@@ -27,10 +29,14 @@ let rec proof_references bound (expression : S.proof_expr) =
 
 let declaration_references = function
   | S.Proof_predicate predicate ->
-      Option.value_map predicate.pred_body ~default:[]
-        ~f:
-          (Translate_context.term_references
-             (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str)))
+      List.concat_map (Option.to_list predicate.pred_ancestry) ~f:(fun ancestry ->
+          Translate_context.term_references
+            (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str))
+            (S.ancestry_application ancestry))
+      @ Option.value_map predicate.pred_body ~default:[]
+          ~f:
+            (Translate_context.term_references
+               (List.map predicate.pred_params ~f:(fun (id, _) -> id.S.pid_str)))
   | Proof_function { function_params; function_body; function_variant; _ } ->
       List.concat_map
         (function_body :: function_variant)
@@ -44,6 +50,7 @@ let declaration_references = function
         lemma_requires;
         lemma_ensures;
         lemma_variant;
+        lemma_opens;
         lemma_body;
         _;
       } ->
@@ -51,13 +58,20 @@ let declaration_references = function
         List.map (lemma_params @ lemma_returns) ~f:(fun (id, _) -> id.S.pid_str)
       in
       List.concat_map
-        (lemma_requires @ lemma_ensures @ lemma_variant)
+        (lemma_requires
+        @ S.postcondition_terms lemma_ensures
+        @ lemma_variant
+        @ Option.value_map lemma_opens ~default:[] ~f:snd)
         ~f:(Translate_context.term_references bound)
       @ proof_references bound lemma_body
-  | Proof_invariant { inv_params; inv_state = state, _; inv_body; _ } ->
+  | Proof_invariant { inv_params; inv_state = state, _; inv_body; inv_ancestry; _ } ->
       Translate_context.term_references
         (state.pid_str :: List.map inv_params ~f:(fun (id, _) -> id.S.pid_str))
         inv_body
+      @ List.concat_map (Option.to_list inv_ancestry) ~f:(fun ancestry ->
+          Translate_context.term_references
+            (state.pid_str :: List.map inv_params ~f:(fun (id, _) -> id.S.pid_str))
+            (S.ancestry_application ancestry))
   | Proof_view { view_params; view_value; _ } ->
       Translate_context.term_references
         (List.map view_params ~f:(fun (id, _) -> id.S.pid_str))
@@ -71,7 +85,7 @@ let declaration_references = function
             (Option.value_map contents ~default:[] ~f:Translate_context.pat_names)
             result)
   | Proof_module _ | Proof_definition _ | Proof_type _ | Proof_resource _ | Proof_au _
-  | Proof_field _ | Proof_state _ ->
+  | Proof_task _ | Proof_field _ | Proof_state _ | Proof_access_field _ ->
       []
 
 let annotation_references (annotation : Annotation.t) =
@@ -90,6 +104,7 @@ let annotation_references (annotation : Annotation.t) =
             | S.Fold term
             | Unfold term
             | Assert term
+            | Cut term
             | Unfold_with (term, _)
             | Ghost_call term ->
                 terms [ term ]
@@ -109,7 +124,8 @@ let rec runtime_references (expression : Typedtree.expression) =
         (body :: List.map bindings ~f:(fun binding -> binding.Typedtree.vb_expr), [])
     | Texp_apply (callee, arguments) ->
         ( callee
-          :: List.filter_map arguments ~f:(function
+          :: Option.to_list (Translate_context.inline_list_fold_left_body expression)
+          @ List.filter_map arguments ~f:(function
             | _, Typedtree.Arg argument -> Some argument
             | _, Omitted () -> None),
           [] )
@@ -312,7 +328,17 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
               if Source.resource_has_path resource path then resource_worker resource
               else None))
     in
-    runtime @ fields @ proof @ atomic @ resources
+    let tasks =
+      List.concat_map value ~f:(fun path ->
+          List.filter_map decls.tasks ~f:(fun task ->
+              Option.some_if
+                (Path.same
+                   (proofs.proof_support.canonical_path path)
+                   (proofs.proof_support.canonical_path
+                      (Path.Pdot (task.Task_facades.source.task_path, "handle"))))
+                task.worker.name))
+    in
+    runtime @ fields @ proof @ atomic @ resources @ tasks
   in
   let references ~environment ~scope refs =
     List.concat_map refs ~f:(reference ~environment ~scope)
@@ -325,8 +351,16 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
   let worker_node ?context (worker : Generic_parameters.t) =
     let context =
       Option.value_or_thunk context ~default:(fun () ->
-          Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
-            ~unapplied_proofs:scopes.unapplied_proofs worker.key)
+          match
+            List.find decls.tasks ~f:(fun task ->
+                task.Task_facades.emit && String.equal task.worker.key worker.key)
+          with
+          | Some task ->
+              Program_scopes.asset_context ~module_contexts:scopes.module_contexts
+                task.source.task_scope
+          | None ->
+              Program_scopes.declaration_context ~module_contexts:scopes.module_contexts
+                ~unapplied_proofs:scopes.unapplied_proofs worker.key)
     in
     let dependencies = types_dependencies worker.parameters in
     let dependencies =
@@ -366,13 +400,27 @@ let create (scopes : Program_scopes.t) (decls : Program_declarations.t)
                         ~f:runtime_path))
           | Invariant _ | Body _ | Direct_invariant _ | View _ -> [])
     in
+    let tasks =
+      List.concat_map decls.tasks ~f:(fun task ->
+          if not (String.equal task.Task_facades.worker.key worker.key) then []
+          else
+            let operation = task.operation in
+            references ~environment:operation.environment
+              ~scope:
+                (Proof_bindings.scope_for_location scopes.scoped_proofs operation.loc)
+              (List.concat_map
+                 (Option.value_map operation.contract ~default:[] ~f:contract_terms)
+                 ~f:
+                   (Translate_context.term_references
+                      (Procedures.contract_bound_names operation))))
+    in
     Generic_families.
       {
         name = worker.name;
         scope = context.namespace;
         variables = worker.variables;
         at = worker.loc;
-        dependencies = helping @ dependencies;
+        dependencies = tasks @ helping @ dependencies;
       }
   in
   let runtime_nodes =

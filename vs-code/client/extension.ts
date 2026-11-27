@@ -15,7 +15,7 @@ function supported(document: vscode.TextDocument): boolean {
   return document.uri.scheme === 'file' &&
     ((document.languageId === 'ocaml' && document.uri.path.endsWith('.ml')) ||
       (document.languageId === 'ocaml.interface' && document.uri.path.endsWith('.mli')) ||
-      (document.languageId === 'caravan-proof' && document.uri.path.endsWith('.proof')));
+      (document.languageId === 'caravan-proof' && /\.(mlp|proof)$/.test(document.uri.path)));
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -60,7 +60,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     run: { module: context.asAbsolutePath(path.join('out', 'server', 'server.js')), transport: TransportKind.ipc },
     debug: { module: context.asAbsolutePath(path.join('out', 'server', 'server.js')), transport: TransportKind.ipc }
   };
-  const fileWatcher = vscode.workspace.createFileSystemWatcher('**/{*.ml,*.mli,*.proof,dune,dune-project,dune-workspace*}');
+  const fileWatcher = vscode.workspace.createFileSystemWatcher('**/{*.ml,*.mli,*.mlp,*.proof,dune,dune-project,dune-workspace*}');
   context.subscriptions.push(fileWatcher);
   const clientOptions: LanguageClientOptions = {
     initializationOptions: () => {
@@ -71,7 +71,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     documentSelector: [
       { scheme: 'file', language: 'ocaml', pattern: '**/*.ml' },
       { scheme: 'file', language: 'ocaml.interface', pattern: '**/*.mli' },
-      { scheme: 'file', language: 'caravan-proof', pattern: '**/*.proof' }
+      { scheme: 'file', language: 'caravan-proof', pattern: '**/*.{mlp,proof}' }
     ],
     synchronize: { configurationSection: 'caravan', fileEvents: fileWatcher },
     outputChannel: output
@@ -115,7 +115,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('caravan.verify', async () => {
       const document = vscode.window.activeTextEditor?.document;
       if (!document || !supported(document)) {
-        void vscode.window.showInformationMessage('Open an OCaml .ml, .mli, or Caravan .proof file to verify.');
+        void vscode.window.showInformationMessage('Open an OCaml .ml, .mli, or Caravan .mlp file to verify.');
         return;
       }
       if (document.isDirty) {

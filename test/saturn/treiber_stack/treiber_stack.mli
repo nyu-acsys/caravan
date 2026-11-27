@@ -145,12 +145,12 @@ val of_seq : 'a Seq.t -> 'a t
     ensures stack t values *)
 
 val add_seq : 'a t -> 'a Seq.t -> unit
-[@@caravan.opens []]
 (** [add_seq stack seq] adds all elements of [seq] to the top of the [stack].
     [seq] must be finite.
 
     🐌 This is a linear-time operation on the size of [elements]. *)
 (*@ atomic add_seq t seq
+    opens {Seq.persistent seq}
     requires Seq.persistent seq values
     atomic requires Seq.persistent seq values && stack t xs
     atomic ensures stack t (List.rev values @ xs) *)

@@ -7,7 +7,7 @@ The bundled mathematical model and its algebra are checked independently.
   $ grep -c 'reverse_involution' list.fingerprints
   1
   $ grep -c 'caravan_stdlib_list_' list.fingerprints
-  5
+  7
 
 Clients use the checked algebra without checking the library's proofs again.
 The mathematical model also applies outside OCaml's machine-integer domain.
@@ -22,7 +22,7 @@ A source filename cannot make an ordinary user proof a trusted library proof.
 
   $ mkdir -p caravan/stdlib
   $ cp path_collision.ml caravan/stdlib/list.ml
-  $ cp path_collision.proof caravan/stdlib/list.proof
+  $ cp path_collision.mlp caravan/stdlib/list.mlp
   $ caravan --shh caravan/stdlib/list.ml > collision.out 2>&1
   [1]
   $ grep -c 'A postcondition may not hold' collision.out

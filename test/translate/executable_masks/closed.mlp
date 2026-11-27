@@ -1,0 +1,38 @@
+module Value = Ghost.Frozen (struct let field (cell : cell) = cell.value end)
+invariant shared (cell : cell) (owner : Ghost.t) = Value.visible owner cell 7
+
+lemma family_mask (owner : Ghost.t) (cell : cell)
+  requires (Value.visible owner cell 7)
+  ensures (Value.visible owner cell 7)
+  opens { Value.frozen } = ()
+
+proof result = allocate ()
+  opens {}
+  ensures (own ~writer:Ghost.self result.value 7) = ()
+
+proof result = create ()
+  opens {}
+  ensures (shared result Ghost.self) =
+  at (allocate ()) (fun make ->
+    let cell = make () in
+    Value.freeze cell;
+    fold shared cell Ghost.self;
+    cell)
+
+proof result = read [@atomic] [value : int] cell
+  opens { Value.frozen cell }
+  requires (Value.visible Ghost.self cell value)
+  ensures (Value.visible Ghost.self cell value && result = value) =
+  at (cell.value) Ghost.frozen_scope (fun load -> let result = load () in result)
+
+proof result = read_shared cell
+  opens { shared cell Ghost.self; Value.frozen }
+  requires (shared cell Ghost.self)
+  ensures (shared cell Ghost.self && result = 7) =
+  at (read cell) (fun read ->
+    unfold shared cell Ghost.self;
+    let result = read 7 in
+    fold shared cell Ghost.self;
+    result)
+
+proof result = client () opens { Value.frozen } ensures (result = 7) = ()

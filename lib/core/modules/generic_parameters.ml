@@ -19,8 +19,11 @@ let aggregate = function
   | [ typ ] -> typ
   | types -> Ctype.newty (Ttuple (List.map types ~f:(fun typ -> (None, typ))))
 
-let discover ?(expand = Fn.id) ~key ~name ~at ~explicit parameters =
-  let* scheme = Polymorphic_functions.discover ~expand ~at (aggregate parameters) in
+let discover ?(expand = Fn.id) ?(project = Polymorphic_functions.source_arguments) ~key
+    ~name ~at ~explicit parameters =
+  let* scheme =
+    Polymorphic_functions.discover ~expand ~project ~at (aggregate parameters)
+  in
   Ok
     {
       key;
@@ -43,16 +46,62 @@ let find ?target predicates key =
 
 let member predicate = predicate.member
 
-let rebind ~expand ~at declaration parameters =
+let rebind ?(project = Polymorphic_functions.source_arguments) ~expand ~at declaration
+    parameters =
   let* rebound =
-    discover ~expand ~key:declaration.key ~name:declaration.name ~at
+    discover ~expand ~project ~key:declaration.key ~name:declaration.name ~at
       ~explicit:declaration.explicit parameters
   in
-  if List.length rebound.variables = List.length declaration.variables then
+  let retained = List.concat_map parameters ~f:Polymorphic_functions.all_variables in
+  let mismatch () =
+    Report.unsupported at "A generic proof signature with different type parameters"
+  in
+  if
+    List.for_all declaration.variables ~f:(fun variable ->
+        List.mem retained variable ~equal:Types.eq_type)
+  then
+    if
+      List.for_all rebound.variables ~f:(fun variable ->
+          List.mem declaration.variables variable ~equal:Types.eq_type)
+    then Ok { declaration with parameters }
+    else mismatch ()
+  else if
+    List.exists declaration.variables ~f:(fun variable ->
+        List.mem retained variable ~equal:Types.eq_type
+        && not (List.mem rebound.variables variable ~equal:Types.eq_type))
+  then
+    Report.unsupported at
+      "A generic proof signature with partially retained type parameters"
+  else if List.length rebound.variables = List.length declaration.variables then
     Ok { rebound with member = declaration.member }
-  else Report.unsupported at "A generic proof signature with different type parameters"
+  else mismatch ()
 
-let instantiate ?environment ?(opaque = fun _ -> false) ~expand ~at predicate actuals =
+let parameter_types predicate arguments =
+  let substitutions = List.zip_exn predicate.variables arguments in
+  let rec substitute typ =
+    match List.Assoc.find substitutions typ ~equal:Types.eq_type with
+    | Some typ -> typ
+    | None ->
+        begin match Types.get_desc typ with
+        | Tvar _ | Tunivar _ -> typ
+        | desc -> Ctype.newty (Compiler_types.map_desc substitute desc)
+        end
+  in
+  List.map predicate.parameters ~f:substitute
+
+let instantiate ?environment ?(opaque = fun _ -> false)
+    ?(project = Polymorphic_functions.source_arguments) ~expand ~at predicate actuals =
+  (* Compiler elaboration can lower recorded quantifiers' levels. *)
+  let variables =
+    List.map predicate.variables ~f:(fun variable ->
+        match Types.get_desc variable with
+        | (Tvar _ | Tunivar _) when Types.get_level variable <> Btype.generic_level ->
+            Btype.newgenty (Types.get_desc variable)
+        | _ -> variable)
+  in
+  let predicate =
+    { predicate with parameters = parameter_types predicate variables; variables }
+  in
   let canonical typ =
     let typ =
       Option.value_map environment ~default:typ ~f:(fun environment ->
@@ -78,9 +127,10 @@ let instantiate ?environment ?(opaque = fun _ -> false) ~expand ~at predicate ac
     in
     let formal, actual = List.unzip pairs in
     let declaration = aggregate formal and occurrence = aggregate actual in
-    let* scheme = Polymorphic_functions.discover ~expand ~at declaration in
+    let* scheme = Polymorphic_functions.discover ~expand ~project ~at declaration in
     let* inferred =
-      Polymorphic_functions.instantiate ~expand ~at scheme ~declaration ~occurrence
+      Polymorphic_functions.instantiate ~expand ~project ~at scheme ~declaration
+        ~occurrence
     in
     let substitutions = List.zip_exn scheme.variables inferred in
     List.map predicate.variables ~f:(fun variable ->
@@ -91,23 +141,14 @@ let instantiate ?environment ?(opaque = fun _ -> false) ~expand ~at predicate ac
               "A predicate type parameter not determined by its supplied arguments")
     |> Result.all
 
-let parameter_types predicate arguments =
-  let substitutions = List.zip_exn predicate.variables arguments in
-  let rec substitute typ =
-    match List.Assoc.find substitutions typ ~equal:Types.eq_type with
-    | Some typ -> typ
-    | None ->
-        begin match Types.get_desc typ with
-        | Tvar _ | Tunivar _ -> typ
-        | desc -> Ctype.newty (Btype.copy_type_desc substitute desc)
-        end
-  in
-  List.map predicate.parameters ~f:substitute
-
-let types predicate types =
+let types ?environment predicate types =
   List.mapi predicate.variables ~f:(fun index variable ->
-      Datatypes.variable_type ~variable
-        ~owner:(String.split predicate.name ~on:'.')
-        ~parameter:("A" ^ Int.to_string index)
-        ~at:predicate.loc)
+      let data =
+        Datatypes.variable_type ~variable
+          ~owner:(String.split predicate.name ~on:'.')
+          ~parameter:("A" ^ Int.to_string index)
+          ~at:predicate.loc
+      in
+      Option.value_map environment ~default:data ~f:(fun environment ->
+          Datatypes.bind_local_variable environment data))
   @ types

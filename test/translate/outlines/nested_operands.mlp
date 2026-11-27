@@ -1,0 +1,23 @@
+proof result = read cell
+  requires (own cell value)
+  ensures (own cell value && result = value) = ()
+
+proof result = increment value
+  requires (value < max_int)
+  ensures (result = value + 1) = ()
+
+proof result = difference first second
+  requires (own first 7 && own second 3)
+  ensures (own first 7 && own second 3 && result = 4) =
+  at (read second) (fun read ->
+    let result = read () in
+    assert (result = 3);
+    result)
+
+proof result = nested cell
+  requires (own cell 5)
+  ensures (own cell 5 && result = 6) =
+  at (read cell) (fun read ->
+    let result = read () in
+    assert (result = 5);
+    result)

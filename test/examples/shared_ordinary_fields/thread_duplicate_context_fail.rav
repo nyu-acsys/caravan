@@ -1,0 +1,5 @@
+lemma duplicate_context(executing: Ref, view: Set[Ref])
+  requires ThreadContext.context(executing, view)
+  ensures ThreadContext.context(executing, view) && ThreadContext.context(executing, view)
+{
+}

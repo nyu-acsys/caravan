@@ -1,0 +1,12 @@
+(library
+ (name caravan_tutorial_blocking_stack)
+ (wrapped false)
+ (modules blocking_stack))
+
+(cram
+ (deps
+  %{bin:caravan}
+  %{bin:raven}
+  (glob_files *.ml)
+  (glob_files *.mli)
+  (glob_files *.mlp)))

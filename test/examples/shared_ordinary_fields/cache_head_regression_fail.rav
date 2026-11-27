@@ -1,0 +1,16 @@
+proc regressing_head_invalidates_cached_bound()
+  opens ThreadContext.released
+{
+  val cached := CacheEvent.write(3, true, 7);
+  val history := CacheWrites.create(cached);
+  val writer := ThreadContext.create_thread();
+  val reader := ThreadContext.create_thread();
+  val channel := ThreadContext.publish(writer, history, {});
+  val acquired := ThreadContext.acquire(reader, channel, history, {}, {});
+  val observed := sample_cache(history, reader, channel, {cached}, {channel}, {});
+  CacheWrites.reconcile(history, {cached}, observed);
+  val limit := 4;
+  val tail := 8;
+  val regressed_head := 5;
+  assert observed.value <= limit - (tail - regressed_head);
+}

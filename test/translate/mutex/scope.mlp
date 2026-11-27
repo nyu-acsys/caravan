@@ -1,0 +1,5 @@
+proof result = scoped () ensures (true) =
+  at (Mutex.create ()) (fun create ->
+    let mutex = create () in
+    assert (mutex === mutex);
+    mutex)

@@ -11,7 +11,7 @@ State projections and inferred action parameters stay typed inside helper calls.
 The update cannot promise the old observation.
 
   $ mkdir stale
-  $ cp ra_view.ml ra_view.proof stale/
+  $ cp ra_view.ml ra_view.mlp stale/
   $ sed 's/atomic ensures model c (R.excl 1) \&\& other c (R.excl 3) \*)/atomic ensures model c R.invalid \&\& other c (R.excl 3) *)/' ra_view.mli > stale/ra_view.mli
   $ caravan --shh stale/ra_view.ml
   [Error] File "stale/ra_view.ml", line 7, columns 5-33:

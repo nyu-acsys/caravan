@@ -1,0 +1,79 @@
+module Payload = Ghost.Relaxed (struct let field (cell : 'a cell) = cell.value end)
+
+proof result = allocate value
+  ensures (exists event : Ghost.t.
+    Payload.state result (Some value) (Set.singleton (event, Some value))) = ()
+
+proof clear [payload : 'a] cell
+  requires (Payload.state cell (Some payload) writes)
+  ensures (exists updated : (Ghost.t * 'a option) set.
+    Payload.state cell (None : 'a option) updated && Set.subset writes updated) = ()
+
+proof result = load [value : 'a] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : 'a option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+
+proof result = copied [value : 'a] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : 'a option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+
+proof result = empty ()
+  ensures (exists event : Ghost.t. Payload.state result (None : bool option)
+    (Set.singleton (event, (None : bool option)))) = ()
+
+proof result = shadow [value : bool] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : bool option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    assert (forall raw_payload : bool. Ghost.raw raw_payload === Some raw_payload);
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+
+proof result = read_option [expected : int option] cell
+  requires (Payload.state cell (Some expected) writes &&
+    forall event : Ghost.t, raw : int option option. Set.mem (event, raw) writes -> raw === Some expected)
+  ensures (Payload.state cell (Some expected) writes &&
+    result = (match expected with None -> 0 | Some n -> n)) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+
+proof result = checked_capture [value : 'a] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : 'a option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  proof result = helper () ensures (result === value) = begin on return () end;
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)
+
+proof result = keep value ensures (result === value) = ()
+
+proof result = checked_call [value : 'a] cell
+  requires (Payload.state cell (Some value) writes &&
+    forall event : Ghost.t, raw : 'a option. Set.mem (event, raw) writes -> raw === Some value)
+  ensures (Payload.state cell (Some value) writes && result === value) =
+  at (cell.value) (fun read ->
+    let result = read () in
+    let event = Payload.observe cell (Ghost.raw result) in
+    Payload.reconcile cell event (Ghost.raw result);
+    result)

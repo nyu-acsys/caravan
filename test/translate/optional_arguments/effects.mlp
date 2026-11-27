@@ -1,0 +1,31 @@
+proof result = bump [before : int] cell
+  requires (own cell.contents before && 0 <= before && before < 100)
+  ensures (own cell.contents (before + 1) && result = before + 1) = ()
+proof result = choose [before : int] cell value token
+  requires (match value with None -> own cell.contents before && 0 <= before && before < 100
+    | Some _ -> true)
+  ensures (match value with None -> own cell.contents (before + 1) && result = before + 1
+    | Some v -> result = v) =
+  at (bump cell) (fun step ->
+    let result = step before in
+    assert (result = before + 1);
+    result)
+proof result = local [before : int] cell value token
+  requires (own cell.contents before && 0 <= before && before < 100)
+  ensures (match value with None -> own cell.contents (before + 1) && result = before + 1
+    | Some v -> own cell.contents before && result = v) =
+  at (bump cell) (fun step -> let result = step before in result);
+  proof result = keep () ensures (result = value) = begin on return () end
+proof touch [before : int] cell token unit
+  requires (own cell.contents before && 0 <= before && before < 100)
+  ensures (own cell.contents (before + (match token with None -> 1 | Some _ -> 0))) = ()
+proof client () =
+  at (choose cell ~value:7 ()) (fun step -> let result = step 0 in result);
+  at (choose cell ()) (fun step -> let result = step 0 in result);
+  at (local cell ~value:9 ()) (fun step -> let result = step 1 in result);
+  at (local cell ()) (fun step -> let result = step 1 in result);
+  at (touch cell ~token:() ()) (fun step -> let result = step 2 in result);
+  at (touch cell ()) (fun step -> let result = step 2 in result)
+
+proof result = unowned cell ensures (result = 7) =
+  at (choose cell ~value:7 ()) (fun step -> let result = step 0 in result)

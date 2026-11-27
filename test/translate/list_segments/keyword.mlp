@@ -1,0 +1,3 @@
+predicate cell_at (position : integer) (c : int) (tail : int list) = c = 0
+
+list_segment cells under cell_at

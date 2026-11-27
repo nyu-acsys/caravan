@@ -1,0 +1,5 @@
+module Value = Ghost.Relaxed (struct let field (cell : 'a cell) = cell.value end)
+
+module Make (Storage : Storage) = struct
+  module Item = Ghost.Relaxed (struct let field (cell : cell) = cell.value end)
+end

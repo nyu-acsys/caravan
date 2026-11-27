@@ -1,0 +1,3 @@
+module Value = Ghost.Frozen (struct
+  let field (cell : cell) = cell.value
+end)

@@ -1,0 +1,15 @@
+invariant counter (c : int Atomic.t) = exists value : int. own c value && 0 <= value
+
+proof result = get c
+  opens { counter c }
+  requires (counter c)
+  ensures (counter c && 0 <= result) =
+  at (Atomic.get c) (fun read ->
+    let result = read () in
+    cut (counter c && 0 <= result && result <= max_int);
+    result)
+
+proof set r
+  requires own r.contents a
+  ensures own r.contents 2 =
+  on return cut (own r.contents 2)

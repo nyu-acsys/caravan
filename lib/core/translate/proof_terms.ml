@@ -29,17 +29,284 @@ let scope = State.map State.get_scope ~f:latest
     variables in scope. *)
 let scope_env ctx = State.map scope ~f:(env_of_scope ctx)
 
+(** Mask entries identify resources and an optional argument prefix. *)
+let mask_entry env (term : S.term) =
+  let open State.Syntax in
+  let at = term.term_loc in
+  let l = loc at in
+  let head, arguments = spine term [] in
+  let wildcard () = R.Expr.var ~loc:l (name ~loc:l "_") in
+  let source_wildcard = S.is_mask_wildcard in
+  let prefix types =
+    if List.length arguments > List.length types then
+      State.of_result (error at "Too many arguments in an opens entry")
+    else
+      let supplied =
+        List.take_while arguments ~f:(fun term -> not (source_wildcard term))
+      in
+      let+ values =
+        State.all
+          (List.zip_exn (List.take types (List.length supplied)) supplied)
+          ~f:(fun (typ, argument) -> expected_formula env (Some typ) argument)
+      in
+      if List.is_empty arguments then []
+      else
+        values
+        @ List.init (List.length types - List.length supplied) ~f:(fun _ -> wildcard ())
+  in
+  match head.term_desc with
+  | Tvar q ->
+      begin match access_method env q with
+      | Some (field, "frozen") ->
+          begin match arguments with
+          | [] ->
+              let* family =
+                State.frozen_field env.ctx.given ~at field.label.lbl_res
+                  field.label.lbl_name
+              in
+              let+ family =
+                State.of_result (Report.expect ~at "The shared field family" family)
+              in
+              (qualified_name ~loc:l (family ^ ".frozen"), [])
+          | [ owner ] ->
+              let* expected = State.of_result (equality_term_type env term) in
+              let+ family, receiver, _ =
+                frozen_selection ~expected env field term owner
+              in
+              (qualified_name ~loc:l (family ^ ".frozen"), [ receiver ])
+          | _ ->
+              State.of_result
+                (error at
+                   "A Frozen opens entry names its family or cell: Value.frozen cell")
+          end
+      | Some _ ->
+          State.of_result (error at "An opens entry must name a predicate or invariant")
+      | None ->
+          let key = logical_key env q in
+          begin match List.Assoc.find env.ctx.given.preds key ~equal:String.equal with
+          | Some (target, types) ->
+              let* instance =
+                State.of_result (predicate_instance env ~at ~key ~target arguments)
+              in
+              let types =
+                Option.value_map instance ~default:types ~f:(fun (worker, parameters) ->
+                    Generic_parameters.parameter_types worker parameters)
+              in
+              let types =
+                if
+                  List.Assoc.mem env.ctx.given.shared.persistent key ~equal:String.equal
+                  || List.Assoc.mem env.ctx.given.shared.persistent target
+                       ~equal:String.equal
+                then
+                  List.take types
+                    (Option.value
+                       (List.Assoc.find env.ctx.given.proof_support.predicate_inputs key
+                          ~equal:String.equal)
+                       ~default:(List.length types))
+                else types
+              in
+              let* target = predicate_target env ~at ~key ~target arguments in
+              let+ arguments = prefix types in
+              (qualified_name ~loc:l target, arguments)
+          | None ->
+              begin match logical_signature env q with
+              | Some signature ->
+                  let* signature =
+                    instantiate_proof_signature env ~at signature arguments
+                  in
+                  let+ arguments = prefix signature.lemma_inputs in
+                  (qualified_name ~loc:l signature.lemma_raven, arguments)
+              | None -> State.of_result (error at "Unknown resource in opens clause")
+              end
+          end
+      end
+  | _ -> State.of_result (error at "An opens entry must name a predicate or invariant")
+
+let invariant_ancestry env ancestry =
+  let open State.Syntax in
+  match ancestry with
+  | None -> State.return None
+  | Some ancestry ->
+      (* Raven reads the clause as a parent in a module and a promise in an interface. *)
+      let+ target, arguments = mask_entry env (S.ancestry_application ancestry) in
+      Some (target, arguments)
+
+let contract_opens env contract =
+  let open State.Syntax in
+  match Option.bind contract ~f:(fun (contract : S.contract) -> contract.opens) with
+  | None -> State.return None
+  | Some (at, entries) ->
+      let+ entries = State.all entries ~f:(mask_entry env) in
+      Some (loc at, entries)
+
+let merge_opens ~at explicit attribute =
+  match (explicit, attribute) with
+  | None, opens | opens, None -> Ok opens
+  | Some (_, []), Some (_, []) -> Ok explicit
+  | Some _, Some _ ->
+      error at
+        "The contract's opens clause conflicts with the signature's empty opens attribute"
+
+let field_proof_signature env (term : S.term) kind method_ =
+  let head, arguments = spine term [] in
+  let prefix_count = if String.equal method_ "transfer" then 3 else 1 in
+  let partial =
+    match head.term_desc with
+    | Tvar qualified when List.length arguments >= prefix_count ->
+        let prefix = List.take arguments prefix_count in
+        let application =
+          List.fold prefix ~init:head ~f:(fun fn arg ->
+              S.{ term with term_desc = Tapply (fn, arg) })
+        in
+        Some (qualified, prefix, application)
+    | _ -> None
+  in
+  Option.bind partial ~f:(fun (qualified, prefix, partial) ->
+      Option.bind
+        (Result.ok (equality_term_type env partial))
+        ~f:(fun partial_type ->
+          let remaining, result = Proof_types.function_arguments partial_type in
+          let outputs =
+            match (kind, method_) with
+            | S.Relaxed, "snapshot" ->
+                begin match Types.get_desc result with
+                | Ttuple [ (_, event); (_, entries) ] -> Some [ event; entries ]
+                | _ -> None
+                end
+            | S.Relaxed, "observe"
+            | S.Frozen, "snapshot"
+            | _, ("publish" | "release" | "release_private") ->
+                Some [ result ]
+            | S.Frozen, "observe"
+            | ( _,
+                ( "freeze" | "split" | "reconcile" | "duplicate" | "acquire" | "adopt"
+                | "transfer" ) ) ->
+                Some []
+            | _ -> None
+          in
+          Option.bind outputs ~f:(fun outputs ->
+              Option.map
+                (Result.ok (Result.all (List.map prefix ~f:(equality_term_type env))))
+                ~f:(fun prefix_types ->
+                  {
+                    lemma_raven = qualid_key qualified;
+                    lemma_constant = false;
+                    lemma_generic = None;
+                    lemma_inputs = prefix_types @ remaining;
+                    lemma_implicit_count = 0;
+                    lemma_outputs = outputs;
+                  }))))
+
 (** A call of a checked proof lemma, separate from logical function applications. *)
 let lemma_call ?expected env (t : S.term) =
   let open State.Syntax in
   let head, args = spine t [] in
-  match head.term_desc with
-  | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
+  let field_method =
+    match head.term_desc with Tvar q -> access_method env q | _ -> None
+  in
+  match (head.term_desc, field_method) with
+  | Tvar (Qid id), _ when List.Assoc.mem env.vars id.pid_str ~equal:String.equal ->
       State.of_result (error id.pid_loc "A local proof value cannot be called as a lemma")
-  | Tvar q ->
+  | Tvar (Qdot (Qid ghost, operation)), None
+    when String.equal ghost.pid_str "Ghost"
+         && String.equal operation.pid_str "merge_views" ->
+      let at = t.term_loc in
+      let* () =
+        if List.length args = 3 then State.return ()
+        else
+          State.of_result
+            (error at "Ghost.merge_views expects an owner and two visibility views")
+      in
+      let* owner_type = State.of_result (Source.ghost_type env.ctx.given.env ~at) in
+      let* output =
+        State.of_result
+          (Source.infer_logical_expression env.ctx.given.env
+             ~functions:(List.map env.funcs ~f:fst)
+             ~variables:(Logical_context.variables env)
+             t)
+      in
+      let+ arguments = typed_arguments env ~at [ owner_type; output; output ] args in
+      ( Visibility_contract.call ~loc:(loc at) ~module_name:Execution_contract.module_name
+          "visibility_union" arguments,
+        [ output ] )
+  | Tvar (Qdot (Qid ghost, operation)), None
+    when String.equal ghost.pid_str "Ghost"
+         && String.equal operation.pid_str "weaken_view" ->
+      let at = t.term_loc in
+      let* () =
+        if List.length args = 3 then State.return ()
+        else
+          State.of_result
+            (error at "Ghost.weaken_view expects an owner and two visibility views")
+      in
+      let* owner_type = State.of_result (Source.ghost_type env.ctx.given.env ~at) in
+      let* view_type = State.of_result (visibility_view_type env.ctx.given ~at) in
+      let+ arguments =
+        typed_arguments env ~at [ owner_type; view_type; view_type ] args
+      in
+      ( Visibility_contract.weaken ~loc:(loc at)
+          ~module_name:Execution_contract.module_name (List.nth_exn arguments 0)
+          (List.nth_exn arguments 1) (List.nth_exn arguments 2),
+        [] )
+  | Tvar _, Some (field, method_) ->
+      let* signature =
+        State.of_result
+          (Report.expect ~at:t.term_loc "A shared-field proof operation"
+             (field_proof_signature env t field.Access_fields.kind method_))
+      in
+      if List.length args <> List.length signature.lemma_inputs then
+        State.of_result (error t.term_loc "Incorrect shared-field operation arguments")
+      else
+        let execution_prefix =
+          match field.kind with
+          | S.Frozen ->
+              List.mem
+                [ "freeze"; "release"; "release_private"; "observe"; "adopt" ]
+                method_ ~equal:String.equal
+          | S.Relaxed ->
+              List.mem
+                [ "publish"; "release"; "acquire"; "adopt" ]
+                method_ ~equal:String.equal
+        in
+        let* prefix, owner, rest =
+          match (method_, args) with
+          | "transfer", source :: target :: owner :: rest ->
+              let* source = formula env source in
+              let+ target = formula env target in
+              ([ source; target ], owner, rest)
+          | _, owner :: rest when execution_prefix ->
+              let+ executing =
+                State.of_result
+                  (Report.expect ~at:t.term_loc
+                     "An executing context for field publication"
+                     env.ctx.given.execution_owner)
+              in
+              ([ executing ], owner, rest)
+          | _, owner :: rest -> State.return ([], owner, rest)
+          | _ ->
+              State.of_result
+                (error t.term_loc "A shared-field operation needs its field owner")
+        in
+        let expected = Generic_parameters.aggregate signature.lemma_outputs in
+        let* family, receiver, selected = field_selection ~expected env field t owner in
+        let+ rest = State.all rest ~f:(formula env) in
+        let native_method =
+          match (field.kind, method_) with
+          | S.Frozen, "freeze" -> "freeze_owned"
+          | S.Relaxed, "observe" -> "observation"
+          | _ -> method_
+        in
+        ( R.Expr.call ~loc:(loc t.term_loc)
+            (qualified_name ~loc:(loc t.term_loc) (family ^ "." ^ native_method))
+            (prefix @ (receiver :: selected :: rest)),
+          signature.lemma_outputs )
+  | Tvar q, None ->
       let display = qualid_key q in
       begin match
-        List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q) ~equal:String.equal
+        Option.first_some
+          (resource_operation ~lemma:true env q)
+          (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
+             ~equal:String.equal)
       with
       | None ->
           State.of_result
@@ -77,8 +344,8 @@ let lemma_call ?expected env (t : S.term) =
 let rec predicate_existentials (t : S.term) =
   match t.term_desc with
   | Ttrue | Tfalse | Tconst _ | Tvar _ -> []
-  | Tquant (Texists, bindings, body) -> bindings @ predicate_existentials body
-  | Tquant (Tforall, _, body)
+  | Tquant (Texists, bindings, _, body) -> bindings @ predicate_existentials body
+  | Tquant (Tforall, _, _, body)
   | Tcomprehension (_, body)
   | Tattr (_, body)
   | Tcast (body, _)
@@ -391,23 +658,6 @@ and predicate_application env ~unfold t witnesses make =
   | _ ->
       State.of_result (error t.term_loc "Expected a predicate applied to its arguments")
 
-(** Ghost annotations invoke checked proof operations. *)
-let proof_statement env =
-  let open State.Syntax in
-  function
-  | S.Fold t -> predicate_use env ~unfold:false t [] R.Stmt.fold
-  | Unfold t -> predicate_use env ~unfold:true t [] R.Stmt.unfold
-  | Fold_with (t, ws) -> predicate_use env ~unfold:false t ws R.Stmt.fold
-  | Unfold_with (t, ws) -> predicate_use env ~unfold:true t ws R.Stmt.unfold
-  | Assert t ->
-      let+ value = formula env t in
-      R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make value)
-  | Ghost_call t ->
-      let* call, outputs = lemma_call env t in
-      if not (List.is_empty outputs) then
-        State.of_result (error t.term_loc "Bind all the results of this lemma")
-      else State.return (R.Stmt.call ~loc:(loc t.term_loc) call)
-
 type proof_target = { target_name : string; target_type : Types.type_expr }
 
 let atomic_proof_signature env t =
@@ -476,19 +726,475 @@ let proof_call ?expected env t =
         | "commit" | "commit_raise" -> "commitAU"
         | _ -> method_
       in
-      State.return (R.Expr.call ~loc:l (name ~loc:l method_) values, outputs)
-  | _ -> lemma_call ?expected env t
+      let call = R.Expr.call ~loc:l (name ~loc:l method_) values in
+      if
+        (not (Poly.equal signature.au_context Execution_contract.No_context))
+        && String.equal method_ "bindAU"
+      then
+        let* owner =
+          State.of_result
+            (Report.expect ~at:t.term_loc "The atomic call's execution owner"
+               env.ctx.given.execution_owner)
+        in
+        let* held =
+          match signature.au_context with
+          | Execution_contract.Owner_and_held ->
+              State.map
+                (State.of_result
+                   (Report.expect ~at:t.term_loc "The atomic call's entry holdings"
+                      env.ctx.given.execution_entry_held))
+                ~f:Option.some
+          | No_context | Owner -> State.return None
+        in
+        let+ raw = State.fresh "au_raw_token" in
+        ( R.Stmt.local ~loc:l ~ghost:true
+            ~typ:
+              (R.Type.atomic_token ~loc:l (qualified_name ~loc:l signature.au_procedure))
+            ~init:(R.Stmt.expr_rhs call) (ident ~loc:l raw),
+          R.Expr.tuple ~loc:l
+            ([ R.Expr.var ~loc:l (name ~loc:l raw); owner ] @ Option.to_list held),
+          outputs )
+      else State.return ([], call, outputs)
+  | _ ->
+      State.map (lemma_call ?expected env t) ~f:(fun (call, outputs) ->
+          ([], call, outputs))
+
+(** [t] with the update operations on the current procedure's own atomic update that omit
+    its arguments given them: the procedure's parameters, which must not be rebound where
+    they are omitted. *)
+let rec with_update_arguments env ~bound (t : S.term) =
+  let ( let* ) = Result.( >>= ) in
+  let ( let+ ) r f = Result.map r ~f in
+  let return = Result.return in
+  let sub ?(bound = bound) t = with_update_arguments env ~bound t in
+  let at = t.S.term_loc in
+  let* desc =
+    match t.term_desc with
+    | Ttrue | Tfalse | Tconst _ | Tvar _ -> return t.term_desc
+    | Tfield (a, f) ->
+        let+ a = sub a in
+        S.Tfield (a, f)
+    | Tapply _ ->
+        (* An application is checked once, as a whole: not its partial applications. *)
+        let head, args = spine t [] in
+        let* head = match head.term_desc with Tvar _ -> return head | _ -> sub head in
+        let+ args = Result.all (List.map args ~f:sub) in
+        (List.fold args ~init:head ~f:(fun f a -> S.mk_term (Tapply (f, a)) at)).term_desc
+    | Tinfix (a, op, b) ->
+        let* a = sub a in
+        let+ b = sub b in
+        S.Tinfix (a, op, b)
+    | Tif (c, a, b) ->
+        let* c = sub c in
+        let* a = sub a in
+        let+ b = sub b in
+        S.Tif (c, a, b)
+    | Tquant (q, binders, triggers, body) ->
+        let bound = List.map binders ~f:(fun (id, _) -> id.S.pid_str) @ bound in
+        let* triggers =
+          Result.all
+            (List.map triggers ~f:(fun ts -> Result.all (List.map ts ~f:(sub ~bound))))
+        in
+        let+ body = sub ~bound body in
+        S.Tquant (q, binders, triggers, body)
+    | Tcomprehension ((x, ty), body) ->
+        let+ body = sub ~bound:(x.pid_str :: bound) body in
+        S.Tcomprehension ((x, ty), body)
+    | Tattr (a, body) ->
+        let+ body = sub body in
+        S.Tattr (a, body)
+    | Tlet (p, value, body) ->
+        let* value = sub value in
+        let+ body = sub ~bound:(S.pat_names p @ bound) body in
+        S.Tlet (p, value, body)
+    | Tmatch (scrutinee, cases) ->
+        let* scrutinee = sub scrutinee in
+        let+ cases =
+          Result.all
+            (List.map cases ~f:(fun (p, body) ->
+                 let+ body = sub ~bound:(S.pat_names p @ bound) body in
+                 (p, body)))
+        in
+        S.Tmatch (scrutinee, cases)
+    | Tcast (a, ty) ->
+        let+ a = sub a in
+        S.Tcast (a, ty)
+    | Ttuple ts ->
+        let+ ts = Result.all (List.map ts ~f:sub) in
+        S.Ttuple ts
+    | Trecord (base, fields) ->
+        let* base =
+          match base with
+          | None -> return None
+          | Some b ->
+              let+ b = sub b in
+              Some b
+        in
+        let+ fields =
+          Result.all
+            (List.map fields ~f:(fun (f, v) ->
+                 let+ v = sub v in
+                 (f, v)))
+        in
+        S.Trecord (base, fields)
+    | Told a ->
+        let+ a = sub a in
+        S.Told a
+  in
+  let t = { t with term_desc = desc } in
+  let head, args = spine t [] in
+  match head.term_desc with
+  | Tvar q ->
+      begin match atomic_method env q with
+      | Some (signature, method_)
+        when Option.equal String.equal env.ctx.given.current_procedure
+               (Some signature.au_procedure)
+             && List.mem
+                  [
+                    "access";
+                    "abort";
+                    "commit";
+                    "commit_raise";
+                    "pending";
+                    "committed";
+                    "raised";
+                  ]
+                  method_ ~equal:String.equal -> begin
+          let defaults = env.ctx.given.own_update_arguments in
+          match (Translate_context.atomic_inputs signature method_, args) with
+          | Some (inputs, _), token :: rest
+            when List.length inputs - List.length args = List.length signature.au_inputs
+                 && List.length defaults = List.length signature.au_inputs ->
+              begin match List.find defaults ~f:(List.mem bound ~equal:String.equal) with
+              | Some x ->
+                  error at
+                    (Printf.sprintf
+                       "%s is rebound here: give the update's arguments explicitly" x)
+              | None ->
+                  let var x = S.mk_term (Tvar (Qid (S.mk_id ~loc:at x))) at in
+                  return
+                    (List.fold
+                       ((token :: List.map defaults ~f:var) @ rest)
+                       ~init:head
+                       ~f:(fun f a -> S.mk_term (Tapply (f, a)) at))
+              end
+          | _ -> return t
+        end
+      | _ -> return t
+      end
+  | _ -> return t
+
+(** [with_update_arguments] throughout the proof [p]. *)
+let rec proof_with_update_arguments env ~bound (p : S.proof_expr) =
+  let ( let* ) = Result.( >>= ) in
+  let ( let+ ) r f = Result.map r ~f in
+  let term ?(bound = bound) t = with_update_arguments env ~bound t in
+  let proof ?(bound = bound) p = proof_with_update_arguments env ~bound p in
+  let+ desc =
+    match p.proof_desc with
+    | Proof_value t ->
+        let+ t = term t in
+        S.Proof_value t
+    | Proof_assert t ->
+        let+ t = term t in
+        S.Proof_assert t
+    | Proof_cut t ->
+        let+ t = term t in
+        S.Proof_cut t
+    | Proof_unfold (t, names) ->
+        let+ t = term t in
+        S.Proof_unfold (t, names)
+    | Proof_fold (t, witnesses) ->
+        let* t = term t in
+        let+ witnesses =
+          Result.all
+            (List.map witnesses ~f:(fun (x, w) ->
+                 let+ w = term w in
+                 (x, w)))
+        in
+        S.Proof_fold (t, witnesses)
+    | Proof_let (pattern, value, body) ->
+        let* value = proof value in
+        let+ body = proof ~bound:(S.pat_names pattern @ bound) body in
+        S.Proof_let (pattern, value, body)
+    | Proof_seq (a, b) ->
+        let* a = proof a in
+        let+ b = proof b in
+        S.Proof_seq (a, b)
+    | Proof_if (c, a, b) ->
+        let* c = term c in
+        let* a = proof a in
+        let+ b = proof b in
+        S.Proof_if (c, a, b)
+    | Proof_match (t, cases) ->
+        let* t = term t in
+        let+ cases =
+          Result.all
+            (List.map cases ~f:(fun (pattern, body) ->
+                 let+ body = proof ~bound:(S.pat_names pattern @ bound) body in
+                 (pattern, body)))
+        in
+        S.Proof_match (t, cases)
+  in
+  { p with proof_desc = desc }
+
+(** The names an outline step imports from earlier ones. *)
+let imported_names (outline : Annotation.outline option) =
+  Option.value_map outline ~default:[] ~f:(fun o ->
+      List.concat_map o.Annotation.imports ~f:(fun (_, pattern) -> S.pat_names pattern))
+
+(** [body] with a delegation, [X.delegate token step arguments] as its value, expanded:
+    the update is opened, the step runs with the arguments, and the update commits with
+    its result, or with its exception if it raised. *)
+let rec delegated env ~operation ~outcome (body : S.proof_expr) =
+  match body.proof_desc with
+  | Proof_let (pattern, value, rest) ->
+      Result.map (delegated env ~operation ~outcome rest) ~f:(fun rest ->
+          { body with proof_desc = Proof_let (pattern, value, rest) })
+  | Proof_seq (first, rest) ->
+      Result.map (delegated env ~operation ~outcome rest) ~f:(fun rest ->
+          { body with proof_desc = Proof_seq (first, rest) })
+  | Proof_value t -> begin
+      let at = t.term_loc in
+      match spine t [] with
+      | ( { term_desc = Tvar (Qdot (parent, { pid_str = "delegate"; _ }) as q); _ },
+          [ token; { term_desc = Tvar (Qid step); _ }; arguments ] )
+        when String.equal step.pid_str operation ->
+          begin match atomic_method env q with
+          | None -> Ok body
+          | Some (signature, _) ->
+              let term desc = S.mk_term desc at in
+              let var x = term (Tvar (Qid (S.mk_id ~loc:at x))) in
+              let method_ name = term (Tvar (Qdot (parent, S.mk_id ~loc:at name))) in
+              let apply f args =
+                List.fold args ~init:f ~f:(fun f a -> term (Tapply (f, a)))
+              in
+              let proof desc = { S.proof_desc = desc; proof_loc = body.proof_loc } in
+              let pid x = { S.pat_desc = Pid (S.mk_id ~loc:at x); pat_loc = at } in
+              let result = "delegated_result" and raised = "delegated_outcome" in
+              let commit =
+                proof (Proof_value (apply (method_ "commit") [ token; var result ]))
+              in
+              let completion =
+                if not outcome then commit
+                else if signature.au_raises then
+                  let constructor name argument =
+                    {
+                      S.pat_desc = Pconstr (Qid (S.mk_id ~loc:at name), argument);
+                      pat_loc = at;
+                    }
+                  in
+                  proof
+                    (Proof_match
+                       ( var raised,
+                         [
+                           (constructor "None" None, commit);
+                           ( constructor "Some" (Some (pid "delegated_exception")),
+                             proof
+                               (Proof_value
+                                  (apply (method_ "commit_raise")
+                                     [ token; var "delegated_exception" ])) );
+                         ] ))
+                else
+                  proof
+                    (Proof_seq
+                       ( proof
+                           (Proof_assert
+                              (term
+                                 (Tinfix
+                                    ( var raised,
+                                      S.mk_id ~fixity:Infix ~loc:at "===",
+                                      var "None" )))),
+                         commit ))
+              in
+              let invoked =
+                if outcome then
+                  { S.pat_desc = Ptuple [ pid result; pid raised ]; pat_loc = at }
+                else pid result
+              in
+              Ok
+                (proof
+                   (Proof_let
+                      ( pid "delegated_values",
+                        proof (Proof_value (apply (method_ "access") [ token ])),
+                        proof
+                          (Proof_let
+                             ( invoked,
+                               proof (Proof_value (apply (var operation) [ arguments ])),
+                               proof
+                                 (Proof_seq (completion, proof (Proof_value (var result))))
+                             )) )))
+          end
+      | _ -> Ok body
+    end
+  | _ -> Ok body
+
+(** [body] with what it opens by a lemma that another closes, and does not close itself,
+    closed before its result or its first cut: the closing lemma is called with the
+    opening one's arguments and results. *)
+let closed env (body : S.proof_expr) =
+  let closers = env.ctx.given.proof_support.lemma_closers in
+  let call (t : S.term) =
+    match spine t [] with
+    | { term_desc = Tvar (Qid f); _ }, args -> Some (f.pid_str, args)
+    | _ -> None
+  in
+  (* The names that a closing call in [p] is given. *)
+  let rec closing_names (p : S.proof_expr) =
+    let of_term (t : S.term) =
+      match call t with
+      | Some (f, args)
+        when List.exists closers ~f:(fun (_, closer) -> String.equal closer f) ->
+          List.filter_map args ~f:(fun (a : S.term) ->
+              match a.term_desc with Tvar (Qid x) -> Some x.pid_str | _ -> None)
+      | _ -> []
+    in
+    match p.proof_desc with
+    | Proof_value t -> of_term t
+    | Proof_assert _ | Proof_cut _ | Proof_fold _ | Proof_unfold _ -> []
+    | Proof_let (_, a, b) | Proof_seq (a, b) | Proof_if (_, a, b) ->
+        closing_names a @ closing_names b
+    | Proof_match (_, cases) -> List.concat_map cases ~f:(fun (_, p) -> closing_names p)
+  in
+  let closed_names = closing_names body in
+  (* The opens of [p]'s spine that nothing closes, as closing calls, innermost first. *)
+  let rec opens (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_let (pattern, { proof_desc = Proof_value value; _ }, rest) -> begin
+        let results =
+          match pattern.pat_desc with
+          | Pid x -> Some [ x ]
+          | Ptuple ps ->
+              Option.all
+                (List.map ps ~f:(fun (p : S.pat) ->
+                     match p.pat_desc with Pid x -> Some x | _ -> None))
+          | _ -> None
+        in
+        let opened =
+          match (call value, results) with
+          | Some (f, args), Some results ->
+              Option.bind (List.Assoc.find closers f ~equal:String.equal)
+                ~f:(fun closer ->
+                  if
+                    List.exists results ~f:(fun (x : S.id) ->
+                        List.mem closed_names x.pid_str ~equal:String.equal)
+                  then None
+                  else
+                    let at = value.term_loc in
+                    let var (x : S.id) = S.mk_term (Tvar (Qid x)) at in
+                    Some
+                      (List.fold
+                         (args @ List.map results ~f:var)
+                         ~init:(S.mk_term (Tvar (Qid (S.mk_id ~loc:at closer))) at)
+                         ~f:(fun f a -> S.mk_term (Tapply (f, a)) at)))
+          | _ -> None
+        in
+        opens rest @ Option.to_list opened
+      end
+    | Proof_let (_, _, rest) | Proof_seq (_, rest) -> opens rest
+    | _ -> []
+  in
+  let closes = opens body in
+  let proof ~at desc = { S.proof_desc = desc; proof_loc = at } in
+  let close_before (p : S.proof_expr) =
+    List.fold (List.rev closes) ~init:p ~f:(fun p close ->
+        proof ~at:p.proof_loc
+          (Proof_seq (proof ~at:close.S.term_loc (Proof_value close), p)))
+  in
+  let rec place (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_seq ({ proof_desc = Proof_cut _; _ }, _) | Proof_value _ -> close_before p
+    | Proof_let (pattern, value, rest) ->
+        { p with proof_desc = Proof_let (pattern, value, place rest) }
+    | Proof_seq (first, rest) -> { p with proof_desc = Proof_seq (first, place rest) }
+    | _ -> p
+  in
+  if List.is_empty closes then body else place body
+
+(** A cut by [t]: it is proved, and the rest is verified from it and the values of
+    variables alone. *)
+let cut env (t : S.term) =
+  let open State.Syntax in
+  let l = loc t.term_loc in
+  let+ value = formula env t in
+  (* A cut restates what contracts carry implicitly: the visibility context and the
+     type facts of the program parameters. *)
+  let implicit =
+    if env.ctx.given.visibility_execution then
+      Option.to_list
+        (Option.map env.ctx.given.execution_owner
+           ~f:(Execution_contract.visibility_context ~loc:l))
+    else []
+  in
+  let typed =
+    List.filter_map env.ctx.given.program_parameters ~f:(fun (raven, t) ->
+        Datatypes.admissible ~loc:l env.ctx.given.types t
+          (R.Expr.var ~loc:l (name ~loc:l raven)))
+  in
+  let value =
+    List.fold (implicit @ typed) ~init:value ~f:(fun value resource ->
+        R.Expr.binary ~loc:l And value resource)
+  in
+  R.Stmt.cut ~loc:l (R.Spec.make value)
+
+(** Ghost annotations invoke checked proof operations. *)
+let proof_statement env =
+  let open State.Syntax in
+  function
+  | S.Fold t -> predicate_use env ~unfold:false t [] R.Stmt.fold
+  | Unfold t -> predicate_use env ~unfold:true t [] R.Stmt.unfold
+  | Fold_with (t, ws) -> predicate_use env ~unfold:false t ws R.Stmt.fold
+  | Unfold_with (t, ws) -> predicate_use env ~unfold:true t ws R.Stmt.unfold
+  | Assert t ->
+      let+ value = formula env t in
+      R.Stmt.assert_ ~loc:(loc t.term_loc) (R.Spec.make value)
+  | Cut t -> cut env t
+  | Ghost_call t ->
+      let* call, outputs = lemma_call env t in
+      if not (List.is_empty outputs) then
+        State.of_result (error t.term_loc "Bind all the results of this lemma")
+      else State.return (R.Stmt.call ~loc:(loc t.term_loc) call)
 
 let proof_signature env (t : S.term) =
   let head, _ = spine t [] in
   match atomic_proof_signature env t with
   | Some _ as signature -> signature
+  | None
+    when List.mem
+           [ "merge_views"; "weaken_view" ]
+           (Option.value (ghost_operation t) ~default:"")
+           ~equal:String.equal ->
+      Option.map
+        (Option.both
+           (Result.ok (Source.ghost_type env.ctx.given.env ~at:t.term_loc))
+           (Result.ok (visibility_view_type env.ctx.given ~at:t.term_loc)))
+        ~f:(fun (owner, view) ->
+          let merge =
+            Option.equal String.equal (ghost_operation t) (Some "merge_views")
+          in
+          {
+            lemma_raven =
+              (Execution_contract.module_name
+              ^ if merge then ".visibility_union" else ".visibility_weaken");
+            lemma_constant = false;
+            lemma_generic = None;
+            lemma_inputs = [ owner; view; view ];
+            lemma_outputs = (if merge then [ view ] else []);
+            lemma_implicit_count = 0;
+          })
   | None ->
       begin match head.term_desc with
       | Tvar (Qid id) when List.Assoc.mem env.vars id.pid_str ~equal:String.equal -> None
       | Tvar q ->
-          List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
-            ~equal:String.equal
+          begin match access_method env q with
+          | Some (field, method_) ->
+              field_proof_signature env t field.Access_fields.kind method_
+          | None ->
+              Option.first_some
+                (resource_operation ~lemma:true env q)
+                (List.Assoc.find env.ctx.given.proof_lemmas (logical_key env q)
+                   ~equal:String.equal)
+          end
       | _ -> None
       end
 
@@ -657,6 +1363,22 @@ let rec proof_value_types ?expected env (t : S.term) =
   | Some signature ->
       let+ signature = instantiate_proof_call_signature ?expected env t signature in
       List.map signature.lemma_outputs ~f:Option.some
+  | None when Option.equal String.equal (prophecy_operation t) (Some "create") ->
+      begin match expected with
+      | Some expected ->
+          let+ () =
+            State.of_result
+              (Source.check_logical_expression
+                 ~type_variables:(source_type_variables env.ctx.given)
+                 env.ctx.given.env ~functions:(List.map env.funcs ~f:fst)
+                 ~variables:env.var_types ~expected t)
+          in
+          [ Some expected ]
+      | None ->
+          State.of_result
+            (error t.term_loc
+               "Annotate the prophecy handle and predicted value when creating a prophecy")
+      end
   | None ->
       begin match t.term_desc with
       | Ttuple ts -> State.all ts ~f:(proof_value_type env)
@@ -977,7 +1699,7 @@ let join_proof_result_types ?expected env ~at branches =
         | None -> (
             match Types.get_desc typ with
             | Tvar _ | Tunivar _ -> typ
-            | desc -> Ctype.newty (Btype.copy_type_desc instantiate desc))
+            | desc -> Ctype.newty (Compiler_types.map_desc instantiate desc))
       in
       let types = List.map types ~f:instantiate in
       let variables =
@@ -1011,13 +1733,15 @@ let rec proof_result_types ?expected env (body : S.proof_expr) =
   let open State.Syntax in
   match body.proof_desc with
   | Proof_value t
-    when is_ghost_fpu t || Option.equal String.equal (ghost_operation t) (Some "write") ->
+    when is_ghost_fpu t
+         || Option.equal String.equal (ghost_operation t) (Some "write")
+         || Option.equal String.equal (prophecy_operation t) (Some "resolve") ->
       State.return (Some [])
   | Proof_value t ->
       let+ ts = proof_value_types ?expected env t in
       Some ts
   | Proof_assert { term_desc = Tfalse; _ } -> State.return None
-  | Proof_assert _ | Proof_fold _ -> State.return (Some [])
+  | Proof_assert _ | Proof_cut _ | Proof_fold _ -> State.return (Some [])
   | Proof_unfold (_, []) -> State.return (Some [])
   | Proof_unfold (predicate, witnesses) ->
       State.of_result (unfold_result_types env predicate witnesses)
@@ -1074,6 +1798,34 @@ let rec proof_expression env targets (body : S.proof_expr) =
          ~expected value)
   in
   match body.proof_desc with
+  | Proof_value t when Option.equal String.equal (prophecy_operation t) (Some "resolve")
+    ->
+      begin match snd (spine t []) with
+      | [ prophecy; value ] ->
+          let* () = check_logical ~expected:Predef.type_unit t in
+          let* prophecy = formula env prophecy in
+          let* value = formula env value in
+          unit_statement (R.Prophecy.resolve ~loc:l prophecy value)
+      | _ ->
+          State.of_result
+            (error t.term_loc
+               "Ghost.Prophecy.resolve expects a prophecy and its actual value")
+      end
+  | Proof_value t when Option.equal String.equal (prophecy_operation t) (Some "create") ->
+      begin match (snd (spine t []), targets) with
+      | [ { term_desc = Ttuple []; _ } ], [ prophecy; value ] ->
+          let* () =
+            check_logical
+              ~expected:(packed_type [ prophecy.target_type; value.target_type ])
+              t
+          in
+          let+ typ = State.typ env.ctx ~at:t.term_loc value.target_type in
+          [ R.Prophecy.create ~loc:l typ (target_expr prophecy) (target_expr value) ]
+      | _ ->
+          State.of_result
+            (error t.term_loc
+               "Bind Ghost.Prophecy.create () to a prophecy and its predicted value")
+      end
   | Proof_value t when is_ghost_fpu t ->
       let* statement = ghost_fpu env t in
       unit_statement statement
@@ -1141,64 +1893,68 @@ let rec proof_expression env targets (body : S.proof_expr) =
                 (error t.term_loc
                    "The proof expression has a different result type from its binding")
           in
-          let* call, outputs = proof_call ~expected env t in
-          if List.length outputs = List.length targets then
-            if List.is_empty targets then State.return [ R.Stmt.call ~loc:l call ]
+          let* before, call, outputs = proof_call ~expected env t in
+          let+ statements =
+            if List.length outputs = List.length targets then
+              if List.is_empty targets then State.return [ R.Stmt.call ~loc:l call ]
+              else
+                State.return
+                  [
+                    R.Stmt.assign ~loc:l
+                      (List.map targets ~f:target_expr)
+                      (R.Stmt.expr_rhs call);
+                  ]
             else
-              State.return
-                [
-                  R.Stmt.assign ~loc:l
-                    (List.map targets ~f:target_expr)
-                    (R.Stmt.expr_rhs call);
-                ]
-          else
-            begin match targets with
-            | [ target ] ->
-                let+ temporaries =
-                  State.all outputs ~f:(fun ty ->
+              begin match targets with
+              | [ target ] ->
+                  let+ temporaries =
+                    State.all outputs ~f:(fun ty ->
+                        let* raven = State.fresh "result" in
+                        let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
+                        let target = { target_name = raven; target_type = ty } in
+                        ( target,
+                          R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
+                            (ident ~loc:l raven) ))
+                  in
+                  let values =
+                    List.map temporaries ~f:(fun (target, _) -> target_expr target)
+                  in
+                  let call =
+                    if List.is_empty values then R.Stmt.call ~loc:l call
+                    else R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs call)
+                  in
+                  let result = R.Expr.tuple ~loc:l values in
+                  List.concat_map temporaries ~f:snd
+                  @ [
+                      call;
+                      R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs result);
+                    ]
+              | _ ->
+                  begin match outputs with
+                  | [ ty ] when not (List.is_empty targets) ->
                       let* raven = State.fresh "result" in
                       let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
-                      let target = { target_name = raven; target_type = ty } in
-                      ( target,
+                      let result = R.Expr.var ~loc:l (name ~loc:l raven) in
+                      let declaration =
                         R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type
-                          (ident ~loc:l raven) ))
-                in
-                let values =
-                  List.map temporaries ~f:(fun (target, _) -> target_expr target)
-                in
-                let call =
-                  if List.is_empty values then R.Stmt.call ~loc:l call
-                  else R.Stmt.assign ~loc:l values (R.Stmt.expr_rhs call)
-                in
-                let result = R.Expr.tuple ~loc:l values in
-                List.concat_map temporaries ~f:snd
-                @ [
-                    call;
-                    R.Stmt.assign ~loc:l [ target_expr target ] (R.Stmt.expr_rhs result);
-                  ]
-            | _ ->
-                begin match outputs with
-                | [ ty ] when not (List.is_empty targets) ->
-                    let* raven = State.fresh "result" in
-                    let+ raven_type = State.typ env.ctx ~at:t.term_loc ty in
-                    let result = R.Expr.var ~loc:l (name ~loc:l raven) in
-                    let declaration =
-                      R.Stmt.local ~loc:l ~ghost:true ~typ:raven_type (ident ~loc:l raven)
-                    in
-                    let assignments =
-                      List.mapi targets ~f:(fun i target ->
-                          R.Stmt.assign ~loc:l
-                            [ target_expr target ]
-                            (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l result i)))
-                    in
-                    declaration
-                    @ [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs call) ]
-                    @ assignments
-                | _ ->
-                    State.of_result
-                      (error t.term_loc "Bind all the results of this lemma")
-                end
-            end
+                          (ident ~loc:l raven)
+                      in
+                      let assignments =
+                        List.mapi targets ~f:(fun i target ->
+                            R.Stmt.assign ~loc:l
+                              [ target_expr target ]
+                              (R.Stmt.expr_rhs (R.Expr.tuple_get ~loc:l result i)))
+                      in
+                      declaration
+                      @ [ R.Stmt.assign ~loc:l [ result ] (R.Stmt.expr_rhs call) ]
+                      @ assignments
+                  | _ ->
+                      State.of_result
+                        (error t.term_loc "Bind all the results of this lemma")
+                  end
+              end
+          in
+          before @ statements
       | None ->
           let values =
             match (targets, t.term_desc) with
@@ -1240,6 +1996,9 @@ let rec proof_expression env targets (body : S.proof_expr) =
       | Tfalse -> State.return [ statement ]
       | _ -> unit_statement statement
       end
+  | Proof_cut t ->
+      let* statement = cut env t in
+      unit_statement statement
   | Proof_fold (t, witnesses) ->
       let* statement = predicate_use env ~unfold:false t witnesses R.Stmt.fold in
       unit_statement statement
@@ -1417,13 +2176,33 @@ let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
             let* body = State.of_result (Annotation.proof annotation) in
             let* env = scope_env ctx in
             let* env = outline_env env annotation.outline in
-            let+ statements =
-              proof_expression env [] (with_outline_lets annotation.outline body)
+            let* body =
+              State.of_result
+                (proof_with_update_arguments env
+                   ~bound:(imported_names annotation.outline)
+                   (with_outline_lets annotation.outline body))
             in
+            let+ statements = proof_expression env [] body in
             [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]
         | _ ->
             let* statements = State.of_result (Annotation.ghost_stmts annotation) in
             let* env = scope_env ctx in
+            let* statements =
+              State.of_result
+                (Result.all
+                   (List.map statements ~f:(fun statement ->
+                        let term t = with_update_arguments env ~bound:[] t in
+                        match statement with
+                        | S.Fold t -> Result.map (term t) ~f:(fun t -> S.Fold t)
+                        | Unfold t -> Result.map (term t) ~f:(fun t -> S.Unfold t)
+                        | Assert t -> Result.map (term t) ~f:(fun t -> S.Assert t)
+                        | Cut t -> Result.map (term t) ~f:(fun t -> S.Cut t)
+                        | Ghost_call t -> Result.map (term t) ~f:(fun t -> S.Ghost_call t)
+                        | Fold_with (t, ws) ->
+                            Result.map (term t) ~f:(fun t -> S.Fold_with (t, ws))
+                        | Unfold_with (t, ws) ->
+                            Result.map (term t) ~f:(fun t -> S.Unfold_with (t, ws)))))
+            in
             State.all statements ~f:(proof_statement env))
   in
   List.concat blocks
@@ -1431,7 +2210,7 @@ let ghost ctx ~(after : Lexing.position) ~(before : Lexing.position) =
 (** Free names in proof expressions, respecting lexical bindings. *)
 let rec proof_names (body : S.proof_expr) =
   match body.proof_desc with
-  | Proof_value t | Proof_assert t | Proof_unfold (t, _) -> term_names t
+  | Proof_value t | Proof_assert t | Proof_cut t | Proof_unfold (t, _) -> term_names t
   | Proof_fold (t, witnesses) ->
       term_names t @ List.concat_map witnesses ~f:(fun (_, t) -> term_names t)
   | Proof_seq (a, b) -> proof_names a @ proof_names b
@@ -1446,25 +2225,37 @@ let rec proof_names (body : S.proof_expr) =
           List.filter (proof_names body) ~f:(fun name ->
               not (List.mem (pat_names p) name ~equal:String.equal)))
 
-let stateful_access access_proofs (e : Typedtree.expression) =
+let rec stateful_access access_proofs (e : Typedtree.expression) =
   let key = (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) in
   match List.Assoc.find access_proofs key ~equal:Poly.equal with
-  | None -> Ok false
+  | None ->
+      let operands =
+        match e.exp_desc with
+        | Texp_tuple components -> List.map components ~f:snd
+        | Texp_record { fields; extended_expression = None; _ } ->
+            List.filter_map (Array.to_list fields) ~f:(function
+              | _, Typedtree.Overridden (_, value) -> Some value
+              | _, Kept _ -> None)
+        | _ -> []
+      in
+      Result.map
+        (Result.all (List.map operands ~f:(stateful_access access_proofs)))
+        ~f:(List.exists ~f:Fn.id)
   | Some annotation ->
       Result.map (Annotation.scope annotation) ~f:(fun scope ->
           Option.is_some scope.scope_state)
 
-let atomic_read_argument (e : Typedtree.expression) =
+let atomic_argument (e : Typedtree.expression) =
   match e.exp_desc with
   | Texp_apply ({ exp_desc = Texp_ident (path, _, _); _ }, [ (_, Arg argument) ])
-    when Option.equal String.equal (atomic_name path) (Some "get") ->
+    when Option.is_some (atomic_name path) ->
       Some argument
   | _ -> None
 
-(** State stays local to a directly nested pair of explicitly stateful reads. *)
-let nested_stateful_read access_proofs e =
-  match atomic_read_argument e with
-  | Some argument when Option.is_some (atomic_read_argument argument) ->
+(** An explicitly stateful atomic access receives the state of its direct operand. *)
+let nested_stateful_atomic_argument access_proofs e =
+  match atomic_argument e with
+  | Some argument ->
       let* outer = stateful_access access_proofs e in
       let* inner = stateful_access access_proofs argument in
       Ok (Option.some_if (outer && inner) argument)
@@ -1489,16 +2280,131 @@ let access_captures_outcome annotation ~outputs =
         | _ -> binding rest
         end
     | Proof_let (_, _, rest) | Proof_seq (_, rest) -> binding rest
+    | Proof_value term ->
+        (* A delegation commits with the outcome of the call. *)
+        begin match spine term [] with
+        | ( { term_desc = Tvar (Qdot (_, { pid_str = "delegate"; _ })); _ },
+            [ _; { term_desc = Tvar (Qid operation); _ }; _ ] )
+          when String.equal operation.pid_str scope.scope_operation.pid_str ->
+            outputs = 0
+        | _ -> false
+        end
     | _ -> false
   in
   Ok (binding scope.scope_body)
 
+(** [body], the proof of a step at a primitive access, with the invariants of the opens
+    clause opened around it: unfolded where it first uses the unfolded state or the
+    operation, under the name [current] (or, if several, the invariant's own name), and
+    folded unchanged before its result, or before its first cut, which can only be made
+    with the invariants closed. A proof that unfolds an invariant itself keeps it in its
+    hands; one that folds it itself replaces only the unchanged fold. *)
+let bracketed env ~operation (body : S.proof_expr) =
+  let head (t : S.term) =
+    match spine t [] with
+    | { term_desc = Tvar q; _ }, _ when Option.is_none (access_method env q) ->
+        Some (logical_key env q, q)
+    | _ -> None
+  in
+  (* An instance of an invariant, rather than a namespace such as [live _]. *)
+  let openable (t : S.term) =
+    let _, arguments = spine t [] in
+    Option.exists (head t) ~f:(fun (key, _) ->
+        Option.exists
+          (List.Assoc.find env.ctx.given.predicate_bodies key ~equal:String.equal)
+          ~f:(fun body -> body.openable && not body.inline))
+    && not
+         (List.exists arguments ~f:(fun (a : S.term) ->
+              match a.term_desc with
+              | Tvar (Qid id) -> String.equal id.pid_str "_"
+              | _ -> false))
+  in
+  (* The invariants that [p] unfolds, and those it folds. *)
+  let rec handled (p : S.proof_expr) =
+    let key t = Option.to_list (Option.map (head t) ~f:fst) in
+    let both (u1, f1) (u2, f2) = (u1 @ u2, f1 @ f2) in
+    match p.proof_desc with
+    | Proof_unfold (t, _) -> (key t, [])
+    | Proof_fold (t, _) -> ([], key t)
+    | Proof_value _ | Proof_assert _ | Proof_cut _ -> ([], [])
+    | Proof_let (_, a, b) | Proof_seq (a, b) | Proof_if (_, a, b) ->
+        both (handled a) (handled b)
+    | Proof_match (_, cases) ->
+        List.fold cases ~init:([], []) ~f:(fun acc (_, p) -> both acc (handled p))
+  in
+  let candidates =
+    List.filter_map env.ctx.given.opened ~f:(fun t ->
+        if openable t then Option.map (head t) ~f:(fun h -> (t, h)) else None)
+  in
+  let unfolded, folded = handled body in
+  let proof ~at desc = { S.proof_desc = desc; proof_loc = at } in
+  let rec before_result fold (p : S.proof_expr) =
+    match p.proof_desc with
+    | Proof_seq ({ proof_desc = Proof_cut _; _ }, _) ->
+        Some (proof ~at:p.proof_loc (Proof_seq (fold, p)))
+    | Proof_let (pattern, value, rest) ->
+        Option.map (before_result fold rest) ~f:(fun rest ->
+            { p with proof_desc = Proof_let (pattern, value, rest) })
+    | Proof_seq (first, rest) ->
+        Option.map (before_result fold rest) ~f:(fun rest ->
+            { p with proof_desc = Proof_seq (first, rest) })
+    | Proof_value _ -> Some (proof ~at:p.proof_loc (Proof_seq (fold, p)))
+    | _ -> None
+  in
+  let open_around body ((t : S.term), (key, q)) =
+    let at = body.S.proof_loc in
+    let refolded =
+      if List.mem folded key ~equal:String.equal then Some body
+      else before_result (proof ~at (Proof_fold (t, []))) body
+    in
+    match refolded with
+    | None -> body
+    | Some _ when List.mem unfolded key ~equal:String.equal -> body
+    | Some body ->
+        let name =
+          match (candidates, q) with
+          | [ _ ], _ -> "current"
+          | _, (S.Qid id | Qdot (_, id)) -> id.pid_str
+        in
+        let unfold = proof ~at (Proof_unfold (t, [])) in
+        let named = List.mem (proof_names body) name ~equal:String.equal in
+        let opened (rest : S.proof_expr) =
+          if named then
+            let pattern = { S.pat_desc = Pid (S.mk_id ~loc:at name); pat_loc = at } in
+            proof ~at:rest.proof_loc (Proof_let (pattern, unfold, rest))
+          else proof ~at:rest.proof_loc (Proof_seq (unfold, rest))
+        in
+        let uses (p : S.proof_expr) =
+          List.exists (proof_names p) ~f:(fun x ->
+              String.equal x operation || (named && String.equal x name))
+        in
+        let rec place (p : S.proof_expr) =
+          match p.proof_desc with
+          | Proof_let (pattern, value, rest) when not (uses value) ->
+              { p with proof_desc = Proof_let (pattern, value, place rest) }
+          | Proof_seq (first, rest) when not (uses first) ->
+              { p with proof_desc = Proof_seq (first, place rest) }
+          | _ -> opened p
+        in
+        place body
+  in
+  List.fold (List.rev candidates) ~init:body ~f:open_around
+
 (** A checked wrapper invokes the original operation once: its statements, and the value
-    of the operation, which [run] gives. *)
-let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types = []) run
-    =
+    of the operation, which [run] gives. With [bracket], the step is at a primitive
+    access, which opens the invariants of the opens clause around its proof. *)
+let access_proof ctx annotation ~result_type ?(mode = S.General_scope) ?(input_types = [])
+    ?(output_types = []) ?(bracket = false) run =
   let open State.Syntax in
   let* scope = State.of_result (Annotation.scope annotation) in
+  let* () =
+    if
+      not (Poly.equal scope.scope_mode S.General_scope || Poly.equal scope.scope_mode mode)
+    then
+      State.of_result
+        (error annotation.loc "This scope does not match the attached operation")
+    else State.return ()
+  in
   let export = Option.bind annotation.Annotation.outline ~f:(fun o -> o.export) in
   let stateful = Option.is_some scope.scope_state || Option.is_some export in
   let operation = scope.scope_operation
@@ -1635,6 +2541,15 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
                 [ result; packed_value ~loc:(loc rhs.proof_loc) outputs ],
               packed_type [ result_type; packed_type output_types ] )
         in
+        let* raw_result = State.raw_value result in
+        let* () =
+          match raw_result with
+          | Some raw when not (List.is_empty output_types) ->
+              State.register_raw
+                (R.Expr.tuple_get ~loc:(loc rhs.proof_loc) result_value 0)
+                raw
+          | Some _ | None -> State.return ()
+        in
         let* env =
           State.of_result (bind_proof_pattern env pattern result_ty result_value)
         in
@@ -1686,7 +2601,23 @@ let access_proof ctx annotation ~result_type ?(input_types = []) ?(output_types 
       (Option.exists scope.scope_state ~f:(fun p ->
            List.mem (pat_names p) operation.pid_str ~equal:String.equal))
   in
-  before env visible body
+  let* body =
+    State.of_result
+      (delegated env ~operation:operation.pid_str
+         ~outcome:(not (List.is_empty output_types))
+         body)
+  in
+  let* body =
+    State.of_result
+      (proof_with_update_arguments env
+         ~bound:
+           (imported_names annotation.outline
+           @ Option.value_map scope.scope_state ~default:[] ~f:pat_names)
+         body)
+  in
+  let body = closed env body in
+  before env visible
+    (if bracket then bracketed env ~operation:operation.pid_str body else body)
 
 let return_proof ctx annotation ~result_type ~result =
   let open State.Syntax in
@@ -1706,5 +2637,11 @@ let return_proof ctx annotation ~result_type ~result =
       List.map ghost_returns ~f:(fun (_, raven, ty) ->
           { target_name = raven; target_type = ty })
     in
-    let+ statements = proof_expression env targets adapter.returns_body in
+    let* body =
+      State.of_result
+        (proof_with_update_arguments env
+           ~bound:(S.pat_names adapter.returns_result @ S.pat_names adapter.returns_state)
+           adapter.returns_body)
+    in
+    let+ statements = proof_expression env targets body in
     [ R.Stmt.ghost_block ~loc:(loc annotation.loc) statements ]

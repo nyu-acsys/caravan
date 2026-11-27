@@ -32,9 +32,9 @@ test('contract hovers omit outer comment markers, preserve the contract, and lin
 
 test('proof contract hovers escape Markdown and fall back to clauses when source is unavailable', () => {
   const original = contract(['a ``` fence']);
-  original.sourceLocation.file = path.resolve('proof [name].proof');
+  original.sourceLocation.file = path.resolve('proof [name].mlp');
   const hover = contractHover([original], root, { line: 2, character: 4 }, () => undefined, path.dirname(root));
-  assert.ok(hover.contents.value.includes('proof \\[name\\].proof:4'));
+  assert.ok(hover.contents.value.includes('proof \\[name\\].mlp:4'));
   assert.ok(hover.contents.value.includes('````caravan-proof\nensures a ``` fence\n````'));
-  assert.ok(hover.contents.value.includes('proof%20%5Bname%5D.proof#L4%2C1'));
+  assert.ok(hover.contents.value.includes('proof%20%5Bname%5D.mlp#L4%2C1'));
 });

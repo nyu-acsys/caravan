@@ -16,7 +16,7 @@ type t = {
 }
 
 (** Source argument positions retained by a universal procedure's worker. *)
-let argument_projection ~at specializations (worker : Polymorphic_functions.t) =
+let argument_projection ~types ~at specializations (worker : Polymorphic_functions.t) =
   match
     List.find specializations ~f:(fun specialization ->
         Ident.same specialization.universal.id worker.id)
@@ -24,7 +24,9 @@ let argument_projection ~at specializations (worker : Polymorphic_functions.t) =
   | None -> Ok None
   | Some specialization ->
       let* source =
-        Polymorphic_functions.discover ~at specialization.original.scheme_type
+        Polymorphic_functions.discover ~expand:(Datatypes.expand types)
+          ~project:(Datatypes.representation_arguments types)
+          ~at specialization.original.scheme_type
       in
       let* positions =
         Result.all
@@ -84,6 +86,7 @@ let result_type ~name (data : Datatypes.t) (witness : Datatypes.witness) =
                raven = c.raven;
                fields = [ c.raven ^ "_0" ];
                args = [ payload ];
+               inline_record = None;
              }))
   in
   Ok

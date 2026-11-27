@@ -72,6 +72,13 @@ let cache_dir =
   let doc = "Reuse successful verification results from the cache in $(docv)." in
   Arg.(value & opt (some string) None & info [ "cache-dir" ] ~docv:"DIR" ~doc)
 
+let only =
+  let doc =
+    "Verify only the source member or module $(docv), including its local helpers and \
+     companion proof obligations, and assume the other implementations."
+  in
+  Arg.(value & opt (some string) None & info [ "only" ] ~docv:"NAME" ~doc)
+
 let history =
   let doc =
     "How histories of states are encoded: $(b,sets), by the set of the states that the \
@@ -108,7 +115,7 @@ let print text =
 
 let main ?on_progress ?(emit = print) () no_greeting include_dirs no_dune history emit_rav
     check_stdlib manifest lsp_mode lsp_annotations lsp_annotations_only smt_timeout
-    cache_dir files =
+    cache_dir only files =
   if manifest then begin
     emit
       (Caravan_editor.Editor_report.manifest ~version:Caravan_config.version
@@ -118,6 +125,17 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs no_dune histor
   end
   else if lsp_mode && emit_rav then begin
     Logs.err (fun m -> m "--lsp-mode and --emit-rav cannot be used together");
+    1
+  end
+  else if Option.is_some only && (emit_rav || check_stdlib || lsp_annotations_only) then begin
+    Logs.err (fun m ->
+        m
+          "--only cannot be combined with --emit-rav, --check-stdlib or \
+           --lsp-annotations-only");
+    1
+  end
+  else if Option.is_some only && files = [] then begin
+    Logs.err (fun m -> m "--only requires a source file");
     1
   end
   else if check_stdlib && (lsp_mode || files <> []) then begin
@@ -138,7 +156,7 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs no_dune histor
           files
       else
         List.map
-          (Caravan_core.Check.run ?cache_dir ?on_progress ~include_dirs
+          (Caravan_core.Check.run ?only ?cache_dir ?on_progress ~include_dirs
              ~discover_dependencies:(not no_dune) ~history ~smt_timeout)
           files
     in
@@ -165,7 +183,7 @@ let main ?on_progress ?(emit = print) () no_greeting include_dirs no_dune histor
       (* Every file is checked, also after one that fails. *)
       let results =
         List.map
-          (Caravan_core.Check.file ?cache_dir ~include_dirs
+          (Caravan_core.Check.file ?only ?cache_dir ~include_dirs
              ~discover_dependencies:(not no_dune) ~history ~emit_rav ~smt_timeout)
           files
       in
@@ -181,7 +199,7 @@ let cmd ?emit ?on_progress () =
       const (main ?emit ?on_progress)
       $ setup $ no_greeting $ include_dirs $ no_dune $ history $ emit_rav $ check_stdlib
       $ manifest $ lsp_mode $ lsp_annotations $ lsp_annotations_only $ smt_timeout
-      $ cache_dir $ files)
+      $ cache_dir $ only $ files)
 
 let serve defaults =
   Logs.set_reporter (Logs_fmt.reporter ());

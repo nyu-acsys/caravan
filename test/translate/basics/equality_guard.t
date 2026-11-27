@@ -87,7 +87,7 @@ Runtime values containing references do not support structural equality.
   [1]
 
   $ caravan --shh equality_match_shadow_ref_fail.ml
-  [Error] File "equality_match_shadow_ref_fail.proof", line 4, columns 34-35:
+  [Error] File "equality_match_shadow_ref_fail.mlp", line 4, columns 34-35:
   4 |   | Some left, Some right -> left = right
                                         ^
   Type Error: Structural equality on references is unsupported; use == or != for reference identity.
@@ -117,7 +117,7 @@ Boxed physical equality cannot be encoded exactly in specifications.
   [1]
 
   $ caravan --shh equality_math_physical_fail.ml
-  [Error] File "equality_math_physical_fail.proof", line 2, columns 14-16:
+  [Error] File "equality_math_physical_fail.mlp", line 2, columns 14-16:
   2 |   requires (a == b) = ()
                     ^^
   Type Error: Physical equality on logical values is unsupported; use = or <>.
@@ -157,7 +157,7 @@ Logical equality compares structure and reference identity without reading conte
 Its operands retain their source types before references are erased.
 
   $ caravan --shh equality_logical_type_fail.ml
-  [Error] File "equality_logical_type_fail.proof", line 2, columns 16-19:
+  [Error] File "equality_logical_type_fail.mlp", line 2, columns 16-19:
   2 |   ensures (left === right) = ()
                       ^^^
   Type Error: Logical equality requires operands of the same OCaml type.

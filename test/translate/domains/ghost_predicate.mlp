@@ -1,0 +1,9 @@
+let allowed (value : int) : bool = value = 7
+
+module Worker = struct
+  let approved (value : int) : bool = value = 7
+
+  predicate accepted (value : int) = value = 7
+
+  module Job = Ghost.Task (struct let operation = work end)
+end

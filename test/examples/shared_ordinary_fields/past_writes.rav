@@ -1,0 +1,80 @@
+// Abstract past-write semantics; concrete OCaml refinement is a separate obligation.
+module PastWrites[E: Library.Type] {
+  module Entries = Library.SetRA[E]
+  module Journal = Library.Auth[Entries]
+
+  ghost field writes: Journal
+
+  pred authority(h: Ref, events: Set[E]) {
+    own(h.writes, Journal.auth(Entries.set(events)))
+  }
+
+  pred observation(h: Ref, event: E) {
+    own(h.writes, Journal.frag(Entries.set({event})))
+  }
+
+  proc create(initial: E)
+    returns (h: Ref)
+    ensures authority(h, {initial})
+  {
+    h := new(writes: Journal.auth(Entries.set({initial})));
+    fold authority(h, {initial});
+  }
+
+  lemma record(h: Ref, events: Set[E], event: E)
+    requires authority(h, events)
+    ensures authority(h, events ++ {event})
+  {
+    unfold authority(h, events);
+    fpu(h.writes,
+      Journal.auth(Entries.set(events)),
+      Journal.full(Entries.set(events)));
+    fpu(h.writes,
+      Journal.full(Entries.set(events)),
+      Journal.full(Entries.set(events ++ {event})));
+    fold authority(h, events ++ {event});
+  }
+
+  lemma remember(h: Ref, events: Set[E], event: E)
+    requires authority(h, events) && event in events
+    ensures authority(h, events) && observation(h, event)
+  {
+    unfold authority(h, events);
+    fpu(h.writes,
+      Journal.auth(Entries.set(events)),
+      Journal.auth_frag(Entries.set(events), Entries.set({event})));
+    fold authority(h, events);
+    fold observation(h, event);
+  }
+
+  lemma reconcile(h: Ref, events: Set[E], event: E)
+    requires authority(h, events) && observation(h, event)
+    ensures authority(h, events) && observation(h, event) && event in events
+  {
+    unfold authority(h, events);
+    unfold observation(h, event);
+    assert event in events;
+    fold authority(h, events);
+    fold observation(h, event);
+  }
+
+  lemma duplicate(h: Ref, event: E)
+    requires observation(h, event)
+    ensures observation(h, event) && observation(h, event)
+  {
+    unfold observation(h, event);
+    fold observation(h, event);
+    fold observation(h, event);
+  }
+
+  atomic proc sample(h: Ref, ghost events: Set[E])
+    returns (result: E)
+    requires authority(h, events) && events != {}
+    ensures authority(h, events) && observation(h, result)
+  {
+    // Nondeterministic choice defines the abstract read operation.
+    havoc result;
+    assume result in events;
+    remember(h, events, result);
+  }
+}

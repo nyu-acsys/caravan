@@ -1,0 +1,18 @@
+predicate cell_at (position : integer) (c : cell) (tail : cell list) (lower : int) =
+  exists v : int. own c.value v && lower <= v
+
+list_segment cells over cell_at
+
+proof reset c = at (c.value <- 0) (fun step ->
+  cells_expose cells 0 0 k c;
+  unfold cell_at k c (cells_suffix cells 0 k) 0;
+  let result = step () in
+  fold cell_at k c (cells_suffix cells 0 k) 0;
+  cells_restore cells 0 0 k c;
+  result)
+
+lemma first_cell (c : cell) (rest : cell list)
+  requires (cells_seg (c :: rest) 0 0)
+  ensures (cells_seg (c :: rest) 0 0) =
+  cells_expose (c :: rest) 0 0 0 c;
+  cells_restore (c :: rest) 0 0 0 c

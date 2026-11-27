@@ -5,9 +5,22 @@ invocation and completion. It supports modular linearizability proofs even when
 the implementation performs several accesses and retries. `atomic` in a contract
 does not assert that the whole implementation is physically atomic.
 
+A helper can declare physical atomicity by putting `[@atomic]` after its name in
+the contract, for example `proof result = read [@atomic] cell ...`. Such a helper
+can be called while an invariant is open. Caravan checks a conservative source
+subset allowing at most one modeled atomic effect, with pure preparation; it
+rejects ordinary mutable accesses and unsupported effects. Two accesses in
+different branches also exceed this initial check. Imported declarations assume
+this guarantee, and module implementations must preserve it. This attribute is
+distinct from the `atomic` keyword for logically atomic contracts.
+
+Function contracts can specify an invariant footprint with `opens {resource …}`;
+`opens {}` promises that no invariants are opened. The syntax matches proof
+lemmas. Omitting the clause keeps contract-based mask inference.
+
 For each example below, download its implementation, interface, and proof into
 one directory. Invoke Caravan on the `.ml` implementation; it loads the sibling
-`.mli` and `.proof` files automatically. Both examples are checked by the
+`.mli` and `.mlp` files automatically. Both examples are checked by the
 repository's regression suite.
 
 ## Actions and linearization points {#sec:actions-and-linearization-points}
@@ -102,9 +115,9 @@ by `set` or preserved by `read`. The client uses the `shared cell` invariant han
 but need not know the invariant's definition or the concrete resources it protects.
 
 The companion proof supplies the state interpretation and linearization points
-([automatic_cell.proof](../examples/automatic_cell.proof)):
+([automatic_cell.mlp](../examples/automatic_cell.mlp)):
 
-<<< ../examples/automatic_cell.proof{proof}
+<<< ../examples/automatic_cell.mlp{proof}
 
 With all three files saved together, verify the example with:
 
@@ -151,9 +164,9 @@ Interface ([manual_cell.mli](../examples/manual_cell.mli)):
 
 <<< ../examples/manual_cell.mli{caravan}
 
-Proof ([manual_cell.proof](../examples/manual_cell.proof)):
+Proof ([manual_cell.mlp](../examples/manual_cell.mlp)):
 
-<<< ../examples/manual_cell.proof{proof}
+<<< ../examples/manual_cell.mlp{proof}
 
 Verify this example with:
 
@@ -186,11 +199,62 @@ proof code. This is the external-outline form of an inline
 selects manual mode. Automatic `commit`, `returning`, and `performs` annotations
 are rejected in manual functions, so the two styles cannot both manage one update.
 
+In the proof of an operation, `access`, `commit`, `commit_raise` and `abort` on its
+own update, and `pending`, `committed` and `raised` about it, may omit the update's
+arguments: they are the operation's parameters, so `Read.access token` and
+`Read.commit token result` suffice here. A step at a call that fulfills the update,
+such as a retry calling the operation recursively, can delegate it to the call:
+`Read.delegate token invoke args` opens the update, runs the call with its ghost
+arguments `args`, and commits with the call's result, or with its exception if it
+raised.
+
 Manual proofs can open and close direct invariants, call structural lemmas around
 atomic accesses, abort an update by restoring its precondition, or let another
 thread commit a stored token. Raven checks permissions and atomicity in all cases.
+
+A step at an atomic access opens the invariants that the function's `opens` clause
+names by instance, such as `opens {is_queue t}`. Caravan unfolds the invariant
+before the step's proof first uses its state or the operation, names that state
+`current` (or the invariant's name, if several are open), and folds it unchanged
+before the result. An explicit `fold` replaces the unchanged one, for a step that
+changes the state; an explicit `unfold` leaves the invariant to the proof. Steps at
+calls of checked procedures open nothing, since the callee opens what it needs.
+
+A lemma can close what another opens: `lemma [@closes expose] restore ...` takes
+`expose`'s arguments followed by its results. A step that binds the results of an
+`expose` at its top level, and passes them to no `restore`, gets the `restore`
+before its result, and before the invariants the step opened are closed.
+
+In a long function, `cut p` summarizes the proof so far: Caravan proves `p` and
+verifies the rest of the function from `p` and the values of variables alone, which
+can make the rest much cheaper to check. It is ghost code, in an annotation
+`(*@ cut p *)` or a proof outline's step. In a step that opens invariants, Caravan
+closes them before the cut. The summary must restate everything the rest needs,
+including a pending atomic update (`Push.pending token ...`) and the range of an
+integer read before the cut; the contract's visibility context and the parameters'
+types are kept implicitly.
 The complete [segment-based queue](https://github.com/nyu-acsys/caravan/tree/main/test/saturn/michael_scott_queue_lseg)
 illustrates this style, including helping and exceptional completion.
+
+A public invariant can contain private invariant assertions. Declare their
+permanent parent in the companion proof so the public opening permission covers
+those private invariants:
+
+```proof
+invariant is_cell (cell : int Atomic.t) = cell_value cell
+invariant [@within is_cell cell] cell_value (cell : int Atomic.t) = own cell 0
+```
+
+An `opens {is_cell cell}` contract then permits opening `cell_value cell`,
+including while `is_cell cell` is open. Merely mentioning the child in the
+parent's definition does not grant that permission. Parent arguments must be
+explicit parameters of the child. An interface can also declare that one of its
+invariants lies within another, as in `(*@ invariant [@within is_cell cell]
+cell_value (cell : int Atomic.t) *)`. Its definition keeps that promise by declaring
+its parent, possibly through invariants private to the implementation, and clients
+of the interface rely on it. A typed wildcard can select a
+polymorphic namespace without choosing an instance, for example
+`opens {Seq.persistent (_ : int Seq.t)}`.
 
 ## Carry ghost information without changing runtime code {#sec:carry-ghost-information-without-changing-runtime-code}
 
@@ -205,10 +269,10 @@ sequence receive the preceding scope's output; its type may change between scope
 Ordinary `Ghost.scope` annotations and unannotated accesses preserve that state.
 
 For example, download [ghost_scopes.ml](../examples/ghost_scopes.ml) and its
-[companion proof](../examples/ghost_scopes.proof). The proof defines a predicate
+[companion proof](../examples/ghost_scopes.mlp). The proof defines a predicate
 owning the cell:
 
-<<< ../examples/ghost_scopes.proof{proof}
+<<< ../examples/ghost_scopes.mlp{proof}
 
 The implementation saves the initial contents as ghost state, replaces the
 runtime contents, and checks the saved value afterward:
@@ -234,11 +298,39 @@ do not escape those regions. A loop also does not carry a changed ghost state
 from one iteration to the next. Use a loop invariant for iteration reasoning;
 `invariant (fun saved -> proposition)` can refer to the inherited ghost state.
 
+A loop invariant can stay in the `.mlp` outline. Anchor its first body
+expression and refer to the counter named in the OCaml source. For a loop
+`for i = 0 to 9 do increment cell done`, its outline can contain:
+
+```proof
+at (increment cell) invariant (own cell.contents i);
+at (increment cell) (fun step -> let result = step () in result)
+```
+
+This form also works for `while` loops. The invariant holds at loop entry and
+after each iteration, including the final counter value beyond a `for` loop's
+bound. It can use exports from earlier outline steps and logical `let` bindings.
+
+Where the solver cannot find the value of an existential of the invariant, as for a
+ghost map that the loop extends, the invariant can name it after each iteration:
+
+```proof
+at (locks.(i) <- Mutex.create ()) invariant
+  (exists ms : (int, Mutex.t) map. ...) with { ms = Map.set ms i m }
+```
+
+`ms` in the witness is its value before the iteration, and the witness can use the
+exports of steps in the loop's body, here `m`. The steps in the loop's body can use
+`ms`, with its value at the start of the iteration, and so can the steps after the
+loop, with its final value.
+Its anchor remains available for a proof scope on the same body expression.
+
 Contracts can also declare ghost inputs and results. Calls pass these through
 access scopes; `Ghost.returns` supplies ghost results at runtime return points.
 Ghost values, allocations, and updates have no runtime effects. Manual and
 automatic modes share the same translation of executable OCaml and the same
 primitive models.
 
-Continue with [OCaml coverage](./ocaml-subset) and the
+Continue with [weak memory](./weak-memory) for advanced shared-field disciplines
+and release/acquire proofs, then [OCaml coverage](./ocaml-subset) and the
 [semantic conventions](./semantics).

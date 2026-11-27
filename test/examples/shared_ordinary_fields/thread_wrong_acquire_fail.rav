@@ -1,0 +1,11 @@
+proc acquire_unrelated(executing: Ref, cell: Ref, channel: Ref,
+    flag: Ref, other: Ref)
+  requires channel != other && ThreadContext.context(executing, {})
+    && ThreadCounters.published(channel, cell, 42, {})
+    && ThreadCounters.published(other, flag, 1, {})
+  opens ThreadCounters.published, ThreadContext.released
+{
+  val observed := ThreadCounters.acquire(executing, other, flag, {}, 1, {});
+  // This acquisition has an empty release view and contributes only other.
+  val result := ThreadCounters.read_frozen(executing, cell, channel, {other}, 42, {});
+}

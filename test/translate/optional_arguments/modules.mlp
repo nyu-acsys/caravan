@@ -1,0 +1,9 @@
+module Native = struct
+  proof result = choose fallback value token
+    ensures (result === (match value with None -> fallback | Some v -> v)) = ()
+end
+module Make (Select : Select) = struct
+  proof result = choose fallback value token
+    ensures (result === (match value with None -> fallback | Some v -> v)) = ()
+end
+proof client () = ()

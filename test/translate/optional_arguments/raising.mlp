@@ -1,0 +1,5 @@
+proof result = choose value token
+  ensures (match value with None -> false | Some v -> result === v)
+  raises Missing -> (value === None) = ()
+proof result = supplied () ensures (result = 42) raises Missing -> (false) = ()
+proof result = caught () ensures (result = 7) = ()

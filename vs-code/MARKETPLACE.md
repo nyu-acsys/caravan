@@ -9,11 +9,11 @@ New to Caravan? Start with the **[project introduction and examples](https://git
 
 ## Features
 
-- **Syntax highlighting** for `(*@ ... *)` specifications and `.proof` files.
+- **Syntax highlighting** for `(*@ ... *)` specifications and `.mlp` files.
 - **Verification on save**, with manual verification from the Command Palette.
 - **Diagnostics** in the editor and Problems panel, with gutter markers for errors,
   warnings, and related locations in companion files.
-- **Contract hovers** on function names, showing contracts from `.mli` and `.proof`
+- **Contract hovers** on function names, showing contracts from `.mli` and `.mlp`
   files with syntax highlighting and links to their sources.
 - **Proof hints** showing external proof steps beside the implementation, with
   full annotations on hover and navigation to their sources.
@@ -40,7 +40,7 @@ and configure `caravan.executable`.
 
 ## Usage
 
-Open an annotated `.ml` file, its `.mli`, or its `.proof` file in a trusted workspace.
+Open an annotated `.ml` file, its `.mli`, or its `.mlp` file in a trusted workspace.
 Save to verify, or run **Caravan: Verify Saved File** from the Command Palette.
 Clicking the **Caravan:** status bar item also verifies the active file.
 For an interface or proof file, Caravan verifies the sibling `.ml` implementation
@@ -53,7 +53,7 @@ Editing a file marks its previous result outdated and stops obsolete checks.
 ### Reading contracts and proofs
 
 Hover over a function name to see its external contract, with a link to the
-original `.mli` or `.proof` source. Short inline hints show proof steps at their
+original `.mli` or `.mlp` source. Short inline hints show proof steps at their
 attachment points; hover for the full annotation or follow the source link to edit
 it. Enable `editor.inlayHints.enabled` to see these hints.
 
@@ -64,7 +64,7 @@ proof hints, and proof views are available without running the solver.
 
 Run **Caravan: Show Generated Raven** to open the saved implementation's translated
 Raven program in a read-only tab beside the source. This command also works from
-its `.mli` or `.proof` file. It translates without running SMT verification and
+its `.mli` or `.mlp` file. It translates without running SMT verification and
 uses the same toolchain and project settings as verification. The view refreshes
 when sources, dependencies, or settings change; save dirty files to see their
 updated translation. Syntax highlighting is provided by the optional

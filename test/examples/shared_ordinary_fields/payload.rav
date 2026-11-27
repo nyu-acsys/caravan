@@ -1,0 +1,138 @@
+// A single publication and retirement epoch; head identities cannot return by default.
+val allow_aba: Bool = false
+
+module Payload[V: Library.Type] {
+  module Raw: Library.Type {
+    rep type T = data {
+      case payload(value: V)
+      case discarded
+    }
+  }
+
+  module Writes = PastWrites[Raw]
+  module Booleans: Library.Type { rep type T = Bool }
+  module Lifetimes = PastWrites[Booleans]
+
+  field head_moved: Bool
+
+  inv cell(c: Ref, history: Ref, lifetime: Ref, initial: V) {
+    exists moved: Bool, events: Set[Raw], phases: Set[Bool] ::
+      own(c.head_moved, moved, 1.0)
+      && Writes.authority(history, events)
+      && Lifetimes.authority(lifetime, phases)
+      && Raw.payload(initial) in events
+      && events subseteq {Raw.payload(initial), Raw.discarded}
+      && false in phases
+      && (true in phases ==> moved || allow_aba)
+      && (Raw.discarded in events ==> true in phases)
+  }
+
+  proc create(initial: V)
+    returns (c: Ref, history: Ref, lifetime: Ref)
+    ensures cell(c, history, lifetime, initial)
+  {
+    history := Writes.create(Raw.payload(initial));
+    lifetime := Lifetimes.create(false);
+    c := new(head_moved: false);
+    fold cell(c, history, lifetime, initial)[
+      moved := false, events := {Raw.payload(initial)}, phases := {false}];
+  }
+
+  atomic proc retire(c: Ref, history: Ref, lifetime: Ref, ghost initial: V)
+    requires cell(c, history, lifetime, initial)
+    ensures cell(c, history, lifetime, initial) && Lifetimes.observation(lifetime, true)
+  {
+    ghost var moved: Bool;
+    ghost var events: Set[Raw];
+    ghost var phases: Set[Bool];
+    unfold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+    c.head_moved := true;
+    Lifetimes.record(lifetime, phases, true);
+    Lifetimes.remember(lifetime, phases ++ {true}, true);
+    fold cell(c, history, lifetime, initial)[
+      moved := true, events := events, phases := phases ++ {true}];
+  }
+
+  atomic proc clear(c: Ref, history: Ref, lifetime: Ref, ghost initial: V)
+    requires cell(c, history, lifetime, initial) && Lifetimes.observation(lifetime, true)
+    ensures cell(c, history, lifetime, initial) && Lifetimes.observation(lifetime, true)
+  {
+    ghost var moved: Bool;
+    ghost var events: Set[Raw];
+    ghost var phases: Set[Bool];
+    unfold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+    Lifetimes.reconcile(lifetime, phases, true);
+    Writes.record(history, events, Raw.discarded);
+    fold cell(c, history, lifetime, initial)[
+      moved := moved, events := events ++ {Raw.discarded}, phases := phases];
+  }
+
+  atomic proc read(c: Ref, history: Ref, lifetime: Ref, ghost initial: V)
+    returns (raw: Raw)
+    requires cell(c, history, lifetime, initial)
+    ensures cell(c, history, lifetime, initial) && Writes.observation(history, raw)
+  {
+    ghost var moved: Bool;
+    ghost var events: Set[Raw];
+    ghost var phases: Set[Bool];
+    unfold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+    raw := Writes.sample(history, events);
+    fold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+  }
+
+  atomic proc validate(c: Ref, history: Ref, lifetime: Ref, ghost initial: V, raw: Raw)
+    returns (accepted: Bool)
+    requires cell(c, history, lifetime, initial) && Writes.observation(history, raw)
+    ensures cell(c, history, lifetime, initial) && Writes.observation(history, raw)
+      && (accepted ==> raw == Raw.payload(initial))
+  {
+    ghost var moved: Bool;
+    ghost var events: Set[Raw];
+    ghost var phases: Set[Bool];
+    unfold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+    Writes.reconcile(history, events, raw);
+    val moved_now := c.head_moved;
+    accepted := !moved_now;
+    if (accepted) {
+      assert raw == Raw.payload(initial);
+    }
+    fold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+  }
+
+  atomic proc rewind(c: Ref, history: Ref, lifetime: Ref, ghost initial: V)
+    requires allow_aba && cell(c, history, lifetime, initial)
+    ensures cell(c, history, lifetime, initial)
+  {
+    ghost var moved: Bool;
+    ghost var events: Set[Raw];
+    ghost var phases: Set[Bool];
+    unfold cell(c, history, lifetime, initial)[moved := moved, events := events, phases := phases];
+    c.head_moved := false;
+    fold cell(c, history, lifetime, initial)[moved := false, events := events, phases := phases];
+  }
+
+  proc peek(c: Ref, history: Ref, lifetime: Ref, ghost initial: V)
+    returns (accepted: Bool, raw: Raw)
+    requires cell(c, history, lifetime, initial)
+    ensures cell(c, history, lifetime, initial)
+      && (accepted ==> raw == Raw.payload(initial))
+  {
+    raw := read(c, history, lifetime, initial);
+    Writes.duplicate(history, raw);
+    accepted := validate(c, history, lifetime, initial, raw);
+  }
+
+  // A later write cannot be the origin of an earlier observation.
+  proc earlier_read(initial: V)
+    returns (raw: Raw)
+    ensures raw == Raw.payload(initial)
+  {
+    val history := Writes.create(Raw.payload(initial));
+    raw := Writes.sample(history, {Raw.payload(initial)});
+    Writes.reconcile(history, {Raw.payload(initial)}, raw);
+    Writes.record(history, {Raw.payload(initial)}, Raw.discarded);
+  }
+}
+
+module Integers: Library.Type { rep type T = Int }
+module Example = Payload[Integers]

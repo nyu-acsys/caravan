@@ -1,0 +1,10 @@
+module Cell : Ghost.MutexResource with type t = int ref = struct
+  type t = int ref
+  predicate resource (cell : t) = exists value : int. own cell.contents value
+end
+module Guard = Ghost.Mutex (Cell)
+
+proof signal_no_resource condition cell
+  requires (Ghost.Mutex.context owner held &&
+    Guard.is_mutex mutex cell && Guard.is_condition condition mutex)
+  ensures (Cell.resource cell) = ()

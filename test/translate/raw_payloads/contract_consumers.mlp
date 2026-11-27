@@ -1,0 +1,3 @@
+proof result = inspect (value [@raw]) = ()
+proof (result [@raw]) = producer () ensures (Ghost.raw result === (None : bool option)) = ()
+proof result = ordinary () = ()

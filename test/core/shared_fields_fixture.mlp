@@ -1,0 +1,13 @@
+module Counter = Ghost.Frozen (struct
+  let field (n : node) = n.counter
+end)
+
+module NodeCounter = Ghost.Frozen (struct
+  let field (Node r : (_, [< `Node]) queue_node) = r.counter
+end)
+
+module Flags = struct
+  module Value = Ghost.Relaxed (struct
+    let field (n : t) = n.value
+  end)
+end

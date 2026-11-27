@@ -40,33 +40,61 @@ let is_closed ~environment ~parameters ~at typ =
           | Ok { type_is_newtype = true; _ } -> true
           | Ok definition when List.length definition.type_params = List.length arguments
             ->
-              let substitutions = List.zip_exn definition.type_params arguments in
-              let rec substitute typ =
-                match List.Assoc.find substitutions typ ~equal:Types.eq_type with
-                | Some actual -> actual
-                | None ->
-                    begin match Types.get_desc typ with
-                    | Tvar _ | Tunivar _ -> typ
-                    | desc -> Ctype.newty (Btype.copy_type_desc substitute desc)
-                    end
+              let roles = Indexed_types.compiler_roles definition in
+              let runtime_arguments =
+                List.filter_map (List.zip_exn roles arguments) ~f:(fun (role, argument) ->
+                    match role with
+                    | Parameter -> Some argument
+                    | Value_index | Constructor_index -> None)
               in
-              if not (List.for_all arguments ~f:(closed seen)) then false
+              let bindings = List.zip_exn definition.type_params arguments in
+              let substitute bindings =
+                let rec apply typ =
+                  match List.Assoc.find bindings typ ~equal:Types.eq_type with
+                  | Some actual -> actual
+                  | None ->
+                      begin match Types.get_desc typ with
+                      | Tvar _ | Tunivar _ -> typ
+                      | desc -> Ctype.newty (Compiler_types.map_desc apply desc)
+                      end
+                in
+                apply
+              in
+              if not (List.for_all runtime_arguments ~f:(closed seen)) then false
               else if List.mem seen path ~equal:Path.same then true
               else
                 let seen = path :: seen in
                 begin match definition.type_kind with
                 | Type_variant (constructors, _) ->
                     List.for_all constructors ~f:(fun constructor ->
-                        match constructor.Types.cd_args with
-                        | Cstr_tuple arguments ->
-                            List.for_all arguments ~f:(fun typ ->
-                                closed seen (substitute typ))
-                        | Cstr_record _ -> false)
+                        let bindings =
+                          match Option.map constructor.Types.cd_res ~f:Types.get_desc with
+                          | Some (Tconstr (_, result, _))
+                            when List.length result = List.length arguments ->
+                              let ordinary =
+                                List.filter_map
+                                  (List.zip_exn roles (List.zip_exn result arguments))
+                                  ~f:(fun (role, binding) ->
+                                    match role with
+                                    | Parameter -> Some binding
+                                    | Value_index | Constructor_index -> None)
+                              in
+                              ordinary @ bindings
+                          | Some _ | None -> bindings
+                        in
+                        let closed_field typ = closed seen (substitute bindings typ) in
+                        match constructor.cd_args with
+                        | Cstr_tuple arguments -> List.for_all arguments ~f:closed_field
+                        | Cstr_record fields ->
+                            List.exists fields ~f:(fun field ->
+                                Poly.equal field.Types.ld_mutable Asttypes.Mutable)
+                            && List.for_all fields ~f:(fun field ->
+                                closed_field field.Types.ld_type))
                 | Type_record (fields, _) ->
                     List.for_all fields ~f:(fun field ->
                         (List.is_empty arguments
                         || Poly.equal field.Types.ld_mutable Asttypes.Immutable)
-                        && closed seen (substitute field.ld_type))
+                        && closed seen (substitute bindings field.ld_type))
                 | Type_abstract _ | Type_open | Type_external _ -> false
                 end
           | Ok _ | Error _ -> false

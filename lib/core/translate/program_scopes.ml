@@ -13,6 +13,7 @@ type t = {
   linearizations : ((int * int) * Annotation.t) list;
   initializations : ((int * int) * Annotation.t) list;
   source : Source.t;
+  mutex_execution : bool;
   implementation : Source.proof_resource -> string option;
   proof_implementation : Source.proof_resource -> string option;
   definition_target : Proof_bindings.binding -> string option;
@@ -91,6 +92,10 @@ let proof_worker ~(module_contexts : Module_context.registry)
   let declaration_context = declaration_context ~module_contexts ~unapplied_proofs in
   (declaration_context name).worker
 
+let resource_has_required_lemma resource =
+  List.exists resource.Source.resource_operations ~f:(fun (_, kind, _, _) ->
+      Poly.equal kind R.Ast.Callable.Lemma)
+
 let run (source : Source.t) : (t, error) Result.t =
   let annotations = Source.annotations source in
   let typed = without_application_operators source.typed in
@@ -116,6 +121,7 @@ let run (source : Source.t) : (t, error) Result.t =
       Prelude.value_interface;
       Prelude.in_range;
       Prelude.wrap;
+      Prelude.wrap_full;
     ];
   let reserved =
     List.map source.libraries ~f:(fun lib -> lib.Source.library_name)
@@ -239,13 +245,59 @@ let run (source : Source.t) : (t, error) Result.t =
     Option.bind (definition_resource binding.entry.scope) ~f:(fun resource ->
         let backend =
           match binding.kind with
+          | Predicate _
+            when List.exists resource.resource_operations ~f:(fun (name, kind, _, _) ->
+                     String.equal name binding.entry.name.pid_str
+                     &&
+                     match kind with
+                     | R.Ast.Callable.Pred | Invariant -> true
+                     | _ -> false) ->
+              implementation resource
+          | Lemma _
+            when List.exists resource.resource_operations ~f:(fun (name, kind, _, _) ->
+                     String.equal name binding.entry.name.pid_str
+                     && Poly.equal kind R.Ast.Callable.Lemma) ->
+              implementation resource
+          | (Predicate _ | Lemma _) when resource_has_required_lemma resource ->
+              implementation resource
           | Predicate _ | Lemma _ -> proof_implementation resource
-          | Function _ | Resource _ | Field _ | Atomic _ | State _ | Action _ ->
+          | Function _ when resource_has_required_lemma resource ->
+              implementation resource
+          | Function _ ->
+              Option.map (implementation resource) ~f:(fun name ->
+                  if List.is_empty resource.resource_parameters then name
+                  else name ^ "$Helpers")
+          | Resource _ | Field _ | Atomic _ | Task _ | State _ | Action _ ->
               implementation resource
         in
         Option.map backend ~f:(fun backend -> backend ^ "." ^ binding.entry.name.pid_str))
   in
   let* inventory = Module_inventory.build source typed in
+  let canonicalize = Source.canonical_field_paths source.proof_scopes in
+  let origins, proof_access_fields =
+    List.fold_map source.proof_access_fields ~init:[]
+      ~f:(fun origins (field : Access_fields.t) ->
+        match
+          Module_inventory.field_origin inventory ~record_path:field.record_path
+            ~position:field.label.lbl_pos
+        with
+        | None -> (origins, field)
+        | Some origin ->
+            let record_path = canonicalize origin.record_path in
+            ({ origin with record_path } :: origins, { field with record_path }))
+  in
+  let source =
+    {
+      source with
+      proof_access_fields;
+      field_disciplines = origins @ inventory.field_disciplines;
+    }
+  in
+  let* () =
+    Access_fields.validate_facades
+      ~disciplines:(source.field_disciplines @ source.signature_field_disciplines)
+      source.proof_access_fields
+  in
   Fresh_names.reserve
     (List.map (root_interface_resources source inventory) ~f:(fun (_, resource) ->
          resource.Module_inventory.declaration.pred_name.pid_str));
@@ -319,6 +371,28 @@ let run (source : Source.t) : (t, error) Result.t =
     Specializations.run types ~helped:(helped source.proof) ~targets (funcs @ lifted)
   in
   let funcs = inherit_contracts funcs in
+  let trusted = Source.mutex_context_path source.env in
+  let needs_context environment contract =
+    Option.exists contract
+      ~f:
+        (Mutex_execution.contract_requires_context ?trusted
+           (Source.annotation_env source environment))
+  in
+  let* imported_contexts =
+    all libraries ~f:(fun library ->
+        all library.Library_modules.signature.signature_values ~f:(fun (_, value) ->
+            let site = value.Module_inventory.site in
+            let* contract =
+              contract_after ~scope:site.scope site.annotations ~item_loc:site.item_loc
+                ~next:site.next
+            in
+            Ok (needs_context site.environment contract)))
+  in
+  let mutex_execution =
+    Mutex_execution.enabled source.proof_resources
+    || List.exists funcs ~f:(fun f -> needs_context f.environment f.contract)
+    || List.exists imported_contexts ~f:(List.exists ~f:Fn.id)
+  in
   let* access_proofs =
     access_annotations ~libraries
       ~checked:
@@ -332,7 +406,7 @@ let run (source : Source.t) : (t, error) Result.t =
         @ List.map specialized ~f:(fun specialized ->
             specialized.Specializations.original))
   in
-  let state_targets = ref [] and nested_reads = ref [] in
+  let state_targets = ref [] and nested_atomics = ref [] in
   let remember (e : Typedtree.expression) =
     state_targets :=
       (e.exp_loc.loc_start.pos_cnum, e.exp_loc.loc_end.pos_cnum) :: !state_targets
@@ -349,7 +423,7 @@ let run (source : Source.t) : (t, error) Result.t =
     | _ -> ()
   in
   let visit iterator (e : Typedtree.expression) =
-    if Option.is_some (atomic_read_argument e) then nested_reads := e :: !nested_reads;
+    if Option.is_some (atomic_argument e) then nested_atomics := e :: !nested_atomics;
     begin match e.exp_desc with
     | Texp_let (Nonrecursive, [ binding ], body) ->
         remember binding.vb_expr;
@@ -358,6 +432,12 @@ let run (source : Source.t) : (t, error) Result.t =
     | Texp_sequence (left, right) ->
         remember left;
         lexical_tail right
+    | Texp_tuple components ->
+        List.iter components ~f:(fun (_, operand) -> remember operand)
+    | Texp_record { fields; extended_expression = None; _ } ->
+        Array.iter fields ~f:(function
+          | _, Typedtree.Overridden (_, value) -> remember value
+          | _, Kept _ -> ())
     | Texp_ifthenelse (_, yes, no) ->
         lexical_tail yes;
         Option.iter no ~f:lexical_tail
@@ -374,8 +454,8 @@ let run (source : Source.t) : (t, error) Result.t =
       iterator.expr iterator f.body);
   let* () =
     Result.all_unit
-      (List.map !nested_reads ~f:(fun e ->
-           let* argument = nested_stateful_read access_proofs e in
+      (List.map !nested_atomics ~f:(fun e ->
+           let* argument = nested_stateful_atomic_argument access_proofs e in
            Option.iter argument ~f:(fun argument ->
                remember e;
                remember argument);
@@ -391,7 +471,8 @@ let run (source : Source.t) : (t, error) Result.t =
            then
              error a.loc
                "A stateful scope needs a direct let binding, sequence continuation, \
-                lexical tail, or directly nested stateful read"
+                tuple or record operand, lexical tail, or directly nested stateful \
+                atomic access"
            else Ok ()))
   in
   let tails = ref [] in
@@ -435,28 +516,68 @@ let run (source : Source.t) : (t, error) Result.t =
                error annotation.loc "Ghost.scope cannot be used in a trusted function"
            | _ -> error annotation.loc "Ghost.scope requires a manual function proof"))
   in
-  (* The abstract types of the libraries. *)
   let* library_types =
     all libraries ~f:(fun (lib : Library_modules.t) ->
-        let* declarations = Library_modules.abstract_types lib in
-        Ok
-          (List.map declarations ~f:(fun declaration ->
-               let descriptor =
-                 Datatypes.library_type ~library:lib.library_name
-                   ~library_id:lib.library_id ~at:declaration.Typedtree.typ_loc
-                   declaration.typ_name.txt
-               in
-               let descriptor =
-                 {
-                   descriptor with
-                   parameters =
-                     List.map declaration.typ_params ~f:(fun (parameter, _) ->
-                         parameter.Typedtree.ctyp_type);
-                 }
-               in
-               Datatypes.with_abstract_domain descriptor |> fun descriptor ->
-               Datatypes.with_paths descriptor
-                 [ Path.Pdot (lib.library_path, declaration.typ_name.txt) ])))
+        let* declarations = Library_modules.type_declarations lib in
+        all declarations ~f:(fun declaration ->
+            let path = Path.Pdot (lib.library_path, declaration.Typedtree.typ_name.txt) in
+            match (declaration.typ_kind, declaration.typ_manifest) with
+            | Ttype_abstract, None ->
+                let descriptor =
+                  Datatypes.library_type ~library:lib.library_name
+                    ~library_id:lib.library_id ~at:declaration.typ_loc
+                    declaration.typ_name.txt
+                in
+                let descriptor =
+                  {
+                    descriptor with
+                    parameters =
+                      List.map declaration.typ_params ~f:(fun (parameter, _) ->
+                          parameter.Typedtree.ctyp_type);
+                  }
+                in
+                Ok
+                  (Datatypes.with_paths
+                     (Datatypes.with_abstract_domain descriptor)
+                     [ path ])
+            | (Ttype_abstract | Ttype_record _), _ ->
+                let* descriptor = Datatypes.of_declaration declaration in
+                let descriptor =
+                  match (declaration.typ_kind, declaration.typ_manifest) with
+                  | Ttype_record _, Some manifest ->
+                      {
+                        descriptor with
+                        alias = Some manifest.ctyp_type;
+                        heap = None;
+                        ctors = [];
+                      }
+                  | _ -> descriptor
+                in
+                let descriptor =
+                  Source_type_map.Group.run
+                    (Source_type_map.descriptor descriptor)
+                    ~f:(Subst.type_expr lib.projection)
+                in
+                let name =
+                  Fresh_names.fresh (lib.library_name ^ "_" ^ descriptor.module_name)
+                in
+                let heap =
+                  Option.map descriptor.heap
+                    ~f:
+                      (List.map ~f:(fun (field : Datatypes.field) ->
+                           {
+                             field with
+                             raven_field =
+                               Fresh_names.fresh
+                                 (String.uncapitalize lib.library_name
+                                 ^ "_" ^ field.raven_field);
+                           }))
+                in
+                Ok
+                  (Datatypes.with_paths
+                     { descriptor with id = None; module_name = name; heap }
+                     [ path ])
+            | _ -> unsupported declaration.typ_loc "This imported type representation"))
   in
   let types =
     List.concat library_types @ types @ source.proof_types
@@ -567,6 +688,7 @@ let run (source : Source.t) : (t, error) Result.t =
       linearizations;
       initializations;
       source;
+      mutex_execution;
       implementation;
       proof_implementation;
       definition_target;

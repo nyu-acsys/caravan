@@ -13,7 +13,7 @@ The public signature hides the application.
 Proof annotations also respect the public signature.
 
   $ cat uniform_sealed_parent.ml > uniform_sealed_parent_hidden_proof.ml
-  $ cat uniform_sealed_parent.proof > uniform_sealed_parent_hidden_proof.proof
-  $ printf '\nlemma hidden (token : World.One.Read.token) = ()\n' >> uniform_sealed_parent_hidden_proof.proof
+  $ cat uniform_sealed_parent.mlp > uniform_sealed_parent_hidden_proof.mlp
+  $ printf '\nlemma hidden (token : World.One.Read.token) = ()\n' >> uniform_sealed_parent_hidden_proof.mlp
   $ ! caravan --shh uniform_sealed_parent_hidden_proof.ml > uniform_sealed_parent_hidden_proof.out 2>&1
   $ grep -q 'Unbound module World.One' uniform_sealed_parent_hidden_proof.out

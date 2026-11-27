@@ -1,0 +1,32 @@
+module Make (Element : ELEMENT) = struct
+  module Resource : Ghost.MutexResource with type t = Element.t = struct
+    type t = Element.t
+    predicate resource (value : t) = true
+  end
+  module Guard = Ghost.Mutex (Resource)
+  invariant shared (cell : t) = exists value : Element.t. Guard.is_mutex cell.mutex value
+
+  proof result = create value
+    requires Ghost.Mutex.context owner held
+    ensures shared result && Ghost.Mutex.context owner held =
+    on return begin
+      fold Resource.resource value;
+      Guard.initialize result.mutex value;
+      fold shared result {value = value}
+    end
+
+  proof work cell
+    opens {shared cell}
+    requires shared cell && Ghost.Mutex.context owner held && held === Finset.empty
+    ensures shared cell && Ghost.Mutex.context owner held =
+    let key = at (Mutex.lock cell.mutex) (fun acquire ->
+      let value = unfold shared cell {value} in
+      fold shared cell {value = value};
+      let result = acquire () in (result, value)) in
+    at (Mutex.unlock cell.mutex) (fun release ->
+      let result = release () in result)
+end
+proof client ()
+  opens {Instance.shared}
+  requires Ghost.Mutex.context owner held && held === Finset.empty
+  ensures Ghost.Mutex.context owner held = ()

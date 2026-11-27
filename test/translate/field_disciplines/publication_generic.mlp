@@ -1,0 +1,5 @@
+module Generic (Storage : Storage) = struct
+  module Item = Ghost.Frozen (struct
+    let field (cell : 'a Storage.t) = cell.item
+  end)
+end

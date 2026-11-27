@@ -1,0 +1,7 @@
+proof result = choose left right ensures (result === left) = ()
+proof result = item box token ensures (result === box.item) = ()
+proof client () =
+  at (choose ~right:2 ~left:1) (fun step ->
+    let result = step () in
+    assert (result = 1);
+    result)

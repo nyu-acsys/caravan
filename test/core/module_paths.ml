@@ -96,6 +96,40 @@ let () =
   assert (
     Option.is_none (C.Translate_context.atomic_name (Path.Pdot (shadow_atomic, "get"))))
 
+let () =
+  let nested root = Path.Pdot (Path.Pdot (Path.Pident root, "Domain"), "t") in
+  let direct root = Path.Pdot (Path.Pident root, "t") in
+  let handles =
+    [
+      nested (Ident.create_persistent "Stdlib");
+      direct (Ident.create_persistent "Stdlib__Domain");
+    ]
+  in
+  List.iter handles ~f:(fun path ->
+      let typ = Ctype.newconstr path [ Predef.type_int ] in
+      assert (C.Datatypes.is_domain path);
+      assert (C.Datatypes.is_heap_ref [] typ);
+      assert (C.Datatypes.immediate [] typ);
+      assert (C.Datatypes.has_refs [] typ);
+      assert (Poly.equal (C.Datatypes.type_key [] typ) (Some C.Datatypes.Ref_key));
+      assert (List.is_empty (C.Datatypes.cell_namespaces [] typ));
+      assert (Result.is_ok (C.Datatypes.typ [] ~at:Location.none typ)));
+  let shadows =
+    [
+      nested (Ident.create_local "Stdlib");
+      direct (Ident.create_local "Stdlib__Domain");
+      direct (Ident.create_local "Domain");
+      direct (Ident.create_persistent "Domain");
+    ]
+  in
+  List.iter shadows ~f:(fun path ->
+      let typ = Ctype.newconstr path [ Predef.type_int ] in
+      assert (not (C.Datatypes.is_domain path));
+      assert (not (C.Datatypes.is_heap_ref [] typ));
+      assert (not (C.Datatypes.immediate [] typ));
+      assert (Option.is_none (C.Datatypes.type_key [] typ));
+      assert (Result.is_error (C.Datatypes.typ [] ~at:Location.none typ)))
+
 let location ?(file = "scope.ml") start stop =
   let position offset = { Lexing.dummy_pos with pos_fname = file; pos_cnum = offset } in
   { Location.loc_start = position start; loc_end = position stop; loc_ghost = false }

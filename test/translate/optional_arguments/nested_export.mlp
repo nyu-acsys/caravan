@@ -1,0 +1,9 @@
+proof result = identity value ensures (result === value) = ()
+proof result = outer () ensures (true) =
+  let exported = at (identity 42) (fun step ->
+    let result = step () in
+    (result, result)) in
+  at (identity value) (fun step ->
+    let result = step () in
+    assert (exported = 42);
+    result)
