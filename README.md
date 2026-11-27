@@ -29,8 +29,9 @@ let increment value = value + 1
 ```
 
 Caravan is under active development. It supports a first-order subset of OCaml 5,
-including polymorphic functions, algebraic data types, records, modules and
-functors, mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
+including polymorphic functions with labelled and optional arguments, algebraic
+data types, records, arrays, modules and functors with `open` and `include`,
+mutable state, atomics, `Domain.spawn`/`Domain.join` for statically known
 tasks, native mutexes and condition variables, exceptions, and GADTs with constant
 witnesses or constructor-set indices. Explicit frozen and relaxed field disciplines
 support [weak-memory reasoning](https://nyu-acsys.github.io/caravan/tutorial/weak-memory).
@@ -64,10 +65,14 @@ The [Saturn case studies](test/saturn) include:
   [parallel stack-drain clients](test/saturn/stack_drain) using domains.
 - A [Michael–Scott queue with automatic history reasoning](test/saturn/michael_scott_queue).
 - The same queue with an [explicit segment proof](test/saturn/michael_scott_queue_lseg).
+- A [bounded queue](test/saturn/bounded_queue) with wrapping position counters and
+  snapshot helping.
 
 The [Moonpool Parker](test/moonpool/parker) uses a mutex and condition variable to
 implement a coalescing permit. The [OCaml 5 tutorial blocking stack](test/ocaml5_tutorial/blocking_stack)
-adds polymorphic LIFO contracts over mutex-protected mutable state.
+adds polymorphic LIFO contracts over mutex-protected mutable state. The
+[generic striped hash set](test/case_studies/generic_striped_hash_set) is a functor
+over its key type with lock-striped buckets and resizing.
 
 Smaller [verification examples](test/examples) illustrate individual proof patterns.
 See [test organization](test/README.md) for the full collection.
@@ -79,7 +84,7 @@ Caravan requires OCaml 5.5 and Raven's `raven-ivl.api` library. From a source ch
 ```bash
 opam switch create caravan 5.5.0
 eval $(opam env --switch=caravan)
-opam pin add raven-ivl.1.6.1 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
+opam pin add raven-ivl.1.7.0 "git+https://github.com/nyu-acsys/raven.git#$(cat RAVEN_REVISION)"
 opam install . --deps-only --with-test
 dune build
 ```

@@ -4,49 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
-- Modules can `open` other modules and `include` modules, functor applications, and structures, with their proof predicates in scope.
-- Invariants can declare with `[@within …]` that they lie beneath another invariant, in proofs and interfaces.
-- Companion interfaces check exported module contracts and frozen invariant masks against existing native and instantiated functor contracts.
-- Pure function contracts are checked through module views and functor parameters, with logical counterparts usable in specifications.
-- A generic striped hash-set case study verifies atomic set operations and load-factor resizing under all stripe locks.
-- `Permission.halve` lets a proof take part of a fraction out of an invariant before a field access.
-- One-shot `Ghost.Prophecy` predictions support linearizability proofs with future-dependent linearization points.
-- Standard-library `ignore` evaluates its argument while discarding its result.
-- Executable contracts support explicit invariant masks with `opens {…}`, using the same syntax as proof lemmas.
-- Access helpers can declare checked physical atomicity with `[@atomic]` contracts, including through imports and functors.
-- `--only` verifies a source member or module together with its local helpers and companion proof obligations.
 - Fully supplied labelled and optional arguments, including effectful defaults, work across functions, imports, aliases, and functors.
 - Constructor-set GADTs support polymorphic payloads, mutable inline records, and unboxed wrappers.
 - Polymorphic mutable records support allocation, ownership contracts, reads, and writes through generic functions, modules, and functors.
-- Native mutex and condition proofs support polymorphic protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.
-- Proof-defined modules support type aliases, including nonrecursive aliases, and parameterized manifest carrier constraints.
-- Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
-- Proof outlines support loop invariants, OCaml closure and record anchors, occurrence selectors, and ghost return adapters.
-- The OCaml 5 tutorial blocking stack verifies with polymorphic LIFO contracts and Domain handoff clients.
+- Arrays support `make`, `length`, `get` and `set`, with entries owned through `Array.cell a i`.
+- Standard-library `ignore` evaluates its argument while discarding its result.
 - Standard-library `List.length` is supported in executable code with an overflow precondition.
 - Inline `List.fold_left` callbacks support loop invariants, effects, exceptions, and ghost-state proof scopes.
-- `list_segment s over p` declares a list predicate iterating `p`, with lemmas that take one element out and put it back.
-- Quantifiers and auto lemmas' postconditions accept explicit triggers, as in `forall x [f x]. p`.
-- Proof-outline steps at atomic accesses open and close the invariants of the function's `opens` clause.
-- `cut p` proves `p` and verifies the rest of a function from `p` and variables' values alone.
+- Modules can `open` other modules and `include` modules, functor applications, and structures, with their proof predicates in scope.
+- Companion interfaces check exported module contracts and frozen invariant masks against existing native and instantiated functor contracts.
+- Pure function contracts are checked through module views and functor parameters, with logical counterparts usable in specifications.
+- Proof-defined modules support type aliases, including nonrecursive aliases, and parameterized manifest carrier constraints.
+- Native mutex and condition proofs support polymorphic protected-resource facades, owner-aware locking and waits, notifications, helper effects, and Domain workers with checked lock cleanup in modules and functors.
+- Domain spawning and joining transfer resources through polymorphic task facades in modules and functors while keeping task bodies verified.
+- Access helpers can declare checked physical atomicity with `[@atomic]` contracts, including through imports and functors.
 - Atomic-update operations may omit the operation's own arguments, and `delegate` hands an update to a call.
+- One-shot `Ghost.Prophecy` predictions support linearizability proofs with future-dependent linearization points.
+- Executable contracts support explicit invariant masks with `opens {…}`, using the same syntax as proof lemmas.
+- Invariants can declare with `[@within …]` that they lie beneath another invariant, in proofs and interfaces.
+- Proof-outline steps at atomic accesses open and close the invariants of the function's `opens` clause.
 - A lemma declared `[@closes opener]` closes, at the end of a proof step, what `opener` opened there.
-- Arrays support `make`, `length`, `get` and `set`, with entries owned through `Array.cell a i`.
+- `Permission.halve` lets a proof take part of a fraction out of an invariant before a field access.
+- Proof outlines support loop invariants, OCaml closure and record anchors, occurrence selectors, and ghost return adapters.
+- `cut p` proves `p` and verifies the rest of a function from `p` and variables' values alone.
+- Quantifiers and auto lemmas' postconditions accept explicit triggers, as in `forall x [f x]. p`.
+- `list_segment s over p` declares a list predicate iterating `p`, with lemmas that take one element out and put it back.
+- `--only` verifies a source member or module together with its local helpers and companion proof obligations.
+- The OCaml 5 tutorial blocking stack verifies with polymorphic LIFO contracts and Domain handoff clients.
+- A generic striped hash-set case study verifies atomic set operations and load-factor resizing under all stripe locks.
 
 ### Changed
 
-- Companion proof files use the extension `.mlp`; `.proof` files are still read, with a deprecation warning.
-- Proof-file contracts and lemmas accept unparenthesized clauses, matching interface annotations.
 - Executable integer arithmetic follows OCaml wraparound semantics, including intermediate results and pure functions.
 - Polymorphic module predicates can be instantiated at concrete types in predicate definitions.
+- Proof-file contracts and lemmas accept unparenthesized clauses, matching interface annotations.
+- Companion proof files use the extension `.mlp`; `.proof` files are still read, with a deprecation warning.
 
 ### Fixed
 
 - Companion interface predicates remain available through annotation-free source module signatures while preserving opacity.
-- Loops no longer retain changing spatial preconditions as invariant facts.
 - Nested generic workers can reference enclosing module parameters without spurious dependency cycles.
+- Loops no longer retain changing spatial preconditions as invariant facts.
 
 ## [0.1.0]
 

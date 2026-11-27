@@ -1,7 +1,7 @@
 (lang dune 3.12)
 (using menhir 2.1)
 
-(version 0.1.0)
+(version 0.2.0)
 
 (generate_opam_files)
 
@@ -23,7 +23,7 @@
   (dune
    (>= 3.12))
   (raven-ivl
-   (= 1.6.1))
+   (= 1.7.0))
   (menhir
    (and
     :build
