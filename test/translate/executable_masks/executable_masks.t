@@ -28,7 +28,7 @@ An imported callee's mask is checked at the call, including adapter procedures.
 
 Module compliance cannot weaken the implementation's invariant footprint.
 
-  $ sed '0,/opens { live cell }/s//opens {}/' generic.ml > generic_fail.ml
+  $ sed '1,/opens { live cell }/s/opens { live cell }/opens {}/' generic.ml > generic_fail.ml
   $ cp generic.proof generic_fail.proof
   $ caravan --shh generic_fail.ml > generic_fail.out 2>&1
   [1]

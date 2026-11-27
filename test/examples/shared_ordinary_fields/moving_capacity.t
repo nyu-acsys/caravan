@@ -32,7 +32,8 @@ Adding one to a refresh can overestimate the logical availability.
 Source counters need not increase when their logical position increases.
 
   $ cp moving_capacity.ml monotone.ml
-  $ sed '/proof result = successor /a\  ensures (result > counter)' moving_capacity.proof > monotone.proof
+  $ sed '/proof result = successor /a\
+  > \  ensures (result > counter)' moving_capacity.proof > monotone.proof
   $ caravan --shh monotone.ml > monotone.out 2>&1
   [1]
   $ grep -q 'Verification Error:' monotone.out

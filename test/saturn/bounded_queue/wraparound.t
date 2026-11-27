@@ -3,9 +3,12 @@ fixture models signed 3-bit arithmetic by shadowing integer addition and
 subtraction in the copied source; it is not native word-size verification.
 
   $ cat wrap_prefix.ml bounded_queue.ml > runtime.ml
-  $ sed -i '/let capacity = get_capacity old_tail in/a\  after_capacity ();' runtime.ml
+  $ sed '/let capacity = get_capacity old_tail in/a\
+  > \  after_capacity ();' runtime.ml > runtime.ml.edited
+  $ mv runtime.ml.edited runtime.ml
   $ cat wrap_harness.ml >> runtime.ml
-  $ sed '/^    else match get_next old_tail with$/,/^    | Link (Node _ as next) -> push_as t new_node next mono$/c\    else match mono with Unit -> raise Full | Bool -> false' runtime.ml > runtime_original.ml
+  $ sed '/^    else match get_next old_tail with$/,/^    | Link (Node _ as next) -> push_as t new_node next mono$/c\
+  > \    else match mono with Unit -> raise Full | Bool -> false' runtime.ml > runtime_original.ml
   $ ocamlopt -o runtime_original.exe runtime_original.ml
   $ ./runtime_original.exe
   Bool wrapper: target=full; queued_target=false

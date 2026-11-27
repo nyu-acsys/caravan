@@ -13,7 +13,8 @@ The generated program preserves prophecy semantics when parsed by Raven.
 Resolving twice requires a resource that the first resolution consumed.
 
   $ cp one_shot.ml twice.ml
-  $ sed '/Ghost.Prophecy.resolve prophecy result;/a\    Ghost.Prophecy.resolve prophecy result;' one_shot.proof > twice.proof
+  $ sed '/Ghost.Prophecy.resolve prophecy result;/a\
+  > \    Ghost.Prophecy.resolve prophecy result;' one_shot.proof > twice.proof
   $ caravan --shh --only observe twice.ml > twice.out 2>&1
   [1]
   $ grep -q 'Verification Error:' twice.out
@@ -23,7 +24,8 @@ Resolving twice requires a resource that the first resolution consumed.
 A predicted value is not known before resolution.
 
   $ cp one_shot.ml early.ml
-  $ sed '/Ghost.Prophecy.resolve prophecy result;/i\    assert (predicted);' one_shot.proof > early.proof
+  $ sed '/Ghost.Prophecy.resolve prophecy result;/i\
+  > \    assert (predicted);' one_shot.proof > early.proof
   $ caravan --shh --only observe early.ml > early.out 2>&1
   [1]
   $ grep -q 'Verification Error:' early.out

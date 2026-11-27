@@ -59,7 +59,8 @@ The constructor does not turn a cleared word into an initialized payload.
 
 Freezing a failed candidate prevents the counter rewrite required by a retry.
 
-  $ sed '/let prior = Counter.release_private candidate in/a\    Counter.freeze candidate;' clients.proof > frozen_candidate.proof
+  $ sed '/let prior = Counter.release_private candidate in/a\
+  > \    Counter.freeze candidate;' clients.proof > frozen_candidate.proof
   $ cp clients.ml frozen_candidate.ml
   $ caravan --shh -I ../backoff --cache-dir verification-cache --only failed_retry frozen_candidate.ml > frozen.out 2>&1
   [1]

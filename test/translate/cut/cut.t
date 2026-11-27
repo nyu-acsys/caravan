@@ -10,7 +10,7 @@ keeps its value but not its range, which the cut restates.
 
 What the cut leaves out is gone: here, the ownership of s.
 
-  $ sed '0,/  r := 3;/s//  s := 3;/' refs.ml > left_behind.ml
+  $ sed '1,/  r := 3;/s/  r := 3;/  s := 3;/' refs.ml > left_behind.ml
   $ cp refs.mli left_behind.mli
   $ caravan --shh --only keep left_behind.ml
   [Error] File "left_behind.ml", line 5, columns 2-8:

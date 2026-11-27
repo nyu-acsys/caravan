@@ -31,7 +31,8 @@ acquired visibility. The stronger postcondition requires the published read rule
 
 Acquiring an unrelated atomic location does not authorize a published read.
 
-  $ sed '/let receive (channel : int Atomic.t) cell =/a\  let other = Atomic.make 1 in' publication.ml | sed 's/Atomic.get channel/Atomic.get other/' > wrong_channel.ml
+  $ sed '/let receive (channel : int Atomic.t) cell =/a\
+  > \  let other = Atomic.make 1 in' publication.ml | sed 's/Atomic.get channel/Atomic.get other/' > wrong_channel.ml
   $ sed 's/at (Atomic.get channel)/at (Atomic.get other)/' publication.proof > wrong_channel.proof
   $ caravan --shh wrong_channel.ml > wrong_channel.out 2>&1
   [1]
